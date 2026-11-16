@@ -18,12 +18,14 @@ use std::{
     path::{Path, PathBuf},
     sync::{mpsc, Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub const PROTOCOL_VERSION: u16 = 9;
 const TOKEN_LENGTH: usize = 32;
 const MAX_MESSAGE: u32 = 4096;
+/// The longest silence toward the runtime; it gives up after 5 seconds
+const KEEPALIVE: Duration = Duration::from_secs(1);
 /// The runtime accepts per-eye sizes up to this (BASALT_CONTROL_MAX_VIEW_*; cranvr's runtime
 /// patch raises them to the Quest 3 panel size).
 pub const MAX_VIEW: (u32, u32) = (2064, 2208);
@@ -44,6 +46,7 @@ mod msg {
     pub const BUTTON_STATE: u16 = 11;
     pub const HAPTIC: u16 = 12;
     pub const INTERACTION_PROFILE: u16 = 13;
+    pub const INPUT_RESET: u16 = 14;
     pub const VIEW_CONFIG: u16 = 15;
     pub const CONTROLLER_MASK: u16 = 16;
     pub const FRAME_CONSUMED: u16 = 17;
@@ -54,6 +57,9 @@ mod msg {
 pub struct GameView {
     pub swapchain: u64,
     pub image: u32,
+    /// The layer of an array swapchain: a game that renders both eyes in one pass ("single pass
+    /// instanced") draws each eye into its own layer of one image
+    pub layer: u32,
     /// x, y, width, height in pixels of the swapchain image
     pub rect: [i32; 4],
     /// tangents of the left, right, up and down angles the game rendered with
@@ -97,6 +103,8 @@ struct Calibration {
 pub struct RuntimeLink {
     events: mpsc::Sender<GameEvent>,
     writer: Mutex<Option<TcpStream>>,
+    /// When the host last sent the runtime anything
+    last_sent: Mutex<Instant>,
     calibration: Mutex<Calibration>,
     control_file: PathBuf,
     port: u16,
@@ -118,6 +126,7 @@ impl RuntimeLink {
         let link = Arc::new(Self {
             events: events.clone(),
             writer: Mutex::new(None),
+            last_sent: Mutex::new(Instant::now()),
             calibration: Mutex::new(Calibration::default()),
             control_file: control_file.to_owned(),
             port,
@@ -133,6 +142,20 @@ impl RuntimeLink {
                     }
                     *link.writer.lock().unwrap() = None;
                     events.send(GameEvent::Disconnected).ok();
+                }
+            })?;
+        }
+        {
+            // The runtime gives up on the host when it hears nothing for 5 seconds
+            // (kSocketTimeoutMilliseconds in BasaltVR's control.cpp). It then stops the game's
+            // rendering but keeps the connection open, so the game sent no frames after the
+            // headset left for 6 or 11 seconds. While no pose flows, the host sends INPUT_RESET,
+            // which the runtime takes as "the headset's controls are gone".
+            let link = Arc::clone(&link);
+            thread::Builder::new().name("runtime-keepalive".into()).spawn(move || loop {
+                thread::sleep(KEEPALIVE / 2);
+                if link.last_sent.lock().unwrap().elapsed() >= KEEPALIVE {
+                    link.send(msg::INPUT_RESET, &[]);
                 }
             })?;
         }
@@ -193,6 +216,7 @@ impl RuntimeLink {
         fs::remove_file(&program_file).ok();
         info!("Game runtime connected: {renderer}, {}", program.as_deref().unwrap_or("program not named"));
 
+        *self.last_sent.lock().unwrap() = Instant::now();
         *self.writer.lock().unwrap() = Some(stream.try_clone().map_err(|e| e.to_string())?);
         self.send(msg::HELLO_ACK, &PROTOCOL_VERSION.to_le_bytes());
         if let Some(view) = self.calibration.lock().unwrap().view_config {
@@ -243,11 +267,11 @@ impl RuntimeLink {
                     if count != 2 {
                         return Err(format!("frame with {count} views; only stereo is supported"));
                     }
-                    let mut views = [GameView { swapchain: 0, image: 0, rect: [0; 4], fov_tan: [0.0; 4] }; 2];
+                    let mut views = [GameView { swapchain: 0, image: 0, layer: 0, rect: [0; 4], fov_tan: [0.0; 4] }; 2];
                     for v in &mut views {
                         v.swapchain = r.u64()?;
                         v.image = r.u32()?;
-                        let _array_index = r.u32()?;
+                        v.layer = r.u32()?;
                         v.rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
                         // pose: 4 + 3 floats; the frame shows the pose of tracking_ns already
                         for _ in 0..7 {
@@ -281,6 +305,7 @@ impl RuntimeLink {
         if stream.write_all(&buf).is_err() {
             *writer = None;
         }
+        *self.last_sent.lock().unwrap() = Instant::now();
     }
 
     pub fn frame_consumed(&self, number: u64) {
@@ -391,6 +416,17 @@ fn random_token() -> std::io::Result<String> {
 }
 
 /// Keeps the swapchain images the frame loop needs, by swapchain ID.
+/// BasaltVR's images per swapchain (kSwapchainImageCount in its swapchain.cpp). A swapchain with
+/// layers sends this many images times its layers, image by image: image i, layer l is at
+/// i * layers + l.
+const RUNTIME_IMAGES: usize = 3;
+
+/// The place of a view's image among a swapchain's `count` images.
+fn slot(count: usize, view: &GameView) -> usize {
+    let layers = (count / RUNTIME_IMAGES).max(1);
+    view.image as usize * layers + view.layer as usize
+}
+
 #[derive(Default)]
 pub struct Swapchains(HashMap<u64, Vec<PixelBuffer>>);
 
@@ -405,13 +441,23 @@ impl Swapchains {
         self.0.clear();
     }
     pub fn image(&self, view: &GameView) -> Option<&PixelBuffer> {
-        self.0.get(&view.swapchain)?.get(view.image as usize)
+        let images = self.0.get(&view.swapchain)?;
+        images.get(slot(images.len(), view))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_eye_takes_its_own_layer_of_an_array_swapchain() {
+        let view = |image, layer| GameView { swapchain: 1, image, layer, rect: [0; 4], fov_tan: [0.0; 4] };
+        // one layer: images in order
+        assert_eq!([slot(3, &view(0, 0)), slot(3, &view(2, 0))], [0, 2]);
+        // two layers: image 1's left eye is the third surface, its right eye the fourth
+        assert_eq!([slot(6, &view(0, 0)), slot(6, &view(0, 1)), slot(6, &view(1, 0)), slot(6, &view(1, 1)), slot(6, &view(2, 1))], [0, 1, 2, 3, 5]);
+    }
     use alvr_common::{
         glam::{Quat, Vec3},
         Pose,

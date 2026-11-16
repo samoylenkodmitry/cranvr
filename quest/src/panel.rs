@@ -503,6 +503,8 @@ pub struct PanelControl {
     room: bool,
     /// Whether the headset can show the room
     room_available: bool,
+    /// While the console shows over a game, the screens hide: rays pass them and no bar draws
+    screens_hidden: bool,
     /// The thumbstick moves a panel by its handle; its place is saved when the stick rests
     pushing: bool,
     hands: [Hand; 2],
@@ -533,6 +535,7 @@ impl PanelControl {
             place_console: false,
             room: std::fs::read_to_string(room_file(&store)).map_or(true, |t| t.trim() != "floor"),
             room_available: false,
+            screens_hidden: false,
             pushing: false,
             hands: [Hand::default(); 2],
             head: Pose::default(),
@@ -560,6 +563,23 @@ impl PanelControl {
             self.room_available = available;
             self.refresh_console();
         }
+    }
+
+    /// Brings the console below and ahead of the head, as a click of the right thumbstick does.
+    /// It takes the place in the next update, by that update's head pose: the control may not
+    /// have seen the head yet.
+    pub fn bring_console(&mut self) {
+        self.place_console = true;
+    }
+
+    /// Hides the screens while the console shows over a game.
+    pub fn set_screens_hidden(&mut self, hidden: bool) {
+        self.screens_hidden = hidden;
+    }
+
+    /// The screens that show.
+    fn shown_slots(&self) -> impl Iterator<Item = &Slot> {
+        self.slots.iter().filter(|_| !self.screens_hidden)
     }
 
     /// Whether the room shows around the screens instead of the floor.
@@ -762,8 +782,7 @@ impl PanelControl {
         let ray = |hand: &Hand| hand.aim.map(|a| (a.position, a.orientation * Vec3::NEG_Z));
         let targets = inputs.hands.map(|hand| {
             ray(&hand).and_then(|(o, d)| {
-                self.slots
-                    .iter()
+                self.shown_slots()
                     .filter_map(|s| s.hit(o, d, can_add))
                     .chain(self.console_hit(o, d))
                     .min_by(|a, b| a.distance.total_cmp(&b.distance))
@@ -986,8 +1005,7 @@ impl PanelControl {
     pub fn bars(&self) -> Vec<Bar> {
         let can_add = self.can_add();
         let mut bars = self
-            .slots
-            .iter()
+            .shown_slots()
             .map(|slot| {
                 let p = &slot.panel;
                 let hovered = |part: Part| self.targets.iter().flatten().any(|t| t.panel == slot.id && t.part == part);
@@ -1092,7 +1110,7 @@ impl PanelControl {
             }
         }
 
-        for slot in &self.slots {
+        for slot in self.shown_slots() {
             let p = &slot.panel;
             // A flat shape in the panel's plane, a little in front of it
             let on_panel = |x: f32, y: f32, lift: f32| Mat4::from_rotation_translation(p.orientation, p.at(x, y) + p.normal() * lift);
@@ -1426,6 +1444,27 @@ mod tests {
         again.set_room_available(true);
         assert!(!again.shows_room());
         std::fs::remove_file(room_file(&control.store)).ok();
+        std::fs::remove_file(&control.store).ok();
+    }
+
+    #[test]
+    fn hidden_screens_let_the_ray_reach_the_console_behind_them() {
+        let mut control = control("hidden");
+        let streams = [(0, ASPECT, 3840)];
+        control.set_menu(Menu { fps: 120, game_scale: 0.6, ..Default::default() });
+        // the console takes its default place in the next update; then it goes straight behind
+        // the screen, as seen from ORIGIN
+        step(&mut control, &streams, Vec3::Y, 0.0);
+        let screen = control.slots[0].panel;
+        let behind = screen.center + (screen.center - ORIGIN).normalize() * 0.5;
+        control.console.as_mut().unwrap().0.center = behind;
+        control.console.as_mut().unwrap().0.orientation = screen.orientation;
+        step(&mut control, &streams, screen.center - ORIGIN, 0.0);
+        assert_eq!(control.targets[1].map(|t| t.panel), Some(0));
+        control.set_screens_hidden(true);
+        step(&mut control, &streams, screen.center - ORIGIN, 0.0);
+        assert_eq!(control.targets[1].map(|t| t.panel), Some(CONSOLE_ID));
+        assert!(control.bars().iter().all(|b| b.panel == CONSOLE_ID));
         std::fs::remove_file(&control.store).ok();
     }
 
