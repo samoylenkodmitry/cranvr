@@ -488,11 +488,13 @@ pub fn entry_point() {
                         }
                     }
                     ClientCoreEvent::RealTimeConfig(config) => {
+                        // cranvr: the host sends this config every second. Dropping the
+                        // passthrough layer here made cranvr's room view start its layer again
+                        // every second, and each new layer showed black at first. The frame
+                        // below drops the layer when neither ALVR nor the room view wants it.
                         alvr_passthrough = config.passthrough.is_some();
                         if config.passthrough.is_some() && passthrough_layer.is_none() {
                             passthrough_layer = PassthroughLayer::new(&xr_session, platform).ok();
-                        } else if config.passthrough.is_none() && passthrough_layer.is_some() {
-                            passthrough_layer = None;
                         }
 
                         if let Some(stream) = &mut stream_context {
@@ -560,6 +562,7 @@ pub fn entry_point() {
             let room = if stage_space.is_some() {
                 let wanted = desktop_layer.shows_room();
                 if wanted && passthrough_layer.is_none() {
+                    info!("cranvr: the room shows through passthrough");
                     passthrough_layer = PassthroughLayer::new(&xr_session, platform)
                         .map_err(|e| {
                             error!("cranvr: no passthrough: {e}");
