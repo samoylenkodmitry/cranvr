@@ -27,7 +27,8 @@
 // debug.cranvr.console_test sends one console request, a JSON object such as
 // {"action":"set","msaa":0}, once the first menu arrives, for tests without hands. "front"
 // instead puts the console straight ahead of the head. "exit" presses the console's Exit button.
-// "room" and "floor" press those buttons.
+// "room" and "floor" press those buttons. "over" shows the console over a running game, as a hold
+// of the left menu button does.
 //
 // debug.cranvr.layer_flags picks the compositor's filters for the desktop layer: "ss" for
 // supersampling, "sharp" for sharpening, "ss,sharp" (the default) for both, "none" for neither.
@@ -43,7 +44,7 @@ use crate::{
 use alvr_common::{
     error,
     glam::{Mat3, Quat, UVec2, Vec3},
-    LEFT_THUMBSTICK_Y_ID, LEFT_TRIGGER_VALUE_ID, RIGHT_THUMBSTICK_CLICK_ID, RIGHT_THUMBSTICK_Y_ID,
+    LEFT_MENU_CLICK_ID, LEFT_THUMBSTICK_Y_ID, LEFT_TRIGGER_VALUE_ID, RIGHT_THUMBSTICK_CLICK_ID, RIGHT_THUMBSTICK_Y_ID,
     RIGHT_TRIGGER_VALUE_ID,
 };
 use alvr_graphics::{GraphicsContext, OverlayRenderer, OverlayView, SDR_FORMAT_GL};
@@ -96,6 +97,8 @@ const MSG_INSET_CONFIG: u8 = 7;
 const MSG_INSET_FRAME: u8 = 8;
 const MSG_INSET_CLOSED: u8 = 9;
 /// Host to app: the console's menu as JSON (see console.rs)
+/// How long the left menu button must stay down to show the console over a game
+const MENU_HOLD: Duration = Duration::from_millis(800);
 const MSG_MENU: u8 = 22;
 /// App to host: a console button's request as JSON
 const MSG_CONSOLE: u8 = 23;
@@ -194,6 +197,14 @@ pub struct DesktopLayer {
     console_test: Option<String>,
     /// Whether the console's Exit button was pressed
     exit: bool,
+    /// Whether the console shows over a running game, after a hold of the left menu button
+    over_game: bool,
+    /// Whether a game ran at the last frame
+    in_game: bool,
+    /// The test hook's "over": the console goes straight ahead after the next update
+    front_test: bool,
+    /// When the left menu button went down, and whether this hold already switched the console
+    menu_held: Option<(Instant, bool)>,
     /// Each panel's bar layer
     bars: HashMap<u8, BarLayer>,
     /// The sharp inset over the panel that the head points at: the panel, its picture, the
@@ -265,6 +276,10 @@ impl DesktopLayer {
             test_commands: property::get("panel_test").map(|t| test_commands(&t)).unwrap_or_default(),
             console_test: property::get("console_test").filter(|t| !t.is_empty()),
             exit: false,
+            over_game: false,
+            in_game: false,
+            front_test: false,
+            menu_held: None,
             bars: HashMap::new(),
             inset: None,
             inset_pending: None,
@@ -346,6 +361,48 @@ impl DesktopLayer {
         }
     }
 
+    /// A hold of the left menu button for MENU_HOLD during a game shows the console over the game,
+    /// with its Stop button; another hold hides it. The game gets the button too, as before.
+    fn follow_menu_button(&mut self, session: &xr::Session<xr::OpenGlEs>, interaction: &InteractionContext) {
+        let game = self.shared.connected.load(Ordering::Relaxed) && !self.shared.visible.load(Ordering::Relaxed);
+        // The console leaves with the game
+        if self.in_game && !game {
+            self.over_game = false;
+        }
+        self.in_game = game;
+        if game && self.console_test.as_deref() == Some("over") {
+            self.console_test = None;
+            self.over_game = true;
+            // straight ahead, so a headset on a desk sees it
+            self.front_test = true;
+            info!("cranvr console: shows over the game (test)");
+        }
+        let down = match interaction.button_actions.get(&*LEFT_MENU_CLICK_ID) {
+            Some(ButtonAction::Binary(a)) => a.state(session, xr::Path::NULL).is_ok_and(|s| s.current_state),
+            Some(ButtonAction::Scalar(a)) => a.state(session, xr::Path::NULL).is_ok_and(|s| s.current_state > 0.5),
+            None => false,
+        };
+        self.menu_held = match (down, self.menu_held) {
+            (false, _) => None,
+            (true, None) => Some((Instant::now(), false)),
+            (true, Some((at, false))) if game && at.elapsed() >= MENU_HOLD => {
+                self.over_game = !self.over_game;
+                if self.over_game {
+                    self.control.bring_console();
+                }
+                info!("cranvr console: {} the game", if self.over_game { "shows over" } else { "leaves" });
+                Some((at, true))
+            }
+            (true, held) => held,
+        };
+        self.control.set_screens_hidden(self.console_over_game());
+    }
+
+    /// Whether the console shows over a running game.
+    fn console_over_game(&self) -> bool {
+        self.over_game && self.shared.connected.load(Ordering::Relaxed) && !self.shared.visible.load(Ordering::Relaxed)
+    }
+
     /// Whether the panels show: the host is connected, sends a stream and runs no game.
     fn shown(&self) -> bool {
         !self.streams.is_empty() && self.shared.connected.load(Ordering::Relaxed) && self.shared.visible.load(Ordering::Relaxed)
@@ -364,7 +421,8 @@ impl DesktopLayer {
         self.views = None;
         let dt = self.last_frame.elapsed().as_secs_f32().min(0.1);
         self.last_frame = Instant::now();
-        if !self.shown() {
+        self.follow_menu_button(session, interaction);
+        if !self.shown() && !self.console_over_game() {
             return;
         }
         let Ok((flags, views)) = session.locate_views(xr::ViewConfigurationType::PRIMARY_STEREO, time, space) else {
@@ -403,11 +461,16 @@ impl DesktopLayer {
             self.control.set_menu(menu);
         }
         let mut out = self.control.update(&inputs, &streams);
+        if std::mem::take(&mut self.front_test) {
+            self.control.console_in_front();
+        }
         if first_menu {
             match self.console_test.take() {
                 Some(test) if test == "front" => self.control.console_in_front(),
                 Some(test) if test == "exit" => out.exit = true,
                 Some(test) if test == "room" || test == "floor" => self.control.choose_room(test == "room"),
+                // "over" waits for a game
+                Some(test) if test == "over" => self.console_test = Some(test),
                 test => out.console.extend(test),
             }
         }
@@ -564,6 +627,10 @@ impl DesktopLayer {
     pub fn layers<'a>(&'a self, space: &'a xr::Space) -> Vec<xr::CompositionLayerQuad<'a, xr::OpenGlEs>> {
         let mut quads = Vec::new();
         if !self.shown() {
+            // Over a game only the console shows, for its Stop button
+            if self.console_over_game() {
+                quads.extend(self.bars.get(&CONSOLE_ID).and_then(|bar| bar.layer(space, self.settings.as_ref())));
+            }
             return quads;
         }
         let cursor = *self.shared.cursor.lock().unwrap();

@@ -545,6 +545,12 @@ fn realtime_thread() {
 
 /// A game that sent no frame for this long counts as paused, and the test scene comes back.
 const GAME_IDLE: Duration = Duration::from_millis(500);
+/// A game that sent frames and then none for this long gives the desktop back, with the console
+/// and its Stop button. SUPERHOT VR sent no frame after the headset left for 11 seconds and came
+/// back, and the user saw only black.
+const GAME_STALL: Duration = Duration::from_secs(3);
+/// A game that sent no frame this long after it connected gives the desktop back too.
+const GAME_LOAD: Duration = Duration::from_secs(90);
 
 /// What the frame loop knows about the game under Wine.
 #[derive(Default)]
@@ -568,6 +574,16 @@ struct Game {
 }
 
 impl Game {
+    /// Whether the game hides the desktop: while it sends frames, and while it loads.
+    fn hides_desktop(&self, frame_now: bool) -> bool {
+        frame_now
+            || self.connected
+                && match self.last_frame {
+                    Some(at) => at.elapsed() < GAME_STALL,
+                    None => self.since.is_some_and(|since| since.elapsed() < GAME_LOAD),
+                }
+    }
+
     fn active(&self) -> bool {
         self.connected && self.last_frame.is_some_and(|t| t.elapsed() < GAME_IDLE)
     }
@@ -816,7 +832,7 @@ fn frame_loop(
         let gpu_start = Instant::now();
 
         // A connected game hides the desktop, also while it loads and sends no frames
-        shared.layer.game.store(game.connected || game_frame.is_some(), Ordering::Relaxed);
+        shared.layer.game.store(game.hides_desktop(game_frame.is_some()), Ordering::Relaxed);
         // The eye stream needs the desktop capture only without a game and without the layer
         if let Some(c) = &capture {
             c.set_running(!game.connected && game_frame.is_none() && !shared.layer.active.load(Ordering::Relaxed));
@@ -1043,5 +1059,24 @@ fn frame_loop(
             (count, game_count, gpu_ms, gpu_exec_ms, since) = (0, 0, 0.0, 0.0, Instant::now());
             (no_sample, no_buffer, busy, dropped, missing) = (0, 0, 0, 0, 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stalled_game_gives_the_desktop_back() {
+        let ago = |s: u64| Instant::now() - Duration::from_secs(s);
+        let game = |since: u64, last: Option<u64>| Game { connected: true, since: Some(ago(since)), last_frame: last.map(ago), ..Default::default() };
+        // loading, running, a frame now
+        assert!(game(10, None).hides_desktop(false));
+        assert!(game(60, Some(1)).hides_desktop(false));
+        assert!(game(60, Some(30)).hides_desktop(true));
+        // stalled after frames, or no frame long after it connected
+        assert!(!game(60, Some(5)).hides_desktop(false));
+        assert!(!game(120, None).hides_desktop(false));
+        assert!(!Game::default().hides_desktop(false));
     }
 }

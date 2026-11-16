@@ -135,23 +135,38 @@ fn vdf_value(text: &str, key: &str) -> Option<String> {
     })
 }
 
-/// The game's program: `<installdir>.exe` if present, else the largest .exe in the folder that
-/// is not a crash handler, installer or redistributable.
+/// The game's program: `<installdir>.exe` if present, else the largest .exe that is not a crash
+/// handler, installer or redistributable. The search goes three folders deep, as Serious Sam VR
+/// keeps its program in Bin/x64. A program in a 64-bit folder (x64, Win64) goes first.
 fn find_exe(dir: &Path, installdir: &str) -> Option<PathBuf> {
     let named = dir.join(format!("{installdir}.exe"));
     if named.exists() {
         return Some(named);
     }
     let skip = ["crash", "unins", "setup", "redist", "vcredist", "dxsetup", "launcherhelper", "report"];
-    fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .filter(|e| {
-            let n = e.file_name().to_string_lossy().to_lowercase();
-            n.ends_with(".exe") && !skip.iter().any(|s| n.contains(s))
-        })
-        .max_by_key(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
-        .map(|e| e.path())
+    let mut found = Vec::new();
+    let mut folders = vec![(dir.to_path_buf(), 0)];
+    while let Some((folder, depth)) = folders.pop() {
+        let Ok(entries) = fs::read_dir(&folder) else { continue };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            let path = entry.path();
+            if path.is_dir() {
+                if depth < 3 && !skip.iter().any(|s| name.contains(s)) {
+                    folders.push((path, depth + 1));
+                }
+            } else if name.ends_with(".exe") && !skip.iter().any(|s| name.contains(s)) {
+                let wide = path.components().any(|c| {
+                    let c = c.as_os_str().to_string_lossy().to_lowercase();
+                    c == "x64" || c == "win64"
+                });
+                // the top folder first, then a 64-bit folder, then the largest
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                found.push(((depth == 0, wide, size), path));
+            }
+        }
+    }
+    found.into_iter().max_by_key(|(key, _)| *key).map(|(_, path)| path)
 }
 
 /// A Wine command with cranvr's environment: the prefix, the runtime's control file and the
@@ -292,6 +307,19 @@ mod tests {
         assert_eq!(find_exe(&dir, "Some Game"), Some(dir.join("Game.exe")));
         fs::write(dir.join("Some Game.exe"), b"x").unwrap();
         assert_eq!(find_exe(&dir, "Some Game"), Some(dir.join("Some Game.exe")));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn finds_a_program_in_a_64_bit_subfolder() {
+        // Serious Sam VR: Bin/SamTLH.exe (32-bit) and Bin/x64/SamTLH.exe
+        let dir = std::env::temp_dir().join(format!("cranvr-exe-deep-{}", std::process::id()));
+        fs::create_dir_all(dir.join("Bin/x64")).unwrap();
+        fs::create_dir_all(dir.join("Redist")).unwrap();
+        fs::write(dir.join("Bin/SamTLH.exe"), vec![0u8; 3000]).unwrap();
+        fs::write(dir.join("Bin/x64/SamTLH.exe"), vec![0u8; 2000]).unwrap();
+        fs::write(dir.join("Redist/big.exe"), vec![0u8; 9000]).unwrap();
+        assert_eq!(find_exe(&dir, "Serious Sam VR The Last Hope"), Some(dir.join("Bin/x64/SamTLH.exe")));
         fs::remove_dir_all(&dir).ok();
     }
 
