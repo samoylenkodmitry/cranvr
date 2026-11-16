@@ -333,6 +333,15 @@ pub fn entry_point() {
         let mut session_running = false;
         let mut stream_context = None::<StreamContext>;
         let mut passthrough_layer = None;
+        // cranvr: whether the host's ALVR settings ask for passthrough, and whether the headset
+        // can show the room for cranvr's own room view
+        #[cfg_attr(not(target_os = "android"), allow(unused_assignments))]
+        let mut alvr_passthrough = false;
+        #[cfg_attr(not(target_os = "android"), allow(unused_mut, unused_variables))]
+        let mut passthrough_supported = {
+            let exts = xr_instance.exts();
+            exts.fb_passthrough.is_some() || exts.htc_passthrough.is_some()
+        };
         // cranvr: the desktop as a compositor layer, when cranvr's host sends it
         #[cfg(target_os = "android")]
         let mut desktop_layer =
@@ -479,6 +488,7 @@ pub fn entry_point() {
                         }
                     }
                     ClientCoreEvent::RealTimeConfig(config) => {
+                        alvr_passthrough = config.passthrough.is_some();
                         if config.passthrough.is_some() && passthrough_layer.is_none() {
                             passthrough_layer = PassthroughLayer::new(&xr_session, platform).ok();
                         } else if config.passthrough.is_none() && passthrough_layer.is_some() {
@@ -529,11 +539,8 @@ pub fn entry_point() {
             };
 
             let projection = layer.build();
-            let mut layers: Vec<&xr::CompositionLayerBase<_>> = Vec::with_capacity(3);
-            if let Some(passthrough_layer) = &passthrough_layer {
-                layers.push(passthrough_layer);
-            }
-            layers.push(&projection);
+            #[cfg(target_os = "android")]
+            desktop_layer.set_passthrough(passthrough_supported);
             #[cfg(target_os = "android")]
             if let Some(space) = &stage_space {
                 desktop_layer.frame(&xr_session, &interaction_context.read(), space, frame_state.predicted_display_time);
@@ -544,6 +551,36 @@ pub fn entry_point() {
                 if let Err(e) = xr_session.request_exit() {
                     error!("cranvr: the session does not end: {e}");
                 }
+            }
+            // cranvr: while the screens show, the room can show around them. The passthrough layer
+            // lies under all layers; the eye stream's floor and sky would hide it. The layer lives
+            // only while the room shows or ALVR's settings ask for it: during a game the cameras'
+            // picture would cost the headset for nothing.
+            #[cfg(target_os = "android")]
+            let room = if stage_space.is_some() {
+                let wanted = desktop_layer.shows_room();
+                if wanted && passthrough_layer.is_none() {
+                    passthrough_layer = PassthroughLayer::new(&xr_session, platform)
+                        .map_err(|e| {
+                            error!("cranvr: no passthrough: {e}");
+                            passthrough_supported = false;
+                        })
+                        .ok();
+                } else if !wanted && !alvr_passthrough && passthrough_layer.is_some() {
+                    passthrough_layer = None;
+                }
+                wanted && passthrough_layer.is_some()
+            } else {
+                false
+            };
+            #[cfg(not(target_os = "android"))]
+            let room = false;
+            let mut layers: Vec<&xr::CompositionLayerBase<_>> = Vec::with_capacity(3);
+            if let Some(passthrough_layer) = &passthrough_layer {
+                layers.push(passthrough_layer);
+            }
+            if !room {
+                layers.push(&projection);
             }
             #[cfg(target_os = "android")]
             let (quads, overlay) = match &stage_space {

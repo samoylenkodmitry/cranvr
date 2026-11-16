@@ -73,6 +73,9 @@ pub struct Menu {
     pub msaa: u32,
     pub low_latency: bool,
     pub status: Status,
+    /// Whether the room shows around the screens instead of the floor; None when the headset
+    /// cannot show the room. The Quest app sets it, not the host.
+    pub room: Option<bool>,
 }
 
 impl Menu {
@@ -101,6 +104,7 @@ impl Menu {
                 latency_ms: number(&s["latency_ms"]),
                 game: s["game"].as_str().map(str::to_string),
             },
+            room: None,
         })
     }
 }
@@ -116,6 +120,8 @@ pub enum Action {
     LowLatency(bool),
     /// Closes cranvr's Quest app; the app handles it itself
     Exit,
+    /// Shows the room through the headset's cameras, or the floor; the app handles it itself
+    Room(bool),
 }
 
 impl Action {
@@ -129,6 +135,7 @@ impl Action {
             Action::Msaa(samples) => json!({"action": "set", "msaa": samples}),
             Action::LowLatency(on) => json!({"action": "set", "low_latency": on}),
             Action::Exit => json!({"action": "exit"}),
+            Action::Room(on) => json!({"action": "room", "on": on}),
         }
         .to_string()
     }
@@ -209,6 +216,10 @@ pub fn layout(menu: &Menu) -> (f32, Vec<Item>) {
         }));
         cells
     };
+    if let Some(room) = menu.room {
+        let around = vec![("Room".to_string(), Action::Room(true), room), ("Floor".to_string(), Action::Room(false), !room)];
+        row(BUTTON, setting("Around you", around, 0.1), &mut items);
+    }
     row(BUTTON, setting("Refresh", RATES.iter().map(|&r| (format!("{r} Hz"), Action::Fps(r), menu.fps == r)).collect(), 0.1), &mut items);
     let scales = SCALES.iter().map(|&f| (format!("{:.0}%", f * 100.0), Action::Scale(f), (menu.game_scale - f).abs() < 0.01)).collect();
     row(BUTTON, setting("Game size", scales, 0.072), &mut items);
@@ -219,7 +230,7 @@ pub fn layout(menu: &Menu) -> (f32, Vec<Item>) {
     row(BUTTON, setting("Anti-aliasing", aa, 0.17), &mut items);
     let low = vec![("Low latency".to_string(), Action::LowLatency(!menu.low_latency), menu.low_latency)];
     row(BUTTON, setting("Latency", low, 0.17), &mut items);
-    let (label, kind) = text("A change restarts the stream for a few seconds");
+    let (label, kind) = text("Refresh, game size and latency restart the stream");
     row(TEXT, vec![(inner, label, kind)], &mut items);
     row(BUTTON, vec![(0.2, "Exit cranvr".into(), Kind::Button { action: Action::Exit, selected: false })], &mut items);
 
@@ -269,6 +280,7 @@ mod tests {
             msaa: 2,
             low_latency: false,
             status: Status { refresh: 120.0, fps: 119.4, game_fps: 117.0, latency_ms: Some(46.2), game: Some("Beat Saber.exe".into()) },
+            room: None,
         }
     }
 
@@ -305,6 +317,22 @@ mod tests {
         let exit = items.last().unwrap();
         assert_eq!(exit.kind, Kind::Button { action: Action::Exit, selected: false });
         assert!(exit.center.0 < 0.0 && exit.center.1 < -height / 2.0 + 0.06, "{exit:?}");
+    }
+
+    #[test]
+    fn the_room_row_shows_when_the_headset_can_show_the_room() {
+        let selected = |menu: &Menu| {
+            let (_, items) = layout(menu);
+            items.iter().filter(|i| matches!(i.kind, Kind::Button { selected: true, .. })).map(|i| i.label.clone()).collect::<Vec<_>>()
+        };
+        let mut m = menu();
+        assert!(!layout(&m).1.iter().any(|i| i.label == "Around you"));
+        m.room = Some(true);
+        assert_eq!(selected(&m)[1], "Room");
+        m.room = Some(false);
+        assert_eq!(selected(&m)[1], "Floor");
+        let (height, items) = layout(&m);
+        assert!(items.iter().all(|i| i.center.1 - i.size.1 / 2.0 >= -height / 2.0 - 1e-4), "{height}");
     }
 
     #[test]
