@@ -29,9 +29,12 @@ alvr_system_info = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" 
 openxr = { git = "https://github.com/Ralith/openxrs", rev = "9270509d23dc774b43a8b7289e8adf69fcac6828" }
 # cranvr: the console's menu from the host (src/console.rs)
 serde_json = "1"
-cranpose = { version = "0.23", features = ["framebuffer"] }
+# Cranpose at a main commit: the console's face (framebuffer) and the 3D overlay (renderer-wgpu-gles)
+cranpose = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "b1f6ffbfb4473c1d4b833e2e372a3eeebf7e1f86", features = ["framebuffer", "renderer-wgpu-gles"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
+# cranvr: the 3D overlay's GL device, on Cranpose's wgpu
+wgpu = { package = "cranpose-wgpu", version = "30", default-features = false, features = ["gles", "std", "wgsl"] }
 android-activity = { version = "0.6", features = ["native-activity"] }
 jni = "0.21"
 libc = "0.2"
@@ -40,6 +43,7 @@ ndk-context = "0.1"
 glow = "0.16"
 khronos-egl = { version = "6", features = ["dynamic"] }
 ndk = { version = "0.9", features = ["api-level-26", "media"] }
+pollster = "0.4"
 
 [profile.release]
 debug = false
@@ -48,3 +52,7 @@ strip = true
 # cranvr: ALVR's graphics crate with a shader fix for Mali GPUs (see alvr-graphics-local)
 [patch."https://github.com/alvr-org/ALVR"]
 alvr_graphics = { path = "alvr-graphics-local" }
+
+# cranvr: the wgpu fork that Cranpose's workspace builds from forks/ at the same commit
+[patch.crates-io]
+cranpose-wgpu = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "b1f6ffbfb4473c1d4b833e2e372a3eeebf7e1f86" }

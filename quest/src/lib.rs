@@ -15,6 +15,8 @@ mod interaction;
 mod lobby;
 mod passthrough;
 mod stream;
+#[cfg(target_os = "android")]
+mod xr_scene;
 
 use crate::stream::ParsedStreamConfig;
 use alvr_client_core::{ClientCapabilities, ClientCoreContext, ClientCoreEvent};
@@ -587,9 +589,9 @@ pub fn entry_point() {
                 layers.push(&projection);
             }
             #[cfg(target_os = "android")]
-            let (quads, overlay) = match &stage_space {
-                Some(space) => (desktop_layer.layers(space), desktop_layer.overlay_layer(space)),
-                None => (Vec::new(), None),
+            let (quads, overlay, scene) = match &stage_space {
+                Some(space) => (desktop_layer.layers(space), desktop_layer.overlay_layer(space), desktop_layer.scene_layer(space)),
+                None => (Vec::new(), None, None),
             };
             #[cfg(target_os = "android")]
             for quad in &quads {
@@ -600,6 +602,12 @@ pub fn entry_point() {
             #[cfg(target_os = "android")]
             if let Some(overlay) = &overlay {
                 layers.push(overlay);
+            }
+            #[cfg(target_os = "android")]
+            let scene = scene.as_ref().map(|s| s.build());
+            #[cfg(target_os = "android")]
+            if let Some(scene) = &scene {
+                layers.push(scene);
             }
             #[cfg(target_os = "android")]
             let display_time = if !quads.is_empty() && desktop_layer.vsync_time { vsync_time } else { display_time };

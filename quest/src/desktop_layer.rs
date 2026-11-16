@@ -45,11 +45,11 @@ use crate::{
 };
 use alvr_common::{
     error,
-    glam::{Mat3, Quat, UVec2, Vec3},
+    glam::{Mat3, Mat4, Quat, UVec2, Vec3},
     LEFT_MENU_CLICK_ID, LEFT_THUMBSTICK_Y_ID, LEFT_TRIGGER_VALUE_ID, RIGHT_THUMBSTICK_CLICK_ID, RIGHT_THUMBSTICK_Y_ID,
     RIGHT_TRIGGER_VALUE_ID,
 };
-use alvr_graphics::{GraphicsContext, OverlayRenderer, OverlayView, SDR_FORMAT_GL};
+use alvr_graphics::{GraphicsContext, OverlayDraw, OverlayRenderer, OverlayShape, OverlayView, SDR_FORMAT_GL};
 use glow::HasContext;
 use ndk::{
     media::media_codec::{
@@ -217,6 +217,12 @@ pub struct DesktopLayer {
     /// A new inset that waits for its first frame
     inset_pending: Option<(u8, Stream, Part)>,
     cursor_swapchain: Option<xr::Swapchain<xr::OpenGlEs>>,
+    /// The overlay's 3D scene, which Cranpose draws
+    scene: Option<crate::xr_scene::XrScene>,
+    /// Whether Cranpose draws the overlay: not with debug.cranvr.overlay=alvr, or once it failed
+    scene_wanted: bool,
+    /// Whether the overlay also draws one shape of each kind (debug.cranvr.xr_probe)
+    overlay_probe: bool,
     settings: Option<xr::sys::CompositionLayerSettingsFB>,
     last_log: Instant,
     /// Frames with the layer go to the compositor with the time of the coming refresh. The
@@ -289,6 +295,9 @@ impl DesktopLayer {
             inset: None,
             inset_pending: None,
             cursor_swapchain,
+            scene: None,
+            scene_wanted: !property::get("overlay").is_some_and(|v| v == "alvr"),
+            overlay_probe: property::get("xr_probe").is_some_and(|v| !v.is_empty()),
             settings,
             last_log: Instant::now(),
             vsync_time,
@@ -588,12 +597,31 @@ impl DesktopLayer {
             self.pointer_seq = self.pointer_seq.wrapping_add(1);
         }
 
+        let mut draws = self.control.draws();
+        if self.overlay_probe {
+            draws.extend(overlay_probe(crate::from_xr_pose(views[0].pose)));
+        }
+        // Cranpose draws the overlay; ALVR's renderer stays for debug.cranvr.overlay=alvr and for
+        // a scene that fails to start
+        if self.scene_wanted && self.scene.is_none() {
+            let eye = (self.view_resolution.as_vec2() * OVERLAY_SCALE).as_uvec2();
+            self.scene = crate::xr_scene::XrScene::new(session, &self.gfx, eye).map_err(|e| error!("cranvr xr scene: {e}")).ok();
+            self.scene_wanted = self.scene.is_some();
+        }
+        if let Some(scene) = &mut self.scene {
+            if scene.running() {
+                scene.frame(&views, &draws);
+                return;
+            }
+            info!("cranvr xr scene: stopped; ALVR's renderer draws the overlay");
+            self.scene = None;
+            self.scene_wanted = false;
+        }
         if self.overlay.is_none() {
             self.overlay = self.create_overlay(session).map_err(|e| error!("cranvr overlay: {e}")).ok();
         }
         let Some(overlay) = &mut self.overlay else { return };
         self.gfx.make_current();
-        let draws = self.control.draws();
         let mut indices = [0u32; 2];
         for (index, swapchain) in indices.iter_mut().zip(overlay.swapchains.iter_mut()) {
             let Ok(i) = swapchain.acquire_image() else { return };
@@ -621,6 +649,11 @@ impl DesktopLayer {
         let renderer = OverlayRenderer::new(Rc::clone(&self.gfx), resolution, textures);
         info!("cranvr overlay: {}x{} per eye", resolution.x, resolution.y);
         Ok(Overlay { swapchains, renderer, resolution })
+    }
+
+    /// The overlay's layer when Cranpose draws it.
+    pub fn scene_layer<'a>(&'a self, space: &'a xr::Space) -> Option<ProjectionLayerBuilder<'a>> {
+        self.scene.as_ref()?.layer(space)
     }
 
     /// The overlay with the controllers, their rays and the handle, over all other layers.
@@ -764,6 +797,26 @@ impl DesktopLayer {
 }
 
 /// Requests from a list such as "add,quality:0:1,pause:1:1,close:1".
+/// One shape of each kind that the overlay draws, in front of the head: a controller, a ray, the
+/// point on a screen and a corner. A headset on the desk tracks no controllers, so a test sets
+/// `debug.cranvr.xr_probe` to compare the two overlay renderers.
+fn overlay_probe(head: alvr_common::Pose) -> [OverlayDraw; 7] {
+    let at = |x: f32, y: f32, z: f32| head.position + head.orientation * Vec3::new(x, y, z);
+    let place = |scale: Vec3, x: f32, y: f32, z: f32| Mat4::from_scale_rotation_translation(scale, head.orientation, at(x, y, z));
+    let flat = |width: f32, height: f32, fade| OverlayShape::RoundRect { width, height, radius: width.min(height) / 2.0, fade };
+    let draw = |shape, model, color| OverlayDraw { shape, model, color };
+    let body = [0.17, 0.18, 0.2, 1.0];
+    [
+        draw(OverlayShape::Cylinder, place(Vec3::new(0.032, 0.032, 0.085), 0.08, -0.12, -0.35), body),
+        draw(OverlayShape::Sphere, place(Vec3::splat(0.032), 0.08, -0.12, -0.39), body),
+        draw(OverlayShape::Sphere, place(Vec3::new(0.06, 0.032, 0.07), -0.08, -0.12, -0.35), [0.24, 0.25, 0.28, 1.0]),
+        draw(flat(0.004, 0.5, 0.6), place(Vec3::ONE, 0.0, 0.05, -0.6), [1.0, 1.0, 1.0, 0.8]),
+        draw(flat(0.018, 0.018, 0.0), place(Vec3::ONE, 0.12, 0.05, -0.6), [0.0, 0.0, 0.0, 0.5]),
+        draw(flat(0.012, 0.012, 0.0), place(Vec3::ONE, 0.12, 0.05, -0.599), [1.0, 1.0, 1.0, 0.95]),
+        draw(flat(0.06, 0.008, 0.0), place(Vec3::ONE, -0.15, 0.05, -0.6), [0.75, 0.77, 0.8, 0.45]),
+    ]
+}
+
 fn test_commands(text: &str) -> Vec<Command> {
     text.split(',')
         .filter_map(|item| {
