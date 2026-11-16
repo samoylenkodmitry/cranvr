@@ -52,8 +52,10 @@ use alvr_common::{
 use alvr_graphics::{GraphicsContext, OverlayDraw, OverlayRenderer, OverlayShape, OverlayView, SDR_FORMAT_GL};
 use glow::HasContext;
 use ndk::{
-    media::media_codec::{
-        DequeuedInputBufferResult, DequeuedOutputBufferInfoResult, MediaCodec, MediaCodecDirection, MediaFormat,
+    hardware_buffer::HardwareBufferUsage,
+    media::{
+        image_reader::{ImageFormat, ImageReader},
+        media_codec::{DequeuedInputBufferResult, DequeuedOutputBufferInfoResult, MediaCodec, MediaCodecDirection, MediaFormat},
     },
     native_window::NativeWindow,
 };
@@ -83,6 +85,8 @@ const PANEL_FILE: &str = "/sdcard/Android/data/dev.cranvr.client/files/panels.tx
 /// The overlay's size as a share of the eye's recommended size. Below 1 the compositor scales
 /// the overlay up, and its edges turn to stairs.
 const OVERLAY_SCALE: f32 = 1.0;
+/// The gap between the first panel and its mirror, in meters
+const MIRROR_GAP: f32 = 0.1;
 const VERSION: u32 = 2;
 
 const MSG_HELLO: u8 = 0;
@@ -153,6 +157,13 @@ struct Shared {
     cursor: Mutex<Option<(u8, f32, f32, bool, Instant)>>,
     /// Frames decoded since the last log line
     decoded: AtomicU32,
+    /// Whether the first panel's frames also go to a second decoder, for a mirror of the panel in
+    /// the overlay's scene (debug.cranvr.mirror)
+    mirror: AtomicBool,
+    /// A new stream of the first panel for the mirror's decoder
+    mirror_config: Mutex<Option<NewStream>>,
+    /// Frames that the mirror's decoder decoded since the last log line
+    mirror_decoded: AtomicU32,
     /// The host's newest menu for the console, not taken yet
     menu: Mutex<Option<Vec<u8>>>,
 }
@@ -223,6 +234,8 @@ pub struct DesktopLayer {
     scene_wanted: bool,
     /// Whether the overlay also draws one shape of each kind (debug.cranvr.xr_probe)
     overlay_probe: bool,
+    /// The first panel's mirror in the overlay's scene (debug.cranvr.mirror)
+    mirror: Option<crate::mirror::Mirror>,
     settings: Option<xr::sys::CompositionLayerSettingsFB>,
     last_log: Instant,
     /// Frames with the layer go to the compositor with the time of the coming refresh. The
@@ -252,6 +265,7 @@ impl DesktopLayer {
         }));
         // A stream that came before this session needs a new surface
         shared.connected.store(false, Ordering::Relaxed);
+        shared.mirror.store(property::get("mirror").is_some_and(|v| v == "1"), Ordering::Relaxed);
         let flags = property::get("layer_flags").unwrap_or_else(|| "ss,sharp".into());
         let mut bits = 0u64;
         if flags.contains("ss") {
@@ -298,6 +312,7 @@ impl DesktopLayer {
             scene: None,
             scene_wanted: !property::get("overlay").is_some_and(|v| v == "alvr"),
             overlay_probe: property::get("xr_probe").is_some_and(|v| !v.is_empty()),
+            mirror: None,
             settings,
             last_log: Instant::now(),
             vsync_time,
@@ -313,6 +328,17 @@ impl DesktopLayer {
             self.host_states.clear();
             self.inset = None;
             self.inset_pending = None;
+            self.mirror = None;
+        }
+        let mirror_config = self.shared.mirror_config.lock().unwrap().take();
+        if let Some((_, size, frames)) = mirror_config {
+            match mirror_decoder(size, frames, Arc::clone(&self.shared)).and_then(|reader| crate::mirror::Mirror::new(&self.gfx, reader, size)) {
+                Ok(mirror) => {
+                    info!("cranvr mirror: {}x{}", size.0, size.1);
+                    self.mirror = Some(mirror);
+                }
+                Err(e) => error!("cranvr mirror: {e}"),
+            }
         }
         let configs: Vec<NewStream> = self.shared.config.lock().unwrap().drain(..).collect();
         for (id, size, frames) in configs {
@@ -364,11 +390,14 @@ impl DesktopLayer {
         }
         if self.last_log.elapsed() > Duration::from_secs(5) {
             let decoded = self.shared.decoded.swap(0, Ordering::Relaxed);
+            let mirrored = self.shared.mirror_decoded.swap(0, Ordering::Relaxed);
             if !self.streams.is_empty() {
+                let seconds = self.last_log.elapsed().as_secs_f32();
                 info!(
-                    "cranvr desktop layer: {} panels, {:.1} frames per second decoded",
+                    "cranvr desktop layer: {} panels, {:.1} frames per second decoded, {:.1} for the mirror",
                     self.streams.len(),
-                    decoded as f32 / self.last_log.elapsed().as_secs_f32()
+                    decoded as f32 / seconds,
+                    mirrored as f32 / seconds
                 );
             }
             self.last_log = Instant::now();
@@ -611,9 +640,22 @@ impl DesktopLayer {
             self.scene = crate::xr_scene::XrScene::new(session, &self.gfx, eye, &views).map_err(|e| error!("cranvr xr scene: {e}")).ok();
             self.scene_wanted = self.scene.is_some();
         }
+        // The mirror stands left of the first panel, as large and turned the same way
+        let mirror = self.mirror.as_mut().map(|mirror| {
+            let frame = mirror.next(&self.gfx);
+            let panel = self.control.panels().find(|(id, _)| *id == 0).map(|(_, p)| p);
+            crate::xr_scene::MirrorJob {
+                frame,
+                surface: panel.map(|p| {
+                    let center = p.center - p.right() * (p.width + MIRROR_GAP);
+                    (Mat4::from_rotation_translation(p.orientation, center), (p.width, p.height))
+                }),
+                size: mirror.size(),
+            }
+        });
         if let Some(scene) = &mut self.scene {
             if scene.running() {
-                scene.frame(&views, &draws);
+                scene.frame(&views, &draws, mirror);
                 return;
             }
             info!("cranvr xr scene: stopped; ALVR's renderer draws the overlay");
@@ -909,6 +951,7 @@ fn serve(mut stream: TcpStream, shared: &Shared) -> std::io::Result<()> {
     shared.visible.store(true, Ordering::Relaxed);
     let mut frames: HashMap<u8, mpsc::Sender<Frame>> = HashMap::new();
     let mut inset_frames: Option<mpsc::Sender<Frame>> = None;
+    let mut mirror_frames: Option<mpsc::Sender<Frame>> = None;
     loop {
         let mut header = [0u8; 5];
         stream.read_exact(&mut header)?;
@@ -923,9 +966,17 @@ fn serve(mut stream: TcpStream, shared: &Shared) -> std::io::Result<()> {
                 let (sender, receiver) = mpsc::channel();
                 frames.insert(id, sender);
                 shared.config.lock().unwrap().push((id, (width, height), receiver));
+                if id == 0 && shared.mirror.load(Ordering::Relaxed) {
+                    let (sender, receiver) = mpsc::channel();
+                    mirror_frames = Some(sender);
+                    *shared.mirror_config.lock().unwrap() = Some((id, (width, height), receiver));
+                }
             }
             MSG_FRAME if len > 10 => {
                 let timestamp_ns = u64::from_le_bytes(payload[1..9].try_into().unwrap());
+                if let (0, Some(sender)) = (payload[0], &mirror_frames) {
+                    sender.send(Frame { timestamp_ns, data: payload[10..].to_vec(), part: None }).ok();
+                }
                 if let Some(sender) = frames.get(&payload[0]) {
                     sender.send(Frame { timestamp_ns, data: payload[10..].to_vec(), part: None }).ok();
                 }
@@ -1037,15 +1088,44 @@ fn surface_decoder(
         .name("desktop-decode".into())
         .spawn(move || {
             let _window = window;
-            decode_loop(codec, frames, &shared, &ready, part)
+            decode_loop(codec, frames, &shared.decoded, &ready, part)
         })
         .map_err(|e| e.to_string())?;
     Ok(swapchain)
 }
 
+/// A second decoder of the first panel's frames, which writes into an image reader. Its pictures
+/// are buffers that the app can draw from, while the panel's own decoder writes into a surface
+/// that only the compositor reads.
+fn mirror_decoder((width, height): (u32, u32), frames: mpsc::Receiver<Frame>, shared: Arc<Shared>) -> Result<ImageReader, String> {
+    let reader = ImageReader::new_with_usage(width as i32, height as i32, ImageFormat::PRIVATE, HardwareBufferUsage::GPU_SAMPLED_IMAGE, 4)
+        .map_err(|e| format!("mirror image reader: {e}"))?;
+    let window = reader.window().map_err(|e| format!("mirror window: {e}"))?;
+    let codec = MediaCodec::from_decoder_type("video/hevc").ok_or("no HEVC decoder for the mirror")?;
+    let mut format = MediaFormat::new();
+    format.set_str("mime", "video/hevc");
+    format.set_i32("width", width as i32);
+    format.set_i32("height", height as i32);
+    format.set_i32("low-latency", 1);
+    format.set_i32("priority", 1);
+    codec
+        .configure(&format, Some(&window), MediaCodecDirection::Decoder)
+        .map_err(|e| format!("mirror decoder configure: {e}"))?;
+    codec.start().map_err(|e| format!("mirror decoder start: {e}"))?;
+    let codec = SendCodec(codec);
+    thread::Builder::new()
+        .name("mirror-decode".into())
+        .spawn(move || {
+            let _window = window;
+            decode_loop(codec, frames, &shared.mirror_decoded, &AtomicBool::new(false), None)
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(reader)
+}
+
 /// Feeds the frames to the decoder and shows every decoded picture at once. Ends when the frame
 /// channel closes, at a new stream or when the host leaves.
-fn decode_loop(codec: SendCodec, frames: mpsc::Receiver<Frame>, shared: &Shared, ready: &AtomicBool, part: Option<Part>) {
+fn decode_loop(codec: SendCodec, frames: mpsc::Receiver<Frame>, decoded: &AtomicU32, ready: &AtomicBool, part: Option<Part>) {
     // The parts of the frames in the decoder, by presentation time: the inset shows the part of
     // the frame that the surface shows
     let mut parts: std::collections::VecDeque<(i64, [f32; 4])> = std::collections::VecDeque::new();
@@ -1095,7 +1175,7 @@ fn decode_loop(codec: SendCodec, frames: mpsc::Receiver<Frame>, shared: &Shared,
                     if let Err(e) = codec.release_output_buffer(buffer, true) {
                         error!("cranvr desktop layer: decoder output: {e}");
                     }
-                    shared.decoded.fetch_add(1, Ordering::Relaxed);
+                    decoded.fetch_add(1, Ordering::Relaxed);
                     ready.store(true, Ordering::Relaxed);
                 }
                 Ok(DequeuedOutputBufferInfoResult::TryAgainLater) => break,

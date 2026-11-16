@@ -21,7 +21,7 @@ use alvr_common::{error, info};
 use glow::HasContext;
 use alvr_graphics::{GraphicsContext, OverlayDraw, OverlayShape};
 use cranpose::prelude::*;
-use cranpose::{GpuContext, GuestView};
+use cranpose::{ExternalFrames, GpuContext, GuestView};
 use cranpose::space::{Camera, Light, Mat4, Material, Mesh, MeshSurface, Scene3d, Vec3};
 use khronos_egl as egl;
 use openxr as xr;
@@ -98,6 +98,70 @@ fn cylinder() -> Mesh {
         }
     }
     Mesh::new(positions, uvs, Some(normals), indices).unwrap_or_else(|_| Mesh::cuboid())
+}
+
+/// The mirror's curved surface: its mesh, made for its size in meters, and its content's size in
+/// pixels. The same surfaces are equal.
+#[derive(Clone)]
+struct MirrorSurface {
+    mesh: Arc<Mesh>,
+    meters: (f32, f32),
+    content: (f32, f32),
+}
+
+impl PartialEq for MirrorSurface {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.mesh, &other.mesh)
+    }
+}
+
+/// The widest content of the mirror in pixels. The surface covers about 750 pixels of an eye at
+/// a meter and a half, so more pixels would only shimmer.
+const MIRROR_CONTENT_WIDTH: f32 = 1920.0;
+
+/// A screen of `width` by `height` meters bent into an S: across it the surface goes one full
+/// sine wave forward and back by `depth`. The picture's top left corner is at u, v = 0, 0.
+/// OpenXR's axes: x right, y up, z toward the viewer.
+fn s_surface(width: f32, height: f32, depth: f32) -> Result<Mesh, String> {
+    const COLUMNS: u32 = 64;
+    let (mut positions, mut uvs, mut normals, mut indices) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for i in 0..=COLUMNS {
+        let u = i as f32 / COLUMNS as f32;
+        let angle = u * std::f32::consts::TAU;
+        let (x, z) = ((u - 0.5) * width, depth * angle.sin());
+        // The surface's slope across, dz/dx, turns its normal
+        let slope = depth * std::f32::consts::TAU / width * angle.cos();
+        let length = (1.0 + slope * slope).sqrt();
+        for (y, v) in [(height / 2.0, 0.0), (-height / 2.0, 1.0)] {
+            positions.push([x, y, z]);
+            uvs.push([u, v]);
+            normals.push([-slope / length, 0.0, 1.0 / length]);
+        }
+    }
+    for i in 0..COLUMNS {
+        let (a, b, c, d) = (2 * i, 2 * i + 1, 2 * i + 2, 2 * i + 3);
+        indices.extend([a, b, c, b, d, c]);
+    }
+    Mesh::new(positions, uvs, Some(normals), indices).map_err(|e| format!("{e:?}"))
+}
+
+#[composable]
+fn Mirror(bitmap: ImageBitmap, surface: MirrorSurface, place: MutableState<Option<[[f32; 4]; 4]>>) {
+    let mesh = Arc::clone(&surface.mesh);
+    let (width, height) = surface.content;
+    Box(
+        Modifier::empty().required_size(Size { width, height }).mesh_surface(move || MeshSurface {
+            mesh: Arc::clone(&mesh),
+            transform: Mat4::from_rows(place.with(|p| p.unwrap_or(Mat4::default().rows()))),
+            material: Material::Unlit,
+            casts_shadow: false,
+            solid: false,
+        }),
+        BoxSpec::default(),
+        move || {
+            Image(bitmap.clone(), None, Modifier::empty().fill_max_size(), Alignment::CENTER, ContentScale::FillBounds, 1.0, None);
+        },
+    );
 }
 
 /// What a shape of the overlay looks like; its place comes apart, as it changes every frame.
@@ -182,6 +246,14 @@ fn Solid(index: usize, shape: Shape, places: MutableState<Vec<[[f32; 4]; 4]>>, m
     Box(surface, BoxSpec::default(), || {});
 }
 
+/// The mirror's states: its newest picture, its surface and where the surface stands.
+#[derive(Clone, Copy, PartialEq)]
+struct MirrorStates {
+    bitmap: MutableState<Option<ImageBitmap>>,
+    surface: MutableState<Option<MirrorSurface>>,
+    place: MutableState<Option<[[f32; 4]; 4]>>,
+}
+
 /// The eyes that the scene shows.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Eyes {
@@ -198,6 +270,7 @@ fn light() -> Light {
 fn Scene(
     eyes: MutableState<Eyes>,
     boxes: MutableState<[(f32, f32); 2]>,
+    mirror: MirrorStates,
     shapes: MutableState<Vec<Shape>>,
     places: MutableState<Vec<[[f32; 4]; 4]>>,
     cell: (f32, f32),
@@ -227,6 +300,9 @@ fn Scene(
                                 let meshes = meshes.clone();
                                 key(index, move || Solid(index, shape, places, meshes.clone()));
                             }
+                            if let (Some(bitmap), Some(surface)) = (mirror.bitmap.get(), mirror.surface.get()) {
+                                key(usize::MAX, move || Mirror(bitmap.clone(), surface.clone(), mirror.place));
+                            }
                         },
                     );
                 });
@@ -241,6 +317,18 @@ struct Job {
     views: [xr::View; 2],
     shapes: Vec<Shape>,
     places: Vec<[[f32; 4]; 4]>,
+    mirror: Option<MirrorJob>,
+}
+
+/// What the scene needs of the first panel's mirror this frame.
+pub struct MirrorJob {
+    /// A new picture, when the mirror's decoder had one
+    pub frame: Option<crate::mirror::MirrorFrame>,
+    /// Where the curved surface stands, in the stage's space and in meters, and its width and
+    /// height; `None` while the first panel is not on show
+    pub surface: Option<(GMat4, (f32, f32))>,
+    /// The size of the mirror's pictures, in pixels
+    pub size: (u32, u32),
 }
 
 /// A finished frame: the fence after Cranpose's GL commands, or `None` when it saw no change and
@@ -345,7 +433,7 @@ impl XrScene {
 
     /// Acquires an image and hands it to the scene's thread with this frame's eyes and the
     /// overlay's draws. A frame whose image the scene has not finished starts no new one.
-    pub fn frame(&mut self, views: &[xr::View], draws: &[OverlayDraw]) {
+    pub fn frame(&mut self, views: &[xr::View], draws: &[OverlayDraw], mirror: Option<MirrorJob>) {
         self.in_view = true;
         let (Some(jobs), [left, right, ..]) = (&self.jobs, views) else { return };
         if self.drawing.is_some() {
@@ -365,7 +453,7 @@ impl XrScene {
         };
         let (shapes, places) = shapes(draws);
         let views = [*left, *right];
-        if jobs.send(Job { image, views, shapes, places }).is_ok() {
+        if jobs.send(Job { image, views, shapes, places, mirror }).is_ok() {
             self.drawing = Some((image, views));
         }
     }
@@ -469,6 +557,48 @@ struct Stats {
     waited: Duration,
 }
 
+/// A GL texture of the share group as a wgpu texture. wgpu leaves the texture to its owner.
+fn wrap_gl_texture(
+    device: &wgpu::Device,
+    name: u32,
+    size: wgpu::Extent3d,
+    format: wgpu::TextureFormat,
+    usage: wgpu::TextureUsages,
+) -> Result<wgpu::Texture, String> {
+    let uses = if usage.contains(wgpu::TextureUsages::RENDER_ATTACHMENT) {
+        wgpu::wgt::TextureUses::COLOR_TARGET
+    } else {
+        wgpu::wgt::TextureUses::COPY_SRC
+    };
+    let hal_desc = wgpu::hal::TextureDescriptor {
+        label: Some("xr scene gl texture"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: uses,
+        memory_flags: wgpu::hal::MemoryFlags::empty(),
+        view_formats: Vec::new(),
+    };
+    let desc = wgpu::TextureDescriptor {
+        label: Some("xr scene gl texture"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage,
+        view_formats: &[],
+    };
+    unsafe {
+        let hal_device = device.as_hal::<wgpu::hal::api::Gles>().ok_or("not a GL device")?;
+        let raw = hal_device.texture_from_raw(NonZeroU32::new(name).ok_or("no texture")?, &hal_desc, Some(Box::new(|| {})));
+        drop(hal_device);
+        Ok(device.create_texture_from_hal::<wgpu::hal::api::Gles>(raw, &desc, wgpu::wgt::TextureUses::UNINITIALIZED))
+    }
+}
+
 fn run(share: Share, images: Vec<u32>, eye: UVec2, flip: bool, jobs: Receiver<Job>, done: Sender<Done>) -> Result<(), String> {
     let start = Instant::now();
     let egl = unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required() }.map_err(|e| e.to_string())?;
@@ -504,33 +634,7 @@ fn run(share: Share, images: Vec<u32>, eye: UVec2, flip: bool, jobs: Receiver<Jo
     let textures: Vec<(wgpu::Texture, wgpu::TextureView)> = images
         .iter()
         .map(|&name| {
-            let hal_desc = wgpu::hal::TextureDescriptor {
-                label: Some("xr scene image"),
-                size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: FORMAT,
-                usage: wgpu::wgt::TextureUses::COLOR_TARGET,
-                memory_flags: wgpu::hal::MemoryFlags::empty(),
-                view_formats: Vec::new(),
-            };
-            let desc = wgpu::TextureDescriptor {
-                label: Some("xr scene image"),
-                size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                view_formats: &[],
-            };
-            let texture = unsafe {
-                let hal_device = device.as_hal::<wgpu::hal::api::Gles>().ok_or("not a GL device")?;
-                let raw = hal_device.texture_from_raw(NonZeroU32::new(name).ok_or("no texture")?, &hal_desc, Some(Box::new(|| {})));
-                drop(hal_device);
-                device.create_texture_from_hal::<wgpu::hal::api::Gles>(raw, &desc, wgpu::wgt::TextureUses::UNINITIALIZED)
-            };
+            let texture = wrap_gl_texture(&device, name, size, FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT)?;
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             Ok::<_, String>((texture, view))
         })
@@ -546,12 +650,21 @@ fn run(share: Share, images: Vec<u32>, eye: UVec2, flip: bool, jobs: Receiver<Jo
         let shapes = remember(|| mutableStateOf(Vec::<Shape>::new())).with(|state| *state);
         let places = remember(|| mutableStateOf(Vec::<[[f32; 4]; 4]>::new())).with(|state| *state);
         let boxes = remember(|| mutableStateOf([cell; 2])).with(|state| *state);
-        held.set(Some((eyes, boxes, shapes, places)));
-        Scene(eyes, boxes, shapes, places, cell, flip, meshes.clone());
+        let mirror = MirrorStates {
+            bitmap: remember(|| mutableStateOf(None::<ImageBitmap>)).with(|state| *state),
+            surface: remember(|| mutableStateOf(None::<MirrorSurface>)).with(|state| *state),
+            place: remember(|| mutableStateOf(None::<[[f32; 4]; 4]>)).with(|state| *state),
+        };
+        held.set(Some((eyes, boxes, mirror, shapes, places)));
+        Scene(eyes, boxes, mirror, shapes, places, cell, flip, meshes.clone());
     })
     .map_err(|e| format!("guest view: {e}"))?;
     guest.shell().renderer().set_transparent_background(true);
-    let (eyes, boxes, shapes, places) = states.get().ok_or("the scene did not compose")?;
+    let (eyes, boxes, mirror, shapes, places) = states.get().ok_or("the scene did not compose")?;
+    let external = ExternalFrames::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureUsages::COPY_DST, true);
+    let writer = external.writer();
+    // The mirror's texture as wgpu sees it, with its GL name and size
+    let mut mirror_source: Option<((u32, (u32, u32)), wgpu::Texture)> = None;
     crate::flat::log::line(&format!("cranvr xr scene: ready in {:?}, {}x{}, flip {flip}", start.elapsed(), size.width, size.height));
 
     let gl = unsafe { glow::Context::from_loader_function(|name| lookup(name)) };
@@ -559,6 +672,57 @@ fn run(share: Share, images: Vec<u32>, eye: UVec2, flip: bool, jobs: Receiver<Jo
         eyes.set(Eyes { eyes: Some([Eye::of(&job.views[0]), Eye::of(&job.views[1])]) });
         // The same boxes as the layer's, from the same views
         boxes.set(job.views.map(|view| fitted(view.fov, eye).as_vec2().into()));
+        if let Some(job_mirror) = job.mirror.take() {
+            if let Some(frame) = job_mirror.frame {
+                unsafe {
+                    let fence = glow::NativeFence(frame.fence as *mut _);
+                    gl.wait_sync(fence, 0, glow::TIMEOUT_IGNORED);
+                    gl.delete_sync(fence);
+                }
+                let key = (frame.texture, frame.size);
+                let source = match &mirror_source {
+                    Some((known, texture)) if *known == key => Some(texture.clone()),
+                    _ => {
+                        let extent = wgpu::Extent3d { width: frame.size.0, height: frame.size.1, depth_or_array_layers: 1 };
+                        match wrap_gl_texture(&device, frame.texture, extent, wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureUsages::COPY_SRC) {
+                            Ok(texture) => {
+                                mirror_source = Some((key, texture.clone()));
+                                Some(texture)
+                            }
+                            Err(e) => {
+                                error!("cranvr mirror: {e}");
+                                None
+                            }
+                        }
+                    }
+                };
+                external.set_size(frame.size.0, frame.size.1);
+                if let (Some(source), Some(target)) = (source, writer.begin()) {
+                    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("mirror copy") });
+                    let extent = wgpu::Extent3d { width: frame.size.0, height: frame.size.1, depth_or_array_layers: 1 };
+                    encoder.copy_texture_to_texture(source.as_image_copy(), target.texture().as_image_copy(), extent);
+                    gpu.queue.submit([encoder.finish()]);
+                    writer.publish(target.number());
+                }
+                if let Some(bitmap) = external.next_frame() {
+                    mirror.bitmap.set(Some(bitmap));
+                }
+            }
+            match job_mirror.surface {
+                Some((model, meters)) => {
+                    mirror.place.set(Some(scene_transform(&model)));
+                    let (width, height) = job_mirror.size;
+                    let content = (MIRROR_CONTENT_WIDTH, MIRROR_CONTENT_WIDTH * height as f32 / width.max(1) as f32);
+                    if mirror.surface.with(|s| s.as_ref().map(|s| (s.meters, s.content))) != Some((meters, content)) {
+                        match s_surface(meters.0, meters.1, meters.0 * 0.08) {
+                            Ok(mesh) => mirror.surface.set(Some(MirrorSurface { mesh: Arc::new(mesh), meters, content })),
+                            Err(e) => error!("cranvr mirror: the surface's mesh: {e}"),
+                        }
+                    }
+                }
+                None => mirror.surface.set(None),
+            }
+        }
         shapes.set(std::mem::take(&mut job.shapes));
         places.set(std::mem::take(&mut job.places));
         let (texture, view) = &textures[job.image as usize];
