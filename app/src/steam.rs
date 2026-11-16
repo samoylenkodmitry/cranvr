@@ -182,7 +182,21 @@ pub fn wine(program: &str) -> Command {
 fn game_wine(program: &str) -> Command {
     let mut command = wine(program);
     command.env("DXMT_SKIP_PRESENT", "1");
+    if one_draw_per_eye(program) {
+        command.env("BASALT_MAX_ARRAY_SIZE", "1");
+    }
     command
+}
+
+/// Games that need one draw per eye: they render both eyes in one pass into a two-slice
+/// swapchain, and DXMT leaves the second slice empty, so the right eye stays black. With
+/// BASALT_MAX_ARRAY_SIZE=1 (cranvr's runtime patch 0003) the runtime rejects such swapchains
+/// and Unity draws each eye apart. SUPERHOT VR then showed both eyes at about 82 frames a
+/// second instead of 119.
+fn one_draw_per_eye(program: &str) -> bool {
+    const GAMES: [&str; 1] = ["superhot_vr.exe"];
+    let file = program.rsplit(['\\', '/']).next().unwrap_or(program).to_lowercase();
+    GAMES.contains(&file.as_str())
 }
 
 fn wine_with(program: &str, msaa_limit: u32) -> Command {
@@ -317,6 +331,12 @@ mod tests {
         fs::write(dir.join("Some Game.exe"), b"x").unwrap();
         assert_eq!(find_exe(&dir, "Some Game"), Some(dir.join("Some Game.exe")));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn superhot_gets_one_draw_per_eye() {
+        assert!(one_draw_per_eye("C:\\Program Files (x86)\\Steam\\steamapps\\common\\SUPERHOT VR\\SUPERHOT_VR.exe"));
+        assert!(!one_draw_per_eye("C:\\Program Files (x86)\\Steam\\steamapps\\common\\Beat Saber\\Beat Saber.exe"));
     }
 
     #[test]

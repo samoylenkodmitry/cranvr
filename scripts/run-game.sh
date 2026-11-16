@@ -29,12 +29,14 @@ home=${CRANVR_HOME:-$HOME/Library/Application Support/cranvr}
 wine_root=${home}/wine/engine
 control=${CRANVR_CONTROL:-${home}/runtime-control.txt}
 mute=false
+steam=false
 if [[ ${1:-} == --mute ]]; then
     mute=true
     shift
 fi
 # --steam: Steam with the flags its web helper shim needs (see setup-steam.sh)
 if [[ ${1:-} == --steam ]]; then
+    steam=true
     shift
     set -- 'C:\Program Files (x86)\Steam\steam.exe' -inhibitbootstrap -noverifyfiles -no-cef-sandbox "$@"
 fi
@@ -55,9 +57,11 @@ export WINEPREFIX=${home}/wine/prefix WINEARCH=win64 WINEDEBUG=${WINEDEBUG:--all
 # The runtime reads the control file through Wine's Z: drive, which maps the Mac's root
 export BASALT_CONTROL="Z:${control//\//\\}"
 export DXMT_BASALT_IOSURFACE=1
-# The game's mirror window on the Mac stays empty and costs no GPU time (DXMT patch 0008);
-# CRANVR_MAC_MIRROR=1 draws it
-[[ ${CRANVR_MAC_MIRROR:-0} == 1 ]] || export DXMT_SKIP_PRESENT=1
+# A game's mirror window on the Mac stays empty and costs no GPU time (DXMT patch 0008);
+# CRANVR_MAC_MIRROR=1 draws it. Steam's own window draws with DXMT too, so it keeps drawing.
+if ! ${steam} && [[ ${CRANVR_MAC_MIRROR:-0} != 1 ]]; then
+    export DXMT_SKIP_PRESENT=1
+fi
 # Games may use at most this many MSAA samples (cranvr's DXMT patch 0006): CRANVR_MAX_MSAA, else
 # the app's setting, else 2. 0 leaves it to the game.
 msaa=${CRANVR_MAX_MSAA:-}
@@ -92,5 +96,11 @@ if [[ ${dir} == */steamapps/common/* ]]; then
         print "Steam app ${app_id} (${installdir})"
     fi
 fi
+# Games that render both eyes in one pass into a two-slice swapchain show a black right eye:
+# DXMT leaves the second slice empty. The runtime then rejects such swapchains (cranvr's runtime
+# patch 0003) and Unity draws each eye apart. Keep this list in step with the app's steam.rs.
+case ${program:l} in
+    *\\superhot_vr.exe) export BASALT_MAX_ARRAY_SIZE=1 ;;
+esac
 export MVK_CONFIG_LOG_LEVEL=0
 exec "${wine_root}/bin/wine" "${program}" "$@"

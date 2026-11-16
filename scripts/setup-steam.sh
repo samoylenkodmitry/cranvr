@@ -107,7 +107,16 @@ fi
 "${wine_root}/bin/wineserver" -k 2>/dev/null || true
 backup=${helper:r}.basalt-original.exe
 if ! cmp -s "${helper}" "${shim}"; then
-    cp "${helper}" "${backup}"
+    # Only Valve's helper goes to the backup, which the shim starts. After a rebuild of BasaltVR the
+    # installed helper is an older shim: a copy of it over the backup would leave Steam without
+    # Valve's helper.
+    if LC_ALL=C grep -q -a "Valve Corp" "${helper}"; then
+        cp "${helper}" "${backup}"
+    elif [[ ! -f ${backup} ]]; then
+        print -u2 "FAIL: ${helper:t} is not Valve's helper and no backup of Valve's helper exists."
+        print -u2 "      Let Steam repair its files (start it once without the shim), then run this again."
+        exit 1
+    fi
     cp "${shim}" "${helper}"
     print "Installed the web helper shim in ${helper:h:t}"
 fi

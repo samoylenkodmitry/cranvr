@@ -57,8 +57,9 @@ mod msg {
 pub struct GameView {
     pub swapchain: u64,
     pub image: u32,
-    /// The layer of an array swapchain: a game that renders both eyes in one pass ("single pass
-    /// instanced") draws each eye into its own layer of one image
+    /// The layer of an array swapchain. The runtime copies each layer into a surface of its own
+    /// and sends the surface's place in `image` (image × layers + layer, BasaltVR's
+    /// prepareSwapchainViewForExport), with the layer 0.
     pub layer: u32,
     /// x, y, width, height in pixels of the swapchain image
     pub rect: [i32; 4],
@@ -416,17 +417,6 @@ fn random_token() -> std::io::Result<String> {
 }
 
 /// Keeps the swapchain images the frame loop needs, by swapchain ID.
-/// BasaltVR's images per swapchain (kSwapchainImageCount in its swapchain.cpp). A swapchain with
-/// layers sends this many images times its layers, image by image: image i, layer l is at
-/// i * layers + l.
-const RUNTIME_IMAGES: usize = 3;
-
-/// The place of a view's image among a swapchain's `count` images.
-fn slot(count: usize, view: &GameView) -> usize {
-    let layers = (count / RUNTIME_IMAGES).max(1);
-    view.image as usize * layers + view.layer as usize
-}
-
 #[derive(Default)]
 pub struct Swapchains(HashMap<u64, Vec<PixelBuffer>>);
 
@@ -441,8 +431,8 @@ impl Swapchains {
         self.0.clear();
     }
     pub fn image(&self, view: &GameView) -> Option<&PixelBuffer> {
-        let images = self.0.get(&view.swapchain)?;
-        images.get(slot(images.len(), view))
+        // `image` already counts the layers: the runtime flattens it
+        self.0.get(&view.swapchain)?.get(view.image as usize)
     }
 }
 
@@ -450,14 +440,6 @@ impl Swapchains {
 mod tests {
     use super::*;
 
-    #[test]
-    fn each_eye_takes_its_own_layer_of_an_array_swapchain() {
-        let view = |image, layer| GameView { swapchain: 1, image, layer, rect: [0; 4], fov_tan: [0.0; 4] };
-        // one layer: images in order
-        assert_eq!([slot(3, &view(0, 0)), slot(3, &view(2, 0))], [0, 2]);
-        // two layers: image 1's left eye is the third surface, its right eye the fourth
-        assert_eq!([slot(6, &view(0, 0)), slot(6, &view(0, 1)), slot(6, &view(1, 0)), slot(6, &view(1, 1)), slot(6, &view(2, 1))], [0, 1, 2, 3, 5]);
-    }
     use alvr_common::{
         glam::{Quat, Vec3},
         Pose,
