@@ -147,6 +147,8 @@ fn ensure_host(settings: MutableState<Settings>, model: MutableState<Model>) {
 fn refresh(settings: MutableState<Settings>, model: MutableState<Model>, slow: bool) {
     let mut next = model.with(Clone::clone);
     backend::pump(&mut next);
+    let requests = std::mem::take(&mut next.vr_requests);
+    vr_requests(settings, &mut next, requests);
     // In Auto mode the stream moves to TCP once, when the host finds that UDP data does not
     // arrive. A problem over TCP stays on screen: switching back would only repeat the first one.
     if std::mem::take(&mut next.udp_blocked)
@@ -185,8 +187,64 @@ fn refresh(settings: MutableState<Settings>, model: MutableState<Model>, slow: b
             _ => (),
         }
     }
+    backend::write_vr_menu(&settings.with(Clone::clone), &next.games);
     if model.with(|m| *m != next) {
         model.set(next);
+    }
+}
+
+/// Runs the requests of the console in VR, as the window's own buttons would.
+fn vr_requests(settings: MutableState<Settings>, next: &mut Model, requests: Vec<serde_json::Value>) {
+    for request in requests {
+        match request["action"].as_str() {
+            Some("play") => {
+                let name = request["game"].as_str().unwrap_or_default().to_string();
+                let games = if next.games.is_empty() { steam::games() } else { next.games.clone() };
+                match games.into_iter().find(|g| g.name == name) {
+                    // Steam may need seconds to start: keep the window responsive
+                    Some(game) => {
+                        thread::spawn(move || {
+                            if let Err(e) = steam::play(&game) {
+                                backend::notify(e);
+                            }
+                        });
+                    }
+                    None => next.message = Some(format!("The console asked for {name}, which is not installed")),
+                }
+            }
+            Some("stop") => {
+                thread::spawn(steam::stop_all);
+            }
+            Some("set") => {
+                let before = settings.with(Clone::clone);
+                let mut after = before.clone();
+                if let Some(fps) = request["fps"].as_u64() {
+                    after.fps = fps as u32;
+                }
+                if let Some(scale) = request["game_scale"].as_f64() {
+                    after.game_scale = scale as f32;
+                }
+                if let Some(samples) = request["msaa"].as_u64() {
+                    after.game_msaa_limit = samples as u32;
+                }
+                if let Some(on) = request["low_latency"].as_bool() {
+                    after.low_latency = on;
+                }
+                if after == before {
+                    continue;
+                }
+                after.save();
+                settings.set(after.clone());
+                // The anti-aliasing limit applies at a game's start; the rest are the host's options
+                let host_options = |s: &Settings| (s.fps, s.game_scale.to_bits(), s.low_latency);
+                if host_options(&before) != host_options(&after) && backend::host_running() {
+                    if let Err(e) = backend::start_host(&after, next.tcp_fallback) {
+                        next.message = Some(e);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 

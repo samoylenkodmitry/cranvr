@@ -267,6 +267,7 @@ fn main() {
     }
     let (options, mut desktop, config_dir) = parse_args();
     std::fs::create_dir_all(&config_dir).expect("config dir");
+    status::set_menu_file(config_dir.join("vr-menu.json"));
     let layout = Layout::new(&config_dir);
     session::prepare(&layout, &options);
 
@@ -556,7 +557,7 @@ impl Game {
                 info!("Game connected ({renderer})");
                 self.program = program;
                 self.rates.clear();
-                status::emit(json!({"type": "game", "connected": true, "name": renderer}));
+                status::emit(json!({"type": "game", "connected": true, "name": renderer, "program": self.program}));
                 self.swapchains.clear();
                 self.connected = true;
                 self.since = Some(Instant::now());

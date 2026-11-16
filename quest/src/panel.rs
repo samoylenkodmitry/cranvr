@@ -38,6 +38,7 @@ use alvr_common::{
     glam::{Mat4, Quat, Vec3},
     Pose,
 };
+use crate::console::{self, Kind, Menu, CONSOLE_ID};
 use alvr_graphics::{OverlayDraw, OverlayShape};
 use std::{collections::HashMap, path::PathBuf};
 
@@ -142,7 +143,13 @@ pub enum Part {
     Handle,
     Corner,
     Button(Button),
+    /// An item on the console's face, by its index in `console::layout`; NONE for the face around
+    /// the items
+    Item(u8),
 }
+
+/// The console's face around its items
+const NONE: u8 = u8::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Hit {
@@ -167,6 +174,8 @@ pub enum Look {
     Idle,
     Hover,
     Active,
+    /// Text without a button under it
+    Label,
 }
 
 /// A button of a bar: its center and size in meters from the bar's center, its text, its look.
@@ -189,6 +198,8 @@ pub struct Bar {
     /// The handle's center and size in meters from the bar's center, and its look
     pub handle: ((f32, f32), (f32, f32), Look),
     pub buttons: Vec<BarButton>,
+    /// A plate behind everything, for the console
+    pub background: Option<[f32; 4]>,
 }
 
 /// What the host reported about a panel.
@@ -434,6 +445,8 @@ pub struct Output {
     /// The panel picture that the head points at, where on it, and its pixels across
     pub look: Option<(u8, f32, f32, u16)>,
     pub commands: Vec<Command>,
+    /// The console's requests for the host, as JSON
+    pub console: Vec<String>,
 }
 
 enum Grab {
@@ -474,6 +487,8 @@ pub struct PanelControl {
     steady: [AimFilter; 2],
     /// Whether the rays go through the filter
     pub steady_rays: bool,
+    /// The console's place and what it shows, once the host sent a menu
+    console: Option<(Panel, Menu)>,
     /// The thumbstick moves a panel by its handle; its place is saved when the stick rests
     pushing: bool,
     hands: [Hand; 2],
@@ -500,6 +515,7 @@ impl PanelControl {
             press: None,
             steady: [AimFilter::default(); 2],
             steady_rays: true,
+            console: None,
             pushing: false,
             hands: [Hand::default(); 2],
             head: Pose::default(),
@@ -539,9 +555,70 @@ impl PanelControl {
         }
     }
 
+    /// Takes the host's menu for the console. The console shows from the first menu on, at its
+    /// saved place or below and ahead of the head.
+    pub fn set_menu(&mut self, menu: Menu) {
+        let (height, _) = console::layout(&menu);
+        match &mut self.console {
+            Some((panel, shown)) => {
+                panel.height = height;
+                *shown = menu;
+            }
+            None => {
+                let mut panel = self.saved.get(&CONSOLE_ID).copied().unwrap_or_else(|| {
+                    console::default_place(self.head.position, self.head.orientation, height)
+                });
+                (panel.width, panel.height) = (console::WIDTH, height);
+                self.console = Some((panel, menu));
+            }
+        }
+    }
+
+    /// Whether the console is nearer to the head than every screen. The compositor stacks layers
+    /// in the order of the list, not by depth: a nearer console must come after the screens.
+    pub fn console_nearer(&self) -> bool {
+        let Some((console, _)) = &self.console else { return false };
+        let distance = |p: &Panel| (p.center - self.head.position).length();
+        self.slots.iter().all(|s| distance(console) < distance(&s.panel))
+    }
+
+    /// Puts the console upright straight ahead of the head, for tests with a headset on a desk.
+    pub fn console_in_front(&mut self) {
+        let head = self.head;
+        if let Some((panel, _)) = self.console.as_mut() {
+            let forward = head.orientation * Vec3::NEG_Z;
+            panel.center = head.position + forward * 0.8;
+            panel.orientation = head.orientation;
+        }
+    }
+
+    /// What a ray hits on the console.
+    fn console_hit(&self, origin: Vec3, dir: Vec3) -> Option<Hit> {
+        let (panel, menu) = self.console.as_ref()?;
+        let (distance, x, y) = panel.plane_hit(origin, dir)?;
+        if x.abs() > panel.width / 2.0 || y.abs() > panel.height / 2.0 {
+            return None;
+        }
+        let (_, items) = console::layout(menu);
+        let part = if console::on_handle(panel.height, (x, y)) {
+            Part::Handle
+        } else {
+            let index = items.iter().position(|i| {
+                matches!(i.kind, Kind::Button { .. })
+                    && (x - i.center.0).abs() <= i.size.0 / 2.0
+                    && (y - i.center.1).abs() <= i.size.1 / 2.0
+            });
+            Part::Item(index.map_or(NONE, |i| i as u8))
+        };
+        Some(Hit { panel: CONSOLE_ID, distance, part })
+    }
+
     fn save(&mut self) {
         for slot in &self.slots {
             self.saved.insert(slot.id, slot.panel);
+        }
+        if let Some((panel, _)) = &self.console {
+            self.saved.insert(CONSOLE_ID, *panel);
         }
         let mut ids: Vec<&u8> = self.saved.keys().collect();
         ids.sort();
@@ -620,14 +697,16 @@ impl PanelControl {
 
         let can_add = self.can_add();
         let ray = |hand: &Hand| hand.aim.map(|a| (a.position, a.orientation * Vec3::NEG_Z));
-        for (target, hand) in self.targets.iter_mut().zip(&inputs.hands) {
-            *target = ray(hand).and_then(|(o, d)| {
+        let targets = inputs.hands.map(|hand| {
+            ray(&hand).and_then(|(o, d)| {
                 self.slots
                     .iter()
                     .filter_map(|s| s.hit(o, d, can_add))
+                    .chain(self.console_hit(o, d))
                     .min_by(|a, b| a.distance.total_cmp(&b.distance))
-            });
-        }
+            })
+        });
+        self.targets = targets;
         let mut press = [false; 2];
         for (i, hand) in inputs.hands.iter().enumerate() {
             let down = hand.aim.is_some() && hand.trigger > if self.pressed[i] { RELEASE } else { PRESS };
@@ -640,12 +719,18 @@ impl PanelControl {
 
         let mut out = Output::default();
         let mut moved = false;
-        // The right thumbstick brings a panel in front of the user
+        // The right thumbstick brings the panel that the ray points at in front of the user. A
+        // click that points at nothing brings the first screen and the console.
         if inputs.stick_click && !self.clicked && self.grab.is_none() {
-            let id = self.targets[self.active].map_or(self.slots[0].id, |t| t.panel);
+            let target = self.targets[self.active].map(|t| t.panel);
+            let id = target.unwrap_or(self.slots[0].id);
             if let Some(slot) = self.slots.iter_mut().find(|s| s.id == id) {
                 let aspect = slot.panel.width / slot.panel.height;
                 slot.panel = Panel::in_front_of(&head, aspect, slot.panel.width);
+                moved = true;
+            }
+            if let (None | Some(CONSOLE_ID), Some((panel, _))) = (target, self.console.as_mut()) {
+                *panel = console::default_place(head.position, head.orientation, panel.height);
                 moved = true;
             }
         }
@@ -653,9 +738,9 @@ impl PanelControl {
 
         if let Some((hand, id, grab)) = &mut self.grab {
             let held = ray(&inputs.hands[*hand]).filter(|_| self.pressed[*hand]);
-            match (held, self.slots.iter_mut().find(|s| s.id == *id)) {
-                (Some((origin, dir)), Some(slot)) => {
-                    let panel = &mut slot.panel;
+            let console = self.console.as_mut().filter(|_| *id == CONSOLE_ID).map(|c| &mut c.0);
+            match (held, self.slots.iter_mut().find(|s| s.id == *id).map(|s| &mut s.panel).or(console)) {
+                (Some((origin, dir)), Some(panel)) => {
                     match grab {
                         Grab::Move { distance, offset, relative } => {
                             let push = inputs.hands[*hand].stick_y * PUSH_SPEED * inputs.dt * distance.max(0.5);
@@ -693,13 +778,22 @@ impl PanelControl {
             (press[self.active], self.targets[self.active], ray(&inputs.hands[self.active]))
         {
             let slot = self.slots.iter().find(|s| s.id == hit.panel);
+            let console = self.console.as_ref().filter(|_| hit.panel == CONSOLE_ID);
             match (hit.part, slot) {
-                (Part::Handle, Some(slot)) => {
-                    let point = origin + dir * hit.distance;
-                    let offset = slot.panel.orientation.inverse() * (slot.panel.center - point);
-                    let aim = inputs.hands[self.active].aim.map_or(Quat::IDENTITY, |a| a.orientation);
-                    let relative = aim.inverse() * slot.panel.orientation;
-                    self.grab = Some((self.active, hit.panel, Grab::Move { distance: hit.distance, offset, relative }));
+                (Part::Handle, _) => {
+                    if let Some(panel) = slot.map(|s| s.panel).or(console.map(|c| c.0)) {
+                        let point = origin + dir * hit.distance;
+                        let offset = panel.orientation.inverse() * (panel.center - point);
+                        let aim = inputs.hands[self.active].aim.map_or(Quat::IDENTITY, |a| a.orientation);
+                        let relative = aim.inverse() * panel.orientation;
+                        self.grab = Some((self.active, hit.panel, Grab::Move { distance: hit.distance, offset, relative }));
+                    }
+                }
+                (Part::Item(index), _) => {
+                    let items = console.map(|(_, menu)| console::layout(menu).1).unwrap_or_default();
+                    if let Some(Kind::Button { action, .. }) = items.get(index as usize).map(|i| &i.kind) {
+                        out.console.push(action.request());
+                    }
                 }
                 (Part::Corner, Some(_)) => self.grab = Some((self.active, hit.panel, Grab::Resize)),
                 (Part::Button(button), Some(slot)) => out.commands.push(match button {
@@ -721,9 +815,9 @@ impl PanelControl {
         let push = hand.stick_y;
         match (target, hand.aim, &self.grab) {
             (Some(Hit { panel, part: Part::Handle, .. }), Some(aim), None) if push.abs() > 0.25 => {
-                if let Some(slot) = self.slots.iter_mut().find(|s| s.id == panel) {
+                let console = self.console.as_mut().filter(|_| panel == CONSOLE_ID).map(|c| &mut c.0);
+                if let Some(p) = self.slots.iter_mut().find(|s| s.id == panel).map(|s| &mut s.panel).or(console) {
                     // Along the ray, so the handle stays under it
-                    let p = &mut slot.panel;
                     let dir = aim.orientation * Vec3::NEG_Z;
                     let distance = (p.center - aim.position).length();
                     let step = push * PUSH_SPEED * inputs.dt * distance.max(0.5);
@@ -790,7 +884,7 @@ impl PanelControl {
                 self.hold = None;
             }
         }
-        let on_controls = matches!(target, Some(Hit { part: Part::Handle | Part::Corner | Part::Button(_), .. }));
+        let on_controls = matches!(target, Some(Hit { part: Part::Handle | Part::Corner | Part::Button(_) | Part::Item(_), .. }));
         if self.grab.is_none() && (!on_controls || self.screen_press) {
             out.trigger = if self.screen_press { hand.trigger } else { 0.0 };
             out.scroll = if on_controls { 0.0 } else { hand.stick_y };
@@ -821,7 +915,8 @@ impl PanelControl {
     /// Each panel's bar: the handle and the buttons, for a layer of its own.
     pub fn bars(&self) -> Vec<Bar> {
         let can_add = self.can_add();
-        self.slots
+        let mut bars = self
+            .slots
             .iter()
             .map(|slot| {
                 let p = &slot.panel;
@@ -861,9 +956,44 @@ impl PanelControl {
                     size: (right - left, height),
                     handle: ((-cx, 0.0), (HANDLE_WIDTH, HANDLE_HEIGHT), handle),
                     buttons,
+                    background: None,
                 }
             })
-            .collect()
+            .collect::<Vec<_>>();
+        if let Some((panel, menu)) = &self.console {
+            let (height, items) = console::layout(menu);
+            let hovered = |part: Part| self.targets.iter().flatten().any(|t| t.panel == CONSOLE_ID && t.part == part);
+            let handle = if matches!(self.grab, Some((_, CONSOLE_ID, Grab::Move { .. }))) {
+                Look::Active
+            } else if hovered(Part::Handle) {
+                Look::Hover
+            } else {
+                Look::Idle
+            };
+            let buttons = items
+                .into_iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    let look = match item.kind {
+                        Kind::Button { selected: true, .. } => Look::Active,
+                        Kind::Button { .. } if hovered(Part::Item(i as u8)) => Look::Hover,
+                        Kind::Button { .. } => Look::Idle,
+                        Kind::Title | Kind::Text => Look::Label,
+                    };
+                    BarButton { center: item.center, size: item.size, label: item.label, look }
+                })
+                .collect();
+            bars.push(Bar {
+                panel: CONSOLE_ID,
+                center: panel.center,
+                orientation: panel.orientation,
+                size: (panel.width, height),
+                handle: (console::handle_center(height), (console::HANDLE_WIDTH, console::HANDLE_HEIGHT), handle),
+                buttons,
+                background: Some([0.09, 0.1, 0.12, 1.0]),
+            });
+        }
+        bars
     }
 
     /// The controllers, their rays, the panels' corners, and the point that the active ray hits.
@@ -916,6 +1046,23 @@ impl PanelControl {
                     draws.push(OverlayDraw { shape: flat(arm, thick, thick / 2.0), model: on_panel(cx - sx * arm / 2.0, cy, 0.002), color });
                     draws.push(OverlayDraw { shape: flat(thick, arm, thick / 2.0), model: on_panel(cx, cy - sy * arm / 2.0, 0.002), color });
                 }
+            }
+        }
+
+        // The console's frame: boxes around its face give it a depth
+        if let Some((p, _)) = &self.console {
+            let (depth, rim) = (0.03, 0.014);
+            let (w, h) = (p.width / 2.0, p.height / 2.0);
+            let color = [0.2, 0.21, 0.24, 1.0];
+            for (x, y, sx, sy) in [
+                (0.0, h + rim / 2.0, 2.0 * (w + rim), rim),
+                (0.0, -h - rim / 2.0, 2.0 * (w + rim), rim),
+                (-w - rim / 2.0, 0.0, rim, 2.0 * h),
+                (w + rim / 2.0, 0.0, rim, 2.0 * h),
+            ] {
+                let center = p.at(x, y) - p.normal() * (depth / 2.0 - 0.003);
+                let model = Mat4::from_scale_rotation_translation(Vec3::new(sx, sy, depth), p.orientation, center);
+                draws.push(OverlayDraw { shape: OverlayShape::Box, model, color });
             }
         }
 
@@ -1138,6 +1285,29 @@ mod tests {
         assert!(control.slots[1].buttons(true).iter().any(|b| b.0 == Button::Close));
         step(&mut control, &streams, Vec3::Y, 0.0);
         assert_eq!(control.slots.len(), 1);
+        std::fs::remove_file(&control.store).ok();
+    }
+
+    #[test]
+    fn the_console_sends_requests_and_a_stick_click_at_nothing_brings_it_back() {
+        let mut control = control("console");
+        let streams = [(0, ASPECT, 3840)];
+        let games = vec![console::Game { name: "Beat Saber".into(), program: "Beat Saber.exe".into() }];
+        control.set_menu(Menu { games, fps: 120, game_scale: 0.6, msaa: 2, ..Default::default() });
+        let (panel, menu) = control.console.clone().unwrap();
+        let (_, items) = console::layout(&menu);
+        let item = items.iter().find(|i| i.label == "90 Hz").unwrap();
+        let point = panel.at(item.center.0, item.center.1);
+        let mut requests = step(&mut control, &streams, point - ORIGIN, 1.0).console;
+        requests.extend(step(&mut control, &streams, point - ORIGIN, 0.0).console);
+        assert_eq!(requests, [console::Action::Fps(90).request()]);
+        // a console carried away comes back below and ahead on a stick click at nothing
+        control.console.as_mut().unwrap().0.center = Vec3::new(3.0, 0.5, 2.0);
+        let aim = Pose { orientation: Quat::from_rotation_arc(Vec3::NEG_Z, Vec3::Y), position: ORIGIN };
+        let hands = [Hand::default(), Hand { aim: Some(aim), grip: None, trigger: 0.0, stick_y: 0.0 }];
+        control.update(&Inputs { hands, head: head(), stick_click: true, dt: 0.01 }, &streams);
+        let back = control.console.as_ref().unwrap().0;
+        assert!((back.center - panel.center).length() < 1e-4, "{back:?}");
         std::fs::remove_file(&control.store).ok();
     }
 
