@@ -2,9 +2,9 @@
 // the stream's state, the installed games and the main settings.
 //
 // The console stands apart from the screens, tilted up like a desk console in front of the user.
-// It is carried by its handle like a screen (see panel.rs). Its face is one sharp picture, drawn
-// like a screen's bar (see bar.rs); boxes in the overlay frame it, so it reads as an object with a
-// depth.
+// It is carried by its handle like a screen (see panel.rs). Its face is a Cranpose composition
+// of the lines here, drawn on the CPU into one sharp picture (see console_view.rs); boxes in the
+// overlay frame it, so it reads as an object with a depth.
 //
 // The cranvr app on the Mac writes the games and the settings into vr-menu.json. The host adds
 // the stream's state and sends it as MENU over the desktop layer's link (desktop_layer.rs). A
@@ -21,14 +21,14 @@ pub const CONSOLE_ID: u8 = 250;
 /// The console's width in meters
 pub const WIDTH: f32 = 0.6;
 /// The margin around the console's content, and the gap between items
-const MARGIN: f32 = 0.022;
-const GAP: f32 = 0.008;
+pub const MARGIN: f32 = 0.022;
+pub const GAP: f32 = 0.008;
 /// Rows: a button's height, a text row's height, a title's height
 const BUTTON: f32 = 0.042;
 const TEXT: f32 = 0.032;
 const TITLE: f32 = 0.04;
 /// The handle's row at the top
-const HANDLE_ROW: f32 = 0.036;
+pub const HANDLE_ROW: f32 = 0.036;
 pub const HANDLE_WIDTH: f32 = 0.2;
 pub const HANDLE_HEIGHT: f32 = 0.014;
 /// The labels' column in a settings row
@@ -148,6 +148,21 @@ pub enum Kind {
     Button { action: Action, selected: bool },
 }
 
+/// One item in a line of the console: its width in meters, its text and what it is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Cell {
+    pub width: f32,
+    pub label: String,
+    pub kind: Kind,
+}
+
+/// One line of the console's face, from the left edge: its height in meters and its items.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Line {
+    pub height: f32,
+    pub cells: Vec<Cell>,
+}
+
 /// One item on the console's face: its center and size in meters from the face's center (+y
 /// up), its text and what it is.
 #[derive(Clone, Debug, PartialEq)]
@@ -158,23 +173,22 @@ pub struct Item {
     pub kind: Kind,
 }
 
-/// The face's height and its items.
-pub fn layout(menu: &Menu) -> (f32, Vec<Item>) {
+/// Whether `game` is the game that runs.
+fn runs(status: &Status, game: &Game) -> bool {
+    status.game.as_deref().is_some_and(|p| !game.program.is_empty() && p.eq_ignore_ascii_case(&game.program))
+}
+
+/// The lines of the face below its handle, from the top. The face shows them with GAP between
+/// lines and after the last one.
+pub fn lines(menu: &Menu) -> Vec<Line> {
     let inner = WIDTH - 2.0 * MARGIN;
-    let left = -WIDTH / 2.0 + MARGIN;
-    // Rows go down from y = 0; the face is centered at the end
-    let mut items: Vec<Item> = Vec::new();
-    let mut y = -(MARGIN / 2.0 + HANDLE_ROW);
-    let mut row = |height: f32, cells: Vec<(f32, String, Kind)>, items: &mut Vec<Item>| {
-        let mut x = left;
-        for (width, label, kind) in cells {
-            items.push(Item { center: (x + width / 2.0, y - height / 2.0), size: (width, height), label, kind });
-            x += width + GAP;
-        }
-        y -= height + GAP;
+    let mut lines = Vec::new();
+    let mut line = |height: f32, cells: Vec<(f32, String, Kind)>| {
+        let cells = cells.into_iter().map(|(width, label, kind)| Cell { width, label, kind }).collect();
+        lines.push(Line { height, cells });
     };
-    let text = |s: &str| (s.to_string(), Kind::Text);
-    let button = |label: String, action: Action, selected: bool| (label, Kind::Button { action, selected });
+    let text = |s: &str| (inner, s.to_string(), Kind::Text);
+    let button = |width: f32, label: String, action: Action, selected: bool| (width, label, Kind::Button { action, selected });
 
     let s = &menu.status;
     let stream = if s.refresh > 0.0 {
@@ -183,62 +197,90 @@ pub fn layout(menu: &Menu) -> (f32, Vec<Item>) {
     } else {
         "No headset stream".to_string()
     };
-    row(TITLE, vec![(0.16, "cranvr".into(), Kind::Title), (inner - 0.16 - GAP, stream, Kind::Text)], &mut items);
-    let running = |g: &Game| s.game.as_deref().is_some_and(|p| !g.program.is_empty() && p.eq_ignore_ascii_case(&g.program));
-    let game = match (&s.game, menu.games.iter().find(|g| running(g))) {
+    line(TITLE, vec![(0.16, "cranvr".into(), Kind::Title), (inner - 0.16 - GAP, stream, Kind::Text)]);
+    let game = match (&s.game, menu.games.iter().find(|g| runs(s, g))) {
         (Some(_), Some(g)) => format!("{} makes {:.0} frames a second", g.name, s.game_fps),
         (Some(program), None) => format!("{program} makes {:.0} frames a second", s.game_fps),
         (None, _) => "No game runs".to_string(),
     };
-    let (label, kind) = text(&game);
-    row(TEXT, vec![(inner, label, kind)], &mut items);
+    line(TEXT, vec![text(&game)]);
 
-    row(TITLE, vec![(inner, "Play".into(), Kind::Title)], &mut items);
+    line(TITLE, vec![(inner, "Play".into(), Kind::Title)]);
     if menu.games.is_empty() {
-        let (label, kind) = text("No games installed in cranvr's Steam");
-        row(TEXT, vec![(inner, label, kind)], &mut items);
+        line(TEXT, vec![text("No games installed in cranvr's Steam")]);
     }
     for g in menu.games.iter().take(MAX_GAMES) {
-        let running = running(g);
-        let mut cells = vec![(0.36, g.name.clone(), Kind::Button { action: Action::Play(g.name.clone()), selected: running })];
+        let running = runs(s, g);
+        let mut cells = vec![button(0.36, g.name.clone(), Action::Play(g.name.clone()), running)];
         if running {
-            cells.push((0.14, "Stop".into(), Kind::Button { action: Action::Stop, selected: false }));
+            cells.push(button(0.14, "Stop".into(), Action::Stop, false));
         }
-        row(BUTTON, cells, &mut items);
+        line(BUTTON, cells);
     }
 
-    row(TITLE, vec![(inner, "Settings".into(), Kind::Title)], &mut items);
-    let setting = |name: &str, buttons: Vec<(String, Action, bool)>, width: f32| {
+    line(TITLE, vec![(inner, "Settings".into(), Kind::Title)]);
+    let setting = |name: &str, width: f32, buttons: Vec<(String, Action, bool)>| {
         let mut cells = vec![(LABEL, name.to_string(), Kind::Text)];
-        cells.extend(buttons.into_iter().map(|(label, action, selected)| {
-            let (label, kind) = button(label, action, selected);
-            (width, label, kind)
-        }));
+        cells.extend(buttons.into_iter().map(|(label, action, selected)| button(width, label, action, selected)));
         cells
     };
     if let Some(room) = menu.room {
         let around = vec![("Room".to_string(), Action::Room(true), room), ("Floor".to_string(), Action::Room(false), !room)];
-        row(BUTTON, setting("Around you", around, 0.1), &mut items);
+        line(BUTTON, setting("Around you", 0.1, around));
     }
-    row(BUTTON, setting("Refresh", RATES.iter().map(|&r| (format!("{r} Hz"), Action::Fps(r), menu.fps == r)).collect(), 0.1), &mut items);
+    let rates = RATES.iter().map(|&r| (format!("{r} Hz"), Action::Fps(r), menu.fps == r)).collect();
+    line(BUTTON, setting("Refresh", 0.1, rates));
     let scales = SCALES.iter().map(|&f| (format!("{:.0}%", f * 100.0), Action::Scale(f), (menu.game_scale - f).abs() < 0.01)).collect();
-    row(BUTTON, setting("Game size", scales, 0.072), &mut items);
+    line(BUTTON, setting("Game size", 0.072, scales));
     let aa = vec![
         ("At most 2x".to_string(), Action::Msaa(2), menu.msaa == 2),
         ("As the game sets".to_string(), Action::Msaa(0), menu.msaa == 0),
     ];
-    row(BUTTON, setting("Anti-aliasing", aa, 0.17), &mut items);
+    line(BUTTON, setting("Anti-aliasing", 0.17, aa));
     let low = vec![("Low latency".to_string(), Action::LowLatency(!menu.low_latency), menu.low_latency)];
-    row(BUTTON, setting("Latency", low, 0.17), &mut items);
-    let (label, kind) = text("Refresh, game size and latency restart the stream");
-    row(TEXT, vec![(inner, label, kind)], &mut items);
-    row(BUTTON, vec![(0.2, "Exit cranvr".into(), Kind::Button { action: Action::Exit, selected: false })], &mut items);
+    line(BUTTON, setting("Latency", 0.17, low));
+    line(TEXT, vec![text("Refresh, game size and latency restart the stream")]);
+    line(BUTTON, vec![button(0.2, "Exit cranvr".into(), Action::Exit, false)]);
+    lines
+}
 
-    let height = -y + MARGIN / 2.0;
-    for item in &mut items {
-        item.center.1 += height / 2.0;
+/// The face's height in meters: the margins, the handle's row and the lines with their gaps.
+pub fn height(menu: &Menu) -> f32 {
+    MARGIN + HANDLE_ROW + lines(menu).iter().map(|line| line.height + GAP).sum::<f32>()
+}
+
+/// The face's height and where its items sit.
+pub fn layout(menu: &Menu) -> (f32, Vec<Item>) {
+    let height = height(menu);
+    let mut items = Vec::new();
+    // Lines go down from the top, after the handle's row
+    let mut top = height / 2.0 - MARGIN / 2.0 - HANDLE_ROW;
+    for line in lines(menu) {
+        let mut x = -WIDTH / 2.0 + MARGIN;
+        for cell in line.cells {
+            items.push(Item {
+                center: (x + cell.width / 2.0, top - line.height / 2.0),
+                size: (cell.width, line.height),
+                label: cell.label,
+                kind: cell.kind,
+            });
+            x += cell.width + GAP;
+        }
+        top -= line.height + GAP;
     }
     (height, items)
+}
+
+/// A point on the face in meters from its center (+y up), in millimeters from its top left
+/// corner, as the face's composition takes it.
+pub fn face_point(height: f32, (x, y): (f32, f32)) -> (f32, f32) {
+    (1000.0 * (x + WIDTH / 2.0), 1000.0 * (height / 2.0 - y))
+}
+
+/// The point on the face of the item with `label`, as `face_point` gives it.
+pub fn item_point(menu: &Menu, label: &str) -> Option<(f32, f32)> {
+    let (height, items) = layout(menu);
+    items.iter().find(|i| i.label == label).map(|i| face_point(height, i.center))
 }
 
 /// The handle's center on the face, in meters from the face's center.

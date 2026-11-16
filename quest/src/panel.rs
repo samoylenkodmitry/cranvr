@@ -38,7 +38,8 @@ use alvr_common::{
     glam::{Mat4, Quat, Vec3},
     Pose,
 };
-use crate::console::{self, Kind, Menu, CONSOLE_ID};
+use crate::console::{self, Menu, CONSOLE_ID};
+use crate::console_view::Pointer;
 use alvr_graphics::{OverlayDraw, OverlayShape};
 use std::{collections::HashMap, path::PathBuf};
 
@@ -143,13 +144,9 @@ pub enum Part {
     Handle,
     Corner,
     Button(Button),
-    /// An item on the console's face, by its index in `console::layout`; NONE for the face around
-    /// the items
-    Item(u8),
+    /// A point on the console's face below its handle, in millimeters from its top left corner
+    Face(f32, f32),
 }
-
-/// The console's face around its items
-const NONE: u8 = u8::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Hit {
@@ -174,8 +171,6 @@ pub enum Look {
     Idle,
     Hover,
     Active,
-    /// Text without a button under it
-    Label,
 }
 
 /// A button of a bar: its center and size in meters from the bar's center, its text, its look.
@@ -198,8 +193,6 @@ pub struct Bar {
     /// The handle's center and size in meters from the bar's center, and its look
     pub handle: ((f32, f32), (f32, f32), Look),
     pub buttons: Vec<BarButton>,
-    /// A plate behind everything, for the console
-    pub background: Option<[f32; 4]>,
 }
 
 /// What the host reported about a panel.
@@ -451,10 +444,8 @@ pub struct Output {
     /// The panel picture that the head points at, where on it, and its pixels across
     pub look: Option<(u8, f32, f32, u16)>,
     pub commands: Vec<Command>,
-    /// The console's requests for the host, as JSON
-    pub console: Vec<String>,
-    /// Whether the console's Exit button asks to close the app
-    pub exit: bool,
+    /// What the active ray does on the console's face
+    pub console: Vec<Pointer>,
 }
 
 enum Grab {
@@ -499,6 +490,10 @@ pub struct PanelControl {
     console: Option<(Panel, Menu)>,
     /// Whether the console waits for the head's pose to take its default place
     place_console: bool,
+    /// The point on the console's face under the active ray, as the console last heard it
+    console_point: Option<(f32, f32)>,
+    /// Whether the active trigger holds a press on the console's face
+    console_held: bool,
     /// The user's choice: the room around the screens, or the floor; saved beside the places
     room: bool,
     /// Whether the headset can show the room
@@ -533,6 +528,8 @@ impl PanelControl {
             steady_rays: true,
             console: None,
             place_console: false,
+            console_point: None,
+            console_held: false,
             room: std::fs::read_to_string(room_file(&store)).map_or(true, |t| t.trim() != "floor"),
             room_available: false,
             screens_hidden: false,
@@ -603,7 +600,7 @@ impl PanelControl {
     fn refresh_console(&mut self) {
         if let Some((panel, menu)) = self.console.as_mut() {
             menu.room = self.room_available.then_some(self.room);
-            panel.height = console::layout(menu).0;
+            panel.height = console::height(menu);
         }
     }
 
@@ -629,7 +626,7 @@ impl PanelControl {
     /// saved place or below and ahead of the head.
     pub fn set_menu(&mut self, mut menu: Menu) {
         menu.room = self.room_available.then_some(self.room);
-        let (height, _) = console::layout(&menu);
+        let height = console::height(&menu);
         match &mut self.console {
             Some((panel, shown)) => {
                 panel.height = height;
@@ -665,23 +662,58 @@ impl PanelControl {
         }
     }
 
+    /// Tells the console where the active ray points on its face and when its trigger presses
+    /// there. A press holds until the trigger goes up or the ray leaves the face.
+    fn follow_console(&mut self, press: &[bool; 2], out: &mut Output) {
+        let face = match (&self.grab, self.targets[self.active]) {
+            (None, Some(Hit { part: Part::Face(x, y), .. })) => Some((x, y)),
+            _ => None,
+        };
+        if let Some((x, y)) = face {
+            if self.console_point != face {
+                out.console.push(Pointer::Move(x, y));
+            }
+            if press[self.active] {
+                out.console.push(Pointer::Press(x, y));
+                self.console_held = true;
+            }
+        }
+        if self.console_held && (face.is_none() || !self.pressed[self.active]) {
+            let (x, y) = face.or(self.console_point).unwrap_or_default();
+            out.console.push(Pointer::Release(x, y));
+            self.console_held = false;
+        }
+        if face.is_none() && self.console_point.is_some() {
+            out.console.push(Pointer::Leave);
+        }
+        self.console_point = face;
+    }
+
+    /// The console's place, what it shows and its handle's look, once the host sent a menu.
+    pub fn console_face(&self) -> Option<(&Panel, &Menu, Look)> {
+        let (panel, menu) = self.console.as_ref()?;
+        let look = if matches!(self.grab, Some((_, CONSOLE_ID, Grab::Move { .. }))) {
+            Look::Active
+        } else if self.targets.iter().flatten().any(|t| t.panel == CONSOLE_ID && t.part == Part::Handle) {
+            Look::Hover
+        } else {
+            Look::Idle
+        };
+        Some((panel, menu, look))
+    }
+
     /// What a ray hits on the console.
     fn console_hit(&self, origin: Vec3, dir: Vec3) -> Option<Hit> {
-        let (panel, menu) = self.console.as_ref()?;
+        let (panel, _) = self.console.as_ref()?;
         let (distance, x, y) = panel.plane_hit(origin, dir)?;
         if x.abs() > panel.width / 2.0 || y.abs() > panel.height / 2.0 {
             return None;
         }
-        let (_, items) = console::layout(menu);
         let part = if console::on_handle(panel.height, (x, y)) {
             Part::Handle
         } else {
-            let index = items.iter().position(|i| {
-                matches!(i.kind, Kind::Button { .. })
-                    && (x - i.center.0).abs() <= i.size.0 / 2.0
-                    && (y - i.center.1).abs() <= i.size.1 / 2.0
-            });
-            Part::Item(index.map_or(NONE, |i| i as u8))
+            let (x, y) = console::face_point(panel.height, (x, y));
+            Part::Face(x, y)
         };
         Some(Hit { panel: CONSOLE_ID, distance, part })
     }
@@ -775,7 +807,9 @@ impl PanelControl {
         }
         if self.slots.is_empty() {
             self.grab = None;
-            return Output::default();
+            self.console_held = false;
+            let console = self.console_point.take().map(|_| Pointer::Leave).into_iter().collect();
+            return Output { console, ..Output::default() };
         }
 
         let can_add = self.can_add();
@@ -801,7 +835,7 @@ impl PanelControl {
 
         let mut out = Output::default();
         let mut moved = false;
-        let mut room = None;
+        self.follow_console(&press, &mut out);
         // The right thumbstick brings the panel that the ray points at in front of the user. A
         // click that points at nothing brings the first screen and the console.
         if inputs.stick_click && !self.clicked && self.grab.is_none() {
@@ -872,15 +906,6 @@ impl PanelControl {
                         self.grab = Some((self.active, hit.panel, Grab::Move { distance: hit.distance, offset, relative }));
                     }
                 }
-                (Part::Item(index), _) => {
-                    let items = console.map(|(_, menu)| console::layout(menu).1).unwrap_or_default();
-                    match items.get(index as usize).map(|i| &i.kind) {
-                        Some(Kind::Button { action: console::Action::Exit, .. }) => out.exit = true,
-                        Some(Kind::Button { action: console::Action::Room(on), .. }) => room = Some(*on),
-                        Some(Kind::Button { action, .. }) => out.console.push(action.request()),
-                        _ => (),
-                    }
-                }
                 (Part::Corner, Some(_)) => self.grab = Some((self.active, hit.panel, Grab::Resize)),
                 (Part::Button(button), Some(slot)) => out.commands.push(match button {
                     Button::Pause => Command::Pause(slot.id, !slot.state.paused),
@@ -893,9 +918,6 @@ impl PanelControl {
         }
         if moved {
             self.save();
-        }
-        if let Some(on) = room {
-            self.choose_room(on);
         }
 
         // The thumbstick moves a panel away or near while the ray points at its handle
@@ -973,7 +995,7 @@ impl PanelControl {
                 self.hold = None;
             }
         }
-        let on_controls = matches!(target, Some(Hit { part: Part::Handle | Part::Corner | Part::Button(_) | Part::Item(_), .. }));
+        let on_controls = matches!(target, Some(Hit { part: Part::Handle | Part::Corner | Part::Button(_) | Part::Face(..), .. }));
         if self.grab.is_none() && (!on_controls || self.screen_press) {
             out.trigger = if self.screen_press { hand.trigger } else { 0.0 };
             out.scroll = if on_controls { 0.0 } else { hand.stick_y };
@@ -1004,7 +1026,7 @@ impl PanelControl {
     /// Each panel's bar: the handle and the buttons, for a layer of its own.
     pub fn bars(&self) -> Vec<Bar> {
         let can_add = self.can_add();
-        let mut bars = self
+        let bars = self
             .shown_slots()
             .map(|slot| {
                 let p = &slot.panel;
@@ -1044,43 +1066,9 @@ impl PanelControl {
                     size: (right - left, height),
                     handle: ((-cx, 0.0), (HANDLE_WIDTH, HANDLE_HEIGHT), handle),
                     buttons,
-                    background: None,
                 }
             })
             .collect::<Vec<_>>();
-        if let Some((panel, menu)) = &self.console {
-            let (height, items) = console::layout(menu);
-            let hovered = |part: Part| self.targets.iter().flatten().any(|t| t.panel == CONSOLE_ID && t.part == part);
-            let handle = if matches!(self.grab, Some((_, CONSOLE_ID, Grab::Move { .. }))) {
-                Look::Active
-            } else if hovered(Part::Handle) {
-                Look::Hover
-            } else {
-                Look::Idle
-            };
-            let buttons = items
-                .into_iter()
-                .enumerate()
-                .map(|(i, item)| {
-                    let look = match item.kind {
-                        Kind::Button { selected: true, .. } => Look::Active,
-                        Kind::Button { .. } if hovered(Part::Item(i as u8)) => Look::Hover,
-                        Kind::Button { .. } => Look::Idle,
-                        Kind::Title | Kind::Text => Look::Label,
-                    };
-                    BarButton { center: item.center, size: item.size, label: item.label, look }
-                })
-                .collect();
-            bars.push(Bar {
-                panel: CONSOLE_ID,
-                center: panel.center,
-                orientation: panel.orientation,
-                size: (panel.width, height),
-                handle: (console::handle_center(height), (console::HANDLE_WIDTH, console::HANDLE_HEIGHT), handle),
-                buttons,
-                background: Some([0.09, 0.1, 0.12, 1.0]),
-            });
-        }
         bars
     }
 
@@ -1198,6 +1186,7 @@ impl PanelControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::console_view::ConsoleView;
 
     const ASPECT: f32 = 16.0 / 9.0;
 
@@ -1376,25 +1365,35 @@ mod tests {
         std::fs::remove_file(&control.store).ok();
     }
 
+    /// Points the right ray at the console's item with `label`, pulls the trigger and lets it go;
+    /// the console's face hears what the ray does. The actions of the pressed buttons.
+    fn press_console(control: &mut PanelControl, view: &mut ConsoleView, label: &str) -> Vec<console::Action> {
+        let streams = [(0, ASPECT, 3840)];
+        let (panel, menu) = control.console.clone().unwrap();
+        let (_, items) = console::layout(&menu);
+        let item = items.iter().find(|i| i.label == label).unwrap();
+        let point = panel.at(item.center.0, item.center.1);
+        for trigger in [0.0, 1.0, 0.0] {
+            for pointer in step(control, &streams, point - ORIGIN, trigger).console {
+                view.pointer(pointer);
+            }
+        }
+        view.take_actions()
+    }
+
     #[test]
-    fn the_console_sends_requests_and_a_stick_click_at_nothing_brings_it_back() {
+    fn the_console_hears_the_ray_and_a_stick_click_at_nothing_brings_it_back() {
         let mut control = control("console");
         let streams = [(0, ASPECT, 3840)];
         let games = vec![console::Game { name: "Beat Saber".into(), program: "Beat Saber.exe".into() }];
         control.set_menu(Menu { games, fps: 120, game_scale: 0.6, msaa: 2, ..Default::default() });
         let (panel, menu) = control.console.clone().unwrap();
-        let (_, items) = console::layout(&menu);
-        let item = items.iter().find(|i| i.label == "90 Hz").unwrap();
-        let point = panel.at(item.center.0, item.center.1);
-        let mut requests = step(&mut control, &streams, point - ORIGIN, 1.0).console;
-        requests.extend(step(&mut control, &streams, point - ORIGIN, 0.0).console);
-        assert_eq!(requests, [console::Action::Fps(90).request()]);
-        // Exit closes the app itself and sends the host nothing
-        let exit = items.iter().find(|i| i.label == "Exit cranvr").unwrap();
-        let point = panel.at(exit.center.0, exit.center.1);
-        let out = step(&mut control, &streams, point - ORIGIN, 1.0);
-        step(&mut control, &streams, point - ORIGIN, 0.0);
-        assert!(out.exit && out.console.is_empty(), "{:?}", out.console);
+        let mut view = ConsoleView::new(menu).unwrap();
+        view.picture();
+        assert_eq!(press_console(&mut control, &mut view, "90 Hz"), [console::Action::Fps(90)]);
+        assert_eq!(press_console(&mut control, &mut view, "Exit cranvr"), [console::Action::Exit]);
+        // the ray leaves the face
+        assert_eq!(step(&mut control, &streams, Vec3::Y, 0.0).console, [Pointer::Leave]);
         // a console carried away comes back below and ahead on a stick click at nothing
         control.console.as_mut().unwrap().0.center = Vec3::new(3.0, 0.5, 2.0);
         let aim = Pose { orientation: Quat::from_rotation_arc(Vec3::NEG_Z, Vec3::Y), position: ORIGIN };
@@ -1423,19 +1422,17 @@ mod tests {
     fn the_console_switches_to_the_floor_and_the_choice_survives() {
         let mut control = control("room");
         std::fs::remove_file(room_file(&control.store)).ok();
-        let streams = [(0, ASPECT, 3840)];
         control.set_menu(Menu { fps: 120, game_scale: 0.6, ..Default::default() });
         // no room choice until the headset says it can show the room
         assert!(!control.shows_room());
         control.set_room_available(true);
         assert!(control.shows_room());
         let (panel, menu) = control.console.clone().unwrap();
-        let (height, items) = console::layout(&menu);
-        assert!((panel.height - height).abs() < 1e-5);
-        let floor = items.iter().find(|i| i.label == "Floor").unwrap();
-        let point = panel.at(floor.center.0, floor.center.1);
-        step(&mut control, &streams, point - ORIGIN, 1.0);
-        step(&mut control, &streams, point - ORIGIN, 0.0);
+        assert!((panel.height - console::height(&menu)).abs() < 1e-5);
+        let mut view = ConsoleView::new(menu).unwrap();
+        view.picture();
+        assert_eq!(press_console(&mut control, &mut view, "Floor"), [console::Action::Room(false)]);
+        control.choose_room(false);
         assert!(!control.shows_room());
         assert_eq!(control.console.as_ref().unwrap().1.room, Some(false));
         assert!((control.console.as_ref().unwrap().0.center - panel.center).length() < 1e-5);
@@ -1464,7 +1461,7 @@ mod tests {
         control.set_screens_hidden(true);
         step(&mut control, &streams, screen.center - ORIGIN, 0.0);
         assert_eq!(control.targets[1].map(|t| t.panel), Some(CONSOLE_ID));
-        assert!(control.bars().iter().all(|b| b.panel == CONSOLE_ID));
+        assert!(control.bars().is_empty());
         std::fs::remove_file(&control.store).ok();
     }
 

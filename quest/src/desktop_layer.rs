@@ -28,14 +28,16 @@
 // {"action":"set","msaa":0}, once the first menu arrives, for tests without hands. "front"
 // instead puts the console straight ahead of the head. "exit" presses the console's Exit button.
 // "room" and "floor" press those buttons. "over" shows the console over a running game, as a hold
-// of the left menu button does.
+// of the left menu button does. "press:LABEL" points at the console's item with that label, such
+// as "press:90 Hz", and pulls the trigger there.
 //
 // debug.cranvr.layer_flags picks the compositor's filters for the desktop layer: "ss" for
 // supersampling, "sharp" for sharpening, "ss,sharp" (the default) for both, "none" for neither.
 
 use crate::{
     bar::BarLayer,
-    console::{Menu, CONSOLE_ID},
+    console::{self, Action, Menu},
+    console_view::{ConsoleLayer, Pointer},
     flat::property,
     graphics::{ProjectionLayerAlphaConfig, ProjectionLayerBuilder},
     interaction::{ButtonAction, InteractionContext},
@@ -207,6 +209,8 @@ pub struct DesktopLayer {
     menu_held: Option<(Instant, bool)>,
     /// Each panel's bar layer
     bars: HashMap<u8, BarLayer>,
+    /// The console's face, from the first menu on
+    console: Option<ConsoleLayer>,
     /// The sharp inset over the panel that the head points at: the panel, its picture, the
     /// part of the display that the picture shows
     inset: Option<(u8, Stream, Part)>,
@@ -281,6 +285,7 @@ impl DesktopLayer {
             front_test: false,
             menu_held: None,
             bars: HashMap::new(),
+            console: None,
             inset: None,
             inset_pending: None,
             cursor_swapchain,
@@ -464,24 +469,55 @@ impl DesktopLayer {
         if std::mem::take(&mut self.front_test) {
             self.control.console_in_front();
         }
+        let mut exit = false;
+        let mut requests = Vec::new();
+        let mut pointers = std::mem::take(&mut out.console);
         if first_menu {
             match self.console_test.take() {
                 Some(test) if test == "front" => self.control.console_in_front(),
-                Some(test) if test == "exit" => out.exit = true,
+                Some(test) if test == "exit" => exit = true,
                 Some(test) if test == "room" || test == "floor" => self.control.choose_room(test == "room"),
                 // "over" waits for a game
                 Some(test) if test == "over" => self.console_test = Some(test),
-                test => out.console.extend(test),
+                Some(test) if test.starts_with("press:") => {
+                    let point = self.control.console_face().and_then(|(_, menu, _)| console::item_point(menu, &test[6..]));
+                    match point {
+                        Some((x, y)) => pointers.extend([Pointer::Move(x, y), Pointer::Press(x, y), Pointer::Release(x, y), Pointer::Leave]),
+                        None => error!("cranvr console: no item {test}"),
+                    }
+                }
+                test => requests.extend(test),
             }
         }
-        if out.exit && !self.exit {
+        // The console's face hears the ray; its pressed buttons' actions come back
+        let mut actions = Vec::new();
+        if let Some((_, menu, look)) = self.control.console_face() {
+            if self.console.is_none() {
+                match ConsoleLayer::start(menu) {
+                    Ok(console) => self.console = Some(console),
+                    Err(e) => error!("cranvr console: {e}"),
+                }
+            }
+            if let Some(console) = self.console.as_mut() {
+                actions = console.update(menu, look, &pointers, session, &self.gfx);
+            }
+        }
+        for action in actions {
+            info!("cranvr console: pressed {action:?}");
+            match action {
+                Action::Exit => exit = true,
+                Action::Room(on) => self.control.choose_room(on),
+                action => requests.push(action.request()),
+            }
+        }
+        if exit && !self.exit {
             info!("cranvr console: exit");
             self.exit = true;
         }
         // The console's requests go to the host over TCP
-        if !out.console.is_empty() {
+        if !requests.is_empty() {
             if let Some(writer) = self.shared.writer.lock().unwrap().as_mut() {
-                for request in out.console.drain(..) {
+                for request in requests {
                     info!("cranvr console: asks the host: {request}");
                     let mut message = vec![MSG_CONSOLE];
                     message.extend((request.len() as u32).to_le_bytes());
@@ -623,20 +659,26 @@ impl DesktopLayer {
         self.shown() && self.control.shows_room()
     }
 
+    /// The console's quad layer, once its face has a picture.
+    fn console_quad<'a>(&'a self, space: &'a xr::Space) -> Option<xr::CompositionLayerQuad<'a, xr::OpenGlEs>> {
+        let (panel, _, _) = self.control.console_face()?;
+        self.console.as_ref()?.layer(space, self.settings.as_ref(), panel)
+    }
+
     /// A quad layer for each panel, and one for the cursor on the panel that holds it.
     pub fn layers<'a>(&'a self, space: &'a xr::Space) -> Vec<xr::CompositionLayerQuad<'a, xr::OpenGlEs>> {
         let mut quads = Vec::new();
         if !self.shown() {
             // Over a game only the console shows, for its Stop button
             if self.console_over_game() {
-                quads.extend(self.bars.get(&CONSOLE_ID).and_then(|bar| bar.layer(space, self.settings.as_ref())));
+                quads.extend(self.console_quad(space));
             }
             return quads;
         }
         let cursor = *self.shared.cursor.lock().unwrap();
         // The console stands apart from the screens; its frame is in the overlay. The compositor
         // stacks the layers in this order, so a nearer console comes after the screens.
-        let console = self.bars.get(&CONSOLE_ID).and_then(|bar| bar.layer(space, self.settings.as_ref()));
+        let console = self.console_quad(space);
         let console_last = self.control.console_nearer();
         let mut console = console.map(|quad| if console_last { Some(quad) } else { quads.push(quad); None }).flatten();
         for (id, panel) in self.control.panels() {
