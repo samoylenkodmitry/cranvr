@@ -15,6 +15,8 @@ mod interaction;
 mod lobby;
 mod passthrough;
 mod stream;
+#[cfg(any(target_os = "android", test))]
+mod xr_eye;
 #[cfg(target_os = "android")]
 mod xr_scene;
 

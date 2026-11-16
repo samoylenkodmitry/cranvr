@@ -608,7 +608,7 @@ impl DesktopLayer {
         // a scene that fails to start
         if self.scene_wanted && self.scene.is_none() {
             let eye = (self.view_resolution.as_vec2() * OVERLAY_SCALE).as_uvec2();
-            self.scene = crate::xr_scene::XrScene::new(session, &self.gfx, eye).map_err(|e| error!("cranvr xr scene: {e}")).ok();
+            self.scene = crate::xr_scene::XrScene::new(session, &self.gfx, eye, &views).map_err(|e| error!("cranvr xr scene: {e}")).ok();
             self.scene_wanted = self.scene.is_some();
         }
         if let Some(scene) = &mut self.scene {
@@ -806,7 +806,6 @@ impl DesktopLayer {
     }
 }
 
-/// Requests from a list such as "add,quality:0:1,pause:1:1,close:1".
 /// One shape of each kind that the overlay draws, in front of the head: a controller, a ray, the
 /// point on a screen and a corner. A headset on the desk tracks no controllers, so a test sets
 /// `debug.cranvr.xr_probe` to compare the two overlay renderers.
@@ -827,6 +826,7 @@ fn overlay_probe(head: alvr_common::Pose) -> [OverlayDraw; 7] {
     ]
 }
 
+/// Requests from a list such as "add,quality:0:1,pause:1:1,close:1".
 fn test_commands(text: &str) -> Vec<Command> {
     text.split(',')
         .filter_map(|item| {
