@@ -260,7 +260,7 @@ Not done or not measured:
 - With the stream frame's time the screen shook a little on head turns while the floor stayed still. With the refresh time the user saw much less shake and a still floor.
 - The overlay lies over the panel with no depth test. A controller behind the panel shows in front of it.
 - Unit tests cover carrying, tilting, pushing and resizing a screen, the click hold, the buttons, the bar picture, the placing of an added screen, the gaze report and the inset's part. On the headset a test hook (`debug.cranvr.panel_test`) added a screen, set its quality, paused it and closed it. The user then added screens and resized one by hand. Not seen on the headset yet: the sharp bar layer, the inset, the click hold and Beat Saber at the game scale of 0.7.
-- The anti-aliasing limit and the sizes per game ran with Beat Saber only, on its first screen (the health and safety warning). No other game was tried. `DXMT_CLAMP_SAMPLE_COUNT=1`, for games that ignore the report, was not tried. Nobody looked at the new rows of the Settings tab (render size, Low latency, anti-aliasing, learned sizes) in the window yet.
+- The anti-aliasing limit and the sizes per game ran with Beat Saber only, on its first screen (the health and safety warning). No other game was tried. `DXMT_CLAMP_SAMPLE_COUNT=1`, for games that ignore the report, was not tried. On 16 November 2026 the Settings tab showed its new rows with the saved values. A press on Low latency wrote it to `app.json` and restarted the host with `--buffering-frames 1`. The list of learned sizes was empty, so its Forget button was not tried.
 - The Mac's load is measured once, with a 60 fps desktop on a 6K display, while other programs ran. With the layer in view, cranvr-host used 20% of one CPU core and the GPU ran at 81%. With the headset asleep, cranvr-host used none and the GPU ran at 48%. In that test macOS's mediaanalysisd used two CPU cores. The Mac's temperature was not measured.
 - Beat Saber on the base M5 ran at 37 to 41 fps with both captures stopped, after 31 to 34 fps before. The two runs used different conditions, so the gain is not proven.
 - Beat Saber on the base M5 on 15 November 2026, at 120 Hz with the 0.7 render size. All runs stayed on the game's first screen, the health and safety warning, with the headset still on a desk: nobody pressed Continue. A song draws more. Other programs built code during the runs. The host ran without the desktop capture and without game sound. With the game's own 4x anti-aliasing the game made 91 frames a second. From the pose to the display took 68 ms. With 2x anti-aliasing the game made 119 frames a second and the time was 52 ms. The GPU ran at 85% with 4x and at 80% with 2x. The Mac's desktop alone kept it at 25%.
@@ -401,6 +401,30 @@ Medians at 90 Hz over Wi-Fi on the Tab S7+ (2.4 GHz, 50 Mbps), 20 seconds each, 
 The Mac drew about 81 of 90 frames a second: the Tab's 2.4 GHz uplink delivers poses in bunches, and the host draws only for a new pose.
 
 At 120 Hz with the probe on the Mac, the test scene ran at 119.9 fps with 14.1 ms from the pose to the display.
+
+### Measure a game with a Quest on the desk
+
+`scripts/perf/` holds the tools behind the Beat Saber numbers above.
+
+```bash
+scripts/perf/game-run.sh aa2 20
+CRANVR_MAX_MSAA=0 scripts/perf/game-run.sh aa-game 20
+HZ=240 scripts/perf/game-run.sh uncapped 20
+scripts/perf/metal-trace.sh bs
+python3 scripts/perf/gpu-by-kind.py target/perf/bs.xml "Beat Saber"
+```
+
+`game-run.sh` needs the cranvr app running. It wakes the headset without a wearer and starts the Quest client and the game without sound. It prints one summary line of the rates and the latency stages. Then it gives the headset its proximity sensor and guardian back. `metal-trace.sh` records 5 seconds of GPU work of every process on the Mac while a game runs. `gpu-by-pass.py` sums that work per process and per pass. `gpu-by-kind.py` sums it per kind of pass. `display-modes.swift` lists the modes of the external display or holds one for its own run. Check `uptime` before a run: builds in other programs halve the rates.
+
+## Other runtimes
+
+### VeRantyx, tried on 16 November 2026
+
+[VeRantyx](https://github.com/Ag3497120/VeRantyx) (commit 422f52e5def7) runs the Windows SteamVR on VXRuntime, a Windows runtime of its own. It does not use Wine. Its ALVR bridge is ALVR 20.14.1, so cranvr's Quest client connected to it. Neither game ran in the headset:
+
+- Google Earth VR: its crash reporter, `crashpad_handler.exe`, failed at its start because VXRuntime has no `NtSuspendProcess`. Earth.exe waited 60 seconds for the reporter, then ended itself. SteamVR kept streaming its empty room.
+- Beat Saber 2.18.4 speaks OpenXR only. VXRuntime registers no OpenXR runtime, so the game started flat on the Mac. With SteamVR's OpenXR runtime registered by hand, SteamVR refused the game: "Returning HmdNotFound because the client-side presence check failed". A driver manifest with `"hmd_presence": ["*.*"]` changed nothing. The games that VeRantyx lists speak OpenVR.
+- SteamVR's empty room, with no game, reached the headset at 120 fps. ALVR reported 73 ms from the pose to the display: 34 ms on the Mac, 7 ms on the network, 7 ms in the decoder and 25 ms on the headset. These numbers come from no game load, so they do not compare with a game through cranvr.
 
 ## Network exposure
 
