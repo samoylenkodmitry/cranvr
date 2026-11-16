@@ -74,6 +74,7 @@
 
 use crate::{
     desktop::{Capture, CaptureSpec, Pointer},
+    screen_capture,
     status,
     virtual_display::DisplayProcess,
 };
@@ -363,7 +364,20 @@ fn run(ip: IpAddr, display_id: u32, state: &LayerState, stop: &AtomicBool) -> Re
     stream.set_read_timeout(None).ok();
 
     let (notify, captured) = mpsc::sync_channel(1);
-    let first = Panel::open(0, display_id, WIDTHS.len() - 1, &notify)?;
+    let first = match Panel::open(0, display_id, WIDTHS.len() - 1, &notify) {
+        Ok(panel) => panel,
+        // The display can leave after the host started, as when Meta's Remote Desktop adds its
+        // own display and macOS mirrors the TV onto it. The main display shows the desktop then.
+        Err(e) => {
+            let main = unsafe { screen_capture::main_display()?.displayID() };
+            if main == display_id {
+                return Err(e);
+            }
+            warn!("Desktop layer: {e}; it shows the main display {main} instead");
+            Panel::open(0, main, WIDTHS.len() - 1, &notify)?
+        }
+    };
+    let display_id = first.display_id;
     write_message(&mut stream, MSG_CONFIG, &first.config())?;
     write_message(&mut stream, MSG_STATE, &first.state())?;
     let (width, height) = first.capture.size;
