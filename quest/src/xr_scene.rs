@@ -322,8 +322,9 @@ struct Done {
     fence: Option<usize>,
 }
 
-/// How long the render thread waits for a frame of the scene before it shows the last one again
-const SCENE_DEADLINE: Duration = Duration::from_millis(20);
+/// How long the render thread waits for a frame of the scene before it shows the last one again.
+/// A frame takes 0.7 to 0.8 ms of waiting, 2.9 ms at most.
+const SCENE_DEADLINE: Duration = Duration::from_millis(4);
 
 pub struct XrScene {
     /// Whether the scene's thread still runs
@@ -338,6 +339,8 @@ pub struct XrScene {
     held: Option<u32>,
     /// The views of the image released last, which the layer shows
     shown: Option<[xr::View; 2]>,
+    /// Whether this frame has the overlay: a frame without it shows no layer
+    in_view: bool,
     thread: Option<JoinHandle<()>>,
     stats: Stats,
 }
@@ -398,6 +401,7 @@ impl XrScene {
             drawing: None,
             held: None,
             shown: None,
+            in_view: false,
             thread: Some(thread),
             stats: Stats::default(),
         })
@@ -411,6 +415,7 @@ impl XrScene {
     /// Acquires an image and hands it to the scene's thread with this frame's eyes and the
     /// overlay's draws. A frame whose image the scene has not finished starts no new one.
     pub fn frame(&mut self, views: &[xr::View], draws: &[OverlayDraw]) {
+        self.in_view = true;
         let (Some(jobs), [left, right, ..]) = (&self.jobs, views) else { return };
         if self.drawing.is_some() {
             return;
@@ -432,6 +437,11 @@ impl XrScene {
         if jobs.send(Job { image, views, shapes, places }).is_ok() {
             self.drawing = Some((image, views));
         }
+    }
+
+    /// Leaves the layer out of this frame, as nothing in it has the overlay.
+    pub fn hide(&mut self) {
+        self.in_view = false;
     }
 
     /// Takes back the image of this frame and releases it. Call it before the frame ends.
@@ -484,7 +494,7 @@ impl XrScene {
 
     /// The layer with the image released last, at the views it was drawn for.
     pub fn layer<'a>(&'a self, space: &'a xr::Space) -> Option<ProjectionLayerBuilder<'a>> {
-        let views = self.shown.as_ref()?;
+        let views = self.shown.as_ref().filter(|_| self.in_view)?;
         let view = |side: usize| {
             let rect = xr::Rect2Di {
                 offset: xr::Offset2Di { x: (side as u32 * self.eye.x) as i32, y: 0 },

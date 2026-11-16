@@ -433,6 +433,9 @@ impl DesktopLayer {
         time: xr::Time,
     ) {
         self.views = None;
+        if let Some(scene) = &mut self.scene {
+            scene.hide();
+        }
         let dt = self.last_frame.elapsed().as_secs_f32().min(0.1);
         self.last_frame = Instant::now();
         self.follow_menu_button(session, interaction);
