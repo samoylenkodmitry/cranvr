@@ -489,6 +489,8 @@ pub struct PanelControl {
     pub steady_rays: bool,
     /// The console's place and what it shows, once the host sent a menu
     console: Option<(Panel, Menu)>,
+    /// Whether the console waits for the head's pose to take its default place
+    place_console: bool,
     /// The thumbstick moves a panel by its handle; its place is saved when the stick rests
     pushing: bool,
     hands: [Hand; 2],
@@ -516,6 +518,7 @@ impl PanelControl {
             steady: [AimFilter::default(); 2],
             steady_rays: true,
             console: None,
+            place_console: false,
             pushing: false,
             hands: [Hand::default(); 2],
             head: Pose::default(),
@@ -565,9 +568,11 @@ impl PanelControl {
                 *shown = menu;
             }
             None => {
-                let mut panel = self.saved.get(&CONSOLE_ID).copied().unwrap_or_else(|| {
-                    console::default_place(self.head.position, self.head.orientation, height)
-                });
+                // The first menu can come before the first head pose. The console then takes its
+                // default place in the next update, not at the stage's origin under the floor.
+                let saved = self.saved.get(&CONSOLE_ID).copied();
+                self.place_console = saved.is_none();
+                let mut panel = saved.unwrap_or_else(|| console::default_place(self.head.position, self.head.orientation, height));
                 (panel.width, panel.height) = (console::WIDTH, height);
                 self.console = Some((panel, menu));
             }
@@ -669,6 +674,11 @@ impl PanelControl {
         let inputs = &steadied;
         let head = inputs.head;
         self.head = head;
+        if std::mem::take(&mut self.place_console) {
+            if let Some((panel, _)) = self.console.as_mut() {
+                *panel = console::default_place(head.position, head.orientation, panel.height);
+            }
+        }
         self.hands = inputs.hands;
 
         // The panels follow the host's streams
@@ -1309,6 +1319,17 @@ mod tests {
         let back = control.console.as_ref().unwrap().0;
         assert!((back.center - panel.center).length() < 1e-4, "{back:?}");
         std::fs::remove_file(&control.store).ok();
+    }
+
+    #[test]
+    fn a_menu_before_the_first_head_pose_places_the_console_by_the_head() {
+        let mut control = PanelControl::new(store("console-first"));
+        control.set_menu(Menu { fps: 120, game_scale: 0.6, ..Default::default() });
+        control.update(&Inputs { hands: [Hand::default(); 2], head: head(), stick_click: false, dt: 0.01 }, &[(0, ASPECT, 3840)]);
+        let (panel, _) = control.console.clone().unwrap();
+        let expected = console::default_place(head().position, head().orientation, panel.height);
+        assert!((panel.center - expected.center).length() < 1e-4, "{panel:?}");
+        assert!(panel.center.y > 1.0, "{panel:?}");
     }
 
     #[test]
