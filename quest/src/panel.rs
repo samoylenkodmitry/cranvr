@@ -447,6 +447,8 @@ pub struct Output {
     pub commands: Vec<Command>,
     /// The console's requests for the host, as JSON
     pub console: Vec<String>,
+    /// Whether the console's Exit button asks to close the app
+    pub exit: bool,
 }
 
 enum Grab {
@@ -801,8 +803,10 @@ impl PanelControl {
                 }
                 (Part::Item(index), _) => {
                     let items = console.map(|(_, menu)| console::layout(menu).1).unwrap_or_default();
-                    if let Some(Kind::Button { action, .. }) = items.get(index as usize).map(|i| &i.kind) {
-                        out.console.push(action.request());
+                    match items.get(index as usize).map(|i| &i.kind) {
+                        Some(Kind::Button { action: console::Action::Exit, .. }) => out.exit = true,
+                        Some(Kind::Button { action, .. }) => out.console.push(action.request()),
+                        _ => (),
                     }
                 }
                 (Part::Corner, Some(_)) => self.grab = Some((self.active, hit.panel, Grab::Resize)),
@@ -1311,6 +1315,12 @@ mod tests {
         let mut requests = step(&mut control, &streams, point - ORIGIN, 1.0).console;
         requests.extend(step(&mut control, &streams, point - ORIGIN, 0.0).console);
         assert_eq!(requests, [console::Action::Fps(90).request()]);
+        // Exit closes the app itself and sends the host nothing
+        let exit = items.iter().find(|i| i.label == "Exit cranvr").unwrap();
+        let point = panel.at(exit.center.0, exit.center.1);
+        let out = step(&mut control, &streams, point - ORIGIN, 1.0);
+        step(&mut control, &streams, point - ORIGIN, 0.0);
+        assert!(out.exit && out.console.is_empty(), "{:?}", out.console);
         // a console carried away comes back below and ahead on a stick click at nothing
         control.console.as_mut().unwrap().0.center = Vec3::new(3.0, 0.5, 2.0);
         let aim = Pose { orientation: Quat::from_rotation_arc(Vec3::NEG_Z, Vec3::Y), position: ORIGIN };
