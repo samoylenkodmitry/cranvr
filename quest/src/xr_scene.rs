@@ -2,12 +2,14 @@
 //
 // A thread of its own holds the Cranpose composition and a GL context of its own, in the share
 // group of ALVR's context: Cranpose's wgpu never touches ALVR's GL state. The layer's swapchain is
-// two eyes wide. The scene's thread owns its images: it acquires one and waits until the
-// compositor no longer reads it, takes the newest eyes and shapes from the render thread, draws
-// both eyes, waits for the GPU and releases the image. The render thread never waits for the
-// scene. It shows the image released last, with the views it was drawn for. Cranpose draws only
+// two eyes wide. Each image lives within one frame, as with ALVR's own overlay: the render thread
+// acquires it when the frame's eyes and shapes are known and hands it to the scene's thread. The
+// scene's thread draws both eyes and puts a fence after its GL commands. Before the frame ends,
+// the render thread takes the image back, has ALVR's context wait for the fence on the GPU and
+// releases the image. No thread waits for the GPU. An image that the compositor still reads after more than
+// a frame stalls both threads, so no image waits across frames for the scene. Cranpose draws only
 // when the scene looks different. An image it did not draw into holds an older picture, so the
-// thread keeps it for the next frame instead of releasing it.
+// render thread keeps it for the next frame instead of releasing it.
 //
 // The scene shows the overlay's draws (panel.rs): the controllers, their rays, the panels'
 // corners and the console's frame, as meshes lit like the overlay's shader lit them.
@@ -15,6 +17,7 @@
 use crate::graphics::{ProjectionLayerAlphaConfig, ProjectionLayerBuilder};
 use alvr_common::glam::{Mat4 as GMat4, UVec2, Vec3 as GVec3};
 use alvr_common::{error, info};
+use glow::HasContext;
 use alvr_graphics::{GraphicsContext, OverlayDraw, OverlayShape};
 use cranpose::prelude::*;
 use cranpose::{GpuContext, GuestView};
@@ -23,12 +26,11 @@ use khronos_egl as egl;
 use openxr as xr;
 use std::{
     ffi::c_void,
-    mem::ManuallyDrop,
     num::NonZeroU32,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
-        Arc, Mutex, MutexGuard, PoisonError,
+        Arc,
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -306,55 +308,38 @@ fn Scene(
     });
 }
 
-/// A frame for the scene's thread: the eyes and the shapes.
+/// A frame for the scene's thread: the image to draw into, the eyes and the shapes.
 struct Job {
+    image: u32,
     views: [xr::View; 2],
     shapes: Vec<Shape>,
     places: Vec<[[f32; 4]; 4]>,
 }
 
-/// The views of the image that the scene's thread released last. The thread releases an image
-/// under this lock, and the render thread holds it while it ends a frame with the layer, so the
-/// layer always shows an image with the views it was drawn for.
-type Released = Mutex<Option<[xr::View; 2]>>;
+/// A finished frame: the fence after Cranpose's GL commands, or `None` when it saw no change and
+/// left the image as it was. The fence is a GL sync object's address, for its trip across threads.
+struct Done {
+    fence: Option<usize>,
+}
+
+/// How long the render thread waits for a frame of the scene before it shows the last one again
+const SCENE_DEADLINE: Duration = Duration::from_millis(20);
 
 pub struct XrScene {
     /// Whether the scene's thread still runs
     alive: Arc<AtomicBool>,
+    swapchain: xr::Swapchain<xr::OpenGlEs>,
     eye: UVec2,
     jobs: Option<Sender<Job>>,
-    released: Arc<Released>,
-    /// The layer's swapchain. The scene's thread acquires and releases its images through a copy
-    /// of the handle; this one destroys the handle after the thread ended.
-    swapchain: xr::Swapchain<xr::OpenGlEs>,
+    done: Receiver<Done>,
+    /// The image that the scene's thread draws into, with the views of its frame
+    drawing: Option<(u32, [xr::View; 2])>,
+    /// An acquired image that holds no new picture, for the next frame
+    held: Option<u32>,
+    /// The views of the image released last, which the layer shows
+    shown: Option<[xr::View; 2]>,
     thread: Option<JoinHandle<()>>,
-}
-
-/// The scene's layer for one frame. It holds the lock on the released views until it is dropped:
-/// drop it after the frame ends.
-pub struct SceneLayer<'a> {
-    views: MutexGuard<'a, Option<[xr::View; 2]>>,
-    scene: &'a XrScene,
-    space: &'a xr::Space,
-}
-
-impl SceneLayer<'_> {
-    /// The layer with the image released last, or `None` before the first one.
-    pub fn builder(&self) -> Option<ProjectionLayerBuilder<'_>> {
-        let views = self.views.as_ref()?;
-        let eye = self.scene.eye;
-        let view = |side: usize| {
-            let rect = xr::Rect2Di {
-                offset: xr::Offset2Di { x: (side as u32 * eye.x) as i32, y: 0 },
-                extent: xr::Extent2Di { width: eye.x as i32, height: eye.y as i32 },
-            };
-            xr::CompositionLayerProjectionView::new()
-                .pose(views[side].pose)
-                .fov(views[side].fov)
-                .sub_image(xr::SwapchainSubImage::new().swapchain(&self.scene.swapchain).image_array_index(0).image_rect(rect))
-        };
-        Some(ProjectionLayerBuilder::new(self.space, [view(0), view(1)], Some(ProjectionLayerAlphaConfig { premultiplied: true }), None))
-    }
+    stats: Stats,
 }
 
 impl XrScene {
@@ -374,9 +359,6 @@ impl XrScene {
             })
             .map_err(|e| e.to_string())?;
         let images = swapchain.enumerate_images().map_err(|e| e.to_string())?;
-        // SAFETY: the handle belongs to `session`. The copy never destroys it, and `Drop` ends
-        // the thread before `swapchain` destroys it.
-        let images_owner = ManuallyDrop::new(unsafe { xr::Swapchain::from_raw(session.clone(), swapchain.as_raw()) });
         let share = Share {
             display: gfx.egl_display.as_ptr() as usize,
             config: gfx.egl_config.as_ptr() as usize,
@@ -385,16 +367,14 @@ impl XrScene {
         // wgpu's GL backend writes rows from the top; OpenXR's GL images run from the bottom
         let flip = !crate::flat::property::get("xr_flip").is_some_and(|v| v == "0");
         let alive = Arc::new(AtomicBool::new(true));
-        let released = Arc::new(Released::default());
-        let (running, thread_released) = (Arc::clone(&alive), Arc::clone(&released));
+        let running = Arc::clone(&alive);
         let (jobs, job_receiver) = mpsc::channel();
+        let (done_sender, done) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("xr-scene".into())
             .spawn(move || {
-                let images_owner = images_owner;
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run(share, images_owner, images, eye, flip, job_receiver, &thread_released)
-                }));
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(share, images, eye, flip, job_receiver, done_sender)));
                 running.store(false, Ordering::Relaxed);
                 let message = match result {
                     Ok(Ok(())) => return,
@@ -409,7 +389,18 @@ impl XrScene {
                 crate::flat::log::line(&format!("cranvr xr scene: stopped: {message}"));
             })
             .map_err(|e| e.to_string())?;
-        Ok(Self { alive, eye, jobs: Some(jobs), released, swapchain, thread: Some(thread) })
+        Ok(Self {
+            alive,
+            swapchain,
+            eye,
+            jobs: Some(jobs),
+            done,
+            drawing: None,
+            held: None,
+            shown: None,
+            thread: Some(thread),
+            stats: Stats::default(),
+        })
     }
 
     /// Whether the scene's thread still draws.
@@ -417,22 +408,100 @@ impl XrScene {
         self.alive.load(Ordering::Relaxed)
     }
 
-    /// Hands the eyes and the overlay's draws of this frame to the scene's thread.
+    /// Acquires an image and hands it to the scene's thread with this frame's eyes and the
+    /// overlay's draws. A frame whose image the scene has not finished starts no new one.
     pub fn frame(&mut self, views: &[xr::View], draws: &[OverlayDraw]) {
         let (Some(jobs), [left, right, ..]) = (&self.jobs, views) else { return };
+        if self.drawing.is_some() {
+            return;
+        }
+        let image = match self.held.take() {
+            Some(image) => image,
+            None => {
+                let start = Instant::now();
+                let Ok(image) = self.swapchain.acquire_image() else { return };
+                if self.swapchain.wait_image(xr::Duration::INFINITE).is_err() {
+                    return;
+                }
+                self.stats.waited += start.elapsed();
+                image
+            }
+        };
         let (shapes, places) = shapes(draws);
-        jobs.send(Job { views: [*left, *right], shapes, places }).ok();
+        let views = [*left, *right];
+        if jobs.send(Job { image, views, shapes, places }).is_ok() {
+            self.drawing = Some((image, views));
+        }
     }
 
-    /// The layer for this frame. It holds a lock until it is dropped.
-    pub fn layer<'a>(&'a self, space: &'a xr::Space) -> SceneLayer<'a> {
-        SceneLayer { views: self.released.lock().unwrap_or_else(PoisonError::into_inner), scene: self, space }
+    /// Takes back the image of this frame and releases it. Call it before the frame ends.
+    pub fn finish(&mut self, gfx: &GraphicsContext) {
+        let Some((image, views)) = self.drawing else { return };
+        let start = Instant::now();
+        let done = self.done.recv_timeout(SCENE_DEADLINE);
+        let took = start.elapsed();
+        let stats = &mut self.stats;
+        stats.frames += 1;
+        stats.spent += took;
+        stats.longest = stats.longest.max(took);
+        match done {
+            Ok(Done { fence: Some(fence) }) => {
+                self.drawing = None;
+                stats.drawn += 1;
+                // The runtime's own fence at the release follows this wait in ALVR's context
+                gfx.make_current();
+                let gl = &gfx.gl_context;
+                let fence = glow::NativeFence(fence as *mut _);
+                unsafe {
+                    gl.wait_sync(fence, 0, glow::TIMEOUT_IGNORED);
+                    gl.delete_sync(fence);
+                }
+                if self.swapchain.release_image().is_ok() {
+                    self.shown = Some(views);
+                }
+            }
+            Ok(Done { fence: None }) => {
+                self.drawing = None;
+                self.held = Some(image);
+            }
+            // The scene is late: the layer shows the last image again, and this one stays with
+            // the scene's thread until it is done
+            Err(_) => stats.late += 1,
+        }
+        if stats.frames % 300 == 0 {
+            let ms = |d: Duration| d.as_secs_f32() * 1000.0;
+            crate::flat::log::line(&format!(
+                "cranvr xr scene: the render thread waited {:.1} ms a frame for the scene, {:.1} ms at most, {:.1} ms for images; {} of 300 drawn, {} late",
+                ms(stats.spent) / 300.0,
+                ms(stats.longest),
+                ms(stats.waited) / 300.0,
+                stats.drawn,
+                stats.late
+            ));
+            *stats = Stats { frames: stats.frames, ..Stats::default() };
+        }
+    }
+
+    /// The layer with the image released last, at the views it was drawn for.
+    pub fn layer<'a>(&'a self, space: &'a xr::Space) -> Option<ProjectionLayerBuilder<'a>> {
+        let views = self.shown.as_ref()?;
+        let view = |side: usize| {
+            let rect = xr::Rect2Di {
+                offset: xr::Offset2Di { x: (side as u32 * self.eye.x) as i32, y: 0 },
+                extent: xr::Extent2Di { width: self.eye.x as i32, height: self.eye.y as i32 },
+            };
+            xr::CompositionLayerProjectionView::new()
+                .pose(views[side].pose)
+                .fov(views[side].fov)
+                .sub_image(xr::SwapchainSubImage::new().swapchain(&self.swapchain).image_array_index(0).image_rect(rect))
+        };
+        Some(ProjectionLayerBuilder::new(space, [view(0), view(1)], Some(ProjectionLayerAlphaConfig { premultiplied: true }), None))
     }
 }
 
 impl Drop for XrScene {
     fn drop(&mut self) {
-        // The thread uses the swapchain's handle, which `swapchain` destroys after this
+        // The thread draws into the swapchain's images, which go with `swapchain` after this
         self.jobs = None;
         if let Some(thread) = self.thread.take() {
             thread.join().ok();
@@ -447,25 +516,18 @@ struct Share {
     context: usize,
 }
 
-/// What the scene's thread did over its last 300 frames.
+/// What the render thread saw over its last 300 frames with the scene.
 #[derive(Default)]
 struct Stats {
     frames: u32,
     drawn: u32,
+    late: u32,
     spent: Duration,
     longest: Duration,
     waited: Duration,
 }
 
-fn run(
-    share: Share,
-    mut swapchain: ManuallyDrop<xr::Swapchain<xr::OpenGlEs>>,
-    images: Vec<u32>,
-    eye: UVec2,
-    flip: bool,
-    jobs: Receiver<Job>,
-    released: &Released,
-) -> Result<(), String> {
+fn run(share: Share, images: Vec<u32>, eye: UVec2, flip: bool, jobs: Receiver<Job>, done: Sender<Done>) -> Result<(), String> {
     let start = Instant::now();
     let egl = unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required() }.map_err(|e| e.to_string())?;
     let (display, config, shared) = unsafe {
@@ -549,59 +611,27 @@ fn run(
     let (eyes, shapes, places) = states.get().ok_or("the scene did not compose")?;
     crate::flat::log::line(&format!("cranvr xr scene: ready in {:?}, {}x{}, flip {flip}", start.elapsed(), size.width, size.height));
 
-    let mut stats = Stats::default();
-    let mut held = None;
-    loop {
-        let image = match held.take() {
-            Some(image) => image,
-            None => {
-                let start = Instant::now();
-                let image = swapchain.acquire_image().map_err(|e| format!("acquire: {e}"))?;
-                swapchain.wait_image(xr::Duration::INFINITE).map_err(|e| format!("wait: {e}"))?;
-                stats.waited += start.elapsed();
-                image
-            }
-        };
-        // The newest eyes and shapes, taken once the image is ready
-        let Ok(mut job) = jobs.recv() else { break };
-        while let Ok(newer) = jobs.try_recv() {
-            job = newer;
-        }
-        let start = Instant::now();
+    let gl = unsafe { glow::Context::from_loader_function(|name| lookup(name)) };
+    while let Ok(mut job) = jobs.recv() {
         eyes.set(Eyes { eyes: Some([Eye::of(&job.views[0]), Eye::of(&job.views[1])]) });
         shapes.set(std::mem::take(&mut job.shapes));
         places.set(std::mem::take(&mut job.places));
-        let (texture, view) = &textures[image as usize];
-        let drew = guest.draw(texture, view).unwrap_or_else(|e| {
+        let (texture, view) = &textures[job.image as usize];
+        let drawn = guest.draw(texture, view).unwrap_or_else(|e| {
             error!("cranvr xr scene: {e}");
             false
         });
-        if drew {
-            device.poll(wgpu::PollType::wait_indefinitely()).ok();
-            let mut views = released.lock().unwrap_or_else(PoisonError::into_inner);
-            swapchain.release_image().map_err(|e| format!("release: {e}"))?;
-            *views = Some(job.views);
-        } else {
-            held = Some(image);
-        }
-        let took = start.elapsed();
-        stats.frames += 1;
-        stats.drawn += drew as u32;
-        stats.spent += took;
-        stats.longest = stats.longest.max(took);
-        if stats.frames <= 3 {
-            crate::flat::log::line(&format!("cranvr xr scene: frame {} took {took:?}", stats.frames));
-        }
-        if stats.frames % 300 == 0 {
-            let ms = |d: Duration| d.as_secs_f32() * 1000.0;
-            crate::flat::log::line(&format!(
-                "cranvr xr scene: {:.1} ms a frame over 300 frames, {:.1} ms at most, {:.1} ms a frame waiting for images, {} drawn",
-                ms(stats.spent) / 300.0,
-                ms(stats.longest),
-                ms(stats.waited) / 300.0,
-                stats.drawn
-            ));
-            stats = Stats { frames: stats.frames, ..Stats::default() };
+        // wgpu learns of finished work here without waiting for it
+        device.poll(wgpu::PollType::Poll).ok();
+        let fence = drawn
+            .then(|| unsafe {
+                let fence = gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0).ok()?;
+                gl.flush();
+                Some(fence.0 as usize)
+            })
+            .flatten();
+        if done.send(Done { fence }).is_err() {
+            break;
         }
     }
     info!("cranvr xr scene: ends");

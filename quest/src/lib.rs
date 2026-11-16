@@ -537,6 +537,14 @@ pub fn entry_point() {
             #[cfg(target_os = "android")]
             desktop_layer.update(&xr_session);
             let stage_space = stream_context.as_ref().map(|s| s.stage_space());
+            // cranvr: the screens' frame comes first. It hands the overlay's scene to its own
+            // thread, which then draws while the eye stream renders here.
+            #[cfg(target_os = "android")]
+            desktop_layer.set_passthrough(passthrough_supported);
+            #[cfg(target_os = "android")]
+            if let Some(space) = &stage_space {
+                desktop_layer.frame(&xr_session, &interaction_context.read(), space, frame_state.predicted_display_time);
+            }
             let (layer, display_time) = if let Some(stream) = &mut stream_context {
                 stream.render(frame_interval, vsync_time)
             } else {
@@ -544,12 +552,6 @@ pub fn entry_point() {
             };
 
             let projection = layer.build();
-            #[cfg(target_os = "android")]
-            desktop_layer.set_passthrough(passthrough_supported);
-            #[cfg(target_os = "android")]
-            if let Some(space) = &stage_space {
-                desktop_layer.frame(&xr_session, &interaction_context.read(), space, frame_state.predicted_display_time);
-            }
             #[cfg(target_os = "android")]
             if desktop_layer.wants_exit() && !exit_requested {
                 exit_requested = true;
@@ -589,6 +591,8 @@ pub fn entry_point() {
                 layers.push(&projection);
             }
             #[cfg(target_os = "android")]
+            desktop_layer.finish_scene();
+            #[cfg(target_os = "android")]
             let (quads, overlay, scene) = match &stage_space {
                 Some(space) => (desktop_layer.layers(space), desktop_layer.overlay_layer(space), desktop_layer.scene_layer(space)),
                 None => (Vec::new(), None, None),
@@ -604,14 +608,11 @@ pub fn entry_point() {
                 layers.push(overlay);
             }
             #[cfg(target_os = "android")]
-            // The scene's layer holds a lock until the frame ends
             #[cfg(target_os = "android")]
-            let scene_builder = scene.as_ref().and_then(|s| s.builder());
+            let scene = scene.as_ref().map(|s| s.build());
             #[cfg(target_os = "android")]
-            let scene_layer = scene_builder.as_ref().map(|s| s.build());
-            #[cfg(target_os = "android")]
-            if let Some(scene_layer) = &scene_layer {
-                layers.push(scene_layer);
+            if let Some(scene) = &scene {
+                layers.push(scene);
             }
             #[cfg(target_os = "android")]
             let display_time = if !quads.is_empty() && desktop_layer.vsync_time { vsync_time } else { display_time };
