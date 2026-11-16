@@ -212,6 +212,12 @@ pub struct PanelState {
 }
 
 /// The rotation that turns a panel's front to `normal` and keeps the panel upright.
+/// The file with the room choice beside the panels' file: panels.txt gets panels-room.txt.
+fn room_file(store: &std::path::Path) -> PathBuf {
+    let stem = store.file_stem().map_or("panels".into(), |s| s.to_string_lossy());
+    store.with_file_name(format!("{stem}-room.txt"))
+}
+
 fn facing(normal: Vec3) -> Quat {
     let flat = Vec3::new(normal.x, 0.0, normal.z).try_normalize().unwrap_or(Vec3::Z);
     Quat::from_rotation_y(flat.x.atan2(flat.z))
@@ -493,6 +499,10 @@ pub struct PanelControl {
     console: Option<(Panel, Menu)>,
     /// Whether the console waits for the head's pose to take its default place
     place_console: bool,
+    /// The user's choice: the room around the screens, or the floor; saved beside the places
+    room: bool,
+    /// Whether the headset can show the room
+    room_available: bool,
     /// The thumbstick moves a panel by its handle; its place is saved when the stick rests
     pushing: bool,
     hands: [Hand; 2],
@@ -521,6 +531,8 @@ impl PanelControl {
             steady_rays: true,
             console: None,
             place_console: false,
+            room: std::fs::read_to_string(room_file(&store)).map_or(true, |t| t.trim() != "floor"),
+            room_available: false,
             pushing: false,
             hands: [Hand::default(); 2],
             head: Pose::default(),
@@ -540,6 +552,39 @@ impl PanelControl {
             }
         }
         out
+    }
+
+    /// Tells whether the headset can show the room; the console offers the choice only then.
+    pub fn set_room_available(&mut self, available: bool) {
+        if self.room_available != available {
+            self.room_available = available;
+            self.refresh_console();
+        }
+    }
+
+    /// Whether the room shows around the screens instead of the floor.
+    pub fn shows_room(&self) -> bool {
+        self.room_available && self.room
+    }
+
+    /// Sets the room or the floor and saves the choice.
+    pub fn choose_room(&mut self, on: bool) {
+        self.room = on;
+        let path = room_file(&self.store);
+        let new = path.with_extension("new");
+        let text = if on { "room\n" } else { "floor\n" };
+        if let Err(e) = std::fs::write(&new, text).and_then(|_| std::fs::rename(&new, &path)) {
+            alvr_common::error!("cranvr: the room choice is not saved in {}: {e}", path.display());
+        }
+        self.refresh_console();
+    }
+
+    /// Shows the room choice on the console, which keeps its place.
+    fn refresh_console(&mut self) {
+        if let Some((panel, menu)) = self.console.as_mut() {
+            menu.room = self.room_available.then_some(self.room);
+            panel.height = console::layout(menu).0;
+        }
     }
 
     /// The press log beside the panels' file: panels.txt gets panels-presses.txt.
@@ -562,7 +607,8 @@ impl PanelControl {
 
     /// Takes the host's menu for the console. The console shows from the first menu on, at its
     /// saved place or below and ahead of the head.
-    pub fn set_menu(&mut self, menu: Menu) {
+    pub fn set_menu(&mut self, mut menu: Menu) {
+        menu.room = self.room_available.then_some(self.room);
         let (height, _) = console::layout(&menu);
         match &mut self.console {
             Some((panel, shown)) => {
@@ -736,6 +782,7 @@ impl PanelControl {
 
         let mut out = Output::default();
         let mut moved = false;
+        let mut room = None;
         // The right thumbstick brings the panel that the ray points at in front of the user. A
         // click that points at nothing brings the first screen and the console.
         if inputs.stick_click && !self.clicked && self.grab.is_none() {
@@ -810,6 +857,7 @@ impl PanelControl {
                     let items = console.map(|(_, menu)| console::layout(menu).1).unwrap_or_default();
                     match items.get(index as usize).map(|i| &i.kind) {
                         Some(Kind::Button { action: console::Action::Exit, .. }) => out.exit = true,
+                        Some(Kind::Button { action: console::Action::Room(on), .. }) => room = Some(*on),
                         Some(Kind::Button { action, .. }) => out.console.push(action.request()),
                         _ => (),
                     }
@@ -826,6 +874,9 @@ impl PanelControl {
         }
         if moved {
             self.save();
+        }
+        if let Some(on) = room {
+            self.choose_room(on);
         }
 
         // The thumbstick moves a panel away or near while the ray points at its handle
@@ -1347,6 +1398,34 @@ mod tests {
         let saved: Vec<_> = std::fs::read_to_string(&control.store).unwrap().lines().filter_map(Panel::load).collect();
         assert_eq!(saved.len(), 1);
         assert!((saved[0].1.center - control.slots[0].panel.center).length() < 1e-4, "{saved:?}");
+        std::fs::remove_file(&control.store).ok();
+    }
+
+    #[test]
+    fn the_console_switches_to_the_floor_and_the_choice_survives() {
+        let mut control = control("room");
+        std::fs::remove_file(room_file(&control.store)).ok();
+        let streams = [(0, ASPECT, 3840)];
+        control.set_menu(Menu { fps: 120, game_scale: 0.6, ..Default::default() });
+        // no room choice until the headset says it can show the room
+        assert!(!control.shows_room());
+        control.set_room_available(true);
+        assert!(control.shows_room());
+        let (panel, menu) = control.console.clone().unwrap();
+        let (height, items) = console::layout(&menu);
+        assert!((panel.height - height).abs() < 1e-5);
+        let floor = items.iter().find(|i| i.label == "Floor").unwrap();
+        let point = panel.at(floor.center.0, floor.center.1);
+        step(&mut control, &streams, point - ORIGIN, 1.0);
+        step(&mut control, &streams, point - ORIGIN, 0.0);
+        assert!(!control.shows_room());
+        assert_eq!(control.console.as_ref().unwrap().1.room, Some(false));
+        assert!((control.console.as_ref().unwrap().0.center - panel.center).length() < 1e-5);
+        // a new start reads the choice
+        let mut again = PanelControl::new(control.store.clone());
+        again.set_room_available(true);
+        assert!(!again.shows_room());
+        std::fs::remove_file(room_file(&control.store)).ok();
         std::fs::remove_file(&control.store).ok();
     }
 
