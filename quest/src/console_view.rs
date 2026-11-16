@@ -427,8 +427,8 @@ impl ConsoleLayer {
         Ok(Self { thread: ConsoleThread::start(menu.clone())?, picture: None, menu: menu.clone(), look: Look::Idle })
     }
 
-    /// Tells the face what changed and what the ray does on it, and shows its newest picture.
-    /// The actions of the buttons pressed meanwhile.
+    /// Tells the face what changed and what the ray does on it. Shows the face's newest picture.
+    /// Returns the actions of the buttons pressed meanwhile.
     pub fn update(
         &mut self,
         menu: &Menu,
@@ -478,7 +478,9 @@ impl ConsoleLayer {
 }
 
 /// Clears the picture outside its round corners. Cranpose's CPU renderer fills the picture with an
-/// opaque color before it draws, so the face's corners cannot be clear from the composition.
+/// opaque color before it draws, so the face's corners cannot be clear from the composition. The
+/// face covers the whole picture, so a corner pixel's alpha is its share inside the corner: set,
+/// not multiplied, as a later picture redraws only the rows that changed.
 fn round_corners(pixels: &mut [u8], width: u32, height: u32) {
     let r = CORNER.min(width / 2).min(height / 2);
     for y in 0..r {
@@ -487,8 +489,7 @@ fn round_corners(pixels: &mut [u8], width: u32, height: u32) {
             let (dx, dy) = (r as f32 - x as f32 - 0.5, r as f32 - y as f32 - 0.5);
             let coverage = (r as f32 - (dx * dx + dy * dy).sqrt() + 0.5).clamp(0.0, 1.0);
             for (cx, cy) in [(x, y), (width - 1 - x, y), (x, height - 1 - y), (width - 1 - x, height - 1 - y)] {
-                let alpha = &mut pixels[((cy * width + cx) * 4 + 3) as usize];
-                *alpha = (*alpha as f32 * coverage).round() as u8;
+                pixels[((cy * width + cx) * 4 + 3) as usize] = (255.0 * coverage).round() as u8;
             }
         }
     }
@@ -533,6 +534,38 @@ mod tests {
         let middle = pixel(&mut view, (300.0, mm(console::height(&menu)) / 2.0));
         assert_eq!(middle[3], 255, "{middle:?}");
         assert_eq!(pixel(&mut view, (0.5, 0.5))[3], 0);
+    }
+
+    #[test]
+    fn the_round_corners_keep_their_edge_through_later_pictures() {
+        let menu = menu(2, None, None);
+        let mut view = ConsoleView::new(menu.clone()).unwrap();
+        let width = view.picture().unwrap().0;
+        // a pixel on the corner's edge in the fifth row, partly inside
+        let x = (0..width).find(|x| view.pixels[((4 * width + x) * 4 + 3) as usize] > 0).unwrap();
+        let alpha = |view: &ConsoleView| view.pixels[((4 * width + x) * 4 + 3) as usize];
+        let edge = alpha(&view);
+        assert!(edge < 255, "{edge}");
+        let (x, y) = button(&menu, &Action::Fps(72));
+        view.pointer(Pointer::Move(x, y));
+        assert!(view.picture().is_some());
+        view.pointer(Pointer::Leave);
+        assert!(view.picture().is_some());
+        assert_eq!(alpha(&view), edge);
+    }
+
+    #[test]
+    fn the_handle_lights_while_the_ray_is_on_it() {
+        let mut view = ConsoleView::new(menu(1, None, None)).unwrap();
+        view.picture();
+        // the handle's middle, half a handle row below the top margin
+        let middle = (mm(console::WIDTH) / 2.0, mm(console::MARGIN / 2.0 + console::HANDLE_ROW / 2.0));
+        let idle = pixel(&mut view, middle);
+        view.set_handle(Look::Hover);
+        let hover = pixel(&mut view, middle);
+        assert_ne!(idle, hover);
+        view.set_handle(Look::Idle);
+        assert_eq!(pixel(&mut view, middle), idle);
     }
 
     #[test]
