@@ -15,6 +15,7 @@
 // corners and the console's frame, as meshes lit like the overlay's shader lit them.
 
 use crate::graphics::{ProjectionLayerAlphaConfig, ProjectionLayerBuilder};
+use crate::xr_eye::{fitted, scene_direction, scene_transform, tangents, Eye};
 use alvr_common::glam::{Mat4 as GMat4, UVec2, Vec3 as GVec3};
 use alvr_common::{error, info};
 use glow::HasContext;
@@ -38,85 +39,6 @@ use std::{
 
 const GL_SRGB8_ALPHA8: u32 = 0x8C43;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
-/// Scene units per meter: a Cranpose camera cuts away what lies nearer than a 64th of its focal
-/// length in pixels, so the scene is in millimeters
-const UNITS: f32 = 1000.0;
-
-/// An eye as OpenXR gives it: where it is, where it looks and the tangents of its view's edges
-/// (left, right, up, down).
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Eye {
-    position: [f32; 3],
-    orientation: [f32; 4],
-    tangents: [f32; 4],
-}
-
-impl Eye {
-    fn of(view: &xr::View) -> Self {
-        let (p, q, f) = (view.pose.position, view.pose.orientation, view.fov);
-        Self {
-            position: [p.x, p.y, p.z],
-            orientation: [q.x, q.y, q.z, q.w],
-            tangents: [f.angle_left.tan(), f.angle_right.tan(), f.angle_up.tan(), f.angle_down.tan()],
-        }
-    }
-
-    /// The camera that sees the scene as this eye does, in a box of `width` by `height` pixels.
-    /// `flip` turns the picture upside down, for a target whose rows go up.
-    fn camera(&self, width: f32, height: f32, flip: bool) -> Camera {
-        let [l, r, u, d] = self.tangents;
-        let focal_length = (width / (r - l)).min(height / (u - d)).max(1.0);
-        // How far the view's center lies from the box's middle, in focal lengths
-        let (sx, sy) = (-(l + r) * 0.5, (u + d) * 0.5);
-        let q = self.orientation;
-        let right = scene_direction(rotate(q, [1.0, 0.0, 0.0]));
-        let down = scene_direction(rotate(q, [0.0, -1.0, 0.0]));
-        let forward = scene_direction(rotate(q, [0.0, 0.0, -1.0]));
-        let eye = scene_point(self.position);
-        let row = |a: Vec3| [a.x, a.y, a.z, -a.dot(eye)];
-        let z = row(forward);
-        let sheared = |a: Vec3, s: f32| {
-            let r = row(a);
-            [r[0] + s * z[0], r[1] + s * z[1], r[2] + s * z[2], r[3] + s * z[3]]
-        };
-        let (down, sy) = if flip { (down * -1.0, -sy) } else { (down, sy) };
-        Camera {
-            view: Mat4::from_rows([sheared(right, sx), sheared(down, sy), z, [0.0, 0.0, 0.0, 1.0]]),
-            focal_length,
-        }
-    }
-}
-
-/// An OpenXR point in meters as a point of the scene: Cranpose's scene has y down and looks
-/// along +z.
-fn scene_point([x, y, z]: [f32; 3]) -> Vec3 {
-    Vec3::new(x, -y, -z) * UNITS
-}
-
-fn scene_direction([x, y, z]: [f32; 3]) -> Vec3 {
-    Vec3::new(x, -y, -z)
-}
-
-fn rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
-    let (axis, w) = (Vec3::new(q[0], q[1], q[2]), q[3]);
-    let v = Vec3::new(v[0], v[1], v[2]);
-    let t = axis.cross(v) * 2.0;
-    let r = v + t * w + axis.cross(t);
-    [r.x, r.y, r.z]
-}
-
-/// A model matrix of the overlay, in meters, as a transform of the scene.
-fn scene_transform(model: &GMat4) -> [[f32; 4]; 4] {
-    let column = |i: usize| {
-        let c = model.col(i);
-        [c.x * UNITS, -c.y * UNITS, -c.z * UNITS]
-    };
-    let [x, y, z, o] = [column(0), column(1), column(2), column(3)];
-    let a = |v: [f32; 3]| Vec3::new(v[0], v[1], v[2]);
-    // The origin column scales like a point, the axes like directions; both by UNITS
-    Mat4::from_axes(a(x), a(y), a(z), a(o)).rows()
-}
-
 /// The overlay's meshes, made once: the same meshes are equal.
 #[derive(Clone)]
 struct Meshes {
@@ -275,34 +197,39 @@ fn light() -> Light {
 #[composable]
 fn Scene(
     eyes: MutableState<Eyes>,
+    boxes: MutableState<[(f32, f32); 2]>,
     shapes: MutableState<Vec<Shape>>,
     places: MutableState<Vec<[[f32; 4]; 4]>>,
-    eye_size: (f32, f32),
+    cell: (f32, f32),
     flip: bool,
     meshes: Meshes,
 ) {
-    let (width, height) = eye_size;
     Row(Modifier::empty(), RowSpec::default(), move || {
         for side in 0..2 {
             let meshes = meshes.clone();
             key(side, move || {
-                Box(
-                    Modifier::empty().width(width).height(height).scene3d(move || {
-                        let eye = eyes.with(|s| s.eyes.map(|e| e[side]));
-                        let camera = eye.map_or(
-                            Camera::look_at(Vec3::ZERO, Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, -1.0, 0.0), width),
-                            |e| e.camera(width, height, flip),
-                        );
-                        Scene3d { camera, light: Some(light()), eye: None }
-                    }),
-                    BoxSpec::default(),
-                    move || {
-                        for (index, shape) in shapes.get().into_iter().enumerate() {
-                            let meshes = meshes.clone();
-                            key(index, move || Solid(index, shape, places, meshes.clone()));
-                        }
-                    },
-                )
+                // Each eye's box sits in the top left corner of its cell, where the layer reads it
+                Box(Modifier::empty().width(cell.0).height(cell.1), BoxSpec::default(), move || {
+                    let (width, height) = boxes.with(|b| b[side]);
+                    let meshes = meshes.clone();
+                    Box(
+                        Modifier::empty().width(width).height(height).scene3d(move || {
+                            let eye = eyes.with(|s| s.eyes.map(|e| e[side]));
+                            let camera = eye.map_or(
+                                Camera::look_at(Vec3::ZERO, Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, -1.0, 0.0), width),
+                                |e| e.camera(width, height, flip),
+                            );
+                            Scene3d { camera, light: Some(light()), eye: None }
+                        }),
+                        BoxSpec::default(),
+                        move || {
+                            for (index, shape) in shapes.get().into_iter().enumerate() {
+                                let meshes = meshes.clone();
+                                key(index, move || Solid(index, shape, places, meshes.clone()));
+                            }
+                        },
+                    );
+                });
             });
         }
     });
@@ -346,7 +273,11 @@ pub struct XrScene {
 }
 
 impl XrScene {
-    pub fn new(session: &xr::Session<xr::OpenGlEs>, gfx: &GraphicsContext, eye: UVec2) -> Result<Self, String> {
+    /// `eye` is the size of an eye's picture. The cell of each eye in the swapchain keeps its
+    /// height and takes the aspect of the widest of `views`.
+    pub fn new(session: &xr::Session<xr::OpenGlEs>, gfx: &GraphicsContext, eye: UVec2, views: &[xr::View]) -> Result<Self, String> {
+        let aspect = views.iter().map(|v| tangents(v.fov)).map(|[l, r, u, d]| (r - l) / (u - d)).fold(0.0, f32::max);
+        let eye = if aspect > 0.0 { UVec2::new((eye.y as f32 * aspect).ceil() as u32, eye.y) } else { eye };
         gfx.make_current();
         let swapchain = session
             .create_swapchain(&xr::SwapchainCreateInfo {
@@ -496,9 +427,10 @@ impl XrScene {
     pub fn layer<'a>(&'a self, space: &'a xr::Space) -> Option<ProjectionLayerBuilder<'a>> {
         let views = self.shown.as_ref().filter(|_| self.in_view)?;
         let view = |side: usize| {
+            let size = fitted(views[side].fov, self.eye);
             let rect = xr::Rect2Di {
                 offset: xr::Offset2Di { x: (side as u32 * self.eye.x) as i32, y: 0 },
-                extent: xr::Extent2Di { width: self.eye.x as i32, height: self.eye.y as i32 },
+                extent: xr::Extent2Di { width: size.x as i32, height: size.y as i32 },
             };
             xr::CompositionLayerProjectionView::new()
                 .pose(views[side].pose)
@@ -608,22 +540,25 @@ fn run(share: Share, images: Vec<u32>, eye: UVec2, flip: bool, jobs: Receiver<Jo
     let meshes = Meshes::new();
     let states = std::rc::Rc::new(std::cell::Cell::new(None));
     let held = std::rc::Rc::clone(&states);
-    let eye_size = (eye.x as f32, eye.y as f32);
+    let cell = (eye.x as f32, eye.y as f32);
     let mut guest = GuestView::new(&AppSettings::default(), &gpu, FORMAT, size.width, size.height, 1.0, move || {
         let eyes = remember(|| mutableStateOf(Eyes::default())).with(|state| *state);
         let shapes = remember(|| mutableStateOf(Vec::<Shape>::new())).with(|state| *state);
         let places = remember(|| mutableStateOf(Vec::<[[f32; 4]; 4]>::new())).with(|state| *state);
-        held.set(Some((eyes, shapes, places)));
-        Scene(eyes, shapes, places, eye_size, flip, meshes.clone());
+        let boxes = remember(|| mutableStateOf([cell; 2])).with(|state| *state);
+        held.set(Some((eyes, boxes, shapes, places)));
+        Scene(eyes, boxes, shapes, places, cell, flip, meshes.clone());
     })
     .map_err(|e| format!("guest view: {e}"))?;
     guest.shell().renderer().set_transparent_background(true);
-    let (eyes, shapes, places) = states.get().ok_or("the scene did not compose")?;
+    let (eyes, boxes, shapes, places) = states.get().ok_or("the scene did not compose")?;
     crate::flat::log::line(&format!("cranvr xr scene: ready in {:?}, {}x{}, flip {flip}", start.elapsed(), size.width, size.height));
 
     let gl = unsafe { glow::Context::from_loader_function(|name| lookup(name)) };
     while let Ok(mut job) = jobs.recv() {
         eyes.set(Eyes { eyes: Some([Eye::of(&job.views[0]), Eye::of(&job.views[1])]) });
+        // The same boxes as the layer's, from the same views
+        boxes.set(job.views.map(|view| fitted(view.fov, eye).as_vec2().into()));
         shapes.set(std::mem::take(&mut job.shapes));
         places.set(std::mem::take(&mut job.places));
         let (texture, view) = &textures[job.image as usize];
