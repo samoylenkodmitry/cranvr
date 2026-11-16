@@ -30,7 +30,7 @@ openxr = { git = "https://github.com/Ralith/openxrs", rev = "9270509d23dc774b43a
 # cranvr: the console's menu from the host (src/console.rs)
 serde_json = "1"
 # Cranpose at a main commit: the console's face (framebuffer) and the 3D overlay (renderer-wgpu-gles)
-cranpose = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "b1f6ffbfb4473c1d4b833e2e372a3eeebf7e1f86", features = ["framebuffer", "renderer-wgpu-gles"] }
+cranpose = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "d2faaab7022e77b14d6da6e5e3676df11630bfc9", features = ["framebuffer", "renderer-wgpu-gles"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # cranvr: the 3D overlay's GL device, on Cranpose's wgpu
@@ -55,4 +55,4 @@ alvr_graphics = { path = "alvr-graphics-local" }
 
 # cranvr: the wgpu fork that Cranpose's workspace builds from forks/ at the same commit
 [patch.crates-io]
-cranpose-wgpu = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "b1f6ffbfb4473c1d4b833e2e372a3eeebf7e1f86" }
+cranpose-wgpu = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "d2faaab7022e77b14d6da6e5e3676df11630bfc9" }
