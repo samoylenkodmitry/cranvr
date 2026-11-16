@@ -1,0 +1,36 @@
+Subject: [PATCH] runtime: an optional limit of one slice per swapchain (cranvr)
+
+BASALT_MAX_ARRAY_SIZE=1 rejects two-slice swapchains, so a Unity game falls
+back to one draw per eye. SUPERHOT VR renders single pass instanced into two
+slices, and DXMT leaves the second slice empty: the right eye stayed black.
+---
+diff --git a/runtime/pe/swapchain.cpp b/runtime/pe/swapchain.cpp
+index 5318c08..7f4666a 100644
+--- a/runtime/pe/swapchain.cpp
++++ b/runtime/pe/swapchain.cpp
+@@ -16,6 +16,16 @@ constexpr uintptr_t kFirstSwapchainHandle = static_cast<uintptr_t>(0x30000);
+ constexpr uintptr_t kSwapchainHandleStride = static_cast<uintptr_t>(0x10);
+ constexpr uint32_t kSwapchainImageCount = 3;
+ constexpr uint32_t kMaxArraySize = 2;
++
++// cranvr: BASALT_MAX_ARRAY_SIZE=1 rejects two-slice swapchains, as this runtime
++// once did, so a Unity game falls back to one draw per eye. SUPERHOT VR renders
++// single pass instanced into a two-slice swapchain, and DXMT leaves the second
++// slice empty: the right eye stayed black.
++uint32_t maxArraySize() {
++    char value[8]{};
++    const DWORD length = GetEnvironmentVariableA("BASALT_MAX_ARRAY_SIZE", value, sizeof(value));
++    return length == 1 && value[0] == '1' ? 1 : kMaxArraySize;
++}
+ constexpr size_t kMaxSwapchains = 4;
+ 
+ constexpr std::array<DXGI_FORMAT, 2> kSupportedFormats = {
+@@ -160,7 +170,7 @@ XrResult XRAPI_CALL createSwapchain(
+         createInfo->createFlags != 0 || createInfo->usageFlags == 0 ||
+         createInfo->width == 0 || createInfo->height == 0 ||
+         createInfo->width > basalt::kMaxViewWidth || createInfo->height > basalt::kMaxViewHeight ||
+-        createInfo->arraySize == 0 || createInfo->arraySize > kMaxArraySize ||
++        createInfo->arraySize == 0 || createInfo->arraySize > maxArraySize() ||
+         createInfo->faceCount != 1 || createInfo->mipCount != 1 ||
+         createInfo->sampleCount != 1) {
+         return XR_ERROR_VALIDATION_FAILURE;
