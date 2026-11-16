@@ -74,6 +74,7 @@
 
 use crate::{
     desktop::{Capture, CaptureSpec, Pointer},
+    status,
     virtual_display::DisplayProcess,
 };
 use alvr_common::{info, warn};
@@ -106,6 +107,12 @@ const MSG_PAUSE: u8 = 16;
 const MSG_QUALITY: u8 = 17;
 const MSG_ADD: u8 = 18;
 const MSG_CLOSE: u8 = 19;
+/// Host to app: the console's menu as JSON: the cranvr app's vr-menu.json with "status" added
+const MSG_MENU: u8 = 22;
+/// App to host: a console button's request as JSON, for the cranvr app
+const MSG_CONSOLE: u8 = 23;
+/// How often the host looks for a new menu
+const MENU_EVERY: Duration = Duration::from_secs(1);
 const MSG_INSET_CONFIG: u8 = 7;
 const MSG_INSET_FRAME: u8 = 8;
 const MSG_INSET_CLOSED: u8 = 9;
@@ -258,6 +265,7 @@ enum Command {
     Quality(u8, u8),
     Add,
     Close(u8),
+    Console(Vec<u8>),
 }
 
 /// One panel's display, capture and encoder.
@@ -390,6 +398,7 @@ fn read_loop(mut stream: TcpStream, commands: Sender<Command>) {
             (MSG_QUALITY, [id, quality, ..]) => Command::Quality(*id, *quality),
             (MSG_ADD, _) => Command::Add,
             (MSG_CLOSE, [id, ..]) => Command::Close(*id),
+            (MSG_CONSOLE, bytes) => Command::Console(bytes.to_vec()),
             _ => continue,
         };
         if commands.send(command).is_err() {
@@ -411,8 +420,18 @@ fn send_loop(
     let mut next_id = 1u8;
     let mut inset: Option<Inset> = None;
     let start = Instant::now();
+    let (mut menu_at, mut menu_sent) = (Instant::now() - MENU_EVERY, None);
     while !stop.load(Ordering::Relaxed) {
         captured.recv_timeout(Duration::from_millis(10)).ok();
+
+        if menu_at.elapsed() >= MENU_EVERY {
+            menu_at = Instant::now();
+            let menu = menu();
+            if menu.is_some() && menu != menu_sent {
+                write_message(stream, MSG_MENU, menu.as_deref().unwrap_or_default())?;
+                menu_sent = menu;
+            }
+        }
 
         while let Ok(command) = commands.try_recv() {
             match command {
@@ -455,6 +474,14 @@ fn send_loop(
                     }
                 }
                 Command::Add => warn!("Desktop layer: {MAX_PANELS} panels at most"),
+                Command::Console(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    Ok(serde_json::Value::Object(mut request)) => {
+                        info!("Desktop layer: the console asks for {}", serde_json::Value::Object(request.clone()));
+                        request.insert("type".into(), "vr_request".into());
+                        status::emit(serde_json::Value::Object(request));
+                    }
+                    _ => warn!("Desktop layer: a console request that is no JSON object"),
+                },
                 Command::Close(id) => {
                     if id != 0 && panels.iter().any(|p| p.id == id) {
                         panels.retain(|p| p.id != id);
@@ -533,6 +560,33 @@ fn send_loop(
         update_inset(stream, &mut inset, look, panels, (notify, flipper, start))?;
     }
     Ok(())
+}
+
+/// The console's menu: the cranvr app's vr-menu.json, with the stream's state as "status". None
+/// without the app's file: the console then stays away.
+fn menu() -> Option<Vec<u8>> {
+    use serde_json::{json, Value};
+    let bytes = std::fs::read(status::menu_file()?).ok()?;
+    let Ok(Value::Object(mut menu)) = serde_json::from_slice::<Value>(&bytes) else { return None };
+    let headset = status::latest("headset").filter(|h| h["connected"] == true);
+    let stats = status::latest("stats");
+    let game = status::latest("game").filter(|g| g["connected"] == true);
+    let round = |v: &Value| v.as_f64().map(|n| (n * 10.0).round() / 10.0);
+    menu.insert(
+        "status".into(),
+        json!({
+            "refresh": headset.as_ref().and_then(|h| round(&h["fps"])),
+            "fps": stats.as_ref().and_then(|s| round(&s["fps"])),
+            "game_fps": stats.as_ref().and_then(|s| s["game_frames"].as_f64()).map(|f| f / 5.0),
+            "latency_ms": stats.as_ref().and_then(|s| round(&s["latency"]["total_ms"])),
+            // The game's program file, by which the console finds its name
+            "game": game.as_ref().map(|g| match g["program"].as_str() {
+                Some(path) => path.rsplit(['\\', '/']).next().unwrap_or(path),
+                None => g["name"].as_str().unwrap_or("a game"),
+            }),
+        }),
+    );
+    serde_json::to_vec(&Value::Object(menu)).ok()
 }
 
 /// Whether panels get the sharp inset: `CRANVR_DESKTOP_INSET=1`.

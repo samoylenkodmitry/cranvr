@@ -24,11 +24,16 @@
 // hands: a list such as "add,quality:0:1,pause:1:1,close:1" (quality and pause take the panel
 // and the value).
 //
+// debug.cranvr.console_test sends one console request, a JSON object such as
+// {"action":"set","msaa":0}, once the first menu arrives, for tests without hands. "front"
+// instead puts the console straight ahead of the head.
+//
 // debug.cranvr.layer_flags picks the compositor's filters for the desktop layer: "ss" for
 // supersampling, "sharp" for sharpening, "ss,sharp" (the default) for both, "none" for neither.
 
 use crate::{
     bar::BarLayer,
+    console::{Menu, CONSOLE_ID},
     flat::property,
     graphics::{ProjectionLayerAlphaConfig, ProjectionLayerBuilder},
     interaction::{ButtonAction, InteractionContext},
@@ -89,6 +94,10 @@ const MSG_CLOSE: u8 = 19;
 const MSG_INSET_CONFIG: u8 = 7;
 const MSG_INSET_FRAME: u8 = 8;
 const MSG_INSET_CLOSED: u8 = 9;
+/// Host to app: the console's menu as JSON (see console.rs)
+const MSG_MENU: u8 = 22;
+/// App to host: a console button's request as JSON
+const MSG_CONSOLE: u8 = 23;
 
 const GL_SRGB8_ALPHA8: u32 = 0x8C43;
 
@@ -138,6 +147,8 @@ struct Shared {
     cursor: Mutex<Option<(u8, f32, f32, bool, Instant)>>,
     /// Frames decoded since the last log line
     decoded: AtomicU32,
+    /// The host's newest menu for the console, not taken yet
+    menu: Mutex<Option<Vec<u8>>>,
 }
 
 /// Sends the codec to the decoder thread, which then uses it alone.
@@ -178,6 +189,8 @@ pub struct DesktopLayer {
     host_states: HashMap<u8, (bool, u8)>,
     /// Requests from debug.cranvr.panel_test, not sent yet
     test_commands: Vec<Command>,
+    /// A request from debug.cranvr.console_test, sent once the console has its first menu
+    console_test: Option<String>,
     /// Each panel's bar layer
     bars: HashMap<u8, BarLayer>,
     /// The sharp inset over the panel that the head points at: the panel, its picture, the
@@ -247,6 +260,7 @@ impl DesktopLayer {
             pending: BTreeMap::new(),
             host_states: HashMap::new(),
             test_commands: property::get("panel_test").map(|t| test_commands(&t)).unwrap_or_default(),
+            console_test: property::get("console_test").filter(|t| !t.is_empty()),
             bars: HashMap::new(),
             inset: None,
             inset_pending: None,
@@ -379,7 +393,30 @@ impl DesktopLayer {
         let inputs = Inputs { hands, head, stick_click: button(*RIGHT_THUMBSTICK_CLICK_ID) > 0.5, dt };
         let streams: Vec<(u8, f32, u32)> =
             self.streams.iter().map(|(id, s)| (*id, s.size.0 as f32 / s.size.1.max(1) as f32, s.size.0)).collect();
+        let menu = self.shared.menu.lock().unwrap().take().and_then(|json| Menu::parse(&json));
+        let first_menu = menu.is_some();
+        if let Some(menu) = menu {
+            self.control.set_menu(menu);
+        }
         let mut out = self.control.update(&inputs, &streams);
+        if first_menu {
+            match self.console_test.take() {
+                Some(test) if test == "front" => self.control.console_in_front(),
+                test => out.console.extend(test),
+            }
+        }
+        // The console's requests go to the host over TCP
+        if !out.console.is_empty() {
+            if let Some(writer) = self.shared.writer.lock().unwrap().as_mut() {
+                for request in out.console.drain(..) {
+                    info!("cranvr console: asks the host: {request}");
+                    let mut message = vec![MSG_CONSOLE];
+                    message.extend((request.len() as u32).to_le_bytes());
+                    message.extend(request.as_bytes());
+                    writer.write_all(&message).ok();
+                }
+            }
+        }
         out.commands.append(&mut self.test_commands);
         for (id, (paused, quality)) in &self.host_states {
             self.control.set_state(*id, *paused, *quality);
@@ -504,6 +541,11 @@ impl DesktopLayer {
             return quads;
         }
         let cursor = *self.shared.cursor.lock().unwrap();
+        // The console stands apart from the screens; its frame is in the overlay. The compositor
+        // stacks the layers in this order, so a nearer console comes after the screens.
+        let console = self.bars.get(&CONSOLE_ID).and_then(|bar| bar.layer(space, self.settings.as_ref()));
+        let console_last = self.control.console_nearer();
+        let mut console = console.map(|quad| if console_last { Some(quad) } else { quads.push(quad); None }).flatten();
         for (id, panel) in self.control.panels() {
             let Some(Stream { swapchain, size: (width, height), .. }) = self.streams.get(&id) else { continue };
             let (center, right, up) = (panel.center, panel.right() * panel.width / 2.0, panel.up() * panel.height / 2.0);
@@ -551,8 +593,8 @@ impl DesktopLayer {
                     });
                 }
             }
-            if let Some(bar) = self.bars.get(&id) {
-                quads.push(bar.layer(space, self.settings.as_ref()));
+            if let Some(quad) = self.bars.get(&id).and_then(|bar| bar.layer(space, self.settings.as_ref())) {
+                quads.push(quad);
             }
 
             if let (Some(cursor_swapchain), Some((panel_id, u, v, true, at))) = (&self.cursor_swapchain, cursor) {
@@ -581,6 +623,7 @@ impl DesktopLayer {
                 );
             }
         }
+        quads.extend(console.take());
         quads
     }
 }
@@ -714,6 +757,7 @@ fn serve(mut stream: TcpStream, shared: &Shared) -> std::io::Result<()> {
                 frames.remove(&payload[0]);
                 shared.closed.lock().unwrap().push(payload[0]);
             }
+            MSG_MENU => *shared.menu.lock().unwrap() = Some(payload.to_vec()),
             _ => {}
         }
     }

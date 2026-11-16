@@ -170,6 +170,8 @@ pub struct Model {
     pub tcp_fallback: bool,
     /// The host reported that no UDP stream data arrives, and the window has not acted on it yet
     pub udp_blocked: bool,
+    /// Requests from the console in VR that the window has not run yet
+    pub vr_requests: Vec<Value>,
 }
 
 const LOG_LINES: usize = 200;
@@ -240,6 +242,7 @@ impl Model {
                     self.udp_blocked = true;
                 }
             }
+            Some("vr_request") => self.vr_requests.push(v.clone()),
             Some("stats") => {
                 self.stats = Some(Stats {
                     fps: v["fps"].as_f64().unwrap_or(0.0),
@@ -381,6 +384,31 @@ impl HostLog {
         if let Some(file) = &self.file {
             writeln!(file.lock().unwrap(), "{:.3} {line}", self.started.elapsed().as_secs_f64()).ok();
         }
+    }
+}
+
+/// Writes vr-menu.json for the console in VR: the games and the settings that it offers. The host
+/// reads it, adds the stream's state and sends it to the headset. Writes only on a change.
+pub fn write_vr_menu(settings: &Settings, games: &[crate::steam::Game]) {
+    static WRITTEN: Mutex<String> = Mutex::new(String::new());
+    let games: Vec<Value> = games
+        .iter()
+        .filter_map(|g| {
+            let program = g.exe.as_ref()?.file_name()?.to_string_lossy().to_string();
+            Some(serde_json::json!({"name": g.name, "program": program}))
+        })
+        .collect();
+    let menu = serde_json::json!({
+        "games": games,
+        "fps": settings.fps,
+        "game_scale": settings.game_scale,
+        "msaa": settings.game_msaa_limit,
+        "low_latency": settings.low_latency,
+    })
+    .to_string();
+    let mut written = WRITTEN.lock().unwrap();
+    if *written != menu && fs::write(config_dir().join("vr-menu.json"), &menu).is_ok() {
+        *written = menu;
     }
 }
 

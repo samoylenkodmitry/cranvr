@@ -8,6 +8,7 @@ mod flat;
 mod graphics;
 // cranvr: the desktop panels' places and the controllers that move them; their bars
 mod bar;
+mod console;
 mod panel;
 mod interaction;
 mod lobby;
