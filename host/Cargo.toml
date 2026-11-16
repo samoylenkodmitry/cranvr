@@ -1,0 +1,28 @@
+[package]
+name = "cranvr-host"
+description = "Streams Metal frames from a Mac to a Quest through the ALVR client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+alvr_common.workspace = true
+alvr_filesystem.workspace = true
+alvr_packets.workspace = true
+alvr_session.workspace = true
+alvr_server_io.workspace = true
+alvr_server_core.workspace = true
+cranvr-vt.workspace = true
+serde_json.workspace = true
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-metal = "0.3"
+cranvr-common.workspace = true
+objc2-screen-capture-kit = "0.3"
+objc2-core-media = "0.3"
+objc2-core-foundation = "0.3"
+dispatch2 = "0.3"
+block2 = "0.6"
+objc2-core-graphics = "0.3"
+tokio = { version = "1", default-features = false, features = ["sync"] }
+alvr_events.workspace = true

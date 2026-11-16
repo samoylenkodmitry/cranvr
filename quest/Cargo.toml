@@ -1,0 +1,48 @@
+# cranvr-quest: the Quest client of cranvr. It is ALVR's OpenXR client of tag v20.14.1 (MIT,
+# see LICENSE-ALVR) with its own Android package, dev.cranvr.client, so it installs beside the
+# ALVR app from the Meta store. It speaks ALVR's v20 protocol unchanged. Native mode will change
+# the protocol here and in the host together.
+#
+# Build the APK with scripts/build-quest.sh. This crate is its own workspace: the host's builds
+# do not touch it.
+[workspace]
+
+[package]
+name = "cranvr-quest"
+version = "20.14.1"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "cranvr_quest"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+alvr_common = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+alvr_client_core = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+alvr_graphics = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+alvr_packets = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+alvr_session = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+alvr_system_info = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+
+openxr = { git = "https://github.com/Ralith/openxrs", rev = "9270509d23dc774b43a8b7289e8adf69fcac6828" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6", features = ["native-activity"] }
+jni = "0.21"
+libc = "0.2"
+ndk-context = "0.1"
+# cranvr: the window display (src/flat)
+glow = "0.16"
+khronos-egl = { version = "6", features = ["dynamic"] }
+ndk = { version = "0.9", features = ["api-level-26", "media"] }
+serde_json = "1"
+
+[profile.release]
+debug = false
+strip = true
+
+# cranvr: ALVR's graphics crate with a shader fix for Mali GPUs (see alvr-graphics-local)
+[patch."https://github.com/alvr-org/ALVR"]
+alvr_graphics = { path = "alvr-graphics-local" }

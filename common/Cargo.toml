@@ -1,0 +1,8 @@
+[package]
+name = "cranvr-common"
+description = "Code shared by the cranvr host and clients"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

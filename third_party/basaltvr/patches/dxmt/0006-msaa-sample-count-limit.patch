@@ -1,0 +1,96 @@
+Subject: [PATCH] d3d11: an optional limit on MSAA sample counts (cranvr)
+
+DXMT_MAX_SAMPLE_COUNT=N reports sample counts above N as unsupported in
+CheckMultisampleQualityLevels, so a game that checks picks a lower count.
+DXMT_CLAMP_SAMPLE_COUNT=1 also creates any 2D texture that asks for more than
+N samples with N samples. Each Metal pass stores every sample to memory, so
+4x MSAA costs far more under DXMT than on a Windows GPU: Beat Saber at 4x ran
+at 91 fps on a base M5, at 2x at 119 fps.
+---
+diff --git a/src/d3d11/d3d11_device.cpp b/src/d3d11/d3d11_device.cpp
+index 6a8caca..1b70ee0 100644
+--- a/src/d3d11/d3d11_device.cpp
++++ b/src/d3d11/d3d11_device.cpp
+@@ -25,9 +25,40 @@
+ #include <memory>
+ #include "d3d11_4.h"
+ #include "util_win32_compat.h"
++#include "util_env.hpp"
++#include <cstdlib>
+ 
+ namespace dxmt {
+ 
++/*
++ * cranvr: a limit on MSAA sample counts for games under Wine.
++ *
++ * DXMT_MAX_SAMPLE_COUNT=N reports every sample count above N as unsupported,
++ * so a game that checks CheckMultisampleQualityLevels picks N or fewer.
++ * DXMT_CLAMP_SAMPLE_COUNT=1 also gives N samples to a texture that asks for
++ * more, for a game that does not check. Each Metal pass stores every sample
++ * to memory, so 4x MSAA costs a game far more here than on a Windows GPU.
++ */
++static UINT
++CranvrMaxSampleCount() {
++  static const UINT count = [] {
++    const std::string value = env::getEnvVar("DXMT_MAX_SAMPLE_COUNT");
++    const UINT n = value.empty() ? 0 : (UINT)std::strtoul(value.c_str(), nullptr, 10);
++    if (n == 1 || n == 2 || n == 4 || n == 8) {
++      WARN("cranvr: MSAA limited to ", n, " samples");
++      return n;
++    }
++    return 0u;
++  }();
++  return count;
++}
++
++static bool
++CranvrClampSampleCount() {
++  static const bool clamp = env::getEnvVar("DXMT_CLAMP_SAMPLE_COUNT") == "1";
++  return clamp;
++}
++
+ const GUID kRenderdocUUID = {0xa7aa6116,
+                              0x9c8d,
+                              0x4bba,
+@@ -821,6 +852,13 @@ public:
+     // seems some pixel format doesn't support MSAA
+     // https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf
+ 
++    if (CranvrMaxSampleCount() && SampleCount > CranvrMaxSampleCount()) {
++      static bool s_shown = false;
++      if (!std::exchange(s_shown, true))
++        WARN("cranvr: reported ", SampleCount, "x MSAA as unsupported");
++      return S_OK;
++    }
++
+     if (GetMTLDevice().supportsTextureSampleCount(SampleCount)) {
+       *pNumQualityLevels = 1; // always 1: in metal there is no concept of
+                               // Quality Level (so is it in vulkan iirc)
+@@ -840,6 +878,27 @@ public:
+     if ((pDesc->MiscFlags & D3D11_RESOURCE_MISC_TILED))
+       return E_INVALIDARG; // not supported yet
+ 
++    D3D11_TEXTURE2D_DESC1 limited;
++    if (CranvrMaxSampleCount() && pDesc->SampleDesc.Count > CranvrMaxSampleCount()) {
++      static bool s_shown = false;
++      const bool first = !std::exchange(s_shown, true);
++      if (CranvrClampSampleCount()) {
++        if (first)
++          WARN("cranvr: gave a ", pDesc->SampleDesc.Count, "x MSAA texture ", CranvrMaxSampleCount(), " samples");
++        limited = *pDesc;
++        limited.SampleDesc.Count = CranvrMaxSampleCount();
++        limited.SampleDesc.Quality = 0;
++        pDesc = &limited;
++      } else if (first) {
++        WARN("cranvr: the game made a ", pDesc->SampleDesc.Count, "x MSAA texture despite the limit");
++      }
++    }
++    if (CranvrMaxSampleCount() && pDesc->SampleDesc.Count > 1) {
++      static bool s_msaa_shown = false;
++      if (!std::exchange(s_msaa_shown, true))
++        WARN("cranvr: first MSAA texture: ", pDesc->SampleDesc.Count, " samples");
++    }
++
+     try {
+       switch (pDesc->Usage) {
+       case D3D11_USAGE_DEFAULT:

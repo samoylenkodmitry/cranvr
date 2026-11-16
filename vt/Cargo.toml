@@ -1,0 +1,8 @@
+[package]
+name = "cranvr-vt"
+description = "VideoToolbox HEVC encoder and decoder through plain C bindings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

@@ -1,0 +1,51 @@
+Subject: [PATCH] dxmt: a separate resolve pass does not store the samples (cranvr)
+
+A resolve that DXMT cannot fold into the render pass before it runs as its
+own render pass: it loads the multisampled texture, resolves it and stored
+every sample back, although the pass changes none. The store now drops: the
+texture's memory still holds the samples. Beat Saber renders both eyes into
+one two-layer texture and resolves each layer apart, so 7 such passes ran per
+frame, 23% of its GPU time. DXMT_RESOLVE_STORE_SAMPLES=1 brings the store
+back.
+---
+diff --git a/src/dxmt/dxmt_context.cpp b/src/dxmt/dxmt_context.cpp
+index 6181fe4..92339bb 100644
+--- a/src/dxmt/dxmt_context.cpp
++++ b/src/dxmt/dxmt_context.cpp
+@@ -1,4 +1,5 @@
+ #include "dxmt_context.hpp"
++#include "util_env.hpp"
+ #include "Metal.hpp"
+ #include "dxmt_command_queue.hpp"
+ #include "dxmt_deptrack.hpp"
+@@ -11,6 +12,16 @@
+ 
+ namespace dxmt {
+ 
++/*
++ * cranvr: DXMT_RESOLVE_STORE_SAMPLES=1 brings back the store of the samples
++ * in a separate resolve pass.
++ */
++static bool
++CranvrStoreResolvedSamples() {
++  static const bool store = env::getEnvVar("DXMT_RESOLVE_STORE_SAMPLES") == "1";
++  return store;
++}
++
+ ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Device device, InternalCommandLibrary &lib) :
+     emulated_cmd(device, lib, *this),
+     clear_rt_cmd(device, lib, *this),
+@@ -1078,7 +1089,12 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
+         WMT::InitializeRenderPassInfo(info);
+         info.colors[0].texture = data->src.texture();
+         info.colors[0].load_action = WMTLoadActionLoad;
+-        info.colors[0].store_action = WMTStoreActionStoreAndMultisampleResolve;
++        // cranvr: this pass changes no sample, so it need not write the
++        // samples back: the texture's memory still holds them. Beat Saber
++        // runs 7 such passes a frame, 23% of its GPU time.
++        info.colors[0].store_action = CranvrStoreResolvedSamples()
++                                          ? WMTStoreActionStoreAndMultisampleResolve
++                                          : WMTStoreActionMultisampleResolve;
+         info.colors[0].resolve_texture = data->dst.texture();
+ 
+         auto encoder = cmdbuf.renderCommandEncoder(info);

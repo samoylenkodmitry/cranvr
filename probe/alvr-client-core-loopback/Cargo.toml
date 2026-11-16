@@ -1,0 +1,35 @@
+# ALVR's client core (tag v20.14.1, MIT) with changes for cranvr-probe, each marked "cranvr":
+# - the discovery announcer sends from a random UDP port, because on one Mac the server already
+#   holds port 9943 (src/sockets.rs);
+# - on Android the probe runs as a plain program started by adb, with no Java VM: src/headless.rs
+#   replaces the calls that need one;
+# - the probe plays no game sound: it measures it (src/audio_meter.rs).
+# Only cranvr-probe uses this copy; the host and the Quest keep stock ALVR.
+[package]
+name = "alvr_client_core"
+version = "20.14.1"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+alvr_audio = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+alvr_common = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+alvr_graphics = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+alvr_packets = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+alvr_session = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+alvr_sockets = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+alvr_system_info = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+
+app_dirs2 = "2"
+mdns-sd = "0.13"
+rand = "0.9"
+serde = "1"
+serde_json = "1"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.14"
+ndk = { version = "0.9", features = ["api-level-26", "audio", "media"] }
+ndk-context = "0.1"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+env_logger = "0.11"

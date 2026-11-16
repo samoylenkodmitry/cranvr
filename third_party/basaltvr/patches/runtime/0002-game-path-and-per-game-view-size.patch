@@ -1,0 +1,146 @@
+Subject: [PATCH] runtime: name the game and a view size per game (cranvr)
+
+At session creation, before the Hello, the runtime writes its program path
+to game-program.txt next to the control file. cranvr-host reads it when the
+game connects. The control protocol stays as it is.
+
+game-sizes.txt, next to the control file, holds lines "<share> <program>".
+cranvr-host writes one when a game stays below the headset's rate. The
+runtime reads the share for its own program once per process and scales the
+recommended view size by it (even sizes, at least 256 pixels).
+---
+diff --git a/runtime/pe/control.cpp b/runtime/pe/control.cpp
+index 8a27df2..14de261 100644
+--- a/runtime/pe/control.cpp
++++ b/runtime/pe/control.cpp
+@@ -1149,6 +1149,9 @@ void controlSessionCreated(XrSession session, ID3D11Device* device) {
+         return;
+     }
+ 
++    // cranvr: name the game for cranvr-host before the Hello reaches it
++    writeGameProgram();
++
+     char renderer[kMaxRendererLength]{};
+     adapterDescription(device, renderer, sizeof(renderer));
+     const size_t rendererLength = std::strlen(renderer);
+@@ -1608,4 +1611,82 @@ void controlFrameReady(
+     ReleaseSRWLockExclusive(&gControlLock);
+ }
+ 
++// cranvr: the share of the configured view size for this game, from
++// game-sizes.txt next to the control file. cranvr-host writes a line
++// "<share> <program path>" when a game stays below the headset's rate. The
++// share is read once per process, so every call returns the same size even
++// while the host rewrites the file.
++namespace {
++
++float gGameViewScale = 1.0f;
++INIT_ONCE gGameViewScaleOnce = INIT_ONCE_STATIC_INIT;
++
++// A file next to the control file, and this program's path.
++bool siblingAndProgram(const char* name, char (&path)[MAX_PATH], char (&program)[MAX_PATH]) {
++    const DWORD length = GetEnvironmentVariableA("BASALT_CONTROL", path, sizeof(path));
++    const DWORD programLength = GetModuleFileNameA(nullptr, program, sizeof(program));
++    if (length == 0 || length >= sizeof(path) || programLength == 0 || programLength >= sizeof(program)) {
++        return false;
++    }
++    char* slash = std::strrchr(path, '\\');
++    if (slash == nullptr || static_cast<size_t>(slash - path) + 1 + std::strlen(name) >= sizeof(path)) {
++        return false;
++    }
++    std::strcpy(slash + 1, name);
++    return true;
++}
++
++float readGameViewScale() {
++    char path[MAX_PATH]{};
++    char program[MAX_PATH]{};
++    if (!siblingAndProgram("game-sizes.txt", path, program)) {
++        return 1.0f;
++    }
++    FILE* file = std::fopen(path, "r");
++    if (file == nullptr) {
++        return 1.0f;
++    }
++    float found = 1.0f;
++    char line[MAX_PATH + 32];
++    while (std::fgets(line, sizeof(line), file) != nullptr) {
++        line[std::strcspn(line, "\r\n")] = '\0';
++        char* rest = nullptr;
++        const float share = std::strtof(line, &rest);
++        if (rest == line || *rest != ' ') {
++            continue;
++        }
++        if (_stricmp(rest + 1, program) == 0 && share >= 0.3f && share <= 1.0f) {
++            found = share;
++        }
++    }
++    std::fclose(file);
++    return found;
++}
++
++BOOL CALLBACK initGameViewScale(PINIT_ONCE, PVOID, PVOID*) {
++    gGameViewScale = readGameViewScale();
++    return TRUE;
++}
++
++}  // namespace
++
++// cranvr: writes this program's path to game-program.txt next to the control
++// file, where cranvr-host reads it when the game connects.
++void writeGameProgram() {
++    char path[MAX_PATH]{};
++    char program[MAX_PATH]{};
++    if (!siblingAndProgram("game-program.txt", path, program)) {
++        return;
++    }
++    if (FILE* file = std::fopen(path, "w")) {
++        std::fputs(program, file);
++        std::fclose(file);
++    }
++}
++
++float controlGameViewScale() {
++    InitOnceExecuteOnce(&gGameViewScaleOnce, initGameViewScale, nullptr, nullptr);
++    return gGameViewScale;
++}
++
+ }  // namespace basalt
+diff --git a/runtime/pe/control.hpp b/runtime/pe/control.hpp
+index ca75b87..3431f07 100644
+--- a/runtime/pe/control.hpp
++++ b/runtime/pe/control.hpp
+@@ -159,4 +159,12 @@ void controlFrameReady(
+     const ControlFrameView* views,
+     uint32_t viewCount);
+ 
++// cranvr: the share of the configured view size for this game (1 without an
++// entry in game-sizes.txt). Read once per process.
++float controlGameViewScale();
++
++// cranvr: writes this program's path to game-program.txt next to the control
++// file, so cranvr-host can keep a render size per game.
++void writeGameProgram();
++
+ }  // namespace basalt
+diff --git a/runtime/pe/system.cpp b/runtime/pe/system.cpp
+index 7fe3cc3..322010c 100644
+--- a/runtime/pe/system.cpp
++++ b/runtime/pe/system.cpp
+@@ -188,6 +188,16 @@ XrResult XRAPI_CALL enumerateViewConfigurationViews(
+     uint32_t recommendedWidth = kMaxViewWidth;
+     uint32_t recommendedHeight = kMaxViewHeight;
+     controlConfiguredViewSize(&recommendedWidth, &recommendedHeight);
++    // cranvr: a smaller size for a game that could not hold the headset's rate
++    const float share = controlGameViewScale();
++    if (share < 1.0f) {
++        const auto scaled = [share](uint32_t size) {
++            const uint32_t even = static_cast<uint32_t>(size * share / 2.0f + 0.5f) * 2;
++            return even < 256u ? 256u : even;
++        };
++        recommendedWidth = scaled(recommendedWidth);
++        recommendedHeight = scaled(recommendedHeight);
++    }
+     for (uint32_t index = 0; index < kViewCount; ++index) {
+         views[index].recommendedImageRectWidth = recommendedWidth;
+         views[index].maxImageRectWidth = kMaxViewWidth;

@@ -1,0 +1,31 @@
+[workspace]
+members = ["common", "vt", "host", "probe", "app"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# ALVR v20.14.1 matches the ALVR client in the Meta store.
+alvr_common = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+alvr_events = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+alvr_filesystem = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+alvr_packets = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+alvr_session = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+alvr_server_io = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+alvr_server_core = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+alvr_client_core = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+serde_json = "1"
+cranvr-vt = { path = "vt" }
+cranvr-common = { path = "common" }
+
+# Only cranvr-probe depends on the client core: see probe/alvr-client-core-loopback/Cargo.toml.
+# The server core copy keeps ALVR's web API on loopback: see host/alvr-server-core-local/Cargo.toml.
+[patch."https://github.com/alvr-org/ALVR"]
+alvr_client_core = { path = "probe/alvr-client-core-loopback" }
+alvr_server_core = { path = "host/alvr-server-core-local" }
+
+[profile.release]
+debug = 1

@@ -1,0 +1,228 @@
+diff --git a/runtime/pe/basalt_control_protocol.h b/runtime/pe/basalt_control_protocol.h
+index 829bdcd..9bf4d10 100644
+--- a/runtime/pe/basalt_control_protocol.h
++++ b/runtime/pe/basalt_control_protocol.h
+@@ -7,13 +7,15 @@
+  * runtime and the native test daemon; C so both can include it.
+  *
+  * Transport: loopback TCP. The daemon listens on 127.0.0.1 on an ephemeral
+- * port and writes "<port> <token> <per_eye_width> <per_eye_height>\n" to a
++ * port and writes "<port> <token> <per_eye_width> <per_eye_height> [<refresh_hz>]\n" to a
+  * file; the launcher passes that
+  * file's Windows-visible path to the game bottle as BASALT_CONTROL. The
+  * token is 32 lowercase hex characters and must be echoed in Hello.
+  * Width and height are optional for compatibility; when absent or outside
+  * BASALT_CONTROL_{MIN_VIEW_DIMENSION,MAX_VIEW_WIDTH,MAX_VIEW_HEIGHT} (or
+- * odd), the runtime recommends its maximum per-eye size instead.
++ * odd), the runtime recommends its maximum per-eye size instead. The optional
++ * refresh rate (BASALT_CONTROL_{MIN,MAX}_REFRESH_HZ) sets the frame period
++ * that xrWaitFrame paces the game at; without it the runtime uses 72 Hz.
+  *
+  * Framing, all little-endian, no padding (fields are written sequentially,
+  * not as C structs):
+@@ -76,8 +78,11 @@
+ /* Per-eye view size bounds. The maximum is also the runtime's advertised and
+  * accepted swapchain limit. */
+ #define BASALT_CONTROL_MIN_VIEW_DIMENSION 256u
+-#define BASALT_CONTROL_MAX_VIEW_WIDTH 1680u
+-#define BASALT_CONTROL_MAX_VIEW_HEIGHT 1760u
++#define BASALT_CONTROL_MAX_VIEW_WIDTH 2064u
++#define BASALT_CONTROL_MAX_VIEW_HEIGHT 2208u
++#define BASALT_CONTROL_MIN_REFRESH_HZ 60u
++#define BASALT_CONTROL_MAX_REFRESH_HZ 240u
++#define BASALT_CONTROL_DEFAULT_REFRESH_HZ 72u
+ 
+ enum {
+     BASALT_MSG_HELLO = 1,
+diff --git a/runtime/pe/control.cpp b/runtime/pe/control.cpp
+index a62c6ac..8a27df2 100644
+--- a/runtime/pe/control.cpp
++++ b/runtime/pe/control.cpp
+@@ -922,13 +922,14 @@ DWORD WINAPI waiterThreadProc(LPVOID) {
+     }
+ }
+ 
+-// Reads "<port> <token> [<per-eye width> <per-eye height>]" from the
+-// BASALT_CONTROL file.
++// Reads "<port> <token> [<per-eye width> <per-eye height> [<refresh hz>]]"
++// from the BASALT_CONTROL file.
+ bool readControlFile(
+     uint16_t* port,
+     char token[BASALT_CONTROL_TOKEN_LENGTH + 1],
+     uint32_t* viewWidth,
+-    uint32_t* viewHeight) {
++    uint32_t* viewHeight,
++    uint32_t* refreshHz = nullptr) {
+     char path[MAX_PATH]{};
+     const DWORD pathLength =
+         GetEnvironmentVariableA("BASALT_CONTROL", path, sizeof(path));
+@@ -955,11 +956,12 @@ bool readControlFile(
+     unsigned int parsedPort = 0;
+     unsigned int parsedWidth = 0;
+     unsigned int parsedHeight = 0;
++    unsigned int parsedRefresh = 0;
+     char extra = '\0';
+     const int parsed = std::sscanf(
+-        contents, "%u %63s %u %u %c", &parsedPort, tokenBuffer,
+-        &parsedWidth, &parsedHeight, &extra);
+-    if ((parsed != 2 && parsed != 4) ||
++        contents, "%u %63s %u %u %u %c", &parsedPort, tokenBuffer,
++        &parsedWidth, &parsedHeight, &parsedRefresh, &extra);
++    if ((parsed != 2 && parsed != 4 && parsed != 5) ||
+         parsedPort == 0 || parsedPort > 65535 ||
+         std::strlen(tokenBuffer) != BASALT_CONTROL_TOKEN_LENGTH) {
+         return false;
+@@ -967,10 +969,13 @@ bool readControlFile(
+     *port = static_cast<uint16_t>(parsedPort);
+     std::memcpy(token, tokenBuffer, BASALT_CONTROL_TOKEN_LENGTH + 1);
+     if (viewWidth != nullptr) {
+-        *viewWidth = parsed == 4 ? parsedWidth : 0;
++        *viewWidth = parsed >= 4 ? parsedWidth : 0;
+     }
+     if (viewHeight != nullptr) {
+-        *viewHeight = parsed == 4 ? parsedHeight : 0;
++        *viewHeight = parsed >= 4 ? parsedHeight : 0;
++    }
++    if (refreshHz != nullptr) {
++        *refreshHz = parsed == 5 ? parsedRefresh : 0;
+     }
+     return true;
+ }
+@@ -1087,6 +1092,18 @@ bool controlConfiguredViewSize(uint32_t* width, uint32_t* height) {
+     return true;
+ }
+ 
++uint32_t controlConfiguredRefreshHz() {
++    uint16_t port = 0;
++    char token[BASALT_CONTROL_TOKEN_LENGTH + 1]{};
++    uint32_t refresh = 0;
++    if (!readControlFile(&port, token, nullptr, nullptr, &refresh) ||
++        refresh < BASALT_CONTROL_MIN_REFRESH_HZ ||
++        refresh > BASALT_CONTROL_MAX_REFRESH_HZ) {
++        return BASALT_CONTROL_DEFAULT_REFRESH_HZ;
++    }
++    return refresh;
++}
++
+ uint32_t queryTextureIOSurfaceId(ID3D11Texture2D* texture) {
+     uint32_t id = 0;
+     UINT size = sizeof(id);
+diff --git a/runtime/pe/control.hpp b/runtime/pe/control.hpp
+index d96b566..ca75b87 100644
+--- a/runtime/pe/control.hpp
++++ b/runtime/pe/control.hpp
+@@ -32,6 +32,8 @@ bool controlActive(XrSession session);
+ // This is available before session creation so OpenXR system/view queries can
+ // advertise the stream's actual target size to the application.
+ bool controlConfiguredViewSize(uint32_t* width, uint32_t* height);
++// The refresh rate from the control file, or the 72 Hz default.
++uint32_t controlConfiguredRefreshHz();
+ 
+ // Blocks frame production while two submitted frames are still unconsumed by
+ // the daemon (an app that calls xrWaitFrame(N+1) before xrEndFrame(N) can
+diff --git a/runtime/pe/frame.cpp b/runtime/pe/frame.cpp
+index 435de27..798fe2b 100644
+--- a/runtime/pe/frame.cpp
++++ b/runtime/pe/frame.cpp
+@@ -3,6 +3,7 @@
+ #include <windows.h>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cmath>
+ #include <cstdint>
+ #include <cstring>
+@@ -11,7 +12,19 @@
+ 
+ namespace {
+ 
+-constexpr XrDuration kDisplayPeriod = 13'888'889;
++// The headset's frame period, from the control file's refresh rate. Read once:
++// a running game keeps its cadence. (An atomic, not a function-local static:
++// a guarded static would import libwinpthread-1.dll.)
++std::atomic<XrDuration> gDisplayPeriod{0};
++
++XrDuration displayPeriod() {
++    XrDuration period = gDisplayPeriod.load(std::memory_order_relaxed);
++    if (period == 0) {
++        period = 1'000'000'000LL / basalt::controlConfiguredRefreshHz();
++        gDisplayPeriod.store(period, std::memory_order_relaxed);
++    }
++    return period;
++}
+ constexpr size_t kEventCapacity = 8;
+ #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+ #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+@@ -536,22 +549,22 @@ XrResult XRAPI_CALL waitFrame(
+     // time. This preserves the requested average cadence without issuing
+     // catch-up frames when the process misses a whole display period.
+     XrTime nextDeadline = waitDeadline == 0
+-                              ? now + kDisplayPeriod
+-                              : waitDeadline + kDisplayPeriod;
++                              ? now + displayPeriod()
++                              : waitDeadline + displayPeriod();
+     if (nextDeadline <= now) {
+         const XrDuration missed = now - nextDeadline;
+-        nextDeadline += (missed / kDisplayPeriod + 1) * kDisplayPeriod;
++        nextDeadline += (missed / displayPeriod() + 1) * displayPeriod();
+     }
+     gNextWaitDeadline = nextDeadline;
+ 
+     const XrTime predictedDisplayTime = std::max(
+-        now + kDisplayPeriod,
++        now + displayPeriod(),
+         gLastPrediction == 0 ? static_cast<XrTime>(1)
+-                             : gLastPrediction + kDisplayPeriod);
++                             : gLastPrediction + displayPeriod());
+     gLastPrediction = predictedDisplayTime;
+     gWaitToken = true;
+     frameState->predictedDisplayTime = predictedDisplayTime;
+-    frameState->predictedDisplayPeriod = kDisplayPeriod;
++    frameState->predictedDisplayPeriod = displayPeriod();
+     // With the streamer daemon consuming frames, submitted images are
+     // displayed; headless sessions keep telling the app not to render.
+     frameState->shouldRender = controlActive(session) ? XR_TRUE : XR_FALSE;
+diff --git a/runtime/tests/d3d11_runtime_smoke.cpp b/runtime/tests/d3d11_runtime_smoke.cpp
+index 951fab7..2150468 100644
+--- a/runtime/tests/d3d11_runtime_smoke.cpp
++++ b/runtime/tests/d3d11_runtime_smoke.cpp
+@@ -491,16 +491,16 @@ int main(int argc, char** argv) {
+             2, &configurationViewCount, configurationViews);
+     }
+     const uint32_t expectedWidth = expectedViewDimension(
+-        "BASALT_EXPECT_VIEW_WIDTH", 1680);
++        "BASALT_EXPECT_VIEW_WIDTH", 2064);
+     const uint32_t expectedHeight = expectedViewDimension(
+-        "BASALT_EXPECT_VIEW_HEIGHT", 1760);
++        "BASALT_EXPECT_VIEW_HEIGHT", 2208);
+     if (XR_FAILED(result) || configurationViewCount != 2 ||
+         configurationViews[0].recommendedImageRectWidth != expectedWidth ||
+         configurationViews[1].recommendedImageRectWidth != expectedWidth ||
+         configurationViews[0].recommendedImageRectHeight != expectedHeight ||
+         configurationViews[1].recommendedImageRectHeight != expectedHeight ||
+-        configurationViews[0].maxImageRectWidth != 1680 ||
+-        configurationViews[0].maxImageRectHeight != 1760) {
++        configurationViews[0].maxImageRectWidth != 2064 ||
++        configurationViews[0].maxImageRectHeight != 2208) {
+         xrDestroyInstance(instance);
+         return fail("xrEnumerateViewConfigurationViews dimensions", result);
+     }
+diff --git a/runtime/tests/loader_smoke.cpp b/runtime/tests/loader_smoke.cpp
+index 153819a..7fe69c8 100644
+--- a/runtime/tests/loader_smoke.cpp
++++ b/runtime/tests/loader_smoke.cpp
+@@ -131,10 +131,10 @@ int main() {
+     views[1].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
+     result = xrEnumerateViewConfigurationViews(instance, systemId, viewConfiguration,
+                                                2, &viewCount, views);
+-    if (result != XR_SUCCESS || views[0].recommendedImageRectWidth != 1680 ||
+-        views[0].recommendedImageRectHeight != 1760 ||
+-        views[1].recommendedImageRectWidth != 1680 ||
+-        views[1].recommendedImageRectHeight != 1760) {
++    if (result != XR_SUCCESS || views[0].recommendedImageRectWidth != 2064 ||
++        views[0].recommendedImageRectHeight != 2208 ||
++        views[1].recommendedImageRectWidth != 2064 ||
++        views[1].recommendedImageRectHeight != 2208) {
+         std::fprintf(stderr, "FAIL: stereo view dimensions returned %d / %ux%u\n",
+                      result, views[0].recommendedImageRectWidth,
+                      views[0].recommendedImageRectHeight);
