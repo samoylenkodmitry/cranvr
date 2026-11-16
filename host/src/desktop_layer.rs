@@ -27,12 +27,14 @@
 //!   covers what the headset can show of it: a sharper picture after the need held for a
 //!   second, a coarser one after five;
 //! - every capture stops while a game runs, and while the headset sends no reports;
-//! - the panel that the head points at gets a sharp inset: a second stream of only the part of
-//!   its display around where the head points, 1920 x 1080 pixels at the full density that the
-//!   headset can show there. The panel's own picture then needs only half that density. The
-//!   inset moves when the head points a quarter of its size away from its middle. The app shows
-//!   the inset as a layer over the panel. The Quest 3 has no eye tracking, so the head's
-//!   direction stands for the eyes'.
+//! - with `CRANVR_DESKTOP_INSET=1`, the panel that the head points at gets a sharp inset: a
+//!   second stream of only the part of its display around where the head points, 1920 x 1080
+//!   pixels at the full density that the headset can show there. The panel's own picture then
+//!   needs only half that density. The inset moves when the head points a quarter of its size
+//!   away from its middle. The app shows the inset as a layer over the panel. The Quest 3 has no
+//!   eye tracking, so the head's direction stands for the eyes'. The inset is off by default: on
+//!   head turns a worn headset showed it flash pictures of other parts of the display. The app
+//!   places it by the part of the newest decoded frame, which the compositor may not show yet.
 //!
 //! Messages on TCP: one byte of type, four bytes of payload length (little endian), the payload.
 //! - app to host, `HELLO`: the protocol version (u32);
@@ -471,8 +473,10 @@ fn send_loop(
         }
 
         let views = state.views.lock().unwrap().clone();
-        // The panel that the head points at, while it needs more than the coarsest picture
+        // The panel that the head points at, while it needs more than the coarsest picture, for the
+        // inset. Without the inset the panel's own picture takes the whole density.
         let look = (*state.look.lock().unwrap())
+            .filter(|_| inset_enabled())
             .filter(|l| l.4.elapsed() < STALE_VIEW && l.3 as usize > WIDTHS[0] * 5 / 4 && visible)
             .filter(|l| panels.iter().any(|p| p.id == l.0 && !p.paused));
         for panel in panels.iter_mut() {
@@ -531,6 +535,12 @@ fn send_loop(
     Ok(())
 }
 
+/// Whether panels get the sharp inset: `CRANVR_DESKTOP_INSET=1`.
+fn inset_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CRANVR_DESKTOP_INSET").is_ok_and(|v| v == "1"))
+}
+
 /// Opens, moves, closes and sends the inset for `look`.
 fn update_inset(
     stream: &mut TcpStream,
@@ -567,6 +577,7 @@ fn update_inset(
             }
             match Inset::open(panel.id, panel.display_id, rect, notify) {
                 Ok(new) => {
+                    info!("Desktop layer: inset over panel {}", panel.id);
                     let mut config = vec![new.panel];
                     config.extend(new.capture.size.0.to_le_bytes());
                     config.extend(new.capture.size.1.to_le_bytes());
