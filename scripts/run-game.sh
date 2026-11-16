@@ -55,6 +55,9 @@ export WINEPREFIX=${home}/wine/prefix WINEARCH=win64 WINEDEBUG=${WINEDEBUG:--all
 # The runtime reads the control file through Wine's Z: drive, which maps the Mac's root
 export BASALT_CONTROL="Z:${control//\//\\}"
 export DXMT_BASALT_IOSURFACE=1
+# The game's mirror window on the Mac stays empty and costs no GPU time (DXMT patch 0008);
+# CRANVR_MAC_MIRROR=1 draws it
+[[ ${CRANVR_MAC_MIRROR:-0} == 1 ]] || export DXMT_SKIP_PRESENT=1
 # Games may use at most this many MSAA samples (cranvr's DXMT patch 0006): CRANVR_MAX_MSAA, else
 # the app's setting, else 2. 0 leaves it to the game.
 msaa=${CRANVR_MAX_MSAA:-}

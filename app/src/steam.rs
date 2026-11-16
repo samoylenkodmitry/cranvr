@@ -176,6 +176,15 @@ pub fn wine(program: &str) -> Command {
 }
 
 /// `wine` with an MSAA limit for the game: 0 leaves it to the game.
+/// A game's Wine command. A VR game draws into the headset: its mirror window on the Mac stays
+/// empty and costs no GPU time (cranvr's DXMT patch 0008). Steam does not get this: its own
+/// window draws with DXMT too.
+fn game_wine(program: &str) -> Command {
+    let mut command = wine(program);
+    command.env("DXMT_SKIP_PRESENT", "1");
+    command
+}
+
 fn wine_with(program: &str, msaa_limit: u32) -> Command {
     let home = config_dir();
     let control = home.join("runtime-control.txt");
@@ -235,7 +244,7 @@ pub fn play(game: &Game) -> Result<(), String> {
         thread::sleep(Duration::from_secs(5));
     }
     let windows = mac_to_windows(&exe);
-    wine(&windows)
+    game_wine(&windows)
         .current_dir(exe.parent().unwrap_or(Path::new("/")))
         .env("SteamAppId", &game.app_id)
         .env("SteamGameId", &game.app_id)
@@ -251,7 +260,7 @@ pub fn run_program(path: &Path) -> Result<(), String> {
     if !wine_ready() {
         return Err("Set up game support first".into());
     }
-    let mut command = wine(&mac_to_windows(path));
+    let mut command = game_wine(&mac_to_windows(path));
     if let Some(app_id) = backend::steam_app_id(path.parent().unwrap_or(path)) {
         command.env("SteamAppId", &app_id).env("SteamGameId", &app_id);
     }
