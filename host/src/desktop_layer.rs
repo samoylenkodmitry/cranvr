@@ -417,6 +417,7 @@ fn send_loop(
                 Command::Pause(id, paused) => {
                     if let Some(panel) = panels.iter_mut().find(|p| p.id == id) {
                         panel.paused = paused;
+                        info!("Desktop layer: panel {id} {}", if paused { "paused" } else { "runs again" });
                         write_message(stream, MSG_STATE, &panel.state())?;
                     }
                 }

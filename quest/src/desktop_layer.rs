@@ -927,23 +927,9 @@ fn cursor_swapchain(session: &xr::Session<xr::OpenGlEs>, gfx: &GraphicsContext) 
     let index = swapchain.acquire_image().map_err(|e| e.to_string())? as usize;
     swapchain.wait_image(xr::Duration::INFINITE).map_err(|e| e.to_string())?;
     unsafe {
-        let gl = &gfx.gl_context;
         let texture = glow::NativeTexture(NonZeroU32::new(images[index]).ok_or("no texture")?);
-        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-        gl.tex_sub_image_2d(
-            glow::TEXTURE_2D,
-            0,
-            0,
-            0,
-            n as i32,
-            n as i32,
-            glow::RGBA,
-            glow::UNSIGNED_BYTE,
-            glow::PixelUnpackData::Slice(Some(&pixels)),
-        );
-        gl.bind_texture(glow::TEXTURE_2D, None);
-        gl.finish();
+        crate::bar::upload_rgba(&gfx.gl_context, texture, (n as u32, n as u32), &pixels);
+        gfx.gl_context.finish();
     }
     swapchain.release_image().map_err(|e| e.to_string())?;
     Ok(swapchain)

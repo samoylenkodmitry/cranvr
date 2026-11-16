@@ -44,6 +44,41 @@ extern "C" {
     fn CGMainDisplayID() -> u32;
     fn CGDisplayPixelsWide(display: u32) -> usize;
     fn CGDisplayPixelsHigh(display: u32) -> usize;
+    fn CGDisplayCopyDisplayMode(display: u32) -> *const c_void;
+    fn CGDisplayModeGetWidth(mode: *const c_void) -> usize;
+    fn CGDisplayModeGetHeight(mode: *const c_void) -> usize;
+    fn CGDisplayModeGetPixelWidth(mode: *const c_void) -> usize;
+    fn CGDisplayModeGetPixelHeight(mode: *const c_void) -> usize;
+    fn CGDisplayModeRelease(mode: *const c_void);
+    fn CGConfigureDisplayWithDisplayMode(config: *mut c_void, display: u32, mode: *const c_void, options: *const c_void) -> i32;
+}
+
+/// A display's mode as macOS gave it.
+struct DisplayMode(*const c_void);
+
+impl DisplayMode {
+    fn current(display: u32) -> Option<Self> {
+        let mode = unsafe { CGDisplayCopyDisplayMode(display) };
+        (!mode.is_null()).then_some(Self(mode))
+    }
+
+    /// Points and pixels
+    fn size(&self) -> [usize; 4] {
+        unsafe {
+            [
+                CGDisplayModeGetWidth(self.0),
+                CGDisplayModeGetHeight(self.0),
+                CGDisplayModeGetPixelWidth(self.0),
+                CGDisplayModeGetPixelHeight(self.0),
+            ]
+        }
+    }
+}
+
+impl Drop for DisplayMode {
+    fn drop(&mut self) {
+        unsafe { CGDisplayModeRelease(self.0) };
+    }
 }
 
 const CONFIGURE_FOR_APP_ONLY: u32 = 0;
@@ -79,6 +114,7 @@ impl VirtualDisplay {
     /// own. `option` says how long the arrangement lasts.
     fn create_numbered(width: u32, height: u32, refresh_rate: f64, serial: u32, option: u32) -> Result<Self, String> {
         let before: Vec<(u32, CGRect)> = active_displays().into_iter().map(|d| (d, unsafe { CGDisplayBounds(d) })).collect();
+        let modes: Vec<(u32, DisplayMode)> = before.iter().filter_map(|&(d, _)| DisplayMode::current(d).map(|m| (d, m))).collect();
         let display = Self::create_display(width, height, refresh_rate, serial)?;
         // The display comes online a moment after its settings
         for _ in 0..40 {
@@ -87,12 +123,31 @@ impl VirtualDisplay {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        // macOS keeps settings for each set of displays. For a set with this display it may bring
+        // back an old mode of a display that was there: a TV set to 3840 x 2160 at 1x went back
+        // to the scaled 3008 x 1692 mode it had with this display before. Each display gets its
+        // mode back.
+        let changed = |modes: &[(u32, DisplayMode)]| -> Vec<(u32, *const c_void)> {
+            modes
+                .iter()
+                .filter(|(d, m)| DisplayMode::current(*d).is_some_and(|now| now.size() != m.size()))
+                .map(|(d, m)| (*d, m.0))
+                .collect()
+        };
+        for _ in 0..10 {
+            if !changed(&modes).is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let restore = changed(&modes);
         let right = before.iter().map(|(_, b)| (b.origin.x + b.size.x) as i32).max().unwrap_or(0);
         let mut layout: Vec<(u32, i32, i32)> = before.iter().map(|(d, b)| (*d, b.origin.x as i32, b.origin.y as i32)).collect();
         layout.push((display.id, right, 0));
         // A display that macOS does not let us arrange may mirror the main display, and the main
         // display then drops to the virtual display's size: the display goes again
-        apply(&layout, true, option)?;
+        // A mode that macOS refuses must not cost the new display
+        apply(&layout, true, &restore, option).or_else(|_| apply(&layout, true, &[], option))?;
         Ok(display)
     }
 
@@ -204,15 +259,22 @@ fn active_displays() -> Vec<u32> {
 }
 
 fn configure(origins: &[(u32, i32, i32)]) -> Result<(), String> {
-    apply(origins, false, CONFIGURE_FOR_APP_ONLY)
+    apply(origins, false, &[], CONFIGURE_FOR_APP_ONLY)
 }
 
-/// Moves the displays to `origins`; with `unmirror` every display also stops mirroring.
-fn apply(origins: &[(u32, i32, i32)], unmirror: bool, option: u32) -> Result<(), String> {
+/// Moves the displays to `origins` and sets the `modes`; with `unmirror` every display also stops
+/// mirroring.
+fn apply(origins: &[(u32, i32, i32)], unmirror: bool, modes: &[(u32, *const c_void)], option: u32) -> Result<(), String> {
     unsafe {
         let mut config = std::ptr::null_mut();
         if CGBeginDisplayConfiguration(&mut config) != 0 {
             return Err("macOS refused a display configuration".into());
+        }
+        for &(display, mode) in modes {
+            if CGConfigureDisplayWithDisplayMode(config, display, mode, std::ptr::null()) != 0 {
+                CGCancelDisplayConfiguration(config);
+                return Err(format!("macOS refused the earlier mode of display {display}"));
+            }
         }
         if unmirror {
             for &(display, _, _) in origins {

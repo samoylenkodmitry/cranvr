@@ -216,24 +216,44 @@ fn upload(swapchain: &mut xr::Swapchain<xr::OpenGlEs>, gfx: &GraphicsContext, (w
     let index = swapchain.acquire_image().map_err(|e| e.to_string())? as usize;
     swapchain.wait_image(xr::Duration::INFINITE).map_err(|e| e.to_string())?;
     unsafe {
-        let gl = &gfx.gl_context;
         let texture = glow::NativeTexture(NonZeroU32::new(images[index]).ok_or("no texture")?);
-        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-        gl.tex_sub_image_2d(
-            glow::TEXTURE_2D,
-            0,
-            0,
-            0,
-            w as i32,
-            h as i32,
-            glow::RGBA,
-            glow::UNSIGNED_BYTE,
-            glow::PixelUnpackData::Slice(Some(bytes)),
-        );
-        gl.bind_texture(glow::TEXTURE_2D, None);
+        upload_rgba(&gfx.gl_context, texture, (w, h), bytes);
     }
     swapchain.release_image().map_err(|e| e.to_string())
+}
+
+/// Writes tightly packed RGBA rows into `texture`, bottom row first.
+///
+/// wgpu's GLES backend shares this context. It sets `UNPACK_ROW_LENGTH` and `UNPACK_IMAGE_HEIGHT`
+/// for its own uploads and leaves them set, and its barriers can leave a pixel buffer bound. The
+/// bar picture then came out skewed and torn on the headset: OpenGL read its rows with the row
+/// length of some other texture, or read from that buffer. So every unpack setting goes back to
+/// its default here first.
+#[cfg(target_os = "android")]
+pub(crate) unsafe fn upload_rgba(gl: &glow::Context, texture: glow::NativeTexture, (w, h): (u32, u32), bytes: &[u8]) {
+    debug_assert_eq!(bytes.len(), (w * h * 4) as usize);
+    gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
+    gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+    gl.pixel_store_i32(glow::UNPACK_IMAGE_HEIGHT, 0);
+    gl.pixel_store_i32(glow::UNPACK_SKIP_ROWS, 0);
+    gl.pixel_store_i32(glow::UNPACK_SKIP_PIXELS, 0);
+    gl.pixel_store_i32(glow::UNPACK_SKIP_IMAGES, 0);
+    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+    gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+    gl.tex_sub_image_2d(
+        glow::TEXTURE_2D,
+        0,
+        0,
+        0,
+        w as i32,
+        h as i32,
+        glow::RGBA,
+        glow::UNSIGNED_BYTE,
+        glow::PixelUnpackData::Slice(Some(bytes)),
+    );
+    gl.bind_texture(glow::TEXTURE_2D, None);
+    // wgpu expects OpenGL's default alignment
+    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
 }
 
 #[cfg(test)]
