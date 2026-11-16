@@ -10,21 +10,29 @@
 #   cmake -S runtime --preset mingw-release && cmake --build runtime/build
 #
 # Usage: scripts/setup-wine.sh BASALTVR_DIR
+#        scripts/setup-wine.sh GAME_SUPPORT_DIR   (an unpacked archive from package-game-support.sh)
 # The stack goes to $CRANVR_HOME/wine (default: ~/Library/Application Support/cranvr/wine).
 # Run it again to update the stack; the prefix and its installed games stay.
 
 set -euo pipefail
 
 if (( $# != 1 )); then
-    print -u2 "usage: scripts/setup-wine.sh BASALTVR_DIR"
+    print -u2 "usage: scripts/setup-wine.sh BASALTVR_DIR|GAME_SUPPORT_DIR"
     exit 2
 fi
-basalt=${1:A}/runtime
 home=${CRANVR_HOME:-$HOME/Library/Application Support/cranvr}
 stack=${home}/wine
-source_wine="${basalt}/build/dxmt/toolchain/wine-11.10/Wine Devel.app/Contents/Resources/wine"
-fork=${basalt}/build/dxmt/fork-install
-runtime_bin=${basalt}/build/bin
+if [[ -x ${1:A}/engine/bin/wine && -f ${1:A}/runtime/basalt_openxr.dll ]]; then
+    # An unpacked game support archive: Wine with DXMT in place, DXMT's DLLs, the runtime
+    source_wine=${1:A}/engine
+    fork=${1:A}/dxmt
+    runtime_bin=${1:A}/runtime
+else
+    basalt=${1:A}/runtime
+    source_wine="${basalt}/build/dxmt/toolchain/wine-11.10/Wine Devel.app/Contents/Resources/wine"
+    fork=${basalt}/build/dxmt/fork-install
+    runtime_bin=${basalt}/build/bin
+fi
 
 for f in "${source_wine}/bin/wine" "${fork}/x86_64-windows/d3d11.dll" "${fork}/x86_64-unix/winemetal.so" \
          "${runtime_bin}/basalt_openxr.dll" "${runtime_bin}/loader_smoke.exe"; do

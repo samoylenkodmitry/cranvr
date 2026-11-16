@@ -63,6 +63,22 @@ pub fn signed_in() -> bool {
     fs::read_to_string(steam_dir().join("config/loginusers.vdf")).is_ok_and(|t| t.contains("AccountName"))
 }
 
+/// Whether Rosetta 2 is installed: Wine's macOS build is Intel code.
+pub fn rosetta_ready() -> bool {
+    Path::new("/Library/Apple/usr/libexec/oah/libRosettaRuntime").exists()
+}
+
+/// Installs Rosetta 2. macOS asks for an administrator's password in its own dialog.
+pub fn install_rosetta() -> Result<(), String> {
+    let script = "do shell script \"/usr/sbin/softwareupdate --install-rosetta --agree-to-license\" with administrator privileges";
+    let output = Command::new("/usr/bin/osascript").args(["-e", script]).output().map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!("Rosetta did not install: {}", String::from_utf8_lossy(&output.stderr).trim()))
+    }
+}
+
 pub fn running() -> bool {
     Command::new("pgrep").args(["-if", "steam\\\\steam\\.exe"]).output().is_ok_and(|o| !o.stdout.is_empty())
 }

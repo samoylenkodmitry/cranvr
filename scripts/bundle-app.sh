@@ -22,7 +22,7 @@ app=${root}/target/release/cranvr.app
 rm -rf "${app}"
 mkdir -p "${app}/Contents/MacOS" "${app}/Contents/Resources/scripts"
 cp target/release/cranvr target/release/cranvr-host "${app}/Contents/MacOS/"
-cp scripts/setup-wine.sh scripts/setup-steam.sh scripts/run-game.sh "${app}/Contents/Resources/scripts/"
+cp scripts/setup-wine.sh scripts/setup-steam.sh scripts/install-game-support.sh scripts/run-game.sh "${app}/Contents/Resources/scripts/"
 version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
 
 cat > "${app}/Contents/Info.plist" <<EOF
