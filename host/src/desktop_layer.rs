@@ -114,6 +114,8 @@ const MSG_MENU: u8 = 22;
 const MSG_CONSOLE: u8 = 23;
 /// How often the host looks for a new menu
 const MENU_EVERY: Duration = Duration::from_secs(1);
+/// How often the layer checks that its displays still draw
+const DISPLAYS_EVERY: Duration = Duration::from_secs(1);
 const MSG_INSET_CONFIG: u8 = 7;
 const MSG_INSET_FRAME: u8 = 8;
 const MSG_INSET_CLOSED: u8 = 9;
@@ -369,7 +371,7 @@ fn run(ip: IpAddr, display_id: u32, state: &LayerState, stop: &AtomicBool) -> Re
         // The display can leave after the host started, as when Meta's Remote Desktop adds its
         // own display and macOS mirrors the TV onto it. The main display shows the desktop then.
         Err(e) => {
-            let main = unsafe { screen_capture::main_display()?.displayID() };
+            let main = screen_capture::main_display_id();
             if main == display_id {
                 return Err(e);
             }
@@ -404,6 +406,48 @@ fn run(ip: IpAddr, display_id: u32, state: &LayerState, stop: &AtomicBool) -> Re
     })
 }
 
+/// Moves the first panel to the main display when its display stops drawing, as when Meta's
+/// Remote Desktop adds its own display and macOS mirrors the TV onto it. Closes an added panel
+/// whose display left. A capture of a display that left otherwise fails for good. A display
+/// counts as gone when two checks in a row miss it: a new display can take a moment to draw.
+fn follow_displays(
+    stream: &mut TcpStream,
+    panels: &mut Vec<Panel>,
+    notify: &SyncSender<()>,
+    state: &LayerState,
+    missing: &mut Vec<u32>,
+) -> Result<(), String> {
+    let active = screen_capture::active_displays();
+    let missed_before = std::mem::take(missing);
+    if active.is_empty() {
+        return Ok(());
+    }
+    missing.extend(panels.iter().map(|p| p.display_id).filter(|d| !active.contains(d)));
+    let gone: Vec<u32> = missing.iter().copied().filter(|d| missed_before.contains(d)).collect();
+    if gone.is_empty() {
+        return Ok(());
+    }
+    let mut closed = Vec::new();
+    for panel in panels.iter_mut().filter(|p| gone.contains(&p.display_id)) {
+        let main = screen_capture::main_display_id();
+        if panel.id != 0 {
+            closed.push(panel.id);
+        } else if main != panel.display_id && active.contains(&main) {
+            warn!("Desktop layer: display {} stopped drawing; panel 0 shows the main display {main}", panel.display_id);
+            panel.display_id = main;
+            panel.reopen(panel.level, notify)?;
+            write_message(stream, MSG_CONFIG, &panel.config())?;
+        }
+    }
+    for id in closed {
+        panels.retain(|p| p.id != id);
+        write_message(stream, MSG_CLOSED, &[id])?;
+        warn!("Desktop layer: the display of panel {id} left; the panel closed");
+    }
+    *state.displays.lock().unwrap() = panels.iter().map(|p| (p.id, p.display_id)).collect();
+    Ok(())
+}
+
 /// Turns the app's messages into commands for the send loop. Ends when the connection closes.
 fn read_loop(mut stream: TcpStream, commands: Sender<Command>) {
     while let Ok((kind, payload)) = read_message(&mut stream) {
@@ -435,8 +479,14 @@ fn send_loop(
     let mut inset: Option<Inset> = None;
     let start = Instant::now();
     let (mut menu_at, mut menu_sent) = (Instant::now() - MENU_EVERY, None);
+    let (mut displays_at, mut missing) = (Instant::now(), Vec::new());
     while !stop.load(Ordering::Relaxed) {
         captured.recv_timeout(Duration::from_millis(10)).ok();
+
+        if displays_at.elapsed() >= DISPLAYS_EVERY {
+            displays_at = Instant::now();
+            follow_displays(stream, panels, notify, state, &mut missing)?;
+        }
 
         if menu_at.elapsed() >= MENU_EVERY {
             menu_at = Instant::now();

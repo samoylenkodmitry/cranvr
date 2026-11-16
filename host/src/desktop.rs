@@ -104,6 +104,8 @@ extern "C" {
     fn AXIsProcessTrusted() -> bool;
 }
 
+/// The wait after a failed start or stop of a capture before the next try
+const RETRY_AFTER: std::time::Duration = std::time::Duration::from_millis(200);
 const K_CV_PIXEL_FORMAT_32BGRA: u32 = 0x4247_5241;
 /// kCVPixelFormatType_420YpCbCr8BiPlanarFullRange: what the video encoder takes without a conversion
 const K_CV_PIXEL_FORMAT_420_FULL: u32 = 0x3432_3066;
@@ -139,6 +141,9 @@ pub struct Capture {
     pub size: (u32, u32),
     /// The state asked for last. A failed stop or start turns it back, so the next call retries.
     running: Arc<std::sync::atomic::AtomicBool>,
+    /// When a start or stop failed last. The next try waits RETRY_AFTER: ScreenCaptureKit kept
+    /// pipes open for each failed start, and a display that left made the host try every 10 ms.
+    failed_at: Arc<Mutex<Option<std::time::Instant>>>,
     /// YUV, cursor
     format: (bool, bool),
     fps: std::sync::atomic::AtomicI32,
@@ -216,6 +221,7 @@ impl Capture {
             aspect: width as f32 / height.max(1) as f32,
             size: (width as u32, height as u32),
             running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            failed_at: Arc::new(Mutex::new(None)),
             format: (yuv, cursor),
             fps: std::sync::atomic::AtomicI32::new(fps),
             source: Mutex::new(source),
@@ -250,14 +256,20 @@ impl Capture {
     /// Stops or restarts the capture. A stopped capture costs the Mac nothing, and `latest` keeps
     /// the last frame. The call does not wait for ScreenCaptureKit.
     pub fn set_running(&self, run: bool) {
-        if self.running.swap(run, std::sync::atomic::Ordering::Relaxed) == run {
+        if self.running.load(std::sync::atomic::Ordering::Relaxed) == run {
             return;
         }
+        if self.failed_at.lock().unwrap().is_some_and(|at| at.elapsed() < RETRY_AFTER) {
+            return;
+        }
+        self.running.store(run, std::sync::atomic::Ordering::Relaxed);
         // A start right after a stop may fail while the stop still runs
         let running = Arc::clone(&self.running);
+        let failed_at = Arc::clone(&self.failed_at);
         let done = block2::RcBlock::new(move |error: *mut objc2_foundation::NSError| {
             // The first few failures go to the log: the retries come every few milliseconds
             static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            *failed_at.lock().unwrap() = (!error.is_null()).then(std::time::Instant::now);
             if !error.is_null() {
                 running.store(!run, std::sync::atomic::Ordering::Relaxed);
                 if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {

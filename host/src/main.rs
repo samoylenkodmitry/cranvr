@@ -257,7 +257,29 @@ fn parse_size(text: &str) -> Option<(u32, u32)> {
     Some((w.parse().ok()?, h.parse().ok()?))
 }
 
+/// Lets the host keep more files open than the 256 that macOS allows by default. A leak of pipes
+/// in ScreenCaptureKit once took all 256, and the desktop layer then sent no frames.
+fn raise_file_limit() {
+    #[repr(C)]
+    struct Limit {
+        current: u64,
+        max: u64,
+    }
+    extern "C" {
+        fn getrlimit(resource: i32, limit: *mut Limit) -> i32;
+        fn setrlimit(resource: i32, limit: *const Limit) -> i32;
+    }
+    const RLIMIT_NOFILE: i32 = 8;
+    const WANTED: u64 = 10240;
+    let mut limit = Limit { current: 0, max: 0 };
+    if unsafe { getrlimit(RLIMIT_NOFILE, &mut limit) } == 0 && limit.current < WANTED {
+        limit.current = WANTED.min(limit.max);
+        unsafe { setrlimit(RLIMIT_NOFILE, &limit) };
+    }
+}
+
 fn main() {
+    raise_file_limit();
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("--display-helper") {
         virtual_display::helper_main(&args[2..]);
