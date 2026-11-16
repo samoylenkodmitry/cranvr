@@ -604,10 +604,14 @@ pub fn entry_point() {
                 layers.push(overlay);
             }
             #[cfg(target_os = "android")]
-            let scene = scene.as_ref().map(|s| s.build());
+            // The scene's layer holds a lock until the frame ends
             #[cfg(target_os = "android")]
-            if let Some(scene) = &scene {
-                layers.push(scene);
+            let scene_builder = scene.as_ref().and_then(|s| s.builder());
+            #[cfg(target_os = "android")]
+            let scene_layer = scene_builder.as_ref().map(|s| s.build());
+            #[cfg(target_os = "android")]
+            if let Some(scene_layer) = &scene_layer {
+                layers.push(scene_layer);
             }
             #[cfg(target_os = "android")]
             let display_time = if !quads.is_empty() && desktop_layer.vsync_time { vsync_time } else { display_time };

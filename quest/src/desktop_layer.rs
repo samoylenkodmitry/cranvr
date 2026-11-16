@@ -652,8 +652,8 @@ impl DesktopLayer {
     }
 
     /// The overlay's layer when Cranpose draws it.
-    pub fn scene_layer<'a>(&'a self, space: &'a xr::Space) -> Option<ProjectionLayerBuilder<'a>> {
-        self.scene.as_ref()?.layer(space)
+    pub fn scene_layer<'a>(&'a self, space: &'a xr::Space) -> Option<crate::xr_scene::SceneLayer<'a>> {
+        Some(self.scene.as_ref()?.layer(space))
     }
 
     /// The overlay with the controllers, their rays and the handle, over all other layers.

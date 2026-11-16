@@ -2,12 +2,12 @@
 //
 // A thread of its own holds the Cranpose composition and a GL context of its own, in the share
 // group of ALVR's context: Cranpose's wgpu never touches ALVR's GL state. The layer's swapchain is
-// two eyes wide. The render thread acquires an image and hands it to the scene's thread with the
-// eyes' views; the scene's thread draws both eyes and waits for the GPU; the render thread then
-// releases the image and shows it with the views it was drawn for. One image is in flight at a
-// time, so the render thread never waits for the scene. Cranpose draws only when the scene looks
-// different. An image it did not draw into holds an older picture, so the render thread keeps it
-// for the next frame instead of showing it.
+// two eyes wide. The scene's thread owns its images: it acquires one and waits until the
+// compositor no longer reads it, takes the newest eyes and shapes from the render thread, draws
+// both eyes, waits for the GPU and releases the image. The render thread never waits for the
+// scene. It shows the image released last, with the views it was drawn for. Cranpose draws only
+// when the scene looks different. An image it did not draw into holds an older picture, so the
+// thread keeps it for the next frame instead of releasing it.
 //
 // The scene shows the overlay's draws (panel.rs): the controllers, their rays, the panels'
 // corners and the console's frame, as meshes lit like the overlay's shader lit them.
@@ -23,12 +23,15 @@ use khronos_egl as egl;
 use openxr as xr;
 use std::{
     ffi::c_void,
+    mem::ManuallyDrop,
     num::NonZeroU32,
     sync::{
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
-        Arc,
+        Arc, Mutex, MutexGuard, PoisonError,
     },
-    time::Instant,
+    thread::JoinHandle,
+    time::{Duration, Instant},
 };
 
 const GL_SRGB8_ALPHA8: u32 = 0x8C43;
@@ -257,7 +260,7 @@ fn Solid(index: usize, shape: Shape, places: MutableState<Vec<[[f32; 4]; 4]>>, m
 
 /// The eyes that the scene shows.
 #[derive(Clone, Debug, Default, PartialEq)]
-struct Shown {
+struct Eyes {
     eyes: Option<[Eye; 2]>,
 }
 
@@ -269,7 +272,7 @@ fn light() -> Light {
 
 #[composable]
 fn Scene(
-    eyes: MutableState<Shown>,
+    eyes: MutableState<Eyes>,
     shapes: MutableState<Vec<Shape>>,
     places: MutableState<Vec<[[f32; 4]; 4]>>,
     eye_size: (f32, f32),
@@ -303,33 +306,55 @@ fn Scene(
     });
 }
 
-/// A frame for the scene's thread: the image to draw into, the eyes and the shapes.
+/// A frame for the scene's thread: the eyes and the shapes.
 struct Job {
-    image: u32,
     views: [xr::View; 2],
     shapes: Vec<Shape>,
     places: Vec<[[f32; 4]; 4]>,
 }
 
-/// A finished frame: the views its image was drawn for, or `None` when Cranpose saw no change
-/// and left the image as it was.
-struct Done {
-    image: u32,
-    drawn: Option<[xr::View; 2]>,
-}
+/// The views of the image that the scene's thread released last. The thread releases an image
+/// under this lock, and the render thread holds it while it ends a frame with the layer, so the
+/// layer always shows an image with the views it was drawn for.
+type Released = Mutex<Option<[xr::View; 2]>>;
 
 pub struct XrScene {
     /// Whether the scene's thread still runs
-    alive: Arc<std::sync::atomic::AtomicBool>,
-    swapchain: xr::Swapchain<xr::OpenGlEs>,
+    alive: Arc<AtomicBool>,
     eye: UVec2,
-    jobs: Sender<Job>,
-    done: Receiver<Done>,
-    in_flight: bool,
-    /// An acquired image that holds no new picture, for the next frame
-    held: Option<u32>,
-    /// The views of the image released last, which the layer shows
-    shown: Option<[xr::View; 2]>,
+    jobs: Option<Sender<Job>>,
+    released: Arc<Released>,
+    /// The layer's swapchain. The scene's thread acquires and releases its images through a copy
+    /// of the handle; this one destroys the handle after the thread ended.
+    swapchain: xr::Swapchain<xr::OpenGlEs>,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// The scene's layer for one frame. It holds the lock on the released views until it is dropped:
+/// drop it after the frame ends.
+pub struct SceneLayer<'a> {
+    views: MutexGuard<'a, Option<[xr::View; 2]>>,
+    scene: &'a XrScene,
+    space: &'a xr::Space,
+}
+
+impl SceneLayer<'_> {
+    /// The layer with the image released last, or `None` before the first one.
+    pub fn builder(&self) -> Option<ProjectionLayerBuilder<'_>> {
+        let views = self.views.as_ref()?;
+        let eye = self.scene.eye;
+        let view = |side: usize| {
+            let rect = xr::Rect2Di {
+                offset: xr::Offset2Di { x: (side as u32 * eye.x) as i32, y: 0 },
+                extent: xr::Extent2Di { width: eye.x as i32, height: eye.y as i32 },
+            };
+            xr::CompositionLayerProjectionView::new()
+                .pose(views[side].pose)
+                .fov(views[side].fov)
+                .sub_image(xr::SwapchainSubImage::new().swapchain(&self.scene.swapchain).image_array_index(0).image_rect(rect))
+        };
+        Some(ProjectionLayerBuilder::new(self.space, [view(0), view(1)], Some(ProjectionLayerAlphaConfig { premultiplied: true }), None))
+    }
 }
 
 impl XrScene {
@@ -349,6 +374,9 @@ impl XrScene {
             })
             .map_err(|e| e.to_string())?;
         let images = swapchain.enumerate_images().map_err(|e| e.to_string())?;
+        // SAFETY: the handle belongs to `session`. The copy never destroys it, and `Drop` ends
+        // the thread before `swapchain` destroys it.
+        let images_owner = ManuallyDrop::new(unsafe { xr::Swapchain::from_raw(session.clone(), swapchain.as_raw()) });
         let share = Share {
             display: gfx.egl_display.as_ptr() as usize,
             config: gfx.egl_config.as_ptr() as usize,
@@ -356,15 +384,18 @@ impl XrScene {
         };
         // wgpu's GL backend writes rows from the top; OpenXR's GL images run from the bottom
         let flip = !crate::flat::property::get("xr_flip").is_some_and(|v| v == "0");
-        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let running = Arc::clone(&alive);
+        let alive = Arc::new(AtomicBool::new(true));
+        let released = Arc::new(Released::default());
+        let (running, thread_released) = (Arc::clone(&alive), Arc::clone(&released));
         let (jobs, job_receiver) = mpsc::channel();
-        let (done_sender, done) = mpsc::channel();
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("xr-scene".into())
             .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(share, images, eye, flip, job_receiver, done_sender)));
-                running.store(false, std::sync::atomic::Ordering::Relaxed);
+                let images_owner = images_owner;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run(share, images_owner, images, eye, flip, job_receiver, &thread_released)
+                }));
+                running.store(false, Ordering::Relaxed);
                 let message = match result {
                     Ok(Ok(())) => return,
                     Ok(Err(e)) => e,
@@ -378,60 +409,34 @@ impl XrScene {
                 crate::flat::log::line(&format!("cranvr xr scene: stopped: {message}"));
             })
             .map_err(|e| e.to_string())?;
-        Ok(Self { alive, swapchain, eye, jobs, done, in_flight: false, held: None, shown: None })
+        Ok(Self { alive, eye, jobs: Some(jobs), released, swapchain, thread: Some(thread) })
     }
 
     /// Whether the scene's thread still draws.
     pub fn running(&self) -> bool {
-        self.alive.load(std::sync::atomic::Ordering::Relaxed)
+        self.alive.load(Ordering::Relaxed)
     }
 
-    /// Releases a finished image and hands the next one to the scene's thread.
+    /// Hands the eyes and the overlay's draws of this frame to the scene's thread.
     pub fn frame(&mut self, views: &[xr::View], draws: &[OverlayDraw]) {
-        while let Ok(done) = self.done.try_recv() {
-            self.in_flight = false;
-            match done.drawn {
-                Some(views) => {
-                    if self.swapchain.release_image().is_ok() {
-                        self.shown = Some(views);
-                    }
-                }
-                None => self.held = Some(done.image),
-            }
-        }
-        if self.in_flight || views.len() < 2 {
-            return;
-        }
-        let image = match self.held.take() {
-            Some(image) => image,
-            None => {
-                let Ok(image) = self.swapchain.acquire_image() else { return };
-                if self.swapchain.wait_image(xr::Duration::INFINITE).is_err() {
-                    return;
-                }
-                image
-            }
-        };
+        let (Some(jobs), [left, right, ..]) = (&self.jobs, views) else { return };
         let (shapes, places) = shapes(draws);
-        if self.jobs.send(Job { image, views: [views[0], views[1]], shapes, places }).is_ok() {
-            self.in_flight = true;
-        }
+        jobs.send(Job { views: [*left, *right], shapes, places }).ok();
     }
 
-    /// The layer with the image released last, at the views it was drawn for.
-    pub fn layer<'a>(&'a self, space: &'a xr::Space) -> Option<ProjectionLayerBuilder<'a>> {
-        let views = self.shown.as_ref()?;
-        let view = |eye: usize| {
-            let rect = xr::Rect2Di {
-                offset: xr::Offset2Di { x: (eye as u32 * self.eye.x) as i32, y: 0 },
-                extent: xr::Extent2Di { width: self.eye.x as i32, height: self.eye.y as i32 },
-            };
-            xr::CompositionLayerProjectionView::new()
-                .pose(views[eye].pose)
-                .fov(views[eye].fov)
-                .sub_image(xr::SwapchainSubImage::new().swapchain(&self.swapchain).image_array_index(0).image_rect(rect))
-        };
-        Some(ProjectionLayerBuilder::new(space, [view(0), view(1)], Some(ProjectionLayerAlphaConfig { premultiplied: true }), None))
+    /// The layer for this frame. It holds a lock until it is dropped.
+    pub fn layer<'a>(&'a self, space: &'a xr::Space) -> SceneLayer<'a> {
+        SceneLayer { views: self.released.lock().unwrap_or_else(PoisonError::into_inner), scene: self, space }
+    }
+}
+
+impl Drop for XrScene {
+    fn drop(&mut self) {
+        // The thread uses the swapchain's handle, which `swapchain` destroys after this
+        self.jobs = None;
+        if let Some(thread) = self.thread.take() {
+            thread.join().ok();
+        }
     }
 }
 
@@ -442,7 +447,25 @@ struct Share {
     context: usize,
 }
 
-fn run(share: Share, images: Vec<u32>, eye: UVec2, flip: bool, jobs: Receiver<Job>, done: Sender<Done>) -> Result<(), String> {
+/// What the scene's thread did over its last 300 frames.
+#[derive(Default)]
+struct Stats {
+    frames: u32,
+    drawn: u32,
+    spent: Duration,
+    longest: Duration,
+    waited: Duration,
+}
+
+fn run(
+    share: Share,
+    mut swapchain: ManuallyDrop<xr::Swapchain<xr::OpenGlEs>>,
+    images: Vec<u32>,
+    eye: UVec2,
+    flip: bool,
+    jobs: Receiver<Job>,
+    released: &Released,
+) -> Result<(), String> {
     let start = Instant::now();
     let egl = unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required() }.map_err(|e| e.to_string())?;
     let (display, config, shared) = unsafe {
@@ -515,7 +538,7 @@ fn run(share: Share, images: Vec<u32>, eye: UVec2, flip: bool, jobs: Receiver<Jo
     let held = std::rc::Rc::clone(&states);
     let eye_size = (eye.x as f32, eye.y as f32);
     let mut guest = GuestView::new(&AppSettings::default(), &gpu, FORMAT, size.width, size.height, 1.0, move || {
-        let eyes = remember(|| mutableStateOf(Shown::default())).with(|state| *state);
+        let eyes = remember(|| mutableStateOf(Eyes::default())).with(|state| *state);
         let shapes = remember(|| mutableStateOf(Vec::<Shape>::new())).with(|state| *state);
         let places = remember(|| mutableStateOf(Vec::<[[f32; 4]; 4]>::new())).with(|state| *state);
         held.set(Some((eyes, shapes, places)));
@@ -526,40 +549,59 @@ fn run(share: Share, images: Vec<u32>, eye: UVec2, flip: bool, jobs: Receiver<Jo
     let (eyes, shapes, places) = states.get().ok_or("the scene did not compose")?;
     crate::flat::log::line(&format!("cranvr xr scene: ready in {:?}, {}x{}, flip {flip}", start.elapsed(), size.width, size.height));
 
-    let (mut frames, mut drawn) = (0u32, 0u32);
-    let mut spent = std::time::Duration::ZERO;
-    while let Ok(mut job) = jobs.recv() {
-        // Only the newest frame counts
+    let mut stats = Stats::default();
+    let mut held = None;
+    loop {
+        let image = match held.take() {
+            Some(image) => image,
+            None => {
+                let start = Instant::now();
+                let image = swapchain.acquire_image().map_err(|e| format!("acquire: {e}"))?;
+                swapchain.wait_image(xr::Duration::INFINITE).map_err(|e| format!("wait: {e}"))?;
+                stats.waited += start.elapsed();
+                image
+            }
+        };
+        // The newest eyes and shapes, taken once the image is ready
+        let Ok(mut job) = jobs.recv() else { break };
         while let Ok(newer) = jobs.try_recv() {
             job = newer;
         }
         let start = Instant::now();
-        eyes.set(Shown { eyes: Some([Eye::of(&job.views[0]), Eye::of(&job.views[1])]) });
+        eyes.set(Eyes { eyes: Some([Eye::of(&job.views[0]), Eye::of(&job.views[1])]) });
         shapes.set(std::mem::take(&mut job.shapes));
         places.set(std::mem::take(&mut job.places));
-        let (texture, view) = &textures[job.image as usize];
+        let (texture, view) = &textures[image as usize];
         let drew = guest.draw(texture, view).unwrap_or_else(|e| {
             error!("cranvr xr scene: {e}");
             false
         });
         if drew {
             device.poll(wgpu::PollType::wait_indefinitely()).ok();
+            let mut views = released.lock().unwrap_or_else(PoisonError::into_inner);
+            swapchain.release_image().map_err(|e| format!("release: {e}"))?;
+            *views = Some(job.views);
+        } else {
+            held = Some(image);
         }
-        spent += start.elapsed();
-        frames += 1;
-        drawn += drew as u32;
-        if frames <= 3 {
-            crate::flat::log::line(&format!("cranvr xr scene: frame {frames} took {:?}", start.elapsed()));
+        let took = start.elapsed();
+        stats.frames += 1;
+        stats.drawn += drew as u32;
+        stats.spent += took;
+        stats.longest = stats.longest.max(took);
+        if stats.frames <= 3 {
+            crate::flat::log::line(&format!("cranvr xr scene: frame {} took {took:?}", stats.frames));
         }
-        if frames % 300 == 0 {
+        if stats.frames % 300 == 0 {
+            let ms = |d: Duration| d.as_secs_f32() * 1000.0;
             crate::flat::log::line(&format!(
-                "cranvr xr scene: {:.1} ms a frame over {frames} frames, {drawn} of the last 300 drawn",
-                spent.as_secs_f32() * 1000.0 / 300.0
+                "cranvr xr scene: {:.1} ms a frame over 300 frames, {:.1} ms at most, {:.1} ms a frame waiting for images, {} drawn",
+                ms(stats.spent) / 300.0,
+                ms(stats.longest),
+                ms(stats.waited) / 300.0,
+                stats.drawn
             ));
-            (spent, drawn) = (std::time::Duration::ZERO, 0);
-        }
-        if done.send(Done { image: job.image, drawn: drew.then_some(job.views) }).is_err() {
-            break;
+            stats = Stats { frames: stats.frames, ..Stats::default() };
         }
     }
     info!("cranvr xr scene: ends");
