@@ -9,7 +9,13 @@
 use crate::panel::{Bar, Look};
 use alvr_graphics::rasterize_text;
 #[cfg(target_os = "android")]
-use {alvr_graphics::GraphicsContext, glow::HasContext, openxr as xr, std::num::NonZeroU32};
+use {
+    alvr_common::glam::{Quat, Vec3},
+    alvr_graphics::GraphicsContext,
+    glow::HasContext,
+    openxr as xr,
+    std::num::NonZeroU32,
+};
 
 /// The bar picture's pixels per meter: a 4 cm button is 64 pixels tall
 const PIXELS_PER_METER: f32 = 1600.0;
@@ -23,14 +29,12 @@ fn handle_color(look: Look) -> [f32; 4] {
         Look::Idle => [0.75, 0.77, 0.8, 0.6],
         Look::Hover => [1.0, 1.0, 1.0, 0.95],
         Look::Active => [0.45, 0.7, 1.0, 1.0],
-        Look::Label => [0.0; 4],
     }
 }
 
 fn button_color(look: Look) -> [f32; 4] {
     match look {
         Look::Idle => [0.13, 0.14, 0.17, 0.85],
-        Look::Label => [0.0; 4],
         Look::Active => [0.2, 0.42, 0.8, 0.95],
         Look::Hover => [0.36, 0.42, 0.55, 0.95],
     }
@@ -116,9 +120,6 @@ fn draw(bar: &Bar) -> (u32, u32, Vec<u8>) {
     let width = (bar.size.0 * PIXELS_PER_METER).round() as u32;
     let height = (bar.size.1 * PIXELS_PER_METER).round() as u32;
     let mut canvas = Canvas::new(width.max(1), height.max(1));
-    if let Some(color) = bar.background {
-        canvas.round_rect((width as f32 / 2.0, height as f32 / 2.0), (width as f32, height as f32), 0.02 * PIXELS_PER_METER, color);
-    }
     let to_px = |(x, y): (f32, f32)| (width as f32 / 2.0 + x * PIXELS_PER_METER, height as f32 / 2.0 - y * PIXELS_PER_METER);
     let size = |(w, h): (f32, f32)| (w * PIXELS_PER_METER, h * PIXELS_PER_METER);
     let (center, handle_size, look) = bar.handle;
@@ -132,15 +133,92 @@ fn draw(bar: &Bar) -> (u32, u32, Vec<u8>) {
     (canvas.width, canvas.height, canvas.bytes_bottom_up())
 }
 
-/// One bar's quad layer: the swapchain and what it shows.
+/// A picture in a quad layer: its swapchain, its size in pixels and its size in meters.
+#[cfg(target_os = "android")]
+pub struct Quad {
+    swapchain: xr::Swapchain<xr::OpenGlEs>,
+    pixels: (u32, u32),
+    meters: (f32, f32),
+}
+
+#[cfg(target_os = "android")]
+impl Quad {
+    /// Shows `bytes`, RGBA rows from the bottom, `meters` wide and tall. `old` keeps its swapchain
+    /// when the size in pixels stays.
+    pub fn show(
+        old: Option<Self>,
+        session: &xr::Session<xr::OpenGlEs>,
+        gfx: &GraphicsContext,
+        (width, height): (u32, u32),
+        bytes: &[u8],
+        meters: (f32, f32),
+    ) -> Result<Self, String> {
+        let mut swapchain = match old {
+            Some(quad) if quad.pixels == (width, height) => quad.swapchain,
+            _ => {
+                gfx.make_current();
+                session
+                    .create_swapchain(&xr::SwapchainCreateInfo {
+                        create_flags: xr::SwapchainCreateFlags::EMPTY,
+                        usage_flags: xr::SwapchainUsageFlags::SAMPLED | xr::SwapchainUsageFlags::COLOR_ATTACHMENT,
+                        format: GL_SRGB8_ALPHA8,
+                        sample_count: 1,
+                        width,
+                        height,
+                        face_count: 1,
+                        array_size: 1,
+                        mip_count: 1,
+                    })
+                    .map_err(|e| e.to_string())?
+            }
+        };
+        upload(&mut swapchain, gfx, (width, height), bytes)?;
+        Ok(Self { swapchain, pixels: (width, height), meters })
+    }
+
+    /// The quad layer at `center` turned by `orientation`, with the compositor's filters in
+    /// `settings`.
+    pub fn layer<'a>(
+        &'a self,
+        space: &'a xr::Space,
+        settings: Option<&'a xr::sys::CompositionLayerSettingsFB>,
+        center: Vec3,
+        orientation: Quat,
+    ) -> xr::CompositionLayerQuad<'a, xr::OpenGlEs> {
+        let ((width, height), (w, h), (c, q)) = (self.pixels, self.meters, (center, orientation));
+        let quad = xr::CompositionLayerQuad::new()
+            .layer_flags(xr::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA | xr::CompositionLayerFlags::UNPREMULTIPLIED_ALPHA)
+            .space(space)
+            .eye_visibility(xr::EyeVisibility::BOTH)
+            .sub_image(xr::SwapchainSubImage::new().swapchain(&self.swapchain).image_rect(xr::Rect2Di {
+                offset: xr::Offset2Di { x: 0, y: 0 },
+                extent: xr::Extent2Di { width: width as i32, height: height as i32 },
+            }))
+            .pose(xr::Posef {
+                orientation: xr::Quaternionf { x: q.x, y: q.y, z: q.z, w: q.w },
+                position: xr::Vector3f { x: c.x, y: c.y, z: c.z },
+            })
+            .size(xr::Extent2Df { width: w, height: h });
+        match settings {
+            Some(settings) => unsafe {
+                xr::CompositionLayerQuad::from_raw(xr::sys::CompositionLayerQuad {
+                    next: std::ptr::from_ref(settings).cast(),
+                    ..quad.into_raw()
+                })
+            },
+            None => quad,
+        }
+    }
+}
+
+/// One bar's quad layer: its picture and what it shows.
 ///
-/// A picture draws on a thread of its own: the console's took 13 ms on the Mac, which on the
-/// Quest would cost the render thread several frames whenever a button's look changes. The old
-/// picture stays until the new one is ready.
+/// A picture draws on a thread of its own: a bar's picture takes milliseconds, which would cost
+/// the render thread frames whenever a button's look changes. The old picture stays until the
+/// new one is ready.
 #[cfg(target_os = "android")]
 pub struct BarLayer {
-    /// The picture: its swapchain, its size in pixels and its size in meters
-    picture: Option<(xr::Swapchain<xr::OpenGlEs>, (u32, u32), (f32, f32))>,
+    picture: Option<Quad>,
     /// What the picture shows, apart from the bar's place
     shown: String,
     /// A picture being drawn: what it shows, its size in meters and its pixels when done
@@ -158,7 +236,7 @@ impl BarLayer {
         session: &xr::Session<xr::OpenGlEs>,
         gfx: &GraphicsContext,
     ) -> Result<Self, String> {
-        let wanted = format!("{:?}", (bar.size, bar.handle, &bar.buttons, bar.background));
+        let wanted = format!("{:?}", (bar.size, bar.handle, &bar.buttons));
         let mut layer = old.unwrap_or(Self { picture: None, shown: String::new(), drawing: None, bar: bar.clone() });
         layer.bar = bar;
         let done = match layer.drawing.as_ref().map(|(_, _, receiver)| receiver.try_recv()) {
@@ -171,27 +249,7 @@ impl BarLayer {
             _ => None,
         };
         if let Some(((width, height, bytes), shown, meters)) = done {
-            let mut swapchain = match layer.picture.take() {
-                Some((swapchain, size, _)) if size == (width, height) => swapchain,
-                _ => {
-                    gfx.make_current();
-                    session
-                        .create_swapchain(&xr::SwapchainCreateInfo {
-                            create_flags: xr::SwapchainCreateFlags::EMPTY,
-                            usage_flags: xr::SwapchainUsageFlags::SAMPLED | xr::SwapchainUsageFlags::COLOR_ATTACHMENT,
-                            format: GL_SRGB8_ALPHA8,
-                            sample_count: 1,
-                            width,
-                            height,
-                            face_count: 1,
-                            array_size: 1,
-                            mip_count: 1,
-                        })
-                        .map_err(|e| e.to_string())?
-                }
-            };
-            upload(&mut swapchain, gfx, (width, height), &bytes)?;
-            layer.picture = Some((swapchain, (width, height), meters));
+            layer.picture = Some(Quad::show(layer.picture.take(), session, gfx, (width, height), &bytes, meters)?);
             layer.shown = shown;
         }
         // One drawing at a time: a change meanwhile draws after it
@@ -215,30 +273,7 @@ impl BarLayer {
         space: &'a xr::Space,
         settings: Option<&'a xr::sys::CompositionLayerSettingsFB>,
     ) -> Option<xr::CompositionLayerQuad<'a, xr::OpenGlEs>> {
-        let (swapchain, (width, height), (w, h)) = self.picture.as_ref()?;
-        let (c, q) = (self.bar.center, self.bar.orientation);
-        let quad = xr::CompositionLayerQuad::new()
-            .layer_flags(xr::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA | xr::CompositionLayerFlags::UNPREMULTIPLIED_ALPHA)
-            .space(space)
-            .eye_visibility(xr::EyeVisibility::BOTH)
-            .sub_image(xr::SwapchainSubImage::new().swapchain(swapchain).image_rect(xr::Rect2Di {
-                offset: xr::Offset2Di { x: 0, y: 0 },
-                extent: xr::Extent2Di { width: *width as i32, height: *height as i32 },
-            }))
-            .pose(xr::Posef {
-                orientation: xr::Quaternionf { x: q.x, y: q.y, z: q.z, w: q.w },
-                position: xr::Vector3f { x: c.x, y: c.y, z: c.z },
-            })
-            .size(xr::Extent2Df { width: *w, height: *h });
-        Some(match settings {
-            Some(settings) => unsafe {
-                xr::CompositionLayerQuad::from_raw(xr::sys::CompositionLayerQuad {
-                    next: std::ptr::from_ref(settings).cast(),
-                    ..quad.into_raw()
-                })
-            },
-            None => quad,
-        })
+        Some(self.picture.as_ref()?.layer(space, settings, self.bar.center, self.bar.orientation))
     }
 }
 
@@ -296,33 +331,6 @@ mod tests {
     use crate::panel::BarButton;
     use alvr_common::glam::{Quat, Vec3};
 
-    /// The console's picture is the largest one. It is opaque over the whole face, so the
-    /// screens behind the console do not show through it.
-    #[test]
-    fn the_console_picture_is_an_opaque_face() {
-        use crate::console::{layout, Menu};
-        let games = ["Beat Saber", "Google Earth VR"].map(|n| crate::console::Game { name: n.into(), program: format!("{n}.exe") });
-        let menu = Menu { games: games.to_vec(), fps: 120, game_scale: 0.6, msaa: 2, ..Default::default() };
-        let (height, items) = layout(&menu);
-        let bar = Bar {
-            panel: 250,
-            center: Vec3::ZERO,
-            orientation: Quat::IDENTITY,
-            size: (crate::console::WIDTH, height),
-            handle: (crate::console::handle_center(height), (0.2, 0.014), Look::Idle),
-            buttons: items.into_iter().map(|i| BarButton { center: i.center, size: i.size, label: i.label, look: Look::Idle }).collect(),
-            background: Some([0.09, 0.1, 0.12, 1.0]),
-        };
-        let start = std::time::Instant::now();
-        let (w, h, bytes) = draw(&bar);
-        println!("console picture {w}x{h} in {:?}", start.elapsed());
-        assert_eq!((w, h), (960, (height * PIXELS_PER_METER).round() as u32));
-        let alpha = |x: u32, y: u32| bytes[((y * w + x) * 4 + 3) as usize];
-        // the middle, the margins, and the corner outside the round face
-        assert_eq!([alpha(w / 2, h / 2), alpha(w / 2, 2), alpha(2, h / 2)], [255; 3]);
-        assert_eq!(alpha(0, 0), 0);
-    }
-
     #[test]
     fn the_bar_picture_has_the_handle_and_the_buttons() {
         let bar = Bar {
@@ -332,7 +340,6 @@ mod tests {
             size: (0.5, 0.052),
             handle: ((-0.15, 0.0), (0.2, 0.018), Look::Idle),
             buttons: vec![BarButton { center: (0.15, 0.0), size: (0.13, 0.04), label: "Pause".into(), look: Look::Hover }],
-            background: None,
         };
         let (w, h, bytes) = draw(&bar);
         assert_eq!((w, h), (800, 83));

@@ -9,6 +9,7 @@ mod graphics;
 // cranvr: the desktop panels' places and the controllers that move them; their bars
 mod bar;
 mod console;
+mod console_view;
 mod panel;
 mod interaction;
 mod lobby;

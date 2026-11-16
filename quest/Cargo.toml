@@ -29,6 +29,7 @@ alvr_system_info = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" 
 openxr = { git = "https://github.com/Ralith/openxrs", rev = "9270509d23dc774b43a8b7289e8adf69fcac6828" }
 # cranvr: the console's menu from the host (src/console.rs)
 serde_json = "1"
+cranpose = { version = "0.23", features = ["framebuffer"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["native-activity"] }
