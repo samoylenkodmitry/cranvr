@@ -633,7 +633,12 @@ impl PanelControl {
         if let Some(dir) = self.store.parent() {
             std::fs::create_dir_all(dir).ok();
         }
-        std::fs::write(&self.store, text).ok();
+        // A new file renamed over the old one: a file that the app may not write, such as one
+        // pushed by adb, would otherwise keep the old places for good
+        let new = self.store.with_extension("new");
+        if let Err(e) = std::fs::write(&new, text).and_then(|_| std::fs::rename(&new, &self.store)) {
+            alvr_common::error!("cranvr: the panels' places are not saved in {}: {e}", self.store.display());
+        }
     }
 
     /// The panels on show, with their numbers.
@@ -1328,6 +1333,20 @@ mod tests {
         control.update(&Inputs { hands, head: head(), stick_click: true, dt: 0.01 }, &streams);
         let back = control.console.as_ref().unwrap().0;
         assert!((back.center - panel.center).length() < 1e-4, "{back:?}");
+        std::fs::remove_file(&control.store).ok();
+    }
+
+    #[test]
+    fn places_are_saved_over_a_file_that_the_app_may_not_write() {
+        let mut control = control("read-only");
+        std::fs::write(&control.store, "0 0 0 0 0 0 0 1 1\n").unwrap();
+        let mut permissions = std::fs::metadata(&control.store).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&control.store, permissions).unwrap();
+        control.save();
+        let saved: Vec<_> = std::fs::read_to_string(&control.store).unwrap().lines().filter_map(Panel::load).collect();
+        assert_eq!(saved.len(), 1);
+        assert!((saved[0].1.center - control.slots[0].panel.center).length() < 1e-4, "{saved:?}");
         std::fs::remove_file(&control.store).ok();
     }
 
