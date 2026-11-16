@@ -8,9 +8,9 @@
 //
 // Each panel shows one Mac display. Under it lie its handle and its buttons:
 // - The handle is a bar, as in the Quest's own apps: point at it and hold the trigger to carry
-//   the panel along the ray. The thumbstick of that hand pushes it away or pulls it near. While it
-//   moves, the panel turns and tilts to face the headset, and its edges stay level: a panel
-//   carried up above the head looks down at the user.
+//   the panel along the ray. The thumbstick of that hand pushes it away or pulls it near. The
+//   panel keeps its angle to the ray: a turn of the wrist turns, tilts or rolls the panel by as
+//   much. Within LEVEL_SNAP degrees of level its top edge snaps level.
 //   Pointing at the handle without the trigger, the thumbstick moves the panel away or near.
 // - The buttons right of the handle pause and resume the panel's picture, change its quality
 //   (automatic, then 1920, 2560 and 3840 pixels across), add a panel with a new Mac display, and
@@ -18,7 +18,12 @@
 //   own layer, sharp like the panel (see `bars`).
 // A trigger pull turns the controller a little, and the Mac would see a drag instead of a click.
 // A press on the picture therefore holds the point where the ray pointed just before the pull,
-// until the ray moves more than DRAG_ANGLE degrees: then the press drags.
+// until the ray turns more than CLICK_ANGLE degrees in the press's first CLICK_TIME seconds, or
+// more than DRAG_ANGLE degrees later: then the press drags. A shaky hand still clicks.
+// The pointing rays go through a one-euro filter: a resting hand's tremor barely moves them, and a
+// fast turn follows with little lag. The hits, the drawn rays and the cursor use the same rays.
+// Each press on a picture adds a line to panels-presses.txt beside the panels' file: its length in
+// seconds, the ray's largest turn in degrees and whether it dragged, for tuning these numbers.
 // A corner of a panel, just outside the picture, resizes it: point there, hold the trigger and
 // pull. The panel keeps its center and its shape. A click on the right thumbstick brings the
 // panel under the ray, or the first panel, in front of the user.
@@ -56,7 +61,22 @@ const BUTTON_GAP: f32 = 0.012;
 /// The bar's margin around the handle and the buttons
 const BAR_MARGIN: f32 = 0.006;
 /// A press on the picture holds its point until the ray turns this far, in degrees
-const DRAG_ANGLE: f32 = 2.0;
+const DRAG_ANGLE: f32 = 4.0;
+/// In its first CLICK_TIME seconds a press holds its point until the ray turns CLICK_ANGLE degrees
+const CLICK_TIME: f32 = 0.35;
+const CLICK_ANGLE: f32 = 10.0;
+/// The pointing rays' one-euro filter: its cutoff in hertz while the hand rests, and how far the
+/// cutoff rises for each radian per second that the ray turns
+const STEADY_CUTOFF: f32 = 1.0;
+const STEADY_BETA: f32 = 2.0;
+/// The cutoff in hertz of the filter's own estimate of the turning speed
+const SPEED_CUTOFF: f32 = 1.0;
+/// A carried panel follows the hand with this time constant, in seconds
+const CARRY_SMOOTH: f32 = 0.05;
+/// A carried panel whose top edge lies within this many degrees of level snaps level
+const LEVEL_SNAP: f32 = 4.0;
+/// The press log stops growing at this size
+const PRESS_LOG_LIMIT: u64 = 200_000;
 /// A press takes the point where the ray pointed this long before, in seconds: the pull of the
 /// trigger turns the controller
 const PRESS_LOOKBACK: f32 = 0.08;
@@ -69,8 +89,6 @@ const PRESS: f32 = 0.6;
 const RELEASE: f32 = 0.4;
 /// How fast the thumbstick moves a carried panel, as a share of its distance per second
 const PUSH_SPEED: f32 = 1.2;
-/// The steepest tilt of a carried panel, so that its edges never lose the horizon
-const MAX_TILT: f32 = 1.3;
 /// A panel within this angle of the view direction gets the full frame rate
 const CENTER_ANGLE: f32 = 25.0;
 /// The pixels per degree that the host should send: twice what a Quest 3 shows in the middle of
@@ -188,13 +206,53 @@ fn facing(normal: Vec3) -> Quat {
     Quat::from_rotation_y(flat.x.atan2(flat.z))
 }
 
-/// The rotation that turns a panel's front toward `normal`, tilted up or down at most MAX_TILT
-/// radians, with level top and bottom edges.
-fn facing_tilted(normal: Vec3) -> Quat {
-    let flat = Vec3::new(normal.x, 0.0, normal.z);
-    let tilt = normal.y.atan2(flat.length()).clamp(-MAX_TILT, MAX_TILT);
-    // Turning about the panel's own x axis by -tilt points its front up by tilt
-    facing(flat) * Quat::from_rotation_x(-tilt)
+/// `q` with its top edge level when the edge lies within LEVEL_SNAP degrees of level.
+fn level_snap(q: Quat) -> Quat {
+    let (right, normal) = (q * Vec3::X, q * Vec3::Z);
+    let Some(level) = Vec3::Y.cross(normal).try_normalize() else { return q };
+    let roll = normal.dot(right.cross(level)).atan2(right.dot(level));
+    if roll.abs().to_degrees() < LEVEL_SNAP {
+        (Quat::from_axis_angle(normal, roll) * q).normalize()
+    } else {
+        q
+    }
+}
+
+/// A one-euro filter on a controller's pointing direction.
+#[derive(Clone, Copy, Debug, Default)]
+struct AimFilter {
+    dir: Option<Vec3>,
+    /// The turning speed in radians per second, itself filtered
+    speed: f32,
+}
+
+/// The share of the way to the new value that a low-pass filter at `cutoff` hertz goes in `dt`
+fn low_pass(dt: f32, cutoff: f32) -> f32 {
+    let tau = 1.0 / (2.0 * std::f32::consts::PI * cutoff);
+    1.0 / (1.0 + tau / dt)
+}
+
+impl AimFilter {
+    fn apply(&mut self, aim: Pose, dt: f32) -> Pose {
+        let raw = aim.orientation * Vec3::NEG_Z;
+        let Some(prev) = self.dir.filter(|_| dt > 0.0) else {
+            self.dir = Some(raw);
+            return aim;
+        };
+        self.speed += low_pass(dt, SPEED_CUTOFF) * (prev.angle_between(raw) / dt - self.speed);
+        let cutoff = STEADY_CUTOFF + STEADY_BETA * self.speed;
+        let dir = prev.lerp(raw, low_pass(dt, cutoff)).try_normalize().unwrap_or(raw);
+        self.dir = Some(dir);
+        Pose { orientation: (Quat::from_rotation_arc(raw, dir) * aim.orientation).normalize(), position: aim.position }
+    }
+}
+
+/// One press on a picture, for the press log
+#[derive(Clone, Copy, Debug)]
+struct PressRecord {
+    start: f32,
+    turn: f32,
+    dragged: bool,
 }
 
 impl Panel {
@@ -353,6 +411,7 @@ pub struct Hand {
     pub stick_y: f32,
 }
 
+#[derive(Clone)]
 pub struct Inputs {
     /// Left, then right
     pub hands: [Hand; 2],
@@ -383,6 +442,8 @@ enum Grab {
         distance: f32,
         /// The panel's center minus the grabbed point, in the panel's own axes
         offset: Vec3,
+        /// The panel's orientation in the controller's axes
+        relative: Quat,
     },
     Resize,
 }
@@ -404,9 +465,15 @@ pub struct PanelControl {
     clock: f32,
     /// Each hand's recent rays: the time, the point on a picture, the ray's direction
     history: [std::collections::VecDeque<(f32, Option<(u8, f32, f32)>, Vec3)>; 2],
-    /// A press on the picture holds this point while the ray stays within DRAG_ANGLE of this
-    /// direction
-    hold: Option<((u8, f32, f32), Vec3)>,
+    /// A press on the picture holds this point while the ray stays near this direction; the
+    /// press's start
+    hold: Option<((u8, f32, f32), Vec3, f32)>,
+    /// The press on a picture under way
+    press: Option<PressRecord>,
+    /// Each hand's ray filter
+    steady: [AimFilter; 2],
+    /// Whether the rays go through the filter
+    pub steady_rays: bool,
     /// The thumbstick moves a panel by its handle; its place is saved when the stick rests
     pushing: bool,
     hands: [Hand; 2],
@@ -430,11 +497,45 @@ impl PanelControl {
             clock: 0.0,
             history: Default::default(),
             hold: None,
+            press: None,
+            steady: [AimFilter::default(); 2],
+            steady_rays: true,
             pushing: false,
             hands: [Hand::default(); 2],
             head: Pose::default(),
             targets: [None; 2],
             store,
+        }
+    }
+
+    /// The hands with their pointing rays through the filters.
+    fn steadied(&mut self, inputs: &Inputs) -> Inputs {
+        let mut out = inputs.clone();
+        let on = self.steady_rays;
+        for (hand, filter) in out.hands.iter_mut().zip(self.steady.iter_mut()) {
+            match hand.aim {
+                Some(aim) if on => hand.aim = Some(filter.apply(aim, inputs.dt)),
+                _ => *filter = AimFilter::default(),
+            }
+        }
+        out
+    }
+
+    /// The press log beside the panels' file: panels.txt gets panels-presses.txt.
+    fn press_log(&self) -> PathBuf {
+        let stem = self.store.file_stem().map_or("panels".into(), |s| s.to_string_lossy());
+        self.store.with_file_name(format!("{stem}-presses.txt"))
+    }
+
+    /// Adds a press to the press log.
+    fn log_press(&self, press: PressRecord) {
+        use std::io::Write;
+        let path = self.press_log();
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > PRESS_LOG_LIMIT) {
+            return;
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            writeln!(file, "{:.3} {:.2} {}", self.clock - press.start, press.turn, press.dragged as u8).ok();
         }
     }
 
@@ -487,6 +588,8 @@ impl PanelControl {
     /// Moves the panels by the controllers and finds what each controller points at. `streams`
     /// holds the panels on show: number, width over height, picture width in pixels.
     pub fn update(&mut self, inputs: &Inputs, streams: &[(u8, f32, u32)]) -> Output {
+        let steadied = self.steadied(inputs);
+        let inputs = &steadied;
         let head = inputs.head;
         self.head = head;
         self.hands = inputs.hands;
@@ -554,16 +657,17 @@ impl PanelControl {
                 (Some((origin, dir)), Some(slot)) => {
                     let panel = &mut slot.panel;
                     match grab {
-                        Grab::Move { distance, offset } => {
+                        Grab::Move { distance, offset, relative } => {
                             let push = inputs.hands[*hand].stick_y * PUSH_SPEED * inputs.dt * distance.max(0.5);
                             *distance = (*distance + push).clamp(0.3, 8.0);
                             let point = origin + dir * *distance;
-                            // The panel faces the head from where it is going to be
-                            let center = point + panel.orientation * *offset;
-                            let orientation = facing_tilted(head.position - center);
-                            // A little smoothing keeps a far panel from shaking with the hand
-                            panel.orientation = panel.orientation.slerp(orientation, 0.5);
-                            panel.center = panel.center.lerp(point + orientation * *offset, 0.5);
+                            // The panel keeps its angle to the ray: the wrist turns it
+                            let aim = inputs.hands[*hand].aim.map_or(Quat::IDENTITY, |a| a.orientation);
+                            let orientation = level_snap(aim * *relative);
+                            // Smoothing keeps a far panel from shaking with the hand
+                            let a = 1.0 - (-inputs.dt / CARRY_SMOOTH).exp();
+                            panel.orientation = panel.orientation.slerp(orientation, a).normalize();
+                            panel.center = panel.center.lerp(point + orientation * *offset, a);
                         }
                         Grab::Resize => {
                             // The corner follows the ray in the panel's plane; the center stays
@@ -593,7 +697,9 @@ impl PanelControl {
                 (Part::Handle, Some(slot)) => {
                     let point = origin + dir * hit.distance;
                     let offset = slot.panel.orientation.inverse() * (slot.panel.center - point);
-                    self.grab = Some((self.active, hit.panel, Grab::Move { distance: hit.distance, offset }));
+                    let aim = inputs.hands[self.active].aim.map_or(Quat::IDENTITY, |a| a.orientation);
+                    let relative = aim.inverse() * slot.panel.orientation;
+                    self.grab = Some((self.active, hit.panel, Grab::Move { distance: hit.distance, offset, relative }));
                 }
                 (Part::Corner, Some(_)) => self.grab = Some((self.active, hit.panel, Grab::Resize)),
                 (Part::Button(button), Some(slot)) => out.commands.push(match button {
@@ -662,15 +768,25 @@ impl PanelControl {
                     .rev()
                     .find(|e| clock - e.0 >= PRESS_LOOKBACK)
                     .or(history.front())
-                    .and_then(|&(_, point, dir)| point.filter(|p| p.0 == panel).map(|p| (p, dir))),
+                    .and_then(|&(_, point, dir)| point.filter(|p| p.0 == panel).map(|p| (p, dir, clock))),
                 _ => None,
             };
+            self.press = self.screen_press.then_some(PressRecord { start: clock, turn: 0.0, dragged: false });
         } else if !self.pressed[self.active] {
+            if let Some(press) = self.press.take() {
+                self.log_press(press);
+            }
             self.screen_press = false;
             self.hold = None;
         }
-        if let (Some((_, held)), Some(dir)) = (self.hold, dir) {
-            if held.angle_between(dir).to_degrees() > DRAG_ANGLE {
+        if let (Some((_, held, start)), Some(dir)) = (self.hold, dir) {
+            let turn = held.angle_between(dir).to_degrees();
+            let limit = if self.clock - start < CLICK_TIME { CLICK_ANGLE } else { DRAG_ANGLE };
+            if let Some(press) = self.press.as_mut() {
+                press.turn = press.turn.max(turn);
+                press.dragged |= turn > limit;
+            }
+            if turn > limit {
                 self.hold = None;
             }
         }
@@ -679,7 +795,7 @@ impl PanelControl {
             out.trigger = if self.screen_press { hand.trigger } else { 0.0 };
             out.scroll = if on_controls { 0.0 } else { hand.stick_y };
             out.pointer = match (self.hold, target) {
-                (Some((point, _)), _) => Some(point),
+                (Some((point, _, _)), _) => Some(point),
                 (None, Some(Hit { panel, part: Part::Screen { u, v }, .. })) => Some((panel, u, v)),
                 _ => None,
             };
@@ -864,9 +980,11 @@ mod tests {
         path
     }
 
-    /// A control with panel 0 in front of the head
+    /// A control with panel 0 in front of the head. Its rays are not filtered, so a step points
+    /// exactly where it says.
     fn control(name: &str) -> PanelControl {
         let mut control = PanelControl::new(store(name));
+        control.steady_rays = false;
         control.update(&Inputs { hands: [Hand::default(); 2], head: head(), stick_click: false, dt: 0.01 }, &[(0, ASPECT, 3840)]);
         control
     }
@@ -875,7 +993,12 @@ mod tests {
 
     /// The right controller at ORIGIN pointing along `dir`
     fn step(control: &mut PanelControl, streams: &[(u8, f32, u32)], dir: Vec3, trigger: f32) -> Output {
-        let aim = Pose { orientation: Quat::from_rotation_arc(Vec3::NEG_Z, dir.normalize()), position: ORIGIN };
+        step_aim(control, streams, Quat::from_rotation_arc(Vec3::NEG_Z, dir.normalize()), trigger)
+    }
+
+    /// The right controller at ORIGIN turned by `orientation`, wrist roll included
+    fn step_aim(control: &mut PanelControl, streams: &[(u8, f32, u32)], orientation: Quat, trigger: f32) -> Output {
+        let aim = Pose { orientation, position: ORIGIN };
         let hands = [Hand::default(), Hand { aim: Some(aim), grip: None, trigger, stick_y: 0.0 }];
         control.update(&Inputs { hands, head: head(), stick_click: false, dt: 0.01 }, streams)
     }
@@ -915,7 +1038,7 @@ mod tests {
     }
 
     #[test]
-    fn the_handle_carries_the_panel_and_tilts_it_toward_the_head() {
+    fn the_handle_carries_the_panel_at_its_angle_to_the_ray() {
         let mut control = control("carry");
         let streams = [(0, ASPECT, 3840)];
         let p = control.slots[0].panel;
@@ -927,31 +1050,48 @@ mod tests {
         assert_eq!(step(&mut control, &streams, p.center - ORIGIN, 1.0).trigger, 1.0);
         assert_eq!(step(&mut control, &streams, Vec3::Y, 1.0).trigger, 1.0);
         step(&mut control, &streams, Vec3::Y, 0.0);
-        // pointing at the handle neither moves the mouse nor clicks
-        let out = step(&mut control, &streams, p.at(0.0, p.handle_offset()) - ORIGIN, 1.0);
+        // pointing at the handle neither moves the mouse nor clicks; the press grabs the handle
+        let to_handle = Quat::from_rotation_arc(Vec3::NEG_Z, (p.at(0.0, p.handle_offset()) - ORIGIN).normalize());
+        let out = step_aim(&mut control, &streams, to_handle, 1.0);
         assert_eq!((out.pointer, out.trigger), (None, 0.0));
-        // the press grabbed the handle: turning the controller to the left carries the panel
-        for _ in 0..30 {
-            step(&mut control, &streams, Vec3::new(-1.0, 0.0, -1.0), 1.0);
+        let angle = |c: &PanelControl, aim: Quat| (aim * Vec3::NEG_Z).angle_between(c.slots[0].panel.normal());
+        let at_grab = angle(&control, to_handle);
+        // turning the controller to the left carries the panel and turns it by as much
+        let left = Quat::from_rotation_y(0.6) * to_handle;
+        for _ in 0..40 {
+            step_aim(&mut control, &streams, left, 1.0);
         }
         let moved = control.slots[0].panel;
         assert!(moved.center.x < -0.5, "{:?}", moved.center);
-        assert!((head().position - moved.center).normalize().dot(moved.normal()) > 0.99);
-        assert!(moved.right().y.abs() < 1e-4);
-        // carried up above the head, it tilts down to face the head
-        for _ in 0..30 {
-            step(&mut control, &streams, Vec3::new(0.0, 1.0, -1.0), 1.0);
+        assert!((angle(&control, left) - at_grab).abs() < 0.01);
+        assert!(moved.right().y.abs() < 1e-3);
+        // tilting the wrist up tilts the panel up by as much
+        let up = Quat::from_axis_angle(left * Vec3::X, 0.5) * left;
+        for _ in 0..40 {
+            step_aim(&mut control, &streams, up, 1.0);
         }
-        let up = control.slots[0].panel;
-        let facing_head = (head().position - up.center).normalize().dot(up.normal());
-        assert!(up.center.y > 2.2 && up.normal().y < -0.3 && facing_head > 0.99, "{up:?} {facing_head}");
-        assert!(up.right().y.abs() < 1e-4);
-        // the release puts it down and keeps the place
-        step(&mut control, &streams, Vec3::new(0.0, 1.0, -1.0), 0.0);
+        assert!((angle(&control, up) - at_grab).abs() < 0.01);
+        assert!(control.slots[0].panel.normal().y < -0.3, "{:?}", control.slots[0].panel);
+        // a roll of the wrist rolls the panel; a slight roll snaps back level
+        for _ in 0..40 {
+            step_aim(&mut control, &streams, left * Quat::from_rotation_z(0.5), 1.0);
+        }
+        assert!(control.slots[0].panel.right().y.abs() > 0.4, "{:?}", control.slots[0].panel);
+        for _ in 0..40 {
+            step_aim(&mut control, &streams, left * Quat::from_rotation_z(0.04), 1.0);
+        }
+        assert!(control.slots[0].panel.right().y.abs() < 1e-3, "{:?}", control.slots[0].panel);
+        // the release puts it down and keeps the place, roll included
+        for _ in 0..40 {
+            step_aim(&mut control, &streams, left * Quat::from_rotation_z(0.5), 1.0);
+        }
+        step_aim(&mut control, &streams, left * Quat::from_rotation_z(0.5), 0.0);
         let text = std::fs::read_to_string(&control.store).unwrap();
         let (_, kept) = Panel::load(text.lines().next().unwrap()).unwrap();
-        assert!((kept.center - control.slots[0].panel.center).length() < 1e-4);
+        let now = control.slots[0].panel;
+        assert!((kept.center - now.center).length() < 1e-4 && kept.orientation.dot(now.orientation).abs() > 0.9999);
         std::fs::remove_file(&control.store).ok();
+        std::fs::remove_file(control.press_log()).ok();
     }
 
     #[test]
@@ -1015,11 +1155,59 @@ mod tests {
         let pressed = step(&mut control, &streams, at(0.11, 0.09), 1.0);
         assert_eq!((pressed.pointer, pressed.trigger), (Some(before), 1.0));
         assert_eq!(step(&mut control, &streams, at(0.115, 0.085), 1.0).pointer, Some(before));
-        // a larger turn drags
-        let dragged = step(&mut control, &streams, at(0.3, 0.1), 1.0).pointer.unwrap();
-        assert!(dragged.1 > before.1 + 0.05);
-        step(&mut control, &streams, at(0.3, 0.1), 0.0);
+        // early in the press a shake of about 6 degrees still holds the point
+        assert_eq!(step(&mut control, &streams, at(0.22, 0.1), 1.0).pointer, Some(before));
+        assert_eq!(step(&mut control, &streams, at(0.0, 0.1), 1.0).pointer, Some(before));
+        // the release clicks there, and the press goes to the press log as a click
+        step(&mut control, &streams, at(0.1, 0.1), 0.0);
+        let log = control.press_log();
+        let line = std::fs::read_to_string(&log).unwrap();
+        assert!(line.trim_end().ends_with(" 0"), "{line}");
+        // later in a press the same turn drags
+        for _ in 0..20 {
+            step(&mut control, &streams, at(0.1, 0.1), 0.0);
+        }
+        step(&mut control, &streams, at(0.1, 0.1), 1.0);
+        for _ in 0..40 {
+            step(&mut control, &streams, at(0.1, 0.1), 1.0);
+        }
+        let dragged = step(&mut control, &streams, at(0.22, 0.1), 1.0).pointer.unwrap();
+        assert!(dragged.1 > before.1 + 0.03, "{dragged:?} {before:?}");
+        step(&mut control, &streams, at(0.22, 0.1), 0.0);
+        // a large turn drags at once
+        for _ in 0..20 {
+            step(&mut control, &streams, at(0.1, 0.1), 0.0);
+        }
+        step(&mut control, &streams, at(0.1, 0.1), 1.0);
+        let fast = step(&mut control, &streams, at(0.6, 0.1), 1.0).pointer.unwrap();
+        assert!(fast.1 > before.1 + 0.15, "{fast:?}");
+        step(&mut control, &streams, at(0.6, 0.1), 0.0);
         std::fs::remove_file(&control.store).ok();
+        std::fs::remove_file(&log).ok();
+    }
+
+    #[test]
+    fn the_filter_calms_a_resting_hand_and_follows_a_turn() {
+        let mut filter = AimFilter::default();
+        let dt = 1.0 / 120.0;
+        let aim = |angle: f32| Pose { orientation: Quat::from_rotation_y(angle), position: Vec3::ZERO };
+        let direction = |pose: Pose| pose.orientation * Vec3::NEG_Z;
+        // a tremor of half a degree at 8 Hz
+        let mut out = Vec::new();
+        for i in 0..240 {
+            let t = i as f32 * dt;
+            out.push(direction(filter.apply(aim((0.5f32).to_radians() * (2.0 * std::f32::consts::PI * 8.0 * t).sin()), dt)));
+        }
+        let spread = out[120..].iter().map(|d| d.angle_between(Vec3::NEG_Z).to_degrees()).fold(0.0f32, f32::max);
+        assert!(spread < 0.2, "{spread}");
+        // a fast turn of 30 degrees: within 0.1 s the ray is near
+        let target = (30.0f32).to_radians();
+        let mut last = Vec3::NEG_Z;
+        for _ in 0..12 {
+            last = direction(filter.apply(aim(target), dt));
+        }
+        let lag = last.angle_between(direction(aim(target))).to_degrees();
+        assert!(lag < 5.0, "{lag}");
     }
 
     #[test]
