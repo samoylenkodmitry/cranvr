@@ -168,6 +168,7 @@ fn refresh(settings: MutableState<Settings>, model: MutableState<Model>, slow: b
         next.clients = backend::read_clients();
         next.permissions = PERMISSIONS.map(Permission::granted);
         next.steam = steam::state();
+        next.rosetta = steam::rosetta_ready();
         next.steam_running = next.steam == SteamState::Ready && steam::running();
         next.steam_signed_in = steam::signed_in();
         next.games = steam::games();
@@ -421,10 +422,7 @@ fn PlayTab(settings: MutableState<Settings>, model: MutableState<Model>) {
             return;
         }
         match state {
-            SteamState::NoWine => {
-                Label("Game support is not set up on this Mac.".into());
-                Hint("Run scripts/build-basaltvr.sh and scripts/setup-wine.sh once in the cranvr folder (about an hour, mostly a compiler build).".into());
-            }
+            SteamState::NoWine => SetupSteps(model),
             SteamState::NotInstalled | SteamState::NeedsSetup => {
                 Label(if state == SteamState::NotInstalled {
                     "Steam for Windows is not installed yet.".into()
@@ -473,6 +471,54 @@ fn PlayTab(settings: MutableState<Settings>, model: MutableState<Model>) {
             }
         }
     });
+}
+
+/// The steps that prepare a Mac for Windows VR games, before Steam: Rosetta 2, then the game
+/// support archive from the public release (scripts/install-game-support.sh).
+#[composable]
+fn SetupSteps(model: MutableState<Model>) {
+    let rosetta = model.with(|m| m.rosetta);
+    Label("Three steps prepare this Mac for Windows VR games.".into());
+    FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+        Text("1. Rosetta 2 runs Wine's Intel code.".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
+        if rosetta {
+            Text("Ready".to_string(), Modifier::empty().padding(8.0), colored(110, 200, 140));
+        } else {
+            Primary("Install Rosetta".into(), move || {
+                // softwareupdate takes a minute: keep the window responsive
+                thread::spawn(|| {
+                    if let Err(e) = steam::install_rosetta() {
+                        backend::notify(e);
+                    }
+                });
+            });
+        }
+    });
+    if !rosetta {
+        Hint("macOS asks for your password to install it.".into());
+    }
+    FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+        Text(
+            "2. Game support: Wine, DXMT and the OpenXR runtime.".to_string(),
+            Modifier::empty().padding(8.0),
+            TextStyle::default(),
+        );
+        if rosetta {
+            Primary("Download and install".into(), move || {
+                let result = backend::run_script("Game support", "install-game-support.sh", &[]);
+                model.update(|m| match result {
+                    Ok(()) => m.task = Some("Game support".into()),
+                    Err(e) => m.message = Some(e),
+                });
+            });
+        }
+    });
+    Hint(if rosetta {
+        "cranvr downloads about 250 MB from github.com/samoylenkodmitry/cranvr-game-support, checks it and installs it. It takes about 1.2 GB on disk.".into()
+    } else {
+        "This step comes after Rosetta.".into()
+    });
+    Text("3. Steam for Windows, after step 2.".to_string(), Modifier::empty().padding(8.0), dim_style());
 }
 
 #[composable]

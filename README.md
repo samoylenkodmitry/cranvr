@@ -290,7 +290,15 @@ Not done or not measured:
 
 ## Games
 
-Games need a one-time setup of the Wine side. The first build takes about an hour, mostly for LLVM.
+Games need Wine with cranvr's DXMT fork and BasaltVR's OpenXR runtime. The app's Play tab sets them up in three steps:
+
+1. Rosetta 2, which runs Wine's Intel code. macOS asks for an administrator's password.
+2. Game support: the app downloads `cranvr-game-support-macos.tar.xz` (about 240 MB) from the public release at https://github.com/samoylenkodmitry/cranvr-game-support, checks its SHA-256, unpacks it and installs it with `setup-wine.sh`. It takes about 1.2 GB on disk. `scripts/install-game-support.sh [ARCHIVE|URL]` does the same without the app.
+3. Steam for Windows (see below).
+
+From an empty home folder the install took 79 seconds with the download. The OpenXR runtime's check through the Khronos loader passed, and the runtime's smoke program connected to the host.
+
+To build game support from source instead (about an hour, mostly LLVM):
 
 ```bash
 xcodebuild -downloadComponent MetalToolchain
@@ -300,7 +308,9 @@ scripts/build-basaltvr.sh
 scripts/setup-wine.sh third_party/basaltvr/src
 ```
 
-`build-basaltvr.sh` clones BasaltVR at a pinned commit into `third_party/basaltvr/src`. It applies cranvr's patches and builds the OpenXR runtime and the DXMT fork. `setup-wine.sh` puts Wine 11.10 with the DXMT fork in `~/Library/Application Support/cranvr/wine`. It registers the runtime in the Wine prefix and checks it through the OpenXR loader.
+`build-basaltvr.sh` clones BasaltVR at a pinned commit into `third_party/basaltvr/src`. It applies cranvr's patches and builds the OpenXR runtime and the DXMT fork. `setup-wine.sh` puts Wine 11.10 with the DXMT fork in `~/Library/Application Support/cranvr/wine`. It registers the runtime in the Wine prefix and checks it through the OpenXR loader. `setup-wine.sh` also takes an unpacked game support archive instead of the BasaltVR folder.
+
+`scripts/package-game-support.sh` packs a built tree into the archive and its `.sha256` in `target/game-support`. The public repository holds the archive as a release asset, with the license texts and `SOURCES.md`. The app downloads `releases/latest/download/cranvr-game-support-macos.tar.xz`, so a new release replaces the old one for new installs. DXMT's `winemetal.so` names its shader sources by their path on the Mac that built it.
 
 Start the host first: it writes `runtime-control.txt` into its config dir. Then start a game from the window ("Game") or with the script:
 

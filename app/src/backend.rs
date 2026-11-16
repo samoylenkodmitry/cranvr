@@ -159,6 +159,8 @@ pub struct Model {
     /// Screen Recording and Accessibility
     pub permissions: [bool; 2],
     pub steam: crate::steam::SteamState,
+    /// Whether Rosetta 2 runs Intel code, which Wine needs
+    pub rosetta: bool,
     pub steam_running: bool,
     pub steam_signed_in: bool,
     pub games: Vec<crate::steam::Game>,
