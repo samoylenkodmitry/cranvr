@@ -26,7 +26,7 @@
 //
 // debug.cranvr.console_test sends one console request, a JSON object such as
 // {"action":"set","msaa":0}, once the first menu arrives, for tests without hands. "front"
-// instead puts the console straight ahead of the head.
+// instead puts the console straight ahead of the head. "exit" presses the console's Exit button.
 //
 // debug.cranvr.layer_flags picks the compositor's filters for the desktop layer: "ss" for
 // supersampling, "sharp" for sharpening, "ss,sharp" (the default) for both, "none" for neither.
@@ -191,6 +191,8 @@ pub struct DesktopLayer {
     test_commands: Vec<Command>,
     /// A request from debug.cranvr.console_test, sent once the console has its first menu
     console_test: Option<String>,
+    /// Whether the console's Exit button was pressed
+    exit: bool,
     /// Each panel's bar layer
     bars: HashMap<u8, BarLayer>,
     /// The sharp inset over the panel that the head points at: the panel, its picture, the
@@ -261,6 +263,7 @@ impl DesktopLayer {
             host_states: HashMap::new(),
             test_commands: property::get("panel_test").map(|t| test_commands(&t)).unwrap_or_default(),
             console_test: property::get("console_test").filter(|t| !t.is_empty()),
+            exit: false,
             bars: HashMap::new(),
             inset: None,
             inset_pending: None,
@@ -402,8 +405,13 @@ impl DesktopLayer {
         if first_menu {
             match self.console_test.take() {
                 Some(test) if test == "front" => self.control.console_in_front(),
+                Some(test) if test == "exit" => out.exit = true,
                 test => out.console.extend(test),
             }
+        }
+        if out.exit && !self.exit {
+            info!("cranvr console: exit");
+            self.exit = true;
         }
         // The console's requests go to the host over TCP
         if !out.console.is_empty() {
@@ -532,6 +540,11 @@ impl DesktopLayer {
             Some(ProjectionLayerAlphaConfig { premultiplied: true }),
             None,
         ))
+    }
+
+    /// Whether the console's Exit button asked to close the app.
+    pub fn wants_exit(&self) -> bool {
+        self.exit
     }
 
     /// A quad layer for each panel, and one for the cursor on the panel that holds it.

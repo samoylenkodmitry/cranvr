@@ -114,6 +114,8 @@ pub enum Action {
     Scale(f32),
     Msaa(u32),
     LowLatency(bool),
+    /// Closes cranvr's Quest app; the app handles it itself
+    Exit,
 }
 
 impl Action {
@@ -126,6 +128,7 @@ impl Action {
             Action::Scale(scale) => json!({"action": "set", "game_scale": scale}),
             Action::Msaa(samples) => json!({"action": "set", "msaa": samples}),
             Action::LowLatency(on) => json!({"action": "set", "low_latency": on}),
+            Action::Exit => json!({"action": "exit"}),
         }
         .to_string()
     }
@@ -218,6 +221,7 @@ pub fn layout(menu: &Menu) -> (f32, Vec<Item>) {
     row(BUTTON, setting("Latency", low, 0.17), &mut items);
     let (label, kind) = text("A change restarts the stream for a few seconds");
     row(TEXT, vec![(inner, label, kind)], &mut items);
+    row(BUTTON, vec![(0.2, "Exit cranvr".into(), Kind::Button { action: Action::Exit, selected: false })], &mut items);
 
     let height = -y + MARGIN / 2.0;
     for item in &mut items {
@@ -297,6 +301,10 @@ mod tests {
         // the running game has a stop button; low latency asks to turn on
         assert!(items.iter().any(|i| i.kind == Kind::Button { action: Action::Stop, selected: false }));
         assert!(items.iter().any(|i| i.kind == Kind::Button { action: Action::LowLatency(true), selected: false }));
+        // the exit button is the last item, at the bottom left
+        let exit = items.last().unwrap();
+        assert_eq!(exit.kind, Kind::Button { action: Action::Exit, selected: false });
+        assert!(exit.center.0 < 0.0 && exit.center.1 < -height / 2.0 + 0.06, "{exit:?}");
     }
 
     #[test]

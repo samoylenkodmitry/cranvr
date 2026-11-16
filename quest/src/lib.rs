@@ -344,6 +344,9 @@ pub fn entry_point() {
             );
 
         let mut event_storage = xr::EventDataBuffer::new();
+        // cranvr: the console's Exit button ends the session; the app then closes
+        #[cfg_attr(not(target_os = "android"), allow(unused_mut))]
+        let mut exit_requested = false;
         'render_loop: loop {
             while let Some(event) = xr_instance.poll_event(&mut event_storage).unwrap() {
                 match event {
@@ -373,7 +376,10 @@ pub fn entry_point() {
                             xr_session.end().unwrap();
                         }
                         xr::SessionState::EXITING | xr::SessionState::LOSS_PENDING => {
-                            break 'render_loop
+                            if exit_requested {
+                                break 'session_loop;
+                            }
+                            break 'render_loop;
                         }
                         _ => (),
                     },
@@ -533,6 +539,13 @@ pub fn entry_point() {
                 desktop_layer.frame(&xr_session, &interaction_context.read(), space, frame_state.predicted_display_time);
             }
             #[cfg(target_os = "android")]
+            if desktop_layer.wants_exit() && !exit_requested {
+                exit_requested = true;
+                if let Err(e) = xr_session.request_exit() {
+                    error!("cranvr: the session does not end: {e}");
+                }
+            }
+            #[cfg(target_os = "android")]
             let (quads, overlay) = match &stage_space {
                 Some(space) => (desktop_layer.layers(space), desktop_layer.overlay_layer(space)),
                 None => (Vec::new(), None),
@@ -611,6 +624,16 @@ fn android_main(app: android_activity::AndroidApp) {
         let _env = vm.attach_current_thread().unwrap();
 
         entry_point();
+
+        // cranvr: the session ended by itself, as after Exit on the console. The activity ends
+        // too, so the headset goes back to its home.
+        if !flat::QUIT.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut env = _env;
+            let activity = unsafe { jni::objects::JObject::from_raw(context.context().cast()) };
+            if let Err(e) = env.call_method(&activity, "finish", "()V", &[]) {
+                error!("cranvr: the activity does not finish: {e}");
+            }
+        }
     });
 
     let mut should_quit = false;
