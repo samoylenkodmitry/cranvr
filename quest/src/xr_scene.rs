@@ -115,8 +115,8 @@ impl PartialEq for MirrorSurface {
     }
 }
 
-/// The widest content of the mirror in pixels. The surface covers about 750 pixels of an eye at
-/// a meter and a half, so more pixels would only shimmer.
+/// The widest content of the mirror in pixels: as wide as its half-size picture of a 3840 pixel
+/// display, so the content shows each pixel of the picture once.
 const MIRROR_CONTENT_WIDTH: f32 = 1920.0;
 
 /// A screen of `width` by `height` meters bent into an S: across it the surface goes one full
