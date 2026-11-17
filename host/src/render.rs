@@ -367,6 +367,78 @@ mod tests {
         });
     }
 
+    /// The luma of the left eye of an encoded frame, `eye_w` pixels wide, as rows.
+    fn left_luma(buffer: &mut PixelBuffer, eye_w: usize, eye_h: usize) -> Vec<f32> {
+        buffer.with_planes_mut(|y, ys, _, _| (0..eye_h).flat_map(|row| (0..eye_w).map(move |x| (row, x))).map(|(row, x)| f32::from(y[row * ys + x]) / 255.0).collect())
+    }
+
+    /// A game's thin line in the compressed edge of a foveated frame stays continuous. The test
+    /// paints a line of one pixel across the top left of the game's eye image, composes the
+    /// frame with ALVR's default foveation and follows the line through the encoded picture. A
+    /// compose that takes one sample for each encoded pixel misses the line in some columns,
+    /// which the headset unwarps into a row of dots.
+    #[test]
+    fn a_thin_game_line_stays_continuous_in_the_compressed_edge() {
+        use cranvr_common::foveation::FoveationConfig;
+        let eye = [1680usize, 1760];
+        let f = Foveation::new([eye[0] as u32, eye[1] as u32], &FoveationConfig::default());
+        let (ow, oh) = (f.optimized[0] as usize, f.optimized[1] as usize);
+        // The line y = 60 + 0.37 x, one pixel thick in the game's image
+        let line = |x: usize| 60.0 + 0.37 * x as f32;
+        let paint = |buffer: &mut PixelBuffer| {
+            buffer.with_bgra_mut(|data, stride| {
+                for y in 0..eye[1] {
+                    for x in 0..eye[0] {
+                        let on = (y as f32 + 0.5 - line(x)).abs() < 0.5 * (1.0 + 0.37f32 * 0.37).sqrt();
+                        let v = if on { 255 } else { 40 };
+                        data[y * stride + x * 4..y * stride + x * 4 + 4].copy_from_slice(&[v, v, v, 255]);
+                    }
+                }
+            });
+        };
+        let (mut left, mut right) = (PixelBuffer::new_bgra_shared(eye[0], eye[1]).unwrap(), PixelBuffer::new_bgra_shared(eye[0], eye[1]).unwrap());
+        paint(&mut left);
+        paint(&mut right);
+        let (tx, _rx) = mpsc::channel();
+        let config = EncoderConfig { width: ow as u32 * 2, height: oh as u32, fps: 90.0, bitrate_bps: 10_000_000, full_range: true, strict_rate: false };
+        let encoder = Encoder::new(&config, tx).expect("encoder");
+        let mut buffer = encoder.pixel_buffer().expect("buffer");
+        let mut params = ComposeParams {
+            fov: [[-1.0, 1.0, 1.0, -1.0]; 2],
+            src_fov: [[-1.0, 1.0, 1.0, -1.0]; 2],
+            src_rect: [[0.0, 0.0, 1.0, 1.0]; 2],
+            eye_w: ow as u32,
+            eye_h: oh as u32,
+            full_range: 1,
+            ..Default::default()
+        };
+        params.set_foveation(Some(&f));
+        let mut renderer = Renderer::new().expect("renderer");
+        let mut gpu = 0.0;
+        for round in 0..40 {
+            renderer.compose(&buffer, &left, &right, &params).expect("compose");
+            if round >= 20 {
+                gpu += renderer.last_gpu_s / 20.0;
+            }
+        }
+        let encoded = left_luma(&mut buffer, ow, oh);
+        // Follow the line over the view columns 30 to 330, where the vertical compression is the
+        // edge ratio of 5: for each encoded column, the brightest pixel near where the line lies
+        let mut peaks = Vec::new();
+        for view_x in (30..330).step_by(2) {
+            let e = f.view_to_encoded([(view_x as f32 + 0.5) / eye[0] as f32, line(view_x) / eye[1] as f32]);
+            let (cx, cy) = ((e[0] * ow as f32) as usize, (e[1] * oh as f32) as usize);
+            let peak = (cy.saturating_sub(2)..=(cy + 2).min(oh - 1)).map(|y| encoded[y * ow + cx]).fold(0.0f32, f32::max);
+            peaks.push(peak);
+        }
+        let mean = peaks.iter().sum::<f32>() / peaks.len() as f32;
+        let least = peaks.iter().copied().fold(f32::MAX, f32::min);
+        let background = 40.0 / 255.0;
+        println!("thin line in the encoded edge: mean peak {mean:.3}, least {least:.3}, background {background:.3}, compose GPU time {:.2} ms", gpu * 1e3);
+        // One sample per pixel leaves columns without the line: its least peak is the background
+        assert!(least > background + 0.25 * (mean - background), "the line breaks up: mean {mean}, least {least}");
+    }
+
     /// Renders into a real encoder buffer and checks the eye badges and the floor on the CPU.
     #[test]
     fn renders_badges_and_floor() {
