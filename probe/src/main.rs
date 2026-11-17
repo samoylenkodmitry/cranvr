@@ -19,6 +19,8 @@ mod android;
 mod compositor;
 #[cfg(target_os = "macos")]
 mod native;
+#[cfg(target_os = "macos")]
+mod native_desktop;
 
 use alvr_client_core::{ClientCapabilities, ClientCoreContext, ClientCoreEvent};
 use alvr_common::{
@@ -63,7 +65,9 @@ fn usage() -> ! {
          \n  --protocol native  connect to cranvr-host --protocol native, not to an ALVR host\
          \n  --connect HOST:PORT  with native: the host's address (default 127.0.0.1:9950)\
          \n  --tcp              with native: ask for the media over TCP, as a USB link needs it\
-         \n  --drop-percent P   with native: drop this share of the media packets, to test the parity"
+         \n  --drop-percent P   with native: drop this share of the media packets, to test the parity\
+         \n  --desktop          with native: ask for the Mac's desktop as a second stream, play a pointer script\
+         \n                     and count the sound (start the host with --desktop and CRANVR_POINTER_DRY_RUN=1)"
     );
     std::process::exit(2);
 }
@@ -79,6 +83,7 @@ fn main() {
     let mut connect = "127.0.0.1:9950".to_string();
     let mut tcp = false;
     let mut drop_percent = 0.0f32;
+    let mut desktop = false;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -92,6 +97,7 @@ fn main() {
             },
             "--connect" => connect = args.next().unwrap_or_else(|| usage()),
             "--tcp" => tcp = true,
+            "--desktop" => desktop = true,
             "--drop-percent" => drop_percent = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             _ => usage(),
         }
@@ -101,11 +107,11 @@ fn main() {
         {
             use std::net::ToSocketAddrs;
             let Some(address) = connect.to_socket_addrs().ok().and_then(|mut a| a.next()) else { usage() };
-            std::process::exit(native::run(native::Options { seconds, game, any_picture, connect: address, tcp, drop_percent }));
+            std::process::exit(native::run(native::Options { seconds, game, any_picture, connect: address, tcp, drop_percent, desktop }));
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (&connect, tcp, drop_percent);
+            let _ = (&connect, tcp, drop_percent, desktop);
             eprintln!("probe: --protocol native runs on macOS only for now");
             std::process::exit(2);
         }

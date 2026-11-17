@@ -18,7 +18,11 @@ use objc2_foundation::{NSArray, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{SCContentFilter, SCStream, SCStreamConfiguration, SCStreamOutput, SCStreamOutputType};
 use std::{
     ffi::c_void,
-    sync::{mpsc::SyncSender, Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::SyncSender,
+        Arc, Mutex, OnceLock,
+    },
 };
 
 /// The newest captured frame, numbered from 1.
@@ -408,6 +412,13 @@ impl Pointer {
 
     /// Call once per frame. `hit` is where the controller points on the screen, if anywhere.
     pub fn update(&mut self, hit: Option<[f32; 2]>, trigger: f32, stick_y: f32) {
+        self.update_scaled(hit, trigger, stick_y, 1.0);
+    }
+
+    /// Like `update`, with the scroll speed scaled: the scroll of one call at full tilt is 20
+    /// pixels, which suits 72 calls a second. A caller that updates at another rate passes
+    /// `72 / rate`, or the time since its last call times 72.
+    pub fn update_scaled(&mut self, hit: Option<[f32; 2]>, trigger: f32, stick_y: f32, scroll_scale: f32) {
         if !self.trusted && self.checked.elapsed() > std::time::Duration::from_secs(2) {
             self.checked = std::time::Instant::now();
             self.trusted = unsafe { AXIsProcessTrusted() };
@@ -415,7 +426,9 @@ impl Pointer {
                 alvr_common::info!("Desktop: Accessibility allowed, the controller moves the mouse");
             }
         }
-        if !self.trusted {
+        // A dry run goes through all the logic and posts no event, so a test with a controller on
+        // a desk never moves the user's real mouse
+        if !self.trusted && !dry_run() {
             return;
         }
         let bounds = unsafe { CGDisplayBounds(self.display_id) };
@@ -444,23 +457,89 @@ impl Pointer {
         }
         // Up to about 1500 pixels per second at full tilt (at 72 frames per second)
         if stick_y.abs() > 0.15 {
-            self.scroll += stick_y * 20.0;
+            self.scroll += stick_y * 20.0 * scroll_scale;
             let whole = self.scroll.trunc();
             if whole != 0.0 {
                 self.scroll -= whole;
-                unsafe {
-                    let event = CGEventCreateScrollWheelEvent2(std::ptr::null(), SCROLL_UNITS_PIXEL, 1, whole as i32, 0, 0);
-                    if !event.is_null() {
-                        CGEventPost(HID_EVENT_TAP, event);
-                        CFRelease(event);
-                    }
-                }
+                post_scroll(whole as i32);
             }
         }
     }
 }
 
+/// What the pointer injected since the host started, or would have injected in a dry run
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InjectedCounts {
+    pub moves: u64,
+    pub downs: u64,
+    pub ups: u64,
+    /// Pixels scrolled, up and down summed by their sizes
+    pub scroll_pixels: u64,
+}
+
+static MOVES: AtomicU64 = AtomicU64::new(0);
+static DOWNS: AtomicU64 = AtomicU64::new(0);
+static UPS: AtomicU64 = AtomicU64::new(0);
+static SCROLL_PIXELS: AtomicU64 = AtomicU64::new(0);
+
+/// The mouse events injected so far
+pub fn injected_counts() -> InjectedCounts {
+    InjectedCounts {
+        moves: MOVES.load(Ordering::Relaxed),
+        downs: DOWNS.load(Ordering::Relaxed),
+        ups: UPS.load(Ordering::Relaxed),
+        scroll_pixels: SCROLL_PIXELS.load(Ordering::Relaxed),
+    }
+}
+
+/// Whether the pointer only logs its events: `CRANVR_POINTER_DRY_RUN=1`. The test host sets it,
+/// because a controller on a desk must not click on the user's Mac.
+fn dry_run() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("CRANVR_POINTER_DRY_RUN").is_ok_and(|v| v == "1");
+        if on {
+            alvr_common::info!("Desktop: dry run, the pointer logs its mouse events and posts none");
+        }
+        on
+    })
+}
+
+fn post_scroll(pixels: i32) {
+    SCROLL_PIXELS.fetch_add(u64::from(pixels.unsigned_abs()), Ordering::Relaxed);
+    if dry_run() {
+        alvr_common::info!("Desktop (dry run): scroll {pixels} pixels");
+        return;
+    }
+    unsafe {
+        let event = CGEventCreateScrollWheelEvent2(std::ptr::null(), SCROLL_UNITS_PIXEL, 1, pixels, 0, 0);
+        if !event.is_null() {
+            CGEventPost(HID_EVENT_TAP, event);
+            CFRelease(event);
+        }
+    }
+}
+
 fn post_mouse(kind: u32, point: CGPoint) {
+    let counter = match kind {
+        LEFT_MOUSE_DOWN => &DOWNS,
+        LEFT_MOUSE_UP => &UPS,
+        _ => &MOVES,
+    };
+    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if dry_run() {
+        // A move comes up to 120 times a second: the first and every hundredth go to the log
+        let name = match kind {
+            LEFT_MOUSE_DOWN => "button down",
+            LEFT_MOUSE_UP => "button up",
+            LEFT_MOUSE_DRAGGED => "drag",
+            _ => "move",
+        };
+        if matches!(kind, LEFT_MOUSE_DOWN | LEFT_MOUSE_UP) || count == 1 || count % 100 == 0 {
+            alvr_common::info!("Desktop (dry run): mouse {name} at ({:.0}, {:.0}) points, event {count} of its kind", point.x, point.y);
+        }
+        return;
+    }
     unsafe {
         let event = CGEventCreateMouseEvent(std::ptr::null(), kind, point, 0);
         if !event.is_null() {

@@ -162,6 +162,66 @@ The probe models the headset's queue (`probe/src/compositor.rs`: the display gri
 
 On 17 November 2026 a Quest 3 on the desk (Wi-Fi, UDP media, 120 Hz, the test scene, 17 intervals of 2 s after a warm-up of 10 s, medians, the Mac's load average 16 to 28) ran the old and the new host in the order old, new, old, new with the lock off. The old host: the headset showed 99.9 and 89.9 frames a second, skipped 18 and 24, repeated 20 and 30, and every frame came late at the take. The new host: 115.8 and 115.8 shown, 0 skipped, 4 repeated, 0 percent late. The price is latency: the host's figure from the tracking sample to the display went from 34.1 and 35.6 ms to 42.5 and 42.2 ms, because a frame now waits for its own point instead of showing in the next headset frame, as a frame of the lock does (the lock gave 6 to 7 ms more in the earlier runs too). With the lock on the new host showed 119.8 frames a second (2 skipped, 2 repeated, 2 percent late, 43.6 ms) and the old host 113.8 (8 skipped, 6 repeated, 5 percent late, 43.4 ms) at load averages of 45 and 51. Beat Saber's first screen (the Steam game through the host's Wine stack, muted, native mode, 34 intervals after 50 s): with the old host the client received 97.9 frames a second and showed 79.9, skipped 18 and repeated 39.9, all frames late at the take, 48.1 ms; with the new host it received 117.8 and showed 117.8, skipped 2 and repeated 2, no frame late, 52.8 ms. The game's frame rate on the Mac varies from second to second while it loads, so the two Beat Saber arms differ in more than the host. The controllers sleep on a desk, so no hand reached the game on the Quest: the host's log showed a tracked mask of 0b0.
 
+#### The desktop panel and the sound
+
+The native client shows the Mac's desktop as its own panel and plays the Mac's sound, as the old Quest app does (`quest/`).
+
+The desktop stream:
+- The host captures the display at its full pixel size (ScreenCaptureKit, YUV 4:2:0, up to 60 pictures a second) and encodes it with a second HEVC session (`host/src/headset/native/desktop.rs`). The units of this stream carry the stream id `DESKTOP_STREAM` (1) in the media header. They share the UDP or TCP media path with the eye stream. Their frame numbers, key frames and parameter sets are their own. ScreenCaptureKit sends a picture only when the display changes, so a still desktop costs nothing.
+- The client asks for the stream with `ClientMsg::Desktop` (a width and a rate). The host answers with `HostMsg::Desktop`: the picture's size in pixels, the display's size in points, the bitrate and whether the panel is visible. A game hides the panel. The host then stops the capture and sends a key frame when the panel shows again. A client that asks for no desktop, or a host without `--desktop`, leaves the desktop in the eye stream as before. While the panel shows, the host leaves its own screen out of the eye stream.
+- The pictures are not mirrored. Cranpose's compositor layer turns a decoder's surface upright. The old Quest app's layer needed a mirror on the Mac (`CRANVR_DESKTOP_FLIP=1` brings it back for such a client).
+- The client shows the stream in a `SpatialExternalSurface` (mono). A second `VideoDecoder` in surface mode writes into it (`client/src/desktop.rs`). The decoder has its own thread: the eye stream's decode never waits for it. The decoder waits up to 30 ms for an input buffer. With Cranpose's default of 4 ms a busy Quest refused pictures. Each refused picture cost a key frame.
+- Cranpose gives the app no place for a panel that the user carried and no hit point on a surface. The client therefore keeps the panel's pose itself (`client/src/place.rs`). Point at the panel and squeeze the grip to carry it. The panel follows the controller and turns to face the head. The thumbstick forward and back moves it away and near. The thumbstick left and right resizes it. The place goes to Cranpose's preferences service when the user lets go, as a center, a turn and a width in the headset's room. The room's origin is where the head was when the app started, so the panel starts in front of the user each time. The launch argument `desktop_place` takes `gaze` (in front of the head, tilt included, for a headset on a desk) or `x,y,z,yaw,pitch,width`.
+- The controller acts as the mouse over the panel. The app finds the ray's point on the panel with Cranpose's `Ray::hit_panel`. It sends the point (u and v from the panel's top left corner), the trigger and the thumbstick as `ClientDatagram::Pointer` for every headset frame in which they change. It sends the same every 50 ms while nothing changes. The controller whose trigger was pulled last points. A trigger that was down before the ray met the panel does not click. A press that leaves the panel's edge keeps its button down until the trigger lets go. The host moves the Mac's mouse, clicks and scrolls with the code of the compat mode (`desktop::Pointer`). The scroll speed follows the time between datagrams. A pointer that goes silent with its button down gets its button lifted after 250 ms. `CRANVR_POINTER_DRY_RUN=1` makes the host log the mouse events and post none: a test with a controller on a desk must not click on the user's Mac. `--es desktop_pointer_test circle` makes the client send the pointer of a controller that circles over the panel, pulls the trigger every 3 seconds and leans the thumbstick every 6 seconds.
+- The Mac's cursor is part of the pictures (the host's capture draws it). The client's own cursor, a small panel in front of the picture, does not show. Cranpose puts the layers of its surfaces after the layers of its panels, so a panel over a surface lies under the surface. A ring that the client placed beside the picture showed. A ring over the picture did not, at 2 cm and at 30 cm in front of it. The cursor's position also goes out as `HostDatagram::Cursor` (every 2 ms while the mouse moves). `CRANVR_DESKTOP_CURSOR_IN_VIDEO=0` on the host leaves the cursor out of the pictures, for a client that draws its own. The controller's ray ends on the panel and shows where the user points without delay. The Mac's cursor follows with the delay of the pictures.
+- Launch arguments of the panel (extras on Android, `--name=value` on the desktop): `desktop` (`false` asks for no desktop), `desktop_width` (the widest picture to ask for, default 3840 or the decoder's limit), `desktop_place` (see above), `desktop_pointer_test` (`circle`) and `cursor` (`none` draws no cursor ring when the host leaves the cursor out of the pictures).
+
+The sound:
+- The host sends the captured sound as PCM: 48 kHz, 16 bits, stereo, in datagrams of 240 frames (5 ms, 960 bytes). That is 1.54 Mbps on top of a video stream of 40 to 100 Mbps. Opus would cut it to about 0.1 Mbps. PCM adds no encode or decode time and needs no codec on the Quest. A datagram carries the host's clock for its first sample, so the client can tell how old the sound is.
+- The client plays it through Cranpose's audio backend (`client/src/audio.rs`). `cranpose_audio::backend::open` runs a renderer on the platform's output thread (AAudio, low-latency mode, 4 ms bursts on a Quest 3). The renderer takes stereo frames from `cranpose_audio::ring`. The renderer never locks or allocates. A jitter buffer between the network thread and the renderer:
+  - plays after the buffer holds 30 ms. It plays again after an underrun when the buffer holds 30 ms again;
+  - keeps its fill near the target by changing the playback rate by at most 0.5% (this absorbs the drift between the Mac's and the Quest's clocks and the difference of a device that does not run at 48 kHz);
+  - drops its oldest sound down to the target when the fill passes 90 ms;
+  - leaves a gap of silence for a datagram that never came. It drops a datagram that came late.
+- ScreenCaptureKit hands over a buffer of 960 frames (20 ms) 50 times a second. The jitter buffer therefore saws between a high and a low fill. A flat window on the Mac plays no sound: the host would capture it again.
+- The client logs the buffer's fill (now, the range and the target), the burst of the device, the age of the sound when it was queued, the lost, late and dropped datagrams and the underruns every 2 seconds. The stats panel shows the same.
+
+Numbers from a Quest 3 on the desk (Wi-Fi 6 on 5 GHz, 5560 MHz, link speed 1200 Mbps), UDP media, 120 Hz, the foveated eye stream, on 17 November 2026. The room was dark: the headset showed "Finding position in room" and did not track, so `debug.oculus.guardian_pause` was 1 during the runs (0 before and after). The headset lay still. The medians are those of intervals of 2 s after 8 s of warm-up.
+
+
+
+The eye stream with and without the desktop panel. Arm A: the host without `--desktop`, the client with `--ez desktop false`. Arm B: `--desktop`, the panel at 3840 by 2160 pixels. The order was A, B, A, B, 52 s each. The Mac's load averages (1, 5 and 15 minutes) were 6.9 21.9 26.4, 6.1 19.1 25.1, 5.8 16.8 23.8 and 9.9 15.9 23.1.
+
+| Arm | Eye frames shown of the headset's | Skipped, repeated a second | Eye decode | Pose to decode end |
+|---|---|---|---|---|
+| A, no desktop | 117.8 of 121.2 | 4, 2 | 3.53 ms | 19.3 ms |
+| B, desktop | 113.8 of 121.1 | 10, 6 | 4.17 ms | 30.5 ms |
+| A | 117.8 of 121.0 | 4, 2 | 3.57 ms | 19.1 ms |
+| B | 114.8 of 121.0 | 10, 5 | 4.34 ms | 28.6 ms |
+
+With the panel the eye stream showed 3 to 4 frames a second less and took 9 to 11 ms more from the pose to the end of the decode. Arm A also left out the host's `--desktop`, so the host's flag and the panel changed together. The cause of the cost is not measured.
+
+The desktop stream in arms B (the display changed about 57 times a second):
+- The client received and decoded 57.2 and 57.3 pictures a second of 3840 by 2160 pixels. It lost none.
+- The decoder's report (the picture's submission to its output) gave 5.95 and 5.90 ms as the mean and 15.8 and 15.9 ms as the longest.
+- The client skipped 8 and 4 pictures in the arm while it waited for a key frame. It refused none. It asked for 4 and 3 key frames in 52 s. With Cranpose's default input wait of 4 ms the decoder refused up to 16 pictures in 20 s. The key frames that followed made it worse.
+- The median bitrate of an interval was 1.2 Mbps. A key frame lifts an interval to 3 to 5 Mbps. The host's encode of a picture took 13 to 18 ms from the call to the encoded frame, at a load of 20 to 30. The probe on the Mac got 2.1 ms from VideoToolbox's decoder.
+- A screenshot of the Quest shows the Mac's text readable, the whole picture upright and the Mac's cursor in it. The panel's surface was made at 1600 by 900 dp (2400 by 1350 pixels at Cranpose's 1.5 pixels to a dp) and at 2560 by 1440 dp (3840 by 2160 pixels). A crop of the screenshot looked the same in both and showed the same part of the picture, so the picture is not cut. The panel was narrower than the eye's 2064 pixels in both. How sharp a panel that fills the view looks is not tested.
+
+The sound (all four arms, about 10,000 datagrams each):
+- The device ran at 48,000 Hz with bursts of 4.0 ms. The host's capture handed over 960 frames (20 ms) 50.0 times a second.
+- The jitter buffer's fill ranged from 7.5 to 10.8 ms at its lowest to 52 to 53 ms at its highest in an interval of 2 s. The target is 30 ms.
+- The sound was 15.5 ms old when the client queued it: the host's capture of a datagram's first sample to the queue. The host's 20 ms buffer causes most of it. The probe on loopback saw an age of 15 ms with a 95th percentile of 20 ms.
+- No datagram was lost or late and no sound was dropped. The renderer ran dry 1, 3, 2 and 2 times in 52 s. Each of these is a gap of silence: the renderer then waits until the buffer holds 30 ms again. The cause is not known. The fill swings by 44 ms against 20 ms bursts, and the probe's arrival age on loopback stayed under 23 ms. So the Wi-Fi path or the Quest's scheduling adds the jitter. The target was not changed. This is an open defect.
+- The rate of the playback stayed within 0.1% of the source's after the control loop took the average of the fill. Before that the rate followed each tooth of the fill and reached the limit of 0.5%.
+- The total from the host's capture to the device's buffer is about 15.5 ms plus the fill, so about 45 ms. The device's own latency comes on top. Cranpose does not report it.
+- The level, from one more run with the Mac's `say` command: the client logs the largest sample that its renderer wrote to the device's buffer in each interval of 2 s. It was 0.000 in every quiet interval and 0.71 to 0.74 in the three intervals while the Mac spoke. So a signal reached the Quest's output buffer. The probe on the Mac read a peak of 0.741 in the datagrams. Nobody listened at the headset.
+- On the Mac the probe got 12.04 s of sound in 12.02 s, with no gap in the sequence and 15 ms of age on arrival (median).
+
+The pointer, from the Quest with the test `--es desktop_pointer_test circle` and the host in dry-run mode (`CRANVR_POINTER_DRY_RUN=1`). The test's controller aims with the same `Place` math that the hit test uses. The run therefore shows the path from the client's frame loop to the host's mouse code. It does not show that a real ray lands on the picture where the user points. The client sent 121 pointer datagrams a second. The host logged 237 mouse moves per 2 s, one button down and one button up every 3 s at the point where the circle was. It logged 1,500 pixels of scroll in each 2 s of the thumbstick's lean. In a run of 40 s the host counted 15 clicks. The probe on the Mac drove the same code path.
+
+Not tested: a controller in a hand (its aim, the carry with the grip, the resize, the place that the preferences keep), a game that hides the desktop, a recenter, the USB path from the Quest, a host that restarts during a stream, several clients one after the other.
+
 ### cranvr's Quest app
 
 `quest/` holds cranvr's own Quest client, the base of native mode. It is ALVR's OpenXR client of v20.14.1 with its own package, `dev.cranvr.client`, labeled "cranvr". It installs beside the ALVR app from the Meta store. Its protocol is still ALVR's v20 protocol, so the host serves both apps the same way. Native mode will change the protocol in the host and in this app together.
@@ -255,7 +315,7 @@ Without the window:
 
 The host captures what this Mac plays, from every app but the host. The headset plays it. The capture takes the sound before the Mac's volume: in a test at a Mac volume of 15%, a tone reached the client at its full source level. Turn the Mac down while you play, or the Mac plays the sound too. The capture needs Screen Recording, like the desktop. "Game sound in the headset" in the settings turns it off; `cranvr-host --no-game-audio` does the same. The headset's microphone does not reach the Mac yet.
 
-ALVR's client buffers about 50 ms of sound. A rhythm game such as Beat Saber has an audio latency setting: set it once with its calibration.
+With `--protocol native` the host sends the sound as PCM to cranvr's Cranpose client (see "The desktop panel and the sound" above). ALVR's client buffers about 50 ms of sound. A rhythm game such as Beat Saber has an audio latency setting: set it once with its calibration.
 
 ### What you should see
 
@@ -452,7 +512,7 @@ The native protocol (`cranvr-proto`) runs the same test. The host listens on `12
 ./target/release/cranvr-probe --protocol native --seconds 10 --drop-percent 3 # lets the parity recover packets
 ```
 
-`scripts/e2e.sh --native` does the same with a report. The native mode has no game sound and no desktop layer yet. `--protocol alvr` stays the default.
+`scripts/e2e.sh --native` does the same with a report. The native mode sends the Mac's sound and, with `--desktop`, the desktop as a stream for the client's desktop panel (see "The desktop panel and the sound"). `--protocol alvr` stays the default.
 
 The game path without Wine:
 

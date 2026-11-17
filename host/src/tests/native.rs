@@ -36,6 +36,8 @@ fn config(port: u16) -> Config {
         pairings: Arc::new(crate::pairing::Pairings::load(&std::env::temp_dir().join(format!("cranvr-native-test-{port}")), None)),
         trust_all: false,
         display_lock: true,
+        desktop: Default::default(),
+        audio: false,
         tcp_media: false,
         wishes: HostWishes {
             eye_width: 2064,

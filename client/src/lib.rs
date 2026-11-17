@@ -9,10 +9,13 @@
 // their own expectation of this lint.
 #![deny(unsafe_code)]
 
+mod audio;
 mod connection;
 mod console;
 mod console_panel;
+mod desktop;
 mod hub;
+mod place;
 mod settings;
 mod sizing;
 mod tracking;
