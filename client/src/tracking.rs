@@ -371,9 +371,11 @@ fn placeholder_frame(at: Nanos, display_time: Nanos) -> HeadsetFrame {
         head: Motion { pose: Pose { position: [0.0, 1.6, 0.0], ..Pose::IDENTITY }, ..Motion::default() },
         left_grip: Some(hand(-0.2)),
         right_grip: Some(hand(0.2)),
-        // A window without a headset has no pointing ray of its own: the aim pose is the grip pose
-        left_aim: Some(hand(-0.2)),
-        right_aim: Some(hand(0.2)),
+        // A window without a headset has no pointing ray. The host then gives a game the grip pose for
+        // both, and its own scene tilts the ray down from the grip pose. A level aim pose would make
+        // the host's scene point the Mac's cursor at the screen straight ahead.
+        left_aim: None,
+        right_aim: None,
         input: Input::default(),
     }
 }
@@ -781,6 +783,9 @@ mod tests {
         while heard < 3 {
             if let Heard::Datagram(ClientDatagram::Tracking(tracking)) = inbox.recv_timeout(Duration::from_secs(10)).unwrap() {
                 assert_eq!(tracking.head.pose.position, [0.0, 1.6, 0.0]);
+                // Both hands have a grip pose and no aim pose
+                assert!(tracking.left_grip.is_some() && tracking.right_grip.is_some());
+                assert!(tracking.left_aim.is_none() && tracking.right_aim.is_none());
                 heard += 1;
             }
         }
