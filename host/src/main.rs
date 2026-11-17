@@ -1017,13 +1017,17 @@ fn frame_loop(
                 thread::sleep(Duration::from_micros(500));
             }
         };
-        // The client shows each frame for its own tracking sample, so a sample is sent once. A
-        // planned frame is the exception: its start does not wait for a pose. When no newer pose
-        // came, it renders again for the same sample, with the pose moved on to the new target.
+        // The client shows each frame for its own tracking sample, so a sample is sent once. Two
+        // frames are the exception. A planned frame's start does not wait for a pose: when no
+        // newer pose came, it renders again for the same sample, with the pose moved on to the
+        // new target. A game's frame comes when the game finishes it. A game that runs near the
+        // rate of the poses finishes two frames for one pose now and then, and the second has new
+        // content. Dropping it wasted a frame (a fifth of the game's frames in a test with Beat
+        // Saber on a loaded Mac) that the headset would show one point later.
         // The frame needs a number of its own, because the notes, the encoder and the headset's
         // reports find a frame by it. The number is the sample's time plus the count of repeats.
         // The pose lookup takes the sample for the nearest one.
-        let repeat = planned.is_some() && sample != 0 && sample == last_sample && repeats < MAX_REPEATS;
+        let repeat = (planned.is_some() || game_frame.is_some()) && sample != 0 && sample == last_sample && repeats < MAX_REPEATS;
         if sample == 0 || (sample == last_sample && !repeat) {
             give_back(&game_frame);
             no_sample += 1;
