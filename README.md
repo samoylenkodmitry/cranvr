@@ -87,7 +87,7 @@ scripts/build-client.sh --install
 cargo run --manifest-path client/Cargo.toml -- --host=127.0.0.1:9950 --connect
 ```
 
-The host serves it with `cranvr-host --protocol native --trust "Meta Quest 3"`. The trust name is the client's device name, which the client takes from the headset's runtime. The host's warning for a client that it does not trust prints the name to pass. A client on the Mac itself needs no trust. The client cannot unwarp a foveated frame. The headset's compositor samples the picture as it is. Cranpose's `StreamedScene` takes no foveation parameters. The client therefore tells the host that it takes no foveation. The host then sends full frames. The host chooses the eye width for such a client: 1248 pixels at 120 Hz, 1504 at 90 Hz and 1728 at 72 Hz, unless `--eye-width` says otherwise. The width of 2064 belongs to a foveated eye. Without that rule the host sent a picture of 4128 by 2162 pixels. The host's encoder took 10.5 ms for each frame of that size, so the host sent 85 to 95 frames a second. The Quest 3 also showed green blocks in part of the picture. Its decoder advertises HEVC level 6.2, so the cause of the green blocks is not known. A Quest that is not on the Mac's network connects over USB: `adb reverse tcp:9950 tcp:9950`. The address is then `127.0.0.1:9950`. A loopback address makes the client ask for the media over TCP.
+The host serves it with `cranvr-host --protocol native --pair CODE`, where `CODE` is the six digits that the connect panel shows (see "Pairing" below). A client on the Mac itself needs no pairing. The client cannot unwarp a foveated frame. The headset's compositor samples the picture as it is. Cranpose's `StreamedScene` takes no foveation parameters. The client therefore tells the host that it takes no foveation. The host then sends full frames. The host chooses the eye width for such a client: 1248 pixels at 120 Hz, 1504 at 90 Hz and 1728 at 72 Hz, unless `--eye-width` says otherwise. The width of 2064 belongs to a foveated eye. Without that rule the host sent a picture of 4128 by 2162 pixels. The host's encoder took 10.5 ms for each frame of that size, so the host sent 85 to 95 frames a second. The Quest 3 also showed green blocks in part of the picture. Its decoder advertises HEVC level 6.2, so the cause of the green blocks is not known. A Quest that is not on the Mac's network connects over USB: `adb reverse tcp:9950 tcp:9950`. The address is then `127.0.0.1:9950`. A loopback address makes the client ask for the media over TCP.
 
 The app has four parts. In a headset the panels are movable panels in the room. On the desktop they draw side by side in a flat window.
 - The connect panel holds the host address, a keypad for it, the Connect button and the state of the link. Cranpose's preferences service remembers the address.
@@ -95,7 +95,7 @@ The app has four parts. In a headset the panels are movable panels in the room. 
 - The stats panel shows the frame rate, the decode time, the loss, the FEC recoveries and the latency.
 - A `SpatialFrameEffect` runs once for each headset frame. It hands the head pose, the eye views, both controllers and the predicted display time to the thread that sends the tracking.
 
-The launch arguments `host`, `connect` and `media` (`udp` or `tcp`) set the address, start the connection and choose the media path. The argument `hold_ms` holds each tracking sample for that many milliseconds before the client sends it. On Android they are intent extras: `adb shell am start -n dev.cranvr.client2/dev.cranpose.android.CranposeActivity --es host 192.168.1.20:9950 --ez connect true`. On the desktop they are `--host=ADDRESS`, `--connect` and `--media=udp`.
+The launch arguments `host`, `connect` and `media` (`udp` or `tcp`) set the address, start the connection and choose the media path. On Android they are intent extras: `adb shell am start -n dev.cranvr.client2/dev.cranpose.android.CranposeActivity --es host 192.168.1.20:9950 --ez connect true`. On the desktop they are `--host=ADDRESS`, `--connect` and `--media=udp`.
 
 `client/src/connection.rs` runs the link on its own threads. `client/src/hub.rs` hands the numbers to the UI. A `LaunchedEffect` copies them into Cranpose state four times a second.
 
@@ -110,6 +110,31 @@ The launch arguments `host`, `connect` and `media` (`udp` or `tcp`) set the addr
 The poses are in the app's room, the LOCAL space of OpenXR. Its origin lies where the head was when the app started, so the head's height is about 0. Cranpose reports no floor height. The poses go to the host as they are.
 
 Without a headset, as in a flat window, the client sends placeholder values: a still head at 1.6 m and two still controllers. The host renders pictures for them. The desktop client cannot decode, because Cranpose's `VideoDecoder` has no desktop backend. It still connects, counts frames, restores lost packets and reports its timing.
+
+#### Pairing
+
+A headset on another machine needs pairing. The client makes a key for itself (Ed25519) and keeps it in Cranpose's preferences service. The connect panel shows a code of six digits that comes from the key's public half. The host's side:
+1. Start the host with `--pair CODE`, for example `cranvr-host --protocol native --pair 482913`.
+2. Press Connect in the headset. The host pairs the headset whose code matches and writes its public key to `paired-headsets.txt` in the config folder.
+3. A later start needs no flag. The host remembers the key.
+
+Each connection proves that the client holds the key: the host sends a random challenge. The client signs it. A device that only saw the public key and the code on the network cannot sign. The host checks the proof before it looks at the code. The pairing window stays open for ten minutes or for one pairing. Five tries with a wrong code close it.
+
+The host listens on this Mac only until a headset is paired or `--pair` is given. `--trust-all` accepts every client without pairing, for tests. `--trust NAME` counts for the ALVR protocol only. A client on this Mac connects without pairing. So does a headset over USB through `adb reverse`, because its connection comes from the loopback address. The session itself is not encrypted: the media and the tracking cross the network in plain form. The cranvr app does not start the native mode yet, so it has no pairing step.
+
+#### Display lock
+
+The headset shows a new frame at each point of a grid, 120 times a second. Its compositor takes the newest decoded frame some milliseconds before that point (about 17 ms on a Quest 3 with this client). A host that renders at the arrival of each pose has a fixed delay from pose to arrival. On the first Quest runs the arrival fell near the edge of the pick, Jitter put two frames into one interval and none into the next. The headset took 78 to 88 of 120 frames a second.
+
+The host now plans each frame of its own scene (`host/src/headset/display_lock.rs`). Each tracking sample carries the display time that its poses are predicted for. The times of successive samples give the host the headset's display grid. The compositor's reports give the lead (display time minus pick time) and how long a frame takes from its start to the end of its decode. For each frame the host
+- picks the target, the grid point at which the frame should show;
+- starts the frame so that its decode ends a margin before the pick of that point. The margin comes from the 90th percentile of the measured time and an extra that rises when a frame misses and falls while frames hit;
+- renders for the pose that is valid at the target, which it gets by moving the sample's pose with its velocities (at most 80 ms ahead);
+- puts the target in the frame's metadata (`FrameMeta::target_display`, on the client's clock).
+
+A planned frame starts at its planned time, not at the arrival of a pose. When no newer pose came since the last frame, it renders again for the same sample, with the pose moved on to the new target. Such a frame carries the sample's time plus one or two nanoseconds, so that the notes, the encoder and the headset's reports find it. At most two frames in a row repeat a sample.
+
+The client passes the target through. Cranpose's `StreamedScene` takes the newest frame for now. When it can choose frames by target time, `client/src/hub.rs` is the place to hand it over (`Feed::to_runtime_time` turns the target into the runtime's clock). While a game runs, the game sets the pace and the lock does not plan. `--no-display-lock` turns the lock off for a comparison.
 
 ### cranvr's Quest app
 
@@ -392,7 +417,7 @@ HOME=/tmp/cranvr-probe-home ./target/release/cranvr-probe --seconds 10
 
 The probe exits with code 0 when at least half of the expected frames decode with the right eye colors. `HOME` keeps the probe's ALVR client settings out of your own Library folder. The ignored app test starts the host the way the window does and connects the probe.
 
-The native protocol (`cranvr-proto`) runs the same test. The host listens on `127.0.0.1:9950` unless `--trust-all` or `--trust NAME` allows a headset on the network. It opens none of ALVR's ports, so it runs beside an ALVR host:
+The native protocol (`cranvr-proto`) runs the same test. The host listens on `127.0.0.1:9950` unless `--trust-all`, a paired headset or `--pair CODE` allows a headset on the network. It opens none of ALVR's ports, so it runs beside an ALVR host:
 
 ```bash
 ./target/release/cranvr-host --protocol native --config-dir /tmp/cranvr-test-native &

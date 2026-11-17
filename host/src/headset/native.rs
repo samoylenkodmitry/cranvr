@@ -3,15 +3,21 @@
 //! - keeps the last tracking samples, so the frame loop can ask for the pose of a sample;
 //! - estimates the offset between the headset's clock and the host's;
 //! - turns the headset's frame timing reports into a display clock;
-//! - sends each encoded slice with the render poses and the display time the host aims for;
+//! - sends each encoded slice with the render poses and the display time the host aims for. The
+//!   display lock (`display_lock.rs`) plans each frame of the host's own scene for a point of the
+//!   headset's display grid;
 //! - sets the parity share of the media from the client's loss reports.
 //!
 //! One client connects at a time. A second one gets the reason `Busy`.
 //!
 //! What is still ALVR only: game audio and the desktop layer.
 
-use super::{Button, Device, Event, EventSource, Headset, OutFrame};
-use crate::{runtime_link::Haptic, session::Negotiated};
+use super::{display_lock::{DisplayLock, Report}, Button, Device, Event, EventSource, FramePlan, Headset, OutFrame};
+use crate::{
+    pairing::{Attempt, Pairings},
+    runtime_link::Haptic,
+    session::Negotiated,
+};
 use alvr_common::{
     error,
     glam::{Quat, Vec3},
@@ -28,13 +34,15 @@ use cranvr_common::foveation::FoveationConfig;
 use cranvr_proto::{
     clock::{now_ns, ClockSync},
     fec::ParityController,
+    identity::{format_code, pairing_code},
     link::{HostLink, HostListener, HostSide, Incoming, MediaMode},
     media::{FrameMeta, DEFAULT_SHARD_LEN},
     message::{
         buttons, negotiate, ClientDatagram, ClientMsg, FrameTiming, HostDatagram, HostMsg, HostWishes, Input,
         LossReport, Ping, Pong, RejectReason, Tracking, Views as ProtoViews,
     },
-    wire::{Codec, Nanos, Pose as ProtoPose, Rect},
+    motion::extrapolate,
+    wire::{Codec, Motion, Nanos, Pose as ProtoPose, Rect},
 };
 use serde_json::{json, Value};
 use std::{
@@ -52,13 +60,15 @@ use std::{
 /// What the host wants from native mode.
 pub struct Config {
     pub port: u16,
-    /// Names of the clients that may connect from another machine. A client on this machine may
-    /// always connect.
-    pub trust: Vec<String>,
+    /// The headsets that the user paired. A client on this machine needs no pairing.
+    pub pairings: Arc<Pairings>,
+    /// Accept every client without a pairing (for tests)
     pub trust_all: bool,
     /// Send the media over TCP, as a USB link needs it
     pub tcp_media: bool,
     pub wishes: HostWishes,
+    /// Plan the frames of the host's own scene for the headset's display grid
+    pub display_lock: bool,
 }
 
 /// The parity share with no loss. Five percent costs five packets on a frame of a hundred.
@@ -110,12 +120,12 @@ impl EventSource for Events {
 
 /// Starts listening. A bind error comes back to the caller.
 pub fn start(config: Config) -> std::io::Result<(Arc<dyn Headset>, Box<dyn EventSource>)> {
-    let local_only = !config.trust_all && config.trust.is_empty();
+    let local_only = !config.trust_all && !config.pairings.reachable();
     let address: SocketAddr = if local_only { ([127, 0, 0, 1], config.port).into() } else { ([0, 0, 0, 0], config.port).into() };
     let listener = HostListener::bind(address).map_err(|e| std::io::Error::other(e.to_string()))?;
     info!(
         "Native protocol: listening on {address}{}",
-        if local_only { " (this Mac only: add --trust-all or --trust NAME for a headset)" } else { "" }
+        if local_only { " (this Mac only: start the host with --pair CODE to pair a headset)" } else { "" }
     );
     let (events, receiver) = mpsc::channel();
     let shared = Arc::new(Shared { events, session: Mutex::new(None), decoder_config: Mutex::new(None) });
@@ -128,7 +138,7 @@ pub fn start(config: Config) -> std::io::Result<(Arc<dyn Headset>, Box<dyn Event
 
 fn accept_loop(listener: HostListener, config: Config, shared: Arc<Shared>) {
     loop {
-        let pending = match listener.accept() {
+        let mut pending = match listener.accept() {
             Ok(pending) => pending,
             Err(e) => {
                 warn!("Native protocol: a connection failed before its hello: {e}");
@@ -141,10 +151,38 @@ fn accept_loop(listener: HostListener, config: Config, shared: Arc<Shared>) {
             pending.reject(RejectReason::Busy);
             continue;
         }
-        if !(config.trust_all || pending.peer.ip().is_loopback() || config.trust.contains(&name)) {
-            warn!("Native protocol: {name} at {} is not trusted (start the host with --trust \"{name}\")", pending.peer);
-            pending.reject(RejectReason::NotTrusted);
-            continue;
+        // A client on this Mac needs no pairing. Another one proves that it holds its key. Then
+        // the host looks at the key. The proof comes first, so a client cannot claim the key of
+        // another client.
+        if !(config.trust_all || pending.peer.ip().is_loopback()) {
+            let key = pending.caps.public_key;
+            match pending.prove_key() {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!("Native protocol: {name} at {} did not prove its key", pending.peer);
+                    pending.reject(RejectReason::NotPaired);
+                    continue;
+                }
+                Err(e) => {
+                    warn!("Native protocol: the proof of {name} at {} failed: {e}", pending.peer);
+                    continue;
+                }
+            }
+            if !config.pairings.contains(&key) {
+                match config.pairings.try_pair(&key, &name) {
+                    Attempt::Paired => info!("Native protocol: paired {name} at {}", pending.peer),
+                    outcome => {
+                        let code = format_code(pairing_code(&key));
+                        let hint = match outcome {
+                            Attempt::WrongCode => "its code is not the one that --pair has".to_string(),
+                            _ => format!("start the host with --pair {}", code.replace(' ', "")),
+                        };
+                        warn!("Native protocol: {name} at {} is not paired. Its code is {code}: {hint}", pending.peer);
+                        pending.reject(RejectReason::NotPaired);
+                        continue;
+                    }
+                }
+            }
         }
         let stream = match negotiate(&config.wishes, &pending.caps) {
             Ok(stream) => stream,
@@ -168,7 +206,7 @@ fn accept_loop(listener: HostListener, config: Config, shared: Arc<Shared>) {
             }
         };
         info!("Native protocol: {name} at {peer} connected, {} media", if link.duplex.has_udp() { "UDP" } else { "TCP" });
-        let session = Arc::new(Session::new(link, &stream));
+        let session = Arc::new(Session::new(link, &stream, config.display_lock));
         *shared.session.lock().unwrap() = Some(Arc::clone(&session));
         let shared = Arc::clone(&shared);
         thread::Builder::new()
@@ -239,6 +277,7 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
     match incoming {
         Incoming::Datagram(ClientDatagram::Tracking(t)) => {
             session.history.lock().unwrap().push(t);
+            session.lock.lock().unwrap().on_tracking(t.display_time);
             shared.emit(Event::Tracking { sample_ns: t.sample_time });
         }
         Incoming::Datagram(ClientDatagram::Input(input)) => {
@@ -268,7 +307,8 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
             );
             shared.emit(Event::Recenter);
         }
-        Incoming::Control(ClientMsg::Hello(_)) => {}
+        // The proof belongs to the handshake. A later one means nothing.
+        Incoming::Control(ClientMsg::Hello(_) | ClientMsg::Proof(_)) => {}
     }
 }
 
@@ -283,6 +323,36 @@ fn views_config(views: &ProtoViews) -> ViewsConfig {
 
 fn proto_pose(p: &AlvrPose) -> ProtoPose {
     ProtoPose { orientation: p.orientation.to_array(), position: p.position.to_array() }
+}
+
+/// A pose is not moved further than this. A wrong clock estimate or a pause of the client would
+/// otherwise throw the head far away.
+const MAX_HORIZON: f32 = 0.08;
+
+/// The time from `valid_at`, when a sample's poses are valid, to `target`, in seconds. `None` for
+/// a sample without a display time, or for a target in the past.
+fn horizon_seconds(valid_at: Nanos, target: Nanos) -> Option<f32> {
+    if valid_at == 0 || target == 0 {
+        return None;
+    }
+    let seconds = (target as i128 - valid_at as i128) as f64 / 1e9;
+    Some((seconds as f32).clamp(0.0, MAX_HORIZON))
+}
+
+fn device_of(t: &Tracking, device: Device) -> Option<Motion> {
+    match device {
+        Device::Head => Some(t.head),
+        Device::LeftHand => t.left,
+        Device::RightHand => t.right,
+    }
+}
+
+fn device_motion(motion: Motion) -> DeviceMotion {
+    DeviceMotion {
+        pose: AlvrPose { orientation: Quat::from_array(motion.pose.orientation), position: Vec3::from_array(motion.pose.position) },
+        linear_velocity: Vec3::from_array(motion.linear_velocity),
+        angular_velocity: Vec3::from_array(motion.angular_velocity),
+    }
 }
 
 /// The newest tracking samples of a session.
@@ -440,6 +510,9 @@ struct Stats {
     data_packets: u64,
     parity_packets: u64,
     loss: LossReport,
+    /// How far the host moved the poses of the frames that it sent, in ms. The count follows
+    horizon: f64,
+    horizon_frames: u32,
 }
 
 struct SentFrame {
@@ -458,6 +531,10 @@ struct Session {
     parity: Mutex<ParityController>,
     stats: Mutex<Stats>,
     sent: Mutex<VecDeque<SentFrame>>,
+    /// The display lock's planner. It learns the display grid in every case. The frame loop follows
+    /// its plans only when `lock_on` is set.
+    lock: Mutex<DisplayLock>,
+    lock_on: bool,
     next_frame: AtomicU32,
     heard: Mutex<Instant>,
     stopped: Mutex<bool>,
@@ -465,7 +542,7 @@ struct Session {
 }
 
 impl Session {
-    fn new(link: HostLink, stream: &cranvr_proto::message::StreamParams) -> Self {
+    fn new(link: HostLink, stream: &cranvr_proto::message::StreamParams, lock_on: bool) -> Self {
         let period = (1e9 / stream.refresh_hz.max(1.0) as f64) as Nanos;
         let udp = link.duplex.has_udp();
         Self {
@@ -477,6 +554,8 @@ impl Session {
             parity: Mutex::new(ParityController::new(if udp { PARITY_MIN } else { 0.0 }, PARITY_MAX)),
             stats: Mutex::new(Stats::default()),
             sent: Mutex::new(VecDeque::new()),
+            lock: Mutex::new(DisplayLock::new(period)),
+            lock_on,
             next_frame: AtomicU32::new(0),
             heard: Mutex::new(Instant::now()),
             stopped: Mutex::new(false),
@@ -553,6 +632,13 @@ impl Session {
             stats.network += ms(t.received.saturating_sub(sent));
             stats.network_frames += 1;
         }
+        drop(stats);
+        self.lock.lock().unwrap().on_report(&Report {
+            sample: t.tracking_sample,
+            decode_end: t.decode_end,
+            picked: t.picked,
+            display_time: t.display_time,
+        });
     }
 
     fn on_loss(&self, report: &LossReport) {
@@ -576,16 +662,35 @@ impl Headset for Native {
         let session = self.shared.session()?;
         let history = session.history.lock().unwrap();
         let t = history.find(sample_ns)?;
-        let motion = match device {
-            Device::Head => t.head,
-            Device::LeftHand => t.left?,
-            Device::RightHand => t.right?,
-        };
-        Some(DeviceMotion {
-            pose: AlvrPose { orientation: Quat::from_array(motion.pose.orientation), position: Vec3::from_array(motion.pose.position) },
-            linear_velocity: Vec3::from_array(motion.linear_velocity),
-            angular_velocity: Vec3::from_array(motion.angular_velocity),
-        })
+        Some(device_motion(device_of(t, device)?))
+    }
+
+    fn motion_at(&self, device: Device, sample_ns: u64, target: u64) -> Option<DeviceMotion> {
+        let session = self.shared.session()?;
+        let history = session.history.lock().unwrap();
+        let t = history.find(sample_ns)?;
+        let mut motion = device_of(t, device)?;
+        // The pose is valid at the sample's display time. The frame shows at the target.
+        if let Some(seconds) = horizon_seconds(t.display_time, target) {
+            motion.pose = extrapolate(&motion, seconds);
+        }
+        Some(device_motion(motion))
+    }
+
+    fn frame_plan(&self) -> Option<FramePlan> {
+        let session = self.shared.session()?;
+        if !session.lock_on {
+            return None;
+        }
+        let now = session.client_time(now_ns())?;
+        let plan = session.lock.lock().unwrap().plan(now)?;
+        Some(FramePlan { start_in: Duration::from_nanos(plan.start.saturating_sub(now)), target: plan.target, start: plan.start })
+    }
+
+    fn frame_started(&self, target: u64, late: Duration) {
+        if let Some(session) = self.shared.session() {
+            session.lock.lock().unwrap().commit(target, late.as_nanos() as u64);
+        }
     }
 
     /// The native client sends one pose per refresh. Its poses jitter by a few milliseconds, and
@@ -609,7 +714,9 @@ impl Headset for Native {
         let Some(session) = self.shared.session() else { return };
         let index = session.next_frame.fetch_add(1, Ordering::Relaxed);
         let now = now_ns();
-        let target_display = session.target_display(now);
+        // A frame that followed a plan has its target. Another frame aims for the first display
+        // time that it can make.
+        let target_display = frame.plan.map_or_else(|| session.target_display(now), |plan| plan.target);
         let parity = session.parity.lock().unwrap().clone();
         let rects: Vec<Rect> = frame.slices.iter().map(|s| Rect { x: s.rect[0], y: s.rect[1], w: s.rect[2], h: s.rect[3] }).collect();
         let mut sent_bytes = 0;
@@ -645,6 +752,19 @@ impl Headset for Native {
                 sent.pop_front();
             }
             sent.push_back(SentFrame { frame: index, sent: now });
+        }
+        // The planner counts the frame. A frame without a plan counts from its send, which makes
+        // its measured need shorter than a planned frame's.
+        if target_display != 0 {
+            let start = frame.plan.map_or_else(|| session.client_time(now).unwrap_or(0), |plan| plan.start);
+            session.lock.lock().unwrap().sent(frame.sample_ns, target_display, start);
+            if let Some(t) = session.history.lock().unwrap().find(frame.sample_ns) {
+                if let Some(seconds) = horizon_seconds(t.display_time, target_display) {
+                    let mut stats = session.stats.lock().unwrap();
+                    stats.horizon += f64::from(seconds) * 1e3;
+                    stats.horizon_frames += 1;
+                }
+            }
         }
         let mut stats = session.stats.lock().unwrap();
         stats.sent_frames += 1;
@@ -685,7 +805,23 @@ impl Headset for Native {
         let lost = stats.loss.packets_expected.saturating_sub(stats.loss.packets_received);
         let loss_pct = if stats.loss.packets_expected > 0 { 100.0 * lost as f64 / stats.loss.packets_expected as f64 } else { 0.0 };
         let sent_frames = stats.sent_frames.max(1) as f64;
+        let slots = session.lock.lock().unwrap().take_stats();
+        let share = |n: u32| 100.0 * f64::from(n) / f64::from(slots.frames().max(1));
         Some(json!({
+            "lock": session.lock_on,
+            "slot_on_target_pct": share(slots.on_time),
+            "slot_late_pct": share(slots.late),
+            "slot_early_pct": share(slots.early),
+            "slot_replaced_pct": share(slots.replaced),
+            "lock_skipped_points": slots.skipped_points,
+            "lock_late_start_ms": slots.late_start_ms,
+            "lock_late_start_max_ms": slots.late_start_max_ms,
+            "lock_need_ms": slots.need_ms,
+            "lock_need_p10_ms": slots.need_p10_ms,
+            "lock_need_p50_ms": slots.need_p50_ms,
+            "lock_lead_ms": slots.lead_ms,
+            "lock_margin_ms": slots.margin_ms,
+            "horizon_ms": stats.horizon / f64::from(stats.horizon_frames.max(1)),
             "frames": stats.frames,
             "client_fps": fps,
             "video_mbps": stats.sent_bytes as f64 * 8.0 / seconds / 1e6,

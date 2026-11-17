@@ -94,6 +94,9 @@ pub struct ClientCaps {
     /// The client reaches the host through a TCP-only path, such as `adb reverse` over USB. The
     /// host then sends the media over TCP.
     pub tcp_only: bool,
+    /// The client's public key (see [`crate::identity`]). The host remembers the keys of the
+    /// clients that the user paired.
+    pub public_key: [u8; 32],
 }
 
 /// The two eyes' field of view and their place relative to the head.
@@ -165,7 +168,8 @@ pub struct Welcome {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RejectReason {
-    NotTrusted,
+    /// The host does not know the client's key. The client shows its pairing code.
+    NotPaired,
     /// Another headset is connected
     Busy,
     NoCommonCodec,
@@ -186,6 +190,8 @@ pub enum ClientMsg {
     /// The headset's runtime moved the origin of its tracking space, which the user asked for by
     /// recentering. A receiver that does not know this message skips it.
     Recenter(Recenter),
+    /// The answer to the host's challenge: the signature of the client's key
+    Proof(Vec<u8>),
 }
 
 /// A change of the origin of the poses that the client sends. Every pose with a display time at or
@@ -214,6 +220,9 @@ pub enum HostMsg {
     /// The host changed the stream, for example the foveation or the eye size
     StreamUpdate(StreamParams),
     Bye,
+    /// The host asks the client to prove that it holds its key. The client answers with
+    /// [`ClientMsg::Proof`].
+    Challenge([u8; 32]),
 }
 
 /// Datagram messages from the client to the host.
@@ -244,6 +253,10 @@ pub struct Tracking {
     /// When the headset sampled the poses, on the client's clock. Frames come back with this
     /// time, so it names the sample.
     pub sample_time: Nanos,
+    /// When the compositor shows the frame that the poses are for, on the client's clock. The
+    /// poses are predictions for this time. The times of successive samples make the host's model
+    /// of the client's display grid.
+    pub display_time: Nanos,
     pub head: Motion,
     pub left: Option<Motion>,
     pub right: Option<Motion>,
@@ -293,6 +306,9 @@ pub struct FrameTiming {
     pub received: Nanos,
     /// The decoder finished the frame
     pub decode_end: Nanos,
+    /// The compositor took the frame for its display. A frame that came later waited for the next
+    /// display time.
+    pub picked: Nanos,
     /// The display time that the compositor reported for this frame
     pub display_time: Nanos,
     /// The next display time that the compositor predicts after this one

@@ -8,6 +8,7 @@
 
 use crate::{
     fec::ParityController,
+    identity::{self, Identity},
     media::{FrameMeta, FrameSender, SendStats},
     message::*,
     wire::{decode, encode, read_tcp_packet, Error, PacketBuf, Wire, KIND_CONTROL, KIND_DATAGRAM, KIND_MEDIA},
@@ -315,6 +316,19 @@ impl Pending {
         write_control(&mut self.tcp, &HostMsg::Reject(reason)).ok();
     }
 
+    /// Asks the client to prove that it holds the key of its Hello. It gives `true` for a valid
+    /// signature of a new random challenge. The host calls it before it looks at the key's
+    /// pairing, so that a client cannot claim the key of another client.
+    pub fn prove_key(&mut self) -> Result<bool, Error> {
+        let challenge = identity::random_bytes()?;
+        write_control(&mut self.tcp, &HostMsg::Challenge(challenge))?;
+        let mut buf = Vec::new();
+        match read_control::<ClientMsg>(&mut self.tcp, &mut buf)? {
+            ClientMsg::Proof(signature) => Ok(identity::verify(&self.caps.public_key, &challenge, &signature)),
+            _ => Err(Error::Unexpected("the client's answer to the challenge is not Proof")),
+        }
+    }
+
     /// Sends the welcome, waits until the media path works and returns the session.
     /// `shard_len` is the payload bytes of a media packet.
     pub fn accept(mut self, stream: StreamParams, mode: MediaMode, shard_len: usize) -> Result<HostLink, Error> {
@@ -404,8 +418,9 @@ pub struct ClientLink {
 
 impl ClientLink {
     /// Connects to the host, agrees on a version, sends the capabilities and waits for the host's
-    /// choices and for the media path. `timeout` bounds each step.
-    pub fn connect(host: SocketAddr, caps: &ClientCaps, timeout: Duration) -> Result<Self, Error> {
+    /// choices and for the media path. The host may first ask for a proof of the key that the
+    /// capabilities carry. `identity` answers it. `timeout` bounds each step.
+    pub fn connect(host: SocketAddr, caps: &ClientCaps, identity: &Identity, timeout: Duration) -> Result<Self, Error> {
         let mut tcp = TcpStream::connect_timeout(&host, timeout)?;
         tcp.set_nodelay(true)?;
         tcp.set_read_timeout(Some(timeout))?;
@@ -420,7 +435,12 @@ impl ClientLink {
         })?;
         write_control(&mut tcp, &ClientMsg::Hello(caps.clone()))?;
         let mut buf = Vec::new();
-        let welcome = match read_control::<HostMsg>(&mut tcp, &mut buf)? {
+        let mut answer = read_control::<HostMsg>(&mut tcp, &mut buf)?;
+        if let HostMsg::Challenge(challenge) = answer {
+            write_control(&mut tcp, &ClientMsg::Proof(identity.sign(&challenge)))?;
+            answer = read_control::<HostMsg>(&mut tcp, &mut buf)?;
+        }
+        let welcome = match answer {
             HostMsg::Welcome(w) => w,
             HostMsg::Reject(reason) => return Err(Error::Rejected(reason)),
             _ => return Err(Error::Unexpected("the host's first answer is not Welcome")),

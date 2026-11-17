@@ -41,6 +41,11 @@ impl Rng {
     }
 }
 
+/// The identity that `caps` carries the public key of
+pub fn identity() -> cranvr_proto::identity::Identity {
+    cranvr_proto::identity::Identity::from_seed([5; 32])
+}
+
 pub fn caps() -> ClientCaps {
     let fov = Fov { left: -0.9, right: 0.8, up: 0.9, down: -1.0 };
     ClientCaps {
@@ -55,6 +60,7 @@ pub fn caps() -> ClientCaps {
         decoders: 2,
         foveation: true,
         tcp_only: false,
+        public_key: identity().public_key(),
     }
 }
 

@@ -21,6 +21,7 @@ use cranvr_proto::{
     clock::now_ns,
     link::ClientLink,
     message::{buttons as bit, ClientDatagram, ClientMsg, HandInput, Input, Recenter, Tracking, Views},
+    motion::velocities,
     wire::{Fov, Motion, Nanos, Pose},
 };
 use std::{
@@ -51,6 +52,9 @@ pub struct HeadsetFrame {
 pub struct Display {
     pub time: Nanos,
     pub period: Nanos,
+    /// The client's clock minus the runtime's clock, in ns. It turns a time of the runtime into
+    /// the client's and back.
+    pub offset: i64,
 }
 
 /// What one headset frame gives the sender.
@@ -81,7 +85,11 @@ impl FrameReader {
     /// another clock, so only their differences from `xr.now` carry over.
     pub fn read(&mut self, xr: &XrFrame, now: Nanos) -> Read {
         let ahead = xr.predicted_display_time.saturating_sub(xr.now).as_nanos() as u64;
-        let display = Display { time: now + ahead, period: xr.period.as_nanos() as u64 };
+        let display = Display {
+            time: now + ahead,
+            period: xr.period.as_nanos() as u64,
+            offset: now as i64 - xr.now.as_nanos() as i64,
+        };
         let recenter = xr.recenter.as_ref().map(|r| recenter(r, xr, now));
         if recenter.is_some() {
             // The poses before and after the change lie in different spaces
@@ -104,7 +112,7 @@ impl FrameReader {
     fn head(&mut self, pose: XrPose, time: Duration) -> Motion {
         let (linear_velocity, angular_velocity) = match self.last_head.replace((time, pose)) {
             Some((before, last)) if time > before && time - before <= MAX_VELOCITY_GAP => {
-                velocities(&last, &pose, (time - before).as_secs_f32())
+                velocities(&proto_pose(&last), &proto_pose(&pose), (time - before).as_secs_f32())
             }
             _ => ([0.0; 3], [0.0; 3]),
         };
@@ -169,31 +177,6 @@ fn recenter(change: &XrRecenter, xr: &XrFrame, now: Nanos) -> Recenter {
         change_time: (now as i128 + offset).max(1) as Nanos,
         origin: change.pose_in_previous_space.as_ref().map(proto_pose),
     }
-}
-
-/// The linear and the angular velocity that take the head from `before` to `after` in `seconds`.
-/// The angular velocity is about the axes of the room.
-fn velocities(before: &XrPose, after: &XrPose, seconds: f32) -> ([f32; 3], [f32; 3]) {
-    let linear = [0, 1, 2].map(|i| (after.position[i] - before.position[i]) / seconds);
-    // The turn from `before` to `after` in the room's axes: after * conjugate(before)
-    let [bx, by, bz, bw] = before.orientation;
-    let [ax, ay, az, aw] = after.orientation;
-    let (cx, cy, cz, cw) = (-bx, -by, -bz, bw);
-    let mut turn = [
-        aw * cx + ax * cw + ay * cz - az * cy,
-        aw * cy - ax * cz + ay * cw + az * cx,
-        aw * cz + ax * cy - ay * cx + az * cw,
-        aw * cw - ax * cx - ay * cy - az * cz,
-    ];
-    if turn[3] < 0.0 {
-        turn = turn.map(|v| -v);
-    }
-    let sine = (turn[0] * turn[0] + turn[1] * turn[1] + turn[2] * turn[2]).sqrt();
-    let angle = 2.0 * sine.atan2(turn[3]);
-    // For a tiny turn the axis is not defined. The angle is then about twice the sine
-    let scale = if sine > 1e-6 { angle / sine } else { 2.0 };
-    let angular = [0, 1, 2].map(|i| turn[i] * scale / seconds);
-    (linear, angular)
 }
 
 /// What the sender takes from the feed.
@@ -284,6 +267,14 @@ impl Feed {
         self.inner.lock().unwrap().display
     }
 
+    /// A time on the client's clock as a time of the headset runtime, the clock of `XrFrame`.
+    /// `None` before the first frame.
+    #[cfg_attr(not(test), expect(dead_code, reason = "Cranpose's StreamedViews will take a target display time in this form"))]
+    pub fn to_runtime_time(&self, client_time: Nanos) -> Option<Duration> {
+        let offset = self.display()?.offset;
+        Some(Duration::from_nanos(u64::try_from(client_time as i128 - offset as i128).ok()?))
+    }
+
     /// Notes the views that the host renders with. The frames that come back carry the render
     /// poses of these views.
     pub fn set_host_views(&self, views: Views) {
@@ -371,7 +362,7 @@ const STOP_CHECK: Duration = Duration::from_millis(20);
 /// Sends the headset's tracking to the host until `stop` is set. In a headset each frame of the
 /// feed goes out as it comes. Without a headset the sender makes placeholder frames once per
 /// refresh. `hello_views` are the views that the host got in the Hello.
-pub fn send_loop(link: &ClientLink, feed: &Feed, in_headset: bool, refresh_hz: f32, hello_views: Views, hold: Duration, stop: &AtomicBool) {
+pub fn send_loop(link: &ClientLink, feed: &Feed, in_headset: bool, refresh_hz: f32, hello_views: Views, stop: &AtomicBool) {
     let period = Duration::from_secs_f64(1.0 / f64::from(refresh_hz.max(1.0)));
     let mut deadline = Instant::now();
     let mut last_input = None;
@@ -402,10 +393,13 @@ pub fn send_loop(link: &ClientLink, feed: &Feed, in_headset: bool, refresh_hz: f
             }
             None => continue,
         };
-        if !hold.is_zero() {
-            std::thread::sleep(hold);
-        }
-        let tracking = Tracking { sample_time: frame.sample_time, head: frame.head, left: frame.left, right: frame.right };
+        let tracking = Tracking {
+            sample_time: frame.sample_time,
+            display_time: frame.display_time,
+            head: frame.head,
+            left: frame.left,
+            right: frame.right,
+        };
         if link.duplex.send_datagram(&ClientDatagram::Tracking(tracking)).is_err() {
             return;
         }
@@ -422,6 +416,7 @@ mod tests {
     use super::*;
     use cranpose_xr::{Button, FieldOfView, Thumbstick, Trigger};
     use cranvr_proto::{
+        identity::Identity,
         link::{HostListener, Incoming, MediaMode},
         message::{negotiate, ClientCaps, HostWishes},
         wire::Codec,
@@ -454,9 +449,20 @@ mod tests {
     #[test]
     fn the_display_time_is_the_clock_reading_plus_the_runtimes_lead() {
         let read = FrameReader::default().read(&frame(), 5_000_000_000);
-        assert_eq!(read.display, Display { time: 5_017_000_000, period: 8_333_000 });
+        // The runtime's clock reads 100 s while the client's reads 5 s
+        assert_eq!(read.display, Display { time: 5_017_000_000, period: 8_333_000, offset: -95_000_000_000 });
         let sent = read.frame.unwrap();
         assert_eq!((sent.sample_time, sent.display_time), (5_000_000_000, 5_017_000_000));
+    }
+
+    #[test]
+    fn a_time_of_the_client_becomes_a_time_of_the_runtime() {
+        let feed = Feed::default();
+        assert_eq!(feed.to_runtime_time(5_000_000_000), None);
+        feed.push(FrameReader::default().read(&frame(), 5_000_000_000));
+        // The frame's clock reading was 5 s on the client and 100 s on the runtime
+        assert_eq!(feed.to_runtime_time(5_017_000_000), Some(Duration::from_millis(100_017)));
+        assert_eq!(feed.to_runtime_time(4_990_000_000), Some(Duration::from_millis(99_990)));
     }
 
     #[test]
@@ -487,20 +493,6 @@ mod tests {
         let head = reader.read(&xr, 2).frame.unwrap().head;
         assert!((head.linear_velocity[0] - 1.0).abs() < 1e-3 && (head.linear_velocity[2] + 2.0).abs() < 1e-3);
         assert_eq!(head.angular_velocity, [0.0; 3]);
-    }
-
-    #[test]
-    fn a_turn_about_y_gives_an_angular_velocity_about_y() {
-        let before = XrPose::IDENTITY;
-        let half = 0.1_f32;
-        let after = XrPose { position: [0.0; 3], orientation: [0.0, half.sin(), 0.0, half.cos()] };
-        let (_, angular) = velocities(&before, &after, 0.1);
-        assert!(angular[0].abs() < 1e-5 && angular[2].abs() < 1e-5);
-        // A turn of 0.2 radians in 0.1 s
-        assert!((angular[1] - 2.0).abs() < 1e-3, "{angular:?}");
-        // The opposite sign of the quaternion is the same turn
-        let flipped = XrPose { orientation: after.orientation.map(|v| -v), ..after };
-        assert!((velocities(&before, &flipped, 0.1).1[1] - 2.0).abs() < 1e-3);
     }
 
     #[test]
@@ -610,6 +602,7 @@ mod tests {
                 Incoming::Media(_) => {}
             });
         });
+        let identity = Identity::from_seed([3; 32]);
         let caps = ClientCaps {
             name: "test".into(),
             eye_size: [1680, 1760],
@@ -619,8 +612,9 @@ mod tests {
             decoders: 1,
             foveation: false,
             tcp_only: true,
+            public_key: identity.public_key(),
         };
-        (ClientLink::connect(addr, &caps, Duration::from_secs(10)).unwrap(), inbox)
+        (ClientLink::connect(addr, &caps, &identity, Duration::from_secs(10)).unwrap(), inbox)
     }
 
     enum Heard {
@@ -637,7 +631,7 @@ mod tests {
         let sender = {
             let (link, feed, stop) = (link.clone(), feed.clone(), stop.clone());
             let hello = FrameReader::default().read(&frame(), 1).views.unwrap();
-            thread::spawn(move || send_loop(&link, &feed, true, 120.0, hello, Duration::ZERO, &stop))
+            thread::spawn(move || send_loop(&link, &feed, true, 120.0, hello, &stop))
         };
         let next = |what: &str| inbox.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|_| panic!("no {what}"));
         let mut reader = FrameReader::default();
@@ -696,7 +690,7 @@ mod tests {
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let sender = {
             let (link, feed, stop) = (link.clone(), feed.clone(), stop.clone());
-            thread::spawn(move || send_loop(&link, &feed, false, 120.0, placeholder_views(), Duration::ZERO, &stop))
+            thread::spawn(move || send_loop(&link, &feed, false, 120.0, placeholder_views(), &stop))
         };
         let mut heard = 0;
         while heard < 3 {

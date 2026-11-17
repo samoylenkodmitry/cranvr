@@ -19,10 +19,12 @@ use cranpose::{AccessUnit, DecodedFrames, DecoderConfig, DecoderError, DecoderOu
 use cranpose_xr::{Hand, Vibration};
 use cranvr_proto::{
     clock::{now_ns, ClockSync},
+    identity::{format_code, Identity},
     link::{ClientLink, ClientSide, Incoming},
     media::{FrameReceiver, Received},
     message::{
-        ClientCaps, ClientDatagram, ClientMsg, FrameTiming, HostDatagram, HostMsg, LossReport, Ping, Pong, StreamParams, Views,
+        ClientCaps, ClientDatagram, ClientMsg, FrameTiming, HostDatagram, HostMsg, LossReport, Ping, Pong, RejectReason,
+        StreamParams, Views,
     },
     wire::{Codec, Error, Nanos},
 };
@@ -79,7 +81,7 @@ const VIEWS_WAIT: Duration = Duration::from_secs(5);
 
 /// What the client tells the host about itself. A headset reports its name, the size of the
 /// pictures that its displays take and its refresh rates.
-fn device_caps(tcp_only: bool, headset: Option<&HeadsetInfo>, views: Views) -> ClientCaps {
+fn device_caps(tcp_only: bool, headset: Option<&HeadsetInfo>, views: Views, identity: &Identity) -> ClientCaps {
     let (name, eye_size, refresh_rates) = match headset {
         Some(HeadsetInfo { properties, .. }) => {
             let size = properties.eye_image_sizes[0].recommended;
@@ -101,6 +103,7 @@ fn device_caps(tcp_only: bool, headset: Option<&HeadsetInfo>, views: Views) -> C
         // The headset's compositor samples the picture as it is. It cannot unwarp a foveated one.
         foveation: false,
         tcp_only,
+        public_key: identity.public_key(),
     }
 }
 
@@ -205,7 +208,8 @@ fn run(
     } else {
         tracking::placeholder_views()
     };
-    let caps = device_caps(tcp_media, headset.as_ref(), views);
+    let identity = crate::settings::identity();
+    let caps = device_caps(tcp_media, headset.as_ref(), views, identity);
     log::info!(
         "Hello: {} with {}x{} pixels an eye, refresh rates {:?}, fov {:?}, eyes at {:?}",
         caps.name,
@@ -216,10 +220,18 @@ fn run(
         caps.views.eye_pose.map(|pose| pose.position),
     );
     hub.feed.set_host_views(views);
-    let link = match ClientLink::connect(host, &caps, CONNECT_TIMEOUT) {
+    let link = match ClientLink::connect(host, &caps, identity, CONNECT_TIMEOUT) {
         Ok(link) => Arc::new(link),
         Err(e) => {
-            hub.report(id, |snapshot| snapshot.state = LinkState::Failed(describe(&e, host)));
+            let message = match &e {
+                Error::Rejected(RejectReason::NotPaired) => format!(
+                    "{host} does not know this headset. On the Mac, start cranvr-host with --pair {}",
+                    format_code(identity.code()).replace(' ', "")
+                ),
+                other => describe(other, host),
+            };
+            log::warn!("{message}");
+            hub.report(id, |snapshot| snapshot.state = LinkState::Failed(message));
             return;
         }
     };
@@ -275,6 +287,10 @@ struct Averages {
     pose_to_decode_n: u32,
     /// The frames that the headset took since the stats thread last looked
     shown: u32,
+    /// Of those, the frames by their display time against the host's target
+    on_target: u32,
+    late: u32,
+    early: u32,
 }
 
 struct Shared<'a> {
@@ -383,7 +399,7 @@ fn session(hub: &'static Hub, id: u64, link: &ClientLink, in_headset: bool, hell
         }
         named("cranvr-upkeep").spawn_scoped(scope, move || upkeep(shared)).expect("the upkeep thread");
         named("cranvr-tracking")
-            .spawn_scoped(scope, move || tracking::send_loop(link, &hub.feed, in_headset, refresh_hz, hello_views, crate::settings::tracking_hold(), stop))
+            .spawn_scoped(scope, move || tracking::send_loop(link, &hub.feed, in_headset, refresh_hz, hello_views, stop))
             .expect("the tracking thread");
         named("cranvr-decode").spawn_scoped(scope, move || decode_loop(shared, &units_rx)).expect("the decoder thread");
         named("cranvr-stats").spawn_scoped(scope, move || stats_loop(shared)).expect("the stats thread");
@@ -641,9 +657,10 @@ impl Decode<'_, '_> {
                 tracking_sample: meta.tracking_sample,
                 received: unit.completed,
                 submitted: unit.completed,
+                target_display: meta.target_display,
             };
             let display_time = s.hub.feed.display_time_after(unit.completed, s.period_ns.load(Ordering::Relaxed));
-            self.send_timing(&sent, unit.completed, display_time, s.period_ns.load(Ordering::Relaxed));
+            self.send_timing(&sent, unit.completed, unit.completed, display_time, s.period_ns.load(Ordering::Relaxed));
         }
     }
 
@@ -680,6 +697,7 @@ impl Decode<'_, '_> {
             tracking_sample: meta.tracking_sample,
             received: unit.completed,
             submitted,
+            target_display: meta.target_display,
         });
         let result = match self.decoder.as_mut() {
             Some(decoder) => decoder.submit(AccessUnit { data, timestamp: Duration::from_micros(pts_us), metadata }),
@@ -703,26 +721,39 @@ impl Decode<'_, '_> {
         for shown in s.hub.take_shown() {
             let sent = shown.sent;
             // The decode time is the one of the newest picture, which the headset took
-            let decode_end = (sent.submitted + shown.decode_time.as_nanos() as u64).min(shown.display_time);
+            // The frame was ready before the compositor took it, so the end of the decode lies
+            // before the pick
+            let decode_end = (sent.submitted + shown.decode_time.as_nanos() as u64).min(shown.picked);
             {
                 let mut averages = s.averages.lock().unwrap();
                 averages.pose_to_decode_ms += decode_end.saturating_sub(sent.tracking_sample) as f64 / 1e6;
                 averages.pose_to_decode_n += 1;
                 averages.shown += 1;
+                if sent.target_display != 0 && shown.period > 0 {
+                    let points = ((shown.display_time as f64 - sent.target_display as f64) / shown.period as f64).round();
+                    if points == 0.0 {
+                        averages.on_target += 1;
+                    } else if points > 0.0 {
+                        averages.late += 1;
+                    } else {
+                        averages.early += 1;
+                    }
+                }
             }
-            self.send_timing(&sent, decode_end, shown.display_time, shown.period);
+            self.send_timing(&sent, decode_end, shown.picked, shown.display_time, shown.period);
         }
     }
 
     /// Tells the host what the display did with a frame: when the picture came out of the decoder
     /// and when the display shows it.
-    fn send_timing(&self, sent: &Sent, decode_end: Nanos, display_time: Nanos, period: Nanos) {
+    fn send_timing(&self, sent: &Sent, decode_end: Nanos, picked: Nanos, display_time: Nanos, period: Nanos) {
         let timing = FrameTiming {
             stream: 0,
             frame: sent.frame,
             tracking_sample: sent.tracking_sample,
             received: sent.received,
             decode_end,
+            picked,
             display_time,
             next_display_time: display_time + period,
         };
@@ -756,9 +787,10 @@ fn stats_loop(s: &Shared<'_>) {
         let decoded_fps = (now_decoded - decoded) as f32 / seconds;
         let received_mbps = (now_bytes - bytes) as f32 * 8.0 / 1e6 / seconds;
         (frames, decoded, bytes) = (now_frames, now_decoded, now_bytes);
-        let shown_fps = {
+        let (shown_fps, slots) = {
             let mut averages = s.averages.lock().unwrap();
             let shown_fps = averages.shown as f32 / seconds;
+            let slots = (averages.on_target, averages.late, averages.early);
             if averages.network_n > 0 {
                 network_ms = Some((averages.network_ms / f64::from(averages.network_n)) as f32);
             }
@@ -766,8 +798,10 @@ fn stats_loop(s: &Shared<'_>) {
                 sample_to_decode_ms = Some((averages.pose_to_decode_ms / f64::from(averages.pose_to_decode_n)) as f32);
             }
             *averages = Averages::default();
-            shown_fps
+            (shown_fps, slots)
         };
+        let with_target = (slots.0 + slots.1 + slots.2).max(1) as f32;
+        let pct = |n: u32| 100.0 * n as f32 / with_target;
         let ms = |d: Duration| d.as_secs_f32() * 1000.0;
         let (headset_fps, headset_gap) = s.hub.feed.frame_rate().unwrap_or_default();
         let totals = s.totals.lock().unwrap();
@@ -795,13 +829,16 @@ fn stats_loop(s: &Shared<'_>) {
             headset_fps,
             headset_gap_ms: ms(headset_gap),
             head_position: s.hub.feed.head().map(|head| head.pose.position),
+            at_target_pct: pct(slots.0),
+            late_pct: pct(slots.1),
+            early_pct: pct(slots.2),
             tracking_live: s.hub.feed.is_live(),
         };
         drop(totals);
         if log_due.elapsed() >= LOG_EVERY {
             log_due = Instant::now();
             log::info!(
-                "{:.1} fps received, {:.1} fps decoded, {:.1} fps shown of {:.1} headset frames (gap up to {:.1} ms), {} dropped by the decoder, {:.1} Mbps, decode {:.2} ms mean, rtt {} ms, \
+                "{:.1} fps received, {:.1} fps decoded, {:.1} fps shown of {:.1} headset frames (gap up to {:.1} ms), at target {:.0}% late {:.0}% early {:.0}%, {} dropped by the decoder, {:.1} Mbps, decode {:.2} ms mean, rtt {} ms, \
                  network {} ms, pose to decode {} ms, tracking {} at {:?}, {} of {} packets lost, {} units recovered, {} units lost, \
                  {} pulses",
                 stats.received_fps,
@@ -809,6 +846,9 @@ fn stats_loop(s: &Shared<'_>) {
                 stats.shown_fps,
                 stats.headset_fps,
                 stats.headset_gap_ms,
+                stats.at_target_pct,
+                stats.late_pct,
+                stats.early_pct,
                 stats.decoder_dropped,
                 stats.received_mbps,
                 stats.decode_mean_ms,

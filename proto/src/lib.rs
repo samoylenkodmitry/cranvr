@@ -23,9 +23,11 @@
 
 pub mod clock;
 pub mod fec;
+pub mod identity;
 pub mod link;
 pub mod media;
 pub mod message;
+pub mod motion;
 pub mod wire;
 
 pub use wire::{Error, Nanos};
@@ -33,10 +35,13 @@ pub use wire::{Error, Nanos};
 /// The newest protocol version this crate speaks. A change of the wire format, or of a message
 /// that older code cannot read, raises it. New enum variants at the end of a message enum do not
 /// need a new version for receivers that ignore what they cannot decode.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// Version 2 added the key and the challenge of pairing, the display time of a tracking sample
+/// and the moment at which the compositor took a frame.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// The oldest protocol version this crate still speaks.
-pub const MIN_PROTOCOL_VERSION: u16 = 1;
+pub const MIN_PROTOCOL_VERSION: u16 = 2;
 
 /// The largest datagram, in bytes. A media packet and any datagram message fit in it. A typical
 /// path MTU of 1500 bytes minus the IP and UDP headers leaves 1472 bytes. The 1400 bytes leave

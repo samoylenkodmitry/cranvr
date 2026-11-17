@@ -26,6 +26,10 @@ pub struct Options {
     pub mbps: u64,
     pub trust: Vec<String>,
     pub trust_all: bool,
+    /// With the native protocol: the pairing code of the headset to pair (see `pairing.rs`)
+    pub pair_code: Option<u32>,
+    /// With the native protocol: plan the host's own scene's frames for the headset's display
+    pub display_lock: bool,
     /// Clients the host connects to at a fixed address, such as a phone through `adb forward`
     pub client_ips: Vec<IpAddr>,
     pub tcp: bool,

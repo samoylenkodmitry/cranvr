@@ -19,7 +19,7 @@ use cranpose_xr::{
     local_haptics, local_headset_properties, local_spatial_capabilities, SpatialFrameEffect, SpatialPanel, StreamedScene,
     Subspace, SubspaceModifier,
 };
-use cranvr_proto::clock::now_ns;
+use cranvr_proto::{clock::now_ns, identity::format_code};
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
 /// How often the UI copies the link's numbers into its state
@@ -182,6 +182,11 @@ fn ConnectPanel(snapshot: MutableState<Snapshot>) {
                     Keypad(address);
                     ConnectButton(state.clone(), address);
                     StatusLine(state.clone(), address);
+                    Text(
+                        format!("Pairing code {}", format_code(settings::identity().code())),
+                        Modifier::empty(),
+                        text_style(22.0, MUTED_COLOR, None),
+                    );
                 },
             );
         },
