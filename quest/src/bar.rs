@@ -1,4 +1,5 @@
-// cranvr: a panel's bar (its handle and buttons) as a quad layer.
+// cranvr: a panel's bar (its buttons) as a quad layer. The panel's handle is a ball in the
+// overlay's scene.
 //
 // The overlay layer drew the bar's text in the eye views, where it shimmered and showed stairs:
 // the text was drawn small, from a larger picture, without the compositor's filters. The bar is
@@ -23,14 +24,6 @@ const PIXELS_PER_METER: f32 = 1600.0;
 const GL_SRGB8_ALPHA8: u32 = 0x8C43;
 /// The text's height as a share of a button's height
 const TEXT_SHARE: f32 = 0.5;
-
-fn handle_color(look: Look) -> [f32; 4] {
-    match look {
-        Look::Idle => [0.75, 0.77, 0.8, 0.6],
-        Look::Hover => [1.0, 1.0, 1.0, 0.95],
-        Look::Active => [0.45, 0.7, 1.0, 1.0],
-    }
-}
 
 fn button_color(look: Look) -> [f32; 4] {
     match look {
@@ -122,9 +115,6 @@ fn draw(bar: &Bar) -> (u32, u32, Vec<u8>) {
     let mut canvas = Canvas::new(width.max(1), height.max(1));
     let to_px = |(x, y): (f32, f32)| (width as f32 / 2.0 + x * PIXELS_PER_METER, height as f32 / 2.0 - y * PIXELS_PER_METER);
     let size = |(w, h): (f32, f32)| (w * PIXELS_PER_METER, h * PIXELS_PER_METER);
-    let (center, handle_size, look) = bar.handle;
-    let handle = size(handle_size);
-    canvas.round_rect(to_px(center), handle, handle.1 / 2.0, handle_color(look));
     for button in &bar.buttons {
         let (center, (w, h)) = (to_px(button.center), size(button.size));
         canvas.round_rect(center, (w, h), 0.3 * h, button_color(button.look));
@@ -236,7 +226,7 @@ impl BarLayer {
         session: &xr::Session<xr::OpenGlEs>,
         gfx: &GraphicsContext,
     ) -> Result<Self, String> {
-        let wanted = format!("{:?}", (bar.size, bar.handle, &bar.buttons));
+        let wanted = format!("{:?}", (bar.size, &bar.buttons));
         let mut layer = old.unwrap_or(Self { picture: None, shown: String::new(), drawing: None, bar: bar.clone() });
         layer.bar = bar;
         let done = match layer.drawing.as_ref().map(|(_, _, receiver)| receiver.try_recv()) {
@@ -332,21 +322,20 @@ mod tests {
     use alvr_common::glam::{Quat, Vec3};
 
     #[test]
-    fn the_bar_picture_has_the_handle_and_the_buttons() {
+    fn the_bar_picture_has_its_buttons() {
         let bar = Bar {
             panel: 0,
             center: Vec3::ZERO,
             orientation: Quat::IDENTITY,
             size: (0.5, 0.052),
-            handle: ((-0.15, 0.0), (0.2, 0.018), Look::Idle),
             buttons: vec![BarButton { center: (0.15, 0.0), size: (0.13, 0.04), label: "Pause".into(), look: Look::Hover }],
         };
         let (w, h, bytes) = draw(&bar);
         assert_eq!((w, h), (800, 83));
         let alpha = |x: u32, y: u32| bytes[(((h - 1 - y) * w + x) * 4 + 3) as usize];
-        // the handle's middle, a button's corner and the empty gap between them
-        assert!(alpha(160, 41) > 120);
-        assert!(alpha(w / 2 + 5, 41) == 0);
+        // the button and the empty part of the bar beside it
+        assert!(alpha(640, 41) > 120);
+        assert!(alpha(160, 41) == 0);
         // the button's text is white on the button
         let row: Vec<u8> = (560..720).map(|x| bytes[(((h - 1 - 41) * w + x) * 4) as usize]).collect();
         assert!(row.iter().any(|&r| r > 200));
