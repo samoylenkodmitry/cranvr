@@ -259,6 +259,36 @@ fn a_native_client_connects_and_the_host_serves_it() {
     // The frame carries the target of its plan
     assert_eq!(meta.target_display, 7_000_000_000);
 
+    // The headset's floor lies 0.4 m below the room's origin. The host's scenes get the room moved
+    // up by that much. The render poses that go back to the headset stay in its room.
+    client.duplex.send_control(&ClientMsg::Floor(-0.4)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while (headset.motion(Device::Head, sample).unwrap().pose.position.y - 2.0).abs() > 1e-4 {
+        assert!(Instant::now() < deadline, "the host did not take the floor");
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!((headset.motion_at(Device::LeftHand, sample, sample).unwrap().pose.position.y - 0.4).abs() < 1e-4);
+    let mut seen = None;
+    for _ in 0..20 {
+        headset.send_frame(OutFrame {
+            plan: None,
+            sample_ns: sample,
+            idr: false,
+            // The scene's eyes 2.0 m above the floor are 1.6 m above the room's origin
+            eye_poses: [
+                AlvrPose { orientation: Quat::IDENTITY, position: Vec3::new(0.468, 2.0, -0.25) },
+                AlvrPose { orientation: Quat::IDENTITY, position: Vec3::new(0.532, 2.0, -0.25) },
+            ],
+            slices: vec![FrameSlice { rect: [0, 0, 2432, 1152], data: data.clone() }],
+        });
+        if let Ok(Heard::Frame(meta, _)) = from_client.recv_timeout(Duration::from_millis(500)) {
+            seen = Some(meta);
+            break;
+        }
+    }
+    let meta = seen.expect("a frame arrived after the floor");
+    assert!((meta.eye_poses[0].position[1] - 1.6).abs() < 1e-4 && (meta.eye_poses[1].position[1] - 1.6).abs() < 1e-4);
+
     // Haptics
     headset.send_haptics(Haptic { hand: 1, duration: Duration::from_millis(20), frequency: 160.0, amplitude: 0.5 });
     loop {

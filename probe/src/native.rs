@@ -143,6 +143,9 @@ impl Shared {
     }
 }
 
+/// The height of the probe's floor in its room, in meters
+const PROBE_FLOOR: f32 = -0.3;
+
 fn caps(tcp: bool, identity: &cranvr_proto::identity::Identity) -> ClientCaps {
     let fov = Fov { left: -FRAC_PI_4, right: FRAC_PI_4, up: FRAC_PI_4, down: -FRAC_PI_4 };
     let eye = |x: f32| Pose { position: [x, 0.0, 0.0], ..Pose::IDENTITY };
@@ -211,6 +214,10 @@ pub fn run(o: Options) -> i32 {
         rng: Mutex::new(Rng(0x9E37_79B9_7F4A_7C15)),
         stop: AtomicBool::new(false),
     });
+
+    // The headset's floor lies below the room's origin. The host moves its scene up by that much
+    // and moves the render poses back, so the eye poses in the metadata stay what the probe sent.
+    shared.link.duplex.send_control(&ClientMsg::Floor(PROBE_FLOOR)).ok();
 
     let (units, unit_receiver) = mpsc::channel::<Received>();
     // The simulated display's refresh times: this origin plus whole periods

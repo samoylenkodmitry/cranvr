@@ -66,6 +66,8 @@ pub struct Read {
     /// `None` while the runtime does not track the head
     pub views: Option<Views>,
     pub recenter: Option<Recenter>,
+    /// The height of the floor in the room, when the runtime gives its stage
+    pub floor: Option<f32>,
 }
 
 /// Turns the frames of the headset into [`Read`]s. It keeps the head's last pose, from which it
@@ -98,7 +100,7 @@ impl FrameReader {
         let frame = xr.device_pose.map(|pose| HeadsetFrame {
             sample_time: now,
             display_time: display.time,
-            head: self.head(pose, xr.predicted_display_time),
+            head: self.head(pose, xr.predicted_display_time, (xr.device_linear_velocity, xr.device_angular_velocity)),
             left: hand(&xr.left_controller),
             right: hand(&xr.right_controller),
             input: Input { sample_time: now, hands: [hand_input(&xr.left_controller), hand_input(&xr.right_controller)] },
@@ -106,17 +108,24 @@ impl FrameReader {
         if frame.is_none() {
             self.last_head = None;
         }
-        Read { display, frame, views: views(xr), recenter }
+        Read { display, frame, views: views(xr), recenter, floor: xr.floor_height().filter(|height| height.is_finite()) }
     }
 
-    fn head(&mut self, pose: XrPose, time: Duration) -> Motion {
-        let (linear_velocity, angular_velocity) = match self.last_head.replace((time, pose)) {
+    /// The head's motion. The runtime's own velocities count. A runtime that gives none leaves the
+    /// estimate from the last two poses.
+    fn head(&mut self, pose: XrPose, time: Duration, runtime: (Option<[f32; 3]>, Option<[f32; 3]>)) -> Motion {
+        let (estimated_linear, estimated_angular) = match self.last_head.replace((time, pose)) {
             Some((before, last)) if time > before && time - before <= MAX_VELOCITY_GAP => {
                 velocities(&proto_pose(&last), &proto_pose(&pose), (time - before).as_secs_f32())
             }
             _ => ([0.0; 3], [0.0; 3]),
         };
-        Motion { pose: proto_pose(&pose), linear_velocity, angular_velocity }
+        let finite = |v: [f32; 3]| v.iter().all(|c| c.is_finite());
+        Motion {
+            pose: proto_pose(&pose),
+            linear_velocity: runtime.0.filter(|v| finite(*v)).unwrap_or(estimated_linear),
+            angular_velocity: runtime.1.filter(|v| finite(*v)).unwrap_or(estimated_angular),
+        }
     }
 }
 
@@ -186,6 +195,8 @@ pub struct Wake {
     pub recenters: Vec<Recenter>,
     /// The newest views of the headset
     pub views: Option<Views>,
+    /// The floor's height in the room, once the headset gave it
+    pub floor: Option<f32>,
 }
 
 /// The newest frame from the headset, the display clock and the views that follow from it.
@@ -209,6 +220,8 @@ struct FeedInner {
     rate: RateCount,
     /// The head of the newest tracked frame
     head: Option<Motion>,
+    /// The floor's height in the room, from the newest frame that had it
+    floor: Option<f32>,
 }
 
 #[derive(Default)]
@@ -231,6 +244,9 @@ impl Feed {
             inner.views = Some(views);
         }
         inner.recenters.extend(read.recenter);
+        if read.floor.is_some() {
+            inner.floor = read.floor;
+        }
         if read.frame.is_some() {
             inner.pending = read.frame;
             inner.head = read.frame.map(|frame| frame.head);
@@ -251,7 +267,7 @@ impl Feed {
         let guard = self.inner.lock().unwrap();
         let (mut inner, _) =
             self.wake.wait_timeout_while(guard, timeout, |i| i.pending.is_none() && i.recenters.is_empty()).unwrap();
-        Wake { frame: inner.pending.take(), recenters: std::mem::take(&mut inner.recenters), views: inner.views }
+        Wake { frame: inner.pending.take(), recenters: std::mem::take(&mut inner.recenters), views: inner.views, floor: inner.floor }
     }
 
     /// Waits up to `timeout` for the first views of the headset. The headset reports them once it
@@ -269,7 +285,6 @@ impl Feed {
 
     /// A time on the client's clock as a time of the headset runtime, the clock of `XrFrame`.
     /// `None` before the first frame.
-    #[cfg_attr(not(test), expect(dead_code, reason = "Cranpose's StreamedViews will take a target display time in this form"))]
     pub fn to_runtime_time(&self, client_time: Nanos) -> Option<Duration> {
         let offset = self.display()?.offset;
         Some(Duration::from_nanos(u64::try_from(client_time as i128 - offset as i128).ok()?))
@@ -356,6 +371,8 @@ fn placeholder_frame(at: Nanos, display_time: Nanos) -> HeadsetFrame {
     }
 }
 
+/// The floor's height changes by more than this before the client tells the host again, in meters
+const FLOOR_EPSILON: f32 = 0.01;
 /// How often the sender looks at the stop flag while it waits for a frame
 const STOP_CHECK: Duration = Duration::from_millis(20);
 
@@ -367,6 +384,7 @@ pub fn send_loop(link: &ClientLink, feed: &Feed, in_headset: bool, refresh_hz: f
     let mut deadline = Instant::now();
     let mut last_input = None;
     let mut sent_views = hello_views;
+    let mut sent_floor: Option<f32> = None;
     while !stop.load(Ordering::Relaxed) {
         let wake = feed.wait(if in_headset { STOP_CHECK } else { period.min(STOP_CHECK) });
         for recenter in wake.recenters {
@@ -378,6 +396,12 @@ pub fn send_loop(link: &ClientLink, feed: &Feed, in_headset: bool, refresh_hz: f
             sent_views = views;
             feed.set_host_views(views);
             link.duplex.send_control(&ClientMsg::Views(views)).ok();
+        }
+        // The floor goes to the host when it is first known and when it moves by a centimeter
+        if let Some(floor) = wake.floor.filter(|floor| sent_floor.is_none_or(|sent| (sent - floor).abs() > FLOOR_EPSILON)) {
+            log::info!("the headset's floor lies {floor:.2} m from the room's origin");
+            sent_floor = Some(floor);
+            link.duplex.send_control(&ClientMsg::Floor(floor)).ok();
         }
         let frame = match wake.frame {
             Some(frame) => frame,
@@ -493,6 +517,35 @@ mod tests {
         let head = reader.read(&xr, 2).frame.unwrap().head;
         assert!((head.linear_velocity[0] - 1.0).abs() < 1e-3 && (head.linear_velocity[2] + 2.0).abs() < 1e-3);
         assert_eq!(head.angular_velocity, [0.0; 3]);
+    }
+
+    #[test]
+    fn the_runtimes_velocities_of_the_head_count_and_the_estimate_fills_the_gaps() {
+        let mut reader = FrameReader::default();
+        let mut xr = frame();
+        xr.device_linear_velocity = Some([0.5, 0.0, -0.25]);
+        xr.device_angular_velocity = Some([0.0, 1.5, 0.0]);
+        let head = reader.read(&xr, 1).frame.unwrap().head;
+        assert_eq!((head.linear_velocity, head.angular_velocity), ([0.5, 0.0, -0.25], [0.0, 1.5, 0.0]));
+        // A runtime that gives only the linear velocity leaves the angular one to the estimate
+        xr.predicted_display_time += Duration::from_millis(10);
+        xr.device_pose = Some(pose_at(0.01, 1.6, 0.0));
+        xr.device_linear_velocity = Some([2.0, 0.0, 0.0]);
+        xr.device_angular_velocity = None;
+        let head = reader.read(&xr, 2).frame.unwrap().head;
+        assert_eq!(head.linear_velocity, [2.0, 0.0, 0.0]);
+        assert_eq!(head.angular_velocity, [0.0; 3]);
+        // A velocity that is not a number does not reach the host
+        xr.device_linear_velocity = Some([f32::NAN, 0.0, 0.0]);
+        assert!(reader.read(&xr, 3).frame.unwrap().head.linear_velocity.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn the_floor_comes_from_the_stage() {
+        let mut xr = frame();
+        assert_eq!(FrameReader::default().read(&xr, 1).floor, None);
+        xr.stage_pose = Some(pose_at(0.3, -1.62, 0.1));
+        assert_eq!(FrameReader::default().read(&xr, 1).floor, Some(-1.62));
     }
 
     #[test]
@@ -663,6 +716,27 @@ mod tests {
                 }
                 Heard::Datagram(ClientDatagram::Tracking(tracking)) if tracking.sample_time == 300 => saw.1 = true,
                 _ => {}
+            }
+        }
+
+        // The floor goes once. It goes again when it moves by more than a centimeter
+        let mut xr = frame();
+        xr.stage_pose = Some(pose_at(0.0, -1.6, 0.0));
+        feed.push(reader.read(&xr, 350));
+        loop {
+            if let Heard::Control(ClientMsg::Floor(height)) = next("floor") {
+                assert_eq!(height, -1.6);
+                break;
+            }
+        }
+        xr.stage_pose = Some(pose_at(0.0, -1.605, 0.0));
+        feed.push(reader.read(&xr, 360));
+        xr.stage_pose = Some(pose_at(0.0, -1.5, 0.0));
+        feed.push(reader.read(&xr, 370));
+        loop {
+            if let Heard::Control(ClientMsg::Floor(height)) = next("floor again") {
+                assert_eq!(height, -1.5, "the move of half a centimeter did not go out");
+                break;
             }
         }
 

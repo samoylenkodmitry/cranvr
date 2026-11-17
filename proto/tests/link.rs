@@ -356,3 +356,19 @@ fn a_client_cannot_claim_the_key_of_another_client() {
     let other = cranvr_proto::identity::Identity::from_seed([6; 32]);
     assert!(!proof_result(identity().public_key(), other).unwrap());
 }
+
+#[test]
+fn a_foveated_stream_takes_the_clients_eye_size_when_the_host_has_no_width() {
+    let mut w = wishes();
+    w.eye_width = 0;
+    w.eye_width_unfoveated = 1248;
+    let mut c = caps();
+    c.eye_size = [1680, 1760];
+    let stream = negotiate(&w, &c).unwrap();
+    assert_eq!(stream.eye_size, [1680, 1760]);
+    assert!(stream.foveation.is_some());
+    // A client that takes no foveation gets the host's own smaller width
+    c.foveation = false;
+    let stream = negotiate(&w, &c).unwrap();
+    assert_eq!((stream.eye_size[0], stream.foveation.is_none()), (1248, true));
+}

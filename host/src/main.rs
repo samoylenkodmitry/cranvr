@@ -164,6 +164,7 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
         fps: 120.0,
         eye_width: 0,
         eye_width_unfoveated: 0,
+        eye_width_given: false,
         mbps: 100,
         trust: vec![],
         trust_all: false,
@@ -243,6 +244,7 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
     }
     // A width that the user gave counts for every client. Otherwise a client that takes no
     // foveation gets the size of the unfoveated table below.
+    options.eye_width_given = options.eye_width != 0;
     options.eye_width_unfoveated = if options.eye_width == 0 { default_eye_width(false, options.fps as u32) } else { 0 };
     if options.eye_width == 0 {
         options.eye_width = default_eye_width(options.foveation, options.fps as u32);
@@ -328,7 +330,9 @@ fn native_config(options: &Options, config_dir: &std::path::Path) -> headset::na
         display_lock: options.display_lock,
         tcp_media: options.tcp,
         wishes: HostWishes {
-            eye_width: options.eye_width,
+            // A foveated eye takes the size that the headset asks for: its recommended size, within
+            // its decoder's limits. The ALVR protocol keeps the host's own choice.
+            eye_width: if options.eye_width_given || !options.foveation { options.eye_width } else { 0 },
             eye_width_unfoveated: options.eye_width_unfoveated,
             refresh_hz: options.fps,
             bitrate_bps: options.mbps * 1_000_000,

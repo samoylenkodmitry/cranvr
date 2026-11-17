@@ -23,6 +23,8 @@ pub struct Options {
     /// The eye width for a native client without foveation, when the user gave no width. 0
     /// means none.
     pub eye_width_unfoveated: u32,
+    /// Whether the user gave `--eye-width`. `eye_width` holds the host's own choice otherwise.
+    pub eye_width_given: bool,
     pub mbps: u64,
     pub trust: Vec<String>,
     pub trust_all: bool,

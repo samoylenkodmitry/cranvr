@@ -12,6 +12,7 @@
 mod connection;
 mod hub;
 mod settings;
+mod sizing;
 mod tracking;
 mod ui;
 
