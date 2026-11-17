@@ -113,7 +113,8 @@ fn usage() -> ! {
         "usage: cranvr-host [--protocol native|alvr, default alvr] [--native-port PORT] [--fps 72|80|90|120, default 120] [--eye-width PIXELS] [--mbps N] [--trust HOSTNAME]... [--trust-all] [--pair CODE] [--no-display-lock] [--client-ip IP]... [--tcp] [--no-foveation] [--buffering-frames N] [--game-scale F] [--decoder-low-latency] [--strict-rate-control] [--no-game-audio] [--desktop] [--desktop-fps N] [--virtual-display WxH] [--vr-main-display] [--pointer-pitch DEG] [--screen-in-view] [--no-desktop-layer] [--config-dir DIR] [--status]\n\
          \n  --protocol P      how the headset's app talks to the host: alvr (the stock ALVR client,\
          \n                    the default) or native (cranvr's own protocol and client). The\
-         \n                    native mode has no game sound and no desktop layer yet.\
+         \n                    native mode sends the Mac's sound as PCM and, with --desktop, the\
+         \n                    desktop as a second video stream for the client's desktop panel.\
          \n  --native-port N   with --protocol native: the TCP port to listen on (default 9950)\
          \n  --trust HOSTNAME  accept this ALVR client (the hostname shows in the client's lobby)\
          \n  --trust-all       accept any client on the network, ALVR or native (for tests)\
@@ -149,7 +150,10 @@ fn usage() -> ! {
          \n  --screen-in-view  put the screen where the headset looks, tilt included: for tests with a\
          \n                    headset that lies on a desk\
          \n  --no-desktop-layer keep the desktop in the eye stream, also for cranvr's Quest app, which\
-         \n                    otherwise shows it as a sharper compositor layer\
+         \n                    otherwise shows it as a sharper compositor layer. With --protocol native\
+         \n                    it stops the desktop panel.\
+         \n\nEnvironment: CRANVR_POINTER_DRY_RUN=1 logs the mouse events that a controller would make\
+         \nand posts none (for tests with a controller on a desk).\
          \n  --status          print status lines (@cranvr JSON) on stdout, for the cranvr app\
          \n\nGames: the host writes runtime-control.txt into the config dir. Start the game under Wine\
          \nwith BASALT_CONTROL set to that file's Windows path (scripts/run-game.sh does this)."
@@ -319,7 +323,11 @@ fn raise_file_limit() {
 }
 
 /// What the native protocol takes from the command line.
-fn native_config(options: &Options, config_dir: &std::path::Path) -> headset::native::Config {
+fn native_config(
+    options: &Options,
+    config_dir: &std::path::Path,
+    desktop: headset::native::desktop::Options,
+) -> headset::native::Config {
     if !options.trust.is_empty() {
         warn!("--trust does not count for the native protocol: pair the headset with --pair CODE");
     }
@@ -328,6 +336,8 @@ fn native_config(options: &Options, config_dir: &std::path::Path) -> headset::na
         pairings: Arc::new(pairing::Pairings::load(config_dir, options.pair_code)),
         trust_all: options.trust_all,
         display_lock: options.display_lock,
+        desktop,
+        audio: options.game_audio,
         tcp_media: options.tcp,
         wishes: HostWishes {
             // A foveated eye takes the size that the headset asks for: its recommended size, within
@@ -364,13 +374,20 @@ fn main() {
     }
     // The logger comes from ALVR's server core. It opens no socket and reads no session file.
     alvr_server_core::init_logging(None, Some(layout.crash_log()));
-    // The native protocol has no game sound and no desktop layer yet
-    if alvr && options.game_audio {
+    // The native protocol sends the sound itself (headset/native/audio.rs)
+    if !alvr {
+        game_audio::set_sink(headset::native::audio::send);
+    }
+    if options.game_audio {
         start_game_audio();
     }
+    // The native client shows the desktop as a panel (headset/native/desktop.rs), not as the old
+    // Quest app's layer
+    let desktop_panel = desktop.enabled && desktop.layer;
     if !alvr {
         desktop.layer = false;
     }
+    let layer: Arc<desktop_layer::LayerState> = Arc::default();
     info!(
         "cranvr-host: {} Hz, {} px per eye, {} Mbps, config in {}",
         options.fps,
@@ -400,7 +417,16 @@ fn main() {
 
     let (headset, mut events) = match options.protocol {
         Protocol::Alvr => headset::alvr::start(layout.session()),
-        Protocol::Native => headset::native::start(native_config(&options, &config_dir)).unwrap_or_else(|e| {
+        Protocol::Native => {
+            let panel = headset::native::desktop::Options {
+                enabled: desktop_panel,
+                display_id: desktop.display_id,
+                layer: Arc::clone(&layer),
+                mbps: headset::native::desktop::MBPS,
+            };
+            headset::native::start(native_config(&options, &config_dir, panel))
+        }
+        .unwrap_or_else(|e| {
             error!("Native protocol: cannot listen on port {}: {e}", options.native_port);
             std::process::exit(1)
         }),
@@ -411,7 +437,7 @@ fn main() {
         views: Mutex::new(Views::default()),
         force_idr: AtomicBool::new(true),
         inputs: Mutex::new(Inputs::default()),
-        layer: Arc::default(),
+        layer,
         desktop_display: std::sync::atomic::AtomicU32::new(0),
     });
 

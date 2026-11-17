@@ -39,6 +39,8 @@ cranvr-common = { path = "../common" }
 # One Cranpose revision for every Cranpose crate: the branch cranpose-xr of the Cranpose repository
 cranpose = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "40abced053656782256aececf04a0bf182a893b5", features = ["embedded-default-font"] }
 cranpose-xr = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "40abced053656782256aececf04a0bf182a893b5" }
+# The output device and the queue for the host's sound (see src/audio.rs)
+cranpose-audio = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "40abced053656782256aececf04a0bf182a893b5" }
 log = "0.4"
 env_logger = { version = "0.11", optional = true }
 

@@ -11,8 +11,13 @@
 //!   (see [`media`] and [`fec`]). Over a USB link the same packets go through the TCP connection
 //!   with no parity.
 //! - **Datagrams** are small messages that may get lost. Tracking, input, frame timing, loss
-//!   reports, clock pings and haptics use them. They share the UDP socket with the media, or the
-//!   TCP connection when UDP is off.
+//!   reports, clock pings, haptics, the pointer on the desktop panel, the Mac's cursor and the
+//!   Mac's sound use them. They share the UDP socket with the media, or the TCP connection when
+//!   UDP is off.
+//!
+//! The eye stream has the stream id 0. The Mac's desktop is a second video stream with the id
+//! [`message::DESKTOP_STREAM`]. Its units share the media path with the eye stream and have their own
+//! frame numbers, key frames and decoder configuration.
 //!
 //! Every packet on either path starts with a kind byte (see [`wire`]). A TCP packet has a four
 //! byte length before it.

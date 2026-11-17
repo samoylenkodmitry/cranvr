@@ -74,6 +74,7 @@ pub fn ClientApp() {
         // its own place.
         ConnectPanel(snapshot);
         StatsPanel(snapshot);
+        crate::desktop::DesktopPanel();
         Stream(frames);
     });
 }
@@ -360,6 +361,9 @@ fn stat_lines(snap: &Snapshot) -> Vec<(&'static str, String, Color)> {
         if stats.tracking_live { GOOD_COLOR } else { WARN_COLOR },
     ));
     lines.push(("Haptics", format!("{} pulses received", stats.haptic_pulses), TEXT_COLOR));
+    for (label, value) in crate::desktop::stat_lines().into_iter().chain(crate::audio::stat_lines()) {
+        lines.push((label, value, TEXT_COLOR));
+    }
     lines
 }
 

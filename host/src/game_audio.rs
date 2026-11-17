@@ -14,8 +14,20 @@ use objc2_foundation::{NSArray, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{SCContentFilter, SCStream, SCStreamConfiguration, SCStreamOutput, SCStreamOutputType};
 use std::{
     ffi::c_void,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
 };
+
+/// Where the sound goes instead of ALVR's server core: the native protocol's sender
+static SINK: OnceLock<fn(&[u8])> = OnceLock::new();
+
+/// Sends the captured sound to `sink` from now on, not to ALVR's server core. The native protocol
+/// takes it, because it runs no ALVR core.
+pub fn set_sink(sink: fn(&[u8])) {
+    SINK.set(sink).ok();
+}
 
 const CHANNELS: usize = 2;
 
@@ -100,7 +112,10 @@ define_class!(
                 match unsafe { convert(sample as *const CMSampleBuffer as *const c_void) } {
                     Some(samples) => {
                         FRAMES.fetch_add((samples.len() / CHANNELS / 2) as u64, Ordering::Relaxed);
-                        send_game_audio(samples);
+                        match SINK.get() {
+                            Some(sink) => sink(&samples),
+                            None => send_game_audio(samples),
+                        }
                     }
                     None => {
                         UNREADABLE.fetch_add(1, Ordering::Relaxed);

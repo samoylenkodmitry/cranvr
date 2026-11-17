@@ -10,7 +10,10 @@
 //!
 //! One client connects at a time. A second one gets the reason `Busy`.
 //!
-//! What is still ALVR only: game audio and the desktop layer.
+//! The desktop panel and the game sound are in `native/desktop.rs` and `native/audio.rs`.
+
+pub mod audio;
+pub mod desktop;
 
 use super::{display_lock::{DisplayLock, Report}, Button, Device, Event, EventSource, FramePlan, Headset, OutFrame};
 use crate::{
@@ -69,6 +72,10 @@ pub struct Config {
     pub wishes: HostWishes,
     /// Plan the frames of the host's own scene for the headset's display grid
     pub display_lock: bool,
+    /// The Mac's desktop as a panel in the client (see `desktop.rs`)
+    pub desktop: desktop::Options,
+    /// Send the Mac's sound (see `audio.rs`)
+    pub audio: bool,
 }
 
 /// The parity share with no loss. Five percent costs five packets on a frame of a hundred.
@@ -184,7 +191,7 @@ fn accept_loop(listener: HostListener, config: Config, shared: Arc<Shared>) {
                 }
             }
         }
-        let stream = match negotiate(&config.wishes, &pending.caps) {
+        let mut stream = match negotiate(&config.wishes, &pending.caps) {
             Ok(stream) => stream,
             Err(reason) => {
                 warn!("Native protocol: no stream for {name}: {reason:?}");
@@ -192,6 +199,7 @@ fn accept_loop(listener: HostListener, config: Config, shared: Arc<Shared>) {
                 continue;
             }
         };
+        stream.audio = config.audio.then_some(cranvr_proto::message::AudioFormat::HOST_CAPTURE);
         let (mode, shard_len) = if config.tcp_media || pending.caps.tcp_only {
             (MediaMode::Tcp, 60_000)
         } else {
@@ -207,6 +215,10 @@ fn accept_loop(listener: HostListener, config: Config, shared: Arc<Shared>) {
         };
         info!("Native protocol: {name} at {peer} connected, {} media", if link.duplex.has_udp() { "UDP" } else { "TCP" });
         let session = Arc::new(Session::new(link, &stream, config.display_lock));
+        session.desktop.set(desktop::Desktop::start(config.desktop.clone(), Arc::clone(&session))).ok();
+        if config.audio {
+            audio::attach(&session);
+        }
         *shared.session.lock().unwrap() = Some(Arc::clone(&session));
         let shared = Arc::clone(&shared);
         thread::Builder::new()
@@ -242,6 +254,10 @@ fn run_session(shared: &Shared, session: &Arc<Session>, stream: cranvr_proto::me
         info!("Native protocol: the headset link ended: {reason}");
         session.stop();
     });
+    if let Some(desktop) = session.desktop.get() {
+        desktop.stop();
+    }
+    audio::detach(session);
     *shared.session.lock().unwrap() = None;
     shared.emit(Event::Disconnected);
 }
@@ -296,7 +312,22 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
             session.clock.lock().unwrap().add(p.ping_sent, p.received, p.sent, now);
         }
         Incoming::Datagram(ClientDatagram::Hello { .. }) | Incoming::Media(_) => {}
+        Incoming::Control(ClientMsg::RequestKeyFrame { stream, .. }) if stream == cranvr_proto::message::DESKTOP_STREAM => {
+            if let Some(desktop) = session.desktop.get() {
+                desktop.request_key_frame();
+            }
+        }
         Incoming::Control(ClientMsg::RequestKeyFrame { .. }) => shared.emit(Event::RequestIdr),
+        Incoming::Control(ClientMsg::Desktop(wish)) => {
+            if let Some(desktop) = session.desktop.get() {
+                desktop.on_wish(wish, session);
+            }
+        }
+        Incoming::Datagram(ClientDatagram::Pointer(pointer)) => {
+            if let Some(desktop) = session.desktop.get() {
+                desktop.on_pointer(pointer);
+            }
+        }
         Incoming::Control(ClientMsg::Views(v)) => shared.emit(Event::Views(views_config(&v))),
         Incoming::Control(ClientMsg::Bye) => session.stop(),
         Incoming::Control(ClientMsg::Floor(height)) if height.is_finite() => {
@@ -555,6 +586,9 @@ struct Session {
     lock_on: bool,
     /// The height of the headset's floor in its room, once the client says it
     floor: Mutex<Option<f32>>,
+    /// The desktop panel's stream and pointer. It starts after the session exists, because its
+    /// threads share the session.
+    desktop: std::sync::OnceLock<desktop::Desktop>,
     next_frame: AtomicU32,
     heard: Mutex<Instant>,
     stopped: Mutex<bool>,
@@ -577,6 +611,7 @@ impl Session {
             lock: Mutex::new(DisplayLock::new(period)),
             lock_on,
             floor: Mutex::new(None),
+            desktop: std::sync::OnceLock::new(),
             next_frame: AtomicU32::new(0),
             heard: Mutex::new(Instant::now()),
             stopped: Mutex::new(false),

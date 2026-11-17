@@ -13,7 +13,7 @@
 //! `--drop-percent` drops that share of the media packets before the receiver sees them, so a
 //! run on loopback can show the parity at work.
 
-use crate::badge_points;
+use crate::{badge_points, native_desktop::DesktopProbe};
 use cranvr_common::foveation::{Foveation, FoveationConfig};
 use cranvr_proto::{
     clock::{now_ns as process_now_ns, ClockSync},
@@ -49,6 +49,8 @@ pub struct Options {
     /// Ask for the media over TCP, as a USB link needs it
     pub tcp: bool,
     pub drop_percent: f32,
+    /// Ask for the desktop stream, play a pointer script and count the sound
+    pub desktop: bool,
 }
 
 /// The probe's clock runs this far ahead of the process clock, as a headset's clock has its own
@@ -57,7 +59,7 @@ pub struct Options {
 const CLOCK_SKEW_NS: u64 = 123_456_789_012;
 
 /// The probe's monotonic clock in nanoseconds.
-fn now_ns() -> u64 {
+pub(crate) fn now_ns() -> u64 {
     process_now_ns() + CLOCK_SKEW_NS
 }
 
@@ -129,6 +131,8 @@ struct Shared {
     drop_percent: f32,
     rng: Mutex<Rng>,
     stop: AtomicBool,
+    /// The desktop stream and the sound, with `--desktop`
+    desktop: Option<Arc<DesktopProbe>>,
 }
 
 impl Shared {
@@ -213,12 +217,21 @@ pub fn run(o: Options) -> i32 {
         drop_percent: o.drop_percent,
         rng: Mutex::new(Rng(0x9E37_79B9_7F4A_7C15)),
         stop: AtomicBool::new(false),
+        desktop: o.desktop.then(DesktopProbe::new),
     });
 
     // The headset's floor lies below the room's origin. The host moves its scene up by that much
     // and moves the render poses back, so the eye poses in the metadata stay what the probe sent.
     shared.link.duplex.send_control(&ClientMsg::Floor(PROBE_FLOOR)).ok();
 
+    if let Some(desktop) = &shared.desktop {
+        desktop.ask(&shared.link);
+        let (send, stop) = (Arc::clone(&shared), Arc::clone(&shared));
+        DesktopProbe::pointer_script(
+            move |p| drop(send.link.duplex.send_datagram(&ClientDatagram::Pointer(p))),
+            move || stop.stop.load(Ordering::Relaxed),
+        );
+    }
     let (units, unit_receiver) = mpsc::channel::<Received>();
     // The simulated display's refresh times: this origin plus whole periods
     let vsync_origin = now_ns();
@@ -292,7 +305,8 @@ pub fn run(o: Options) -> i32 {
         shared.counters.haptics.load(Ordering::Relaxed)
     );
     print_summary(&shared, &r, o.seconds, expected);
-    i32::from(r.good * 2 < expected)
+    let desktop_ok = shared.desktop.as_ref().is_none_or(|d| d.summary());
+    i32::from(r.good * 2 < expected || !desktop_ok)
 }
 
 #[derive(Default)]
@@ -346,13 +360,32 @@ fn read_loop(shared: &Arc<Shared>, units: &mpsc::Sender<Received>, udp: bool) {
                 println!("probe: first haptic pulse");
             }
         }
-        Incoming::Datagram(HostDatagram::Audio(_)) => {}
-        Incoming::Control(HostMsg::DecoderConfig { config, .. }) => {
-            let mut c = shared.config.lock().unwrap();
-            *c = (c.0 + 1, config);
+        Incoming::Datagram(HostDatagram::Audio(audio)) => {
+            if let Some(desktop) = &shared.desktop {
+                desktop.on_audio(&audio, &shared.clock);
+            }
+        }
+        Incoming::Datagram(HostDatagram::Cursor(cursor)) => {
+            if let Some(desktop) = &shared.desktop {
+                desktop.on_cursor(cursor);
+            }
+        }
+        Incoming::Control(HostMsg::DecoderConfig { stream, config, codec }) => {
+            if stream == cranvr_proto::message::DESKTOP_STREAM {
+                if let Some(desktop) = &shared.desktop {
+                    desktop.on_message(&HostMsg::DecoderConfig { stream, config, codec });
+                }
+            } else {
+                let mut c = shared.config.lock().unwrap();
+                *c = (c.0 + 1, config);
+            }
         }
         Incoming::Control(HostMsg::Bye) => shared.stop.store(true, Ordering::Relaxed),
-        Incoming::Control(_) => {}
+        Incoming::Control(message) => {
+            if let Some(desktop) = &shared.desktop {
+                desktop.on_message(&message);
+            }
+        }
     };
     let reason = if udp { shared.link.duplex.read_udp(handler) } else { shared.link.duplex.read_tcp(handler) };
     if !shared.stop.load(Ordering::Relaxed) {
@@ -375,14 +408,22 @@ fn on_media(shared: &Shared, packet: &[u8], units: &mpsc::Sender<Received>) {
         Ok(None) => {
             let lost = receiver.take_lost();
             drop(receiver);
-            if let Some(first) = lost.first() {
-                shared.waiting_key.store(true, Ordering::Relaxed);
-                shared.request_key_frame(first.frame);
-            }
+            on_lost(shared, &lost);
         }
         Err(_) => {
             shared.counters.malformed.fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+/// Asks for a key frame of the stream that lost a unit.
+fn on_lost(shared: &Shared, lost: &[cranvr_proto::media::LostUnit]) {
+    if let Some(first) = lost.iter().find(|l| l.stream == 0) {
+        shared.waiting_key.store(true, Ordering::Relaxed);
+        shared.request_key_frame(first.frame);
+    }
+    if let (Some(first), Some(desktop)) = (lost.iter().find(|l| l.stream != 0), &shared.desktop) {
+        desktop.on_lost(&shared.link, first.frame);
     }
 }
 
@@ -445,10 +486,7 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
                 totals.units_lost += report.units_lost;
                 totals.packets_recovered += report.packets_recovered;
             }
-            if let Some(first) = lost.first() {
-                shared.waiting_key.store(true, Ordering::Relaxed);
-                shared.request_key_frame(first.frame);
-            }
+            on_lost(shared, &lost);
         }
         // Wait for the next refresh. `park_timeout` may wake early, so it checks the clock. A
         // thread that fell far behind starts again from now, not with a burst of samples.
@@ -490,6 +528,13 @@ fn decode_loop(
     let mut last_frame: Option<u32> = None;
     let ms = |ns: u64| ns as f64 / 1e6;
     for unit in units {
+        // The desktop stream has its own decoder
+        if unit.meta.stream != 0 {
+            if let Some(desktop) = &shared.desktop {
+                desktop.on_unit(&unit, &shared.link, &shared.clock);
+            }
+            continue;
+        }
         let mut r = results.lock().unwrap();
         // A new decoder config, or the first one
         let (generation, config) = shared.config.lock().unwrap().clone();
