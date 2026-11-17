@@ -639,22 +639,22 @@ impl Session {
         (display.next != 0).then(|| Duration::from_nanos(grid_at_or_after(display.next, display.period, now) - now))
     }
 
-    /// The display time that a frame sent now can make, on the headset's clock: the first refresh
-    /// after the frame has crossed the network and decoded, and after the headset's frame loop has
-    /// taken it. The loop takes a frame at the start of a headset frame, which reaches the display
-    /// one lead later. A target that leaves the lead out lies before the display time of the
-    /// headset frame that takes the frame, so the headset's queue counts the frame as late and
-    /// skips frames (the host's game frames did this: 90 shown and 29 skipped in a second, of 120).
-    /// 0 while the clocks are not in sync.
+    /// The display time that a frame sent now can make, on the headset's clock: the first point of
+    /// the display's grid after the frame has crossed the network, decoded and waited for the
+    /// headset's take, which comes one lead before the point. A target that leaves the lead out
+    /// lies before the display time of the headset frame that takes the frame, so the headset's
+    /// queue counts the frame as late and skips frames. The planner gives successive frames
+    /// successive points (see `DisplayLock::point_for`). 0 while the clocks are not in sync.
     fn target_display(&self, now: Nanos) -> Nanos {
         let (Some(client_now), Some(estimate)) = (self.client_time(now), self.clock.lock().unwrap().estimate()) else { return 0 };
-        let lead = self.lock.lock().unwrap().lead_ns();
-        let display = self.display.lock().unwrap();
-        if display.next == 0 {
-            return 0;
-        }
-        let ready = client_now + estimate.rtt_ns / 2 + display.decode as Nanos + DISPLAY_MARGIN.as_nanos() as Nanos + lead;
-        grid_at_or_after(display.next, display.period, ready)
+        let ready = {
+            let display = self.display.lock().unwrap();
+            if display.next == 0 {
+                return 0;
+            }
+            client_now + estimate.rtt_ns / 2 + display.decode as Nanos + DISPLAY_MARGIN.as_nanos() as Nanos
+        };
+        self.lock.lock().unwrap().point_for(ready).unwrap_or(0)
     }
 
     fn on_timing(&self, t: &FrameTiming) {

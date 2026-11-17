@@ -233,13 +233,6 @@ impl DisplayLock {
         percentile(&self.lead, PERCENTILE).unwrap_or(2.0 * self.period)
     }
 
-    /// The time from the pick to the display that the planner counts on, in ns. A frame that no
-    /// plan started needs it too, because the headset takes a frame one lead before the display
-    /// point that shows it.
-    pub fn lead_ns(&self) -> Nanos {
-        self.lead() as Nanos
-    }
-
     /// The next frame's start and target, given the time `now` on the headset's clock. `None`
     /// while the grid is unknown.
     pub fn plan(&self, now: Nanos) -> Option<Plan> {
@@ -265,6 +258,23 @@ impl DisplayLock {
         };
         let start = (target as f64 - need - lead).max(0.0) as Nanos;
         Some(Plan { start, target })
+    }
+
+    /// The target for a frame that no plan started, such as a game's frame, which is ready for the
+    /// headset's take at `ready` on the headset's clock (its arrival and decode included, the lead
+    /// not). The target is the first point of the grid at or after `ready` plus the lead, and after
+    /// the target of the frame before it, but no more than one point past the first. Frames that
+    /// follow each other within one period then take successive points, and the headset's queue
+    /// shows each of them. Two frames for one point would leave the first one out, and the point
+    /// after it would show the picture before. `None` while the grid is unknown.
+    pub fn point_for(&mut self, ready: Nanos) -> Option<Nanos> {
+        let origin = self.origin?;
+        let period = self.period;
+        let earliest = grid_at_or_after(origin, period, ready + self.lead() as Nanos);
+        let next = self.last_target + period as Nanos;
+        let target = if self.last_target != 0 && next > earliest { next.min(earliest + period as Nanos) } else { earliest };
+        self.last_target = self.last_target.max(target);
+        Some(target)
     }
 
     /// The frame loop took the plan with this target, `late` nanoseconds after the planned start.

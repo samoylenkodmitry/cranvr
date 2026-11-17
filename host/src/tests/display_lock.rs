@@ -128,16 +128,38 @@ fn a_frame_shown_a_point_early_lowers_the_margin() {
 fn a_frame_without_a_plan_teaches_the_lead_and_nothing_else() {
     let mut lock = lock_with_grid();
     // Before any report the lead is two periods
-    assert_eq!(lock.lead_ns(), 2 * PERIOD);
+    assert_eq!(lock.lead() as Nanos, 2 * PERIOD);
     let (need, margin) = (lock.need(), lock.margin_ms);
     for sample in 1..20 {
         lock.sent_unplanned(sample, 2_000_000_000);
         // Shown one point late, with a lead of 17 ms
         lock.on_report(&report(sample, 2_000_000_000, 2_000_000_000 + PERIOD));
     }
-    assert_eq!(lock.lead_ns(), 17 * MS as u64);
+    assert_eq!(lock.lead() as Nanos, 17 * MS as u64);
     assert_eq!((lock.need(), lock.margin_ms), (need, margin), "a game's frames leave the planner's need and margin alone");
     assert_eq!(lock.take_stats().late, 19);
+}
+
+#[test]
+fn frames_without_a_plan_take_successive_points_and_the_first_point_after_the_lead() {
+    let mut lock = DisplayLock::new(PERIOD);
+    assert_eq!(lock.point_for(1_100_000_000), None, "no grid yet");
+    lock.on_tracking(1_000_000_000);
+    let lead = lock.lead() as Nanos;
+    // A frame that is ready at 1.1 s takes the first point at or after 1.1 s plus the lead
+    let first = lock.point_for(1_100_000_000).unwrap();
+    assert!(first >= 1_100_000_000 + lead && first < 1_100_000_000 + lead + PERIOD, "{first}");
+    assert!((first - 1_000_000_000) % PERIOD < 2, "the target lies on the grid");
+    // A second frame that is ready a millisecond later would take the same point: it takes the next
+    let second = lock.point_for(1_101_000_000).unwrap();
+    assert!(second.abs_diff(first + PERIOD) < 2, "{first} {second}");
+    // A third one would take the point after, but no frame goes more than one point past the first
+    // point that it could make: the backlog stays short, and the queue replaces the older frame
+    let third = lock.point_for(1_101_500_000).unwrap();
+    assert!(third.abs_diff(second) < 2, "{second} {third}");
+    // A frame that is ready much later takes its own first point
+    let late = lock.point_for(1_300_000_000).unwrap();
+    assert!(late >= 1_300_000_000 + lead && late < 1_300_000_000 + lead + PERIOD);
 }
 
 /// A small generator, so that the simulation repeats.

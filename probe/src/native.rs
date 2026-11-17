@@ -13,7 +13,7 @@
 //! `--drop-percent` drops that share of the media packets before the receiver sees them, so a
 //! run on loopback can show the parity at work.
 
-use crate::badge_points;
+use crate::{badge_points, compositor};
 use cranvr_common::foveation::{Foveation, FoveationConfig};
 use cranvr_proto::{
     clock::{now_ns as process_now_ns, ClockSync},
@@ -105,7 +105,7 @@ struct Latencies {
     network: Vec<f64>,
     /// The last packet's arrival to the end of the decode
     decode: Vec<f64>,
-    /// The display time that the probe's display gave the frame, minus the host's target
+    /// The display time at which the model of the headset shows a frame, minus the host's target
     target_gap: Vec<f64>,
 }
 
@@ -303,9 +303,8 @@ struct DecodeResults {
     good: u64,
     bad: u64,
     size: (usize, usize),
-    /// Frames that got their own refresh. Frames that a newer frame replaced within one refresh
-    shown: u64,
-    replaced: u64,
+    /// What the model of the headset's queue did with the frames (see `compositor.rs`)
+    queue: compositor::Counts,
     /// Frames dropped before the decoder: they were not key frames and no key frame came yet
     skipped: u64,
     /// Frames whose eye poses equal the head pose that the probe sent plus the eye offset, frames
@@ -499,8 +498,10 @@ fn decode_loop(
     let (decoded_sender, decoded_receiver) = mpsc::channel::<DecodedFrame>();
     let mut decoder: Option<Decoder> = None;
     let mut config_seen = 0;
-    let mut last_slot = u64::MAX;
     let mut last_frame: Option<u32> = None;
+    // The headset frame loop starts two periods before the display, as the probe's tracking samples
+    // say with their display times
+    let mut compositor = compositor::Compositor::new(vsync_origin, period, 2 * period, now_ns());
     let ms = |ns: u64| ns as f64 / 1e6;
     for unit in units {
         let mut r = results.lock().unwrap();
@@ -548,30 +549,16 @@ fn decode_loop(
         }
         let decode_end = now_ns();
         let Ok(frame) = decoded_receiver.try_recv() else { continue };
-        // The simulated display shows the frame at the first refresh after its decode
-        let display_time = next_refresh(vsync_origin, period, decode_end);
-        let timing = FrameTiming {
-            stream: 0,
-            frame: unit.meta.frame,
-            tracking_sample: unit.meta.tracking_sample,
+        compositor.submit(compositor::Frame {
+            number: unit.meta.frame,
+            sample: unit.meta.tracking_sample,
             received: unit.completed,
             decode_end,
-            // The simulated display takes the frame at its refresh: its pick is the display time
-            picked: display_time,
-            display_time,
-            next_display_time: display_time + period,
-        };
-        shared.link.duplex.send_datagram(&ClientDatagram::FrameTiming(timing)).ok();
-        let slot = (display_time - vsync_origin) / period;
-        if slot == last_slot {
-            r.replaced += 1;
-        } else {
-            r.shown += 1;
-            last_slot = slot;
-        }
+            target: unit.meta.target_display,
+        });
+        run_compositor(shared, &mut compositor, decode_end, period, &mut r);
 
         let l = &mut r.latencies;
-        l.pose_to_display.push(ms(display_time.saturating_sub(unit.meta.tracking_sample)));
         l.pose_to_decode.push(ms(decode_end.saturating_sub(unit.meta.tracking_sample)));
         l.decode.push(ms(decode_end.saturating_sub(unit.completed)));
         if let Some(sent) = shared.clock.lock().unwrap().to_local(unit.meta.sent) {
@@ -608,8 +595,6 @@ fn decode_loop(
         }
         if unit.meta.target_display == 0 {
             r.no_target += 1;
-        } else {
-            r.latencies.target_gap.push((display_time as i128 - unit.meta.target_display as i128) as f64 / 1e6);
         }
 
         r.decoded += 1;
@@ -630,6 +615,36 @@ fn decode_loop(
             }
         }
     }
+    // The frames that the headset frames after the last decode would have shown
+    run_compositor(shared, &mut compositor, now_ns() + 4 * period, period, &mut results.lock().unwrap());
+}
+
+/// Runs the model of the headset up to `now`: sends the report of each frame that entered its
+/// queue and notes the frames that it shows.
+fn run_compositor(shared: &Shared, compositor: &mut compositor::Compositor, now: u64, period: u64, r: &mut DecodeResults) {
+    let out = compositor.advance(now);
+    for intake in out.intakes {
+        let f = intake.frame;
+        let timing = FrameTiming {
+            stream: 0,
+            frame: f.number,
+            tracking_sample: f.sample,
+            received: f.received,
+            decode_end: f.decode_end,
+            picked: intake.picked,
+            display_time: intake.display_time,
+            next_display_time: intake.display_time + period,
+        };
+        shared.link.duplex.send_datagram(&ClientDatagram::FrameTiming(timing)).ok();
+    }
+    let ms = |ns: i128| ns as f64 / 1e6;
+    for (frame, display) in out.shown {
+        r.latencies.pose_to_display.push(ms(i128::from(display) - i128::from(frame.sample)));
+        if frame.target != 0 {
+            r.latencies.target_gap.push(ms(i128::from(display) - i128::from(frame.target)));
+        }
+    }
+    r.queue = compositor.counts;
 }
 
 /// The pose of an eye that sits `x` meters to the side of a head, in the head's own frame.
@@ -679,12 +694,19 @@ fn print_summary(shared: &Shared, r: &DecodeResults, seconds: f32, expected: u64
     let c = &shared.counters;
     let totals = *shared.totals.lock().unwrap();
     let lost = totals.packets_expected.saturating_sub(totals.packets_received);
+    let q = &r.queue;
     println!(
-        "probe: native: {:.1} frames per second decoded, {:.1} shown on their own refresh, {} replaced by a newer frame, {} skipped before the decoder (of about {expected} expected)",
+        "probe: native: {:.1} frames per second decoded, {} skipped before the decoder (of about {expected} expected)",
         r.decoded as f32 / seconds,
-        r.shown as f32 / seconds,
-        r.replaced,
         r.skipped
+    );
+    println!(
+        "probe: native: the headset's queue of 3 frames showed {:.1} frames a second, skipped {:.1} and repeated {:.1} (headset frames that showed the last picture again); {:.1}% of {} frames came after the headset frame of their own display point",
+        q.shown as f32 / seconds,
+        q.skipped as f32 / seconds,
+        q.repeated as f32 / seconds,
+        100.0 * q.late as f64 / q.intakes.max(1) as f64,
+        q.intakes
     );
     println!(
         "probe: native: packets {} seen, {} dropped by the test, {} malformed; units {} complete, {} lost; {} units needed parity, {} data packets restored; {} lost on the wire of {} expected ({:.2}%); {} key frame requests",
@@ -710,7 +732,7 @@ fn print_summary(shared: &Shared, r: &DecodeResults, seconds: f32, expected: u64
     );
     let near = l.target_gap.iter().filter(|g| g.abs() < 1.0).count();
     println!(
-        "probe: native: display time of the probe's display minus the host's target display time (ms): {}; {:.0}% within 1 ms",
+        "probe: native: display time of the headset model minus the host's target display time (ms): {}; {:.0}% within 1 ms",
         describe(&l.target_gap),
         100.0 * near as f64 / l.target_gap.len().max(1) as f64
     );

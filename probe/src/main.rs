@@ -16,6 +16,8 @@
 #[cfg(target_os = "android")]
 mod android;
 #[cfg(target_os = "macos")]
+mod compositor;
+#[cfg(target_os = "macos")]
 mod native;
 
 use alvr_client_core::{ClientCapabilities, ClientCoreContext, ClientCoreEvent};
