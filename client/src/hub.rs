@@ -7,6 +7,7 @@
 
 use crate::{
     connection::Connection,
+    console::{Action, Console, Menu, View as ConsoleView},
     tracking::{Display, Feed},
 };
 use cranpose::{CropRect, DecodedFrames};
@@ -25,7 +26,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Mutex, OnceLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Where the link stands.
@@ -234,6 +235,35 @@ struct StreamTable {
 /// The frames that the table keeps. The decoder holds a few, so this is far more than needed.
 const TABLE_LEN: usize = 128;
 
+/// How long a link that streamed and then ended waits before the client connects again. The host
+/// restarts when the console changes a setting, which takes a few seconds.
+const RECONNECT_AFTER: Duration = Duration::from_secs(2);
+
+/// The connection that the user asked for. The client keeps it up: a link that streamed and ended
+/// without the user's say connects again. A connection that never streamed stays failed, so the
+/// panel shows why.
+struct Wanted {
+    host: String,
+    media: MediaChoice,
+    streamed: bool,
+    failed_at: Option<Instant>,
+}
+
+impl Wanted {
+    /// Notes the link's state and says whether the client should connect again at `now`.
+    fn due(&mut self, state: &LinkState, now: Instant) -> bool {
+        match state {
+            LinkState::Streaming => {
+                self.streamed = true;
+                self.failed_at = None;
+                false
+            }
+            LinkState::Failed(_) if self.streamed => now.duration_since(*self.failed_at.get_or_insert(now)) >= RECONNECT_AFTER,
+            LinkState::Failed(_) | LinkState::Idle | LinkState::Connecting => false,
+        }
+    }
+}
+
 pub struct Hub {
     snapshot: Mutex<Snapshot>,
     headset: Mutex<Option<HeadsetInfo>>,
@@ -249,6 +279,8 @@ pub struct Hub {
     current: AtomicU64,
     last_id: AtomicU64,
     connection: Mutex<Option<Connection>>,
+    wanted: Mutex<Option<Wanted>>,
+    console: Mutex<Console>,
 }
 
 /// The one hub of the process. The activity may rebuild the composition, and the link outlives it.
@@ -265,6 +297,8 @@ pub fn hub() -> &'static Hub {
         current: AtomicU64::new(0),
         last_id: AtomicU64::new(0),
         connection: Mutex::new(None),
+        wanted: Mutex::new(None),
+        console: Mutex::new(Console::default()),
     })
 }
 
@@ -276,27 +310,61 @@ impl Hub {
     /// Starts a connection to `host`, an address with an optional port. An earlier connection ends
     /// first.
     pub fn connect(&'static self, host: String, media: MediaChoice) {
-        self.disconnect();
+        self.start(host, media, false);
+    }
+
+    fn start(&'static self, host: String, media: MediaChoice, streamed: bool) {
+        self.end_connection();
         let id = self.last_id.fetch_add(1, Ordering::Relaxed) + 1;
         self.current.store(id, Ordering::Release);
         *self.snapshot.lock().unwrap() = Snapshot { state: LinkState::Connecting, ..Snapshot::idle() };
+        *self.wanted.lock().unwrap() = Some(Wanted { host: host.clone(), media, streamed, failed_at: None });
         *self.connection.lock().unwrap() = Some(Connection::start(self, id, host, media));
     }
 
-    /// Ends the connection. Its threads end in the background.
+    /// Ends the connection, because the user asked. Its threads end in the background.
     pub fn disconnect(&self) {
+        *self.wanted.lock().unwrap() = None;
+        self.end_connection();
+    }
+
+    fn end_connection(&self) {
         self.current.store(0, Ordering::Release);
         if let Some(connection) = self.connection.lock().unwrap().take() {
             connection.stop();
         }
+        self.console.lock().unwrap().clear();
         *self.snapshot.lock().unwrap() = Snapshot::idle();
+    }
+
+    /// Connects again when a link that streamed has ended and a pause has passed, unless the user
+    /// ended the connection. The UI calls it a few times a second.
+    pub fn reconnect_if_due(&'static self) {
+        let state = self.snapshot.lock().unwrap().state.clone();
+        let again = {
+            let mut wanted = self.wanted.lock().unwrap();
+            wanted.as_mut().and_then(|wanted| wanted.due(&state, Instant::now()).then(|| (wanted.host.clone(), wanted.media)))
+        };
+        if let Some((host, media)) = again {
+            log::info!("the link ended: connecting to {host} again");
+            self.start(host, media, true);
+        }
     }
 
     /// Lets the connection `id` change the snapshot. A connection that was replaced or ended by the
     /// user changes nothing.
     pub fn report(&self, id: u64, update: impl FnOnce(&mut Snapshot)) {
-        if self.current.load(Ordering::Acquire) == id {
-            update(&mut self.snapshot.lock().unwrap());
+        if self.current.load(Ordering::Acquire) != id {
+            return;
+        }
+        let streaming = {
+            let mut snapshot = self.snapshot.lock().unwrap();
+            update(&mut snapshot);
+            snapshot.state == LinkState::Streaming
+        };
+        // A link that streamed for any time counts, also when the UI never saw the state
+        if let Some(wanted) = self.wanted.lock().unwrap().as_mut().filter(|_| streaming) {
+            wanted.streamed = true;
         }
     }
 
@@ -379,6 +447,44 @@ impl Hub {
             late: timing.late,
         });
         views
+    }
+
+    /// The console's menu from the host, for the connection `id`.
+    pub(crate) fn set_menu(&self, id: u64, text: &str) {
+        if self.current.load(Ordering::Acquire) != id {
+            return;
+        }
+        match Menu::parse(text) {
+            Some(menu) => self.console.lock().unwrap().on_menu(menu),
+            None => log::warn!("the host sent a menu that the console cannot read"),
+        }
+    }
+
+    pub fn console(&self) -> ConsoleView {
+        self.console.lock().unwrap().view()
+    }
+
+    /// One frame of the headset for the console: the head and the left menu button. Returns
+    /// whether a hold of the button showed or hid the console.
+    pub fn console_frame(&self, head: Option<([f32; 3], [f32; 4])>, menu_down: bool, now: Nanos) -> bool {
+        self.console.lock().unwrap().on_frame(head, menu_down, now)
+    }
+
+    pub fn close_console(&self) {
+        self.console.lock().unwrap().close();
+    }
+
+    /// Opens the console and keeps it open when the link ends (see `settings::console_on_launch`).
+    pub fn pin_console(&self) {
+        self.console.lock().unwrap().pin();
+    }
+
+    /// Sends a press of a console button to the host.
+    pub fn press(&self, action: &Action) {
+        log::info!("the console asks for {}", action.request());
+        if let Some(connection) = self.connection.lock().unwrap().as_ref() {
+            connection.send_console(action.request());
+        }
     }
 
     /// The frames that the headset took since the last call
@@ -524,6 +630,24 @@ mod tests {
         assert_eq!((w % 32, h % 32), (0, 0));
         let share = f64::from(w * h) / f64::from(1680 * 1760);
         assert!((0.28..0.36).contains(&share), "{share}");
+    }
+
+    #[test]
+    fn a_link_that_streamed_connects_again_after_a_pause_and_one_that_never_did_does_not() {
+        let start = Instant::now();
+        let failed = LinkState::Failed("the link ended".into());
+        let mut wanted = Wanted { host: "mac".into(), media: MediaChoice::Auto, streamed: false, failed_at: None };
+        // Never streamed: the failure stays, as the panel shows why
+        assert!(!wanted.due(&LinkState::Connecting, start));
+        assert!(!wanted.due(&failed, start) && !wanted.due(&failed, start + Duration::from_secs(60)));
+        // Streaming, then the host restarts: wait for the pause, then connect again
+        assert!(!wanted.due(&LinkState::Streaming, start));
+        assert!(!wanted.due(&failed, start + Duration::from_secs(1)));
+        assert!(!wanted.due(&failed, start + Duration::from_secs(2) + Duration::from_millis(900)));
+        assert!(wanted.due(&failed, start + Duration::from_secs(3) + Duration::from_millis(100)));
+        // The attempt fails again (the host is still down): the next try follows after a new pause.
+        // The caller starts it with `streamed` kept, so the failed state does not end the retries.
+        assert!(wanted.streamed);
     }
 
     fn display(time: Nanos) -> Display {

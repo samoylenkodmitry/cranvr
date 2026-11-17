@@ -10,6 +10,8 @@
 #![deny(unsafe_code)]
 
 mod connection;
+mod console;
+mod console_panel;
 mod hub;
 mod settings;
 mod sizing;

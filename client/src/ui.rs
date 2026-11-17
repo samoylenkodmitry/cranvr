@@ -8,6 +8,7 @@
 //! times a second.
 
 use crate::{
+    console_panel::{self, ConsolePanel},
     hub::{hub, DecoderView, LinkState, Snapshot, Stats},
     settings,
 };
@@ -27,17 +28,19 @@ const POLL: Duration = Duration::from_millis(250);
 /// How often the UI looks for a new decoder. The decoder drops pictures that nobody takes, so the
 /// streamed scene must start soon after the decoder does.
 const STREAM_POLL: Duration = Duration::from_millis(16);
+/// How often the UI looks at the console's state. A hold of the menu button should show it soon.
+const CONSOLE_POLL: Duration = Duration::from_millis(50);
 
-const PANEL_COLOR: Color = Color(0.09, 0.1, 0.13, 0.96);
-const FIELD_COLOR: Color = Color(0.16, 0.18, 0.23, 1.0);
-const KEY_COLOR: Color = Color(0.2, 0.23, 0.3, 1.0);
-const TEXT_COLOR: Color = Color(0.95, 0.96, 0.98, 1.0);
-const MUTED_COLOR: Color = Color(0.62, 0.66, 0.73, 1.0);
-const GOOD_COLOR: Color = Color(0.4, 0.82, 0.55, 1.0);
-const WARN_COLOR: Color = Color(0.95, 0.72, 0.3, 1.0);
-const BAD_COLOR: Color = Color(0.95, 0.42, 0.4, 1.0);
-const ACCENT_COLOR: Color = Color(0.25, 0.45, 0.95, 1.0);
-const STOP_COLOR: Color = Color(0.75, 0.3, 0.3, 1.0);
+pub(crate) const PANEL_COLOR: Color = Color(0.09, 0.1, 0.13, 0.96);
+pub(crate) const FIELD_COLOR: Color = Color(0.16, 0.18, 0.23, 1.0);
+pub(crate) const KEY_COLOR: Color = Color(0.2, 0.23, 0.3, 1.0);
+pub(crate) const TEXT_COLOR: Color = Color(0.95, 0.96, 0.98, 1.0);
+pub(crate) const MUTED_COLOR: Color = Color(0.62, 0.66, 0.73, 1.0);
+pub(crate) const GOOD_COLOR: Color = Color(0.4, 0.82, 0.55, 1.0);
+pub(crate) const WARN_COLOR: Color = Color(0.95, 0.72, 0.3, 1.0);
+pub(crate) const BAD_COLOR: Color = Color(0.95, 0.42, 0.4, 1.0);
+pub(crate) const ACCENT_COLOR: Color = Color(0.25, 0.45, 0.95, 1.0);
+pub(crate) const STOP_COLOR: Color = Color(0.75, 0.3, 0.3, 1.0);
 
 // The side panels stand on a circle of about a meter around the viewer, at 47 degrees to the left
 // and to the right of the stream, and face the viewer.
@@ -55,6 +58,22 @@ pub fn ClientApp() {
     LaunchedEffect((), async move |_| loop {
         snapshot.set(hub().snapshot());
         delay(POLL).await;
+    });
+    // A link that streamed and ended without the user's say connects again, as after a restart of
+    // the host that a setting of the console asks for
+    LaunchedEffect((), async move |_| loop {
+        hub().reconnect_if_due();
+        delay(POLL).await;
+    });
+    let console = rememberMutableStateOf(|| hub().console());
+    LaunchedEffect((), async move |_| {
+        if settings::console_on_launch() {
+            hub().pin_console();
+        }
+        loop {
+            console.set(hub().console());
+            delay(CONSOLE_POLL).await;
+        }
     });
     let frames = rememberMutableStateOf(|| None::<DecodedFrames>);
     LaunchedEffect((), async move |_| {
@@ -74,11 +93,12 @@ pub fn ClientApp() {
         // its own place.
         ConnectPanel(snapshot);
         StatsPanel(snapshot);
+        ConsolePanel(console, snapshot);
         Stream(frames);
     });
 }
 
-fn text_style(size: f32, color: Color, weight: Option<FontWeight>) -> TextStyle {
+pub(crate) fn text_style(size: f32, color: Color, weight: Option<FontWeight>) -> TextStyle {
     TextStyle {
         span_style: SpanStyle {
             color: Some(color),
@@ -96,7 +116,9 @@ fn text_style(size: f32, color: Color, weight: Option<FontWeight>) -> TextStyle 
 fn HeadsetFrames() {
     let reader = remember(|| Rc::new(RefCell::new(FrameReader::default()))).with(Clone::clone);
     SpatialFrameEffect(move |frame| {
-        let read = reader.borrow_mut().read(frame, now_ns());
+        let now = now_ns();
+        let read = reader.borrow_mut().read(frame, now);
+        console_panel::on_frame(&read, now);
         hub().feed.push(read);
     });
 }
