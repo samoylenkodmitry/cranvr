@@ -87,6 +87,9 @@ const PANEL_FILE: &str = "/sdcard/Android/data/dev.cranvr.client/files/panels.tx
 const OVERLAY_SCALE: f32 = 1.0;
 /// The gap between the first panel and its mirror, in meters
 const MIRROR_GAP: f32 = 0.1;
+/// The scale of the overlay's scene while the mirror shows: 1.5 times the headset's recommended
+/// eye picture, which is smaller than its display
+const MIRROR_SCENE_SCALE: f32 = 1.5;
 const VERSION: u32 = 2;
 
 const MSG_HELLO: u8 = 0;
@@ -636,7 +639,10 @@ impl DesktopLayer {
         // Cranpose draws the overlay; ALVR's renderer stays for debug.cranvr.overlay=alvr and for
         // a scene that fails to start
         if self.scene_wanted && self.scene.is_none() {
-            let eye = (self.view_resolution.as_vec2() * OVERLAY_SCALE).as_uvec2();
+            // The mirror needs more pixels than the overlay's shapes: its picture is resampled
+            // once more by the compositor
+            let scale = if self.mirror.is_some() || self.shared.mirror.load(Ordering::Relaxed) { MIRROR_SCENE_SCALE } else { OVERLAY_SCALE };
+            let eye = (self.view_resolution.as_vec2() * scale).as_uvec2();
             self.scene = crate::xr_scene::XrScene::new(session, &self.gfx, eye, &views).map_err(|e| error!("cranvr xr scene: {e}")).ok();
             self.scene_wanted = self.scene.is_some();
         }
@@ -650,7 +656,7 @@ impl DesktopLayer {
                     let center = p.center - p.right() * (p.width + MIRROR_GAP);
                     (Mat4::from_rotation_translation(p.orientation, center), (p.width, p.height))
                 }),
-                size: mirror.size(),
+                size: mirror.frame_size(),
             }
         });
         if let Some(scene) = &mut self.scene {

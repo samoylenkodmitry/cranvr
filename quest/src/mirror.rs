@@ -18,7 +18,8 @@ out vec2 uv;
 void main() {
     vec2 screen_uv = vec2(gl_VertexID & 1, gl_VertexID >> 1);
     gl_Position = vec4((screen_uv - 0.5) * 2.0, 0.0, 1.0);
-    uv = screen_uv;
+    // The buffer's first row is the picture's top; wgpu reads the texture's first row as its top
+    uv = vec2(screen_uv.x, 1.0 - screen_uv.y);
 }
 "#;
 
@@ -42,7 +43,11 @@ pub struct MirrorFrame {
     pub fence: usize,
 }
 
-/// The second decoder's pictures, turned into textures for the scene.
+/// The second decoder's pictures, turned into textures for the scene at half their size: each
+/// pixel of the texture is the mean of 2 by 2 pixels of the picture, as one linear sample halfway
+/// between them. The surface spans about 75 degrees, so half of a 3840 pixel picture already
+/// gives the headset's display about one pixel for each of its own, and the scene samples the
+/// texture with no mipmaps.
 pub struct Mirror {
     reader: ImageReader,
     size: (u32, u32),
@@ -99,10 +104,10 @@ impl Mirror {
         };
         let gl = &gfx.gl_context;
         gfx.make_current();
-        let (width, height) = self.size;
+        let (width, height) = self.frame_size();
         unsafe {
             let (texture, framebuffer) = match self.target {
-                Some((texture, framebuffer, size)) if size == self.size => (texture, framebuffer),
+                Some((texture, framebuffer, size)) if size == (width, height) => (texture, framebuffer),
                 old => {
                     if let Some((texture, framebuffer, _)) = old {
                         gl.delete_framebuffer(framebuffer);
@@ -116,7 +121,7 @@ impl Mirror {
                     gl.bind_framebuffer(gl::DRAW_FRAMEBUFFER, Some(framebuffer));
                     gl.framebuffer_texture_2d(gl::DRAW_FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, Some(texture), 0);
                     gl.bind_framebuffer(gl::DRAW_FRAMEBUFFER, None);
-                    self.target = Some((texture, framebuffer, self.size));
+                    self.target = Some((texture, framebuffer, (width, height)));
                     (texture, framebuffer)
                 }
             };
@@ -139,11 +144,12 @@ impl Mirror {
             let fence = gl.fence_sync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0).ok()?;
             gl.flush();
             self.held = Some(image);
-            Some(MirrorFrame { texture: texture.0.get(), size: self.size, fence: fence.0 as usize })
+            Some(MirrorFrame { texture: texture.0.get(), size: (width, height), fence: fence.0 as usize })
         }
     }
 
-    pub fn size(&self) -> (u32, u32) {
-        self.size
+    /// The size of the textures for the scene: half the picture's.
+    pub fn frame_size(&self) -> (u32, u32) {
+        ((self.size.0 / 2).max(1), (self.size.1 / 2).max(1))
     }
 }
