@@ -121,7 +121,9 @@ const MIRROR_CONTENT_WIDTH: f32 = 1920.0;
 
 /// A screen of `width` by `height` meters bent into an S: across it the surface goes one full
 /// sine wave forward and back by `depth`. The picture's top left corner is at u, v = 0, 0.
-/// OpenXR's axes: x right, y up, z toward the viewer.
+/// OpenXR's axes: x right, y up, z toward the viewer. The surface has two sides: Cranpose draws
+/// a triangle only from its front, so each triangle comes again turned the other way. From behind
+/// the picture shows reversed, as through glass.
 fn s_surface(width: f32, height: f32, depth: f32) -> Result<Mesh, String> {
     const COLUMNS: u32 = 64;
     let (mut positions, mut uvs, mut normals, mut indices) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -141,6 +143,19 @@ fn s_surface(width: f32, height: f32, depth: f32) -> Result<Mesh, String> {
     for i in 0..COLUMNS {
         let (a, b, c, d) = (2 * i, 2 * i + 1, 2 * i + 2, 2 * i + 3);
         indices.extend([a, b, c, b, d, c]);
+    }
+    // The back: the same places with the normals turned around, and each triangle wound the
+    // other way
+    let back = positions.len() as u32;
+    positions.extend_from_within(..);
+    uvs.extend_from_within(..);
+    normals.extend_from_within(..);
+    for normal in &mut normals[back as usize..] {
+        *normal = normal.map(|c| -c);
+    }
+    for i in 0..COLUMNS {
+        let (a, b, c, d) = (back + 2 * i, back + 2 * i + 1, back + 2 * i + 2, back + 2 * i + 3);
+        indices.extend([a, c, b, b, c, d]);
     }
     Mesh::new(positions, uvs, Some(normals), indices).map_err(|e| format!("{e:?}"))
 }
