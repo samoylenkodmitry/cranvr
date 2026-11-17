@@ -21,7 +21,7 @@ use cranpose::{
 use cranpose_xr::{Hand, StreamCounts, Vibration};
 use cranvr_proto::{
     clock::{now_ns, ClockSync},
-    identity::{format_code, Identity},
+    identity::format_code,
     link::{ClientLink, ClientSide, Incoming},
     media::{FrameReceiver, Received},
     message::{
@@ -126,7 +126,7 @@ fn eye_for(recommended: [u32; 2], refresh_rates: &[f32]) -> [u32; 2] {
 
 /// What the client tells the host about itself. A headset reports its name, the size of the
 /// pictures that its displays take and its refresh rates.
-fn device_caps(tcp_only: bool, headset: Option<&HeadsetInfo>, views: Views, identity: &Identity) -> ClientCaps {
+fn device_caps(tcp_only: bool, headset: Option<&HeadsetInfo>, views: Views) -> ClientCaps {
     let (name, recommended, refresh_rates) = match headset {
         Some(HeadsetInfo { properties, .. }) => {
             let size = properties.eye_image_sizes[0].recommended;
@@ -149,7 +149,6 @@ fn device_caps(tcp_only: bool, headset: Option<&HeadsetInfo>, views: Views, iden
         // The headset's streamed scene unwarps ALVR's foveated encoding in its shader
         foveation: true,
         tcp_only,
-        public_key: identity.public_key(),
     }
 }
 
@@ -207,14 +206,10 @@ fn describe(error: &Error, host: SocketAddr) -> String {
 /// The port that cranvr-host listens on for the native protocol unless told otherwise.
 const DEFAULT_PORT: u16 = 9950;
 
-/// Turns what the user typed into an address. The port is optional. A name resolves through the
-/// system, which may take a moment.
-fn resolve(text: &str) -> Result<SocketAddr, String> {
+/// What the user typed with a port: the default port when there is none.
+fn with_port(text: &str) -> String {
     let text = text.trim();
-    if text.is_empty() {
-        return Err("Enter the address of the Mac that runs cranvr-host".into());
-    }
-    let with_port = if text.parse::<SocketAddr>().is_ok() {
+    if text.parse::<SocketAddr>().is_ok() {
         text.to_string()
     } else if let Ok(ip) = text.parse::<IpAddr>() {
         SocketAddr::new(ip, DEFAULT_PORT).to_string()
@@ -223,8 +218,23 @@ fn resolve(text: &str) -> Result<SocketAddr, String> {
         text.to_string()
     } else {
         format!("{text}:{DEFAULT_PORT}")
-    };
-    with_port
+    }
+}
+
+/// The name under which the app remembers the key of the host that the user typed. Two ways to
+/// write one address give one name.
+pub fn host_name(text: &str) -> String {
+    with_port(text).to_lowercase()
+}
+
+/// Turns what the user typed into an address. The port is optional. A name resolves through the
+/// system, which may take a moment.
+fn resolve(text: &str) -> Result<SocketAddr, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("Enter the address of the Mac that runs cranvr-host".into());
+    }
+    with_port(text)
         .to_socket_addrs()
         .map_err(|e| format!("Cannot resolve {text}: {e}"))?
         .next()
@@ -262,7 +272,7 @@ fn run(
         tracking::placeholder_views()
     };
     let identity = crate::settings::identity();
-    let caps = device_caps(tcp_media, headset.as_ref(), views, identity);
+    let caps = device_caps(tcp_media, headset.as_ref(), views);
     log::info!(
         "Hello: {} with {}x{} pixels an eye, refresh rates {:?}, fov {:?}, eyes at {:?}",
         caps.name,
@@ -273,13 +283,21 @@ fn run(
         caps.views.eye_pose.map(|pose| pose.position),
     );
     hub.feed.set_host_views(views);
-    let link = match ClientLink::connect(host, &caps, identity, CONNECT_TIMEOUT) {
+    // A host on this device or this Mac (USB through `adb reverse`, or a flat window beside the
+    // host) is reached through no network. Its key is not checked, as the host does not check the
+    // pairing of a client on loopback. Any other host must be the one that this headset paired with.
+    let name = host_name(text);
+    let pinned = if host.ip().is_loopback() { None } else { crate::settings::host_key(&name) };
+    let link = match ClientLink::connect(host, &caps, identity, pinned, CONNECT_TIMEOUT) {
         Ok(link) => Arc::new(link),
         Err(e) => {
             let message = match &e {
                 Error::Rejected(RejectReason::NotPaired) => format!(
                     "{host} does not know this headset. On the Mac, start cranvr-host with --pair {}",
                     format_code(identity.code()).replace(' ', "")
+                ),
+                Error::HostKeyChanged => format!(
+                    "{host} does not have the key that this headset paired with. Someone may pose as the host. If you reinstalled the host or lost its host-identity.txt, press Forget host key and connect again."
                 ),
                 other => describe(other, host),
             };
@@ -288,6 +306,11 @@ fn run(
             return;
         }
     };
+    if pinned.is_none() && !host.ip().is_loopback() {
+        // The host accepted this headset, so this is the host that the user meant to pair with
+        log::info!("paired with the host key {} at {host}", cranvr_proto::identity::to_hex(&link.host_key[..8]));
+        crate::settings::remember_host_key(&name, &link.host_key);
+    }
     *slot.lock().unwrap() = Some(Arc::clone(&link));
     if stop.load(Ordering::Relaxed) {
         // The user ended the attempt while the handshake ran
@@ -863,6 +886,7 @@ fn stats_loop(s: &Shared<'_>) {
     let (mut network_ms, mut sample_to_decode_ms) = (None, None);
     // The streamed scene's counts at the last look. A new scene starts from 0.
     let mut scene = StreamCounts::default();
+    let mut crypto = s.link.duplex.crypto_stats();
     let mut log_due = Instant::now();
     while !s.stopped() {
         thread::sleep(Duration::from_millis(50));
@@ -877,7 +901,8 @@ fn stats_loop(s: &Shared<'_>) {
         decoder_seen = decoder.decoded;
         let (now_frames, now_decoded, now_bytes) =
             (c.frames.load(Ordering::Relaxed), c.decoded.load(Ordering::Relaxed) + decoder_total, c.bytes.load(Ordering::Relaxed));
-        let received_fps = (now_frames - frames) as f32 / seconds;
+        let frames_in = now_frames - frames;
+        let received_fps = frames_in as f32 / seconds;
         let decoded_fps = (now_decoded - decoded) as f32 / seconds;
         let received_mbps = (now_bytes - bytes) as f32 * 8.0 / 1e6 / seconds;
         (frames, decoded, bytes) = (now_frames, now_decoded, now_bytes);
@@ -899,6 +924,12 @@ fn stats_loop(s: &Shared<'_>) {
             late_pct
         };
         let ms = |d: Duration| d.as_secs_f32() * 1000.0;
+        let opened = s.link.duplex.crypto_stats();
+        let (open_packets, open_ns) = (opened.opened - crypto.opened, opened.open_ns - crypto.open_ns);
+        let open_us_per_frame = if frames_in > 0 { open_ns as f32 / 1e3 / frames_in as f32 } else { 0.0 };
+        let open_us_per_packet = if open_packets > 0 { open_ns as f32 / 1e3 / open_packets as f32 } else { 0.0 };
+        let open_core_pct = open_ns as f32 / 1e9 / seconds * 100.0;
+        crypto = opened;
         let (headset_fps, headset_gap) = s.hub.feed.frame_rate().unwrap_or_default();
         let totals = s.totals.lock().unwrap();
         let stats = Stats {
@@ -929,6 +960,10 @@ fn stats_loop(s: &Shared<'_>) {
             head_position: s.hub.feed.head().map(|head| head.pose.position),
             late_pct,
             tracking_live: s.hub.feed.is_live(),
+            open_us_per_frame,
+            open_us_per_packet,
+            open_core_pct,
+            packets_rejected: opened.rejected,
         };
         drop(totals);
         if log_due.elapsed() >= LOG_EVERY {
@@ -936,7 +971,7 @@ fn stats_loop(s: &Shared<'_>) {
             log::info!(
                 "{:.1} fps received, {:.1} fps decoded, {:.1} fps shown, {:.1} skipped, {:.1} repeated of {:.1} headset frames (gap up to {:.1} ms), {:.0}% late at the take, {} dropped by the decoder, {:.1} Mbps, decode {:.2} ms mean, rtt {} ms, \
                  network {} ms, pose to decode {} ms, tracking {} at {:?}, {} of {} packets lost, {} units recovered, {} units lost, \
-                 {} pulses",
+                 {} pulses, opening {:.0} us a frame ({:.2} us a packet, {:.1}% of a core), {} packets refused",
                 stats.received_fps,
                 stats.decoded_fps,
                 stats.shown_fps,
@@ -958,6 +993,10 @@ fn stats_loop(s: &Shared<'_>) {
                 stats.units_recovered,
                 stats.units_lost,
                 stats.haptic_pulses,
+                stats.open_us_per_frame,
+                stats.open_us_per_packet,
+                stats.open_core_pct,
+                stats.packets_rejected,
             );
         }
         s.hub.report(s.id, |snapshot: &mut Snapshot| snapshot.stats = stats);

@@ -150,7 +150,7 @@ impl Shared {
 /// The height of the probe's floor in its room, in meters
 const PROBE_FLOOR: f32 = -0.3;
 
-fn caps(tcp: bool, identity: &cranvr_proto::identity::Identity) -> ClientCaps {
+fn caps(tcp: bool) -> ClientCaps {
     let fov = Fov { left: -FRAC_PI_4, right: FRAC_PI_4, up: FRAC_PI_4, down: -FRAC_PI_4 };
     let eye = |x: f32| Pose { position: [x, 0.0, 0.0], ..Pose::IDENTITY };
     ClientCaps {
@@ -163,7 +163,6 @@ fn caps(tcp: bool, identity: &cranvr_proto::identity::Identity) -> ClientCaps {
         decoders: 1,
         foveation: true,
         tcp_only: tcp,
-        public_key: identity.public_key(),
     }
 }
 
@@ -176,7 +175,7 @@ pub fn run(o: Options) -> i32 {
     // pairing
     let identity = cranvr_proto::identity::Identity::generate().expect("random numbers for the probe's key");
     let link = loop {
-        match ClientLink::connect(o.connect, &caps(o.tcp, &identity), &identity, Duration::from_secs(5)) {
+        match ClientLink::connect(o.connect, &caps(o.tcp), &identity, None, Duration::from_secs(5)) {
             Ok(link) => break link,
             // The host is not up yet, or not ready
             Err(Error::Io(_) | Error::Timeout | Error::Closed) if started.elapsed() < Duration::from_secs(60) => {

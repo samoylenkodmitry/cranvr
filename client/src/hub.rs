@@ -112,6 +112,14 @@ pub struct Stats {
     pub late_pct: f32,
     /// Whether the poses come from the headset or are placeholders (see `tracking.rs`)
     pub tracking_live: bool,
+    /// What opening the sealed packets cost in the last stats interval. `open_us_per_frame` counts
+    /// every packet, so a desktop panel and the sound add to it. `open_us_per_packet` is the mean
+    /// for one packet. `open_core_pct` is the share of one core in percent.
+    pub open_us_per_frame: f32,
+    pub open_us_per_packet: f32,
+    pub open_core_pct: f32,
+    /// Packets that failed to open since the session began: changed, replayed or too old
+    pub packets_rejected: u64,
 }
 
 impl Default for Stats {
@@ -144,6 +152,10 @@ impl Default for Stats {
             head_position: None,
             late_pct: 0.0,
             tracking_live: false,
+            open_us_per_frame: 0.0,
+            open_us_per_packet: 0.0,
+            open_core_pct: 0.0,
+            packets_rejected: 0,
         }
     }
 }

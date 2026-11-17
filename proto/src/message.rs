@@ -3,12 +3,14 @@
 //!
 //! The handshake in order:
 //! 1. Both sides swap a preamble (see [`client_preamble`]) that picks the protocol version.
-//! 2. The client sends [`ClientMsg::Hello`] with its capabilities.
-//! 3. The host answers [`HostMsg::Welcome`] with its choices, or [`HostMsg::Reject`].
-//! 4. With UDP media, the client repeats [`ClientDatagram::Hello`] until the host answers
+//! 2. The key exchange of [`crate::secure`]: three flights. They prove the keys of both sides and
+//!    give both the keys of the session. Everything below is sealed.
+//! 3. The client sends [`ClientMsg::Hello`] with its capabilities.
+//! 4. The host answers [`HostMsg::Welcome`] with its choices, or [`HostMsg::Reject`].
+//! 5. With UDP media, the client repeats [`ClientDatagram::Hello`] until the host answers
 //!    [`HostMsg::MediaReady`] over TCP. The datagram tells the host the client's UDP address.
 //!    With TCP media the host sends `MediaReady` at once.
-//! 5. The host sends [`HostMsg::DecoderConfig`] and then frames. The first frame is a key frame.
+//! 6. The host sends [`HostMsg::DecoderConfig`] and then frames. The first frame is a key frame.
 
 use crate::wire::{Codec, Fov, Motion, Nanos, Pose};
 use crate::{Error, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
@@ -94,9 +96,6 @@ pub struct ClientCaps {
     /// The client reaches the host through a TCP-only path, such as `adb reverse` over USB. The
     /// host then sends the media over TCP.
     pub tcp_only: bool,
-    /// The client's public key (see [`crate::identity`]). The host remembers the keys of the
-    /// clients that the user paired.
-    pub public_key: [u8; 32],
 }
 
 /// The two eyes' field of view and their place relative to the head.
@@ -157,7 +156,8 @@ pub enum MediaPlan {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Welcome {
-    /// A number that the client repeats in its UDP hello, so the host knows whose datagram it is
+    /// A number that the client repeats in its UDP hello. The hello is sealed, so only a client
+    /// that finished the handshake can send it.
     pub session: u64,
     pub version: u16,
     pub stream: StreamParams,
@@ -190,8 +190,6 @@ pub enum ClientMsg {
     /// The headset's runtime moved the origin of its tracking space, which the user asked for by
     /// recentering. A receiver that does not know this message skips it.
     Recenter(Recenter),
-    /// The answer to the host's challenge: the signature of the client's key
-    Proof(Vec<u8>),
     /// The height of the floor in the headset's room in meters, from the headset's stage. It is
     /// negative when the floor lies below the room's origin, which is where the head was when the
     /// app started. The client sends it again when it changes. The host puts its scenes' floor
@@ -234,9 +232,6 @@ pub enum HostMsg {
     /// The host changed the stream, for example the foveation or the eye size
     StreamUpdate(StreamParams),
     Bye,
-    /// The host asks the client to prove that it holds its key. The client answers with
-    /// [`ClientMsg::Proof`].
-    Challenge([u8; 32]),
     /// The state of the desktop stream: its parameters, or `None` when the host has no desktop for
     /// this client. The host sends it after a [`ClientMsg::Desktop`] and again when the picture's
     /// size or the visibility changes. The decoder's parameter sets follow in a

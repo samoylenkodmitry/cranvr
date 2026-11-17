@@ -19,6 +19,7 @@ fn the_sound_reaches_the_client_in_datagrams_of_five_milliseconds() {
     let identity = cranvr_proto::identity::Identity::from_seed([6; 32]);
     let config = Config {
         port,
+        identity: cranvr_proto::identity::Identity::from_seed([7; 32]),
         pairings: Arc::new(crate::pairing::Pairings::load(&std::env::temp_dir().join(format!("cranvr-native-audio-test-{port}")), None)),
         trust_all: false,
         display_lock: false,
@@ -46,9 +47,8 @@ fn the_sound_reaches_the_client_in_datagrams_of_five_milliseconds() {
         decoders: 1,
         foveation: true,
         tcp_only: false,
-        public_key: identity.public_key(),
     };
-    let client = Arc::new(ClientLink::connect(([127, 0, 0, 1], port).into(), &caps, &identity, Duration::from_secs(10)).unwrap());
+    let client = Arc::new(ClientLink::connect(([127, 0, 0, 1], port).into(), &caps, &identity, None, Duration::from_secs(10)).unwrap());
     // The welcome tells the client that sound comes
     assert_eq!(client.welcome.stream.audio, Some(cranvr_proto::message::AudioFormat::HOST_CAPTURE));
     let (to_test, heard) = channel();

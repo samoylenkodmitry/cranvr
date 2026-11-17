@@ -41,9 +41,14 @@ impl Rng {
     }
 }
 
-/// The identity that `caps` carries the public key of
+/// The client's key
 pub fn identity() -> cranvr_proto::identity::Identity {
     cranvr_proto::identity::Identity::from_seed([5; 32])
+}
+
+/// The host's key
+pub fn host_identity() -> cranvr_proto::identity::Identity {
+    cranvr_proto::identity::Identity::from_seed([6; 32])
 }
 
 pub fn caps() -> ClientCaps {
@@ -60,17 +65,17 @@ pub fn caps() -> ClientCaps {
         decoders: 2,
         foveation: true,
         tcp_only: false,
-        public_key: identity().public_key(),
     }
 }
 
-/// The packets of one unit, as the sender emits them, with `share` parity packets per data packet.
+/// The packets of one unit, as the sender builds them (not sealed), with `share` parity packets per
+/// data packet.
 pub fn packets(meta: &FrameMeta, payload: &[u8], share: f32) -> Vec<Vec<u8>> {
     let mut sender = FrameSender::new(DEFAULT_SHARD_LEN).unwrap();
     let mut out = Vec::new();
     sender
-        .send_unit(meta, payload, |n| parity_for(n, share), |wire| {
-            out.push(wire.packet.to_vec());
+        .send_unit(meta, payload, |n| parity_for(n, share), |packet| {
+            out.push(packet.content().to_vec());
             Ok(())
         })
         .unwrap();

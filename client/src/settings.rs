@@ -52,6 +52,32 @@ pub fn media_choice() -> MediaChoice {
     }
 }
 
+/// The preferences key under which the headset remembers the key of a host, by the name that
+/// `connection::host_name` gives.
+fn host_key_entry(name: &str) -> String {
+    format!("host-key:{name}")
+}
+
+/// The key of the host that this headset paired with at `name`, if it did.
+pub fn host_key(name: &str) -> Option<[u8; 32]> {
+    preferences().get(&host_key_entry(name)).and_then(|text| from_hex(&text))
+}
+
+/// Remembers the key of a host. The headset refuses a host at this name that has another key.
+pub fn remember_host_key(name: &str, key: &[u8; 32]) {
+    if let Err(e) = preferences().set(&host_key_entry(name), &to_hex(key)) {
+        log::warn!("the host's key was not saved, so the next connection trusts the host's key again: {e}");
+    }
+}
+
+/// Forgets the key of the host at `name`. The next connection trusts the key that the host shows
+/// and remembers it.
+pub fn forget_host_key(name: &str) {
+    if let Err(e) = preferences().remove(&host_key_entry(name)) {
+        log::warn!("the host's key was not forgotten: {e}");
+    }
+}
+
 /// The key of this headset, for pairing with a host. The first call reads it from Cranpose's
 /// preferences service, or makes a new one and saves it there. The host remembers the public key
 /// of a paired headset, so a headset keeps its key for good.

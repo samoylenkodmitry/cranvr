@@ -2,16 +2,22 @@
 //! ends ([`HostLink`] and [`ClientLink`]). All calls block. A caller runs one thread per read loop
 //! ([`Duplex::read_tcp`] and [`Duplex::read_udp`]). Any thread may send.
 //!
-//! The client dials the host. The host listens on one TCP port. With UDP media the host opens a
-//! UDP socket per session on an ephemeral port and names it in the welcome. The client's first
-//! datagram teaches the host the client's address.
+//! The client dials the host. The host listens on one TCP port. After the version exchange both
+//! sides run the key exchange of [`crate::secure`]. Everything after it is sealed. With UDP media
+//! the host opens a UDP socket per session on an ephemeral port and names it in the welcome. The
+//! client's first datagram teaches the host the client's address. The datagram is sealed, so only
+//! the client that finished the handshake can teach it.
 
 use crate::{
     fec::ParityController,
-    identity::{self, Identity},
+    identity::{Identity, KEY_LEN},
     media::{FrameMeta, FrameSender, SendStats},
     message::*,
-    wire::{decode, encode, read_tcp_packet, Error, PacketBuf, Wire, KIND_CONTROL, KIND_DATAGRAM, KIND_MEDIA},
+    secure::{
+        derive, sign_as_client, sign_as_host, transcript_hash, verify_client, verify_host, Channels, ClientAuth, Ephemeral, HostHello, Role,
+        TcpRx, TcpTx, UdpRx, UdpTx, CLIENT_HELLO_LEN, HOST_HELLO_LEN, OVERHEAD,
+    },
+    wire::{decode, encode, read_tcp_packet, read_tcp_packet_limited, Error, PacketBuf, KIND_CONTROL, KIND_DATAGRAM, KIND_HANDSHAKE, KIND_MEDIA},
     MTU,
 };
 use serde::{de::DeserializeOwned, Serialize};
@@ -31,6 +37,8 @@ use std::{
 
 /// The time that handshake reads and writes may take.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The longest packet that the handshake reads. The Hello with the capabilities is the largest.
+const HANDSHAKE_PACKET_LIMIT: usize = 64 << 10;
 /// A write to the TCP connection that takes longer than this ends the session: the peer is gone.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The UDP read loop wakes this often to see that the session closed.
@@ -72,15 +80,67 @@ pub enum Incoming<'a, S: Side> {
     Media(&'a [u8]),
 }
 
+/// The TCP stream and the key that seals what it carries. One lock holds both, so the counter
+/// of a record and its place in the stream agree.
+struct TcpWriter {
+    stream: TcpStream,
+    tx: TcpTx,
+}
+
+/// What sealing and opening cost, summed since the session began. The client shows the cost of a
+/// frame by the difference between two readings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CryptoStats {
+    /// Packets that this side sealed, their bytes on the wire and the nanoseconds that sealing took
+    pub sealed: u64,
+    pub sealed_bytes: u64,
+    pub seal_ns: u64,
+    /// Packets that this side opened, their bytes on the wire and the nanoseconds that opening took
+    pub opened: u64,
+    pub opened_bytes: u64,
+    pub open_ns: u64,
+    /// UDP packets that failed to open: changed, replayed, too old or from another key
+    pub rejected: u64,
+}
+
+#[derive(Default)]
+struct CryptoCounters {
+    sealed: AtomicU64,
+    sealed_bytes: AtomicU64,
+    seal_ns: AtomicU64,
+    opened: AtomicU64,
+    opened_bytes: AtomicU64,
+    open_ns: AtomicU64,
+    rejected: AtomicU64,
+}
+
+impl CryptoCounters {
+    fn sealed(&self, bytes: usize, since: Instant) {
+        self.sealed.fetch_add(1, Ordering::Relaxed);
+        self.sealed_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.seal_ns.fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn opened(&self, bytes: usize, since: Instant) {
+        self.opened.fetch_add(1, Ordering::Relaxed);
+        self.opened_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.open_ns.fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
 /// The connection of one session, as seen from one side.
 pub struct Duplex<S: Side> {
-    tcp_write: Mutex<TcpStream>,
+    tcp_write: Mutex<TcpWriter>,
     tcp_read: TcpStream,
+    tcp_rx: Mutex<TcpRx>,
     udp: Option<UdpSocket>,
+    udp_tx: UdpTx,
+    udp_rx: Mutex<UdpRx>,
     /// Builds control messages and datagrams. Media packets use the sender's own buffer.
     out: Mutex<PacketBuf>,
     closed: AtomicBool,
     dropped_sends: AtomicU64,
+    crypto: CryptoCounters,
     side: PhantomData<fn() -> S>,
 }
 
@@ -95,17 +155,22 @@ fn is_transient(e: &io::Error) -> bool {
 }
 
 impl<S: Side> Duplex<S> {
-    fn new(tcp: TcpStream, udp: Option<UdpSocket>) -> Result<Self, Error> {
+    fn new(tcp: TcpStream, udp: Option<UdpSocket>, channels: Channels) -> Result<Self, Error> {
         tcp.set_nodelay(true)?;
         tcp.set_read_timeout(None)?;
         tcp.set_write_timeout(Some(WRITE_TIMEOUT))?;
+        let Channels { tcp_tx, tcp_rx, udp_tx, udp_rx } = channels;
         Ok(Self {
             tcp_read: tcp.try_clone()?,
-            tcp_write: Mutex::new(tcp),
+            tcp_write: Mutex::new(TcpWriter { stream: tcp, tx: tcp_tx }),
+            tcp_rx: Mutex::new(tcp_rx),
             udp,
+            udp_tx,
+            udp_rx: Mutex::new(udp_rx),
             out: Mutex::new(PacketBuf::new()),
             closed: AtomicBool::new(false),
             dropped_sends: AtomicU64::new(0),
+            crypto: CryptoCounters::default(),
             side: PhantomData,
         })
     }
@@ -119,27 +184,29 @@ impl<S: Side> Duplex<S> {
     pub fn send_control(&self, msg: &S::TxMsg) -> Result<(), Error> {
         let mut out = self.out.lock().unwrap();
         encode(msg, out.begin(KIND_CONTROL))?;
-        let wire = out.seal()?;
-        self.write_tcp(wire.framed)
+        self.write_tcp(&mut out)
     }
 
     /// Sends a datagram message. It gets lost when the path loses it.
     pub fn send_datagram(&self, msg: &S::TxDatagram) -> Result<(), Error> {
         let mut out = self.out.lock().unwrap();
         encode(msg, out.begin(KIND_DATAGRAM))?;
-        let wire = out.seal()?;
-        self.send_wire(wire)
+        self.send_wire(&mut out)
     }
 
-    /// Sends a finished packet by UDP, or through TCP when there is no UDP socket. A UDP send that
-    /// the system refuses for lack of buffer space counts as a lost packet.
-    pub fn send_wire(&self, wire: Wire<'_>) -> Result<(), Error> {
+    /// Seals a packet that [`PacketBuf::begin`] started and sends it by UDP, or through TCP when
+    /// there is no UDP socket. The packet is sealed in its own buffer. A UDP send that the system
+    /// refuses for lack of buffer space counts as a lost packet.
+    pub fn send_wire(&self, buf: &mut PacketBuf) -> Result<(), Error> {
         match &self.udp {
             Some(udp) => {
-                if wire.packet.len() > MTU {
-                    return Err(Error::TooLarge(wire.packet.len()));
+                if buf.content().len() + OVERHEAD > MTU {
+                    return Err(Error::TooLarge(buf.content().len() + OVERHEAD));
                 }
-                match udp.send(wire.packet) {
+                let started = Instant::now();
+                self.udp_tx.seal(buf)?;
+                self.crypto.sealed(buf.datagram().len(), started);
+                match udp.send(buf.datagram()) {
                     Ok(_) => Ok(()),
                     Err(e) if is_transient(&e) => {
                         self.dropped_sends.fetch_add(1, Ordering::Relaxed);
@@ -148,13 +215,19 @@ impl<S: Side> Duplex<S> {
                     Err(e) => Err(e.into()),
                 }
             }
-            None => self.write_tcp(wire.framed),
+            None => self.write_tcp(buf),
         }
     }
 
-    /// One lock holds a whole packet, so packets of different threads never interleave.
-    fn write_tcp(&self, bytes: &[u8]) -> Result<(), Error> {
-        self.tcp_write.lock().unwrap().write_all(bytes)?;
+    /// One lock holds the counter, the seal and the write of a whole record, so records of
+    /// different threads never interleave and the counters follow the order of the stream.
+    fn write_tcp(&self, buf: &mut PacketBuf) -> Result<(), Error> {
+        let mut writer = self.tcp_write.lock().unwrap();
+        let TcpWriter { stream, tx } = &mut *writer;
+        let started = Instant::now();
+        let record = tx.seal(buf)?;
+        self.crypto.sealed(record.len(), started);
+        stream.write_all(record)?;
         Ok(())
     }
 
@@ -163,8 +236,23 @@ impl<S: Side> Duplex<S> {
         self.dropped_sends.load(Ordering::Relaxed)
     }
 
-    fn dispatch(packet: &[u8], over_udp: bool, handler: &mut impl FnMut(Incoming<'_, S>)) {
-        let Some((&kind, body)) = packet.split_first() else { return };
+    /// The cost of sealing and opening since the session began.
+    pub fn crypto_stats(&self) -> CryptoStats {
+        let c = &self.crypto;
+        CryptoStats {
+            sealed: c.sealed.load(Ordering::Relaxed),
+            sealed_bytes: c.sealed_bytes.load(Ordering::Relaxed),
+            seal_ns: c.seal_ns.load(Ordering::Relaxed),
+            opened: c.opened.load(Ordering::Relaxed),
+            opened_bytes: c.opened_bytes.load(Ordering::Relaxed),
+            open_ns: c.open_ns.load(Ordering::Relaxed),
+            rejected: c.rejected.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Hands an opened packet to the handler. `content` is the kind byte and the body.
+    fn dispatch(content: &[u8], over_udp: bool, handler: &mut impl FnMut(Incoming<'_, S>)) {
+        let Some((&kind, body)) = content.split_first() else { return };
         match kind {
             // A control message must come through TCP, so the peer cannot inject one by UDP
             KIND_CONTROL if !over_udp => {
@@ -177,31 +265,56 @@ impl<S: Side> Duplex<S> {
                     handler(Incoming::Datagram(msg));
                 }
             }
-            KIND_MEDIA => handler(Incoming::Media(packet)),
+            KIND_MEDIA => handler(Incoming::Media(content)),
             _ => {}
         }
     }
 
     /// Reads the TCP connection until it ends. It returns the reason: [`Error::Closed`] for a peer
-    /// that left, or after [`Duplex::close`].
+    /// that left, or after [`Duplex::close`]. A record that fails to open ends the session with
+    /// [`Error::Crypto`]: TCP delivers every record, so a bad one means an attacker.
     pub fn read_tcp(&self, mut handler: impl FnMut(Incoming<'_, S>)) -> Error {
         let mut buf = Vec::new();
         let mut reader = &self.tcp_read;
+        let mut rx = self.tcp_rx.lock().unwrap();
         loop {
             if let Err(e) = read_tcp_packet(&mut reader, &mut buf) {
                 return e;
             }
-            Self::dispatch(&buf, false, &mut handler);
+            let started = Instant::now();
+            let wire_len = buf.len() + 4;
+            match rx.open(&mut buf) {
+                Ok(content) => {
+                    self.crypto.opened(wire_len, started);
+                    Self::dispatch(content, false, &mut handler);
+                }
+                Err(e) => {
+                    self.crypto.rejected.fetch_add(1, Ordering::Relaxed);
+                    return e;
+                }
+            }
         }
     }
 
-    /// Reads the UDP socket until the session closes or the socket fails.
+    /// Reads the UDP socket until the session closes or the socket fails. A datagram that fails to
+    /// open is dropped, as a lost one is.
     pub fn read_udp(&self, mut handler: impl FnMut(Incoming<'_, S>)) -> Error {
         let Some(udp) = &self.udp else { return Error::Unexpected("no UDP path") };
         let mut buf = vec![0u8; 2048];
         while !self.closed.load(Ordering::Relaxed) {
             match udp.recv(&mut buf) {
-                Ok(n) => Self::dispatch(&buf[..n], true, &mut handler),
+                Ok(n) => {
+                    let started = Instant::now();
+                    match self.udp_rx.lock().unwrap().open(&mut buf[..n]) {
+                        Ok(content) => {
+                            self.crypto.opened(n, started);
+                            Self::dispatch(content, true, &mut handler);
+                        }
+                        Err(_) => {
+                            self.crypto.rejected.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
                 Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::ConnectionRefused) => {}
                 Err(e) => return e.into(),
             }
@@ -232,34 +345,56 @@ fn udp_socket(bind: SocketAddr) -> io::Result<UdpSocket> {
     Ok(udp)
 }
 
-/// A number the client repeats to prove that its UDP datagram belongs to this session. It stops
-/// a stray datagram from claiming the session. It is not a secret: pairing is a separate step.
+/// A number the client repeats in its UDP hello. It stops a datagram of an earlier session from
+/// claiming this one. The hello is sealed, so the number needs no secrecy of its own.
 fn random_session() -> u64 {
     RandomState::new().build_hasher().finish()
 }
 
-/// Writes one control message to a TCP stream that no [`Duplex`] owns yet.
-fn write_control<T: Serialize>(tcp: &mut TcpStream, msg: &T) -> Result<(), Error> {
+/// Writes one control message, sealed, to a TCP stream that no [`Duplex`] owns yet.
+fn write_control<T: Serialize>(tcp: &mut TcpStream, tx: &mut TcpTx, msg: &T) -> Result<(), Error> {
     let mut buf = PacketBuf::new();
     encode(msg, buf.begin(KIND_CONTROL))?;
-    tcp.write_all(buf.seal()?.framed)?;
+    tcp.write_all(tx.seal(&mut buf)?)?;
     Ok(())
 }
 
-fn read_control<T: DeserializeOwned>(tcp: &mut TcpStream, buf: &mut Vec<u8>) -> Result<T, Error> {
-    read_tcp_packet(tcp, buf)?;
-    match buf.split_first() {
+fn read_control<T: DeserializeOwned>(tcp: &mut TcpStream, rx: &mut TcpRx, buf: &mut Vec<u8>) -> Result<T, Error> {
+    read_tcp_packet_limited(tcp, buf, HANDSHAKE_PACKET_LIMIT)?;
+    match rx.open(buf)?.split_first() {
         Some((&KIND_CONTROL, body)) => decode(body),
         _ => Err(Error::Unexpected("expected a control message")),
+    }
+}
+
+/// Writes a flight of the key exchange: a TCP packet of the handshake kind. Nothing in it is
+/// secret. The exchange's signatures make a changed flight fail.
+fn write_flight(tcp: &mut TcpStream, body: &[u8]) -> Result<(), Error> {
+    let mut packet = Vec::with_capacity(5 + body.len());
+    packet.extend_from_slice(&(1 + body.len() as u32).to_le_bytes());
+    packet.push(KIND_HANDSHAKE);
+    packet.extend_from_slice(body);
+    tcp.write_all(&packet)?;
+    Ok(())
+}
+
+/// Reads a flight of the key exchange whose body has `len` bytes. The length is checked before
+/// the read, so a peer that has proved nothing cannot size a buffer.
+fn read_flight<'a>(tcp: &mut TcpStream, buf: &'a mut Vec<u8>, len: usize) -> Result<&'a [u8], Error> {
+    read_tcp_packet_limited(tcp, buf, 1 + len)?;
+    match buf.split_first() {
+        Some((&KIND_HANDSHAKE, body)) if body.len() == len => Ok(body),
+        _ => Err(Error::Unexpected("expected a handshake flight")),
     }
 }
 
 // ---------------------------------------------------------------------------------------------
 // Host
 
-/// The host's listening socket.
+/// The host's listening socket and its key.
 pub struct HostListener {
     listener: TcpListener,
+    identity: Identity,
 }
 
 /// How the host wants to send media to a client.
@@ -269,43 +404,75 @@ pub enum MediaMode {
     Tcp,
 }
 
-/// A client that passed the version check and sent its capabilities. The host looks at them and
-/// accepts or rejects.
+/// A client that passed the version check and the key exchange and sent its capabilities. The
+/// host looks at them and accepts or rejects.
 pub struct Pending {
     tcp: TcpStream,
+    channels: Channels,
     pub peer: SocketAddr,
     pub version: u16,
     pub caps: ClientCaps,
+    /// The client's public key. The client proved that it holds the key, so the host may look it
+    /// up in its pairings. The host does that after this call: a client on this Mac needs no
+    /// pairing.
+    pub client_key: [u8; KEY_LEN],
 }
 
 impl HostListener {
-    pub fn bind(addr: impl ToSocketAddrs) -> Result<Self, Error> {
-        Ok(Self { listener: TcpListener::bind(addr)? })
+    /// Listens on `addr`. `identity` is the host's key: the client checks it against the key that
+    /// it paired with.
+    pub fn bind(addr: impl ToSocketAddrs, identity: Identity) -> Result<Self, Error> {
+        Ok(Self { listener: TcpListener::bind(addr)?, identity })
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, Error> {
         Ok(self.listener.local_addr()?)
     }
 
-    /// Waits for a client and runs the version exchange. A client that sends bad bytes, or speaks
-    /// no common version, gives an error and the caller calls `accept` again.
+    /// The host's public key
+    pub fn public_key(&self) -> [u8; KEY_LEN] {
+        self.identity.public_key()
+    }
+
+    /// Waits for a client and runs the version exchange and the key exchange. A client that sends
+    /// bad bytes, speaks no common version or cannot prove its key gives an error and the caller
+    /// calls `accept` again.
     pub fn accept(&self) -> Result<Pending, Error> {
         let (mut tcp, peer) = self.listener.accept()?;
         tcp.set_nodelay(true)?;
         tcp.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
         tcp.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
-        let mut preamble = [0u8; CLIENT_PREAMBLE_LEN];
-        tcp.read_exact(&mut preamble)?;
-        let theirs = parse_client_preamble(&preamble)?;
+        let mut client_pre = [0u8; CLIENT_PREAMBLE_LEN];
+        tcp.read_exact(&mut client_pre)?;
+        let theirs = parse_client_preamble(&client_pre)?;
         let version = VersionRange::OURS.common(theirs);
-        tcp.write_all(&host_preamble(version, VersionRange::OURS))?;
+        let host_pre = host_preamble(version, VersionRange::OURS);
+        tcp.write_all(&host_pre)?;
         let version = version.ok_or(Error::Version {
             ours: (VersionRange::OURS.min, VersionRange::OURS.max),
             theirs: (theirs.min, theirs.max),
         })?;
         let mut buf = Vec::new();
-        match read_control::<ClientMsg>(&mut tcp, &mut buf)? {
-            ClientMsg::Hello(caps) => Ok(Pending { tcp, peer, version, caps }),
+        // Flight 1: the client's fresh key. Flight 2: the host's fresh key, its key and its
+        // signature over both preambles and both fresh keys.
+        let client_fresh: [u8; KEY_LEN] = read_flight(&mut tcp, &mut buf, CLIENT_HELLO_LEN)?.try_into().expect("checked length");
+        let fresh = Ephemeral::new()?;
+        let host_key = self.identity.public_key();
+        let transcript = transcript_hash(&client_pre, &host_pre, &client_fresh, &fresh.public(), &host_key);
+        let hello = HostHello { ephemeral: fresh.public(), key: host_key, signature: sign_as_host(&self.identity, &transcript) };
+        write_flight(&mut tcp, &hello.to_bytes())?;
+        let mut channels = derive(Role::Host, &*fresh.agree(&client_fresh)?, &transcript);
+        // Flight 3, sealed: the client's key and its signature over the same transcript
+        read_tcp_packet_limited(&mut tcp, &mut buf, HANDSHAKE_PACKET_LIMIT)?;
+        let auth = match channels.tcp_rx.open(&mut buf)?.split_first() {
+            Some((&KIND_HANDSHAKE, body)) => ClientAuth::parse(body)?,
+            _ => return Err(Error::Unexpected("expected the client's key")),
+        };
+        if !verify_client(&auth.key, &transcript, &auth.signature) {
+            return Err(Error::Crypto("the client does not hold the key that it claims"));
+        }
+        match read_control::<ClientMsg>(&mut tcp, &mut channels.tcp_rx, &mut buf)? {
+            ClientMsg::Hello(caps) => Ok(Pending { tcp, channels, peer, version, caps, client_key: auth.key }),
             _ => Err(Error::Unexpected("the client's first message is not Hello")),
         }
     }
@@ -313,20 +480,7 @@ impl HostListener {
 
 impl Pending {
     pub fn reject(mut self, reason: RejectReason) {
-        write_control(&mut self.tcp, &HostMsg::Reject(reason)).ok();
-    }
-
-    /// Asks the client to prove that it holds the key of its Hello. It gives `true` for a valid
-    /// signature of a new random challenge. The host calls it before it looks at the key's
-    /// pairing, so that a client cannot claim the key of another client.
-    pub fn prove_key(&mut self) -> Result<bool, Error> {
-        let challenge = identity::random_bytes()?;
-        write_control(&mut self.tcp, &HostMsg::Challenge(challenge))?;
-        let mut buf = Vec::new();
-        match read_control::<ClientMsg>(&mut self.tcp, &mut buf)? {
-            ClientMsg::Proof(signature) => Ok(identity::verify(&self.caps.public_key, &challenge, &signature)),
-            _ => Err(Error::Unexpected("the client's answer to the challenge is not Proof")),
-        }
+        write_control(&mut self.tcp, &mut self.channels.tcp_tx, &HostMsg::Reject(reason)).ok();
     }
 
     /// Sends the welcome, waits until the media path works and returns the session.
@@ -336,8 +490,8 @@ impl Pending {
         let sender = FrameSender::new(shard_len)?;
         let udp = match mode {
             MediaMode::Udp => {
-                if shard_len + crate::media::HEADER_LEN > MTU {
-                    return Err(Error::TooLarge(shard_len + crate::media::HEADER_LEN));
+                if shard_len + crate::media::HEADER_LEN + OVERHEAD > MTU {
+                    return Err(Error::TooLarge(shard_len + crate::media::HEADER_LEN + OVERHEAD));
                 }
                 Some(udp_socket(SocketAddr::new(self.tcp.local_addr()?.ip(), 0))?)
             }
@@ -348,7 +502,7 @@ impl Pending {
             None => MediaPlan::Tcp,
         };
         let welcome = Welcome { session, version: self.version, stream: stream.clone(), media, shard_len: shard_len as u16 };
-        write_control(&mut self.tcp, &HostMsg::Welcome(welcome))?;
+        write_control(&mut self.tcp, &mut self.channels.tcp_tx, &HostMsg::Welcome(welcome))?;
         if let Some(udp) = &udp {
             // The client repeats its hello until the host answers, so a lost datagram costs 50 ms
             let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
@@ -356,8 +510,10 @@ impl Pending {
             loop {
                 match udp.recv_from(&mut buf) {
                     Ok((n, from)) => {
-                        let hello = match buf[..n].split_first() {
-                            Some((&KIND_DATAGRAM, body)) => decode::<ClientDatagram>(body).ok(),
+                        // Only a datagram that opens with the session's key can name the client's
+                        // address
+                        let hello = match self.channels.udp_rx.open(&mut buf[..n]).map(|content| content.split_first()) {
+                            Ok(Some((&KIND_DATAGRAM, body))) => decode::<ClientDatagram>(body).ok(),
                             _ => None,
                         };
                         if matches!(hello, Some(ClientDatagram::Hello { session: s }) if s == session) {
@@ -373,11 +529,12 @@ impl Pending {
                 }
             }
         }
-        write_control(&mut self.tcp, &HostMsg::MediaReady)?;
+        write_control(&mut self.tcp, &mut self.channels.tcp_tx, &HostMsg::MediaReady)?;
         Ok(HostLink {
-            duplex: Duplex::new(self.tcp, udp)?,
+            duplex: Duplex::new(self.tcp, udp, self.channels)?,
             sender: Mutex::new(sender),
             peer: self.peer,
+            client_key: self.client_key,
             session,
             version: self.version,
             stream,
@@ -391,6 +548,8 @@ pub struct HostLink {
     pub duplex: Duplex<HostSide>,
     sender: Mutex<FrameSender>,
     pub peer: SocketAddr,
+    /// The key that the client proved
+    pub client_key: [u8; KEY_LEN],
     pub session: u64,
     pub version: u16,
     pub stream: StreamParams,
@@ -402,7 +561,7 @@ impl HostLink {
     /// zero, because TCP loses nothing.
     pub fn send_unit(&self, meta: &FrameMeta, payload: &[u8], parity: &ParityController) -> Result<SendStats, Error> {
         let udp = self.duplex.has_udp();
-        self.sender.lock().unwrap().send_unit(meta, payload, |n| if udp { parity.parity_count(n) } else { 0 }, |wire| self.duplex.send_wire(wire))
+        self.sender.lock().unwrap().send_unit(meta, payload, |n| if udp { parity.parity_count(n) } else { 0 }, |packet| self.duplex.send_wire(packet))
     }
 }
 
@@ -414,33 +573,55 @@ pub struct ClientLink {
     pub duplex: Duplex<ClientSide>,
     pub welcome: Welcome,
     pub host: SocketAddr,
+    /// The host's key. The host signed the key exchange with it. The host accepted this client, so
+    /// a caller that has no key of this host yet may remember this one.
+    pub host_key: [u8; KEY_LEN],
 }
 
 impl ClientLink {
-    /// Connects to the host, agrees on a version, sends the capabilities and waits for the host's
-    /// choices and for the media path. The host may first ask for a proof of the key that the
-    /// capabilities carry. `identity` answers it. `timeout` bounds each step.
-    pub fn connect(host: SocketAddr, caps: &ClientCaps, identity: &Identity, timeout: Duration) -> Result<Self, Error> {
+    /// Connects to the host, agrees on a version, proves its key and checks the host's, sends the
+    /// capabilities and waits for the host's choices and for the media path. `expected_host` is
+    /// the key that the client paired with, if it has one: a host with another key fails with
+    /// [`Error::HostKeyChanged`] before the client says anything about itself. `timeout` bounds each step.
+    pub fn connect(
+        host: SocketAddr,
+        caps: &ClientCaps,
+        identity: &Identity,
+        expected_host: Option<[u8; KEY_LEN]>,
+        timeout: Duration,
+    ) -> Result<Self, Error> {
         let mut tcp = TcpStream::connect_timeout(&host, timeout)?;
         tcp.set_nodelay(true)?;
         tcp.set_read_timeout(Some(timeout))?;
         tcp.set_write_timeout(Some(timeout))?;
-        tcp.write_all(&client_preamble(VersionRange::OURS))?;
-        let mut preamble = [0u8; HOST_PREAMBLE_LEN];
-        tcp.read_exact(&mut preamble)?;
-        let (chosen, theirs) = parse_host_preamble(&preamble)?;
+        let client_pre = client_preamble(VersionRange::OURS);
+        tcp.write_all(&client_pre)?;
+        let mut host_pre = [0u8; HOST_PREAMBLE_LEN];
+        tcp.read_exact(&mut host_pre)?;
+        let (chosen, theirs) = parse_host_preamble(&host_pre)?;
         chosen.ok_or(Error::Version {
             ours: (VersionRange::OURS.min, VersionRange::OURS.max),
             theirs: (theirs.min, theirs.max),
         })?;
-        write_control(&mut tcp, &ClientMsg::Hello(caps.clone()))?;
         let mut buf = Vec::new();
-        let mut answer = read_control::<HostMsg>(&mut tcp, &mut buf)?;
-        if let HostMsg::Challenge(challenge) = answer {
-            write_control(&mut tcp, &ClientMsg::Proof(identity.sign(&challenge)))?;
-            answer = read_control::<HostMsg>(&mut tcp, &mut buf)?;
+        let fresh = Ephemeral::new()?;
+        write_flight(&mut tcp, &fresh.public())?;
+        let hello = HostHello::parse(read_flight(&mut tcp, &mut buf, HOST_HELLO_LEN)?)?;
+        let transcript = transcript_hash(&client_pre, &host_pre, &fresh.public(), &hello.ephemeral, &hello.key);
+        if !verify_host(&hello.key, &transcript, &hello.signature) {
+            return Err(Error::Crypto("the host's signature is not valid"));
         }
-        let welcome = match answer {
+        if expected_host.is_some_and(|expected| expected != hello.key) {
+            return Err(Error::HostKeyChanged);
+        }
+        let mut channels = derive(Role::Client, &*fresh.agree(&hello.ephemeral)?, &transcript);
+        let mut auth = PacketBuf::new();
+        let body = auth.begin(KIND_HANDSHAKE);
+        body.extend_from_slice(&identity.public_key());
+        body.extend_from_slice(&sign_as_client(identity, &transcript));
+        tcp.write_all(channels.tcp_tx.seal(&mut auth)?)?;
+        write_control(&mut tcp, &mut channels.tcp_tx, &ClientMsg::Hello(caps.clone()))?;
+        let welcome = match read_control::<HostMsg>(&mut tcp, &mut channels.tcp_rx, &mut buf)? {
             HostMsg::Welcome(w) => w,
             HostMsg::Reject(reason) => return Err(Error::Rejected(reason)),
             _ => return Err(Error::Unexpected("the host's first answer is not Welcome")),
@@ -458,19 +639,20 @@ impl ClientLink {
         // paces the repeats.
         let started = Instant::now();
         tcp.set_read_timeout(Some(Duration::from_millis(50)))?;
+        let mut out = PacketBuf::new();
         loop {
             if let Some(udp) = &udp {
-                let mut out = PacketBuf::new();
                 encode(&ClientDatagram::Hello { session: welcome.session }, out.begin(KIND_DATAGRAM))?;
-                udp.send(out.seal()?.packet).ok();
+                channels.udp_tx.seal(&mut out)?;
+                udp.send(out.datagram()).ok();
             }
-            match read_control::<HostMsg>(&mut tcp, &mut buf) {
+            match read_control::<HostMsg>(&mut tcp, &mut channels.tcp_rx, &mut buf) {
                 Ok(HostMsg::MediaReady) => break,
                 Ok(_) => return Err(Error::Unexpected("expected MediaReady")),
                 Err(Error::Timeout) if started.elapsed() < timeout => {}
                 Err(e) => return Err(e),
             }
         }
-        Ok(Self { duplex: Duplex::new(tcp, udp)?, welcome, host })
+        Ok(Self { duplex: Duplex::new(tcp, udp, channels)?, welcome, host, host_key: hello.key })
     }
 }

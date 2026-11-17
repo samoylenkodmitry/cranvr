@@ -629,7 +629,7 @@ mod tests {
 
     /// A host and a client on loopback with the media over TCP. The host's messages go to a channel.
     fn loopback() -> (ClientLink, mpsc::Receiver<Heard>) {
-        let listener = HostListener::bind("127.0.0.1:0").unwrap();
+        let listener = HostListener::bind("127.0.0.1:0", Identity::from_seed([4; 32])).unwrap();
         let addr = listener.local_addr().unwrap();
         let (heard, inbox) = mpsc::channel();
         thread::spawn(move || {
@@ -662,9 +662,8 @@ mod tests {
             decoders: 1,
             foveation: false,
             tcp_only: true,
-            public_key: identity.public_key(),
         };
-        (ClientLink::connect(addr, &caps, &identity, Duration::from_secs(10)).unwrap(), inbox)
+        (ClientLink::connect(addr, &caps, &identity, None, Duration::from_secs(10)).unwrap(), inbox)
     }
 
     enum Heard {

@@ -120,7 +120,8 @@ fn usage() -> ! {
          \n  --trust-all       accept any client on the network, ALVR or native (for tests)\
          \n  --pair CODE       with --protocol native: pair the headset that shows this code. The\
          \n                    cranvr client shows a code of six digits when the host does not know it.\
-         \n                    The host remembers the headset in paired-headsets.txt.\
+         \n                    The host remembers the headset in paired-headsets.txt. It has a key of its\
+         \n                    own in host-identity.txt: keep it, or the paired headsets refuse the host.\
          \n  --no-display-lock with --protocol native: render at the arrival of each pose, not at a\
          \n                    time that follows the headset's display (for comparison)\
          \n  --client-ip IP    connect to a client at this address; 127.0.0.1 with `adb forward` of\
@@ -333,6 +334,7 @@ fn native_config(
     }
     headset::native::Config {
         port: options.native_port,
+        identity: pairing::host_identity(config_dir),
         pairings: Arc::new(pairing::Pairings::load(config_dir, options.pair_code)),
         trust_all: options.trust_all,
         display_lock: options.display_lock,

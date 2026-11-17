@@ -7,6 +7,7 @@ use cranvr_proto::{
     fec::{parity_for, ParityController},
     media::{FrameReceiver, FrameSender, MediaHeader, DEFAULT_SHARD_LEN, HEADER_LEN},
     message::LossReport,
+    secure::OVERHEAD,
     MTU,
 };
 
@@ -29,10 +30,11 @@ fn push_all(receiver: &mut FrameReceiver, packets: &[Vec<u8>]) -> Vec<(u32, Vec<
 #[test]
 fn a_packet_fits_the_mtu() {
     let payload = Rng(1).bytes(10_000);
+    // The packets are not sealed here. Sealing adds the counter and the tag.
     for p in packets(&meta(0), &payload, 0.1) {
-        assert!(p.len() <= MTU, "{} bytes", p.len());
+        assert!(p.len() + OVERHEAD <= MTU, "{} bytes", p.len());
     }
-    assert_eq!(DEFAULT_SHARD_LEN + HEADER_LEN, MTU);
+    assert_eq!(DEFAULT_SHARD_LEN + HEADER_LEN + OVERHEAD, MTU);
 }
 
 #[test]
@@ -65,7 +67,8 @@ fn the_unit_length_is_a_multiple_of_the_shard_only_when_the_payload_makes_it() {
     let overhead = unit_len(&packets(&meta(0), &[0], 0.0)) - 1;
     let exact = packets(&meta(0), &vec![9; 4 * DEFAULT_SHARD_LEN - overhead], 0.0);
     assert_eq!(exact.len(), 4);
-    assert!(exact.iter().all(|p| p.len() == MTU));
+    // Sealing adds the counter and the tag, which fills the datagram
+    assert!(exact.iter().all(|p| p.len() + OVERHEAD == MTU));
 }
 
 #[test]
@@ -160,7 +163,7 @@ fn losing_a_share_of_packets_is_covered_by_a_larger_parity_share() {
             let mut m = meta(frame);
             m.key = false;
             let mut wire = Vec::new();
-            sender.send_unit(&m, &payload, |n| parity_for(n, share), |w| { wire.push(w.packet.to_vec()); Ok(()) }).unwrap();
+            sender.send_unit(&m, &payload, |n| parity_for(n, share), |packet| { wire.push(packet.content().to_vec()); Ok(()) }).unwrap();
             sent_frames += 1;
             for p in &wire {
                 if rng.unit() < 0.05 {
@@ -238,7 +241,7 @@ fn a_header_that_claims_a_huge_parity_is_refused_before_it_sizes_a_buffer() {
     let mut rng = Rng(5);
     let sent = packets(&meta(0), &rng.bytes(5_000), 0.1);
     let mut receiver = FrameReceiver::new();
-    // Bytes 14 and 15 hold the parity count. 65535 packets of 1376 bytes would be 90 MB.
+    // Bytes 14 and 15 hold the parity count. 65535 packets of 1352 bytes would be 88 MB.
     let mut hostile = sent[0].clone();
     hostile[14..16].copy_from_slice(&u16::MAX.to_le_bytes());
     assert!(receiver.push(&hostile, 0).is_err());

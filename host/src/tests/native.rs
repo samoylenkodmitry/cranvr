@@ -22,7 +22,6 @@ fn caps(name: &str) -> ClientCaps {
         decoders: 1,
         foveation: true,
         tcp_only: false,
-        public_key: identity().public_key(),
     }
 }
 
@@ -33,6 +32,7 @@ fn identity() -> cranvr_proto::identity::Identity {
 fn config(port: u16) -> Config {
     Config {
         port,
+        identity: cranvr_proto::identity::Identity::from_seed([7; 32]),
         pairings: Arc::new(crate::pairing::Pairings::load(&std::env::temp_dir().join(format!("cranvr-native-test-{port}")), None)),
         trust_all: false,
         display_lock: true,
@@ -168,7 +168,7 @@ fn the_display_grid_gives_the_next_refresh() {
 fn a_native_client_connects_and_the_host_serves_it() {
     let port = free_port();
     let (headset, mut events) = start(config(port)).unwrap();
-    let client = ClientLink::connect(([127, 0, 0, 1], port).into(), &caps("Test headset"), &identity(), Duration::from_secs(10)).unwrap();
+    let client = ClientLink::connect(([127, 0, 0, 1], port).into(), &caps("Test headset"), &identity(), None, Duration::from_secs(10)).unwrap();
     let client = Arc::new(client);
 
     let Event::Connected { stream: Some(stream), ip } = wait_for(&mut *events, |e| matches!(e, Event::Connected { .. })) else { unreachable!() };
@@ -392,14 +392,14 @@ fn a_second_headset_gets_busy_and_the_host_takes_the_next_one() {
     let port = free_port();
     let (_headset, mut events) = start(config(port)).unwrap();
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    let first = ClientLink::connect(addr, &caps("First"), &identity(), Duration::from_secs(10)).unwrap();
+    let first = ClientLink::connect(addr, &caps("First"), &identity(), None, Duration::from_secs(10)).unwrap();
     wait_for(&mut *events, |e| matches!(e, Event::Connected { .. }));
-    let second = ClientLink::connect(addr, &caps("Second"), &identity(), Duration::from_secs(10));
+    let second = ClientLink::connect(addr, &caps("Second"), &identity(), None, Duration::from_secs(10));
     assert!(matches!(second, Err(cranvr_proto::Error::Rejected(RejectReason::Busy))), "{:?}", second.err());
     first.duplex.close();
     wait_for(&mut *events, |e| matches!(e, Event::Disconnected));
     // The host takes the next client
-    let third = ClientLink::connect(addr, &caps("Third"), &identity(), Duration::from_secs(10)).unwrap();
+    let third = ClientLink::connect(addr, &caps("Third"), &identity(), None, Duration::from_secs(10)).unwrap();
     wait_for(&mut *events, |e| matches!(e, Event::Connected { .. }));
     third.duplex.close();
 }
