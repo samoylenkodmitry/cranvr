@@ -628,7 +628,7 @@ fn send_loop(
 
 /// The console's menu: the cranvr app's vr-menu.json, with the stream's state as "status". None
 /// without the app's file: the console then stays away.
-fn menu() -> Option<Vec<u8>> {
+pub(crate) fn menu() -> Option<Vec<u8>> {
     use serde_json::{json, Value};
     let bytes = std::fs::read(status::menu_file()?).ok()?;
     let Ok(Value::Object(mut menu)) = serde_json::from_slice::<Value>(&bytes) else { return None };

@@ -37,6 +37,12 @@ pub fn connect_on_launch() -> bool {
     launch_args().boolean("connect").unwrap_or(false)
 }
 
+/// Whether the launch asks for the console open and kept open, with `--console` or the extra
+/// `console`. A headset on a desk has no controller that could hold the menu button.
+pub fn console_on_launch() -> bool {
+    launch_args().boolean("console").unwrap_or(false)
+}
+
 /// How the media should travel, from the launch argument `media` (`udp` or `tcp`).
 pub fn media_choice() -> MediaChoice {
     match launch_args().string("media") {

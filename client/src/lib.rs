@@ -11,6 +11,8 @@
 
 mod audio;
 mod connection;
+mod console;
+mod console_panel;
 mod desktop;
 mod hub;
 mod place;

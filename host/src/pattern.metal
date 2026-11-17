@@ -38,6 +38,25 @@ static float2 foveated_to_view(float2 e, float4 fov_center, float4 fov_edge) {
     return select(select(center, right_edge, e > hi), left_edge, e < lo);
 }
 
+// How many full-view pixels one encoded pixel spans on each axis at `e` (a point of the encoded
+// eye as `foveated_to_view` takes it): 1 in the center, the edge ratio at the edges. An encoded
+// pixel stands for the average of that many view pixels, so a feature thinner than that must not
+// be sampled at one point: it would show in some pixels and miss others. The decoded and unwarped
+// picture then shows a thin line as a row of dots.
+static float2 compression(float2 e, float4 fov_center, float4 fov_edge) {
+    const float h = 1.0 / 128.0;
+    float2 lo = max(e - h, 0.0);
+    float2 hi = min(e + h, 1.0);
+    float2 slope = (foveated_to_view(hi, fov_center, fov_edge) - foveated_to_view(lo, fov_center, fov_edge)) / (hi - lo);
+    // The slope in the center, where one encoded pixel is one view pixel
+    float2 center = ((fov_edge.xy - 1.0) * fov_center.xy + 1.0) / fov_edge.xy;
+    return max(slope / center, 1.0);
+}
+
+// The most taps along one axis of an encoded pixel that `compose` takes. A bilinear tap averages
+// two texels, so three taps cover the edge ratio of 5 that ALVR's defaults give the vertical axis.
+constant uint MAX_TAPS = 3;
+
 static float3 qrot(float4 q, float3 v) {
     float3 t = 2.0 * cross(q.xyz, v);
     return v + q.w * t + cross(q.xyz, t);
@@ -47,10 +66,13 @@ static float4 qmul(float4 a, float4 b) {
     return float4(a.w * b.xyz + b.w * a.xyz + cross(a.xyz, b.xyz), a.w * b.w - dot(a.xyz, b.xyz));
 }
 
-// 1 on a grid line, 0 between lines
-static float grid(float v, float step, float width) {
+// 1 on a grid line, 0 between lines. `footprint` is the size of one output pixel in the unit of
+// `v`. A line that is thinner than the pixel spreads over the pixel and gets as much dimmer as it
+// gets wider, so it keeps its weight and shows as a continuous line.
+static float grid(float v, float step, float width, float footprint) {
     float d = abs(fract(v / step + 0.5) - 0.5) * step;
-    return 1.0 - smoothstep(0.0, width, d);
+    float half_width = max(width, 0.5 * footprint);
+    return width / half_width * (1.0 - smoothstep(0.0, half_width, d));
 }
 
 static float sphere(float3 o, float3 d, float3 c, float r) {
@@ -72,8 +94,12 @@ static float3 shade(float3 o, float3 d, constant Params &p, uint eye, float2 uv,
         float lon = atan2(d.x, -d.z) * 57.29578;
         float lat = asin(clamp(d.y, -1.0, 1.0)) * 57.29578;
         col = mix(float3(0.05, 0.07, 0.12), float3(0.25, 0.45, 0.8), saturate(d.y * 0.5 + 0.5));
-        col = mix(col, float3(0.8), 0.5 * max(grid(lon, 15.0, 0.25), grid(lat, 15.0, 0.25)));
-        col = mix(col, float3(1.0, 0.85, 0.4), 0.8 * max(grid(lon, 45.0, 0.5), grid(lat, 45.0, 0.5)));
+        // The angle of one pixel in degrees. Longitude lines cover more degrees of longitude the
+        // nearer they are to the poles: the pixel's size is that of its latitude.
+        float pixel = px * 57.29578;
+        float lon_pixel = pixel / max(sqrt(1.0 - d.y * d.y), 0.05);
+        col = mix(col, float3(0.8), 0.5 * max(grid(lon, 15.0, 0.25, lon_pixel), grid(lat, 15.0, 0.25, pixel)));
+        col = mix(col, float3(1.0, 0.85, 0.4), 0.8 * max(grid(lon, 45.0, 0.5, lon_pixel), grid(lat, 45.0, 0.5, pixel)));
     } else {
         // A dim room, so the screen stands out
         col = mix(float3(0.02, 0.02, 0.03), float3(0.07, 0.08, 0.1), saturate(d.y * 0.5 + 0.5));
@@ -88,7 +114,9 @@ static float3 shade(float3 o, float3 d, constant Params &p, uint eye, float2 uv,
             float3 h = o + t * d;
             float2 cell = floor(h.xz / 0.5);
             float3 floor_col = mix(float3(0.25), float3(0.6), fmod(abs(cell.x + cell.y), 2.0));
-            floor_col = mix(floor_col, float3(0.1, 0.8, 0.3), max(grid(h.x, 1.0, 0.01), grid(h.z, 1.0, 0.01)));
+            // One pixel covers this much of the floor, along the ray's long axis
+            float spot = min(t * px / max(abs(d.y), 0.05), 1.0);
+            floor_col = mix(floor_col, float3(0.1, 0.8, 0.3), max(grid(h.x, 1.0, 0.01, spot), grid(h.z, 1.0, 0.01, spot)));
             floor_col *= p.scene == 0 ? 1.0 : 0.3;
             col = mix(floor_col, col, saturate(t / 40.0));
         }
@@ -144,9 +172,13 @@ kernel void pattern(texture2d<float, access::write> luma [[texture(0)]],
         uint2 px = gid * 2 + uint2(k & 1, k >> 1);
         uint eye = px.x >= p.eye_w ? 1 : 0;
         float2 uv = float2((float(px.x - eye * p.eye_w) + 0.5) / float(p.eye_w), (float(px.y) + 0.5) / float(p.eye_h));
+        // The size of this pixel in the full view, as a multiple of the center's pixel
+        float squeeze = 1.0;
         if (p.foveated != 0) {
             // the right eye is stored mirrored, so its outer edge is at the frame's right side
             float2 e = float2(eye == 1 ? 1.0 - uv.x : uv.x, uv.y) / p.fov_edge.zw;
+            float2 c = compression(e, p.fov_center, p.fov_edge);
+            squeeze = max(c.x, c.y);
             float2 v = foveated_to_view(e, p.fov_center, p.fov_edge);
             uv = float2(eye == 1 ? 1.0 - v.x : v.x, v.y);
         }
@@ -154,7 +186,9 @@ kernel void pattern(texture2d<float, access::write> luma [[texture(0)]],
         float3 ray_eye = normalize(float3(mix(f.x, f.y, uv.x), mix(f.z, f.w, uv.y), -1.0));
         float3 ray = normalize(qrot(qmul(p.head_q, p.eye_q[eye]), ray_eye));
         float3 origin = p.head_p.xyz + qrot(p.head_q, p.eye_p[eye].xyz);
-        float3 rgb = saturate(shade(origin, ray, p, eye, uv, (f.y - f.x) / float(p.eye_w), desk));
+        // The scene has no texels to average. It filters its thin features by the pixel's size.
+        float pixel = (f.y - f.x) / float(p.eye_w);
+        float3 rgb = saturate(shade(origin, ray, p, eye, uv, pixel * squeeze, desk));
         float y = dot(rgb, float3(0.2126, 0.7152, 0.0722));
         luma.write(float4(p.full_range != 0 ? y : (16.0 + 219.0 * y) / 255.0), px);
         sum += rgb;
@@ -181,6 +215,27 @@ struct ComposeParams {
     uint full_range;
 };
 
+// One tap of `compose`: the game's color at the point of the full view that the encoded eye
+// position `pe` shows (in pixels of the encoded eye, as a fraction of a pixel after its corner).
+static float3 compose_tap(float2 pe, uint eye, constant ComposeParams &p, texture2d<float, access::sample> left,
+                          texture2d<float, access::sample> right, sampler s) {
+    float2 uv = pe / float2(p.eye_w, p.eye_h);
+    if (p.foveated != 0) {
+        float2 e = float2(eye == 1 ? 1.0 - uv.x : uv.x, uv.y) / p.fov_edge.zw;
+        float2 v = foveated_to_view(e, p.fov_center, p.fov_edge);
+        uv = float2(eye == 1 ? 1.0 - v.x : v.x, v.y);
+    }
+    float4 f = p.fov[eye];
+    float2 t = float2(mix(f.x, f.y, uv.x), mix(f.z, f.w, uv.y));
+    float4 g = p.src_fov[eye];
+    float2 src = float2((t.x - g.x) / (g.y - g.x), (g.z - t.y) / (g.z - g.w));
+    float4 r = p.src_rect[eye];
+    float2 tex = r.xy + src * r.zw;
+    // the game's image already holds display values (sRGB swapchains read as plain unorm)
+    float3 rgb = eye == 0 ? left.sample(s, tex, level(0)).rgb : right.sample(s, tex, level(0)).rgb;
+    return any(src < 0.0) || any(src > 1.0) ? float3(0.0) : rgb;
+}
+
 kernel void compose(texture2d<float, access::write> luma [[texture(0)]],
                     texture2d<float, access::write> chroma [[texture(1)]],
                     texture2d<float, access::sample> left [[texture(2)]],
@@ -196,23 +251,24 @@ kernel void compose(texture2d<float, access::write> luma [[texture(0)]],
     for (uint k = 0; k < 4; k++) {
         uint2 px = gid * 2 + uint2(k & 1, k >> 1);
         uint eye = px.x >= p.eye_w ? 1 : 0;
-        float2 uv = float2((float(px.x - eye * p.eye_w) + 0.5) / float(p.eye_w), (float(px.y) + 0.5) / float(p.eye_h));
+        float2 pe = float2(float(px.x - eye * p.eye_w), float(px.y));
+        // An edge pixel stands for several pixels of the game's image. Averaging taps over the
+        // pixel, laid out in the encoded picture, keeps a thin line that the compression squeezes
+        // below one pixel. One tap would show the line in some pixels and miss it in others, and
+        // the headset would unwarp that into a row of dots.
+        uint2 taps = uint2(1, 1);
         if (p.foveated != 0) {
+            float2 uv = (pe + 0.5) / float2(p.eye_w, p.eye_h);
             float2 e = float2(eye == 1 ? 1.0 - uv.x : uv.x, uv.y) / p.fov_edge.zw;
-            float2 v = foveated_to_view(e, p.fov_center, p.fov_edge);
-            uv = float2(eye == 1 ? 1.0 - v.x : v.x, v.y);
+            taps = uint2(clamp(ceil(0.5 * compression(e, p.fov_center, p.fov_edge)), 1.0, float(MAX_TAPS)));
         }
-        float4 f = p.fov[eye];
-        float2 t = float2(mix(f.x, f.y, uv.x), mix(f.z, f.w, uv.y));
-        float4 g = p.src_fov[eye];
-        float2 src = float2((t.x - g.x) / (g.y - g.x), (g.z - t.y) / (g.z - g.w));
-        float4 r = p.src_rect[eye];
-        float2 tex = r.xy + src * r.zw;
-        // the game's image already holds display values (sRGB swapchains read as plain unorm)
-        float3 rgb = eye == 0 ? left.sample(s, tex, level(0)).rgb : right.sample(s, tex, level(0)).rgb;
-        if (any(src < 0.0) || any(src > 1.0)) {
-            rgb = float3(0.0);
+        float3 rgb = float3(0.0);
+        for (uint ty = 0; ty < taps.y; ty++) {
+            for (uint tx = 0; tx < taps.x; tx++) {
+                rgb += compose_tap(pe + (float2(tx, ty) + 0.5) / float2(taps), eye, p, left, right, s);
+            }
         }
+        rgb /= float(taps.x * taps.y);
         float y = dot(rgb, float3(0.2126, 0.7152, 0.0722));
         luma.write(float4(p.full_range != 0 ? y : (16.0 + 219.0 * y) / 255.0), px);
         sum += rgb;

@@ -201,6 +201,11 @@ pub enum ClientMsg {
     /// stream. The host answers with [`HostMsg::Desktop`]. The video is the stream
     /// [`DESKTOP_STREAM`]. A host that does not know the message skips it.
     Desktop(DesktopWish),
+    /// A press on a button of the console, as the JSON object that the old client's console sent
+    /// (`{"action": "play", "game": "Beat Saber"}`, `{"action": "stop"}`, `{"action": "set",
+    /// "fps": 90}`). The host hands it to the cranvr app as a `vr_request` status line. A host
+    /// that does not know the message skips it.
+    Console(String),
 }
 
 /// A change of the origin of the poses that the client sends. Every pose with a display time at or
@@ -237,6 +242,11 @@ pub enum HostMsg {
     /// size or the visibility changes. The decoder's parameter sets follow in a
     /// [`HostMsg::DecoderConfig`] of the stream [`DESKTOP_STREAM`].
     Desktop(Option<DesktopParams>),
+    /// The console's menu as a JSON object: the games and the settings that the cranvr app
+    /// offers (its `vr-menu.json`) and the stream's state as `status`. The host sends it when the
+    /// client connects and again when it changes, at most once a second. A client that does not
+    /// know the message skips it.
+    Menu(String),
 }
 
 /// Datagram messages from the client to the host.

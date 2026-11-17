@@ -174,6 +174,13 @@ impl Connection {
         Self { stop, link }
     }
 
+    /// Sends a console request to the host. It goes nowhere while the handshake runs.
+    pub fn send_console(&self, request: String) {
+        if let Some(link) = self.link.lock().unwrap().as_ref() {
+            link.duplex.send_control(&ClientMsg::Console(request)).ok();
+        }
+    }
+
     /// Tells the host goodbye and ends the threads. A handshake that still runs ends within its
     /// timeout.
     pub fn stop(&self) {
@@ -516,6 +523,7 @@ fn read_loop(s: &Shared<'_>, units: mpsc::Sender<Received>, udp: bool) -> Error 
             s.set_stream(&stream);
             s.epoch.fetch_add(1, Ordering::Relaxed);
         }
+        Incoming::Control(HostMsg::Menu(text)) => s.hub.set_menu(s.id, &text),
         Incoming::Control(HostMsg::Bye) => {
             s.stop.store(true, Ordering::Relaxed);
             s.link.duplex.close();

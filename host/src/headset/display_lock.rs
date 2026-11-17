@@ -119,6 +119,9 @@ struct InFlight {
     sample: Nanos,
     target: Nanos,
     start: Nanos,
+    /// A plan started the frame. A frame without one (a game's frame) says nothing about the
+    /// need of a planned frame or about the margin: it starts when the game finishes it.
+    planned: bool,
 }
 
 pub struct DisplayLock {
@@ -257,6 +260,23 @@ impl DisplayLock {
         Some(Plan { start, target })
     }
 
+    /// The target for a frame that no plan started, such as a game's frame, which is ready for the
+    /// headset's take at `ready` on the headset's clock (its arrival and decode included, the lead
+    /// not). The target is the first point of the grid at or after `ready` plus the lead, and after
+    /// the target of the frame before it, but no more than one point past the first. Frames that
+    /// follow each other within one period then take successive points, and the headset's queue
+    /// shows each of them. Two frames for one point would leave the first one out, and the point
+    /// after it would show the picture before. `None` while the grid is unknown.
+    pub fn point_for(&mut self, ready: Nanos) -> Option<Nanos> {
+        let origin = self.origin?;
+        let period = self.period;
+        let earliest = grid_at_or_after(origin, period, ready + self.lead() as Nanos);
+        let next = self.last_target + period as Nanos;
+        let target = if self.last_target != 0 && next > earliest { next.min(earliest + period as Nanos) } else { earliest };
+        self.last_target = self.last_target.max(target);
+        Some(target)
+    }
+
     /// The frame loop took the plan with this target, `late` nanoseconds after the planned start.
     /// The next plan takes a later point.
     pub fn commit(&mut self, target: Nanos, late: Nanos) {
@@ -279,7 +299,16 @@ impl DisplayLock {
         if self.in_flight.len() >= IN_FLIGHT {
             self.in_flight.pop_front();
         }
-        self.in_flight.push_back(InFlight { sample, target, start });
+        self.in_flight.push_back(InFlight { sample, target, start, planned: true });
+    }
+
+    /// Notes a frame that no plan started, with the target that the host gave it. The headset's
+    /// report of it still teaches the lead and counts in the stats.
+    pub fn sent_unplanned(&mut self, sample: Nanos, target: Nanos) {
+        if self.in_flight.len() >= IN_FLIGHT {
+            self.in_flight.pop_front();
+        }
+        self.in_flight.push_back(InFlight { sample, target, start: 0, planned: false });
     }
 
     /// Notes what the headset did with a frame.
@@ -288,7 +317,9 @@ impl DisplayLock {
         let older = at;
         self.in_flight.drain(..older);
         let frame = self.in_flight.pop_front().expect("the frame is at the front now");
-        push(&mut self.need, report.decode_end.saturating_sub(frame.start) as f64);
+        if frame.planned {
+            push(&mut self.need, report.decode_end.saturating_sub(frame.start) as f64);
+        }
         push(&mut self.lead, report.display_time.saturating_sub(report.picked) as f64);
         let points = ((report.display_time as f64 - frame.target as f64) / self.period).round();
         // Frames that were sent before this one and have no report were replaced, or they never
@@ -296,21 +327,28 @@ impl DisplayLock {
         // own points. The newer frame took their place. If this frame showed early, it was
         // ready at the pick of an older frame's point and replaced that frame. The fault is then
         // this frame's earliness.
+        let adapt = frame.planned;
         for _ in 0..older {
             self.stats.replaced += 1;
-            if points >= 0.0 {
+            if points >= 0.0 && adapt {
                 self.miss();
             }
         }
         if points == 0.0 {
             self.stats.on_time += 1;
-            self.margin_ms = (self.margin_ms - HIT_STEP_MS).max(MIN_MARGIN_MS);
+            if adapt {
+                self.margin_ms = (self.margin_ms - HIT_STEP_MS).max(MIN_MARGIN_MS);
+            }
         } else if points > 0.0 {
             self.stats.late += 1;
-            self.miss();
+            if adapt {
+                self.miss();
+            }
         } else {
             self.stats.early += 1;
-            self.margin_ms = (self.margin_ms - EARLY_STEP_MS).max(MIN_MARGIN_MS);
+            if adapt {
+                self.margin_ms = (self.margin_ms - EARLY_STEP_MS).max(MIN_MARGIN_MS);
+            }
         }
     }
 

@@ -62,6 +62,10 @@ pub enum Event {
     /// The headset's origin moved, because the user recentered. The poses that follow are relative
     /// to the new origin. Only the native protocol reports it.
     Recenter,
+    /// A press on a button of the headset's console, as a JSON text (see `status::console_request`).
+    /// Only the native protocol reports it. With ALVR the console's request travels through the
+    /// desktop layer.
+    Console(String),
     /// The link wants the host to stop
     Stop,
     /// An event that the host has no use for
@@ -139,6 +143,13 @@ pub trait Headset: Send + Sync {
         false
     }
 
+    /// Whether the link takes a second frame for the same tracking sample, which the frame loop
+    /// numbers with the sample's time plus a few nanoseconds. A link whose client names frames
+    /// by the samples that it sent cannot: ALVR's client sees a timestamp that it never sent.
+    fn repeats_samples(&self) -> bool {
+        false
+    }
+
     /// The parameter sets of the HEVC stream (VPS, SPS and PPS in Annex B).
     fn set_decoder_config(&self, config: Vec<u8>);
 
@@ -152,6 +163,10 @@ pub trait Headset: Send + Sync {
     fn bitrate_bps(&self) -> Option<u64>;
 
     fn send_haptics(&self, haptic: Haptic);
+
+    /// Sends the console's menu as a JSON text, when the link has a console. With ALVR the
+    /// desktop layer sends the menu to the Quest app instead.
+    fn send_menu(&self, _menu: &str) {}
 
     /// The averages since the last call: the time of each stage from the pose to the display, and
     /// the link's own counters. `None` when no report came.

@@ -461,7 +461,10 @@ fn main() {
 
     let mut watch = network::StreamWatch::default();
     let mut layer_stop = Arc::new(AtomicBool::new(false));
+    // The console in the headset gets the menu when it connects and when it changes
+    let mut console = ConsoleMenu::default();
     loop {
+        console.update(&*headset);
         let event = match events.next(Duration::from_millis(50)) {
             Ok(event) => event,
             Err(RecvTimeoutError::Timeout) => continue,
@@ -470,6 +473,7 @@ fn main() {
         match event {
             Event::Connected { stream: negotiated, ip: client_ip } => {
                 watch.connected();
+                console.connected();
                 layer_stop.store(true, Ordering::Relaxed);
                 layer_stop = Arc::new(AtomicBool::new(false));
                 let display = shared.desktop_display.load(Ordering::Relaxed);
@@ -499,6 +503,7 @@ fn main() {
             }
             Event::Disconnected => {
                 info!("Headset disconnected");
+                console.disconnected();
                 layer_stop.store(true, Ordering::Relaxed);
                 if let Some(display) = virtual_display.as_mut().filter(|d| d.is_main()) {
                     match display.restore() {
@@ -583,6 +588,12 @@ fn main() {
                     link.button(button.path_id, button.scalar, value);
                 }
             }
+            Event::Console(request) => {
+                info!("The console asks for {request}");
+                if !status::console_request(&request) {
+                    warn!("A console request that is no JSON object");
+                }
+            }
             Event::RequestIdr => shared.force_idr.store(true, Ordering::Relaxed),
             // The headset's new origin makes the old screen place wrong: put the screen in front
             // of the user again, as a click of the right thumbstick does
@@ -592,6 +603,41 @@ fn main() {
                 break;
             }
             Event::Other => {}
+        }
+    }
+}
+
+/// How often the host looks for a new menu for the headset's console
+const MENU_EVERY: Duration = Duration::from_secs(1);
+
+/// Sends the console's menu to a connected headset, when it differs from the last one that went out.
+#[derive(Default)]
+struct ConsoleMenu {
+    connected: bool,
+    last: Option<String>,
+    checked: Option<Instant>,
+}
+
+impl ConsoleMenu {
+    fn connected(&mut self) {
+        self.connected = true;
+        self.last = None;
+        self.checked = None;
+    }
+
+    fn disconnected(&mut self) {
+        self.connected = false;
+    }
+
+    fn update(&mut self, headset: &dyn Headset) {
+        if !self.connected || self.checked.is_some_and(|at| at.elapsed() < MENU_EVERY) {
+            return;
+        }
+        self.checked = Some(Instant::now());
+        let Some(menu) = desktop_layer::menu().and_then(|bytes| String::from_utf8(bytes).ok()) else { return };
+        if self.last.as_deref() != Some(&menu) {
+            headset.send_menu(&menu);
+            self.last = Some(menu);
         }
     }
 }
@@ -997,13 +1043,17 @@ fn frame_loop(
                 thread::sleep(Duration::from_micros(500));
             }
         };
-        // The client shows each frame for its own tracking sample, so a sample is sent once. A
-        // planned frame is the exception: its start does not wait for a pose. When no newer pose
-        // came, it renders again for the same sample, with the pose moved on to the new target.
+        // The client shows each frame for its own tracking sample, so a sample is sent once. Two
+        // frames are the exception. A planned frame's start does not wait for a pose: when no
+        // newer pose came, it renders again for the same sample, with the pose moved on to the
+        // new target. A game's frame comes when the game finishes it. A game that runs near the
+        // rate of the poses finishes two frames for one pose now and then, and the second has new
+        // content. Dropping it wasted a frame (a fifth of the game's frames in a test with Beat
+        // Saber on a loaded Mac) that the headset would show one point later.
         // The frame needs a number of its own, because the notes, the encoder and the headset's
         // reports find a frame by it. The number is the sample's time plus the count of repeats.
         // The pose lookup takes the sample for the nearest one.
-        let repeat = planned.is_some() && sample != 0 && sample == last_sample && repeats < MAX_REPEATS;
+        let repeat = (planned.is_some() || (game_frame.is_some() && headset.repeats_samples())) && sample != 0 && sample == last_sample && repeats < MAX_REPEATS;
         if sample == 0 || (sample == last_sample && !repeat) {
             give_back(&game_frame);
             no_sample += 1;
@@ -1216,6 +1266,13 @@ fn frame_loop(
                 warn!("Game audio: {unreadable} buffers in a format the host cannot read");
             }
             let poses = pose_gaps::take(secs);
+            let input = link.take_counts();
+            if game.connected || input.buttons > 0 || input.haptics > 0 {
+                info!(
+                    "Game input: {} left and {} right controller poses (tracked mask {:#b}), {} button and axis values, {} haptic pulses from the game",
+                    input.poses[0], input.poses[1], input.mask, input.buttons, input.haptics
+                );
+            }
             let layer_fps = shared.layer.frames.swap(0, Ordering::Relaxed) as f64 / secs;
             status::emit(json!({
                 "type": "stats",

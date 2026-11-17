@@ -1241,6 +1241,7 @@ dependencies = [
  "cranvr-proto",
  "env_logger",
  "log",
+ "serde_json",
 ]
 
 [[package]]
