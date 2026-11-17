@@ -42,6 +42,9 @@ static SEQUENCE: AtomicU32 = AtomicU32::new(0);
 static DATAGRAMS: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
 static FRAMES: AtomicU64 = AtomicU64::new(0);
+/// The size in stereo frames of the capture's last buffer, and the largest since the last log line
+static LAST_BUFFER_FRAMES: AtomicU64 = AtomicU64::new(0);
+static BUFFERS: AtomicU64 = AtomicU64::new(0);
 /// Buffers that arrived while no client was there to play them
 static DISCARDED_FRAMES: AtomicU64 = AtomicU64::new(0);
 
@@ -74,6 +77,8 @@ pub fn send(pcm: &[u8]) {
     };
     let arrived = now_ns();
     let total_frames = pcm.len() / BYTES_PER_FRAME;
+    LAST_BUFFER_FRAMES.store(total_frames as u64, Ordering::Relaxed);
+    BUFFERS.fetch_add(1, Ordering::Relaxed);
     let mut first_frame = 0;
     for chunk in pcm.chunks(FRAMES_PER_DATAGRAM * BYTES_PER_FRAME) {
         let frames = chunk.len() / BYTES_PER_FRAME;
@@ -97,6 +102,7 @@ pub fn send(pcm: &[u8]) {
 
 fn log_loop(session: &Arc<Session>) {
     let mut seen = (0u64, 0u64, 0u64);
+    let mut seen_buffers = 0u64;
     let mut at = std::time::Instant::now();
     loop {
         thread::sleep(LOG_EVERY);
@@ -105,12 +111,17 @@ fn log_loop(session: &Arc<Session>) {
         }
         let now = (DATAGRAMS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed), FRAMES.load(Ordering::Relaxed));
         let seconds = at.elapsed().as_secs_f64();
+        let buffers = BUFFERS.load(Ordering::Relaxed);
         info!(
-            "Native audio: {:.2} s of sound a second in {:.0} datagrams a second, {:.2} Mbps of PCM",
+            "Native audio: {:.2} s of sound a second in {:.0} datagrams a second, {:.2} Mbps of PCM; the capture hands over {:.1} buffers a second of {} frames ({:.1} ms)",
             (now.2 - seen.2) as f64 / SAMPLE_RATE / seconds,
             (now.0 - seen.0) as f64 / seconds,
-            (now.1 - seen.1) as f64 * 8.0 / seconds / 1e6
+            (now.1 - seen.1) as f64 * 8.0 / seconds / 1e6,
+            (buffers - seen_buffers) as f64 / seconds,
+            LAST_BUFFER_FRAMES.load(Ordering::Relaxed),
+            LAST_BUFFER_FRAMES.load(Ordering::Relaxed) as f64 * 1000.0 / SAMPLE_RATE
         );
+        seen_buffers = buffers;
         (seen, at) = (now, std::time::Instant::now());
     }
 }
@@ -120,3 +131,7 @@ fn log_loop(session: &Arc<Session>) {
 pub fn discarded_seconds() -> f64 {
     DISCARDED_FRAMES.load(Ordering::Relaxed) as f64 / SAMPLE_RATE
 }
+
+#[cfg(test)]
+#[path = "../../tests/native_audio.rs"]
+mod tests;

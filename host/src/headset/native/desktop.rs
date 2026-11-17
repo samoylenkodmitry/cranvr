@@ -178,10 +178,12 @@ fn flip_pictures() -> bool {
     std::env::var("CRANVR_DESKTOP_FLIP").is_ok_and(|v| v == "1")
 }
 
-/// The cursor goes into the pictures: `CRANVR_DESKTOP_CURSOR_IN_VIDEO=1`. The client draws no cursor
-/// of its own then, and the cursor is as late as the pictures are.
+/// The cursor goes into the pictures unless `CRANVR_DESKTOP_CURSOR_IN_VIDEO=0`. The client then
+/// draws no cursor of its own, and the cursor is as late as the pictures are. A panel in front of
+/// the client's surface panel is hidden under the surface today (Cranpose draws surfaces after the
+/// panels), so a cursor that the client draws cannot show over the desktop.
 fn cursor_in_video() -> bool {
-    std::env::var("CRANVR_DESKTOP_CURSOR_IN_VIDEO").is_ok_and(|v| v == "1")
+    !matches!(std::env::var("CRANVR_DESKTOP_CURSOR_IN_VIDEO").as_deref(), Ok("0"))
 }
 
 impl Running {
@@ -216,6 +218,7 @@ impl Running {
             full_range: true,
             flipped: flipper.is_some(),
             visible: true,
+            cursor_in_video: cursor_in_video(),
         };
         Ok(Self { capture, encoder, encoded, params, wish, flipper, last_seq: 0, index: 0, key: true, config: None })
     }

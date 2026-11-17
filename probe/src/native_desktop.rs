@@ -101,8 +101,8 @@ impl DesktopProbe {
             HostMsg::Desktop(params) => {
                 match params {
                     Some(p) => println!(
-                        "probe: the host runs the desktop stream: {}x{} pixels, {}x{} points, up to {} a second, {} Mbps, visible {}, mirrored {}",
-                        p.size[0], p.size[1], p.points[0], p.points[1], p.max_fps, p.bitrate_bps / 1_000_000, p.visible, p.flipped
+                        "probe: the host runs the desktop stream: {}x{} pixels, {}x{} points, up to {} a second, {} Mbps, visible {}, mirrored {}, cursor in the pictures {}",
+                        p.size[0], p.size[1], p.points[0], p.points[1], p.max_fps, p.bitrate_bps / 1_000_000, p.visible, p.flipped, p.cursor_in_video
                     ),
                     None => println!("probe: the host has no desktop for this client"),
                 }

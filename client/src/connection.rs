@@ -449,7 +449,9 @@ fn session(hub: &'static Hub, id: u64, link: &ClientLink, in_headset: bool, hell
     let (units_tx, units_rx) = mpsc::channel::<Received>();
     // The desktop panel and the sound have their own state (desktop.rs, audio.rs)
     let desktop_units = crate::desktop::desktop().session_start(in_headset);
-    if let Some(format) = stream.audio {
+    // Only a headset plays the sound. A flat window on the Mac that runs the host would play what
+    // the host captures, and the host would capture it again: an echo that grows.
+    if let (Some(format), true) = (stream.audio, in_headset) {
         crate::audio::open(format);
     }
     let reason = thread::scope(|scope| {

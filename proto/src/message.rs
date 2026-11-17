@@ -445,6 +445,10 @@ pub struct DesktopParams {
     /// `false` while the host hides the desktop, as while a game runs. The host sends no pictures
     /// then.
     pub visible: bool,
+    /// The Mac's cursor is part of the pictures. The client then draws none of its own. A client's
+    /// panel cannot show a cursor over a surface panel today: the compositor draws surfaces over
+    /// panels.
+    pub cursor_in_video: bool,
 }
 
 /// Where a controller points on the desktop panel, as the client measures it. The client sends it

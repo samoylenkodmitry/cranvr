@@ -113,7 +113,8 @@ fn usage() -> ! {
         "usage: cranvr-host [--protocol native|alvr, default alvr] [--native-port PORT] [--fps 72|80|90|120, default 120] [--eye-width PIXELS] [--mbps N] [--trust HOSTNAME]... [--trust-all] [--pair CODE] [--no-display-lock] [--client-ip IP]... [--tcp] [--no-foveation] [--buffering-frames N] [--game-scale F] [--decoder-low-latency] [--strict-rate-control] [--no-game-audio] [--desktop] [--desktop-fps N] [--virtual-display WxH] [--vr-main-display] [--pointer-pitch DEG] [--screen-in-view] [--no-desktop-layer] [--config-dir DIR] [--status]\n\
          \n  --protocol P      how the headset's app talks to the host: alvr (the stock ALVR client,\
          \n                    the default) or native (cranvr's own protocol and client). The\
-         \n                    native mode has no game sound and no desktop layer yet.\
+         \n                    native mode sends the Mac's sound as PCM and, with --desktop, the\
+         \n                    desktop as a second video stream for the client's desktop panel.\
          \n  --native-port N   with --protocol native: the TCP port to listen on (default 9950)\
          \n  --trust HOSTNAME  accept this ALVR client (the hostname shows in the client's lobby)\
          \n  --trust-all       accept any client on the network, ALVR or native (for tests)\
@@ -149,7 +150,10 @@ fn usage() -> ! {
          \n  --screen-in-view  put the screen where the headset looks, tilt included: for tests with a\
          \n                    headset that lies on a desk\
          \n  --no-desktop-layer keep the desktop in the eye stream, also for cranvr's Quest app, which\
-         \n                    otherwise shows it as a sharper compositor layer\
+         \n                    otherwise shows it as a sharper compositor layer. With --protocol native\
+         \n                    it stops the desktop panel.\
+         \n\nEnvironment: CRANVR_POINTER_DRY_RUN=1 logs the mouse events that a controller would make\
+         \nand posts none (for tests with a controller on a desk).\
          \n  --status          print status lines (@cranvr JSON) on stdout, for the cranvr app\
          \n\nGames: the host writes runtime-control.txt into the config dir. Start the game under Wine\
          \nwith BASALT_CONTROL set to that file's Windows path (scripts/run-game.sh does this)."

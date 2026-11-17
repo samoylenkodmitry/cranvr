@@ -22,12 +22,12 @@
 //! The decoder lives in a mutex because the composition thread must drop it before the surface's
 //! end callback returns, while the decode thread feeds it.
 
-use crate::place::{Engine, Frame, Hand, Place, PointerNow};
+use crate::place::{aim_at, Engine, Frame, Hand, Place, PointerNow};
 use cranpose::{
     launch_args, preferences, prelude::*, AccessUnit, DecodedFrames, DecoderConfig, DecoderError, DecoderOutput, ExternalSurface,
     VideoCodec, VideoDecoder,
 };
-use cranpose_xr::{Controller, SpatialExternalSurface, SpatialFrameEffect, SpatialPanel, StereoMode, SubspaceModifier, XrFrame};
+use cranpose_xr::{Controller, Pose, SpatialExternalSurface, SpatialFrameEffect, SpatialPanel, StereoMode, XrFrame};
 use cranvr_proto::{
     clock::now_ns,
     link::ClientLink,
@@ -36,10 +36,10 @@ use cranvr_proto::{
     wire::Codec,
 };
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     rc::Rc,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc::{self, RecvTimeoutError, Sender},
         Condvar, Mutex, OnceLock,
     },
@@ -47,6 +47,12 @@ use std::{
 };
 
 const PLACE_KEY: &str = "desktop_place";
+/// How often the headset's frame effect ran and how often the cursor panel composed since the start,
+/// for the log
+static EFFECT_FRAMES: AtomicU64 = AtomicU64::new(0);
+static CURSOR_COMPOSITIONS: AtomicU64 = AtomicU64::new(0);
+/// How long the decoder waits for a free input buffer before it refuses a picture
+const INPUT_WAIT: Duration = Duration::from_millis(30);
 /// What the client asks for. The Quest 3's hardware decoder takes 3840 by 2160 at 60 pictures a
 /// second (the old Quest app ran it).
 const WISH_WIDTH: u32 = 3840;
@@ -57,8 +63,6 @@ const KEY_REQUEST_GAP: Duration = Duration::from_millis(250);
 /// How often the panel looks at the link's state, and how often the decode thread logs
 const POLL: Duration = Duration::from_millis(100);
 const LOG_EVERY: Duration = Duration::from_secs(2);
-/// The panel's width in dp while the headset makes its surface, so the surface's size is the picture's
-const CREATION_WIDTH_DP: f32 = 2560.0;
 /// The cursor: a ring that is lifted this far off the surface, in meters, and its diameter in dp
 const CURSOR_LIFT: f32 = 0.004;
 const CURSOR_SIZE: f32 = 26.0;
@@ -81,8 +85,10 @@ struct Counts {
     refused: u64,
     key_requests: u64,
     pointers_sent: u64,
-    cursors: u64,
 }
+
+/// Cursor datagrams received since the start
+static CURSOR_PACKETS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 struct Inner {
@@ -100,7 +106,6 @@ struct Inner {
     waiting_key: bool,
     last_pts_us: u64,
     counts: Counts,
-    cursor: Option<Cursor>,
     decoder_error: Option<String>,
 }
 
@@ -114,7 +119,21 @@ struct Uplink {
     frame: u32,
 }
 
+/// What the headset's frame loop and the composition read. They must never wait for the decoder,
+/// which holds `Inner` while it takes a picture, so these live apart from it.
+struct Quick {
+    /// The host offers the desktop and shows it
+    visible: AtomicBool,
+    /// The picture's width over its height, as f32 bits
+    aspect: AtomicU32,
+    cursor_in_video: AtomicBool,
+    cursor: Mutex<Option<Cursor>>,
+    /// The panel and the lines of the stats panel that were last made, for when `Inner` is busy
+    lines: Mutex<Vec<(&'static str, String)>>,
+}
+
 pub struct Desktop {
+    quick: Quick,
     inner: Mutex<Inner>,
     uplink: Mutex<Uplink>,
     wake: Condvar,
@@ -126,6 +145,13 @@ pub struct Desktop {
 pub fn desktop() -> &'static Desktop {
     static DESKTOP: OnceLock<Desktop> = OnceLock::new();
     DESKTOP.get_or_init(|| Desktop {
+        quick: Quick {
+            visible: AtomicBool::new(false),
+            aspect: AtomicU32::new((16.0f32 / 9.0).to_bits()),
+            cursor_in_video: AtomicBool::new(false),
+            cursor: Mutex::new(None),
+            lines: Mutex::new(Vec::new()),
+        },
         inner: Mutex::new(Inner::default()),
         uplink: Mutex::new(Uplink::default()),
         wake: Condvar::new(),
@@ -133,11 +159,13 @@ pub fn desktop() -> &'static Desktop {
     })
 }
 
-/// How the cursor shows: `cursor=panel` (default) draws a ring on a small panel over the picture,
-/// `cursor=none` draws nothing. The host's `CRANVR_DESKTOP_CURSOR_IN_VIDEO=1` puts the Mac's cursor
-/// into the pictures.
+/// Whether the app draws the Mac's cursor as a ring on a small panel in front of the picture. It
+/// does when the host leaves the cursor out of the pictures and the launch does not say
+/// `cursor=none`. On a Quest today the ring is hidden under the surface panel: the compositor draws
+/// the surface layers after the panel layers, so the host puts the cursor into the pictures.
 fn draws_cursor() -> bool {
-    launch_args().string("cursor") != Some("none")
+    let in_video = desktop().quick.cursor_in_video.load(Ordering::Relaxed);
+    !in_video && launch_args().string("cursor") != Some("none")
 }
 
 impl Desktop {
@@ -149,6 +177,7 @@ impl Desktop {
         // The surface belongs to the composition and stays. Everything else starts again.
         *inner = Inner { surface: inner.surface.take(), active: in_headset, waiting_key: true, ..Inner::default() };
         *self.uplink.lock().unwrap() = Uplink::default();
+        self.publish(&inner);
         receiver
     }
 
@@ -161,6 +190,20 @@ impl Desktop {
         inner.decoder = None;
         inner.frames = None;
         inner.built_for = None;
+        self.publish(&inner);
+    }
+
+    /// Copies what the frame loop and the composition read into `quick`.
+    fn publish(&self, inner: &Inner) {
+        let shown = inner.params.filter(|p| inner.active && p.visible);
+        if let Some(p) = shown {
+            self.quick.aspect.store((p.size[0] as f32 / p.size[1].max(1) as f32).to_bits(), Ordering::Relaxed);
+        }
+        self.quick.cursor_in_video.store(inner.params.is_some_and(|p| p.cursor_in_video), Ordering::Relaxed);
+        self.quick.visible.store(shown.is_some(), Ordering::Relaxed);
+        if shown.is_none() {
+            *self.quick.cursor.lock().unwrap() = None;
+        }
     }
 
     /// What the host says about the desktop stream.
@@ -185,6 +228,7 @@ impl Desktop {
                 inner.params = *params;
                 inner.waiting_key = true;
                 inner.rebuild();
+                self.publish(&inner);
             }
             HostMsg::DecoderConfig { stream, config, .. } if *stream == DESKTOP_STREAM => {
                 self.inner.lock().unwrap().config.clone_from(config);
@@ -218,10 +262,10 @@ impl Desktop {
 
     /// The Mac's cursor moved. The newest datagram wins.
     pub fn on_cursor(&self, cursor: Cursor) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.counts.cursors += 1;
-        if inner.cursor.is_none_or(|old| cursor.seq.wrapping_sub(old.seq) < u32::MAX / 2) {
-            inner.cursor = Some(cursor);
+        CURSOR_PACKETS.fetch_add(1, Ordering::Relaxed);
+        let mut newest = self.quick.cursor.lock().unwrap();
+        if newest.is_none_or(|old| cursor.seq.wrapping_sub(old.seq) < u32::MAX / 2) {
+            *newest = Some(cursor);
         }
     }
 
@@ -233,17 +277,14 @@ impl Desktop {
         inner.rebuild();
     }
 
+    /// What the panel needs. It never waits for the decoder.
     pub fn view(&self) -> View {
-        let inner = self.inner.lock().unwrap();
-        match inner.params.filter(|p| inner.active && p.visible) {
-            Some(p) => View { visible: true, aspect: p.size[0] as f32 / (p.size[1].max(1)) as f32 },
-            None => View { visible: false, aspect: 16.0 / 9.0 },
-        }
+        View { visible: self.quick.visible.load(Ordering::Relaxed), aspect: f32::from_bits(self.quick.aspect.load(Ordering::Relaxed)) }
     }
 
     /// Where the Mac's cursor is on the picture as u and v, when it is on the desktop's display.
     fn cursor(&self) -> Option<[f32; 2]> {
-        self.inner.lock().unwrap().cursor.filter(|c| c.on).map(|c| [c.u, c.v])
+        self.quick.cursor.lock().unwrap().filter(|c| c.on).map(|c| [c.u, c.v])
     }
 
     /// The pointer of this frame. It goes to the host when it changed.
@@ -279,7 +320,11 @@ impl Inner {
             Codec::Hevc => VideoCodec::Hevc,
             Codec::Av1 => VideoCodec::Av1,
         };
-        match VideoDecoder::new(DecoderConfig::new(codec, size[0], size[1], DecoderOutput::Surface(surface.clone()))) {
+        // This decoder has a thread of its own, so it may wait longer for an input buffer than the
+        // default 4 ms: a picture that is refused breaks the chain and costs a key frame
+        let mut config = DecoderConfig::new(codec, size[0], size[1], DecoderOutput::Surface(surface.clone()));
+        config.input_wait = INPUT_WAIT;
+        match VideoDecoder::new(config) {
             Ok(decoder) => {
                 log::info!("desktop: decoder started for {}x{}", size[0], size[1]);
                 self.frames = Some(decoder.frames());
@@ -415,7 +460,7 @@ impl Rates {
             refused: c.refused,
             key_requests: c.key_requests,
             pointers_sent: c.pointers_sent,
-            cursors: c.cursors,
+            cursors: CURSOR_PACKETS.load(Ordering::Relaxed),
             error: inner.decoder_error.clone(),
         };
         self.units = c.units;
@@ -428,7 +473,15 @@ impl Rates {
 /// The lines of the stats panel: a label and a value.
 pub fn stat_lines() -> Vec<(&'static str, String)> {
     let d = desktop();
-    let inner = d.inner.lock().unwrap();
+    // The decoder holds `Inner` while it waits for an input buffer: the stats panel then shows
+    // its last lines
+    let Ok(inner) = d.inner.try_lock() else { return d.quick.lines.lock().unwrap().clone() };
+    let lines = lines_of(&inner);
+    *d.quick.lines.lock().unwrap() = lines.clone();
+    lines
+}
+
+fn lines_of(inner: &Inner) -> Vec<(&'static str, String)> {
     let Some(params) = inner.params.filter(|_| inner.active) else { return Vec::new() };
     let decoder = inner.frames.as_ref().map(DecodedFrames::stats).unwrap_or_default();
     let ms = |d: Duration| d.as_secs_f32() * 1000.0;
@@ -456,7 +509,7 @@ pub fn stat_lines() -> Vec<(&'static str, String)> {
             ms(decoder.max_decode),
             decoder.dropped,
             c.pointers_sent,
-            c.cursors
+            CURSOR_PACKETS.load(Ordering::Relaxed)
         ),
     )]
 }
@@ -478,7 +531,7 @@ pub fn decode_loop(units: &mpsc::Receiver<Received>, stop: &AtomicBool) {
             let s = rates.look();
             if s.size != [0, 0] {
                 log::info!(
-                    "desktop: {:.1} pictures/s received and {:.1}/s decoded of {}x{}, {:.1} Mbps, decoder {} (decode {:.2} ms mean, {:.2} ms last, {:.2} ms longest, {} dropped, {} late), {} skipped, {} refused, {} key requests, {} pointer packets sent, {} cursor packets{}",
+                    "desktop: {:.1} pictures/s received and {:.1}/s decoded of {}x{}, {:.1} Mbps, decoder {} (decode {:.2} ms mean, {:.2} ms last, {:.2} ms longest, {} dropped, {} late), {} skipped, {} refused, {} key requests, {} pointer packets sent, {} cursor packets, frame effect ran {} times, cursor panel composed {} times{}",
                     s.received_fps,
                     s.decoded_fps,
                     s.size[0],
@@ -495,6 +548,8 @@ pub fn decode_loop(units: &mpsc::Receiver<Received>, stop: &AtomicBool) {
                     s.key_requests,
                     s.pointers_sent,
                     s.cursors,
+                    EFFECT_FRAMES.load(Ordering::Relaxed),
+                    CURSOR_COMPOSITIONS.load(Ordering::Relaxed),
                     s.error.map_or(String::new(), |e| format!(", {e}"))
                 );
             }
@@ -520,7 +575,8 @@ fn wish() -> DesktopWish {
 /// session ends.
 pub fn uplink(link: &ClientLink, stop: &AtomicBool) {
     let d = desktop();
-    if !d.inner.lock().unwrap().active {
+    // `--ez desktop false` leaves the desktop out, to compare the eye stream without it
+    if !d.inner.lock().unwrap().active || launch_args().boolean("desktop") == Some(false) {
         return;
     }
     let wish = wish();
@@ -549,9 +605,20 @@ pub fn uplink(link: &ClientLink, stop: &AtomicBool) {
     }
 }
 
-/// The place that the preferences keep, or the default.
+/// The place that the launch asks for, that the preferences keep, or the default.
+/// `desktop_place=x,y,z,yaw,pitch,width` sets one for a test.
 fn saved_place() -> Place {
-    preferences().get(PLACE_KEY).and_then(|text| Place::from_text(&text)).unwrap_or_default()
+    launch_args()
+        .string("desktop_place")
+        .and_then(Place::from_text)
+        .or_else(|| preferences().get(PLACE_KEY).and_then(|text| Place::from_text(&text)))
+        .unwrap_or_default()
+}
+
+/// Whether the launch asks for the panel in front of the head's gaze at the first frame, tilt
+/// included: `--es desktop_place gaze`, for a headset that lies on a desk.
+fn place_in_gaze() -> bool {
+    launch_args().string("desktop_place") == Some("gaze")
 }
 
 fn save_place(place: &Place) {
@@ -570,9 +637,34 @@ fn hand(controller: &Controller) -> Hand {
     }
 }
 
+/// A test with no controller in the room: `--es desktop_pointer_test circle` makes the right
+/// controller circle over the panel, pull its trigger for 0.3 s every 3 s and lean its thumbstick
+/// forward for 2 s every 6 s. The real engine turns that into the pointer packets that go to the
+/// host.
+fn pointer_test() -> bool {
+    launch_args().string("desktop_pointer_test") == Some("circle")
+}
+
+/// The right controller of the pointer test at the headset time `time`: at the head's place
+/// pointing at a point that circles the middle of the panel once in 4 seconds.
+fn synthetic_hand(time: Duration, head: &Pose, place: &Place, aspect: f32) -> Hand {
+    let t = time.as_secs_f32();
+    let angle = t * std::f32::consts::TAU / 4.0;
+    let target = place.point_at(aspect, [0.5 + 0.3 * angle.cos(), 0.5 + 0.3 * angle.sin()]);
+    let origin = [head.position[0] + 0.2, head.position[1] - 0.3, head.position[2] - 0.2];
+    Hand {
+        aim: Some(aim_at(origin, target)),
+        trigger: if t % 3.0 < 0.3 { 1.0 } else { 0.0 },
+        squeeze: 0.0,
+        stick: [0.0, if t % 6.0 > 4.0 { 0.6 } else { 0.0 }],
+    }
+}
+
 /// What the headset's frame loop shares with the composition: the engine and the last saved place.
 struct Shared {
     engine: RefCell<Engine>,
+    /// The panel was put in the gaze already
+    gazed: Cell<bool>,
 }
 
 /// The desktop panel and the cursor over it. It composes nothing while the host has no desktop for
@@ -587,7 +679,8 @@ pub fn DesktopPanel() {
         }
         delay(POLL).await;
     });
-    let shared = remember(|| Rc::new(Shared { engine: RefCell::new(Engine::new(saved_place(), 16.0 / 9.0)) })).with(Clone::clone);
+    let shared = remember(|| Rc::new(Shared { engine: RefCell::new(Engine::new(saved_place(), 16.0 / 9.0)), gazed: Cell::new(false) }))
+        .with(Clone::clone);
     let place = rememberMutableStateOf({
         let shared = Rc::clone(&shared);
         move || shared.engine.borrow().place
@@ -596,18 +689,27 @@ pub fn DesktopPanel() {
     {
         let shared = Rc::clone(&shared);
         SpatialFrameEffect(move |frame: &XrFrame| {
+            EFFECT_FRAMES.fetch_add(1, Ordering::Relaxed);
             let now = desktop().view();
             let mut engine = shared.engine.borrow_mut();
             engine.aspect = now.aspect;
+            if let (true, false, Some(head)) = (place_in_gaze(), shared.gazed.get(), frame.device_pose) {
+                shared.gazed.set(true);
+                engine.place = Place::in_gaze(&head, engine.place.width, 1.2);
+                log::info!("desktop: the panel is put in the gaze at {:?}", engine.place);
+            }
             if !now.visible {
                 desktop().set_pointer(PointerNow::default());
                 return;
             }
-            let input = Frame {
+            let mut input = Frame {
                 hands: [hand(&frame.left_controller), hand(&frame.right_controller)],
                 head: frame.device_pose.map(|pose| pose.position),
                 dt: frame.period.as_secs_f32(),
             };
+            if let (true, Some(head)) = (pointer_test(), frame.device_pose) {
+                input.hands[1] = synthetic_hand(frame.predicted_display_time, &head, &engine.place, now.aspect);
+            }
             let step = engine.step(&input);
             desktop().set_pointer(step.pointer);
             if place.get_non_reactive() != engine.place {
@@ -633,25 +735,16 @@ pub fn DesktopPanel() {
     }
 }
 
-/// The surface that the decoder writes into. The headset makes the swapchain at the size of the
-/// panel's first composition and keeps it, so the panel starts as large as the picture's pixels and
-/// takes its own size when the surface is there.
+/// The surface that the decoder writes into. The headset makes its swapchain at the size of the
+/// panel's first composition (1.5 pixels to a dp) and keeps it when the user resizes the panel. The
+/// decoder's pictures are larger. A test with the swapchain at 1600 by 900 dp (2400 by 1350 pixels) and
+/// at 2560 by 1440 dp (3840 by 2160 pixels) showed the whole picture and the same sharpness, so the
+/// compositor samples the decoder's own buffer.
 #[composable]
 fn Surface(place: MutableState<Place>, aspect: f32) {
-    let created = rememberMutableStateOf(|| false);
-    let p = place.get();
-    let modifier = if created.get() {
-        p.modifier(aspect)
-    } else {
-        // Far away, so that the empty panel is a speck until the surface is there
-        SubspaceModifier::new().size(CREATION_WIDTH_DP, CREATION_WIDTH_DP / aspect).offset(0.0, 0.0, -60_000.0)
-    };
-    let was_created = created;
+    let modifier = place.get().modifier(aspect);
     SpatialExternalSurface(StereoMode::Mono, modifier, move |scope| {
-        scope.on_surface_created(move |surface| {
-            desktop().set_surface(Some(surface));
-            was_created.set(true);
-        });
+        scope.on_surface_created(|surface| desktop().set_surface(Some(surface)));
         // The decoder stops before the callback returns, as the surface's owner requires
         scope.on_surface_destroyed(|_| desktop().set_surface(None));
     });
@@ -662,7 +755,12 @@ fn Surface(place: MutableState<Place>, aspect: f32) {
 fn CursorRing(place: MutableState<Place>, cursor: MutableState<Option<[f32; 2]>>, aspect: f32) {
     let Some([u, v]) = cursor.get() else { return };
     let p = place.get();
-    SpatialPanel(p.cursor_modifier(aspect, [u, v], CURSOR_SIZE, CURSOR_LIFT), || {
+    CURSOR_COMPOSITIONS.fetch_add(1, Ordering::Relaxed);
+    // `--ef cursor_lift 0.3` lifts the ring far off the picture: a test of what hides it
+    let lift = launch_args().float("cursor_lift").unwrap_or(CURSOR_LIFT);
+    // `--ef cursor_u_add 0.7` shifts the ring beside the picture: a test that the ring draws at all
+    let u = u + launch_args().float("cursor_u_add").unwrap_or(0.0);
+    SpatialPanel(p.cursor_modifier(aspect, [u, v], CURSOR_SIZE, lift), || {
         Box(
             Modifier::empty()
                 .fill_max_size()

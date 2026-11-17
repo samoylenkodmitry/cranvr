@@ -49,6 +49,10 @@ const MAX_RATE_ADJUST: f32 = 0.005;
 /// The control loop's gain: a fill that is the whole target too high speeds the playback by this
 /// much
 const RATE_GAIN: f32 = 0.01;
+/// The control loop follows the fill's average over this time in seconds. The capture hands over
+/// 20 ms at once, so the fill saws up and down by that much 50 times a second. A loop that followed
+/// each tooth would change the pitch by up to the full 0.5% at 50 Hz.
+const SMOOTHING_S: f32 = 1.0;
 /// The longest gap of silence that a missing sequence leaves, in datagrams. A longer gap is a
 /// reconnect or a pause of the host.
 const MAX_GAP: u32 = 20;
@@ -149,9 +153,47 @@ pub fn open(format: AudioFormat) {
                 format.sample_rate
             );
             let producer = Mutex::new(Producer { queue, expected: None, shared: Arc::clone(&shared) });
-            *PLAYER.lock().unwrap() = Some(Arc::new(Player { producer, shared, source_rate: format.sample_rate as f32, _sink: sink }));
+            let player = Arc::new(Player { producer, shared, source_rate: format.sample_rate as f32, _sink: sink });
+            *PLAYER.lock().unwrap() = Some(Arc::clone(&player));
+            let spawned = std::thread::Builder::new().name("cranvr-audio-log".into()).spawn(move || log_loop(&player));
+            if let Err(e) = spawned {
+                log::warn!("audio: no log thread: {e}");
+            }
         }
         Err(e) => log::warn!("audio: no output device ({e}): the sound stays off"),
+    }
+}
+
+/// How often the player logs its numbers
+const LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Logs the player's numbers until a newer player or `close` replaces it.
+fn log_loop(player: &Arc<Player>) {
+    loop {
+        std::thread::sleep(LOG_EVERY);
+        if PLAYER.lock().unwrap().as_ref().is_none_or(|current| !Arc::ptr_eq(current, player)) {
+            return;
+        }
+        let s = stats_of(player, true);
+        log::info!(
+            "audio: {}, buffer {:.1} ms now (range {:.1} to {:.1}, target {:.0}), device burst {:.1} ms at {} Hz, age when queued {} ms, {} packets, {} lost, {} late, {} underruns, {:.0} ms dropped, {:.0} ms overflow, rate {:+.2}%, {:.1} s played",
+            if s.playing { "playing" } else { "waiting for the buffer" },
+            s.fill_ms,
+            s.fill_min_ms,
+            s.fill_max_ms,
+            s.target_ms,
+            s.burst_ms,
+            s.device_rate,
+            s.age_ms.map_or("-".to_string(), |a| format!("{a:.1}")),
+            s.packets,
+            s.lost_packets,
+            s.late_packets,
+            s.underruns,
+            s.dropped_ms,
+            s.overflow_ms,
+            s.rate_pct,
+            s.played_s,
+        );
     }
 }
 
@@ -213,17 +255,31 @@ impl Producer {
     }
 }
 
-/// What the stats panel and the log show now. The range of the fill restarts at each call.
+/// What the stats panel shows now: the totals, and the fill's range and the sound's age since the
+/// log's last line.
 pub fn stats() -> Stats {
     let Some(player) = PLAYER.lock().unwrap().clone() else { return Stats::default() };
+    stats_of(&player, false)
+}
+
+/// The numbers of `player`. With `reset` the range of the fill and the mean age start again.
+fn stats_of(player: &Player, reset: bool) -> Stats {
     let s = &player.shared;
     let rate = player.source_rate.max(1.0);
     let frames_to_ms = |frames: u64| frames as f32 * 1000.0 / rate;
     let pushed = s.pushed.load(Ordering::Acquire);
     let popped = s.popped.load(Ordering::Acquire);
-    let (min, max) = (s.fill_min.swap(u64::MAX, Ordering::Relaxed), s.fill_max.swap(0, Ordering::Relaxed));
+    let (min, max, age_us, age_n) = if reset {
+        (
+            s.fill_min.swap(u64::MAX, Ordering::Relaxed),
+            s.fill_max.swap(0, Ordering::Relaxed),
+            s.age_us.swap(0, Ordering::Relaxed),
+            s.age_n.swap(0, Ordering::Relaxed),
+        )
+    } else {
+        (s.fill_min.load(Ordering::Relaxed), s.fill_max.load(Ordering::Relaxed), s.age_us.load(Ordering::Relaxed), s.age_n.load(Ordering::Relaxed))
+    };
     let fill = pushed.saturating_sub(popped);
-    let (age_us, age_n) = (s.age_us.swap(0, Ordering::Relaxed), s.age_n.swap(0, Ordering::Relaxed));
     let device_rate = s.device_rate.load(Ordering::Relaxed);
     Stats {
         open: true,
@@ -281,6 +337,8 @@ struct Output {
     device_rate: f32,
     channels: usize,
     primed: bool,
+    /// The fill's moving average in frames, which the rate follows
+    smoothed: f32,
     /// The frames between which the playback position lies, and how far past `before` it is
     before: [f32; 2],
     after: [f32; 2],
@@ -297,6 +355,7 @@ impl Output {
             device_rate: backend::NOMINAL_SAMPLE_RATE,
             channels: backend::NOMINAL_CHANNELS,
             primed: false,
+            smoothed: 0.0,
             before: [0.0; 2],
             after: [0.0; 2],
             phase: 1.0,
@@ -356,11 +415,13 @@ impl Renderer for Output {
             }
             self.primed = true;
             self.started = false;
+            self.smoothed = fill as f32;
             self.shared.playing.store(true, Ordering::Relaxed);
         }
 
         // The rate: the source's samples per device sample, nudged toward the target fill
-        let error = (fill as f32 - target as f32) / target.max(1) as f32;
+        self.smoothed += (fill as f32 - self.smoothed) * (out_frames as f32 / self.device_rate / SMOOTHING_S).min(1.0);
+        let error = (self.smoothed - target as f32) / target.max(1) as f32;
         let adjust = (error * RATE_GAIN).clamp(-MAX_RATE_ADJUST, MAX_RATE_ADJUST);
         self.shared.rate_ppm.store((adjust * 1e6).to_bits(), Ordering::Relaxed);
         let step = self.source_rate / self.device_rate * (1.0 + adjust);
@@ -473,6 +534,26 @@ mod tests {
         out.render(&mut buffer);
         let ppm = f32::from_bits(out.shared.rate_ppm.load(Ordering::Relaxed));
         assert!(ppm > 0.0 && ppm <= MAX_RATE_ADJUST * 1e6, "{ppm}");
+    }
+
+    #[test]
+    fn the_rate_follows_the_average_fill_and_not_each_tooth_of_the_saw() {
+        let (mut queue, mut out) = output(48_000.0, 48_000.0, 2);
+        // The buffer starts at the target. Then 20 ms of sound arrives every 20 ms while the device
+        // takes 4 ms at a time: the fill saws between about 20 and 40 ms around the target.
+        push(&out, &mut queue, (0..1440).map(|_| [0.1, 0.1]));
+        let mut buffer = [0.0f32; 2 * 192];
+        let mut rates = Vec::new();
+        for callback in 0..400 {
+            if callback % 5 == 0 {
+                push(&out, &mut queue, (0..960).map(|_| [0.1, 0.1]));
+            }
+            out.render(&mut buffer);
+            rates.push(f32::from_bits(out.shared.rate_ppm.load(Ordering::Relaxed)));
+        }
+        let (min, max) = rates.iter().fold((f32::MAX, f32::MIN), |(lo, hi), r| (lo.min(*r), hi.max(*r)));
+        // Without the average the rate would swing over the whole range of 10 000 ppm
+        assert!(max - min < 2500.0, "{min} {max}");
     }
 
     #[test]

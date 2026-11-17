@@ -92,6 +92,20 @@ impl Place {
         SubspaceModifier::new().size(size, size).offset(x, y, z).rotate(self.pitch, self.yaw, 0.0)
     }
 
+    /// A place `distance` meters ahead of the head along the way it looks, facing it. For tests with
+    /// a headset that lies on a desk and looks at an odd angle.
+    pub fn in_gaze(head: &Pose, width: f32, distance: f32) -> Self {
+        let ahead = head.rotate([0.0, 0.0, -distance]);
+        let center = [head.position[0] + ahead[0], head.position[1] + ahead[1], head.position[2] + ahead[2]];
+        Self { center, yaw: 0.0, pitch: 0.0, width }.facing(head.position)
+    }
+
+    /// The point at `[u, v]` on the panel, in the room.
+    pub fn point_at(&self, aspect: f32, [u, v]: [f32; 2]) -> [f32; 3] {
+        let [width, height] = self.size(aspect);
+        self.pose().then(&Pose::at([(u - 0.5) * width, (0.5 - v) * height, 0.0])).position
+    }
+
     /// The place with its face turned to `head`.
     pub fn facing(mut self, head: [f32; 3]) -> Self {
         let d = [head[0] - self.center[0], head[1] - self.center[1], head[2] - self.center[2]];
@@ -137,6 +151,15 @@ fn turn(pitch: f32, yaw: f32) -> [f32; 4] {
         a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
         a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
     ]
+}
+
+/// The pose of a controller at `origin` that points at `target`: its aim runs along -z.
+pub fn aim_at(origin: [f32; 3], target: [f32; 3]) -> Pose {
+    let d = [target[0] - origin[0], target[1] - origin[1], target[2] - origin[2]];
+    let length = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6);
+    let yaw = (-d[0]).atan2(-d[2]).to_degrees();
+    let pitch = (d[1] / length).clamp(-1.0, 1.0).asin().to_degrees();
+    Pose { position: origin, orientation: turn(pitch, yaw) }
 }
 
 /// One controller in a frame.
@@ -393,6 +416,18 @@ mod tests {
     }
 
     #[test]
+    fn an_aim_at_a_point_of_the_panel_hits_that_point() {
+        let place = Place { center: [0.3, 0.1, -1.4], yaw: -12.0, pitch: 6.0, width: 1.6 };
+        let engine = Engine::new(place, 16.0 / 9.0);
+        for uv in [[0.5, 0.5], [0.1, 0.2], [0.9, 0.8]] {
+            let target = place.point_at(16.0 / 9.0, uv);
+            let hand = Hand { aim: Some(aim_at([0.2, -0.3, -0.2], target)), ..Hand::default() };
+            let hit = engine.hit(&hand).unwrap();
+            assert!((hit[0] - uv[0]).abs() < 1e-3 && (hit[1] - uv[1]).abs() < 1e-3, "{hit:?} {uv:?}");
+        }
+    }
+
+    #[test]
     fn the_cursor_panel_lies_on_the_point_in_front_of_the_picture() {
         // A panel 1.6 m by 0.9 m, 1.5 m ahead. The cursor at one quarter across and one quarter
         // down is 40 cm left of the middle and 22.5 cm above it, 4 mm in front
@@ -401,6 +436,21 @@ mod tests {
         let at = modifier.pose().position;
         assert!((at[0] + 0.4).abs() < 1e-5 && (at[1] - 0.225).abs() < 1e-5 && (at[2] - (-1.5 + 0.004 + 1.0)).abs() < 1e-5, "{at:?}");
         assert_eq!(modifier.size_or([0.0, 0.0]), [26.0, 26.0]);
+    }
+
+    #[test]
+    fn a_place_in_the_gaze_lies_ahead_of_a_head_that_looks_down() {
+        // A head at 0.2 m that looks 60 degrees down
+        let head = Pose { position: [0.0, 0.2, 0.0], orientation: turn(-60.0, 0.0) };
+        let place = Place::in_gaze(&head, 1.6, 1.2);
+        let look = head.rotate([0.0, 0.0, -1.0]);
+        assert!(look[1] < -0.8, "{look:?}");
+        assert!((place.center[1] - (0.2 + look[1] * 1.2)).abs() < 1e-4 && (place.center[2] - look[2] * 1.2).abs() < 1e-4);
+        // The panel's face points back at the head
+        let normal = place.pose().rotate([0.0, 0.0, 1.0]);
+        for i in 0..3 {
+            assert!((normal[i] + look[i]).abs() < 1e-3, "{normal:?} {look:?}");
+        }
     }
 
     #[test]

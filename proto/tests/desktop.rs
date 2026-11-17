@@ -27,6 +27,7 @@ fn params() -> DesktopParams {
         full_range: true,
         flipped: false,
         visible: true,
+        cursor_in_video: true,
     }
 }
 
