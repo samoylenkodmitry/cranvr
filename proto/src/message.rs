@@ -197,6 +197,10 @@ pub enum ClientMsg {
     /// app started. The client sends it again when it changes. The host puts its scenes' floor
     /// there. A host that does not know the message skips it.
     Floor(f32),
+    /// The client shows the Mac's desktop as a panel and asks the host for its video, or stops the
+    /// stream. The host answers with [`HostMsg::Desktop`]. The video is the stream
+    /// [`DESKTOP_STREAM`]. A host that does not know the message skips it.
+    Desktop(DesktopWish),
 }
 
 /// A change of the origin of the poses that the client sends. Every pose with a display time at or
@@ -228,6 +232,11 @@ pub enum HostMsg {
     /// The host asks the client to prove that it holds its key. The client answers with
     /// [`ClientMsg::Proof`].
     Challenge([u8; 32]),
+    /// The state of the desktop stream: its parameters, or `None` when the host has no desktop for
+    /// this client. The host sends it after a [`ClientMsg::Desktop`] and again when the picture's
+    /// size or the visibility changes. The decoder's parameter sets follow in a
+    /// [`HostMsg::DecoderConfig`] of the stream [`DESKTOP_STREAM`].
+    Desktop(Option<DesktopParams>),
 }
 
 /// Datagram messages from the client to the host.
@@ -241,6 +250,8 @@ pub enum ClientDatagram {
     Loss(LossReport),
     Ping(Ping),
     Pong(Pong),
+    /// Where a controller points on the desktop panel, with its trigger and thumbstick
+    Pointer(Pointer),
 }
 
 /// Datagram messages from the host to the client.
@@ -250,6 +261,8 @@ pub enum HostDatagram {
     Audio(Audio),
     Ping(Ping),
     Pong(Pong),
+    /// Where the Mac's cursor is on the desktop
+    Cursor(Cursor),
 }
 
 /// The head and the controllers at one moment.
@@ -393,6 +406,75 @@ pub struct Audio {
     /// When the host captured the first sample, on the host's clock
     pub host_time: Nanos,
     pub pcm: Vec<u8>,
+}
+
+/// The id of the stream that carries the Mac's desktop. The eye stream is 0.
+pub const DESKTOP_STREAM: u8 = 1;
+
+/// What the client asks of the desktop stream.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DesktopWish {
+    /// Whether the client shows the desktop. `false` stops the capture.
+    pub enabled: bool,
+    /// The widest picture in pixels that the client's decoder takes and the panel can use. The host
+    /// takes the display's own pixel width when that is smaller.
+    pub max_width: u32,
+    /// The most pictures a second that the client wants
+    pub max_fps: u8,
+}
+
+/// The desktop stream as the host runs it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DesktopParams {
+    /// [`DESKTOP_STREAM`]
+    pub stream: u8,
+    pub codec: Codec,
+    /// The size of the pictures in pixels: the display's full pixel size, or the client's
+    /// `max_width` with the display's shape
+    pub size: [u32; 2],
+    /// The display's size in points, which the cursor's position and the pointer refer to
+    pub points: [f32; 2],
+    pub max_fps: f32,
+    pub bitrate_bps: u64,
+    /// The encoder uses the full 0 to 255 range
+    pub full_range: bool,
+    /// The host's pictures are mirrored top to bottom, because the client's compositor reads a
+    /// decoder's surface bottom row first. Cranpose's compositor does not: the host sends the
+    /// pictures upright and this is `false`.
+    pub flipped: bool,
+    /// `false` while the host hides the desktop, as while a game runs. The host sends no pictures
+    /// then.
+    pub visible: bool,
+}
+
+/// Where a controller points on the desktop panel, as the client measures it. The client sends it
+/// for every headset frame while it changes and every 50 ms otherwise, so a lost datagram heals.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Pointer {
+    /// Counts up by one per datagram. The host drops a datagram that is older than the newest.
+    pub seq: u32,
+    /// When the client sampled the controller, on the client's clock
+    pub sent: Nanos,
+    /// The point on the panel as u and v from its top left corner (0, 0) to its bottom right corner
+    /// (1, 1), or `None` while no controller points at the panel
+    pub hit: Option<[f32; 2]>,
+    /// How far the pointing controller's trigger is pulled, from 0 to 1. A trigger past 0.6 presses
+    /// the mouse button, one below 0.4 releases it.
+    pub trigger: f32,
+    /// How far the pointing controller's thumbstick leans forward, from -1 to 1. The host scrolls.
+    pub scroll: f32,
+}
+
+/// Where the Mac's cursor lies on the desktop. The newest datagram wins.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Cursor {
+    pub seq: u32,
+    /// The position as u and v from the display's top left corner (0, 0) to its bottom right
+    /// corner (1, 1)
+    pub u: f32,
+    pub v: f32,
+    /// Whether the cursor lies on the desktop's display
+    pub on: bool,
 }
 
 /// What the host wants from a stream, before it knows the client.

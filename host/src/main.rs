@@ -319,7 +319,11 @@ fn raise_file_limit() {
 }
 
 /// What the native protocol takes from the command line.
-fn native_config(options: &Options, config_dir: &std::path::Path) -> headset::native::Config {
+fn native_config(
+    options: &Options,
+    config_dir: &std::path::Path,
+    desktop: headset::native::desktop::Options,
+) -> headset::native::Config {
     if !options.trust.is_empty() {
         warn!("--trust does not count for the native protocol: pair the headset with --pair CODE");
     }
@@ -328,6 +332,8 @@ fn native_config(options: &Options, config_dir: &std::path::Path) -> headset::na
         pairings: Arc::new(pairing::Pairings::load(config_dir, options.pair_code)),
         trust_all: options.trust_all,
         display_lock: options.display_lock,
+        desktop,
+        audio: options.game_audio,
         tcp_media: options.tcp,
         wishes: HostWishes {
             // A foveated eye takes the size that the headset asks for: its recommended size, within
@@ -364,13 +370,20 @@ fn main() {
     }
     // The logger comes from ALVR's server core. It opens no socket and reads no session file.
     alvr_server_core::init_logging(None, Some(layout.crash_log()));
-    // The native protocol has no game sound and no desktop layer yet
-    if alvr && options.game_audio {
+    // The native protocol sends the sound itself (headset/native/audio.rs)
+    if !alvr {
+        game_audio::set_sink(headset::native::audio::send);
+    }
+    if options.game_audio {
         start_game_audio();
     }
+    // The native client shows the desktop as a panel (headset/native/desktop.rs), not as the old
+    // Quest app's layer
+    let desktop_panel = desktop.enabled && desktop.layer;
     if !alvr {
         desktop.layer = false;
     }
+    let layer: Arc<desktop_layer::LayerState> = Arc::default();
     info!(
         "cranvr-host: {} Hz, {} px per eye, {} Mbps, config in {}",
         options.fps,
@@ -400,7 +413,16 @@ fn main() {
 
     let (headset, mut events) = match options.protocol {
         Protocol::Alvr => headset::alvr::start(layout.session()),
-        Protocol::Native => headset::native::start(native_config(&options, &config_dir)).unwrap_or_else(|e| {
+        Protocol::Native => {
+            let panel = headset::native::desktop::Options {
+                enabled: desktop_panel,
+                display_id: desktop.display_id,
+                layer: Arc::clone(&layer),
+                mbps: headset::native::desktop::MBPS,
+            };
+            headset::native::start(native_config(&options, &config_dir, panel))
+        }
+        .unwrap_or_else(|e| {
             error!("Native protocol: cannot listen on port {}: {e}", options.native_port);
             std::process::exit(1)
         }),
@@ -411,7 +433,7 @@ fn main() {
         views: Mutex::new(Views::default()),
         force_idr: AtomicBool::new(true),
         inputs: Mutex::new(Inputs::default()),
-        layer: Arc::default(),
+        layer,
         desktop_display: std::sync::atomic::AtomicU32::new(0),
     });
 
