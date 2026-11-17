@@ -6,7 +6,7 @@ fn main() {
     env_logger::init();
     if let Err(error) = cranpose::AppLauncher::new()
         .with_title("cranvr client")
-        .with_size(1560, 900)
+        .with_size(2240, 960)
         .try_run(cranvr_client::ClientApp)
     {
         eprintln!("the client failed to start: {error}");
