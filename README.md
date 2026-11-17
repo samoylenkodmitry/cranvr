@@ -49,9 +49,10 @@ Foveated encoding is on by default. It makes the full Quest 3 eye size fit at 12
 |---|---|
 | `vt` | HEVC encoder and decoder through plain C bindings to VideoToolbox. |
 | `common` | ALVR's foveation math, for the host and the probe. |
+| `proto` | `cranvr-proto`: cranvr's own protocol for native mode, with no ALVR code. It builds for macOS and for Android. |
 | `host` | `cranvr-host`: the ALVR server core, the frame loop, the Metal shaders (`host/src/pattern.metal`), the game link (`runtime_link.rs`) and the desktop (`desktop.rs`). |
 | `app` | `cranvr`: the window. It runs `cranvr-host` and shows its status. |
-| `probe` | `cranvr-probe` (a headless ALVR client) and `cranvr-fake-game` (a stand-in for a game), for tests. |
+| `probe` | `cranvr-probe` (a headless client of ALVR's protocol or of the native one) and `cranvr-fake-game` (a stand-in for a game), for tests. |
 | `quest` | `cranvr-quest`: cranvr's own Quest app, the start of native mode. Its own Cargo workspace. |
 | `scripts` | Build and run the Wine side for games. |
 | `third_party/basaltvr` | cranvr's patches to BasaltVR's runtime and DXMT fork. |
@@ -357,6 +358,17 @@ HOME=/tmp/cranvr-probe-home ./target/release/cranvr-probe --seconds 10
 ```
 
 The probe exits with code 0 when at least half of the expected frames decode with the right eye colors. `HOME` keeps the probe's ALVR client settings out of your own Library folder. The ignored app test starts the host the way the window does and connects the probe.
+
+The native protocol (`cranvr-proto`) runs the same test. The host listens on `127.0.0.1:9950` unless `--trust-all` or `--trust NAME` allows a headset on the network. It opens none of ALVR's ports, so it runs beside an ALVR host:
+
+```bash
+./target/release/cranvr-host --protocol native --config-dir /tmp/cranvr-test-native &
+./target/release/cranvr-probe --protocol native --seconds 10
+./target/release/cranvr-probe --protocol native --seconds 10 --tcp            # media over TCP, as over USB
+./target/release/cranvr-probe --protocol native --seconds 10 --drop-percent 3 # lets the parity recover packets
+```
+
+`scripts/e2e.sh --native` does the same with a report. The native mode has no game sound and no desktop layer yet. `--protocol alvr` stays the default.
 
 The game path without Wine:
 

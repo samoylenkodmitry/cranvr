@@ -4,7 +4,8 @@
 # encode time, the client's latency split by stage) and the median and worst of each.
 #
 # Usage: scripts/e2e.sh [--seconds N] [--fps HZ] [--game | --wine PROGRAM [--wine-arg ARG]...] [--desktop]
-#                       [--android [SERIAL] [--wifi] [--pause-tailscale] | --quest [SERIAL] [--cranvr-client]]
+#                       [--android [SERIAL] [--wifi] [--pause-tailscale] | --quest [SERIAL] [--cranvr-client]
+#                        | --native [--native-tcp] [--native-drop PERCENT] [--native-port PORT]]
 #                       [--host-arg ARG]... [--report FILE]
 #
 #   --seconds N   how long the stream runs (default 20)
@@ -35,6 +36,15 @@
 #   --cranvr-client with --quest: the client is cranvr's own Quest app (dev.cranvr.client, see
 #                 scripts/build-quest.sh) instead of the store ALVR app.
 #                 Without either the client is cranvr-probe on this Mac, over loopback TCP.
+#   --native      cranvr's own protocol instead of ALVR's: the host runs with --protocol native
+#                 and cranvr-probe connects to it over loopback, with UDP media and parity packets.
+#                 The report's latency block comes from the headset's frame timing reports. It adds
+#                 the loss, the parity and the clock round trip. It cannot combine with --android
+#                 or --quest. It has no game sound and no desktop layer yet.
+#   --native-tcp  with --native: the media goes over TCP, as it does over USB with `adb reverse`
+#   --native-drop PERCENT  with --native: the probe drops this share of the media packets, so the
+#                 parity has loss to recover
+#   --native-port PORT  with --native: the host's TCP port (default 9950)
 #   --host-arg ARG one more cranvr-host argument, for an A/B run of a setting:
 #                 --host-arg --buffering-frames --host-arg 1
 #   --report FILE where the report goes (default: target/e2e/run-<time>/report.json)
@@ -48,6 +58,7 @@ set -euo pipefail
 root=${0:A:h:h}
 seconds=20 fps=120 game=0 desktop=0 client=mac serial="" report="" wifi=0 pause_tailscale=0
 wine="" wine_args=() cranvr_client=0
+native=0 native_tcp=0 native_drop=0 native_port=9950
 more_host_args=()
 # The arguments other than the client, for the run under a device lock
 other_args=()
@@ -60,6 +71,10 @@ while (( $# )); do
         --wine) wine=$2; other_args+=("$1" "$2"); shift 2 ;;
         --wine-arg) wine_args+=("$2"); other_args+=("$1" "$2"); shift 2 ;;
         --cranvr-client) cranvr_client=1; other_args+=("$1"); shift ;;
+        --native) native=1; other_args+=("$1"); shift ;;
+        --native-tcp) native_tcp=1; other_args+=("$1"); shift ;;
+        --native-drop) native_drop=$2; other_args+=("$1" "$2"); shift 2 ;;
+        --native-port) native_port=$2; other_args+=("$1" "$2"); shift 2 ;;
         --wifi) wifi=1; other_args+=("$1"); shift ;;
         --pause-tailscale) pause_tailscale=1; other_args+=("$1"); shift ;;
         --android|--quest)
@@ -70,6 +85,11 @@ while (( $# )); do
         *) print -u2 "unknown option $1"; exit 2 ;;
     esac
 done
+
+if (( native )) && [[ ${client} != mac ]]; then
+    print -u2 "--native runs the probe on this Mac: it cannot combine with --android or --quest."
+    exit 2
+fi
 
 # A device: its serial from the arguments, or the first that passes `fits`
 pick_device() {
@@ -107,7 +127,15 @@ fi
 
 host_args=(--status --config-dir "${work}/config" --fps "${fps}")
 case ${client} in
-    mac) host_args+=(--trust-all --tcp) ;;
+    mac)
+        if (( native )); then
+            # The host listens on this Mac only, so it needs no trust option
+            host_args+=(--protocol native --native-port "${native_port}")
+            (( native_tcp )) && host_args+=(--tcp)
+        else
+            host_args+=(--trust-all --tcp)
+        fi
+        ;;
     android) ;;
     quest) host_args+=(--trust-all) ;;
 esac
@@ -291,6 +319,10 @@ if [[ -n ${wine} ]]; then
 fi
 
 probe_args=(--seconds "${seconds}")
+if (( native )); then
+    probe_args+=(--protocol native --connect "127.0.0.1:${native_port}" --drop-percent "${native_drop}")
+    (( native_tcp )) && probe_args+=(--tcp)
+fi
 (( game )) && probe_args+=(--game)
 # A real program and the desktop scene draw no eye badges
 if [[ -n ${wine} ]] || (( desktop )); then
@@ -339,7 +371,8 @@ protocol=udp
 if (( ${host_args[(Ie)--tcp]} )); then
     protocol=tcp
 fi
-extra=(mode=${mode} protocol=${protocol} "warnings=${(j: | :)device_warnings}" client_exit=${client_exit} game=${game} "wine=${wine}" desktop=${desktop} seconds=${seconds} \
+(( native )) && mode+=-native
+extra=(mode=${mode} protocol=${protocol} native_drop=${native_drop} "warnings=${(j: | :)device_warnings}" client_exit=${client_exit} game=${game} "wine=${wine}" desktop=${desktop} seconds=${seconds} \
     work=${work} "host_args=${more_host_args[*]}")
 # The probe's count of frames that reached its decoder, and of frames it showed with the right picture
 done_line=$(grep -h "probe: done" "${work}/probe.log" 2>/dev/null || true)
@@ -359,6 +392,6 @@ fi
 result=0
 python3 -I "${root}/scripts/e2e-report.py" "${work}/host.out" "${fps}" "${report}" "${extra[@]}" || result=$?
 (( client_exit == 0 )) || result=1
-grep -hE "probe: (done|frame arrival|game audio)" "${work}/probe.log" 2>/dev/null || true
+grep -hE "probe: (done|frame arrival|native|game audio)" "${work}/probe.log" 2>/dev/null || true
 print "Report: ${report}"
 exit ${result}
