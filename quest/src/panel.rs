@@ -51,12 +51,16 @@ const WIDTH: f32 = 2.2;
 const EXTRA_WIDTH: f32 = 1.6;
 const MIN_WIDTH: f32 = 0.3;
 const MAX_WIDTH: f32 = 6.0;
-/// The handle bar: its gap to the panel's bottom edge and its height
+/// The buttons' row: its gap to the panel's bottom edge and the room left of the buttons, where
+/// the handle sits
 const HANDLE_GAP: f32 = 0.04;
 const HANDLE_HEIGHT: f32 = 0.018;
 const HANDLE_WIDTH: f32 = 0.2;
-/// The handle catches a ray within this height, more than the bar itself
-const HANDLE_REACH: f32 = 0.07;
+/// The handle: a ball under the middle of the panel's bottom edge, outside the panel. Its radius
+/// and its gap to the edge, and how near a ray must pass its center to catch it
+const KNOB_RADIUS: f32 = 0.03;
+const KNOB_GAP: f32 = 0.02;
+const KNOB_REACH: f32 = 0.06;
 /// The buttons' height and the gap between them
 const BUTTON_HEIGHT: f32 = 0.04;
 const BUTTON_GAP: f32 = 0.012;
@@ -182,7 +186,7 @@ pub struct BarButton {
     pub look: Look,
 }
 
-/// A panel's handle and buttons, as one flat picture under the panel.
+/// A panel's buttons, as one flat picture under the panel, right of its handle.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Bar {
     pub panel: u8,
@@ -190,8 +194,6 @@ pub struct Bar {
     pub orientation: Quat,
     /// Width and height in meters
     pub size: (f32, f32),
-    /// The handle's center and size in meters from the bar's center, and its look
-    pub handle: ((f32, f32), (f32, f32), Look),
     pub buttons: Vec<BarButton>,
 }
 
@@ -295,8 +297,21 @@ impl Panel {
         -(self.height / 2.0 + HANDLE_GAP + HANDLE_HEIGHT / 2.0)
     }
 
-    fn handle_width(&self) -> f32 {
-        HANDLE_WIDTH
+    /// The center of the handle's ball: under the middle of the bottom edge, as far in front of
+    /// the panel as its radius.
+    pub fn knob(&self) -> Vec3 {
+        self.at(0.0, -(self.height / 2.0 + KNOB_GAP + KNOB_RADIUS)) + self.normal() * KNOB_RADIUS
+    }
+
+    /// How far along a ray from `origin` in `dir` the ray first meets the handle's ball, from
+    /// any side.
+    fn knob_hit(&self, origin: Vec3, dir: Vec3) -> Option<f32> {
+        let to_center = self.knob() - origin;
+        let along = to_center.dot(dir);
+        let miss = to_center.length_squared() - along * along;
+        let inside = KNOB_REACH * KNOB_REACH - miss;
+        let distance = along - inside.max(0.0).sqrt();
+        (inside >= 0.0 && distance > 0.0).then_some(distance)
     }
 
     /// Where a ray from `origin` along `dir` meets the panel's plane from the front: the distance
@@ -397,8 +412,6 @@ impl Slot {
             Part::Corner
         } else if x.abs() <= w && y.abs() <= h {
             Part::Screen { u: x / p.width + 0.5, v: 0.5 - y / p.height }
-        } else if x.abs() <= p.handle_width() / 2.0 + 0.02 && (y - p.handle_offset()).abs() <= HANDLE_REACH / 2.0 {
-            Part::Handle
         } else {
             let (button, ..) = self
                 .buttons(can_add)
@@ -816,9 +829,12 @@ impl PanelControl {
         let ray = |hand: &Hand| hand.aim.map(|a| (a.position, a.orientation * Vec3::NEG_Z));
         let targets = inputs.hands.map(|hand| {
             ray(&hand).and_then(|(o, d)| {
+                let knob = |id: u8, panel: &Panel| panel.knob_hit(o, d).map(|distance| Hit { panel: id, distance, part: Part::Handle });
                 self.shown_slots()
                     .filter_map(|s| s.hit(o, d, can_add))
+                    .chain(self.shown_slots().filter_map(|s| knob(s.id, &s.panel)))
                     .chain(self.console_hit(o, d))
+                    .chain(self.console.as_ref().and_then(|(panel, _)| knob(CONSOLE_ID, panel)))
                     .min_by(|a, b| a.distance.total_cmp(&b.distance))
             })
         });
@@ -900,9 +916,16 @@ impl PanelControl {
                 (Part::Handle, _) => {
                     if let Some(panel) = slot.map(|s| s.panel).or(console.map(|c| c.0)) {
                         let point = origin + dir * hit.distance;
-                        let offset = panel.orientation.inverse() * (panel.center - point);
+                        // A panel grabbed from behind turns half around while it is carried, so
+                        // its picture comes to face the user
+                        let orientation = if dir.dot(panel.normal()) > 0.0 {
+                            panel.orientation * Quat::from_rotation_y(std::f32::consts::PI)
+                        } else {
+                            panel.orientation
+                        };
+                        let offset = orientation.inverse() * (panel.center - point);
                         let aim = inputs.hands[self.active].aim.map_or(Quat::IDENTITY, |a| a.orientation);
-                        let relative = aim.inverse() * panel.orientation;
+                        let relative = aim.inverse() * orientation;
                         self.grab = Some((self.active, hit.panel, Grab::Move { distance: hit.distance, offset, relative }));
                     }
                 }
@@ -1033,15 +1056,8 @@ impl PanelControl {
                 let hovered = |part: Part| self.targets.iter().flatten().any(|t| t.panel == slot.id && t.part == part);
                 let buttons = slot.buttons(can_add);
                 let right = buttons.last().map_or(HANDLE_WIDTH / 2.0, |(b, x, _)| x + b.width() / 2.0) + BAR_MARGIN;
-                let left = -HANDLE_WIDTH / 2.0 - BAR_MARGIN;
+                let left = buttons.first().map_or(HANDLE_WIDTH / 2.0, |(b, x, _)| x - b.width() / 2.0) - BAR_MARGIN;
                 let (cx, height) = ((left + right) / 2.0, BUTTON_HEIGHT + 2.0 * BAR_MARGIN);
-                let handle = if matches!(self.grab, Some((_, id, Grab::Move { .. })) if id == slot.id) {
-                    Look::Active
-                } else if hovered(Part::Handle) {
-                    Look::Hover
-                } else {
-                    Look::Idle
-                };
                 let buttons = buttons
                     .into_iter()
                     .map(|(button, x, _)| {
@@ -1064,7 +1080,6 @@ impl PanelControl {
                     center: p.at(cx, p.handle_offset()) + p.normal() * 0.001,
                     orientation: p.orientation,
                     size: (right - left, height),
-                    handle: ((-cx, 0.0), (HANDLE_WIDTH, HANDLE_HEIGHT), handle),
                     buttons,
                 }
             })
@@ -1123,6 +1138,27 @@ impl PanelControl {
                     draws.push(OverlayDraw { shape: flat(thick, arm, thick / 2.0), model: on_panel(cx, cy - sy * arm / 2.0, 0.002), color });
                 }
             }
+        }
+
+        // The handles: a ball under each window, lit from every side
+        let knob_look = |id: u8| {
+            if matches!(self.grab, Some((_, grabbed, Grab::Move { .. })) if grabbed == id) {
+                Look::Active
+            } else if self.targets.iter().flatten().any(|t| t.panel == id && t.part == Part::Handle) {
+                Look::Hover
+            } else {
+                Look::Idle
+            }
+        };
+        let knobs = self.shown_slots().map(|s| (s.id, s.panel)).chain(self.console.as_ref().map(|(p, _)| (CONSOLE_ID, *p)));
+        for (id, panel) in knobs {
+            let color = match knob_look(id) {
+                Look::Idle => [0.62, 0.64, 0.68, 1.0],
+                Look::Hover => [0.95, 0.96, 0.98, 1.0],
+                Look::Active => [0.45, 0.7, 1.0, 1.0],
+            };
+            let model = Mat4::from_scale_rotation_translation(Vec3::splat(KNOB_RADIUS * 2.0), panel.orientation, panel.knob());
+            draws.push(OverlayDraw { shape: OverlayShape::Sphere, model, color });
         }
 
         // The console's frame: boxes around its face give it a depth
@@ -1228,6 +1264,30 @@ mod tests {
     }
 
     #[test]
+    fn the_handle_ball_catches_a_ray_from_behind_and_the_carry_turns_the_panel_to_the_user() {
+        let mut control = control("behind");
+        let streams = [(0, ASPECT, 3840)];
+        let p = control.slots[0].panel;
+        // A controller a meter behind the panel, pointing at the ball
+        let origin = p.center - p.normal();
+        let dir = (p.knob() - origin).normalize();
+        let hands = |trigger| {
+            let aim = Pose { orientation: Quat::from_rotation_arc(Vec3::NEG_Z, dir), position: origin };
+            [Hand::default(), Hand { aim: Some(aim), grip: None, trigger, stick_y: 0.0 }]
+        };
+        let mut update = |trigger| control.update(&Inputs { hands: hands(trigger), head: head(), stick_click: false, dt: 0.01 }, &streams);
+        update(0.0);
+        for _ in 0..80 {
+            update(1.0);
+        }
+        let carried = control.slots[0].panel;
+        let to_controller = (origin - carried.center).normalize();
+        assert!(carried.normal().dot(to_controller) > 0.9, "{carried:?}");
+        assert!((carried.center - p.center).length() < 0.05, "{carried:?}");
+        std::fs::remove_file(&control.store).ok();
+    }
+
+    #[test]
     fn a_new_panel_faces_the_user() {
         let p = panel();
         assert!((p.center - Vec3::new(0.0, 1.6, -DISTANCE)).length() < 1e-5);
@@ -1236,7 +1296,7 @@ mod tests {
     }
 
     #[test]
-    fn rays_hit_the_picture_the_handle_a_button_a_corner_or_nothing() {
+    fn rays_hit_the_picture_a_button_a_corner_or_nothing() {
         let slot = Slot { id: 0, panel: panel(), state: PanelState::default() };
         let p = slot.panel;
         let eye = head().position;
@@ -1245,7 +1305,6 @@ mod tests {
         assert!((u - 0.5).abs() < 1e-4 && (v - 0.5).abs() < 1e-4);
         let Some(Part::Screen { u, v }) = part(p.at(-0.5, 0.3)) else { panic!() };
         assert!(u < 0.5 && v < 0.5);
-        assert_eq!(part(p.at(0.0, p.handle_offset())), Some(Part::Handle));
         let (button, x, y) = slot.buttons(true)[0];
         assert_eq!(part(p.at(x, y)), Some(Part::Button(button)));
         assert_eq!(part(p.at(p.width / 2.0 + 0.02, p.height / 2.0 + 0.02)), Some(Part::Corner));
@@ -1275,7 +1334,7 @@ mod tests {
         assert_eq!(step(&mut control, &streams, Vec3::Y, 1.0).trigger, 1.0);
         step(&mut control, &streams, Vec3::Y, 0.0);
         // pointing at the handle neither moves the mouse nor clicks; the press grabs the handle
-        let to_handle = Quat::from_rotation_arc(Vec3::NEG_Z, (p.at(0.0, p.handle_offset()) - ORIGIN).normalize());
+        let to_handle = Quat::from_rotation_arc(Vec3::NEG_Z, (p.knob() - ORIGIN).normalize());
         let out = step_aim(&mut control, &streams, to_handle, 1.0);
         assert_eq!((out.pointer, out.trigger), (None, 0.0));
         let angle = |c: &PanelControl, aim: Quat| (aim * Vec3::NEG_Z).angle_between(c.slots[0].panel.normal());
@@ -1550,7 +1609,7 @@ mod tests {
         let mut control = control("push");
         let streams = [(0, ASPECT, 3840)];
         let p = control.slots[0].panel;
-        let aim = Pose { orientation: Quat::from_rotation_arc(Vec3::NEG_Z, (p.at(0.0, p.handle_offset()) - ORIGIN).normalize()), position: ORIGIN };
+        let aim = Pose { orientation: Quat::from_rotation_arc(Vec3::NEG_Z, (p.knob() - ORIGIN).normalize()), position: ORIGIN };
         let hands = |stick_y| [Hand::default(), Hand { aim: Some(aim), grip: None, trigger: 0.0, stick_y }];
         for _ in 0..50 {
             control.update(&Inputs { hands: hands(1.0), head: head(), stick_click: false, dt: 0.01 }, &streams);
