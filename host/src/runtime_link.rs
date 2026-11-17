@@ -16,7 +16,10 @@ use std::{
     net::{TcpListener, TcpStream},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -94,6 +97,28 @@ pub struct Haptic {
     pub amplitude: f32,
 }
 
+/// What the host handed to the game's runtime and got back from it, since the last `take_counts`.
+/// The host's stats line shows it, so a log says whether the controllers reached the game.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InputCounts {
+    /// Controller poses sent, for the left and the right hand
+    pub poses: [u32; 2],
+    /// The newest mask of tracked controllers: bit 0 left, bit 1 right
+    pub mask: u32,
+    /// Button and axis values sent
+    pub buttons: u32,
+    /// Haptic pulses that the game asked for
+    pub haptics: u32,
+}
+
+#[derive(Default)]
+struct InputCounters {
+    poses: [AtomicU32; 2],
+    mask: AtomicU32,
+    buttons: AtomicU32,
+    haptics: AtomicU32,
+}
+
 /// What the host knows about the headset, sent to each new runtime connection.
 #[derive(Clone, Copy, Default)]
 struct Calibration {
@@ -107,6 +132,7 @@ pub struct RuntimeLink {
     /// When the host last sent the runtime anything
     last_sent: Mutex<Instant>,
     calibration: Mutex<Calibration>,
+    counters: InputCounters,
     control_file: PathBuf,
     port: u16,
     token: String,
@@ -129,6 +155,7 @@ impl RuntimeLink {
             writer: Mutex::new(None),
             last_sent: Mutex::new(Instant::now()),
             calibration: Mutex::new(Calibration::default()),
+            counters: InputCounters::default(),
             control_file: control_file.to_owned(),
             port,
             token: random_token()?,
@@ -285,6 +312,7 @@ impl RuntimeLink {
                 msg::HAPTIC => {
                     let hand = r.u32()?;
                     let duration = Duration::from_nanos(r.u64()?);
+                    self.counters.haptics.fetch_add(1, Ordering::Relaxed);
                     on_haptic(Haptic { hand, duration, frequency: r.f32()?, amplitude: r.f32()? });
                 }
                 msg::TEARDOWN => {
@@ -320,6 +348,7 @@ impl RuntimeLink {
     }
 
     pub fn controller(&self, timestamp_ns: u64, hand: u32, motion: &DeviceMotion) {
+        self.counters.poses[(hand as usize).min(1)].fetch_add(1, Ordering::Relaxed);
         let mut p = timestamp_ns.to_le_bytes().to_vec();
         p.extend_from_slice(&hand.to_le_bytes());
         p.extend_from_slice(&0u32.to_le_bytes());
@@ -334,6 +363,7 @@ impl RuntimeLink {
 
     /// Which controllers are tracked: bit 0 left, bit 1 right.
     pub fn controller_mask(&self, timestamp_ns: u64, mask: u32) {
+        self.counters.mask.store(mask, Ordering::Relaxed);
         let mut p = timestamp_ns.to_le_bytes().to_vec();
         p.extend_from_slice(&mask.to_le_bytes());
         p.extend_from_slice(&0u32.to_le_bytes());
@@ -342,10 +372,22 @@ impl RuntimeLink {
 
     /// An ALVR button: `scalar` false sends a binary value (0 or 1).
     pub fn button(&self, path_id: u64, scalar: bool, value: f32) {
+        self.counters.buttons.fetch_add(1, Ordering::Relaxed);
         let mut p = path_id.to_le_bytes().to_vec();
         p.extend_from_slice(&(scalar as u32).to_le_bytes());
         p.extend_from_slice(&value.to_le_bytes());
         self.send(msg::BUTTON_STATE, &p);
+    }
+
+    /// What went to the runtime and came back from it since the last call.
+    pub fn take_counts(&self) -> InputCounts {
+        let c = &self.counters;
+        InputCounts {
+            poses: [c.poses[0].swap(0, Ordering::Relaxed), c.poses[1].swap(0, Ordering::Relaxed)],
+            mask: c.mask.load(Ordering::Relaxed),
+            buttons: c.buttons.swap(0, Ordering::Relaxed),
+            haptics: c.haptics.swap(0, Ordering::Relaxed),
+        }
     }
 
     /// IPD in meters and the field of view of each eye (left, right, up, down; radians).

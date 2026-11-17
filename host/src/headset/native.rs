@@ -358,16 +358,39 @@ fn device_of(t: &Tracking, device: Device) -> Option<Motion> {
     }
 }
 
+/// The offset that ALVR's client applies to a Quest controller's grip pose before it sends the
+/// pose (`get_controller_offset` in `quest/src/interaction.rs`, from ALVR v20): the runtimes'
+/// grip poses do not follow the OpenXR specification exactly. The native client sends the grip
+/// pose as the headset reports it. The host applies the offset, so a game, the desktop pointer
+/// (`--pointer-pitch` was tuned with ALVR's poses) and the test scene's markers see the pose that
+/// they see with ALVR. The offset is that of the left controller. The right one mirrors it.
+fn hand_offset(device: Device) -> AlvrPose {
+    let left = AlvrPose { orientation: Quat::from_rotation_x(-15f32.to_radians()), position: Vec3::new(-0.005, -0.005, 0.0) };
+    match device {
+        Device::RightHand => {
+            let (p, q) = (left.position, left.orientation);
+            AlvrPose { orientation: Quat::from_xyzw(-q.x, q.y, q.z, -q.w), position: Vec3::new(-p.x, p.y, p.z) }
+        }
+        Device::LeftHand | Device::Head => left,
+    }
+}
+
 /// The motion for the host's scene or game. The poses of the headset lie in its room, whose origin
 /// is where the head was when the app started. The host's scenes and games want the floor at
 /// height 0, so the room moves up by the height of the floor below its origin. `floor` is 0 until
-/// the client says where its floor is.
-fn device_motion(motion: Motion, floor: f32) -> DeviceMotion {
+/// the client says where its floor is. A hand's pose moves by `hand_offset`.
+fn device_motion(device: Device, motion: Motion, floor: f32) -> DeviceMotion {
+    let orientation = Quat::from_array(motion.pose.orientation);
+    let position = Vec3::from_array(motion.pose.position) - Vec3::new(0.0, floor, 0.0);
+    let pose = match device {
+        Device::Head => AlvrPose { orientation, position },
+        Device::LeftHand | Device::RightHand => {
+            let offset = hand_offset(device);
+            AlvrPose { orientation: orientation * offset.orientation, position: position + orientation * offset.position }
+        }
+    };
     DeviceMotion {
-        pose: AlvrPose {
-            orientation: Quat::from_array(motion.pose.orientation),
-            position: Vec3::from_array(motion.pose.position) - Vec3::new(0.0, floor, 0.0),
-        },
+        pose,
         linear_velocity: Vec3::from_array(motion.linear_velocity),
         angular_velocity: Vec3::from_array(motion.angular_velocity),
     }
@@ -611,14 +634,20 @@ impl Session {
     }
 
     /// The display time that a frame sent now can make, on the headset's clock: the first refresh
-    /// after the frame has crossed the network and decoded. 0 while the clocks are not in sync.
+    /// after the frame has crossed the network and decoded, and after the headset's frame loop has
+    /// taken it. The loop takes a frame at the start of a headset frame, which reaches the display
+    /// one lead later. A target that leaves the lead out lies before the display time of the
+    /// headset frame that takes the frame, so the headset's queue counts the frame as late and
+    /// skips frames (the host's game frames did this: 90 shown and 29 skipped in a second, of 120).
+    /// 0 while the clocks are not in sync.
     fn target_display(&self, now: Nanos) -> Nanos {
         let (Some(client_now), Some(estimate)) = (self.client_time(now), self.clock.lock().unwrap().estimate()) else { return 0 };
+        let lead = self.lock.lock().unwrap().lead_ns();
         let display = self.display.lock().unwrap();
         if display.next == 0 {
             return 0;
         }
-        let ready = client_now + estimate.rtt_ns / 2 + display.decode as Nanos + DISPLAY_MARGIN.as_nanos() as Nanos;
+        let ready = client_now + estimate.rtt_ns / 2 + display.decode as Nanos + DISPLAY_MARGIN.as_nanos() as Nanos + lead;
         grid_at_or_after(display.next, display.period, ready)
     }
 
@@ -684,7 +713,7 @@ impl Headset for Native {
         let history = session.history.lock().unwrap();
         let t = history.find(sample_ns)?;
         let floor = session.floor.lock().unwrap().unwrap_or(0.0);
-        Some(device_motion(device_of(t, device)?, floor))
+        Some(device_motion(device, device_of(t, device)?, floor))
     }
 
     fn motion_at(&self, device: Device, sample_ns: u64, target: u64) -> Option<DeviceMotion> {
@@ -697,7 +726,7 @@ impl Headset for Native {
             motion.pose = extrapolate(&motion, seconds);
         }
         let floor = session.floor.lock().unwrap().unwrap_or(0.0);
-        Some(device_motion(motion, floor))
+        Some(device_motion(device, motion, floor))
     }
 
     fn frame_plan(&self) -> Option<FramePlan> {
@@ -777,11 +806,13 @@ impl Headset for Native {
             }
             sent.push_back(SentFrame { frame: index, sent: now });
         }
-        // The planner counts the frame. A frame without a plan counts from its send, which makes
-        // its measured need shorter than a planned frame's.
+        // The planner counts the frame. A frame without a plan teaches it the lead only: the
+        // frame's measured need would start at its send and read shorter than a planned frame's.
         if target_display != 0 {
-            let start = frame.plan.map_or_else(|| session.client_time(now).unwrap_or(0), |plan| plan.start);
-            session.lock.lock().unwrap().sent(frame.sample_ns, target_display, start);
+            match frame.plan {
+                Some(plan) => session.lock.lock().unwrap().sent(frame.sample_ns, target_display, plan.start),
+                None => session.lock.lock().unwrap().sent_unplanned(frame.sample_ns, target_display),
+            }
             if let Some(t) = session.history.lock().unwrap().find(frame.sample_ns) {
                 if let Some(seconds) = horizon_seconds(t.display_time, target_display) {
                     let mut stats = session.stats.lock().unwrap();

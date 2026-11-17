@@ -1190,6 +1190,13 @@ fn frame_loop(
                 warn!("Game audio: {unreadable} buffers in a format the host cannot read");
             }
             let poses = pose_gaps::take(secs);
+            let input = link.take_counts();
+            if game.connected || input.buttons > 0 || input.haptics > 0 {
+                info!(
+                    "Game input: {} left and {} right controller poses (tracked mask {:#b}), {} button and axis values, {} haptic pulses from the game",
+                    input.poses[0], input.poses[1], input.mask, input.buttons, input.haptics
+                );
+            }
             let layer_fps = shared.layer.frames.swap(0, Ordering::Relaxed) as f64 / secs;
             status::emit(json!({
                 "type": "stats",

@@ -119,6 +119,9 @@ struct InFlight {
     sample: Nanos,
     target: Nanos,
     start: Nanos,
+    /// A plan started the frame. A frame without one (a game's frame) says nothing about the
+    /// need of a planned frame or about the margin: it starts when the game finishes it.
+    planned: bool,
 }
 
 pub struct DisplayLock {
@@ -230,6 +233,13 @@ impl DisplayLock {
         percentile(&self.lead, PERCENTILE).unwrap_or(2.0 * self.period)
     }
 
+    /// The time from the pick to the display that the planner counts on, in ns. A frame that no
+    /// plan started needs it too, because the headset takes a frame one lead before the display
+    /// point that shows it.
+    pub fn lead_ns(&self) -> Nanos {
+        self.lead() as Nanos
+    }
+
     /// The next frame's start and target, given the time `now` on the headset's clock. `None`
     /// while the grid is unknown.
     pub fn plan(&self, now: Nanos) -> Option<Plan> {
@@ -279,7 +289,16 @@ impl DisplayLock {
         if self.in_flight.len() >= IN_FLIGHT {
             self.in_flight.pop_front();
         }
-        self.in_flight.push_back(InFlight { sample, target, start });
+        self.in_flight.push_back(InFlight { sample, target, start, planned: true });
+    }
+
+    /// Notes a frame that no plan started, with the target that the host gave it. The headset's
+    /// report of it still teaches the lead and counts in the stats.
+    pub fn sent_unplanned(&mut self, sample: Nanos, target: Nanos) {
+        if self.in_flight.len() >= IN_FLIGHT {
+            self.in_flight.pop_front();
+        }
+        self.in_flight.push_back(InFlight { sample, target, start: 0, planned: false });
     }
 
     /// Notes what the headset did with a frame.
@@ -288,7 +307,9 @@ impl DisplayLock {
         let older = at;
         self.in_flight.drain(..older);
         let frame = self.in_flight.pop_front().expect("the frame is at the front now");
-        push(&mut self.need, report.decode_end.saturating_sub(frame.start) as f64);
+        if frame.planned {
+            push(&mut self.need, report.decode_end.saturating_sub(frame.start) as f64);
+        }
         push(&mut self.lead, report.display_time.saturating_sub(report.picked) as f64);
         let points = ((report.display_time as f64 - frame.target as f64) / self.period).round();
         // Frames that were sent before this one and have no report were replaced, or they never
@@ -296,21 +317,28 @@ impl DisplayLock {
         // own points. The newer frame took their place. If this frame showed early, it was
         // ready at the pick of an older frame's point and replaced that frame. The fault is then
         // this frame's earliness.
+        let adapt = frame.planned;
         for _ in 0..older {
             self.stats.replaced += 1;
-            if points >= 0.0 {
+            if points >= 0.0 && adapt {
                 self.miss();
             }
         }
         if points == 0.0 {
             self.stats.on_time += 1;
-            self.margin_ms = (self.margin_ms - HIT_STEP_MS).max(MIN_MARGIN_MS);
+            if adapt {
+                self.margin_ms = (self.margin_ms - HIT_STEP_MS).max(MIN_MARGIN_MS);
+            }
         } else if points > 0.0 {
             self.stats.late += 1;
-            self.miss();
+            if adapt {
+                self.miss();
+            }
         } else {
             self.stats.early += 1;
-            self.margin_ms = (self.margin_ms - EARLY_STEP_MS).max(MIN_MARGIN_MS);
+            if adapt {
+                self.margin_ms = (self.margin_ms - EARLY_STEP_MS).max(MIN_MARGIN_MS);
+            }
         }
     }
 

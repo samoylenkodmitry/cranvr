@@ -392,7 +392,6 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
     let period = Duration::from_nanos(period_ns);
     let mut deadline = origin;
     let (mut last_report, mut last_ping, mut ping_id) = (origin, origin - PING_EVERY, 0u32);
-    let mut squeezed = false;
     while !shared.stop.load(Ordering::Relaxed) {
         let t = origin.elapsed().as_secs_f32();
         let sample_time = now_ns();
@@ -401,6 +400,13 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
         let display_time = next_refresh(vsync_origin, period_ns, sample_time + 2 * period_ns);
         let head = head_at(shared.pose_origin, display_time);
         let left = Motion { pose: Pose { orientation: [0.0, 0.0, 0.0, 1.0], position: [-0.2, 1.2, -0.4] }, ..Default::default() };
+        // The right hand swings 10 cm to each side of a point in front of the head, with its velocity
+        let swing = (t * std::f32::consts::PI).sin();
+        let right = Motion {
+            pose: Pose { orientation: [0.0, 0.0, 0.0, 1.0], position: [0.25 + 0.1 * swing, 1.1, -0.4] },
+            linear_velocity: [0.1 * std::f32::consts::PI * (t * std::f32::consts::PI).cos(), 0.0, 0.0],
+            ..Default::default()
+        };
         {
             let mut sent = shared.sent_poses.lock().unwrap();
             if sent.len() >= 512 {
@@ -413,16 +419,23 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
                 display_time,
                 head,
                 left: Some(left),
-                right: None,
+                right: Some(right),
             })).ok();
-        // Squeeze the left grip for half a second every 3 seconds, as a game test may ask
-        let squeeze = t % 3.0 > 2.5;
-        if squeeze != squeezed {
-            squeezed = squeeze;
-            let mut input = Input { sample_time, ..Default::default() };
-            input.hands[0] = HandInput { grip: if squeeze { 1.0 } else { 0.0 }, buttons: buttons::GRIP_CLICK * u32::from(squeeze), ..Default::default() };
-            shared.link.duplex.send_datagram(&ClientDatagram::Input(input)).ok();
-        }
+        // The input goes out with each sample, as the client's does. For half a second in every
+        // 3 seconds the left grip squeezes, the right trigger goes to 0.75, A is down and the right
+        // stick leans to 0.5, as a game test may ask. A game answers the squeeze with a haptic pulse.
+        let held = t % 3.0 > 2.5;
+        let on = |v: f32| if held { v } else { 0.0 };
+        let mut input = Input { sample_time, ..Default::default() };
+        input.hands[0] = HandInput { grip: on(1.0), buttons: buttons::GRIP_CLICK * u32::from(held), ..Default::default() };
+        input.hands[1] = HandInput {
+            trigger: on(0.75),
+            stick: [on(0.5), 0.0],
+            buttons: (buttons::PRIMARY | buttons::TRIGGER_CLICK) * u32::from(held),
+            touches: buttons::PRIMARY * u32::from(held),
+            ..Default::default()
+        };
+        shared.link.duplex.send_datagram(&ClientDatagram::Input(input)).ok();
         if last_ping.elapsed() >= PING_EVERY {
             last_ping = Instant::now();
             shared.link.duplex.send_datagram(&ClientDatagram::Ping(Ping { id: ping_id, sent: now_ns() })).ok();

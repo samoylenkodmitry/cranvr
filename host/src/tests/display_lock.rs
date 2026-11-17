@@ -124,6 +124,22 @@ fn a_frame_shown_a_point_early_lowers_the_margin() {
     assert_eq!(lock.take_stats().early, 1);
 }
 
+#[test]
+fn a_frame_without_a_plan_teaches_the_lead_and_nothing_else() {
+    let mut lock = lock_with_grid();
+    // Before any report the lead is two periods
+    assert_eq!(lock.lead_ns(), 2 * PERIOD);
+    let (need, margin) = (lock.need(), lock.margin_ms);
+    for sample in 1..20 {
+        lock.sent_unplanned(sample, 2_000_000_000);
+        // Shown one point late, with a lead of 17 ms
+        lock.on_report(&report(sample, 2_000_000_000, 2_000_000_000 + PERIOD));
+    }
+    assert_eq!(lock.lead_ns(), 17 * MS as u64);
+    assert_eq!((lock.need(), lock.margin_ms), (need, margin), "a game's frames leave the planner's need and margin alone");
+    assert_eq!(lock.take_stats().late, 19);
+}
+
 /// A small generator, so that the simulation repeats.
 struct Rng(u64);
 

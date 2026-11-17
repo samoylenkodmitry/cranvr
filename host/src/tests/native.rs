@@ -124,6 +124,29 @@ fn input_changes_name_the_buttons_that_moved() {
 }
 
 #[test]
+fn a_hands_pose_carries_the_offset_that_alvrs_client_gives_a_quest_controller() {
+    let grip = Motion { pose: ProtoPose { position: [0.1, 1.2, -0.3], ..ProtoPose::IDENTITY }, linear_velocity: [0.0, 0.0, -1.0], ..Default::default() };
+    let left = device_motion(Device::LeftHand, grip, 0.0);
+    let right = device_motion(Device::RightHand, grip, 0.0);
+    // A pitch of 15 degrees down, and the shift mirrored between the hands
+    for hand in [&left, &right] {
+        let forward = hand.pose.orientation * Vec3::NEG_Z;
+        assert!((forward.y + 15f32.to_radians().sin()).abs() < 1e-5 && forward.x.abs() < 1e-6, "{forward:?}");
+        assert_eq!(hand.linear_velocity, Vec3::new(0.0, 0.0, -1.0));
+    }
+    assert!((left.pose.position - Vec3::new(0.095, 1.195, -0.3)).length() < 1e-6, "{:?}", left.pose.position);
+    assert!((right.pose.position - Vec3::new(0.105, 1.195, -0.3)).length() < 1e-6, "{:?}", right.pose.position);
+    // The head and the floor
+    let head = device_motion(Device::Head, grip, 0.3);
+    assert_eq!(head.pose.orientation, Quat::IDENTITY);
+    assert!((head.pose.position - Vec3::new(0.1, 0.9, -0.3)).length() < 1e-6);
+    // The offset turns with the hand: a hand turned 90 degrees to the left shifts along the other axis
+    let turned = Motion { pose: ProtoPose { orientation: Quat::from_rotation_y(90f32.to_radians()).to_array(), position: [0.0; 3] }, ..grip };
+    let shifted = device_motion(Device::LeftHand, turned, 0.0).pose.position;
+    assert!((shifted - Vec3::new(0.0, -0.005, 0.005)).length() < 1e-6, "{shifted:?}");
+}
+
+#[test]
 fn the_display_grid_gives_the_next_refresh() {
     // Refreshes at 1000, 1100, 1200, ...
     assert_eq!(grid_at_or_after(1000, 100, 1000), 1000);
@@ -267,7 +290,8 @@ fn a_native_client_connects_and_the_host_serves_it() {
         assert!(Instant::now() < deadline, "the host did not take the floor");
         thread::sleep(Duration::from_millis(5));
     }
-    assert!((headset.motion_at(Device::LeftHand, sample, sample).unwrap().pose.position.y - 0.4).abs() < 1e-4);
+    // The hand lies at the room's origin, which the floor moves up. The hand offset lowers it by 5 mm.
+    assert!((headset.motion_at(Device::LeftHand, sample, sample).unwrap().pose.position.y - 0.395).abs() < 1e-4);
     let mut seen = None;
     for _ in 0..20 {
         headset.send_frame(OutFrame {

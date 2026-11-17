@@ -305,10 +305,19 @@ for i in {1..50}; do
     sleep 0.2
 done
 
+game_pid=""
 if (( game )); then
-    "${bin}/cranvr-fake-game" --control "${work}/config/runtime-control.txt" --fps "${fps}" \
-        --seconds $(( seconds + 60 )) > "${work}/game.log" 2>&1 &
-    pids+=($!)
+    # With the native protocol the fake game also checks the controller input of the probe's script
+    # (see cranvr-fake-game) and ends a few seconds after the probe, so its exit code counts.
+    if (( native )); then
+        "${bin}/cranvr-fake-game" --control "${work}/config/runtime-control.txt" --fps "${fps}" \
+            --seconds $(( seconds + 4 )) --expect-input > "${work}/game.log" 2>&1 &
+    else
+        "${bin}/cranvr-fake-game" --control "${work}/config/runtime-control.txt" --fps "${fps}" \
+            --seconds $(( seconds + 60 )) > "${work}/game.log" 2>&1 &
+    fi
+    game_pid=$!
+    pids+=(${game_pid})
 fi
 
 if [[ -n ${wine} ]]; then
@@ -360,6 +369,12 @@ case ${client} in
         ;;
 esac
 (( client_exit == 0 )) || print -u2 "The client failed; see ${work}/probe.log"
+game_exit=0
+if (( native && game )); then
+    wait ${game_pid} || game_exit=$?
+    grep -h "fake-game: input" "${work}/game.log" || true
+    (( game_exit == 0 )) || print -u2 "The fake game failed or saw wrong input; see ${work}/game.log"
+fi
 # The host prints a stats line every 5 seconds: wait for the last one
 sleep 5.5
 
@@ -392,6 +407,7 @@ fi
 result=0
 python3 -I "${root}/scripts/e2e-report.py" "${work}/host.out" "${fps}" "${report}" "${extra[@]}" || result=$?
 (( client_exit == 0 )) || result=1
+(( game_exit == 0 )) || result=1
 grep -hE "probe: (done|frame arrival|native|game audio)" "${work}/probe.log" 2>/dev/null || true
 print "Report: ${report}"
 exit ${result}
