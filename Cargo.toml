@@ -1,5 +1,5 @@
 [workspace]
-members = ["common", "vt", "host", "probe", "app"]
+members = ["common", "vt", "proto", "host", "probe", "app"]
 resolver = "2"
 
 [workspace.package]
@@ -20,6 +20,7 @@ alvr_client_core = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" 
 serde_json = "1"
 cranvr-vt = { path = "vt" }
 cranvr-common = { path = "common" }
+cranvr-proto = { path = "proto" }
 
 # Only cranvr-probe depends on the client core: see probe/alvr-client-core-loopback/Cargo.toml.
 # The server core copy keeps ALVR's web API on loopback: see host/alvr-server-core-local/Cargo.toml.
@@ -29,3 +30,8 @@ alvr_server_core = { path = "host/alvr-server-core-local" }
 
 [profile.release]
 debug = 1
+
+# Debug builds run the Reed-Solomon code in tests and in the host. It is about ten times slower without
+# optimization.
+[profile.dev.package.reed-solomon-simd]
+opt-level = 3
