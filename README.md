@@ -87,18 +87,29 @@ scripts/build-client.sh --install
 cargo run --manifest-path client/Cargo.toml -- --host=127.0.0.1:9950 --connect
 ```
 
-The host serves it with `cranvr-host --protocol native --no-foveation --trust cranvr-client`. The trust name is the client's device name. A client on the Mac itself needs no trust. The client cannot unwarp a foveated frame. Without `--no-foveation` the host picks an eye width of 2064 pixels, a picture of 4128 by 2208 pixels. The host's own comment puts its encoder at about 2 ms for each megapixel, so it is not expected to keep up at 120 Hz. This combination was not run. A Quest that is not on the Mac's network connects over USB: `adb reverse tcp:9950 tcp:9950`, then the address `127.0.0.1:9950`. A loopback address makes the client ask for the media over TCP.
+The host serves it with `cranvr-host --protocol native --trust "Meta Quest 3"`. The trust name is the client's device name, which the client takes from the headset's runtime. The host's warning for a client that it does not trust prints the name to pass. A client on the Mac itself needs no trust. The client cannot unwarp a foveated frame. The headset's compositor samples the picture as it is. Cranpose's `StreamedScene` takes no foveation parameters. The client therefore tells the host that it takes no foveation. The host then sends full frames. The host chooses the eye width for such a client: 1248 pixels at 120 Hz, 1504 at 90 Hz and 1728 at 72 Hz, unless `--eye-width` says otherwise. The width of 2064 belongs to a foveated eye. Without that rule the host sent a picture of 4128 by 2162 pixels. The host's encoder took 10.5 ms for each frame of that size, so the host sent 85 to 95 frames a second. The Quest 3 also showed green blocks in part of the picture. Its decoder advertises HEVC level 6.2, so the cause of the green blocks is not known. A Quest that is not on the Mac's network connects over USB: `adb reverse tcp:9950 tcp:9950`. The address is then `127.0.0.1:9950`. A loopback address makes the client ask for the media over TCP.
 
-The app has three parts. In a headset each is a movable panel in the room. On the desktop they draw side by side in a flat window.
+The app has four parts. In a headset the panels are movable panels in the room. On the desktop they draw side by side in a flat window.
 - The connect panel holds the host address, a keypad for it, the Connect button and the state of the link. Cranpose's preferences service remembers the address.
-- The stream is a `SpatialExternalSurface` with `StereoMode::SideBySide`. Cranpose's `VideoDecoder` writes the decoded frames into it. The compositor shows each half to one eye.
+- The stream is a `StreamedScene`. Cranpose's `VideoDecoder` outputs frames. The headset's compositor shows each one from the pose that the host rendered it for. It then corrects the picture for the head's newer pose. The client takes the render poses from the frame's metadata (`FrameMeta::eye_poses`). It takes the field of view from the views that it last sent to the host. Each eye's picture is one half of the frame.
 - The stats panel shows the frame rate, the decode time, the loss, the FEC recoveries and the latency.
+- A `SpatialFrameEffect` runs once for each headset frame. It hands the head pose, the eye views, both controllers and the predicted display time to the thread that sends the tracking.
 
-The launch arguments `host`, `connect` and `media` (`udp` or `tcp`) set the address, start the connection and choose the media path. On Android they are intent extras: `adb shell am start -n dev.cranvr.client2/dev.cranpose.android.CranposeActivity --es host 192.168.1.20:9950 --ez connect true`. On the desktop they are `--host=ADDRESS`, `--connect` and `--media=udp`.
+The launch arguments `host`, `connect` and `media` (`udp` or `tcp`) set the address, start the connection and choose the media path. The argument `hold_ms` holds each tracking sample for that many milliseconds before the client sends it. On Android they are intent extras: `adb shell am start -n dev.cranvr.client2/dev.cranpose.android.CranposeActivity --es host 192.168.1.20:9950 --ez connect true`. On the desktop they are `--host=ADDRESS`, `--connect` and `--media=udp`.
 
 `client/src/connection.rs` runs the link on its own threads. `client/src/hub.rs` hands the numbers to the UI. A `LaunchedEffect` copies them into Cranpose state four times a second.
 
-`client/src/tracking.rs` is the seam for the headset's per-frame data: the head pose, the controllers, the predicted display time and the eye views. Cranpose's public API does not carry them yet. Until it does, the client sends placeholder values: a still head, two still controllers and a display clock on a fixed grid. The host renders real pictures for these values. The pictures do not follow a real head. The desktop client cannot decode, because Cranpose's `VideoDecoder` has no desktop backend. It still connects, counts frames, restores lost packets and reports its timing.
+`client/src/tracking.rs` turns Cranpose's `XrFrame` into the protocol's messages:
+- The Hello carries the system name, the recommended eye size and the refresh rates of `HeadsetProperties`. It also carries the fields of view and the eyes' places in the head from the first tracked frame. A change of the distance between the eyes goes to the host as a `Views` message.
+- The runtime's display time and clock reading are on one clock. The client adds their difference to its own clock reading, so the display time lands on the client's clock.
+- Each headset frame sends one tracking sample. The head's velocities are the differences of two poses, because `XrFrame` has no head velocities. A controller's pose is its grip pose. The buttons, touches, trigger, grip and stick go to the host when they change.
+- A recenter of the headset goes to the host as a `Recenter` message. The host then puts its desktop screen in front of the user again.
+- The host's haptics pulses play on the controllers through `Haptics`.
+- The headset's compositor asks for the views of each frame that it takes for its display. That call is also the display time of the frame, which the client sends back as the frame's timing.
+
+The poses are in the app's room, the LOCAL space of OpenXR. Its origin lies where the head was when the app started, so the head's height is about 0. Cranpose reports no floor height. The poses go to the host as they are.
+
+Without a headset, as in a flat window, the client sends placeholder values: a still head at 1.6 m and two still controllers. The host renders pictures for them. The desktop client cannot decode, because Cranpose's `VideoDecoder` has no desktop backend. It still connects, counts frames, restores lost packets and reports its timing.
 
 ### cranvr's Quest app
 

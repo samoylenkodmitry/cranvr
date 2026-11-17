@@ -58,6 +58,9 @@ pub enum Event {
     Buttons(Vec<Button>),
     /// The client lost video and wants a frame that it can start from
     RequestIdr,
+    /// The headset's origin moved, because the user recentered. The poses that follow are relative
+    /// to the new origin. Only the native protocol reports it.
+    Recenter,
     /// The link wants the host to stop
     Stop,
     /// An event that the host has no use for

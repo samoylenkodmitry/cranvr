@@ -20,6 +20,9 @@ pub struct Options {
     pub native_port: u16,
     pub fps: f32,
     pub eye_width: u32,
+    /// The eye width for a native client without foveation, when the user gave no width. 0
+    /// means none.
+    pub eye_width_unfoveated: u32,
     pub mbps: u64,
     pub trust: Vec<String>,
     pub trust_all: bool,

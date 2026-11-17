@@ -157,6 +157,7 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
         native_port: 9950,
         fps: 120.0,
         eye_width: 0,
+        eye_width_unfoveated: 0,
         mbps: 100,
         trust: vec![],
         trust_all: false,
@@ -225,19 +226,29 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
             _ => usage(),
         }
     }
+    // A width that the user gave counts for every client. Otherwise a client that takes no
+    // foveation gets the size of the unfoveated table below.
+    options.eye_width_unfoveated = if options.eye_width == 0 { default_eye_width(false, options.fps as u32) } else { 0 };
     if options.eye_width == 0 {
-        // With strict rate control an M5 encoded about a megapixel in 2 ms (3200x1696 in 10.5 ms,
-        // 2496x1312 in 6.9 ms), and these sizes come from that; the overlapping encoder is faster
-        // (2432x1152 in 3.5 ms). With ALVR's default foveation a Quest 3 eye (2064 wide) encodes
-        // as about 1216x1152.
-        options.eye_width = match (options.foveation, options.fps as u32) {
-            (true, _) => 2064,
-            (false, 0..=72) => 1728,
-            (false, 73..=90) => 1504,
-            (false, _) => 1248,
-        };
+        options.eye_width = default_eye_width(options.foveation, options.fps as u32);
     }
     (options, desktop, config_dir)
+}
+
+/// The eye width that the host picks when the user gives none.
+fn default_eye_width(foveation: bool, fps: u32) -> u32 {
+    // With strict rate control an M5 encoded about a megapixel in 2 ms (3200x1696 in 10.5 ms,
+    // 2496x1312 in 6.9 ms), and these sizes come from that; the overlapping encoder is faster
+    // (2432x1152 in 3.5 ms). With ALVR's default foveation a Quest 3 eye (2064 wide) encodes
+    // as about 1216x1152. A client without foveation that got an eye of 2064 wide saw frames of
+    // 4128 by 2162 pixels. They took 10.5 ms each to encode, and a Quest 3 showed green blocks in
+    // part of the picture. Its decoder advertises HEVC level 6.2, so the cause is not known.
+    match (foveation, fps) {
+        (true, _) => 2064,
+        (false, 0..=72) => 1728,
+        (false, 73..=90) => 1504,
+        (false, _) => 1248,
+    }
 }
 
 /// Starts the capture of the Mac's sound in the background: ScreenCaptureKit takes up to a few
@@ -299,6 +310,7 @@ fn native_config(options: &Options) -> headset::native::Config {
         tcp_media: options.tcp,
         wishes: HostWishes {
             eye_width: options.eye_width,
+            eye_width_unfoveated: options.eye_width_unfoveated,
             refresh_hz: options.fps,
             bitrate_bps: options.mbps * 1_000_000,
             codecs: vec![Codec::Hevc],
@@ -523,6 +535,9 @@ fn main() {
                 }
             }
             Event::RequestIdr => shared.force_idr.store(true, Ordering::Relaxed),
+            // The headset's new origin makes the old screen place wrong: put the screen in front
+            // of the user again, as a click of the right thumbstick does
+            Event::Recenter => shared.inputs.lock().unwrap().recenter = true,
             Event::Stop => {
                 info!("The headset link asked the host to stop");
                 break;

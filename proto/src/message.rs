@@ -183,6 +183,21 @@ pub enum ClientMsg {
     /// The headset's views changed
     Views(Views),
     Bye,
+    /// The headset's runtime moved the origin of its tracking space, which the user asked for by
+    /// recentering. A receiver that does not know this message skips it.
+    Recenter(Recenter),
+}
+
+/// A change of the origin of the poses that the client sends. Every pose with a display time at or
+/// after `change_time` is relative to the new origin. Poses that came before it are relative to the
+/// old one.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Recenter {
+    /// When the new origin takes effect, on the client's clock. It may lie after the time at which
+    /// the client sends the message.
+    pub change_time: Nanos,
+    /// The new origin as a pose in the old space, when the runtime gives it
+    pub origin: Option<Pose>,
 }
 
 /// Control messages from the host to the client.
@@ -364,6 +379,10 @@ pub struct Audio {
 pub struct HostWishes {
     /// The eye width in pixels; 0 takes the client's own width
     pub eye_width: u32,
+    /// The eye width for a client that takes no foveation, when `foveation` is wished. The width
+    /// of a foveated eye counts pixels that the foveation then leaves out, so a client that takes
+    /// no foveation would get a picture that no encoder or decoder holds. 0 keeps `eye_width`.
+    pub eye_width_unfoveated: u32,
     pub refresh_hz: f32,
     pub bitrate_bps: u64,
     /// The codecs the host encodes, the preferred one first
@@ -388,7 +407,13 @@ pub fn negotiate(wishes: &HostWishes, caps: &ClientCaps) -> Result<StreamParams,
         .or_else(|| rates.first().copied())
         .ok_or(RejectReason::NoCommonRefreshRate)?;
     let [native_w, native_h] = caps.eye_size;
-    let width = if wishes.eye_width == 0 { native_w } else { wishes.eye_width };
+    let foveation = wishes.foveation.filter(|_| caps.foveation);
+    let wished = if wishes.foveation.is_some() && foveation.is_none() && wishes.eye_width_unfoveated != 0 {
+        wishes.eye_width_unfoveated
+    } else {
+        wishes.eye_width
+    };
+    let width = if wished == 0 { native_w } else { wished };
     // Keep the client's aspect ratio. Hardware encoders want even sizes.
     let height = ((width as u64 * native_h as u64 + native_w as u64 / 2) / native_w.max(1) as u64) as u32 & !1;
     Ok(StreamParams {
@@ -397,7 +422,7 @@ pub fn negotiate(wishes: &HostWishes, caps: &ClientCaps) -> Result<StreamParams,
         codec,
         refresh_hz,
         bitrate_bps: wishes.bitrate_bps,
-        foveation: wishes.foveation.filter(|_| caps.foveation),
+        foveation,
         full_range: wishes.full_range,
         slices: wishes.slices.max(1),
         audio: None,
