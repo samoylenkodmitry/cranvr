@@ -67,6 +67,19 @@ pub fn enable() {
         .ok();
 }
 
+/// Hands a console button's request, a JSON object, to the cranvr app as a `vr_request` status
+/// line. Returns whether the text was such an object.
+pub fn console_request(text: &str) -> bool {
+    match serde_json::from_str::<Value>(text) {
+        Ok(Value::Object(mut request)) => {
+            request.insert("type".into(), "vr_request".into());
+            emit(Value::Object(request));
+            true
+        }
+        _ => false,
+    }
+}
+
 pub fn emit(value: Value) {
     if let Some(kind) = value["type"].as_str() {
         LATEST.lock().unwrap().insert(kind.to_string(), value.clone());
@@ -75,5 +88,19 @@ pub fn emit(value: Value) {
         let mut out = std::io::stdout().lock();
         writeln!(out, "@cranvr {value}").ok();
         out.flush().ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_console_request_becomes_a_status_line() {
+        assert!(console_request(r#"{"action":"set","fps":90}"#));
+        let line = latest("vr_request").unwrap();
+        assert_eq!((line["action"].as_str(), line["fps"].as_u64()), (Some("set"), Some(90)));
+        // Anything but an object is no request
+        assert!(!console_request("not json") && !console_request("[1]"));
     }
 }

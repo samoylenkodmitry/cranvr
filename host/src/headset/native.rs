@@ -307,6 +307,7 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
             *floor = Some(height);
         }
         Incoming::Control(ClientMsg::Floor(_)) => {}
+        Incoming::Control(ClientMsg::Console(request)) => shared.emit(Event::Console(request)),
         Incoming::Control(ClientMsg::Recenter(recenter)) => {
             let ahead_ms = session.clock.lock().unwrap().to_local(recenter.change_time).map(|at| (at as i64 - now as i64) as f64 / 1e6);
             info!(
@@ -844,6 +845,14 @@ impl Headset for Native {
                 amplitude: haptic.amplitude,
             };
             session.link.duplex.send_datagram(&HostDatagram::Haptics(message)).ok();
+        }
+    }
+
+    fn send_menu(&self, menu: &str) {
+        if let Some(session) = self.shared.session() {
+            if let Err(e) = session.link.duplex.send_control(&HostMsg::Menu(menu.to_owned())) {
+                warn!("Native protocol: the console's menu did not go out: {e}");
+            }
         }
     }
 

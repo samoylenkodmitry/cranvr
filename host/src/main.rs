@@ -435,7 +435,10 @@ fn main() {
 
     let mut watch = network::StreamWatch::default();
     let mut layer_stop = Arc::new(AtomicBool::new(false));
+    // The console in the headset gets the menu when it connects and when it changes
+    let mut console = ConsoleMenu::default();
     loop {
+        console.update(&*headset);
         let event = match events.next(Duration::from_millis(50)) {
             Ok(event) => event,
             Err(RecvTimeoutError::Timeout) => continue,
@@ -444,6 +447,7 @@ fn main() {
         match event {
             Event::Connected { stream: negotiated, ip: client_ip } => {
                 watch.connected();
+                console.connected();
                 layer_stop.store(true, Ordering::Relaxed);
                 layer_stop = Arc::new(AtomicBool::new(false));
                 let display = shared.desktop_display.load(Ordering::Relaxed);
@@ -473,6 +477,7 @@ fn main() {
             }
             Event::Disconnected => {
                 info!("Headset disconnected");
+                console.disconnected();
                 layer_stop.store(true, Ordering::Relaxed);
                 if let Some(display) = virtual_display.as_mut().filter(|d| d.is_main()) {
                     match display.restore() {
@@ -557,6 +562,12 @@ fn main() {
                     link.button(button.path_id, button.scalar, value);
                 }
             }
+            Event::Console(request) => {
+                info!("The console asks for {request}");
+                if !status::console_request(&request) {
+                    warn!("A console request that is no JSON object");
+                }
+            }
             Event::RequestIdr => shared.force_idr.store(true, Ordering::Relaxed),
             // The headset's new origin makes the old screen place wrong: put the screen in front
             // of the user again, as a click of the right thumbstick does
@@ -566,6 +577,41 @@ fn main() {
                 break;
             }
             Event::Other => {}
+        }
+    }
+}
+
+/// How often the host looks for a new menu for the headset's console
+const MENU_EVERY: Duration = Duration::from_secs(1);
+
+/// Sends the console's menu to a connected headset, when it differs from the last one that went out.
+#[derive(Default)]
+struct ConsoleMenu {
+    connected: bool,
+    last: Option<String>,
+    checked: Option<Instant>,
+}
+
+impl ConsoleMenu {
+    fn connected(&mut self) {
+        self.connected = true;
+        self.last = None;
+        self.checked = None;
+    }
+
+    fn disconnected(&mut self) {
+        self.connected = false;
+    }
+
+    fn update(&mut self, headset: &dyn Headset) {
+        if !self.connected || self.checked.is_some_and(|at| at.elapsed() < MENU_EVERY) {
+            return;
+        }
+        self.checked = Some(Instant::now());
+        let Some(menu) = desktop_layer::menu().and_then(|bytes| String::from_utf8(bytes).ok()) else { return };
+        if self.last.as_deref() != Some(&menu) {
+            headset.send_menu(&menu);
+            self.last = Some(menu);
         }
     }
 }

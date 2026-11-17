@@ -62,6 +62,10 @@ pub enum Event {
     /// The headset's origin moved, because the user recentered. The poses that follow are relative
     /// to the new origin. Only the native protocol reports it.
     Recenter,
+    /// A press on a button of the headset's console, as a JSON text (see `status::console_request`).
+    /// Only the native protocol reports it. With ALVR the console's request travels through the
+    /// desktop layer.
+    Console(String),
     /// The link wants the host to stop
     Stop,
     /// An event that the host has no use for
@@ -152,6 +156,10 @@ pub trait Headset: Send + Sync {
     fn bitrate_bps(&self) -> Option<u64>;
 
     fn send_haptics(&self, haptic: Haptic);
+
+    /// Sends the console's menu as a JSON text, when the link has a console. With ALVR the
+    /// desktop layer sends the menu to the Quest app instead.
+    fn send_menu(&self, _menu: &str) {}
 
     /// The averages since the last call: the time of each stage from the pose to the display, and
     /// the link's own counters. `None` when no report came.

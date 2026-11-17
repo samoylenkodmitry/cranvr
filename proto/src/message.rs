@@ -197,6 +197,11 @@ pub enum ClientMsg {
     /// app started. The client sends it again when it changes. The host puts its scenes' floor
     /// there. A host that does not know the message skips it.
     Floor(f32),
+    /// A press on a button of the console, as the JSON object that the old client's console sent
+    /// (`{"action": "play", "game": "Beat Saber"}`, `{"action": "stop"}`, `{"action": "set",
+    /// "fps": 90}`). The host hands it to the cranvr app as a `vr_request` status line. A host
+    /// that does not know the message skips it.
+    Console(String),
 }
 
 /// A change of the origin of the poses that the client sends. Every pose with a display time at or
@@ -228,6 +233,11 @@ pub enum HostMsg {
     /// The host asks the client to prove that it holds its key. The client answers with
     /// [`ClientMsg::Proof`].
     Challenge([u8; 32]),
+    /// The console's menu as a JSON object: the games and the settings that the cranvr app
+    /// offers (its `vr-menu.json`) and the stream's state as `status`. The host sends it when the
+    /// client connects and again when it changes, at most once a second. A client that does not
+    /// know the message skips it.
+    Menu(String),
 }
 
 /// Datagram messages from the client to the host.

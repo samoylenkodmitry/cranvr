@@ -322,6 +322,18 @@ fn a_native_client_connects_and_the_host_serves_it() {
         }
     }
 
+    // The console: the host's menu reaches the client and a button's request reaches the host
+    headset.send_menu(r#"{"games":[],"fps":120}"#);
+    loop {
+        if let Heard::Control(HostMsg::Menu(menu)) = from_client.recv_timeout(Duration::from_secs(10)).unwrap() {
+            assert_eq!(menu, r#"{"games":[],"fps":120}"#);
+            break;
+        }
+    }
+    client.duplex.send_control(&ClientMsg::Console(r#"{"action":"play","game":"Beat Saber"}"#.into())).unwrap();
+    let Event::Console(request) = wait_for(&mut *events, |e| matches!(e, Event::Console(_))) else { unreachable!() };
+    assert_eq!(request, r#"{"action":"play","game":"Beat Saber"}"#);
+
     // A recenter of the headset reaches the frame loop as an event
     client.duplex.send_control(&ClientMsg::Recenter(Recenter { change_time: now_ns(), origin: None })).unwrap();
     wait_for(&mut *events, |e| matches!(e, Event::Recenter));
