@@ -10,7 +10,7 @@ use cranvr_proto::{
     link::{ClientLink, HostLink, HostListener, Incoming, MediaMode},
     media::{FrameReceiver, DEFAULT_SHARD_LEN},
     message::*,
-    wire::{Codec, Error, Pose},
+    wire::{Codec, Error, Motion, Pose},
     PROTOCOL_VERSION,
 };
 use std::{
@@ -129,7 +129,20 @@ fn datagrams_cross_by_udp_in_both_directions() {
             }
         })
     });
-    let tracking = Tracking { sample_time: 123_456_789, left: Some(Default::default()), ..Default::default() };
+    // Every pose differs, so a swap of two fields on the wire shows
+    let motion = |x: f32| Motion {
+        pose: Pose { orientation: [0.0, 0.0, 0.0, 1.0], position: [x, 1.0, -0.5] },
+        linear_velocity: [x, 0.5, 0.25],
+        angular_velocity: [0.0, x, 0.125],
+    };
+    let tracking = Tracking {
+        sample_time: 123_456_789,
+        left_grip: Some(motion(-0.2)),
+        right_grip: Some(motion(0.2)),
+        left_aim: Some(motion(-0.3)),
+        right_aim: None,
+        ..Default::default()
+    };
     // UDP may lose a datagram even on loopback when the machine is busy, so send until one comes
     let mut seen = None;
     for _ in 0..50 {
@@ -268,6 +281,23 @@ fn a_peer_of_another_version_is_told_so() {
     assert_eq!(chosen, None);
     assert_eq!(range, VersionRange::OURS);
     assert!(matches!(host.join().unwrap(), Some(Error::Version { .. })));
+}
+
+#[test]
+fn a_client_of_version_2_or_3_is_refused() {
+    // Version 3 changed the tracking sample. Version 4 seals the session. Neither older version
+    // can share a session with this crate: the older ones spoke in clear text.
+    for old in [2, 3] {
+        let listener = HostListener::bind("127.0.0.1:0", host_identity()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = thread::spawn(move || listener.accept().err());
+        let mut raw = TcpStream::connect(addr).unwrap();
+        raw.write_all(&client_preamble(VersionRange { min: old, max: old })).unwrap();
+        let mut answer = [0u8; HOST_PREAMBLE_LEN];
+        raw.read_exact(&mut answer).unwrap();
+        assert_eq!(parse_host_preamble(&answer).unwrap().0, None);
+        assert!(matches!(host.join().unwrap(), Some(Error::Version { .. })));
+    }
 }
 
 #[test]

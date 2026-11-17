@@ -47,8 +47,8 @@ fn the_desktop_messages_round_trip() {
 #[test]
 fn the_new_variants_leave_the_old_tags_alone() {
     let mut bytes = Vec::new();
-    // Version 3 took the challenge and the proof out: the handshake's own flights replace them.
-    // The tags below are those of version 3. A later variant stands after these.
+    // Version 4 took the challenge and the proof out: the handshake's own flights replace them.
+    // The tags below are those of version 4. A later variant stands after these.
     encode(&ClientMsg::Floor(1.0), &mut bytes).unwrap();
     assert_eq!(bytes[0], 5);
     bytes.clear();

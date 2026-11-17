@@ -13,7 +13,7 @@
 //! `--drop-percent` drops that share of the media packets before the receiver sees them, so a
 //! run on loopback can show the parity at work.
 
-use crate::{badge_points, compositor, native_desktop::DesktopProbe};
+use crate::{badge_points, compositor, hands, native_desktop::DesktopProbe};
 use cranvr_common::foveation::{Foveation, FoveationConfig};
 use cranvr_proto::{
     clock::{now_ns as process_now_ns, ClockSync},
@@ -438,14 +438,16 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
         // sample. The head's pose is the one that is valid then, as a headset predicts it.
         let display_time = next_refresh(vsync_origin, period_ns, sample_time + 2 * period_ns);
         let head = head_at(shared.pose_origin, display_time);
-        let left = Motion { pose: Pose { orientation: [0.0, 0.0, 0.0, 1.0], position: [-0.2, 1.2, -0.4] }, ..Default::default() };
-        // The right hand swings 10 cm to each side of a point in front of the head, with its velocity
+        // The left hand stays where it is. The right hand swings 10 cm to each side of a point in
+        // front of the head, with its velocity. Each hand has a grip pose and its own aim pose
+        // (see hands.rs).
+        let left = hands::grip(0, hands::LEFT_AT, [0.0; 3]);
         let swing = (t * std::f32::consts::PI).sin();
-        let right = Motion {
-            pose: Pose { orientation: [0.0, 0.0, 0.0, 1.0], position: [0.25 + 0.1 * swing, 1.1, -0.4] },
-            linear_velocity: [0.1 * std::f32::consts::PI * (t * std::f32::consts::PI).cos(), 0.0, 0.0],
-            ..Default::default()
-        };
+        let right = hands::grip(
+            1,
+            [hands::RIGHT_AT[0] + hands::RIGHT_SWING * swing, hands::RIGHT_AT[1], hands::RIGHT_AT[2]],
+            [hands::RIGHT_SWING * std::f32::consts::PI * (t * std::f32::consts::PI).cos(), 0.0, 0.0],
+        );
         {
             let mut sent = shared.sent_poses.lock().unwrap();
             if sent.len() >= 512 {
@@ -457,8 +459,10 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
                 sample_time,
                 display_time,
                 head,
-                left: Some(left),
-                right: Some(right),
+                left_grip: Some(left),
+                right_grip: Some(right),
+                left_aim: Some(hands::aim_with(0, &left)),
+                right_aim: Some(hands::aim_with(1, &right)),
             })).ok();
         // The input goes out with each sample, as the client's does. For half a second in every
         // 3 seconds the left grip squeezes, the right trigger goes to 0.75, A is down and the right

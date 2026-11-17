@@ -445,31 +445,18 @@ fn a_man_in_the_middle_that_swaps_the_fresh_key_breaks_the_host_signature() {
 }
 
 #[test]
-fn a_version_2_peer_is_refused_because_it_speaks_in_clear_text() {
-    let listener = HostListener::bind("127.0.0.1:0", host_identity()).unwrap();
-    let addr = listener.local_addr().unwrap();
-    let host = thread::spawn(move || listener.accept().err());
-    let mut raw = TcpStream::connect(addr).unwrap();
-    raw.write_all(&client_preamble(VersionRange { min: 2, max: 2 })).unwrap();
-    let mut answer = [0u8; HOST_PREAMBLE_LEN];
-    raw.read_exact(&mut answer).unwrap();
-    assert_eq!(parse_host_preamble(&answer).unwrap().0, None);
-    assert!(matches!(host.join().unwrap(), Some(Error::Version { .. })));
-}
-
-#[test]
-fn a_host_of_version_2_is_refused_by_the_client() {
+fn a_host_of_version_3_is_refused_by_the_client() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let old = thread::spawn(move || {
         let (mut tcp, _) = listener.accept().unwrap();
         let mut pre = [0u8; CLIENT_PREAMBLE_LEN];
         tcp.read_exact(&mut pre).unwrap();
-        // The old host's answer: no common version, as its range is 2 to 2
-        tcp.write_all(&host_preamble(None, VersionRange { min: 2, max: 2 })).unwrap();
+        // The old host's answer: no common version, as its range is 3 to 3. It speaks in clear text.
+        tcp.write_all(&host_preamble(None, VersionRange { min: 3, max: 3 })).unwrap();
     });
     let result = ClientLink::connect(addr, &caps(), &identity(), None, WAIT);
-    assert!(matches!(result, Err(Error::Version { theirs: (2, 2), .. })), "{:?}", result.err());
+    assert!(matches!(result, Err(Error::Version { theirs: (3, 3), .. })), "{:?}", result.err());
     old.join().unwrap();
 }
 

@@ -49,13 +49,17 @@ pub use wire::{Error, Nanos};
 /// Version 2 added the key and the challenge of pairing, the display time of a tracking sample
 /// and the moment at which the compositor took a frame.
 ///
-/// Version 3 seals the session. Both sides sign a key exchange. Every packet after it is encrypted
-/// and authenticated. The host also has a key. Version 2 ran in clear text, so this crate speaks no
-/// older version. A version 2 peer is refused.
-pub const PROTOCOL_VERSION: u16 = 3;
+/// Version 3 added the aim pose of each controller to [`message::Tracking`]. Postcard has no
+/// optional trailing fields, so a version 2 sample does not decode and the two versions cannot
+/// talk.
+///
+/// Version 4 seals the session. Both sides sign a key exchange. Every packet after it is encrypted
+/// and authenticated. The host also has a key. Versions 2 and 3 ran in clear text, so this crate
+/// speaks no older version. A peer of version 3 or lower is refused.
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// The oldest protocol version this crate still speaks.
-pub const MIN_PROTOCOL_VERSION: u16 = 3;
+pub const MIN_PROTOCOL_VERSION: u16 = 4;
 
 /// The largest datagram, in bytes, sealed: the counter and the tag are in it. A media packet and
 /// any datagram message fit in it. A typical path MTU of 1500 bytes minus the IP and UDP headers

@@ -121,6 +121,19 @@ pub trait Headset: Send + Sync {
         self.motion(device, sample_ns)
     }
 
+    /// The aim pose of a controller at a tracking sample: where it points. `motion` gives the grip
+    /// pose, the place of the hand that holds the controller. A link whose headset reports one
+    /// pose per hand has no separate aim pose and returns `None`, as ALVR's does.
+    fn aim_motion(&self, _device: Device, _sample_ns: u64) -> Option<DeviceMotion> {
+        None
+    }
+
+    /// The aim pose of a controller at a tracking sample, moved to the display time `target` like
+    /// `motion_at`.
+    fn aim_motion_at(&self, device: Device, sample_ns: u64, _target: u64) -> Option<DeviceMotion> {
+        self.aim_motion(device, sample_ns)
+    }
+
     /// Where the next frame of the host's own scene should start so that it reaches the headset's
     /// display on its grid. `None` when the link does not lock its frames to the display, or does
     /// not know the display yet. The frame loop then renders at the arrival of a pose.

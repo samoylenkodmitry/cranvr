@@ -547,8 +547,8 @@ fn main() {
                     }
                     let mut mask = 0;
                     for (hand, device) in [Device::LeftHand, Device::RightHand].into_iter().enumerate() {
-                        if let Some(motion) = headset.motion(device, ns) {
-                            link.controller(ns, hand as u32, &motion);
+                        if let Some(grip) = headset.motion(device, ns) {
+                            link.controller(ns, hand as u32, &grip, headset.aim_motion(device, ns).as_ref());
                             mask |= 1 << hand;
                         }
                     }
@@ -1084,6 +1084,10 @@ fn frame_loop(
             Some(plan) => headset.motion_at(device, sample, plan.target),
             None => headset.motion(device, sample),
         };
+        let aim_of = |device: Device| match &planned {
+            Some(plan) => headset.aim_motion_at(device, sample, plan.target),
+            None => headset.aim_motion(device, sample),
+        };
         let gpu_start = Instant::now();
 
         // A connected game hides the desktop, also while it loads and sends no frames
@@ -1141,7 +1145,7 @@ fn frame_loop(
                     let p = head.pose.position;
                     params.head_p = [p.x, p.y, p.z, 0.0];
                 }
-                let mut right_hand = None;
+                let mut right_ray = None;
                 // cranvr's Quest app draws the controllers itself while it shows the layer
                 let layer = shared.layer.active.load(Ordering::Relaxed);
                 for (i, device) in [Device::LeftHand, Device::RightHand].into_iter().enumerate() {
@@ -1151,7 +1155,12 @@ fn frame_loop(
                             params.ctl[i] = [p.x, p.y, p.z, 1.0];
                         }
                         if i == 1 {
-                            right_hand = Some(hand.pose);
+                            // A headset that reports an aim pose says where the controller points.
+                            // Otherwise the ray tilts down from the grip pose.
+                            right_ray = Some(match aim_of(device) {
+                                Some(aim) => desktop::aim_ray(&aim.pose),
+                                None => desktop::pointing_ray(&hand.pose, desktop_options.pointer_pitch),
+                            });
                         }
                     }
                 }
@@ -1172,10 +1181,7 @@ fn frame_loop(
                     // points and tells the layer link: the eye stream leaves the screen out
                     if let (Some(s), false) = (screen, layer) {
                         params.screen = s.to_params();
-                        let hit = right_hand.and_then(|grip| {
-                            let (origin, direction) = desktop::pointing_ray(&grip, desktop_options.pointer_pitch);
-                            s.hit(origin, direction)
-                        });
+                        let hit = right_ray.and_then(|(origin, direction)| s.hit(origin, direction));
                         pointer.update(hit, input.right_trigger, input.right_stick_y);
                     }
                     if let Some((seq, image)) = capture.latest() {
@@ -1271,8 +1277,8 @@ fn frame_loop(
             let input = link.take_counts();
             if game.connected || input.buttons > 0 || input.haptics > 0 {
                 info!(
-                    "Game input: {} left and {} right controller poses (tracked mask {:#b}), {} button and axis values, {} haptic pulses from the game",
-                    input.poses[0], input.poses[1], input.mask, input.buttons, input.haptics
+                    "Game input: {} left and {} right controller poses, {} and {} of them with an aim pose (tracked mask {:#b}), {} button and axis values, {} haptic pulses from the game",
+                    input.poses[0], input.poses[1], input.aim_poses[0], input.aim_poses[1], input.mask, input.buttons, input.haptics
                 );
             }
             let layer_fps = shared.layer.frames.swap(0, Ordering::Relaxed) as f64 / secs;
