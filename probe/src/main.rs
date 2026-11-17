@@ -18,6 +18,8 @@ mod android;
 #[cfg(target_os = "macos")]
 mod compositor;
 #[cfg(target_os = "macos")]
+mod hands;
+#[cfg(target_os = "macos")]
 mod native;
 #[cfg(target_os = "macos")]
 mod native_desktop;

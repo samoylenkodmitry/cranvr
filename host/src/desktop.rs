@@ -374,6 +374,12 @@ pub fn pointing_ray(grip: &Pose, pitch_deg: f32) -> (Vec3, Vec3) {
     (grip.position, grip.orientation * tilt * Vec3::NEG_Z)
 }
 
+/// The direction a controller points, from its aim pose: the pose's -Z axis, as OpenXR defines it.
+/// A link whose headset reports an aim pose needs no `pitch_deg`.
+pub fn aim_ray(aim: &Pose) -> (Vec3, Vec3) {
+    (aim.position, aim.orientation * Vec3::NEG_Z)
+}
+
 /// Turns pointing, trigger and thumbstick into mouse events on one display.
 pub struct Pointer {
     display_id: u32,
@@ -618,6 +624,14 @@ mod tests {
         let mid = screen.hit(head.position, head.orientation * Vec3::NEG_Z).unwrap();
         assert!((mid[0] - 0.5).abs() < 1e-5 && (mid[1] - 0.5).abs() < 1e-5);
         assert!(screen.center.y < head.position.y);
+    }
+
+    #[test]
+    fn an_aim_pose_points_along_its_minus_z_axis() {
+        let aim = Pose { orientation: Quat::from_rotation_x(-30f32.to_radians()), position: Vec3::new(0.1, 1.2, -0.3) };
+        let (origin, direction) = aim_ray(&aim);
+        assert_eq!(origin, aim.position);
+        assert!((direction - Vec3::new(0.0, -0.5, -0.866_025_4)).length() < 1e-5, "{direction:?}");
     }
 
     #[test]

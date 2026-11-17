@@ -69,7 +69,8 @@ dxmt_commit=$(git -C "${runtime}/build/dxmt/src" rev-parse HEAD)
     print
     print "cranvr's DXMT patches add a limit on MSAA samples, an MSAA resolve without a sample store and an"
     print "optional skip of the Mac window's present. cranvr's runtime patches add the headset's refresh rate,"
-    print "a view size per game and an optional limit of one slice per swapchain."
+    print "a view size per game, an optional limit of one slice per swapchain and a separate aim pose for each"
+    print "controller."
 } > "${root}/SOURCES.md"
 
 mkdir -p "${out}"

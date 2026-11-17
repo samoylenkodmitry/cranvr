@@ -2,7 +2,8 @@
 //!
 //! Cranpose's `SpatialFrameEffect` calls the app once for each headset frame with an `XrFrame`.
 //! [`FrameReader::read`] turns that into what the host needs:
-//! - the head pose and the controllers' poses and buttons, sampled at the start of the frame;
+//! - the head pose and the controllers' grip and aim poses and buttons, sampled at the start of the
+//!   frame;
 //! - the time at which the compositor will show the frame, as a prediction;
 //! - the eye views with their field of view, which the host renders with;
 //! - the recenter event, when the user recentered the headset.
@@ -14,7 +15,9 @@
 //!
 //! All poses are in the app's room, the LOCAL space of OpenXR. Its origin lies where the head was
 //! when the app started, so the head's height above that point is about 0 and not the height above
-//! the floor. The poses go to the host as they are. Cranpose reports no floor height.
+//! the floor. The poses go to the host as they are. Cranpose reports no floor height. The
+//! controllers' poses go as they are too: the grip pose and the aim pose, each with its own
+//! velocities and with no offset. The host hands both to a game, which picks the one that it needs.
 
 use cranpose_xr::{Controller, Pose as XrPose, Recenter as XrRecenter, RenderViewpoint, TrackedPose, XrFrame};
 use cranvr_proto::{
@@ -41,8 +44,12 @@ pub struct HeadsetFrame {
     /// When the compositor will show this frame, as the runtime predicts it
     pub display_time: Nanos,
     pub head: Motion,
-    pub left: Option<Motion>,
-    pub right: Option<Motion>,
+    /// The grip poses: the places of the hands that hold the controllers
+    pub left_grip: Option<Motion>,
+    pub right_grip: Option<Motion>,
+    /// The aim poses: where the controllers point
+    pub left_aim: Option<Motion>,
+    pub right_aim: Option<Motion>,
     pub input: Input,
 }
 
@@ -101,8 +108,10 @@ impl FrameReader {
             sample_time: now,
             display_time: display.time,
             head: self.head(pose, xr.predicted_display_time, (xr.device_linear_velocity, xr.device_angular_velocity)),
-            left: hand(&xr.left_controller),
-            right: hand(&xr.right_controller),
+            left_grip: xr.left_controller.grip.as_ref().map(motion),
+            right_grip: xr.right_controller.grip.as_ref().map(motion),
+            left_aim: xr.left_controller.aim.as_ref().map(motion),
+            right_aim: xr.right_controller.aim.as_ref().map(motion),
             input: Input { sample_time: now, hands: [hand_input(&xr.left_controller), hand_input(&xr.right_controller)] },
         });
         if frame.is_none() {
@@ -139,11 +148,6 @@ fn motion(tracked: &TrackedPose) -> Motion {
         linear_velocity: tracked.linear_velocity.unwrap_or_default(),
         angular_velocity: tracked.angular_velocity.unwrap_or_default(),
     }
-}
-
-/// The pose of the hand that holds the controller. The host takes it as the controller's pose.
-fn hand(controller: &Controller) -> Option<Motion> {
-    controller.grip.as_ref().map(motion)
 }
 
 fn hand_input(c: &Controller) -> HandInput {
@@ -365,8 +369,11 @@ fn placeholder_frame(at: Nanos, display_time: Nanos) -> HeadsetFrame {
         sample_time: at,
         display_time,
         head: Motion { pose: Pose { position: [0.0, 1.6, 0.0], ..Pose::IDENTITY }, ..Motion::default() },
-        left: Some(hand(-0.2)),
-        right: Some(hand(0.2)),
+        left_grip: Some(hand(-0.2)),
+        right_grip: Some(hand(0.2)),
+        // A window without a headset has no pointing ray of its own: the aim pose is the grip pose
+        left_aim: Some(hand(-0.2)),
+        right_aim: Some(hand(0.2)),
         input: Input::default(),
     }
 }
@@ -420,8 +427,10 @@ pub fn send_loop(link: &ClientLink, feed: &Feed, in_headset: bool, refresh_hz: f
             sample_time: frame.sample_time,
             display_time: frame.display_time,
             head: frame.head,
-            left: frame.left,
-            right: frame.right,
+            left_grip: frame.left_grip,
+            right_grip: frame.right_grip,
+            left_aim: frame.left_aim,
+            right_aim: frame.right_aim,
         };
         if link.duplex.send_datagram(&ClientDatagram::Tracking(tracking)).is_err() {
             return;
@@ -560,6 +569,7 @@ mod tests {
         let mut xr = frame();
         xr.right_controller = Controller {
             grip: Some(TrackedPose { pose: pose_at(0.2, 1.1, -0.3), linear_velocity: Some([1.0, 0.0, 0.0]), angular_velocity: None }),
+            aim: Some(TrackedPose { pose: XrPose { orientation: [0.0, 0.382_683_43, 0.0, 0.923_879_5], position: [0.2, 1.05, -0.4] }, linear_velocity: Some([1.0, 0.1, 0.0]), angular_velocity: Some([0.0, 0.5, 0.0]) }),
             trigger: Trigger { value: 0.75, touched: true },
             squeeze: 0.25,
             thumbstick: Thumbstick { x: 0.5, y: -1.0, pressed: true, touched: true },
@@ -570,9 +580,13 @@ mod tests {
             ..Controller::default()
         };
         let read = FrameReader::default().read(&xr, 1).frame.unwrap();
-        assert!(read.left.is_none());
-        let right = read.right.unwrap();
-        assert_eq!((right.pose.position, right.linear_velocity, right.angular_velocity), ([0.2, 1.1, -0.3], [1.0, 0.0, 0.0], [0.0; 3]));
+        assert!(read.left_grip.is_none() && read.left_aim.is_none());
+        let grip = read.right_grip.unwrap();
+        assert_eq!((grip.pose.position, grip.linear_velocity, grip.angular_velocity), ([0.2, 1.1, -0.3], [1.0, 0.0, 0.0], [0.0; 3]));
+        // The aim pose has its own place and velocities: the client adds no offset to either pose
+        let aim = read.right_aim.unwrap();
+        assert_eq!((aim.pose.position, aim.linear_velocity, aim.angular_velocity), ([0.2, 1.05, -0.4], [1.0, 0.1, 0.0], [0.0, 0.5, 0.0]));
+        assert_eq!((grip.pose.orientation, aim.pose.orientation), ([0.0, 0.0, 0.0, 1.0], [0.0, 0.382_683_43, 0.0, 0.923_879_5]));
         let input = read.input.hands[1];
         assert_eq!(input.buttons, bit::PRIMARY | bit::STICK_CLICK | bit::TRIGGER_CLICK);
         assert_eq!(input.touches, bit::PRIMARY | bit::SECONDARY | bit::STICK_CLICK | bit::TRIGGER_CLICK | bit::THUMB_REST);

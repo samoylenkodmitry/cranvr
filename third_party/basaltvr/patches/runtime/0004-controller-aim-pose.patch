@@ -1,0 +1,532 @@
+Subject: [PATCH] runtime: a separate aim pose for each controller (cranvr)
+
+A new control message, CONTROLLER_MOTION_AIM (18), carries the grip and the
+aim pose of one hand, each with its velocities. An action space on
+/input/aim/pose follows the aim pose, one on /input/grip/pose the grip pose,
+for xrLocateSpace and xrLocateViews. A hand that the daemon fed with the
+plain CONTROLLER_MOTION has no aim pose, and its aim space follows the grip
+pose as before.
+
+A runtime without the patch closes the connection at a message that it does
+not know. This runtime therefore writes runtime-features.txt ("aim") next to
+the control file when it creates its session, as it writes game-program.txt.
+The daemon sends the new message only to a runtime that wrote the file. The
+protocol version stays 9.
+
+The test daemon sends the new message for the left hand and a plain one when
+the controller comes back. The smoke test locates an aim space and a grip
+space of the left hand and checks both.
+---
+diff --git a/runtime/pe/basalt_control_protocol.h b/runtime/pe/basalt_control_protocol.h
+index 9bf4d10..ced3878 100644
+--- a/runtime/pe/basalt_control_protocol.h
++++ b/runtime/pe/basalt_control_protocol.h
+@@ -54,6 +54,16 @@
+  *     u64 target_timestamp_ns, u32 hand (0 left, 1 right), u32 reserved,
+  *     f32 orientation[4] (xyzw), f32 position[3],
+  *     f32 linear_velocity[3], f32 angular_velocity[3]
++ *   CONTROLLER_MOTION_AIM (daemon → runtime; optional; latest sample wins per hand)
++ *     u64 target_timestamp_ns, u32 hand (0 left, 1 right), u32 reserved,
++ *     then twice, first the grip pose and then the aim pose:
++ *       f32 orientation[4] (xyzw), f32 position[3],
++ *       f32 linear_velocity[3], f32 angular_velocity[3]
++ *     Replaces CONTROLLER_MOTION for a headset that reports a separate aim
++ *     pose. The runtime says that it takes the message by writing the word
++ *     "aim" to runtime-features.txt next to the control file before it
++ *     connects. A daemon must not send the message to a runtime that did
++ *     not: the runtime closes the connection at a message it does not know.
+  *   BUTTON_STATE (daemon → runtime; retained until replaced/disconnect)
+  *     u64 ALVR path_id, u32 value_type (0 binary, 1 scalar), f32 value
+  *   HAPTIC (runtime → daemon)
+@@ -102,6 +112,7 @@ enum {
+     BASALT_MSG_VIEW_CONFIG = 15,
+     BASALT_MSG_CONTROLLER_MASK = 16,
+     BASALT_MSG_FRAME_CONSUMED = 17,
++    BASALT_MSG_CONTROLLER_MOTION_AIM = 18,
+ };
+ 
+ enum {
+diff --git a/runtime/pe/control.cpp b/runtime/pe/control.cpp
+index 14de261..3b802f4 100644
+--- a/runtime/pe/control.cpp
++++ b/runtime/pe/control.cpp
+@@ -49,6 +49,8 @@ constexpr uint32_t kMaxFrameViews = 2;
+ constexpr size_t kMaxRendererLength = 256;
+ constexpr size_t kHeadPosePayloadLength = 8 + 7 * sizeof(float);
+ constexpr size_t kControllerMotionPayloadLength = 8 + 4 + 4 + 13 * sizeof(float);
++// cranvr: the grip and the aim pose, 13 floats each
++constexpr size_t kControllerMotionAimPayloadLength = 8 + 4 + 4 + 26 * sizeof(float);
+ constexpr size_t kButtonStatePayloadLength = 8 + 4 + sizeof(float);
+ constexpr size_t kInteractionProfilePayloadLength = 4 + 8;
+ constexpr XrDuration kHeadPoseFreshness = 500'000'000;
+@@ -76,6 +78,11 @@ struct ControllerInputRecord {
+     XrPosef rawPose{};
+     XrVector3f rawLinearVelocity{};
+     XrVector3f rawAngularVelocity{};
++    // cranvr: the aim pose of the same sample, when the daemon sent one
++    bool aimValid = false;
++    XrPosef rawAimPose{};
++    XrVector3f rawAimLinearVelocity{};
++    XrVector3f rawAimAngularVelocity{};
+ };
+ 
+ struct RecenterNotification {
+@@ -419,32 +426,45 @@ bool parseHeadPose(
+     return true;
+ }
+ 
+-bool parseControllerMotion(const uint8_t* payload, size_t payloadLength) {
+-    if (payloadLength != kControllerMotionPayloadLength) {
++double quaternionNorm(const float* q) {
++    return std::sqrt(
++        static_cast<double>(q[0]) * q[0] + static_cast<double>(q[1]) * q[1] +
++        static_cast<double>(q[2]) * q[2] + static_cast<double>(q[3]) * q[3]);
++}
++
++XrQuaternionf normalizedQuaternion(const float* q, double norm) {
++    const float inverseNorm = static_cast<float>(1.0 / norm);
++    return {q[0] * inverseNorm, q[1] * inverseNorm, q[2] * inverseNorm, q[3] * inverseNorm};
++}
++
++// cranvr: withAim is CONTROLLER_MOTION_AIM, which carries the aim pose of the
++// same sample after the grip pose. A plain CONTROLLER_MOTION leaves the hand
++// without an aim pose, so a space on /input/aim/pose follows the grip pose.
++bool parseControllerMotion(const uint8_t* payload, size_t payloadLength, bool withAim) {
++    if (payloadLength != (withAim ? kControllerMotionAimPayloadLength
++                                  : kControllerMotionPayloadLength)) {
+         return false;
+     }
+     uint64_t timestamp = 0;
+     uint32_t hand = 0;
+     uint32_t reserved = 0;
+-    float values[13]{};
++    float values[26]{};
++    const size_t valueCount = withAim ? 26 : 13;
+     std::memcpy(&timestamp, payload, sizeof(timestamp));
+     std::memcpy(&hand, payload + 8, sizeof(hand));
+     std::memcpy(&reserved, payload + 12, sizeof(reserved));
+-    std::memcpy(values, payload + 16, sizeof(values));
++    std::memcpy(values, payload + 16, valueCount * sizeof(float));
+     if (hand > 1 || reserved != 0) {
+         return false;
+     }
+-    for (float value : values) {
+-        if (!std::isfinite(value)) {
++    for (size_t index = 0; index < valueCount; ++index) {
++        if (!std::isfinite(values[index])) {
+             return false;
+         }
+     }
+-    const double norm = std::sqrt(
+-        static_cast<double>(values[0]) * values[0] +
+-        static_cast<double>(values[1]) * values[1] +
+-        static_cast<double>(values[2]) * values[2] +
+-        static_cast<double>(values[3]) * values[3]);
+-    if (norm < 0.5 || norm > 1.5) {
++    const double norm = quaternionNorm(values);
++    const double aimNorm = withAim ? quaternionNorm(values + 13) : 1.0;
++    if (norm < 0.5 || norm > 1.5 || aimNorm < 0.5 || aimNorm > 1.5) {
+         return false;
+     }
+     ControllerInputRecord& record = gControllerInputs[hand];
+@@ -456,14 +476,17 @@ bool parseControllerMotion(const uint8_t* payload, size_t payloadLength) {
+     if (!gLocalOriginValid) {
+         return true;
+     }
+-    const float inverseNorm = static_cast<float>(1.0 / norm);
+-    record.rawPose.orientation = {
+-        values[0] * inverseNorm, values[1] * inverseNorm,
+-        values[2] * inverseNorm, values[3] * inverseNorm,
+-    };
++    record.rawPose.orientation = normalizedQuaternion(values, norm);
+     record.rawPose.position = {values[4], values[5], values[6]};
+     record.rawLinearVelocity = {values[7], values[8], values[9]};
+     record.rawAngularVelocity = {values[10], values[11], values[12]};
++    record.aimValid = withAim;
++    if (withAim) {
++        record.rawAimPose.orientation = normalizedQuaternion(values + 13, aimNorm);
++        record.rawAimPose.position = {values[17], values[18], values[19]};
++        record.rawAimLinearVelocity = {values[20], values[21], values[22]};
++        record.rawAimAngularVelocity = {values[23], values[24], values[25]};
++    }
+     record.questTimestamp = timestamp;
+     record.poseArrival = monotonicTime();
+     record.poseValid = true;
+@@ -615,6 +638,7 @@ bool parseControllerMask(const uint8_t* payload, size_t payloadLength) {
+         record.questTimestamp = timestamp;
+         record.rawLinearVelocity = {};
+         record.rawAngularVelocity = {};
++        record.aimValid = false;
+     }
+     return true;
+ }
+@@ -659,7 +683,9 @@ DWORD WINAPI receiverThreadProc(LPVOID) {
+         if (type == BASALT_MSG_HEAD_POSE) {
+             accepted = parseHeadPose(payload, payloadLength, &recenter);
+         } else if (type == BASALT_MSG_CONTROLLER_MOTION) {
+-            accepted = parseControllerMotion(payload, payloadLength);
++            accepted = parseControllerMotion(payload, payloadLength, false);
++        } else if (type == BASALT_MSG_CONTROLLER_MOTION_AIM) {
++            accepted = parseControllerMotion(payload, payloadLength, true);
+         } else if (type == BASALT_MSG_BUTTON_STATE) {
+             accepted = parseButtonState(payload, payloadLength);
+         } else if (type == BASALT_MSG_INTERACTION_PROFILE) {
+@@ -1151,6 +1177,7 @@ void controlSessionCreated(XrSession session, ID3D11Device* device) {
+ 
+     // cranvr: name the game for cranvr-host before the Hello reaches it
+     writeGameProgram();
++    writeRuntimeFeatures();
+ 
+     char renderer[kMaxRendererLength]{};
+     adapterDescription(device, renderer, sizeof(renderer));
+@@ -1354,6 +1381,16 @@ bool controlInputSnapshot(
+                 localFromQuest.orientation, source.rawLinearVelocity);
+             destination.angularVelocity = quaternionRotate(
+                 localFromQuest.orientation, source.rawAngularVelocity);
++            // cranvr: without an aim pose the aim state is the grip state
++            ControlControllerState& aimDestination = snapshot->aimControllers[hand];
++            aimDestination = destination;
++            if (source.aimValid) {
++                aimDestination.poseInLocal = poseCompose(localFromQuest, source.rawAimPose);
++                aimDestination.linearVelocity = quaternionRotate(
++                    localFromQuest.orientation, source.rawAimLinearVelocity);
++                aimDestination.angularVelocity = quaternionRotate(
++                    localFromQuest.orientation, source.rawAimAngularVelocity);
++            }
+         }
+         for (const ButtonInputRecord& source : gButtonInputs) {
+             if (!source.valid || snapshot->buttonCount >= kControlButtonCapacity) {
+@@ -1684,6 +1721,21 @@ void writeGameProgram() {
+     }
+ }
+ 
++// cranvr: this runtime takes CONTROLLER_MOTION_AIM. cranvr-host reads the file
++// when the game connects, as it reads game-program.txt, and sends the message
++// to a runtime that wrote it. A runtime without this patch writes no file.
++void writeRuntimeFeatures() {
++    char path[MAX_PATH]{};
++    char program[MAX_PATH]{};
++    if (!siblingAndProgram("runtime-features.txt", path, program)) {
++        return;
++    }
++    if (FILE* file = std::fopen(path, "w")) {
++        std::fputs("aim\n", file);
++        std::fclose(file);
++    }
++}
++
+ float controlGameViewScale() {
+     InitOnceExecuteOnce(&gGameViewScaleOnce, initGameViewScale, nullptr, nullptr);
+     return gGameViewScale;
+diff --git a/runtime/pe/control.hpp b/runtime/pe/control.hpp
+index 3431f07..174219a 100644
+--- a/runtime/pe/control.hpp
++++ b/runtime/pe/control.hpp
+@@ -90,10 +90,21 @@ inline bool controlButtonPressed(uint32_t valueType, float value) {
+ 
+ struct ControlInputSnapshot {
+     ControlControllerState controllers[2];
++    // cranvr: the same controllers with the aim pose and its velocities in place
++    // of the grip pose's. Equal to `controllers` for a hand whose daemon sent no
++    // aim pose, so an aim action space then lies at the grip pose.
++    ControlControllerState aimControllers[2];
+     uint32_t buttonCount;
+     ControlButtonState buttons[kControlButtonCapacity];
+ };
+ 
++// cranvr: the state that an action space reads: the aim pose for an
++// /input/aim/pose binding, the grip pose for a /input/grip/pose binding.
++inline const ControlControllerState& controlControllerFor(
++    const ControlInputSnapshot& snapshot, uint32_t hand, bool aim) {
++    return aim ? snapshot.aimControllers[hand] : snapshot.controllers[hand];
++}
++
+ // Returns the latest calibrated Quest eye geometry. False means the daemon
+ // has not supplied it yet; callers retain conservative prototype defaults.
+ bool controlViewConfig(
+@@ -167,4 +178,9 @@ float controlGameViewScale();
+ // file, so cranvr-host can keep a render size per game.
+ void writeGameProgram();
+ 
++// cranvr: writes runtime-features.txt next to the control file. It names the
++// optional control messages that this runtime takes ("aim"), so cranvr-host
++// sends them only to a runtime that does.
++void writeRuntimeFeatures();
++
+ }  // namespace basalt
+diff --git a/runtime/pe/space.cpp b/runtime/pe/space.cpp
+index 93dd067..40b0767 100644
+--- a/runtime/pe/space.cpp
++++ b/runtime/pe/space.cpp
+@@ -365,12 +365,14 @@ XrResult XRAPI_CALL locateSpace(
+         controlInputSnapshot(target.session, &input, time);
+ 
+         auto localFromSpace = [&](const SpaceRecord& record, bool actionResolved,
+-                                  uint32_t hand, XrPosef* pose) -> bool {
++                                  uint32_t hand, bool aim, XrPosef* pose) -> bool {
+             if (record.kind == SpaceKind::kAction) {
+                 if (!actionResolved || hand >= 2 || !input.controllers[hand].poseActive) {
+                     return false;
+                 }
+-                *pose = poseCompose(input.controllers[hand].poseInLocal, record.pose);
++                // cranvr: an aim space follows the aim pose, a grip space the grip pose
++                *pose = poseCompose(
++                    controlControllerFor(input, hand, aim).poseInLocal, record.pose);
+                 return true;
+             }
+             if (record.referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL) {
+@@ -386,8 +388,8 @@ XrResult XRAPI_CALL locateSpace(
+ 
+         XrPosef targetInLocal{};
+         XrPosef baseInLocal{};
+-        if (!localFromSpace(target, targetActionResolved, targetHand, &targetInLocal) ||
+-            !localFromSpace(base, baseActionResolved, baseHand, &baseInLocal)) {
++        if (!localFromSpace(target, targetActionResolved, targetHand, targetAim, &targetInLocal) ||
++            !localFromSpace(base, baseActionResolved, baseHand, baseAim, &baseInLocal)) {
+             location->locationFlags = 0;
+             location->pose = identityPose();
+             setChainedSpaceVelocity(
+@@ -410,7 +412,7 @@ XrResult XRAPI_CALL locateSpace(
+             base.kind == SpaceKind::kReference &&
+             base.referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL) {
+             const ControlControllerState& controller =
+-                input.controllers[targetHand];
++                controlControllerFor(input, targetHand, targetAim);
+             const XrVector3f radiusInLocal{
+                 targetInLocal.position.x - controller.poseInLocal.position.x,
+                 targetInLocal.position.y - controller.poseInLocal.position.y,
+@@ -487,7 +489,8 @@ XrResult XRAPI_CALL locateViews(
+         controlInputSnapshot(session, &input, viewLocateInfo->displayTime);
+         if (getActionPoseSource(session, base.action, base.subactionPath, &hand, &aim) &&
+             hand < 2 && input.controllers[hand].poseActive) {
+-            baseInLocal = poseCompose(input.controllers[hand].poseInLocal, base.pose);
++            baseInLocal = poseCompose(
++                controlControllerFor(input, hand, aim).poseInLocal, base.pose);
+             baseTracked = true;
+         }
+     }
+diff --git a/runtime/tests/d3d11_runtime_smoke.cpp b/runtime/tests/d3d11_runtime_smoke.cpp
+index 2150468..01b94c2 100644
+--- a/runtime/tests/d3d11_runtime_smoke.cpp
++++ b/runtime/tests/d3d11_runtime_smoke.cpp
+@@ -850,6 +850,14 @@ int main(int argc, char** argv) {
+     if (XR_SUCCEEDED(result)) {
+         result = xrCreateAction(actionSet, &actionInfo, &poseAction);
+     }
++    // cranvr: a second pose action, bound to the aim pose
++    std::strncpy(actionInfo.actionName, "aim_pose", XR_MAX_ACTION_NAME_SIZE - 1);
++    std::strncpy(actionInfo.localizedActionName, "Aim Pose",
++                 XR_MAX_LOCALIZED_ACTION_NAME_SIZE - 1);
++    XrAction aimPoseAction = XR_NULL_HANDLE;
++    if (XR_SUCCEEDED(result)) {
++        result = xrCreateAction(actionSet, &actionInfo, &aimPoseAction);
++    }
+     actionInfo.actionType = XR_ACTION_TYPE_VIBRATION_OUTPUT;
+     std::strncpy(actionInfo.actionName, "vibrate_hand", XR_MAX_ACTION_NAME_SIZE - 1);
+     std::strncpy(actionInfo.localizedActionName, "Vibrate Hand",
+@@ -931,6 +939,16 @@ int main(int argc, char** argv) {
+         xrDestroyInstance(instance);
+         return fail("xrCreateActionSpace before attach", result);
+     }
++    actionSpaceInfo.action = aimPoseAction;
++    XrSpace aimSpace = XR_NULL_HANDLE;
++    result = xrCreateActionSpace(session, &actionSpaceInfo, &aimSpace);
++    if (XR_FAILED(result) || aimSpace == XR_NULL_HANDLE) {
++        xrDestroySession(session);
++        release(context);
++        release(device);
++        xrDestroyInstance(instance);
++        return fail("xrCreateActionSpace(aim) before attach", result);
++    }
+     actionSpaceInfo.action = grabAction;
+     XrSpace rejectedSpace2 = XR_NULL_HANDLE;
+     result = xrCreateActionSpace(session, &actionSpaceInfo, &rejectedSpace2);
+@@ -967,6 +985,10 @@ int main(int argc, char** argv) {
+     if (XR_SUCCEEDED(result)) {
+         result = xrStringToPath(instance, "/user/hand/left/input/grip/pose", &gripPosePath);
+     }
++    XrPath aimPosePath = XR_NULL_PATH;
++    if (XR_SUCCEEDED(result)) {
++        result = xrStringToPath(instance, "/user/hand/left/input/aim/pose", &aimPosePath);
++    }
+     XrPath hapticPath = XR_NULL_PATH;
+     if (XR_SUCCEEDED(result)) {
+         result = xrStringToPath(instance, "/user/hand/left/output/haptic", &hapticPath);
+@@ -974,6 +996,7 @@ int main(int argc, char** argv) {
+     const XrActionSuggestedBinding suggested[] = {
+         {grabAction, squeezePath},
+         {poseAction, gripPosePath},
++        {aimPoseAction, aimPosePath},
+         {vibrateAction, hapticPath},
+         {overlayGrabAction, squeezePath},
+         {overlayPoseAction, gripPosePath},
+@@ -982,7 +1005,7 @@ int main(int argc, char** argv) {
+     XrInteractionProfileSuggestedBinding suggestedBindings{};
+     suggestedBindings.type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING;
+     suggestedBindings.interactionProfile = touchProfilePath;
+-    suggestedBindings.countSuggestedBindings = 6;
++    suggestedBindings.countSuggestedBindings = 7;
+     suggestedBindings.suggestedBindings = suggested;
+     if (XR_SUCCEEDED(result)) {
+         result = xrSuggestInteractionProfileBindings(instance, &suggestedBindings);
+@@ -1479,6 +1502,49 @@ int main(int argc, char** argv) {
+         return fail("xrLocateSpace(action space)", result);
+     }
+ 
++    // cranvr: the daemon sent the grip and the aim pose of the left hand in one
++    // message (CONTROLLER_MOTION_AIM). The aim space lies 5 cm below the grip
++    // space and points down by 30 degrees, and it has its own velocities.
++    // The grip space points along x in LOCAL; the raw hand has no turn.
++    auto locateAim = [&](XrSpaceLocation* aimLocation, XrSpaceVelocity* aimVelocity) {
++        *aimVelocity = {};
++        aimVelocity->type = XR_TYPE_SPACE_VELOCITY;
++        *aimLocation = {};
++        aimLocation->type = XR_TYPE_SPACE_LOCATION;
++        aimLocation->next = aimVelocity;
++        return xrLocateSpace(aimSpace, localSpace, locateTime, aimLocation);
++    };
++    auto pointsAlong = [](const XrSpaceLocation& where, float x, float y, float z) {
++        const XrVector3f forward = rotateVector(where.pose.orientation, {0.0f, 0.0f, -1.0f});
++        return nearlyEqual(forward.x, x) && nearlyEqual(forward.y, y) &&
++               nearlyEqual(forward.z, z);
++    };
++    if (injectedController) {
++        XrSpaceVelocity aimVelocity{};
++        XrSpaceLocation aimLocation{};
++        result = locateAim(&aimLocation, &aimVelocity);
++        if (XR_FAILED(result) || aimLocation.locationFlags != kControllerTrackedFlags ||
++            !nearlyEqual(aimLocation.pose.position.x, -0.1f) ||
++            !nearlyEqual(aimLocation.pose.position.y, 1.15f) ||
++            !nearlyEqual(aimLocation.pose.position.z, -0.45f) ||
++            !pointsAlong(aimLocation, 0.866025f, -0.5f, 0.0f) ||
++            !pointsAlong(location, 1.0f, 0.0f, 0.0f) ||
++            aimVelocity.velocityFlags !=
++                (XR_SPACE_VELOCITY_LINEAR_VALID_BIT |
++                 XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) ||
++            !nearlyEqual(aimVelocity.linearVelocity.x, -0.6f) ||
++            !nearlyEqual(aimVelocity.linearVelocity.y, 0.5f) ||
++            !nearlyEqual(aimVelocity.linearVelocity.z, 0.4f) ||
++            !nearlyEqual(aimVelocity.angularVelocity.y, 0.75f)) {
++            xrDestroySession(session);
++            release(context);
++            release(device);
++            xrDestroyInstance(instance);
++            return fail("xrLocateSpace(aim action space)", result);
++        }
++        std::puts("PASS: the aim space follows the aim pose, the grip space the grip pose");
++    }
++
+     if (injectedController) {
+         // Ask the native daemon to publish mask(timestamp=3, absent), followed
+         // by stale motion(timestamp=2). The pose and chained velocity must
+@@ -1558,6 +1624,29 @@ int main(int argc, char** argv) {
+         }
+         std::puts(
+             "PASS: controller presence clears stale pose/velocity and recovers");
++
++        // cranvr: the recovery sample is a plain CONTROLLER_MOTION without an
++        // aim pose. The aim space then follows the grip pose, and the aim pose
++        // of the earlier samples is gone.
++        XrSpaceVelocity aimVelocity{};
++        XrSpaceLocation aimLocation{};
++        result = locateAim(&aimLocation, &aimVelocity);
++        if (XR_FAILED(result) || aimLocation.locationFlags != kControllerTrackedFlags ||
++            !nearlyEqual(aimLocation.pose.position.x, location.pose.position.x) ||
++            !nearlyEqual(aimLocation.pose.position.y, location.pose.position.y) ||
++            !nearlyEqual(aimLocation.pose.position.z, location.pose.position.z) ||
++            !pointsAlong(aimLocation, 1.0f, 0.0f, 0.0f) ||
++            !nearlyEqual(aimVelocity.linearVelocity.x, -0.3f) ||
++            !nearlyEqual(aimVelocity.linearVelocity.y, 0.2f) ||
++            !nearlyEqual(aimVelocity.linearVelocity.z, 0.1f) ||
++            !nearlyEqual(aimVelocity.angularVelocity.y, 0.5f)) {
++            xrDestroySession(session);
++            release(context);
++            release(device);
++            xrDestroyInstance(instance);
++            return fail("aim space without an aim pose", result);
++        }
++        std::puts("PASS: a hand without an aim pose has its aim space at the grip pose");
+     }
+ 
+     // Public action destruction must not invalidate the backing resource of
+@@ -1596,6 +1685,20 @@ int main(int argc, char** argv) {
+             "(squeeze %.3f, position %.3f %.3f %.3f)\n",
+             floatState.currentState, location.pose.position.x,
+             location.pose.position.y, location.pose.position.z);
++        // cranvr: the aim space of the same hand, for a run against a headset
++        XrSpaceVelocity aimVelocity{};
++        XrSpaceLocation aimLocation{};
++        if (XR_SUCCEEDED(locateAim(&aimLocation, &aimVelocity)) &&
++            aimLocation.locationFlags == kControllerTrackedFlags) {
++            std::printf(
++                "PASS: live left controller aim space (position %.3f %.3f %.3f, "
++                "minus the grip space %.3f %.3f %.3f)\n",
++                aimLocation.pose.position.x, aimLocation.pose.position.y,
++                aimLocation.pose.position.z,
++                aimLocation.pose.position.x - location.pose.position.x,
++                aimLocation.pose.position.y - location.pose.position.y,
++                aimLocation.pose.position.z - location.pose.position.z);
++        }
+     }
+ 
+     referenceSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+diff --git a/runtime/tests/native/basalt_control_test_daemon.c b/runtime/tests/native/basalt_control_test_daemon.c
+index 304b775..f3c1b62 100644
+--- a/runtime/tests/native/basalt_control_test_daemon.c
++++ b/runtime/tests/native/basalt_control_test_daemon.c
+@@ -149,6 +149,24 @@ static bool send_controller_motion(int fd, uint64_t timestamp, uint32_t hand) {
+     return send_message(fd, BASALT_MSG_CONTROLLER_MOTION, payload, sizeof(payload));
+ }
+ 
++/* cranvr: CONTROLLER_MOTION_AIM. The grip pose is the one of
++ * send_controller_motion. The aim pose lies 5 cm below it and points down by
++ * 30 degrees (a turn about x), and it moves on its own. */
++static bool send_controller_motion_aim(int fd, uint64_t timestamp, uint32_t hand) {
++    uint8_t payload[8 + 4 + 4 + 26 * sizeof(float)] = {0};
++    const float x = hand == 0 ? -0.2f : 0.2f;
++    const float motion[26] = {
++        0.0f, 0.0f, 0.0f, 1.0f, x, 1.2f, -0.4f,
++        0.1f, 0.2f, 0.3f, 0.0f, 0.5f, 0.0f,
++        -0.258819045f, 0.0f, 0.0f, 0.965925826f, x, 1.15f, -0.4f,
++        0.4f, 0.5f, 0.6f, 0.0f, 0.75f, 0.0f,
++    };
++    memcpy(payload, &timestamp, 8);
++    memcpy(payload + 8, &hand, 4);
++    memcpy(payload + 16, motion, sizeof(motion));
++    return send_message(fd, BASALT_MSG_CONTROLLER_MOTION_AIM, payload, sizeof(payload));
++}
++
+ static bool send_controller_mask(int fd, uint64_t timestamp, uint32_t active_mask) {
+     uint8_t payload[16] = {0};
+     memcpy(payload, &timestamp, 8);
+@@ -216,9 +234,11 @@ static bool handle_haptic(int fd, const uint8_t* payload, size_t length) {
+     // a later motion+mask pair restores it without stale motion winning.
+     if (duration != 0 && __builtin_fabsf(amplitude - 0.125f) < 0.0001f) {
+         return send_controller_mask(fd, 3, 0) &&
+-               send_controller_motion(fd, 2, 0);  // stale: must not resurrect
++               send_controller_motion_aim(fd, 2, 0);  // stale: must not resurrect
+     }
+     if (duration != 0 && __builtin_fabsf(amplitude - 0.25f) < 0.0001f) {
++        // cranvr: a plain motion without an aim pose, so the smoke can check
++        // that the aim space then follows the grip pose
+         return send_controller_motion(fd, 4, 0) &&
+                send_controller_mask(fd, 4, 1);
+     }
+@@ -336,7 +356,7 @@ static bool handle_create_swapchain(int fd, const uint8_t* payload, size_t lengt
+      * the runtime has one receiver/demultiplexer instead of treating the
+      * next daemon message as the synchronous reply. */
+     const bool sent = send_head_pose(fd, 2) &&
+-                      send_controller_motion(fd, 2, 0) &&
++                      send_controller_motion_aim(fd, 2, 0) &&
+                       send_controller_mask(fd, 2, 1) &&
+                       send_message(fd, BASALT_MSG_SWAPCHAIN_ACK, ack, sizeof(ack));
+     if (sent) {
+@@ -635,7 +655,7 @@ int main(int argc, char** argv) {
+                      send_touch_profile(fd, 0) &&
+                      send_touch_profile(fd, 1) &&
+                      send_left_squeeze(fd, 0.75f) &&
+-                     send_controller_motion(fd, 1, 0) &&
++                     send_controller_motion_aim(fd, 1, 0) &&
+                      send_controller_mask(fd, 1, 1);
+             }
+             hello_done = true;

@@ -31,13 +31,24 @@ if [[ $(git -C "${dir}" rev-parse HEAD) != ${commit} ]]; then
     git -C "${dir}" checkout --quiet "${commit}"
 fi
 
-# Runtime patches: apply once (a second run finds them applied)
-for patch in "${patches}"/runtime/*.patch; do
-    if git -C "${dir}" apply --check "${patch}" 2>/dev/null; then
+# Runtime patches: apply once (a second run finds them applied). The series builds on itself: a
+# later patch may change lines that an earlier one added, and the earlier one then no longer
+# reverses on its own. The newest patch that reverses cleanly is applied, and so are all before it.
+patch_files=("${patches}"/runtime/*.patch)
+applied=0
+for (( i = ${#patch_files}; i >= 1; i-- )); do
+    if git -C "${dir}" apply --reverse --check "${patch_files[i]}" 2>/dev/null; then
+        applied=${i}
+        break
+    fi
+done
+for (( i = 1; i <= ${#patch_files}; i++ )); do
+    patch=${patch_files[i]}
+    if (( i <= applied )); then
+        print "Already applied: ${patch:t}"
+    elif git -C "${dir}" apply --check "${patch}" 2>/dev/null; then
         git -C "${dir}" apply "${patch}"
         print "Applied ${patch:t}"
-    elif git -C "${dir}" apply --reverse --check "${patch}" 2>/dev/null; then
-        print "Already applied: ${patch:t}"
     else
         print -u2 "FAIL: ${patch:t} does not apply to ${dir}"
         exit 1

@@ -62,8 +62,16 @@ fn tracking(sample: u64, x: f32) -> Tracking {
         sample_time: sample,
         display_time: sample + 18_000_000,
         head: Motion { pose: ProtoPose { position: [x, 1.6, 0.0], ..ProtoPose::IDENTITY }, linear_velocity: [1.0, 0.0, 0.0], ..Default::default() },
-        left: Some(Motion::default()),
-        right: None,
+        left_grip: Some(Motion::default()),
+        right_grip: None,
+        // The aim pose lies below and ahead of the grip pose, turned down by 30 degrees, and moves
+        // on its own
+        left_aim: Some(Motion {
+            pose: ProtoPose { orientation: Quat::from_rotation_x(-30f32.to_radians()).to_array(), position: [0.0, -0.05, -0.1] },
+            linear_velocity: [0.0, 0.0, 2.0],
+            angular_velocity: [0.5, 0.0, 0.0],
+        }),
+        right_aim: None,
     }
 }
 
@@ -126,26 +134,45 @@ fn input_changes_name_the_buttons_that_moved() {
 }
 
 #[test]
-fn a_hands_pose_carries_the_offset_that_alvrs_client_gives_a_quest_controller() {
-    let grip = Motion { pose: ProtoPose { position: [0.1, 1.2, -0.3], ..ProtoPose::IDENTITY }, linear_velocity: [0.0, 0.0, -1.0], ..Default::default() };
-    let left = device_motion(Device::LeftHand, grip, 0.0);
-    let right = device_motion(Device::RightHand, grip, 0.0);
-    // A pitch of 15 degrees down, and the shift mirrored between the hands
-    for hand in [&left, &right] {
-        let forward = hand.pose.orientation * Vec3::NEG_Z;
-        assert!((forward.y + 15f32.to_radians().sin()).abs() < 1e-5 && forward.x.abs() < 1e-6, "{forward:?}");
-        assert_eq!(hand.linear_velocity, Vec3::new(0.0, 0.0, -1.0));
+fn a_hand_has_a_grip_pose_and_an_aim_pose_that_the_host_does_not_offset() {
+    let motion = |x: f32, pitch: f32| Motion {
+        pose: ProtoPose { orientation: Quat::from_rotation_x(pitch.to_radians()).to_array(), position: [x, 1.2, -0.3] },
+        linear_velocity: [x, 0.0, -1.0],
+        angular_velocity: [0.0, x, 0.0],
+    };
+    // Every pose of the sample differs, so a swap of two of them shows
+    let sample = Tracking {
+        left_grip: Some(motion(-0.1, 10.0)),
+        right_grip: Some(motion(0.1, 20.0)),
+        left_aim: Some(motion(-0.2, -40.0)),
+        right_aim: Some(motion(0.2, -50.0)),
+        ..tracking(1, 0.0)
+    };
+    for (device, pose, expected) in [
+        (Device::LeftHand, HandPose::Grip, sample.left_grip),
+        (Device::RightHand, HandPose::Grip, sample.right_grip),
+        (Device::LeftHand, HandPose::Aim, sample.left_aim),
+        (Device::RightHand, HandPose::Aim, sample.right_aim),
+    ] {
+        let given = device_of(&sample, device, pose);
+        assert_eq!(given, expected, "{device:?} {pose:?}");
+        // Only the floor moves a pose: the orientation and the velocities stay as the headset gave them
+        let hand = device_motion(given.unwrap(), 0.0);
+        let sent = expected.unwrap();
+        assert_eq!(hand.pose.orientation, Quat::from_array(sent.pose.orientation));
+        assert_eq!(hand.pose.position, Vec3::from_array(sent.pose.position));
+        assert_eq!(hand.linear_velocity, Vec3::from_array(sent.linear_velocity));
+        assert_eq!(hand.angular_velocity, Vec3::from_array(sent.angular_velocity));
     }
-    assert!((left.pose.position - Vec3::new(0.095, 1.195, -0.3)).length() < 1e-6, "{:?}", left.pose.position);
-    assert!((right.pose.position - Vec3::new(0.105, 1.195, -0.3)).length() < 1e-6, "{:?}", right.pose.position);
-    // The head and the floor
-    let head = device_motion(Device::Head, grip, 0.3);
-    assert_eq!(head.pose.orientation, Quat::IDENTITY);
-    assert!((head.pose.position - Vec3::new(0.1, 0.9, -0.3)).length() < 1e-6);
-    // The offset turns with the hand: a hand turned 90 degrees to the left shifts along the other axis
-    let turned = Motion { pose: ProtoPose { orientation: Quat::from_rotation_y(90f32.to_radians()).to_array(), position: [0.0; 3] }, ..grip };
-    let shifted = device_motion(Device::LeftHand, turned, 0.0).pose.position;
-    assert!((shifted - Vec3::new(0.0, -0.005, 0.005)).length() < 1e-6, "{shifted:?}");
+    // A hand without an aim pose has none: the runtime then gives a game the grip pose for both
+    let grip_only = Tracking { left_aim: None, ..sample };
+    assert!(device_of(&grip_only, Device::LeftHand, HandPose::Aim).is_none());
+    assert!(device_of(&grip_only, Device::LeftHand, HandPose::Grip).is_some());
+    // The head has one pose
+    assert_eq!(device_of(&sample, Device::Head, HandPose::Aim), Some(sample.head));
+    // The floor lowers every pose by its height
+    let head = device_motion(sample.head, 0.3);
+    assert!((head.pose.position - Vec3::new(0.0, 1.3, 0.0)).length() < 1e-6);
 }
 
 #[test]
@@ -221,6 +248,11 @@ fn a_native_client_connects_and_the_host_serves_it() {
     assert_eq!(head.pose.position.x, 0.5);
     assert!(headset.motion(Device::LeftHand, sample).is_some());
     assert!(headset.motion(Device::RightHand, sample).is_none());
+    // The aim pose is its own pose of the same hand
+    let aim = headset.aim_motion(Device::LeftHand, sample).unwrap();
+    assert_eq!(aim.pose.position, Vec3::new(0.0, -0.05, -0.1));
+    assert_eq!(aim.linear_velocity, Vec3::new(0.0, 0.0, 2.0));
+    assert!(headset.aim_motion(Device::RightHand, sample).is_none());
     // The pose moves by its velocity to a later display time: 30 ms at 1 m/s are 3 cm. The sample
     // is valid at its own display time, so a target at that time changes nothing. A target before
     // it does not move the pose back.
@@ -297,8 +329,10 @@ fn a_native_client_connects_and_the_host_serves_it() {
         assert!(Instant::now() < deadline, "the host did not take the floor");
         thread::sleep(Duration::from_millis(5));
     }
-    // The hand lies at the room's origin, which the floor moves up. The hand offset lowers it by 5 mm.
-    assert!((headset.motion_at(Device::LeftHand, sample, sample).unwrap().pose.position.y - 0.395).abs() < 1e-4);
+    // The hand lies at the room's origin, which the floor moves up. No offset lowers it. The aim
+    // pose lies 5 cm below the grip pose.
+    assert!((headset.motion_at(Device::LeftHand, sample, sample).unwrap().pose.position.y - 0.4).abs() < 1e-4);
+    assert!((headset.aim_motion_at(Device::LeftHand, sample, sample).unwrap().pose.position.y - 0.35).abs() < 1e-4);
     // The headset reports the planned frame: it showed 20 ms after its arrival, and its compositor
     // took it 17 ms before. The host then knows the display's grid and the lead.
     let arrived = now_ns();

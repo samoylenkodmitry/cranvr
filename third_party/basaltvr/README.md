@@ -35,6 +35,19 @@ applies these patches and builds both parts.
   share for its own program once per process and scales the recommended view size by it, to even
   sizes of at least 256 pixels. A game reads its view size only when it starts.
 
+`0004-controller-aim-pose.patch`
+
+- A new control message, `CONTROLLER_MOTION_AIM` (18), carries the grip pose and the aim pose of one
+  hand with the velocities of both. An action space on `/input/aim/pose` follows the aim pose, one
+  on `/input/grip/pose` the grip pose, in `xrLocateSpace` and `xrLocateViews`. A hand that the daemon
+  fed with the plain `CONTROLLER_MOTION` has no aim pose, and its aim space follows the grip pose.
+- A runtime without the patch closes the connection at a message that it does not know. The runtime
+  therefore writes `runtime-features.txt` (the word `aim`) next to the control file at session
+  creation, as it writes `game-program.txt`. cranvr-host sends the message only to a runtime that
+  wrote the file. The control protocol keeps its version 9.
+- The test daemon sends the new message for the left hand and a plain one when the controller comes
+  back. The smoke test locates the aim space and the grip space of that hand and checks both.
+
 ## patches/dxmt
 
 `0005-public-atomic-for-new-metal-compiler.patch`: DXMT 0.80 calls a private Metal builtin

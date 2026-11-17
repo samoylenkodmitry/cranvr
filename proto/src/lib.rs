@@ -43,10 +43,14 @@ pub use wire::{Error, Nanos};
 ///
 /// Version 2 added the key and the challenge of pairing, the display time of a tracking sample
 /// and the moment at which the compositor took a frame.
-pub const PROTOCOL_VERSION: u16 = 2;
+///
+/// Version 3 added the aim pose of each controller to [`message::Tracking`]. Postcard has no
+/// optional trailing fields, so a version 2 sample does not decode and the two versions cannot
+/// talk.
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// The oldest protocol version this crate still speaks.
-pub const MIN_PROTOCOL_VERSION: u16 = 2;
+pub const MIN_PROTOCOL_VERSION: u16 = 3;
 
 /// The largest datagram, in bytes. A media packet and any datagram message fit in it. A typical
 /// path MTU of 1500 bytes minus the IP and UDP headers leaves 1472 bytes. The 1400 bytes leave
