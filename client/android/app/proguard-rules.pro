@@ -1,0 +1,1 @@
+-keep class dev.cranvr.client2.** { *; }

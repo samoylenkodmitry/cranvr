@@ -1,0 +1,365 @@
+//! The app's composables: the connect panel, the stream surface and the stats panel.
+//!
+//! In a headset each panel is a layer of the compositor and a controller's trigger presses its
+//! buttons. In a flat window the panels draw side by side. Every composable here is plain
+//! Cranpose. The state that the network threads produce arrives as a [`Snapshot`], which a
+//! `LaunchedEffect` copies into Cranpose state a few times a second.
+
+use crate::{
+    hub::{hub, DecoderView, LinkState, Snapshot, Stats},
+    settings,
+};
+use cranpose::prelude::*;
+use cranpose::text::{FontWeight, TextUnit};
+use cranpose_xr::{
+    local_spatial_capabilities, SpatialExternalSurface, SpatialPanel, StereoMode, Subspace, SubspaceModifier,
+};
+use std::time::Duration;
+
+/// How often the UI copies the link's numbers into its state
+const POLL: Duration = Duration::from_millis(250);
+
+const PANEL_COLOR: Color = Color(0.09, 0.1, 0.13, 0.96);
+const FIELD_COLOR: Color = Color(0.16, 0.18, 0.23, 1.0);
+const KEY_COLOR: Color = Color(0.2, 0.23, 0.3, 1.0);
+const TEXT_COLOR: Color = Color(0.95, 0.96, 0.98, 1.0);
+const MUTED_COLOR: Color = Color(0.62, 0.66, 0.73, 1.0);
+const GOOD_COLOR: Color = Color(0.4, 0.82, 0.55, 1.0);
+const WARN_COLOR: Color = Color(0.95, 0.72, 0.3, 1.0);
+const BAD_COLOR: Color = Color(0.95, 0.42, 0.4, 1.0);
+const ACCENT_COLOR: Color = Color(0.25, 0.45, 0.95, 1.0);
+const STOP_COLOR: Color = Color(0.75, 0.3, 0.3, 1.0);
+
+// One eye's image of the Quest 3 is nearly square, and the stream shows each eye on its own
+// layer. The surface takes the eye's proportions: 1680 by 1760 pixels.
+const STREAM_SIZE: [f32; 2] = [1000.0, 1048.0];
+
+/// The app. In a headset it shows the stream in front of the viewer, the connect panel to the left
+/// and the stats panel to the right.
+#[composable]
+pub fn ClientApp() {
+    let snapshot = rememberMutableStateOf(|| hub().snapshot());
+    LaunchedEffect((), async move |_| loop {
+        snapshot.set(hub().snapshot());
+        delay(POLL).await;
+    });
+    Subspace(move || {
+        // A flat window shows the panels in this order, side by side. The stream's surface is
+        // empty there, so it comes last. In a headset each panel has its own place.
+        ConnectPanel(snapshot);
+        StatsPanel(snapshot);
+        StreamSurface();
+    });
+}
+
+fn text_style(size: f32, color: Color, weight: Option<FontWeight>) -> TextStyle {
+    TextStyle {
+        span_style: SpanStyle {
+            color: Some(color),
+            font_size: TextUnit::Sp(size),
+            font_weight: weight,
+            ..SpanStyle::default()
+        },
+        ..TextStyle::default()
+    }
+}
+
+/// The surface that the hardware decoder writes into. Each eye sees its half of the picture. The
+/// decoder starts when the compositor makes the surface and lets go of it before the surface ends.
+#[composable]
+fn StreamSurface() {
+    SpatialExternalSurface(
+        StereoMode::SideBySide,
+        SubspaceModifier::new().size(STREAM_SIZE[0], STREAM_SIZE[1]).offset(0.0, 60.0, 0.0).movable(),
+        |scope| {
+            scope.on_surface_created(|surface| hub().surface_created(surface));
+            scope.on_surface_destroyed(|_| hub().surface_destroyed());
+        },
+    );
+}
+
+/// What the user presses on the keypad.
+#[derive(Clone, Copy, PartialEq)]
+enum KeyPress {
+    Text(&'static str),
+    Back,
+    Clear,
+}
+
+/// Starts or ends the connection, as the button of the panel says.
+fn toggle_connection(state: &LinkState, address: TextFieldState) {
+    match state {
+        LinkState::Idle | LinkState::Failed(_) => {
+            let host = address.text();
+            settings::remember_host(&host);
+            hub().connect(host, settings::media_choice());
+        }
+        LinkState::Connecting | LinkState::Streaming => hub().disconnect(),
+    }
+}
+
+/// The host address, a keypad for it and the Connect button. A headset has no keyboard in the
+/// room, so the keypad edits the same text as the field does.
+#[composable]
+fn ConnectPanel(snapshot: MutableState<Snapshot>) {
+    let address = remember(|| TextFieldState::new(settings::initial_host())).with(|state| *state);
+    LaunchedEffect((), async move |_| {
+        if settings::connect_on_launch() {
+            toggle_connection(&LinkState::Idle, address);
+        }
+    });
+    // In a headset a focused field must not ask for a software keyboard
+    let in_headset = local_spatial_capabilities().current().is_spatial_ui_enabled();
+    SpatialPanel(
+        SubspaceModifier::new().size(760.0, 840.0).offset(-1000.0, 0.0, 150.0).rotate(0.0, 22.0, 0.0).movable(),
+        move || {
+            let snap = snapshot.get();
+            let state = snap.state.clone();
+            Column(
+                Modifier::empty().fill_max_size().background(PANEL_COLOR).rounded_corners(24.0).padding(36.0),
+                ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(20.0)),
+                move || {
+                    Text("cranvr", Modifier::empty(), text_style(44.0, TEXT_COLOR, Some(FontWeight::BOLD)));
+                    Text(
+                        "Address of the Mac that runs cranvr-host --protocol native",
+                        Modifier::empty(),
+                        text_style(22.0, MUTED_COLOR, None),
+                    );
+                    Box(
+                        Modifier::empty().fill_max_width().background(FIELD_COLOR).rounded_corners(14.0).padding(18.0),
+                        BoxSpec::default(),
+                        move || {
+                            BasicTextFieldWithOptions(
+                                address,
+                                Modifier::empty().fill_max_width(),
+                                BasicTextFieldOptions {
+                                    text_style: text_style(34.0, TEXT_COLOR, None),
+                                    cursor_color: TEXT_COLOR,
+                                    line_limits: TextFieldLineLimits::SingleLine,
+                                    show_keyboard_on_focus: !in_headset,
+                                    ..BasicTextFieldOptions::default()
+                                },
+                            );
+                        },
+                    );
+                    Keypad(address);
+                    ConnectButton(state.clone(), address);
+                    StatusLine(state.clone(), address);
+                },
+            );
+        },
+    );
+}
+
+#[composable]
+fn Keypad(address: TextFieldState) {
+    let rows: [&[KeyPress]; 3] = [
+        &[KeyPress::Text("1"), KeyPress::Text("2"), KeyPress::Text("3"), KeyPress::Text("4"), KeyPress::Text("5")],
+        &[KeyPress::Text("6"), KeyPress::Text("7"), KeyPress::Text("8"), KeyPress::Text("9"), KeyPress::Text("0")],
+        &[KeyPress::Text("."), KeyPress::Text(":"), KeyPress::Back, KeyPress::Clear],
+    ];
+    Column(
+        Modifier::empty(),
+        ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(10.0)),
+        move || {
+            for row in rows {
+                Row(
+                    Modifier::empty(),
+                    RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(10.0)),
+                    move || {
+                        for press in row {
+                            Key(*press, address);
+                        }
+                    },
+                );
+            }
+        },
+    );
+}
+
+#[composable]
+fn Key(press: KeyPress, address: TextFieldState) {
+    let label = match press {
+        KeyPress::Text(text) => text,
+        KeyPress::Back => "<-",
+        KeyPress::Clear => "clear",
+    };
+    let wide = !matches!(press, KeyPress::Text(_));
+    Button(
+        Modifier::empty()
+            .background(KEY_COLOR)
+            .rounded_corners(12.0)
+            .padding_symmetric(if wide { 26.0 } else { 30.0 }, 14.0),
+        ButtonSpec::default(),
+        move || {
+            address.edit(|buffer| match press {
+                KeyPress::Text(text) => buffer.insert(text),
+                KeyPress::Back => buffer.delete_before_cursor(),
+                KeyPress::Clear => buffer.clear(),
+            });
+        },
+        move || {
+            Text(label, Modifier::empty(), text_style(30.0, TEXT_COLOR, Some(FontWeight::BOLD)));
+        },
+    );
+}
+
+#[composable]
+fn ConnectButton(state: LinkState, address: TextFieldState) {
+    let (label, color) = match state {
+        LinkState::Idle | LinkState::Failed(_) => ("Connect", ACCENT_COLOR),
+        LinkState::Connecting => ("Cancel", STOP_COLOR),
+        LinkState::Streaming => ("Disconnect", STOP_COLOR),
+    };
+    Button(
+        Modifier::empty().background(color).rounded_corners(16.0).padding_symmetric(44.0, 20.0),
+        ButtonSpec::default(),
+        move || toggle_connection(&state, address),
+        move || {
+            Text(label, Modifier::empty(), text_style(32.0, TEXT_COLOR, Some(FontWeight::BOLD)));
+        },
+    );
+}
+
+/// The state of the link in words: connecting, streaming or the error.
+#[composable]
+fn StatusLine(state: LinkState, address: TextFieldState) {
+    let (text, color) = state_text(&state, &address.text());
+    Text(text, Modifier::empty(), text_style(24.0, color, None));
+}
+
+fn state_text(state: &LinkState, address: &str) -> (String, Color) {
+    match state {
+        LinkState::Idle => ("Not connected".into(), MUTED_COLOR),
+        LinkState::Connecting => (format!("Connecting to {}...", address.trim()), WARN_COLOR),
+        LinkState::Streaming => ("Connected".into(), GOOD_COLOR),
+        LinkState::Failed(message) => (message.clone(), BAD_COLOR),
+    }
+}
+
+/// The numbers of the link: rates, decoder times, loss and latency.
+#[composable]
+fn StatsPanel(snapshot: MutableState<Snapshot>) {
+    SpatialPanel(
+        SubspaceModifier::new().size(700.0, 840.0).offset(1000.0, 0.0, 150.0).rotate(0.0, -22.0, 0.0).movable(),
+        move || {
+            let snap = snapshot.get();
+            let lines = stat_lines(&snap);
+            Column(
+                Modifier::empty().fill_max_size().background(PANEL_COLOR).rounded_corners(24.0).padding(36.0),
+                ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(14.0)),
+                move || {
+                    Text("Stream", Modifier::empty(), text_style(44.0, TEXT_COLOR, Some(FontWeight::BOLD)));
+                    for (label, value, color) in lines.clone() {
+                        StatLine(label, value, color);
+                    }
+                },
+            );
+        },
+    );
+}
+
+#[composable]
+fn StatLine(label: &'static str, value: String, color: Color) {
+    Row(
+        Modifier::empty().fill_max_width(),
+        RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(16.0)),
+        move || {
+            Text(label, Modifier::empty().width(170.0), text_style(22.0, MUTED_COLOR, None));
+            Text(value.clone(), Modifier::empty().weight(1.0), text_style(22.0, color, None));
+        },
+    );
+}
+
+/// The lines of the stats panel: a label, a value and the value's color.
+fn stat_lines(snap: &Snapshot) -> Vec<(&'static str, String, Color)> {
+    let stats = &snap.stats;
+    let (link, link_color) = state_text(&snap.state, "the host");
+    let mut lines = vec![("Link", link, link_color)];
+    let Some(stream) = &snap.stream else {
+        return lines;
+    };
+    lines.push((
+        "Stream",
+        format!(
+            "{}x{} per eye, {} at {} Hz, {} media, {:.0} Mbps asked",
+            stream.eye[0],
+            stream.eye[1],
+            stream.codec,
+            stream.refresh_hz,
+            if stream.udp { "UDP" } else { "TCP" },
+            stream.target_mbps
+        ),
+        TEXT_COLOR,
+    ));
+    lines.push(("Frames", frames_text(stats, stream.refresh_hz), fps_color(stats.decoded_fps, stream.refresh_hz)));
+    let (decoder, decoder_color) = decoder_text(stats);
+    lines.push(("Decoder", decoder, decoder_color));
+    lines.push(("Loss", loss_text(stats), if stats.units_lost > 0 { BAD_COLOR } else { TEXT_COLOR }));
+    lines.push((
+        "FEC",
+        format!("{} units recovered, {} packets restored", stats.units_recovered, stats.packets_recovered),
+        TEXT_COLOR,
+    ));
+    lines.push(("Latency", latency_text(stats), TEXT_COLOR));
+    lines.push(("Key frames", format!("{} requested", stats.key_requests), TEXT_COLOR));
+    lines.push((
+        "Tracking",
+        if stats.tracking_live {
+            "from the headset".to_string()
+        } else {
+            "placeholder: the pose is not from the headset yet".to_string()
+        },
+        if stats.tracking_live { GOOD_COLOR } else { WARN_COLOR },
+    ));
+    lines.push(("Haptics", format!("{} pulses received", stats.haptic_pulses), TEXT_COLOR));
+    lines
+}
+
+fn fps_color(fps: f32, target: f32) -> Color {
+    if fps >= target * 0.9 {
+        GOOD_COLOR
+    } else if fps >= target * 0.6 {
+        WARN_COLOR
+    } else {
+        BAD_COLOR
+    }
+}
+
+fn frames_text(stats: &Stats, target_hz: f32) -> String {
+    format!(
+        "{:.1} fps decoded of {:.0}, {:.1} fps received, {:.1} Mbps",
+        stats.decoded_fps, target_hz, stats.received_fps, stats.received_mbps
+    )
+}
+
+fn decoder_text(stats: &Stats) -> (String, Color) {
+    match &stats.decoder {
+        DecoderView::Idle => ("waiting for the stream".into(), MUTED_COLOR),
+        DecoderView::NoSurface => ("none: this window has no headset surface to decode into".into(), WARN_COLOR),
+        DecoderView::Failed(message) => (message.clone(), BAD_COLOR),
+        DecoderView::Running => (
+            format!(
+                "{:.2} ms mean, {:.2} ms last, {:.2} ms longest, {} dropped",
+                stats.decode_mean_ms, stats.decode_last_ms, stats.decode_max_ms, stats.decoder_dropped
+            ),
+            TEXT_COLOR,
+        ),
+    }
+}
+
+fn loss_text(stats: &Stats) -> String {
+    let lost = stats.packets_expected.saturating_sub(stats.packets_received);
+    let percent = 100.0 * lost as f64 / stats.packets_expected.max(1) as f64;
+    format!("{percent:.2}% of {} packets, {} frames lost", stats.packets_expected, stats.units_lost)
+}
+
+fn latency_text(stats: &Stats) -> String {
+    let ms = |value: Option<f32>| value.map_or("-".to_string(), |v| format!("{v:.1}"));
+    format!(
+        "round trip {} ms, network {} ms, pose to decode {} ms",
+        ms(stats.rtt_ms),
+        ms(stats.network_ms),
+        ms(stats.sample_to_decode_ms)
+    )
+}

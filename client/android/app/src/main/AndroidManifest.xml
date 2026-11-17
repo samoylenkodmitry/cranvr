@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The app declares only what is its own. The activity, its launcher entry, the library name and
+    the entries of the xr service come from the Cranpose Gradle plugin.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- The sockets of the link to the host -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:allowBackup="false"
+        android:supportsRtl="true" />
+</manifest>

@@ -1,0 +1,51 @@
+# cranvr-client: the new Quest client of cranvr. It is a pure Cranpose app. It uses Cranpose's
+# public API and plain Rust crates such as cranvr-proto, and it has no ndk, JNI, GL, OpenXR or
+# platform code of its own. It speaks cranvr's own protocol: start the host with
+# `cranvr-host --protocol native`. The ALVR client in quest/ stays beside it for now.
+#
+# Build the APK with scripts/build-client.sh. This crate is its own workspace, so the host's
+# builds do not touch it. The desktop binary runs the same app in a flat window.
+[workspace]
+
+[package]
+name = "cranvr-client"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "cranvr_client"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[[bin]]
+name = "cranvr-client"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+# The Gradle plugin builds the Android library with `android` and `renderer-wgpu`. There the
+# panels stand in the headset. On the desktop they draw flat.
+[features]
+default = ["renderer-wgpu", "desktop"]
+renderer-wgpu = ["cranpose/renderer-wgpu"]
+desktop = ["cranpose/desktop", "dep:env_logger"]
+android = ["renderer-wgpu", "cranpose/android", "cranpose-xr/openxr"]
+
+[dependencies]
+cranvr-proto = { path = "../proto" }
+# One Cranpose revision for every Cranpose crate: the branch cranpose-xr of the Cranpose repository
+cranpose = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "ca4b2d4542580d0a142677f1e4138787dfdade65", features = ["embedded-default-font"] }
+cranpose-xr = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "ca4b2d4542580d0a142677f1e4138787dfdade65" }
+log = "0.4"
+env_logger = { version = "0.11", optional = true }
+
+[build-dependencies]
+cranpose-capabilities = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "ca4b2d4542580d0a142677f1e4138787dfdade65" }
+
+# The Reed-Solomon code of the protocol is about ten times slower without optimization.
+[profile.dev.package.reed-solomon-simd]
+opt-level = 3
+
+[profile.release]
+debug = 1
