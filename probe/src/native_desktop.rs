@@ -7,7 +7,7 @@
 //! - it plays a pointer script: a controller circles over the panel, pulls the trigger once a
 //!   second and leans the thumbstick back and forth. The host's log shows the mouse events that it
 //!   injected (start it with `CRANVR_POINTER_DRY_RUN=1` so that nothing moves the real mouse);
-//! - it counts the datagrams of the Mac's cursor and the seconds of sound, and measures how old
+//! - it counts the datagrams of the Mac's cursor and the seconds of sound. It measures how old
 //!   the sound is on arrival.
 
 use crate::native::now_ns;
@@ -59,6 +59,8 @@ struct Totals {
     audio_age_ms: Vec<f64>,
     audio_first: Option<Instant>,
     audio_last: Option<Instant>,
+    /// The largest absolute sample of the sound, from 0 to 32768
+    audio_peak: u16,
 }
 
 pub struct DesktopProbe {
@@ -197,6 +199,8 @@ impl DesktopProbe {
         let mut totals = self.totals.lock().unwrap();
         totals.audio_datagrams += 1;
         totals.audio_bytes += audio.pcm.len() as u64;
+        let peak = audio.pcm.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b).unsigned_abs()).max().unwrap_or(0);
+        totals.audio_peak = totals.audio_peak.max(peak);
         if totals.last_audio_sequence.is_some_and(|last| audio.sequence != last.wrapping_add(1)) {
             totals.audio_gaps += 1;
         }
@@ -276,12 +280,13 @@ impl DesktopProbe {
             _ => 0.0,
         };
         println!(
-            "probe: audio: {} datagrams, {:.2} s of sound in {:.2} s, {} sequence gaps, {:.2} Mbps; age on arrival (ms) {}",
+            "probe: audio: {} datagrams, {:.2} s of sound in {:.2} s, {} sequence gaps, {:.2} Mbps, peak level {:.3}; age on arrival (ms) {}",
             totals.audio_datagrams,
             audio_seconds,
             audio_span,
             totals.audio_gaps,
             totals.audio_bytes as f64 * 8.0 / audio_span.max(1e-3) / 1e6,
+            f64::from(totals.audio_peak) / 32768.0,
             describe(&totals.audio_age_ms),
         );
         totals.pictures > 0

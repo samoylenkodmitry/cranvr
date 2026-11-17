@@ -1,7 +1,7 @@
 //! The Mac's sound for the native client. `game_audio.rs` captures what this Mac plays with
 //! ScreenCaptureKit and converts it to interleaved 16-bit stereo at 48 kHz. In ALVR mode the server
 //! core sends it. In native mode `send` below cuts it into datagrams of `FRAMES_PER_DATAGRAM`
-//! stereo frames, 5 ms each, and the client plays them (`client/src/audio.rs`).
+//! stereo frames, 5 ms each. The client plays them (`client/src/audio.rs`).
 //!
 //! The sound goes out as plain PCM. Opus would cut 1.54 Mbps to about 0.1 Mbps. The stream's
 //! video takes 40 to 100 Mbps, so the PCM costs about 1.5% on top of it. PCM adds no encode or
@@ -9,7 +9,7 @@
 //!
 //! Each datagram carries the host's clock for its first sample, so the client can tell how old the
 //! sound is when it plays it. ScreenCaptureKit hands over a buffer of about 20 ms at once. The
-//! datagrams of one buffer therefore leave together, and the client's jitter buffer absorbs it.
+//! datagrams of one buffer therefore leave together. The client's jitter buffer absorbs it.
 
 use super::Session;
 use alvr_common::info;
@@ -27,7 +27,7 @@ use std::{
 };
 
 /// The stereo frames in one datagram: 240 frames of 4 bytes are 960 bytes, under the limit of one
-/// datagram, and last 5 ms.
+/// datagram. They last 5 ms.
 const FRAMES_PER_DATAGRAM: usize = 240;
 const BYTES_PER_FRAME: usize = 4;
 const SAMPLE_RATE: f64 = 48_000.0;
@@ -38,11 +38,11 @@ const _: () = assert!(FRAMES_PER_DATAGRAM * BYTES_PER_FRAME <= MAX_AUDIO_BYTES);
 /// The session that plays the sound now. Its audio thread logs the numbers.
 static CURRENT: Mutex<Option<Arc<Session>>> = Mutex::new(None);
 static SEQUENCE: AtomicU32 = AtomicU32::new(0);
-/// Datagrams and bytes sent, and the stereo frames that they hold, since the host started
+/// Datagrams and bytes sent with the stereo frames that they hold, since the host started
 static DATAGRAMS: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
 static FRAMES: AtomicU64 = AtomicU64::new(0);
-/// The size in stereo frames of the capture's last buffer, and the largest since the last log line
+/// The size in stereo frames of the capture's last buffer
 static LAST_BUFFER_FRAMES: AtomicU64 = AtomicU64::new(0);
 static BUFFERS: AtomicU64 = AtomicU64::new(0);
 /// Buffers that arrived while no client was there to play them

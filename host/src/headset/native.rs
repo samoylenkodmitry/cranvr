@@ -320,7 +320,7 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
         Incoming::Control(ClientMsg::RequestKeyFrame { .. }) => shared.emit(Event::RequestIdr),
         Incoming::Control(ClientMsg::Desktop(wish)) => {
             if let Some(desktop) = session.desktop.get() {
-                desktop.on_wish(wish);
+                desktop.on_wish(wish, session);
             }
         }
         Incoming::Datagram(ClientDatagram::Pointer(pointer)) => {

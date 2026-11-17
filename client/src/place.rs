@@ -1,7 +1,7 @@
-//! Where the desktop panel stands in the room, how the user carries and resizes it, and where a
+//! Where the desktop panel stands in the room, how the user carries and resizes it and where a
 //! controller points on it.
 //!
-//! Cranpose carries a `movable()` panel but does not tell the app where the user put it, and a ray
+//! Cranpose carries a `movable()` panel. It does not tell the app where the user put it. A ray
 //! that meets a surface panel reports no point. The app needs both: it saves the place for the next
 //! start and it sends the point to the host as the mouse position. So the app keeps the panel's pose
 //! itself, moves it with its own grab and finds the point with Cranpose's public ray math
@@ -9,9 +9,9 @@
 //!
 //! The pose lives in the room of the headset (OpenXR's LOCAL space, whose origin lies where the head
 //! was when the app started), as the controllers' poses do. A saved place therefore stays in front of
-//! the user at each start, and a recenter of the headset moves the panel with the room.
+//! the user at each start. A recenter of the headset moves the panel with the room.
 //!
-//! The panel stays upright and faces the head: a place is a center, a yaw and a pitch, and a width.
+//! The panel stays upright and faces the head: a place is a center, a yaw, a pitch and a width.
 //! The height follows the picture's aspect ratio.
 //!
 //! The controls:
@@ -26,7 +26,7 @@ use cranpose_xr::{Pose, Ray, SubspaceModifier};
 /// head's place at the start. A panel's modifier offset counts from there.
 const SUBSPACE_ORIGIN: [f32; 3] = [0.0, 0.0, -1.0];
 
-/// The smallest and the widest panel in meters, and the nearest and the farthest it stands.
+/// The smallest and the widest panel in meters. The nearest and the farthest it stands follow.
 const WIDTH_RANGE: [f32; 2] = [0.4, 8.0];
 const DISTANCE_RANGE: [f32; 2] = [0.5, 6.0];
 /// A grip squeezed past this grabs the panel and one released below `LET_GO` drops it.
@@ -36,7 +36,7 @@ const LET_GO: f32 = 0.5;
 /// The host applies the same limits.
 const PRESS: f32 = 0.6;
 const RELEASE: f32 = 0.4;
-/// Carrying: how fast the thumbstick moves the panel away in meters a second, and how fast it
+/// Carrying: how fast the thumbstick moves the panel away in meters a second. Then how fast it
 /// resizes the panel as a share of the width a second, at full lean
 const PUSH_SPEED: f32 = 1.2;
 const RESIZE_SPEED: f32 = 0.7;
@@ -240,7 +240,7 @@ pub struct Engine {
     carry: Option<Carry>,
     /// The hand that points, 0 left and 1 right
     active: usize,
-    /// A press that began on the panel, and the last point on it
+    /// A press that began on the panel with the last point on it
     pressed: Option<[f32; 2]>,
     /// A trigger that was down before it met the panel does not click
     ignoring: bool,

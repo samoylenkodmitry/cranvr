@@ -42,7 +42,7 @@ fn the_desktop_messages_round_trip() {
 }
 
 /// The new variants stand after the old ones, so a host and a client that do not know them read
-/// every old message as before: an old message keeps its tag, and a message that a side does not
+/// every old message as before: an old message keeps its tag. A message that a side does not
 /// know fails to decode, which the read loops skip.
 #[test]
 fn the_new_variants_leave_the_old_tags_alone() {
@@ -73,7 +73,7 @@ fn the_new_variants_leave_the_old_tags_alone() {
 }
 
 /// A desktop picture and an eye frame with the same frame number are two units. Neither hides the
-/// other, and each comes back under its own stream.
+/// other. Each comes back under its own stream.
 #[test]
 fn the_desktop_stream_has_its_own_units() {
     let mut rng = Rng(11);

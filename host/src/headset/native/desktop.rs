@@ -15,7 +15,7 @@
 //!   thumbstick. The host moves the Mac's mouse, clicks and scrolls as the compat mode does
 //!   (`desktop::Pointer`).
 //! - `LayerState` tells the frame loop that the client shows the desktop, so the eye stream leaves
-//!   its own copy of the screen out, and that a game hides it.
+//!   its own copy of the screen out. It tells the loop that a game hides the desktop.
 
 use super::Session;
 use crate::{
@@ -65,7 +65,7 @@ impl Default for Options {
 pub const MBPS: u64 = 40;
 /// Pictures a second at most
 const MAX_FPS: i32 = 60;
-/// The cursor's position goes out this often while the mouse moves, and at least this often
+/// The cursor's position goes out this often while the mouse moves. It goes out at least this often
 const CURSOR_EVERY: Duration = Duration::from_millis(2);
 const CURSOR_KEEPALIVE: Duration = Duration::from_millis(50);
 /// A pointer that the client stopped reporting counts as lifted after this time
@@ -139,8 +139,14 @@ impl Desktop {
         self.inner.options.layer.active.store(false, Ordering::Relaxed);
     }
 
-    /// The client asks for the stream, or stops it.
-    pub(super) fn on_wish(&self, wish: DesktopWish) {
+    /// The client asks for the stream, or stops it. A host without `--desktop` answers that it has
+    /// none.
+    pub(super) fn on_wish(&self, wish: DesktopWish, session: &Session) {
+        if !self.inner.options.enabled {
+            info!("Native desktop: the client asks for the desktop and the host runs without --desktop");
+            session.link.duplex.send_control(&HostMsg::Desktop(None)).ok();
+            return;
+        }
         info!("Native desktop: the client {} the desktop at up to {} pixels across and {} pictures a second", if wish.enabled { "asks for" } else { "stops" }, wish.max_width, wish.max_fps);
         *self.inner.wish.lock().unwrap() = Some(wish);
     }
@@ -179,7 +185,7 @@ fn flip_pictures() -> bool {
 }
 
 /// The cursor goes into the pictures unless `CRANVR_DESKTOP_CURSOR_IN_VIDEO=0`. The client then
-/// draws no cursor of its own, and the cursor is as late as the pictures are. A panel in front of
+/// draws no cursor of its own. The cursor is as late as the pictures are. A panel in front of
 /// the client's surface panel is hidden under the surface today (Cranpose draws surfaces after the
 /// panels), so a cursor that the client draws cannot show over the desktop.
 fn cursor_in_video() -> bool {
@@ -507,7 +513,7 @@ fn mouse_location() -> Option<CGPoint> {
     }
 }
 
-/// Sends the Mac's cursor position on the captured display every 2 ms while it moves, and every
+/// Sends the Mac's cursor position on the captured display every 2 ms while it moves. It sends it every
 /// 50 ms otherwise, so a lost datagram does not leave the client with an old position.
 fn cursor_loop(inner: &Inner, session: &Session) {
     let (mut seq, mut last, mut sent) = (0u32, None::<(u32, u32, bool)>, Instant::now());

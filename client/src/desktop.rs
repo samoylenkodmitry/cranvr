@@ -47,10 +47,7 @@ use std::{
 };
 
 const PLACE_KEY: &str = "desktop_place";
-/// How often the headset's frame effect ran and how often the cursor panel composed since the start,
-/// for the log
-static EFFECT_FRAMES: AtomicU64 = AtomicU64::new(0);
-static CURSOR_COMPOSITIONS: AtomicU64 = AtomicU64::new(0);
+
 /// How long the decoder waits for a free input buffer before it refuses a picture
 const INPUT_WAIT: Duration = Duration::from_millis(30);
 /// What the client asks for. The Quest 3's hardware decoder takes 3840 by 2160 at 60 pictures a
@@ -60,10 +57,10 @@ const WISH_FPS: u8 = 60;
 /// The pointer goes to the host this often while it points at the panel, if nothing changes
 const POINTER_KEEPALIVE: Duration = Duration::from_millis(50);
 const KEY_REQUEST_GAP: Duration = Duration::from_millis(250);
-/// How often the panel looks at the link's state, and how often the decode thread logs
+/// How often the panel looks at the link's state. The decode thread logs as often as `LOG_EVERY`
 const POLL: Duration = Duration::from_millis(100);
 const LOG_EVERY: Duration = Duration::from_secs(2);
-/// The cursor: a ring that is lifted this far off the surface, in meters, and its diameter in dp
+/// The cursor: a ring that is lifted this far off the surface, in meters, with this diameter in dp
 const CURSOR_LIFT: f32 = 0.004;
 const CURSOR_SIZE: f32 = 26.0;
 
@@ -141,7 +138,7 @@ pub struct Desktop {
     units: Mutex<Option<Sender<Received>>>,
 }
 
-/// The desktop of the process. The activity may rebuild the composition, and the link outlives it.
+/// The desktop of the process. The activity may rebuild the composition. The link outlives it.
 pub fn desktop() -> &'static Desktop {
     static DESKTOP: OnceLock<Desktop> = OnceLock::new();
     DESKTOP.get_or_init(|| Desktop {
@@ -531,7 +528,7 @@ pub fn decode_loop(units: &mpsc::Receiver<Received>, stop: &AtomicBool) {
             let s = rates.look();
             if s.size != [0, 0] {
                 log::info!(
-                    "desktop: {:.1} pictures/s received and {:.1}/s decoded of {}x{}, {:.1} Mbps, decoder {} (decode {:.2} ms mean, {:.2} ms last, {:.2} ms longest, {} dropped, {} late), {} skipped, {} refused, {} key requests, {} pointer packets sent, {} cursor packets, frame effect ran {} times, cursor panel composed {} times{}",
+                    "desktop: {:.1} pictures/s received and {:.1}/s decoded of {}x{}, {:.1} Mbps, decoder {} (decode {:.2} ms mean, {:.2} ms last, {:.2} ms longest, {} dropped, {} late), {} skipped, {} refused, {} key requests, {} pointer packets sent, {} cursor packets{}",
                     s.received_fps,
                     s.decoded_fps,
                     s.size[0],
@@ -548,8 +545,6 @@ pub fn decode_loop(units: &mpsc::Receiver<Received>, stop: &AtomicBool) {
                     s.key_requests,
                     s.pointers_sent,
                     s.cursors,
-                    EFFECT_FRAMES.load(Ordering::Relaxed),
-                    CURSOR_COMPOSITIONS.load(Ordering::Relaxed),
                     s.error.map_or(String::new(), |e| format!(", {e}"))
                 );
             }
@@ -689,7 +684,6 @@ pub fn DesktopPanel() {
     {
         let shared = Rc::clone(&shared);
         SpatialFrameEffect(move |frame: &XrFrame| {
-            EFFECT_FRAMES.fetch_add(1, Ordering::Relaxed);
             let now = desktop().view();
             let mut engine = shared.engine.borrow_mut();
             engine.aspect = now.aspect;
@@ -738,8 +732,8 @@ pub fn DesktopPanel() {
 /// The surface that the decoder writes into. The headset makes its swapchain at the size of the
 /// panel's first composition (1.5 pixels to a dp) and keeps it when the user resizes the panel. The
 /// decoder's pictures are larger. A test with the swapchain at 1600 by 900 dp (2400 by 1350 pixels) and
-/// at 2560 by 1440 dp (3840 by 2160 pixels) showed the whole picture and the same sharpness, so the
-/// compositor samples the decoder's own buffer.
+/// at 2560 by 1440 dp (3840 by 2160 pixels) showed the whole picture both times. The sharpness of a
+/// panel wider than the view is not tested.
 #[composable]
 fn Surface(place: MutableState<Place>, aspect: f32) {
     let modifier = place.get().modifier(aspect);
@@ -755,12 +749,7 @@ fn Surface(place: MutableState<Place>, aspect: f32) {
 fn CursorRing(place: MutableState<Place>, cursor: MutableState<Option<[f32; 2]>>, aspect: f32) {
     let Some([u, v]) = cursor.get() else { return };
     let p = place.get();
-    CURSOR_COMPOSITIONS.fetch_add(1, Ordering::Relaxed);
-    // `--ef cursor_lift 0.3` lifts the ring far off the picture: a test of what hides it
-    let lift = launch_args().float("cursor_lift").unwrap_or(CURSOR_LIFT);
-    // `--ef cursor_u_add 0.7` shifts the ring beside the picture: a test that the ring draws at all
-    let u = u + launch_args().float("cursor_u_add").unwrap_or(0.0);
-    SpatialPanel(p.cursor_modifier(aspect, [u, v], CURSOR_SIZE, lift), || {
+    SpatialPanel(p.cursor_modifier(aspect, [u, v], CURSOR_SIZE, CURSOR_LIFT), || {
         Box(
             Modifier::empty()
                 .fill_max_size()

@@ -24,7 +24,7 @@
 //! renderer stops is gone for good.
 //!
 //! The device's own output latency is not known: Cranpose's backend does not report it. `Stats`
-//! gives the buffer's fill, which is what this file controls, and the age of the sound when the
+//! gives the buffer's fill, which is what this file controls. It gives the age of the sound when the
 //! network thread queued it.
 
 use cranpose_audio::{
@@ -70,23 +70,26 @@ struct Shared {
     dropped_frames: AtomicU64,
     /// Frames that the network thread could not queue, because the queue was full
     overflow_frames: AtomicU64,
-    /// Datagrams that never came, and datagrams that came after a newer one
+    /// Datagrams that never came. Datagrams that came after a newer one
     lost_packets: AtomicU64,
     late_packets: AtomicU64,
     packets: AtomicU64,
-    /// Stereo frames that the device asks for in one callback, and its rate
+    /// Stereo frames that the device asks for in one callback. The device's rate
     callback_frames: AtomicU32,
     device_rate: AtomicU32,
     /// The smallest and the largest fill in frames since the last `stats` call
     fill_min: AtomicU64,
     fill_max: AtomicU64,
-    /// The renderer plays, and not waits for the buffer to fill
+    /// The renderer plays. It does not wait for the buffer to fill
     playing: AtomicBool,
-    /// The sum of the age of the sound when it was queued, in microseconds, and the count
+    /// The sum of the age of the sound when it was queued, in microseconds. The count
     age_us: AtomicU64,
     age_n: AtomicU64,
-    /// The playback rate's change in parts per million, and the signed value as a bit pattern
+    /// The playback rate's change in parts per million, as the bits of an f32
     rate_ppm: AtomicU32,
+    /// The largest absolute sample that the renderer wrote since the last log line, as the bits of
+    /// an f32. The bits of a non-negative float order like the floats, so `fetch_max` works.
+    peak: AtomicU32,
 }
 
 /// The numbers that the stats panel and the log show.
@@ -116,6 +119,9 @@ pub struct Stats {
     pub played_s: f32,
     /// The playback rate's change in percent
     pub rate_pct: f32,
+    /// The largest sample that reached the device since the last log line, from 0 to 1. 0 means
+    /// silence: the sound can be on while nothing plays.
+    pub peak: f32,
 }
 
 /// The producer's end: it converts the datagrams and pushes them.
@@ -176,7 +182,7 @@ fn log_loop(player: &Arc<Player>) {
         }
         let s = stats_of(player, true);
         log::info!(
-            "audio: {}, buffer {:.1} ms now (range {:.1} to {:.1}, target {:.0}), device burst {:.1} ms at {} Hz, age when queued {} ms, {} packets, {} lost, {} late, {} underruns, {:.0} ms dropped, {:.0} ms overflow, rate {:+.2}%, {:.1} s played",
+            "audio: {}, buffer {:.1} ms now (range {:.1} to {:.1}, target {:.0}), device burst {:.1} ms at {} Hz, age when queued {} ms, {} packets, {} lost, {} late, {} underruns, {:.0} ms dropped, {:.0} ms overflow, rate {:+.2}%, {:.1} s played, peak level {:.3}",
             if s.playing { "playing" } else { "waiting for the buffer" },
             s.fill_ms,
             s.fill_min_ms,
@@ -193,6 +199,7 @@ fn log_loop(player: &Arc<Player>) {
             s.overflow_ms,
             s.rate_pct,
             s.played_s,
+            s.peak,
         );
     }
 }
@@ -255,7 +262,7 @@ impl Producer {
     }
 }
 
-/// What the stats panel shows now: the totals, and the fill's range and the sound's age since the
+/// What the stats panel shows now: the totals, the fill's range and the sound's age since the
 /// log's last line.
 pub fn stats() -> Stats {
     let Some(player) = PLAYER.lock().unwrap().clone() else { return Stats::default() };
@@ -269,15 +276,22 @@ fn stats_of(player: &Player, reset: bool) -> Stats {
     let frames_to_ms = |frames: u64| frames as f32 * 1000.0 / rate;
     let pushed = s.pushed.load(Ordering::Acquire);
     let popped = s.popped.load(Ordering::Acquire);
-    let (min, max, age_us, age_n) = if reset {
+    let (min, max, age_us, age_n, peak) = if reset {
         (
             s.fill_min.swap(u64::MAX, Ordering::Relaxed),
             s.fill_max.swap(0, Ordering::Relaxed),
             s.age_us.swap(0, Ordering::Relaxed),
             s.age_n.swap(0, Ordering::Relaxed),
+            s.peak.swap(0, Ordering::Relaxed),
         )
     } else {
-        (s.fill_min.load(Ordering::Relaxed), s.fill_max.load(Ordering::Relaxed), s.age_us.load(Ordering::Relaxed), s.age_n.load(Ordering::Relaxed))
+        (
+            s.fill_min.load(Ordering::Relaxed),
+            s.fill_max.load(Ordering::Relaxed),
+            s.age_us.load(Ordering::Relaxed),
+            s.age_n.load(Ordering::Relaxed),
+            s.peak.load(Ordering::Relaxed),
+        )
     };
     let fill = pushed.saturating_sub(popped);
     let device_rate = s.device_rate.load(Ordering::Relaxed);
@@ -299,6 +313,7 @@ fn stats_of(player: &Player, reset: bool) -> Stats {
         overflow_ms: frames_to_ms(s.overflow_frames.load(Ordering::Relaxed)),
         played_s: popped as f32 / rate,
         rate_pct: f32::from_bits(s.rate_ppm.load(Ordering::Relaxed)) / 10_000.0,
+        peak: f32::from_bits(peak),
     }
 }
 
@@ -339,7 +354,7 @@ struct Output {
     primed: bool,
     /// The fill's moving average in frames, which the rate follows
     smoothed: f32,
-    /// The frames between which the playback position lies, and how far past `before` it is
+    /// The frames between which the playback position lies. `phase` is how far past `before` it is
     before: [f32; 2],
     after: [f32; 2],
     phase: f32,
@@ -436,6 +451,7 @@ impl Renderer for Output {
                 }
             }
         }
+        let mut peak = 0.0f32;
         for frame in 0..out_frames {
             while self.phase >= 1.0 {
                 match self.pop() {
@@ -445,7 +461,7 @@ impl Renderer for Output {
                         self.phase -= 1.0;
                     }
                     None => {
-                        // The buffer ran dry: the rest of this callback stays silent, and the
+                        // The buffer ran dry: the rest of this callback stays silent. The
                         // renderer waits until the buffer holds the target again
                         self.shared.underruns.fetch_add(1, Ordering::Relaxed);
                         self.primed = false;
@@ -466,8 +482,10 @@ impl Renderer for Output {
                     out[at + 1] = right;
                 }
             }
+            peak = peak.max(left.abs()).max(right.abs());
             self.phase += step;
         }
+        self.shared.peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
         RenderStatus::Continue
     }
 }
@@ -534,6 +552,21 @@ mod tests {
         out.render(&mut buffer);
         let ppm = f32::from_bits(out.shared.rate_ppm.load(Ordering::Relaxed));
         assert!(ppm > 0.0 && ppm <= MAX_RATE_ADJUST * 1e6, "{ppm}");
+    }
+
+    #[test]
+    fn the_renderer_reports_the_peak_of_what_it_played() {
+        let (mut queue, mut out) = output(48_000.0, 48_000.0, 2);
+        push(&out, &mut queue, (0..2000).map(|i| if i == 700 { [0.0, -0.8] } else { [0.25, 0.1] }));
+        let mut buffer = [0.0f32; 2 * 960];
+        out.render(&mut buffer);
+        let peak = f32::from_bits(out.shared.peak.load(Ordering::Relaxed));
+        assert!((peak - 0.8).abs() < 0.3 && peak > 0.25, "{peak}");
+        // Silence leaves a peak of 0
+        let (mut queue, mut quiet) = output(48_000.0, 48_000.0, 2);
+        push(&quiet, &mut queue, (0..2000).map(|_| [0.0, 0.0]));
+        quiet.render(&mut buffer);
+        assert_eq!(quiet.shared.peak.load(Ordering::Relaxed), 0);
     }
 
     #[test]
