@@ -17,8 +17,11 @@ fn percentile_and_grid_work() {
     assert_eq!(percentile(&VecDeque::new(), 0.9), None);
     assert_eq!(grid_at_or_after(100, 10.0, 100), 100);
     assert_eq!(grid_at_or_after(100, 10.0, 101), 110);
-    assert_eq!(grid_at_or_after(100, 10.0, 90), 100);
     assert_eq!(grid_at_or_after(100, 10.0, 130), 130);
+    // The grid goes back from its origin: the origin is the newest display time and can lie ahead
+    assert_eq!(grid_at_or_after(100, 10.0, 90), 90);
+    assert_eq!(grid_at_or_after(100, 10.0, 81), 90);
+    assert_eq!(grid_at_or_after(100, 10.0, 3), 10);
 }
 
 #[test]
@@ -41,7 +44,7 @@ fn the_start_is_the_target_minus_the_lead_and_the_need() {
     // The first target is feasible for the median need, which is the need without the margin
     let median = (FIRST_NEED_MS * MS) as u64;
     assert!(plan.target >= now + median + lead && plan.target < now + median + lead + PERIOD);
-    assert_eq!((plan.target - 1_000_000_000) % PERIOD < 2, true, "the target lies on the grid");
+    assert!((plan.target - 1_000_000_000) % PERIOD < 2, "the target lies on the grid");
     assert_eq!(plan.start, plan.target - need - lead);
 }
 
@@ -145,8 +148,6 @@ struct Outcome {
     on_target: usize,
     /// Frames that the headset replaced
     replaced: usize,
-    /// The planner's counts and estimates at the end
-    stats: Stats,
 }
 
 /// A headset with a display grid and a pick `lead` before each point. A host whose frames take
@@ -167,10 +168,9 @@ fn simulate(locked: bool, pipeline_ms: f64, jitter_ms: f64, seed: u64) -> Outcom
     let mut frames: Vec<(Nanos, Nanos, Nanos)> = Vec::new(); // arrival, target, id
     let mut consumed = 0usize;
     let mut last_shown: Option<Nanos> = None;
-    let mut out = Outcome { new_frames: 0, slots: 0, on_target: 0, replaced: 0, stats: Stats::default() };
+    let mut out = Outcome { new_frames: 0, slots: 0, on_target: 0, replaced: 0 };
     let mut host_free = 0u64;
     let mut id = 0u64;
-    let mut slot_log: Vec<(usize, Option<Nanos>)> = Vec::new();
     let mut picks: Vec<u64> = (0..slots).map(|j| pick(j, &mut rng)).collect();
     picks.push(u64::MAX);
     while next_slot < slots {
@@ -198,8 +198,6 @@ fn simulate(locked: bool, pipeline_ms: f64, jitter_ms: f64, seed: u64) -> Outcom
         // The headset's side up to this start: picks and the reports that came back
         id += 1;
         let arrival = start + ((pipeline_ms + rng.jitter(jitter_ms)) * MS) as u64;
-        let planned = if locked { lock.plan(start).map_or(start, |p| p.start.min(start)) } else { start };
-        let _ = planned;
         if locked {
             lock.commit(target, 0);
             lock.sent(id, target, start.min(target));
@@ -234,11 +232,9 @@ fn simulate(locked: bool, pipeline_ms: f64, jitter_ms: f64, seed: u64) -> Outcom
             if next_slot >= 200 {
                 out.slots += 1;
             }
-            slot_log.push((next_slot, shown.map(|i| frames[i].2)));
             next_slot += 1;
         }
     }
-    out.stats = lock.take_stats();
     out
 }
 

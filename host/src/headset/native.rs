@@ -817,6 +817,8 @@ impl Headset for Native {
             "lock_late_start_ms": slots.late_start_ms,
             "lock_late_start_max_ms": slots.late_start_max_ms,
             "lock_need_ms": slots.need_ms,
+            "lock_need_p10_ms": slots.need_p10_ms,
+            "lock_need_p50_ms": slots.need_p50_ms,
             "lock_lead_ms": slots.lead_ms,
             "lock_margin_ms": slots.margin_ms,
             "horizon_ms": stats.horizon / f64::from(stats.horizon_frames.max(1)),

@@ -46,8 +46,14 @@ const MAX_MARGIN_PERIODS: f64 = 0.7;
 /// about 2.5 percent.
 const MISS_STEP_MS: f64 = 0.4;
 const HIT_STEP_MS: f64 = 0.01;
-/// A frame shown a point early lowers the margin by this much, in ms.
-const EARLY_STEP_MS: f64 = 0.4;
+/// A frame shown a point early lowers the margin by this much, in ms. The step is small: with a
+/// wide spread of the need, early frames come in any case. A large step would take the margin to
+/// its floor.
+const EARLY_STEP_MS: f64 = 0.1;
+/// The planned need is at most the 10th percentile of the measured need plus this share of a
+/// period. A frame at the 10th percentile then still shows at its own point. A larger need would
+/// make every fast frame early. An early frame replaces the frame before it.
+const NEED_CAP_PERIODS: f64 = 0.9;
 /// The percentile of the lead and of the need
 const PERCENTILE: f64 = 0.9;
 /// Frames that wait for their report. An older one is forgotten.
@@ -92,6 +98,10 @@ pub struct Stats {
     pub need_ms: f64,
     pub lead_ms: f64,
     pub margin_ms: f64,
+    /// The 10th and the 50th percentile of the measured time from a frame's start to the end of
+    /// its decode, in ms
+    pub need_p10_ms: f64,
+    pub need_p50_ms: f64,
 }
 
 impl Stats {
@@ -139,12 +149,15 @@ fn percentile(window: &VecDeque<f64>, share: f64) -> Option<f64> {
     Some(sorted[index])
 }
 
-/// The first point of the grid `start + k * period` at or after `t`.
-fn grid_at_or_after(start: Nanos, period: f64, t: Nanos) -> Nanos {
-    if t <= start || period < 1.0 {
-        return start.max(t);
+/// The first point of the grid `origin + k * period` at or after `t`, for any whole `k`. The
+/// origin is the newest display time that a sample gave. It lies ahead of `t` when the frame is
+/// quick. The grid goes back from it.
+fn grid_at_or_after(origin: Nanos, period: f64, t: Nanos) -> Nanos {
+    if period < 1.0 {
+        return t;
     }
-    start + (((t - start) as f64 / period).ceil() * period) as Nanos
+    let steps = ((t as f64 - origin as f64) / period).ceil();
+    (origin as f64 + steps * period).max(0.0) as Nanos
 }
 
 impl DisplayLock {
@@ -177,7 +190,7 @@ impl DisplayLock {
             // The gap between two successive samples is one period, or a few when samples are lost
             let gap = (display_time - origin) as f64;
             let points = (gap / self.period).round();
-            if points >= 1.0 && points <= 4.0 {
+            if (1.0..=4.0).contains(&points) {
                 let one = gap / points;
                 if (one - self.nominal_period as f64).abs() < 0.2 * self.nominal_period as f64 {
                     self.period += 0.02 * (one - self.period);
@@ -188,10 +201,12 @@ impl DisplayLock {
     }
 
     /// Whether the planner knows the grid.
+    #[cfg(test)]
     pub fn ready(&self) -> bool {
         self.origin.is_some()
     }
 
+    #[cfg(test)]
     pub fn period(&self) -> Nanos {
         self.period as Nanos
     }
@@ -199,7 +214,11 @@ impl DisplayLock {
     /// The time from a frame's start to the end of its decode that the planner counts on, in ns
     fn need(&self) -> f64 {
         let measured = percentile(&self.need, PERCENTILE).unwrap_or(FIRST_NEED_MS * 1e6);
-        measured + self.margin_ms * 1e6
+        let planned = measured + self.margin_ms * 1e6;
+        match percentile(&self.need, 0.1) {
+            Some(fast) => planned.min(fast + NEED_CAP_PERIODS * self.period),
+            None => planned,
+        }
     }
 
     /// The time from the pick to the display that the planner counts on, in ns
@@ -304,6 +323,8 @@ impl DisplayLock {
         stats.need_ms = self.need() / 1e6;
         stats.lead_ms = self.lead() / 1e6;
         stats.margin_ms = self.margin_ms;
+        stats.need_p10_ms = percentile(&self.need, 0.1).unwrap_or(0.0) / 1e6;
+        stats.need_p50_ms = percentile(&self.need, 0.5).unwrap_or(0.0) / 1e6;
         stats
     }
 }

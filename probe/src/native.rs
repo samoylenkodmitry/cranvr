@@ -116,6 +116,9 @@ struct Shared {
     /// The head poses that the probe sent, by sample time. The decoder checks the eye poses that
     /// come back in the frame metadata against them.
     sent_poses: Mutex<VecDeque<(u64, Pose)>>,
+    /// The time at which the probe's head had no turn. The head's pose is a function of time
+    /// since then: it turns at a constant rate about the vertical axis.
+    pose_origin: u64,
     /// Frames wait for a key frame at the start and after a lost unit
     waiting_key: AtomicBool,
     last_key_request: Mutex<Instant>,
@@ -198,6 +201,7 @@ pub fn run(o: Options) -> i32 {
         receiver: Mutex::new(FrameReceiver::new()),
         clock: Mutex::new(ClockSync::new()),
         sent_poses: Mutex::new(VecDeque::new()),
+        pose_origin: now_ns(),
         waiting_key: AtomicBool::new(true),
         last_key_request: Mutex::new(Instant::now() - KEY_REQUEST_GAP),
         config: Mutex::new((0, Vec::new())),
@@ -231,7 +235,7 @@ pub fn run(o: Options) -> i32 {
     // The headset's clock: tracking, input, pings and the loss reports
     {
         let shared = Arc::clone(&shared);
-        thread::Builder::new().name("tracking".into()).spawn(move || tracking_loop(&shared, period)).unwrap();
+        thread::Builder::new().name("tracking".into()).spawn(move || tracking_loop(&shared, period, vsync_origin)).unwrap();
     }
     // The decoder
     let results = Arc::new(Mutex::new(DecodeResults::default()));
@@ -302,6 +306,9 @@ struct DecodeResults {
     poses_ok: u64,
     poses_bad: u64,
     poses_unknown: u64,
+    /// Of the frames with right eye poses, those whose poses are the ones valid at the target
+    /// display time: the host moved the sample's pose forward
+    poses_at_target: u64,
     /// Frames whose slice rectangle covers the whole decoded image
     slices_ok: u64,
     /// Frames that came before the host's clock estimate was ready, so they have no target
@@ -373,24 +380,20 @@ fn on_media(shared: &Shared, packet: &[u8], units: &mpsc::Sender<Received>) {
 }
 
 /// Sends the synthetic tracking at the refresh rate, then the slower reports.
-fn tracking_loop(shared: &Shared, period_ns: u64) {
+fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
     let origin = Instant::now();
     let period = Duration::from_nanos(period_ns);
     let mut deadline = origin;
     let (mut last_report, mut last_ping, mut ping_id) = (origin, origin - PING_EVERY, 0u32);
-    let turn_rate = 20f32.to_radians();
     let mut squeezed = false;
     while !shared.stop.load(Ordering::Relaxed) {
         let t = origin.elapsed().as_secs_f32();
-        let (sin, cos) = (turn_rate * t / 2.0).sin_cos();
-        // Turns about the vertical axis: the quaternion (0, sin, 0, cos)
-        let head = Motion {
-            pose: Pose { orientation: [0.0, sin, 0.0, cos], position: [0.0, 1.6, 0.0] },
-            linear_velocity: [0.0; 3],
-            angular_velocity: [0.0, turn_rate, 0.0],
-        };
-        let left = Motion { pose: Pose { orientation: [0.0, 0.0, 0.0, 1.0], position: [-0.2, 1.2, -0.4] }, ..Default::default() };
         let sample_time = now_ns();
+        // The simulated display shows the frame of this sample at its second refresh after the
+        // sample. The head's pose is the one that is valid then, as a headset predicts it.
+        let display_time = next_refresh(vsync_origin, period_ns, sample_time + 2 * period_ns);
+        let head = head_at(shared.pose_origin, display_time);
+        let left = Motion { pose: Pose { orientation: [0.0, 0.0, 0.0, 1.0], position: [-0.2, 1.2, -0.4] }, ..Default::default() };
         {
             let mut sent = shared.sent_poses.lock().unwrap();
             if sent.len() >= 512 {
@@ -400,8 +403,7 @@ fn tracking_loop(shared: &Shared, period_ns: u64) {
         }
         shared.link.duplex.send_datagram(&ClientDatagram::Tracking(Tracking {
                 sample_time,
-                // The simulated display shows the frame two refreshes after the sample
-                display_time: sample_time + 2 * period_ns,
+                display_time,
                 head,
                 left: Some(left),
                 right: None,
@@ -534,7 +536,8 @@ fn decode_loop(
             tracking_sample: unit.meta.tracking_sample,
             received: unit.completed,
             decode_end,
-            picked: decode_end,
+            // The simulated display takes the frame at its refresh: its pick is the display time
+            picked: display_time,
             display_time,
             next_display_time: display_time + period,
         };
@@ -557,11 +560,19 @@ fn decode_loop(
         }
 
         // What the host put in the metadata
-        let sent = shared.sent_poses.lock().unwrap().iter().rev().find(|(t, _)| *t == unit.meta.tracking_sample).map(|(_, p)| *p);
+        let sent = shared.sent_poses.lock().unwrap().iter().rev().find(|(t, _)| (*t..*t + 3).contains(&unit.meta.tracking_sample)).map(|(_, p)| *p);
         match sent {
             Some(head) => {
-                let expected = [eye_pose(&head, -EYE_X), eye_pose(&head, EYE_X)];
-                if unit.meta.eye_poses.iter().zip(&expected).all(|(a, b)| same_pose(a, b)) {
+                let eyes = |head: &Pose| [eye_pose(head, -EYE_X), eye_pose(head, EYE_X)];
+                let matches = |expected: [Pose; 2], tolerance: f32| unit.meta.eye_poses.iter().zip(&expected).all(|(a, b)| same_pose(a, b, tolerance));
+                // The host renders for the pose that is valid at its target display time when it
+                // locks its frames to the display. Otherwise it renders for the sample's pose. The
+                // head turns at a constant rate, so both are exact up to rounding.
+                let expected = eyes(&head);
+                if unit.meta.target_display != 0 && matches(eyes(&head_at(shared.pose_origin, unit.meta.target_display).pose), 2e-3) {
+                    r.poses_ok += 1;
+                    r.poses_at_target += 1;
+                } else if matches(expected, 1e-4) {
                     r.poses_ok += 1;
                 } else {
                     r.poses_bad += 1;
@@ -614,8 +625,22 @@ fn eye_pose(head: &Pose, x: f32) -> Pose {
     Pose { orientation: head.orientation, position: [head.position[0] + rotated[0], head.position[1] + rotated[1], head.position[2] + rotated[2]] }
 }
 
-fn same_pose(a: &Pose, b: &Pose) -> bool {
-    a.orientation.iter().zip(&b.orientation).all(|(x, y)| (x - y).abs() < 1e-4) && a.position.iter().zip(&b.position).all(|(x, y)| (x - y).abs() < 1e-4)
+fn same_pose(a: &Pose, b: &Pose, tolerance: f32) -> bool {
+    a.orientation.iter().zip(&b.orientation).all(|(x, y)| (x - y).abs() < tolerance)
+        && a.position.iter().zip(&b.position).all(|(x, y)| (x - y).abs() < tolerance)
+}
+
+/// The probe's head at `time` on the client's clock: it turns about the vertical axis at 20 degrees
+/// a second, from no turn at `origin`.
+fn head_at(origin: u64, time: u64) -> Motion {
+    let turn_rate = 20f32.to_radians();
+    let seconds = (time as i128 - origin as i128) as f32 / 1e9;
+    let (sin, cos) = (turn_rate * seconds / 2.0).sin_cos();
+    Motion {
+        pose: Pose { orientation: [0.0, sin, 0.0, cos], position: [0.0, 1.6, 0.0] },
+        linear_velocity: [0.0; 3],
+        angular_velocity: [0.0, turn_rate, 0.0],
+    }
 }
 
 /// The mean, the median, the 95th percentile and the largest value.
@@ -660,8 +685,8 @@ fn print_summary(shared: &Shared, r: &DecodeResults, seconds: f32, expected: u64
     }
     let l = &r.latencies;
     println!(
-        "probe: native: frame metadata: eye poses right in {} frames, wrong in {}, sample unknown in {}; slice rectangle right in {}; no target display in {}",
-        r.poses_ok, r.poses_bad, r.poses_unknown, r.slices_ok, r.no_target
+        "probe: native: frame metadata: eye poses right in {} frames ({} of them for the target display time), wrong in {}, sample unknown in {}; slice rectangle right in {}; no target display in {}",
+        r.poses_ok, r.poses_at_target, r.poses_bad, r.poses_unknown, r.slices_ok, r.no_target
     );
     let near = l.target_gap.iter().filter(|g| g.abs() < 1.0).count();
     println!(

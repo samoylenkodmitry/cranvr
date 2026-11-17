@@ -256,7 +256,7 @@ fn default_eye_width(foveation: bool, fps: u32) -> u32 {
     // 2496x1312 in 6.9 ms), and these sizes come from that; the overlapping encoder is faster
     // (2432x1152 in 3.5 ms). With ALVR's default foveation a Quest 3 eye (2064 wide) encodes
     // as about 1216x1152. A client without foveation that got an eye of 2064 wide saw frames of
-    // 4128 by 2162 pixels. They took 10.5 ms each to encode, and a Quest 3 showed green blocks in
+    // 4128 by 2162 pixels. They took 10.5 ms each to encode. A Quest 3 showed green blocks in
     // part of the picture. Its decoder advertises HEVC level 6.2, so the cause is not known.
     match (foveation, fps) {
         (true, _) => 2064,
@@ -631,6 +631,9 @@ impl FrameNote {
     }
 }
 
+/// A planned frame may reuse the sample of the frame before it this many times in a row.
+const MAX_REPEATS: u64 = 2;
+
 /// Frames the encoder may hold at once. More would wait inside the encoder and add latency.
 const MAX_IN_FLIGHT: usize = 2;
 
@@ -821,9 +824,13 @@ fn frame_loop(
     let mut encoder: Option<(Arc<Encoder>, Negotiated, Option<Foveation>)> = None;
     let mut game = Game { unscale: unscale_displays, ..Game::default() };
     let mut last_sample = 0;
+    // How many frames in a row rendered again for `last_sample`
+    let mut repeats = 0u64;
     // The stream's rate replaces this when the encoder starts
     let mut pacer = pacer::Pacer::new(120.0).with_ready(headset.pacer_ready());
     let mut frame_index = 0i64;
+    // The display lock's plan that the loop waits for, with the instant at which its start is due
+    let mut pending_plan: Option<(headset::FramePlan, Instant)> = None;
     let mut bitrate = mbps * 1_000_000;
     let mut new_bitrate = None;
     let (mut count, mut game_count, mut gpu_ms, mut gpu_exec_ms, mut since) = (0u32, 0u32, 0.0f64, 0.0f64, Instant::now());
@@ -838,7 +845,24 @@ fn frame_loop(
         // While a game runs its frames set the pace. Otherwise the display lock plans the frame,
         // when the link has one: the frame starts at a time that makes it reach the headset's
         // display on its grid. Without a plan the headset's vsync sets the pace.
-        let planned = if game.active() { None } else { headset.frame_plan() };
+        // A plan holds while its start lies ahead: a pose that arrives meanwhile wakes the loop,
+        // and the loop goes on waiting for the same start. A plan whose start passed without a
+        // frame is made again.
+        let planned = if game.active() {
+            pending_plan = None;
+            None
+        } else {
+            match pending_plan {
+                Some((plan, start_at)) if Instant::now() < start_at => {
+                    Some(headset::FramePlan { start_in: start_at - Instant::now(), ..plan })
+                }
+                _ => {
+                    let plan = headset.frame_plan();
+                    pending_plan = plan.map(|plan| (plan, Instant::now() + plan.start_in));
+                    plan
+                }
+            }
+        };
         let planned_at = Instant::now();
         let wait = if game.active() {
             GAME_IDLE
@@ -943,13 +967,20 @@ fn frame_loop(
                 thread::sleep(Duration::from_micros(500));
             }
         };
-        // The client shows each frame for its own tracking sample, so a sample is sent once.
-        if sample == 0 || sample == last_sample {
+        // The client shows each frame for its own tracking sample, so a sample is sent once. A
+        // planned frame is the exception: its start does not wait for a pose. When no newer pose
+        // came, it renders again for the same sample, with the pose moved on to the new target.
+        // The frame needs a number of its own, because the notes, the encoder and the headset's
+        // reports find a frame by it. The number is the sample's time plus the count of repeats.
+        // The pose lookup takes the sample for the nearest one.
+        let repeat = planned.is_some() && sample != 0 && sample == last_sample && repeats < MAX_REPEATS;
+        if sample == 0 || (sample == last_sample && !repeat) {
             give_back(&game_frame);
             no_sample += 1;
             retry_later();
             continue;
         }
+        let sample_id = if repeat { sample + repeats + 1 } else { sample };
         if enc.in_flight() >= MAX_IN_FLIGHT {
             give_back(&game_frame);
             busy += 1;
@@ -1088,6 +1119,7 @@ fn frame_loop(
         }
         gpu_ms += gpu_start.elapsed().as_secs_f64() * 1000.0;
         gpu_exec_ms += renderer.last_gpu_s * 1000.0;
+        repeats = if repeat { repeats + 1 } else { 0 };
         last_sample = sample;
         if game_frame.is_none() {
             pacer.spend();
@@ -1103,7 +1135,7 @@ fn frame_loop(
             encoder: Arc::clone(enc),
             buffer,
             index: frame_index,
-            sample,
+            sample: sample_id,
             idr: shared.force_idr.swap(false, Ordering::Relaxed),
             bitrate: new_bitrate.take(),
         };
@@ -1113,16 +1145,16 @@ fn frame_loop(
         } else {
             Default::default()
         };
-        FrameNote::push(&notes, FrameNote { sample, eye_poses, rect: [0, 0, eye_w * 2, eye_h], plan: planned });
+        FrameNote::push(&notes, FrameNote { sample: sample_id, eye_poses, rect: [0, 0, eye_w * 2, eye_h], plan: planned });
         match jobs.try_send(job) {
             Ok(()) => {
-                headset.frame_submitted(sample);
+                headset.frame_submitted(sample_id);
                 frame_index += 1;
                 count += 1;
                 game_count += game_frame.is_some() as u32;
             }
             Err(mpsc::TrySendError::Full(job)) => {
-                FrameNote::cancel(&notes, sample);
+                FrameNote::cancel(&notes, sample_id);
                 busy += 1;
                 if job.idr {
                     shared.force_idr.store(true, Ordering::Relaxed);

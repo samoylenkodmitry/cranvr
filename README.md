@@ -132,6 +132,8 @@ The host now plans each frame of its own scene (`host/src/headset/display_lock.r
 - renders for the pose that is valid at the target, which it gets by moving the sample's pose with its velocities (at most 80 ms ahead);
 - puts the target in the frame's metadata (`FrameMeta::target_display`, on the client's clock).
 
+A planned frame starts at its planned time, not at the arrival of a pose. When no newer pose came since the last frame, it renders again for the same sample, with the pose moved on to the new target. Such a frame carries the sample's time plus one or two nanoseconds, so that the notes, the encoder and the headset's reports find it. At most two frames in a row repeat a sample.
+
 The client passes the target through. Cranpose's `StreamedScene` takes the newest frame for now. When it can choose frames by target time, `client/src/hub.rs` is the place to hand it over (`Feed::to_runtime_time` turns the target into the runtime's clock). While a game runs, the game sets the pace and the lock does not plan. `--no-display-lock` turns the lock off for a comparison.
 
 ### cranvr's Quest app
@@ -415,7 +417,7 @@ HOME=/tmp/cranvr-probe-home ./target/release/cranvr-probe --seconds 10
 
 The probe exits with code 0 when at least half of the expected frames decode with the right eye colors. `HOME` keeps the probe's ALVR client settings out of your own Library folder. The ignored app test starts the host the way the window does and connects the probe.
 
-The native protocol (`cranvr-proto`) runs the same test. The host listens on `127.0.0.1:9950` unless `--trust-all` or `--trust NAME` allows a headset on the network. It opens none of ALVR's ports, so it runs beside an ALVR host:
+The native protocol (`cranvr-proto`) runs the same test. The host listens on `127.0.0.1:9950` unless `--trust-all`, a paired headset or `--pair CODE` allows a headset on the network. It opens none of ALVR's ports, so it runs beside an ALVR host:
 
 ```bash
 ./target/release/cranvr-host --protocol native --config-dir /tmp/cranvr-test-native &
