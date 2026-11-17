@@ -8,9 +8,14 @@
 //!
 //! The pairing window stays open for ten minutes or until it paired one headset. It closes after
 //! five tries with a wrong code, so a device on the network cannot try all codes.
+//!
+//! The host has a key of its own, in `host-identity.txt` beside the file of the paired headsets.
+//! The headset remembers it when the host accepted the headset the first time. A host with another
+//! key is refused afterwards. Keep the file. A host without it gets a new key. The paired headsets
+//! then refuse it until their user forgets the old one.
 
 use alvr_common::{info, warn};
-use cranvr_proto::identity::{format_code, from_hex, pairing_code, to_hex, KEY_LEN};
+use cranvr_proto::identity::{format_code, from_hex, pairing_code, to_hex, Identity, KEY_LEN};
 use std::{
     io::Write,
     path::PathBuf,
@@ -23,6 +28,31 @@ const WINDOW_OPEN: Duration = Duration::from_secs(10 * 60);
 /// Tries with a wrong code that close the window
 const MAX_FAILURES: u32 = 5;
 const FILE: &str = "paired-headsets.txt";
+const HOST_KEY_FILE: &str = "host-identity.txt";
+
+/// The host's key. It comes from `host-identity.txt` in `config_dir`. A host that has none makes a key and
+/// saves it there, readable by the user alone. When the file cannot be written the key lasts for
+/// this run only. The headsets that paired with the old key then refuse the host.
+pub fn host_identity(config_dir: &std::path::Path) -> Identity {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = config_dir.join(HOST_KEY_FILE);
+    if let Some(seed) = std::fs::read_to_string(&path).ok().and_then(|text| from_hex(&text)) {
+        return Identity::from_seed(seed);
+    }
+    let identity = Identity::generate().expect("random numbers for the host's key");
+    let saved = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .and_then(|mut file| file.write_all(format!("{}\n", to_hex(&identity.seed())).as_bytes()));
+    match saved {
+        Ok(()) => info!("Native protocol: made the host's key in {}", path.display()),
+        Err(e) => warn!("Native protocol: the host's key was not saved to {}: {e}. Paired headsets refuse the host at its next start.", path.display()),
+    }
+    identity
+}
 
 struct Window {
     code: u32,
@@ -161,6 +191,21 @@ mod tests {
         // Five wrong tries closed the window, so even the right headset cannot pair now
         assert_eq!(pairings.try_pair(&key(1).0, "Headset"), Attempt::NoWindow);
         assert!(!pairings.reachable());
+    }
+
+    #[test]
+    fn the_host_makes_its_key_once_and_keeps_it_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = dir("host-key");
+        std::fs::remove_file(dir.join(HOST_KEY_FILE)).ok();
+        let first = host_identity(&dir);
+        let again = host_identity(&dir);
+        assert_eq!(first.public_key(), again.public_key());
+        let mode = std::fs::metadata(dir.join(HOST_KEY_FILE)).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "only the user reads the host's seed");
+        // A damaged file gives a new key. The host does not crash.
+        std::fs::write(dir.join(HOST_KEY_FILE), "not a key").unwrap();
+        assert_ne!(host_identity(&dir).public_key(), first.public_key());
     }
 
     #[test]

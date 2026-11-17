@@ -5,7 +5,9 @@
 //!
 //! - **Control** runs over TCP. The client dials the host, because `adb reverse` forwards only in
 //!   that direction. Both sides first swap a fixed preamble that names the protocol versions they
-//!   speak. Every later message is a [`postcard`] value. The messages are in [`message`].
+//!   speak. Then they run the handshake that proves their keys and agrees on the session's keys
+//!   (see [`secure`]). Every later message is a [`postcard`] value, sealed. The messages are in
+//!   [`message`].
 //! - **Media** goes from the host to the client. Each encoded slice of a frame is a "unit". The
 //!   unit is cut into packets that fit a 1400-byte datagram. Reed-Solomon parity packets follow
 //!   (see [`media`] and [`fec`]). Over a USB link the same packets go through the TCP connection
@@ -19,8 +21,10 @@
 //! [`message::DESKTOP_STREAM`]. Its units share the media path with the eye stream and have their own
 //! frame numbers, key frames and decoder configuration.
 //!
-//! Every packet on either path starts with a kind byte (see [`wire`]). A TCP packet has a four
-//! byte length before it.
+//! Every packet on either path is sealed after the handshake: ChaCha20-Poly1305 encrypts it and
+//! authenticates it with a key that only the two sides hold. Its content starts with a kind byte
+//! (see [`wire`]). A TCP packet has a four byte length before it. A sealed UDP packet starts with
+//! the counter that makes its nonce, so the receiver can drop a replayed packet.
 //!
 //! Times are `u64` nanoseconds on the clock of the side that wrote them. The host and the client
 //! each have their own monotonic clock. [`clock::ClockSync`] estimates the offset between them
@@ -33,6 +37,7 @@ pub mod link;
 pub mod media;
 pub mod message;
 pub mod motion;
+pub mod secure;
 pub mod wire;
 
 pub use wire::{Error, Nanos};
@@ -47,12 +52,16 @@ pub use wire::{Error, Nanos};
 /// Version 3 added the aim pose of each controller to [`message::Tracking`]. Postcard has no
 /// optional trailing fields, so a version 2 sample does not decode and the two versions cannot
 /// talk.
-pub const PROTOCOL_VERSION: u16 = 3;
+///
+/// Version 4 seals the session. Both sides sign a key exchange. Every packet after it is encrypted
+/// and authenticated. The host also has a key. Versions 2 and 3 ran in clear text, so this crate
+/// speaks no older version. A peer of version 3 or lower is refused.
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// The oldest protocol version this crate still speaks.
-pub const MIN_PROTOCOL_VERSION: u16 = 3;
+pub const MIN_PROTOCOL_VERSION: u16 = 4;
 
-/// The largest datagram, in bytes. A media packet and any datagram message fit in it. A typical
-/// path MTU of 1500 bytes minus the IP and UDP headers leaves 1472 bytes. The 1400 bytes leave
-/// room for a tunnel header.
+/// The largest datagram, in bytes, sealed: the counter and the tag are in it. A media packet and
+/// any datagram message fit in it. A typical path MTU of 1500 bytes minus the IP and UDP headers
+/// leaves 1472 bytes. The 1400 bytes leave room for a tunnel header.
 pub const MTU: usize = 1400;

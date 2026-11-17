@@ -47,17 +47,16 @@ fn the_desktop_messages_round_trip() {
 #[test]
 fn the_new_variants_leave_the_old_tags_alone() {
     let mut bytes = Vec::new();
+    // Version 4 took the challenge and the proof out: the handshake's own flights replace them.
+    // The tags below are those of version 4. A later variant stands after these.
     encode(&ClientMsg::Floor(1.0), &mut bytes).unwrap();
-    assert_eq!(bytes[0], 6);
+    assert_eq!(bytes[0], 5);
     bytes.clear();
     encode(&ClientMsg::Desktop(DesktopWish { enabled: true, max_width: 1, max_fps: 1 }), &mut bytes).unwrap();
-    assert_eq!(bytes[0], 7);
-    bytes.clear();
-    encode(&HostMsg::Challenge([0; 32]), &mut bytes).unwrap();
     assert_eq!(bytes[0], 6);
     bytes.clear();
     encode(&HostMsg::Desktop(None), &mut bytes).unwrap();
-    assert_eq!(bytes[0], 7);
+    assert_eq!(bytes[0], 6);
     bytes.clear();
     encode(&ClientDatagram::Pong(Pong { id: 0, ping_sent: 0, received: 0, sent: 0 }), &mut bytes).unwrap();
     assert_eq!(bytes[0], 6);

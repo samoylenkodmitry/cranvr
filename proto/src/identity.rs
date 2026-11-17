@@ -1,38 +1,40 @@
-//! Pairing: a client has a key that it generated. The host remembers the keys that the user
-//! approved.
+//! Keys: every client and every host has an Ed25519 key that it generated. A side that is paired
+//! with another one remembers that side's public key.
 //!
-//! The client keeps a 32-byte seed. Its public key goes to the host in the Hello. A client that the
-//! host does not know shows a short code that comes from its public key. The user enters the code
-//! at the host (`cranvr-host --pair CODE`). The host then remembers the public key.
+//! The client keeps a 32-byte seed. Its public key goes to the host in the handshake. A client
+//! that the host does not know shows a short code that comes from its public key. The user enters
+//! the code at the host (`cranvr-host --pair CODE`). The host then remembers the public key. The
+//! host has a key of its own. A client remembers the key of the host that it paired with, and
+//! refuses a host with another key.
 //!
-//! Each later connection proves that the client holds the key. The host sends a random challenge.
-//! The client signs a fixed label and the challenge with its seed. The host checks the signature
-//! with the public key that it remembers. A listener of the network sees the public key and the
-//! code, but it cannot sign a challenge without the seed.
+//! Each connection proves the keys. Both sides sign a hash of the handshake with their seeds (see
+//! [`crate::secure`]). The hash covers the fresh keys of that connection, so a signature serves for
+//! no other connection. A listener of the network sees the public keys and the code. It cannot
+//! sign without a seed.
 //!
 //! The proof comes before the code check. A client that knows only another client's public key
 //! gets no further than the proof.
 //!
-//! This protects against a device that wants a stream without the user's approval. The session
-//! itself stays plain: the media and the tracking are not encrypted.
+//! The first connection of a client to a host is trusted on first use: the client has no earlier
+//! key of the host to compare with. It remembers the key once the host accepted it. Someone who
+//! controls the network at that moment can pose as the host to the client. The host stays safe:
+//! the attacker cannot sign for the client.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::{fs::File, io::Read};
 
-/// The length of a seed, a public key and a challenge in bytes
+/// The length of a seed and of a public key in bytes
 pub const KEY_LEN: usize = 32;
 /// The length of a signature in bytes
 pub const SIGNATURE_LEN: usize = 64;
-/// What the client signs in front of the challenge. It keeps the signature from serving another
-/// purpose.
-const LABEL: &[u8] = b"cranvr pairing challenge v1";
 /// What the pairing code hashes in front of the public key
 const CODE_LABEL: &[u8] = b"cranvr pairing code v1";
 /// The pairing code has this many digits.
 pub const CODE_DIGITS: u32 = 6;
 
-/// The client's key.
+/// A key of a client or of a host.
+#[derive(Clone)]
 pub struct Identity {
     key: SigningKey,
 }
@@ -60,21 +62,18 @@ impl Identity {
         pairing_code(&self.public_key())
     }
 
-    /// Answers the host's challenge.
-    pub fn sign(&self, challenge: &[u8; KEY_LEN]) -> Vec<u8> {
-        self.key.sign(&message(challenge)).to_bytes().to_vec()
+    /// Signs a message with the key. [`crate::secure`] builds the message from a label and the
+    /// hash of the handshake.
+    pub fn sign_message(&self, message: &[u8]) -> [u8; SIGNATURE_LEN] {
+        self.key.sign(message).to_bytes()
     }
 }
 
-fn message(challenge: &[u8; KEY_LEN]) -> Vec<u8> {
-    [LABEL, challenge].concat()
-}
-
-/// Whether `signature` answers `challenge` for `public_key`.
-pub fn verify(public_key: &[u8; KEY_LEN], challenge: &[u8; KEY_LEN], signature: &[u8]) -> bool {
+/// Whether `signature` is the signature of `message` by `public_key`.
+pub fn verify_message(public_key: &[u8; KEY_LEN], message: &[u8], signature: &[u8; SIGNATURE_LEN]) -> bool {
     let Ok(key) = VerifyingKey::from_bytes(public_key) else { return false };
-    let Ok(signature) = <[u8; SIGNATURE_LEN]>::try_from(signature) else { return false };
-    key.verify(&message(challenge), &Signature::from_bytes(&signature)).is_ok()
+    // The strict check also refuses a public key of small order, which signs for every message
+    key.verify_strict(message, &Signature::from_bytes(signature)).is_ok()
 }
 
 /// The code of a public key, from 0 to 999999.
@@ -127,18 +126,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_signature_proves_the_key_for_one_challenge() {
+    fn a_signature_proves_the_key_for_one_message() {
         let identity = Identity::from_seed([7; KEY_LEN]);
-        let challenge = [1; KEY_LEN];
-        let signature = identity.sign(&challenge);
-        assert!(verify(&identity.public_key(), &challenge, &signature));
-        // Another challenge, another key, a cut signature and a flipped bit fail
-        assert!(!verify(&identity.public_key(), &[2; KEY_LEN], &signature));
-        assert!(!verify(&Identity::from_seed([8; KEY_LEN]).public_key(), &challenge, &signature));
-        assert!(!verify(&identity.public_key(), &challenge, &signature[..63]));
-        let mut flipped = signature.clone();
+        let signature = identity.sign_message(b"message");
+        assert!(verify_message(&identity.public_key(), b"message", &signature));
+        // Another message, another key and a flipped bit fail
+        assert!(!verify_message(&identity.public_key(), b"messagf", &signature));
+        assert!(!verify_message(&Identity::from_seed([8; KEY_LEN]).public_key(), b"message", &signature));
+        let mut flipped = signature;
         flipped[10] ^= 1;
-        assert!(!verify(&identity.public_key(), &challenge, &flipped));
+        assert!(!verify_message(&identity.public_key(), b"message", &flipped));
     }
 
     #[test]

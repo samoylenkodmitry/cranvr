@@ -11,6 +11,12 @@ serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 reed-solomon-simd = "3"
 socket2 = "0.6"
-# Pairing: the client signs the host's challenge with a key that it generated
-ed25519-dalek = "2"
-sha2 = "0.10"
+# Both sides sign their half of the handshake with a key that they generated
+ed25519-dalek = "3"
+sha2 = "0.11"
+# The session's keys: an X25519 exchange, HKDF to split it and ChaCha20-Poly1305 to seal each packet.
+# These crates and ed25519-dalek share one generation of `digest` and `curve25519-dalek`.
+x25519-dalek = "3"
+hkdf = "0.13"
+chacha20poly1305 = "0.11"
+zeroize = "1"

@@ -37,7 +37,7 @@ use cranvr_common::foveation::FoveationConfig;
 use cranvr_proto::{
     clock::{now_ns, ClockSync},
     fec::ParityController,
-    identity::{format_code, pairing_code},
+    identity::{format_code, pairing_code, Identity},
     link::{HostLink, HostListener, HostSide, Incoming, MediaMode},
     media::{FrameMeta, DEFAULT_SHARD_LEN},
     message::{
@@ -63,6 +63,9 @@ use std::{
 /// What the host wants from native mode.
 pub struct Config {
     pub port: u16,
+    /// The host's own key. The host signs each handshake with it. Clients check it against the key
+    /// that they paired with.
+    pub identity: Identity,
     /// The headsets that the user paired. A client on this machine needs no pairing.
     pub pairings: Arc<Pairings>,
     /// Accept every client without a pairing (for tests)
@@ -129,7 +132,8 @@ impl EventSource for Events {
 pub fn start(config: Config) -> std::io::Result<(Arc<dyn Headset>, Box<dyn EventSource>)> {
     let local_only = !config.trust_all && !config.pairings.reachable();
     let address: SocketAddr = if local_only { ([127, 0, 0, 1], config.port).into() } else { ([0, 0, 0, 0], config.port).into() };
-    let listener = HostListener::bind(address).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let listener = HostListener::bind(address, config.identity.clone()).map_err(|e| std::io::Error::other(e.to_string()))?;
+    info!("Native protocol: this host's key starts with {}", cranvr_proto::identity::to_hex(&config.identity.public_key()[..8]));
     info!(
         "Native protocol: listening on {address}{}",
         if local_only { " (this Mac only: start the host with --pair CODE to pair a headset)" } else { "" }
@@ -145,7 +149,7 @@ pub fn start(config: Config) -> std::io::Result<(Arc<dyn Headset>, Box<dyn Event
 
 fn accept_loop(listener: HostListener, config: Config, shared: Arc<Shared>) {
     loop {
-        let mut pending = match listener.accept() {
+        let pending = match listener.accept() {
             Ok(pending) => pending,
             Err(e) => {
                 warn!("Native protocol: a connection failed before its hello: {e}");
@@ -158,23 +162,11 @@ fn accept_loop(listener: HostListener, config: Config, shared: Arc<Shared>) {
             pending.reject(RejectReason::Busy);
             continue;
         }
-        // A client on this Mac needs no pairing. Another one proves that it holds its key. Then
-        // the host looks at the key. The proof comes first, so a client cannot claim the key of
+        // A client on this Mac needs no pairing. For another one the host looks up the key.
+        // The handshake proved that the client holds it, so a client cannot claim the key of
         // another client.
         if !(config.trust_all || pending.peer.ip().is_loopback()) {
-            let key = pending.caps.public_key;
-            match pending.prove_key() {
-                Ok(true) => {}
-                Ok(false) => {
-                    warn!("Native protocol: {name} at {} did not prove its key", pending.peer);
-                    pending.reject(RejectReason::NotPaired);
-                    continue;
-                }
-                Err(e) => {
-                    warn!("Native protocol: the proof of {name} at {} failed: {e}", pending.peer);
-                    continue;
-                }
-            }
+            let key = pending.client_key;
             if !config.pairings.contains(&key) {
                 match config.pairings.try_pair(&key, &name) {
                     Attempt::Paired => info!("Native protocol: paired {name} at {}", pending.peer),
@@ -213,7 +205,7 @@ fn accept_loop(listener: HostListener, config: Config, shared: Arc<Shared>) {
                 continue;
             }
         };
-        info!("Native protocol: {name} at {peer} connected, {} media", if link.duplex.has_udp() { "UDP" } else { "TCP" });
+        info!("Native protocol: {name} at {peer} connected, {} media, sealed", if link.duplex.has_udp() { "UDP" } else { "TCP" });
         let session = Arc::new(Session::new(link, &stream, config.display_lock));
         session.desktop.set(desktop::Desktop::start(config.desktop.clone(), Arc::clone(&session))).ok();
         if config.audio {
@@ -348,7 +340,7 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
             shared.emit(Event::Recenter);
         }
         // The proof belongs to the handshake. A later one means nothing.
-        Incoming::Control(ClientMsg::Hello(_) | ClientMsg::Proof(_)) => {}
+        Incoming::Control(ClientMsg::Hello(_)) => {}
     }
 }
 

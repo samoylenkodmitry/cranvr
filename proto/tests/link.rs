@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{caps, identity, meta, Rng};
+use common::{caps, host_identity, identity, meta, Rng};
 use cranvr_proto::{
     fec::ParityController,
     link::{ClientLink, HostLink, HostListener, Incoming, MediaMode},
@@ -38,7 +38,7 @@ fn wishes() -> HostWishes {
 
 /// Connects a client to a host on loopback and returns both ends.
 fn session(mode: MediaMode, client_caps: ClientCaps) -> (HostLink, ClientLink) {
-    let listener = HostListener::bind("127.0.0.1:0").unwrap();
+    let listener = HostListener::bind("127.0.0.1:0", host_identity()).unwrap();
     let addr = listener.local_addr().unwrap();
     let host = thread::spawn(move || {
         let pending = listener.accept().unwrap();
@@ -46,7 +46,7 @@ fn session(mode: MediaMode, client_caps: ClientCaps) -> (HostLink, ClientLink) {
         let shard = if mode == MediaMode::Tcp { 60_000 } else { DEFAULT_SHARD_LEN };
         pending.accept(stream, mode, shard).unwrap()
     });
-    let client = ClientLink::connect(addr, &client_caps, &identity(), WAIT).unwrap();
+    let client = ClientLink::connect(addr, &client_caps, &identity(), None, WAIT).unwrap();
     (host.join().unwrap(), client)
 }
 
@@ -254,7 +254,7 @@ fn the_tcp_fallback_carries_everything_over_one_connection() {
 
 #[test]
 fn a_host_that_finds_no_common_codec_rejects() {
-    let listener = HostListener::bind("127.0.0.1:0").unwrap();
+    let listener = HostListener::bind("127.0.0.1:0", host_identity()).unwrap();
     let addr = listener.local_addr().unwrap();
     let host = thread::spawn(move || {
         let pending = listener.accept().unwrap();
@@ -263,14 +263,14 @@ fn a_host_that_finds_no_common_codec_rejects() {
     });
     let mut only_h264 = caps();
     only_h264.codecs = vec![Codec::H264];
-    let result = ClientLink::connect(addr, &only_h264, &identity(), WAIT);
+    let result = ClientLink::connect(addr, &only_h264, &identity(), None, WAIT);
     assert!(matches!(result, Err(Error::Rejected(RejectReason::NoCommonCodec))), "{:?}", result.err());
     host.join().unwrap();
 }
 
 #[test]
 fn a_peer_of_another_version_is_told_so() {
-    let listener = HostListener::bind("127.0.0.1:0").unwrap();
+    let listener = HostListener::bind("127.0.0.1:0", host_identity()).unwrap();
     let addr = listener.local_addr().unwrap();
     let host = thread::spawn(move || listener.accept().err());
     let mut raw = TcpStream::connect(addr).unwrap();
@@ -284,22 +284,25 @@ fn a_peer_of_another_version_is_told_so() {
 }
 
 #[test]
-fn a_version_2_client_is_refused() {
-    // Version 3 changed the tracking sample, so the two versions cannot share a session
-    let listener = HostListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let host = thread::spawn(move || listener.accept().err());
-    let mut raw = TcpStream::connect(addr).unwrap();
-    raw.write_all(&client_preamble(VersionRange { min: 2, max: 2 })).unwrap();
-    let mut answer = [0u8; HOST_PREAMBLE_LEN];
-    raw.read_exact(&mut answer).unwrap();
-    assert_eq!(parse_host_preamble(&answer).unwrap().0, None);
-    assert!(matches!(host.join().unwrap(), Some(Error::Version { .. })));
+fn a_client_of_version_2_or_3_is_refused() {
+    // Version 3 changed the tracking sample. Version 4 seals the session. Neither older version
+    // can share a session with this crate: the older ones spoke in clear text.
+    for old in [2, 3] {
+        let listener = HostListener::bind("127.0.0.1:0", host_identity()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = thread::spawn(move || listener.accept().err());
+        let mut raw = TcpStream::connect(addr).unwrap();
+        raw.write_all(&client_preamble(VersionRange { min: old, max: old })).unwrap();
+        let mut answer = [0u8; HOST_PREAMBLE_LEN];
+        raw.read_exact(&mut answer).unwrap();
+        assert_eq!(parse_host_preamble(&answer).unwrap().0, None);
+        assert!(matches!(host.join().unwrap(), Some(Error::Version { .. })));
+    }
 }
 
 #[test]
 fn a_stranger_on_the_port_is_refused() {
-    let listener = HostListener::bind("127.0.0.1:0").unwrap();
+    let listener = HostListener::bind("127.0.0.1:0", host_identity()).unwrap();
     let addr = listener.local_addr().unwrap();
     let host = thread::spawn(move || listener.accept().err());
     let mut raw = TcpStream::connect(addr).unwrap();
@@ -343,45 +346,6 @@ fn the_host_picks_the_nearest_rate_and_keeps_the_aspect() {
     let mut w = wishes();
     w.foveation = None;
     assert_eq!(negotiate(&w, &c).unwrap().eye_size[0], 2064);
-}
-
-/// Connects a client whose Hello carries the public key of `claimed`, while `signer` answers the
-/// host's challenge. The host asks for the proof and reports whether it held.
-fn proof_result(claimed: [u8; 32], signer: cranvr_proto::identity::Identity) -> Result<bool, Error> {
-    let listener = HostListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let host = thread::spawn(move || {
-        let mut pending = listener.accept().unwrap();
-        let held = pending.prove_key();
-        // The host ends the handshake either way
-        if matches!(held, Ok(true)) {
-            let stream = negotiate(&wishes(), &pending.caps).unwrap();
-            drop(pending.accept(stream, MediaMode::Tcp, 60_000));
-        } else {
-            pending.reject(RejectReason::NotPaired);
-        }
-        held
-    });
-    let mut c = caps();
-    c.public_key = claimed;
-    let connected = ClientLink::connect(addr, &c, &signer, WAIT);
-    let held = host.join().unwrap()?;
-    assert_eq!(connected.is_ok(), held);
-    if !held {
-        assert!(matches!(connected, Err(Error::Rejected(RejectReason::NotPaired))));
-    }
-    Ok(held)
-}
-
-#[test]
-fn a_client_proves_that_it_holds_its_key() {
-    assert!(proof_result(identity().public_key(), identity()).unwrap());
-}
-
-#[test]
-fn a_client_cannot_claim_the_key_of_another_client() {
-    let other = cranvr_proto::identity::Identity::from_seed([6; 32]);
-    assert!(!proof_result(identity().public_key(), other).unwrap());
 }
 
 #[test]

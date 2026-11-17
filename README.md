@@ -137,14 +137,46 @@ Without a headset, as in a flat window, the client sends placeholder values: a s
 
 #### Pairing
 
-A headset on another machine needs pairing. The client makes a key for itself (Ed25519) and keeps it in Cranpose's preferences service. The connect panel shows a code of six digits that comes from the key's public half. The host's side:
+A headset on another machine needs pairing. The client makes a key for itself (Ed25519) and keeps it in Cranpose's preferences service. The connect panel shows a code of six digits that comes from the key's public half. The host has a key too. It makes one at its first start and keeps it in `host-identity.txt` in the config folder (readable by the user alone). The host's side:
 1. Start the host with `--pair CODE`, for example `cranvr-host --protocol native --pair 482913`.
-2. Press Connect in the headset. The host pairs the headset whose code matches and writes its public key to `paired-headsets.txt` in the config folder.
-3. A later start needs no flag. The host remembers the key.
+2. Press Connect in the headset. The host pairs the headset whose code matches and writes its public key to `paired-headsets.txt` in the config folder. The headset remembers the host's key under the address that the user typed.
+3. A later start needs no flag. The host remembers the headset's key and the headset remembers the host's.
 
-Each connection proves that the client holds the key: the host sends a random challenge. The client signs it. A device that only saw the public key and the code on the network cannot sign. The host checks the proof before it looks at the code. The pairing window stays open for ten minutes or for one pairing. Five tries with a wrong code close it.
+Each connection proves both keys (see "The sealed session"). A device that only saw the public keys and the code on the network cannot sign. The host checks the headset's proof before it looks at the code. The pairing window stays open for ten minutes or for one pairing. Five tries with a wrong code close it. A headset refuses a host whose key differs from the one that it remembers and says so in the connect panel. It says nothing about itself to that host first. A new install of the host that lost `host-identity.txt` has a new key: press "Forget host key" in the connect panel (or remove the preference `host-key:ADDRESS`), then connect again.
 
-The host listens on this Mac only until a headset is paired or `--pair` is given. `--trust-all` accepts every client without pairing, for tests. `--trust NAME` counts for the ALVR protocol only. A client on this Mac connects without pairing. So does a headset over USB through `adb reverse`, because its connection comes from the loopback address. The session itself is not encrypted: the media and the tracking cross the network in plain form. The cranvr app does not start the native mode yet, so it has no pairing step.
+The first connection of a headset to an address trusts the host's key on first use. The headset remembers the key after the host accepted the headset. Someone who controls the network during that first connection can pose as the host to the headset and show it a picture. That someone cannot reach the real host through the headset: it cannot sign for the headset's key. The pairing code does not bind the host's key yet. Binding it would make the first connection safe as well.
+
+The host listens on this Mac only until a headset is paired or `--pair` is given. `--trust-all` accepts every client without pairing, for tests. `--trust NAME` counts for the ALVR protocol only. A client on this Mac connects without pairing. So does a headset over USB through `adb reverse`, because its connection comes from the loopback address. The headset does not check the host's key when it connects to a loopback address. The session is sealed in every case. The cranvr app does not start the native mode yet, so it has no pairing step.
+
+#### The sealed session
+
+Protocol version 4 encrypts and authenticates everything after the version exchange. The crate refuses a peer of version 3 or lower, which spoke in clear text. The ALVR mode is unchanged.
+
+The handshake (`proto/src/secure.rs`, `proto/src/link.rs`) has three flights after the preambles:
+1. The client sends a fresh X25519 key.
+2. The host answers with its fresh key, its Ed25519 key and its signature over the transcript. The transcript hashes both preambles (a downgrade of the version breaks it), both fresh keys and the host's key. The client checks the signature and, when it remembers a key of this host, compares the keys.
+3. The client sends its Ed25519 key and its signature over the same transcript, already sealed. The host verifies it. The signature covers the host's fresh key, so a recorded proof does not serve in another session.
+
+HKDF-SHA256 turns the X25519 secret into four keys (salt: the transcript): the TCP path and the UDP path, each in two directions. ChaCha20-Poly1305 seals each packet. The nonce is four zero bytes and the packet's counter. A key never seals two packets with one counter.
+
+| Path | What is on the wire | Order and replay |
+|---|---|---|
+| TCP | 4-byte length, 8-byte counter, content, 16-byte tag. It carries the control messages. With TCP media (USB) it carries the media and the datagrams too. | The counter must be the next one. A record that fails to open, repeats or is missing ends the session. |
+| UDP | 8-byte counter, content, 16-byte tag. Carries the media and the datagram messages. | A window of 4096 counters tolerates loss and reordering. A replayed or older packet and one that fails the tag are dropped like a lost one. A forged packet cannot move the window: it moves after the tag held. |
+
+The content is the kind byte and the body, as before. The sender seals in the buffer that it built the packet in: no copy and no allocation per packet. The sender computes the parity over the plain packets. It seals each packet on its own. A lost packet stays recoverable. A changed packet counts as lost. The sealed datagram keeps the 1400-byte limit, so the media payload of a packet is 1352 bytes (it was 1376). The host's UDP socket learns the client's address from the first datagram that opens with the session's key.
+
+The sealing hides the content. The sizes and the times of the packets and the addresses stay visible. The Hello's device name and capabilities are sealed.
+
+What it costs. `cargo test --release -p cranvr-proto --test secure seal_cost -- --ignored --nocapture` seals and opens the packets of a frame as the host and the client do. On the Mac (an M5, load average 30 to 40 from other builds, medians of 500 frames, runs agreed within 5 percent unless the load spiked):
+
+| Frame | Packets (data and 10% parity) | Seal | Open |
+|---|---|---|---|
+| 12 kB, the test scene | 10 | 19 us | 19 us |
+| 104 kB, one frame of 100 Mbps at 120 Hz | 85 | 155 us | 157 us |
+| 600 kB, a key frame | 489 | 0.90 ms | 0.91 ms |
+
+A packet of 1400 bytes takes 1.8 to 1.9 us to seal and as much to open, which is 0.75 GB/s. Cutting a 104 kB unit into packets and computing its parity takes 14 us, so sealing multiplies the sender's work per frame by about 12 and adds 0.16 ms to a frame of 8.3 ms. Sealing takes about 2 percent of the host's core at 120 Hz with 100 Mbps. The client's `Stats` and its log line show the opening time per frame, per packet and as a share of one core.
 
 #### Display lock
 

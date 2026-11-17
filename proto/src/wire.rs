@@ -11,7 +11,13 @@
 //!
 //! The media packet header is not a postcard value. It has fixed offsets, so a receiver can read
 //! it without a parser and the sender can write it into a reused buffer.
+//!
+//! Every packet after the handshake is sealed (see [`crate::secure`]). A sealed packet is a counter,
+//! the content encrypted in place and a tag. The content is the kind byte and the body that the
+//! rest of this crate builds. [`PacketBuf`] reserves room for the counter in front of the content,
+//! so sealing needs no copy and no allocation.
 
+use crate::secure::{Cipher, COUNTER_LEN, OVERHEAD};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{fmt, io};
 
@@ -24,6 +30,9 @@ pub const KIND_CONTROL: u8 = 1;
 pub const KIND_MEDIA: u8 = 2;
 /// The first byte of a datagram message.
 pub const KIND_DATAGRAM: u8 = 3;
+/// The first byte of a handshake packet. The handshake's own packets carry it. The sealed answer of
+/// the client carries it as the first byte of its content.
+pub const KIND_HANDSHAKE: u8 = 4;
 
 /// The longest TCP packet this crate reads, in bytes. A longer length prefix means a broken stream.
 pub const MAX_TCP_PACKET: usize = 16 << 20;
@@ -43,6 +52,11 @@ pub enum Error {
     Rejected(crate::message::RejectReason),
     /// The peer sent something else than the handshake expects
     Unexpected(&'static str),
+    /// A signature, a tag or a key that does not hold. The peer is not who it claims to be, or the
+    /// packet was changed on the way.
+    Crypto(&'static str),
+    /// The host's key differs from the one that this client paired with
+    HostKeyChanged,
     /// A wait ran out
     Timeout,
     /// The connection ended
@@ -63,6 +77,8 @@ impl fmt::Display for Error {
             ),
             Error::Rejected(reason) => write!(f, "the host refused the connection: {reason:?}"),
             Error::Unexpected(what) => write!(f, "unexpected message: {what}"),
+            Error::Crypto(what) => write!(f, "authentication failed: {what}"),
+            Error::HostKeyChanged => write!(f, "the host's key is not the one that this client paired with"),
             Error::Timeout => write!(f, "timed out"),
             Error::Closed => write!(f, "connection closed"),
         }
@@ -151,8 +167,12 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Error> {
     Ok(postcard::from_bytes(bytes)?)
 }
 
-/// A packet under construction. The first four bytes stay free for the TCP length prefix, so one
-/// buffer serves both transports: UDP sends `packet()`, TCP writes `framed()`.
+/// Bytes in front of a packet's content: the four byte TCP length and the eight byte counter.
+const PREFIX: usize = 4 + COUNTER_LEN;
+
+/// A packet under construction. The first twelve bytes stay free for the TCP length and the
+/// counter, so one buffer serves both transports and sealing happens in place: UDP sends
+/// [`PacketBuf::datagram`], TCP writes [`PacketBuf::framed`].
 pub struct PacketBuf {
     bytes: Vec<u8>,
 }
@@ -171,37 +191,59 @@ impl PacketBuf {
     /// Starts a packet of `kind` and returns the buffer to append the body to.
     pub fn begin(&mut self, kind: u8) -> &mut Vec<u8> {
         self.bytes.clear();
-        self.bytes.extend_from_slice(&[0; 4]);
+        self.bytes.extend_from_slice(&[0; PREFIX]);
         self.bytes.push(kind);
         &mut self.bytes
     }
 
-    /// Fills in the length and returns the finished packet.
-    pub fn seal(&mut self) -> Result<Wire<'_>, Error> {
-        let len = self.bytes.len() - 4;
-        if len > MAX_TCP_PACKET {
-            return Err(Error::TooLarge(len));
-        }
-        self.bytes[..4].copy_from_slice(&(len as u32).to_le_bytes());
-        Ok(Wire { packet: &self.bytes[4..], framed: &self.bytes })
+    /// The kind byte and the body, as long as the packet is not sealed.
+    pub fn content(&self) -> &[u8] {
+        &self.bytes[PREFIX.min(self.bytes.len())..]
     }
-}
 
-/// A finished packet in the two forms of the two transports.
-#[derive(Clone, Copy)]
-pub struct Wire<'a> {
-    /// The packet as a datagram: kind byte and body
-    pub packet: &'a [u8],
-    /// The packet with its four byte length, as TCP carries it
-    pub framed: &'a [u8],
+    /// The bytes that a sealed copy of this packet adds to its content.
+    pub const OVERHEAD: usize = OVERHEAD;
+
+    /// Encrypts the content in place with `cipher` and puts `counter` in front of it. The tag goes
+    /// behind it. The packet is then ready for [`PacketBuf::datagram`] and [`PacketBuf::framed`].
+    /// The counter must be new for the cipher's key: a key that seals two packets with one counter
+    /// loses its secrecy.
+    pub fn seal(&mut self, cipher: &Cipher, counter: u64) -> Result<(), Error> {
+        let content = self.bytes.len() - PREFIX;
+        if content + OVERHEAD > MAX_TCP_PACKET {
+            return Err(Error::TooLarge(content + OVERHEAD));
+        }
+        self.bytes[4..PREFIX].copy_from_slice(&counter.to_le_bytes());
+        let tag = cipher.seal_in_place(counter, &mut self.bytes[PREFIX..])?;
+        self.bytes.extend_from_slice(&tag);
+        let len = (self.bytes.len() - 4) as u32;
+        self.bytes[..4].copy_from_slice(&len.to_le_bytes());
+        Ok(())
+    }
+
+    /// The sealed packet as a datagram: the counter, the encrypted content and the tag.
+    pub fn datagram(&self) -> &[u8] {
+        &self.bytes[4..]
+    }
+
+    /// The sealed packet with its four byte length, as TCP carries it.
+    pub fn framed(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 /// Reads one TCP packet into `buf`: the kind byte and the body, without the length.
 pub fn read_tcp_packet(reader: &mut impl io::Read, buf: &mut Vec<u8>) -> Result<(), Error> {
+    read_tcp_packet_limited(reader, buf, MAX_TCP_PACKET)
+}
+
+/// Like [`read_tcp_packet`], with a lower limit on the length. The handshake reads from a peer that
+/// has proved nothing yet, so it must not let that peer size a buffer of megabytes.
+pub fn read_tcp_packet_limited(reader: &mut impl io::Read, buf: &mut Vec<u8>, limit: usize) -> Result<(), Error> {
     let mut prefix = [0u8; 4];
     reader.read_exact(&mut prefix)?;
     let len = u32::from_le_bytes(prefix) as usize;
-    if len == 0 || len > MAX_TCP_PACKET {
+    if len == 0 || len > limit.min(MAX_TCP_PACKET) {
         return Err(Error::Malformed("TCP packet length out of range"));
     }
     buf.resize(len, 0);

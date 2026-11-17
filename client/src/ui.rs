@@ -205,6 +205,7 @@ fn ConnectPanel(snapshot: MutableState<Snapshot>) {
                     Keypad(address);
                     ConnectButton(state.clone(), address);
                     StatusLine(state.clone(), address);
+                    ForgetHostButton(address);
                     Text(
                         format!("Pairing code {}", format_code(settings::identity().code())),
                         Modifier::empty(),
@@ -282,6 +283,21 @@ fn ConnectButton(state: LinkState, address: TextFieldState) {
         move || toggle_connection(&state, address),
         move || {
             Text(label, Modifier::empty(), text_style(32.0, TEXT_COLOR, Some(FontWeight::BOLD)));
+        },
+    );
+}
+
+/// Makes this headset forget the key of the host at the typed address. The headset then trusts the
+/// key that the host shows at the next connection. The user needs it after a new install of the
+/// host, which makes a new key.
+#[composable]
+fn ForgetHostButton(address: TextFieldState) {
+    Button(
+        Modifier::empty().background(KEY_COLOR).rounded_corners(12.0).padding_symmetric(26.0, 12.0),
+        ButtonSpec::default(),
+        move || settings::forget_host_key(&crate::connection::host_name(&address.text())),
+        move || {
+            Text("Forget host key", Modifier::empty(), text_style(22.0, MUTED_COLOR, None));
         },
     );
 }
@@ -373,6 +389,7 @@ fn stat_lines(snap: &Snapshot) -> Vec<(&'static str, String, Color)> {
     ));
     lines.push(("Latency", latency_text(stats), TEXT_COLOR));
     lines.push(("Key frames", format!("{} requested", stats.key_requests), TEXT_COLOR));
+    lines.push(("Sealing", crypto_text(stats), if stats.packets_rejected > 0 { WARN_COLOR } else { TEXT_COLOR }));
     lines.push((
         "Tracking",
         if stats.tracking_live {
@@ -387,6 +404,13 @@ fn stat_lines(snap: &Snapshot) -> Vec<(&'static str, String, Color)> {
         lines.push((label, value, TEXT_COLOR));
     }
     lines
+}
+
+fn crypto_text(stats: &Stats) -> String {
+    format!(
+        "opening took {:.0} us a frame ({:.2} us a packet, {:.1}% of a core), {} packets refused",
+        stats.open_us_per_frame, stats.open_us_per_packet, stats.open_core_pct, stats.packets_rejected
+    )
 }
 
 fn fps_color(fps: f32, target: f32) -> Color {

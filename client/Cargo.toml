@@ -52,5 +52,12 @@ cranpose-capabilities = { git = "https://github.com/samoylenkodmitry/Cranpose", 
 [profile.dev.package.reed-solomon-simd]
 opt-level = 3
 
+# The cipher of the sealed packets is about fifty times slower without optimization.
+[profile.dev.package.chacha20]
+opt-level = 3
+
+[profile.dev.package.poly1305]
+opt-level = 3
+
 [profile.release]
 debug = 1

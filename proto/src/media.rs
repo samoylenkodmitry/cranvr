@@ -26,18 +26,25 @@
 //!
 //! All numbers are little-endian. The slices of a frame are separate units. A slice can go on the
 //! wire when its encoder is done. Its parity covers that slice only.
+//!
+//! The parity is computed over the plain packets. The sender then seals each packet on its own
+//! (see [`crate::secure`]): a datagram is the counter, the packet and the tag. A receiver opens
+//! each packet that arrives and feeds the plain packet to [`FrameReceiver::push`]. A packet that
+//! fails to open counts as lost, so parity restores it. Sealed parity would need the lost packet's
+//! tag to open the restored one.
 
 use crate::{
     clock::now_ns,
     fec::{Fec, MAX_PARITY},
-    wire::{decode, encode, Error, Nanos, PacketBuf, Pose, Rect, Wire, KIND_MEDIA},
+    secure::OVERHEAD,
+    wire::{decode, encode, Error, Nanos, PacketBuf, Pose, Rect, KIND_MEDIA},
     MTU,
 };
 use serde::{Deserialize, Serialize};
 
 pub const HEADER_LEN: usize = 24;
-/// The payload bytes of a packet that fills a datagram of [`MTU`] bytes.
-pub const DEFAULT_SHARD_LEN: usize = MTU - HEADER_LEN;
+/// The payload bytes of a packet that fills a datagram of [`MTU`] bytes once it is sealed.
+pub const DEFAULT_SHARD_LEN: usize = MTU - HEADER_LEN - OVERHEAD;
 /// The largest unit in bytes.
 pub const MAX_UNIT_LEN: usize = 8 << 20;
 /// The largest payload of one packet. Over TCP a packet may be much larger than a datagram.
@@ -181,13 +188,14 @@ impl FrameSender {
     /// Sends one unit through `emit`, data packets first, then parity packets. `parity` says how
     /// many parity packets a unit of a given number of data packets gets (see
     /// [`crate::fec::parity_for`] and [`crate::fec::ParityController::parity_count`]). `emit` gets
-    /// each packet in both of its framings (see [`Wire`]).
+    /// each packet in the buffer that it was built in. The caller seals it there and sends it, or
+    /// takes [`PacketBuf::content`] where nothing is sealed.
     pub fn send_unit(
         &mut self,
         meta: &FrameMeta,
         payload: &[u8],
         parity: impl FnOnce(usize) -> usize,
-        mut emit: impl FnMut(Wire<'_>) -> Result<(), Error>,
+        mut emit: impl FnMut(&mut PacketBuf) -> Result<(), Error>,
     ) -> Result<SendStats, Error> {
         self.unit.clear();
         self.unit.extend_from_slice(&[0, 0]);
@@ -221,9 +229,8 @@ impl FrameSender {
             let buf = self.packet.begin(KIND_MEDIA);
             header.append_after_kind(buf);
             buf.extend_from_slice(chunk);
-            let wire = self.packet.seal()?;
-            stats.bytes += wire.packet.len();
-            emit(wire)?;
+            stats.bytes += self.packet.content().len() + OVERHEAD;
+            emit(&mut self.packet)?;
             stats.data_packets += 1;
         }
         if parity_count > 0 {
@@ -246,9 +253,8 @@ impl FrameSender {
                 let buf = self.packet.begin(KIND_MEDIA);
                 header.append_after_kind(buf);
                 buf.extend_from_slice(recovery);
-                let wire = self.packet.seal()?;
-                stats.bytes += wire.packet.len();
-                emit(wire)?;
+                stats.bytes += self.packet.content().len() + OVERHEAD;
+                emit(&mut self.packet)?;
                 stats.parity_packets += 1;
             }
         }
