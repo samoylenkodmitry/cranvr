@@ -1027,7 +1027,7 @@ fn frame_loop(
         // The frame needs a number of its own, because the notes, the encoder and the headset's
         // reports find a frame by it. The number is the sample's time plus the count of repeats.
         // The pose lookup takes the sample for the nearest one.
-        let repeat = (planned.is_some() || game_frame.is_some()) && sample != 0 && sample == last_sample && repeats < MAX_REPEATS;
+        let repeat = (planned.is_some() || (game_frame.is_some() && headset.repeats_samples())) && sample != 0 && sample == last_sample && repeats < MAX_REPEATS;
         if sample == 0 || (sample == last_sample && !repeat) {
             give_back(&game_frame);
             no_sample += 1;

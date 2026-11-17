@@ -382,7 +382,6 @@ const STOP_CHECK: Duration = Duration::from_millis(20);
 pub fn send_loop(link: &ClientLink, feed: &Feed, in_headset: bool, refresh_hz: f32, hello_views: Views, stop: &AtomicBool) {
     let period = Duration::from_secs_f64(1.0 / f64::from(refresh_hz.max(1.0)));
     let mut deadline = Instant::now();
-    let mut last_input = None;
     let mut sent_views = hello_views;
     let mut sent_floor: Option<f32> = None;
     while !stop.load(Ordering::Relaxed) {
@@ -427,11 +426,9 @@ pub fn send_loop(link: &ClientLink, feed: &Feed, in_headset: bool, refresh_hz: f
         if link.duplex.send_datagram(&ClientDatagram::Tracking(tracking)).is_err() {
             return;
         }
-        // The input travels when it changes: a held button stays held on the host
-        if last_input != Some(frame.input) {
-            last_input = Some(frame.input);
-            link.duplex.send_datagram(&ClientDatagram::Input(frame.input)).ok();
-        }
+        // The input goes out with every sample. A datagram may get lost, and the host takes the
+        // changes from the values that it sees, so a lost one leaves a button wrong for one frame.
+        link.duplex.send_datagram(&ClientDatagram::Input(frame.input)).ok();
     }
 }
 

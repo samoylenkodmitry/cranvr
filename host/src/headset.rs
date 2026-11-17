@@ -143,6 +143,13 @@ pub trait Headset: Send + Sync {
         false
     }
 
+    /// Whether the link takes a second frame for the same tracking sample, which the frame loop
+    /// numbers with the sample's time plus a few nanoseconds. A link whose client names frames
+    /// by the samples that it sent cannot: ALVR's client sees a timestamp that it never sent.
+    fn repeats_samples(&self) -> bool {
+        false
+    }
+
     /// The parameter sets of the HEVC stream (VPS, SPS and PPS in Annex B).
     fn set_decoder_config(&self, config: Vec<u8>);
 

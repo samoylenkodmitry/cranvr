@@ -761,6 +761,10 @@ impl Headset for Native {
         true
     }
 
+    fn repeats_samples(&self) -> bool {
+        true
+    }
+
     fn set_decoder_config(&self, config: Vec<u8>) {
         *self.shared.decoder_config.lock().unwrap() = Some(config.clone());
         if let Some(session) = self.shared.session() {
