@@ -8,11 +8,16 @@ use alvr_session::{
     BitrateModeDefaultVariant, CodecTypeDefaultVariant, FrameSizeDefaultVariant, MediacodecPropTypeDefault,
     MediacodecPropTypeDefaultVariant, MediacodecPropertyDefault, SocketProtocolDefaultVariant,
 };
+use crate::headset::Protocol;
 use cranvr_common::foveation::FoveationConfig;
 use cranvr_proto::wire::Codec;
 use std::{fs, net::IpAddr, path::Path};
 
 pub struct Options {
+    /// How the host talks to the headset's app
+    pub protocol: Protocol,
+    /// The TCP port of the native protocol
+    pub native_port: u16,
     pub fps: f32,
     pub eye_width: u32,
     pub mbps: u64,

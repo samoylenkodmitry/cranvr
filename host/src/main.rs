@@ -1,6 +1,6 @@
-//! cranvr-host: streams to a Quest through the stock ALVR client (v20.14.1). It shows a game
-//! when the BasaltVR OpenXR runtime inside Wine connects (see runtime_link.rs), and a
-//! head-tracked test scene otherwise. The headset's link sits behind the interface in headset.rs.
+//! cranvr-host: streams to a Quest, through the stock ALVR client (v20.14.1) or through cranvr's
+//! own protocol (see headset.rs). It shows a game when the BasaltVR OpenXR runtime inside Wine
+//! connects (see runtime_link.rs). Without a game it shows a head-tracked test scene.
 
 mod compat;
 mod desktop;
@@ -22,10 +22,10 @@ mod virtual_display;
 
 use alvr_common::{error, info, warn, RIGHT_THUMBSTICK_CLICK_ID, RIGHT_THUMBSTICK_Y_ID, RIGHT_TRIGGER_VALUE_ID};
 use alvr_filesystem::Layout;
-use cranvr_common::foveation::Foveation;
-use cranvr_proto::wire::Codec;
+use cranvr_common::foveation::{Foveation, FoveationConfig};
+use cranvr_proto::{message::HostWishes, wire::Codec};
 use cranvr_vt::{EncodedFrame, Encoder, EncoderConfig, PixelBuffer};
-use headset::{Device, Event, FrameSlice, Headset, OutFrame};
+use headset::{Device, Event, FrameSlice, Headset, OutFrame, Protocol};
 use render::{ComposeParams, Params, Renderer};
 use runtime_link::{GameEvent, GameFrame, RuntimeLink, Swapchains};
 use serde_json::json;
@@ -109,7 +109,11 @@ impl Default for Views {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: cranvr-host [--fps 72|80|90|120, default 120] [--eye-width PIXELS] [--mbps N] [--trust HOSTNAME]... [--trust-all] [--client-ip IP]... [--tcp] [--no-foveation] [--buffering-frames N] [--game-scale F] [--decoder-low-latency] [--strict-rate-control] [--no-game-audio] [--desktop] [--desktop-fps N] [--virtual-display WxH] [--vr-main-display] [--pointer-pitch DEG] [--screen-in-view] [--no-desktop-layer] [--config-dir DIR] [--status]\n\
+        "usage: cranvr-host [--protocol native|alvr, default alvr] [--native-port PORT] [--fps 72|80|90|120, default 120] [--eye-width PIXELS] [--mbps N] [--trust HOSTNAME]... [--trust-all] [--client-ip IP]... [--tcp] [--no-foveation] [--buffering-frames N] [--game-scale F] [--decoder-low-latency] [--strict-rate-control] [--no-game-audio] [--desktop] [--desktop-fps N] [--virtual-display WxH] [--vr-main-display] [--pointer-pitch DEG] [--screen-in-view] [--no-desktop-layer] [--config-dir DIR] [--status]\n\
+         \n  --protocol P      how the headset's app talks to the host: alvr (the stock ALVR client,\
+         \n                    the default) or native (cranvr's own protocol and client). The\
+         \n                    native mode has no game sound and no desktop layer yet.\
+         \n  --native-port N   with --protocol native: the TCP port to listen on (default 9950)\
          \n  --trust HOSTNAME  accept this ALVR client (the hostname shows in the client's lobby)\
          \n  --trust-all       accept any ALVR client on the network (for tests)\
          \n  --client-ip IP    connect to a client at this address; 127.0.0.1 with `adb forward` of\
@@ -149,6 +153,8 @@ fn usage() -> ! {
 
 fn parse_args() -> (Options, DesktopOptions, PathBuf) {
     let mut options = Options {
+        protocol: Protocol::Alvr,
+        native_port: 9950,
         fps: 120.0,
         eye_width: 0,
         mbps: 100,
@@ -183,6 +189,14 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
     while let Some(arg) = args.next() {
         let mut value = || args.next().unwrap_or_else(|| usage());
         match arg.as_str() {
+            "--protocol" => {
+                options.protocol = match value().as_str() {
+                    "native" => Protocol::Native,
+                    "alvr" => Protocol::Alvr,
+                    _ => usage(),
+                }
+            }
+            "--native-port" => options.native_port = value().parse().unwrap_or_else(|_| usage()),
             "--fps" => options.fps = value().parse().unwrap_or_else(|_| usage()),
             "--eye-width" => options.eye_width = value().parse().unwrap_or_else(|_| usage()),
             "--mbps" => options.mbps = value().parse().unwrap_or_else(|_| usage()),
@@ -276,6 +290,25 @@ fn raise_file_limit() {
     }
 }
 
+/// What the native protocol takes from the command line.
+fn native_config(options: &Options) -> headset::native::Config {
+    headset::native::Config {
+        port: options.native_port,
+        trust: options.trust.clone(),
+        trust_all: options.trust_all,
+        tcp_media: options.tcp,
+        wishes: HostWishes {
+            eye_width: options.eye_width,
+            refresh_hz: options.fps,
+            bitrate_bps: options.mbps * 1_000_000,
+            codecs: vec![Codec::Hevc],
+            foveation: options.foveation.then(|| FoveationConfig::default().into()),
+            full_range: true,
+            slices: 1,
+        },
+    }
+}
+
 fn main() {
     raise_file_limit();
     let args: Vec<String> = std::env::args().collect();
@@ -289,12 +322,19 @@ fn main() {
     std::fs::create_dir_all(&config_dir).expect("config dir");
     status::set_menu_file(config_dir.join("vr-menu.json"));
     let layout = Layout::new(&config_dir);
-    session::prepare(&layout, &options);
-
-    alvr_server_core::initialize_environment(layout.clone());
+    let alvr = options.protocol == Protocol::Alvr;
+    if alvr {
+        session::prepare(&layout, &options);
+        alvr_server_core::initialize_environment(layout.clone());
+    }
+    // The logger comes from ALVR's server core. It opens no socket and reads no session file.
     alvr_server_core::init_logging(None, Some(layout.crash_log()));
-    if options.game_audio {
+    // The native protocol has no game sound and no desktop layer yet
+    if alvr && options.game_audio {
         start_game_audio();
+    }
+    if !alvr {
+        desktop.layer = false;
     }
     info!(
         "cranvr-host: {} Hz, {} px per eye, {} Mbps, config in {}",
@@ -303,7 +343,7 @@ fn main() {
         options.mbps,
         config_dir.display()
     );
-    if options.trust_all {
+    if options.trust_all && alvr {
         warn!("--trust-all: any ALVR client on this network can connect");
     }
 
@@ -323,7 +363,13 @@ fn main() {
         }
     }
 
-    let (headset, mut events) = headset::alvr::start(layout.session());
+    let (headset, mut events) = match options.protocol {
+        Protocol::Alvr => headset::alvr::start(layout.session()),
+        Protocol::Native => headset::native::start(native_config(&options)).unwrap_or_else(|e| {
+            error!("Native protocol: cannot listen on port {}: {e}", options.native_port);
+            std::process::exit(1)
+        }),
+    };
     let shared = Arc::new(Shared {
         stream: Mutex::new(None),
         latest_sample_ns: AtomicU64::new(0),
@@ -739,7 +785,7 @@ fn frame_loop(
     let mut game = Game { unscale: unscale_displays, ..Game::default() };
     let mut last_sample = 0;
     // The stream's rate replaces this when the encoder starts
-    let mut pacer = pacer::Pacer::new(120.0);
+    let mut pacer = pacer::Pacer::new(120.0).with_ready(headset.pacer_ready());
     let mut frame_index = 0i64;
     let mut bitrate = mbps * 1_000_000;
     let mut new_bitrate = None;
@@ -798,7 +844,7 @@ fn frame_loop(
         if encoder.as_ref().is_none_or(|(_, n, _)| *n != stream) {
             let foveation = stream
                 .foveated
-                .then(|| Foveation::new([stream.eye_width, stream.eye_height], &session::foveation_config()));
+                .then(|| Foveation::new([stream.eye_width, stream.eye_height], &stream.foveation));
             let (eye_w, eye_h) = foveation.map_or((stream.eye_width, stream.eye_height), |f| (f.optimized[0], f.optimized[1]));
             let config = EncoderConfig {
                 width: eye_w * 2,

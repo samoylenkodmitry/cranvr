@@ -1,5 +1,6 @@
-//! What the host's frame loop needs from a headset's link. ALVR's v20 protocol stands behind it
-//! today (`alvr.rs`). The frame loop, the encoder and the pacer do not know which protocol runs.
+//! What the host's frame loop needs from a headset's link. Two protocols stand behind it. ALVR's
+//! v20 protocol serves the stock ALVR client (`alvr.rs`). cranvr's own protocol serves cranvr's
+//! client (`native.rs`). The frame loop, the encoder and the pacer do not know which one runs.
 //!
 //! The interface has four parts:
 //! - events from the headset: a connection, a tracking sample, buttons (`EventSource`);
@@ -17,6 +18,16 @@ use serde_json::Value;
 use std::{net::IpAddr, sync::mpsc::RecvTimeoutError, time::Duration};
 
 pub mod alvr;
+pub mod native;
+
+/// The protocol between the host and the headset's app.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Protocol {
+    /// cranvr's own protocol (`cranvr-proto`), for cranvr's own Quest client
+    Native,
+    /// ALVR v20, for the stock ALVR client
+    Alvr,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Device {
@@ -40,7 +51,8 @@ pub enum Event {
     /// tell.
     Connected { stream: Option<Negotiated>, ip: Option<IpAddr> },
     Disconnected,
-    /// The headset sent a new tracking sample. Frames carry its time back.
+    /// The headset sent a new tracking sample. With the native protocol the sample time is on the
+    /// headset's clock. With ALVR it is on ALVR's. Frames carry it back.
     Tracking { sample_ns: u64 },
     Views(ViewsConfig),
     Buttons(Vec<Button>),
@@ -59,8 +71,7 @@ pub trait EventSource: Send {
 
 /// A part of an encoded frame. Today the encoder makes one slice per frame, which covers all of it.
 pub struct FrameSlice {
-    /// x, y, width, height in the encoded frame's pixels. Only the native link reads it.
-    #[allow(dead_code)]
+    /// x, y, width, height in the encoded frame's pixels. ALVR's client needs no slice layout.
     pub rect: [u32; 4],
     /// The encoded bytes, Annex B
     pub data: Vec<u8>,
@@ -72,7 +83,6 @@ pub struct OutFrame {
     pub sample_ns: u64,
     pub idr: bool,
     /// The pose that each eye was rendered from. Only links that `wants_eye_poses` read them.
-    #[allow(dead_code)]
     pub eye_poses: [Pose; 2],
     pub slices: Vec<FrameSlice>,
 }
@@ -83,6 +93,12 @@ pub trait Headset: Send + Sync {
 
     /// The pose of a device at a tracking sample.
     fn motion(&self, device: Device, sample_ns: u64) -> Option<DeviceMotion>;
+
+    /// The share of a frame's budget that the pacer needs before it draws a frame for a new pose
+    /// (see `Pacer::with_ready`). A client that sends several poses per refresh keeps the default.
+    fn pacer_ready(&self) -> f32 {
+        crate::pacer::READY
+    }
 
     /// Whether `send_frame` reads `OutFrame::eye_poses`. The frame loop computes them only then.
     fn wants_eye_poses(&self) -> bool {
