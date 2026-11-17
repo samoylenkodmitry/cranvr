@@ -78,6 +78,28 @@ The first build downloads ALVR v20.14.1 from GitHub with its submodules.
 4. Press "Start host". Open ALVR on the Quest. The Quest's hostname (such as `1234.client`) appears under "Headset". Press "Pair".
 5. On the first connection the client shows "The streamer is restarting" once. It reconnects by itself.
 
+### cranvr's Cranpose client
+
+`client/` holds the client of native mode. It is a Cranpose app. It uses only Cranpose's public API and plain Rust crates such as `cranvr-proto`. It has no ndk, JNI, GL, OpenXR or platform code. Its Android application id is `dev.cranvr.client2`, so it installs beside the old client (`quest/`) and the ALVR app.
+
+```bash
+scripts/build-client.sh --install
+cargo run --manifest-path client/Cargo.toml -- --host=127.0.0.1:9950 --connect
+```
+
+The host serves it with `cranvr-host --protocol native --no-foveation --trust cranvr-client`. The trust name is the client's device name. A client on the Mac itself needs no trust. The client cannot unwarp a foveated frame. Without `--no-foveation` the host picks an eye width of 2064 pixels, a picture of 4128 by 2208 pixels. The host's own comment puts its encoder at about 2 ms for each megapixel, so it is not expected to keep up at 120 Hz. This combination was not run. A Quest that is not on the Mac's network connects over USB: `adb reverse tcp:9950 tcp:9950`, then the address `127.0.0.1:9950`. A loopback address makes the client ask for the media over TCP.
+
+The app has three parts. In a headset each is a movable panel in the room. On the desktop they draw side by side in a flat window.
+- The connect panel holds the host address, a keypad for it, the Connect button and the state of the link. Cranpose's preferences service remembers the address.
+- The stream is a `SpatialExternalSurface` with `StereoMode::SideBySide`. Cranpose's `VideoDecoder` writes the decoded frames into it. The compositor shows each half to one eye.
+- The stats panel shows the frame rate, the decode time, the loss, the FEC recoveries and the latency.
+
+The launch arguments `host`, `connect` and `media` (`udp` or `tcp`) set the address, start the connection and choose the media path. On Android they are intent extras: `adb shell am start -n dev.cranvr.client2/dev.cranpose.android.CranposeActivity --es host 192.168.1.20:9950 --ez connect true`. On the desktop they are `--host=ADDRESS`, `--connect` and `--media=udp`.
+
+`client/src/connection.rs` runs the link on its own threads. `client/src/hub.rs` hands the numbers to the UI. A `LaunchedEffect` copies them into Cranpose state four times a second.
+
+`client/src/tracking.rs` is the seam for the headset's per-frame data: the head pose, the controllers, the predicted display time and the eye views. Cranpose's public API does not carry them yet. Until it does, the client sends placeholder values: a still head, two still controllers and a display clock on a fixed grid. The host renders real pictures for these values. The pictures do not follow a real head. The desktop client cannot decode, because Cranpose's `VideoDecoder` has no desktop backend. It still connects, counts frames, restores lost packets and reports its timing.
+
 ### cranvr's Quest app
 
 `quest/` holds cranvr's own Quest client, the base of native mode. It is ALVR's OpenXR client of v20.14.1 with its own package, `dev.cranvr.client`, labeled "cranvr". It installs beside the ALVR app from the Meta store. Its protocol is still ALVR's v20 protocol, so the host serves both apps the same way. Native mode will change the protocol in the host and in this app together.

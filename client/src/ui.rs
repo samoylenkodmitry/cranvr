@@ -31,8 +31,13 @@ const ACCENT_COLOR: Color = Color(0.25, 0.45, 0.95, 1.0);
 const STOP_COLOR: Color = Color(0.75, 0.3, 0.3, 1.0);
 
 // One eye's image of the Quest 3 is nearly square, and the stream shows each eye on its own
-// layer. The surface takes the eye's proportions: 1680 by 1760 pixels.
-const STREAM_SIZE: [f32; 2] = [1000.0, 1048.0];
+// layer. The surface takes the eye's proportions: 1680 by 1760 pixels. In a headset one dp is a
+// millimeter, so the stream is 92 centimeters wide, a meter in front of the viewer.
+const STREAM_SIZE: [f32; 2] = [920.0, 964.0];
+// The side panels stand on a circle of about a meter around the viewer, at 47 degrees to the left
+// and to the right of the stream, and face the viewer.
+const SIDE_OFFSET: [f32; 3] = [760.0, 0.0, 300.0];
+const SIDE_TURN: f32 = 45.0;
 
 /// The app. In a headset it shows the stream in front of the viewer, the connect panel to the left
 /// and the stats panel to the right.
@@ -111,7 +116,11 @@ fn ConnectPanel(snapshot: MutableState<Snapshot>) {
     // In a headset a focused field must not ask for a software keyboard
     let in_headset = local_spatial_capabilities().current().is_spatial_ui_enabled();
     SpatialPanel(
-        SubspaceModifier::new().size(760.0, 840.0).offset(-1000.0, 0.0, 150.0).rotate(0.0, 22.0, 0.0).movable(),
+        SubspaceModifier::new()
+            .size(760.0, 840.0)
+            .offset(-SIDE_OFFSET[0], SIDE_OFFSET[1], SIDE_OFFSET[2])
+            .rotate(0.0, SIDE_TURN, 0.0)
+            .movable(),
         move || {
             let snap = snapshot.get();
             let state = snap.state.clone();
@@ -241,7 +250,11 @@ fn state_text(state: &LinkState, address: &str) -> (String, Color) {
 #[composable]
 fn StatsPanel(snapshot: MutableState<Snapshot>) {
     SpatialPanel(
-        SubspaceModifier::new().size(700.0, 840.0).offset(1000.0, 0.0, 150.0).rotate(0.0, -22.0, 0.0).movable(),
+        SubspaceModifier::new()
+            .size(700.0, 840.0)
+            .offset(SIDE_OFFSET[0], SIDE_OFFSET[1], SIDE_OFFSET[2])
+            .rotate(0.0, -SIDE_TURN, 0.0)
+            .movable(),
         move || {
             let snap = snapshot.get();
             let lines = stat_lines(&snap);

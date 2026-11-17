@@ -472,7 +472,13 @@ struct Decode<'s, 'a> {
     last_frame: Option<u32>,
     /// Holds a key frame's parameter sets and its bytes together
     scratch: Vec<u8>,
+    /// A decoder that failed to start is tried again at this time. The decoder of an earlier
+    /// session may still hold the surface for a moment.
+    retry_at: Option<Instant>,
 }
+
+/// How long to wait before a decoder that failed to start is tried again
+const RETRY_AFTER: Duration = Duration::from_millis(500);
 
 fn decode_loop(s: &Shared<'_>, units: &mpsc::Receiver<Received>) {
     let mut d = Decode {
@@ -484,6 +490,7 @@ fn decode_loop(s: &Shared<'_>, units: &mpsc::Receiver<Received>) {
         last_pts_us: 0,
         last_frame: None,
         scratch: Vec::new(),
+        retry_at: None,
     };
     while !s.stopped() {
         d.sync_decoder();
@@ -504,7 +511,7 @@ impl Decode<'_, '_> {
         *self.s.decoder_frames.lock().unwrap() = None;
         self.pending.clear();
         if had_decoder {
-            self.s.hub.set_surface_in_use(false);
+            self.s.hub.surface_released();
         }
     }
 
@@ -518,9 +525,10 @@ impl Decode<'_, '_> {
         let s = self.s;
         let (surface_generation, surface) = s.hub.surface();
         let wanted = (surface_generation, s.epoch.load(Ordering::Relaxed));
-        if self.built_for == Some(wanted) {
+        if self.built_for == Some(wanted) || self.retry_at.is_some_and(|at| Instant::now() < at) {
             return;
         }
+        self.retry_at = None;
         // The owner of a surface waits for the decoder to let go of it, so this comes first
         self.release();
         let Some(surface) = surface else {
@@ -545,7 +553,7 @@ impl Decode<'_, '_> {
                 log::info!("decoder started for {}x{}", stream.eye_size[0] * 2, stream.eye_size[1]);
                 *s.decoder_frames.lock().unwrap() = Some(decoder.frames());
                 self.decoder = Some(decoder);
-                s.hub.set_surface_in_use(true);
+                s.hub.surface_taken();
                 self.last_pts_us = 0;
                 // The new decoder starts at a key frame
                 s.waiting_key.store(true, Ordering::Relaxed);
@@ -555,6 +563,8 @@ impl Decode<'_, '_> {
             Err(e) => {
                 log::warn!("no decoder: {e}");
                 self.set_view(DecoderView::Failed(e.to_string()));
+                self.built_for = None;
+                self.retry_at = Some(Instant::now() + RETRY_AFTER);
             }
         }
     }

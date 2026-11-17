@@ -136,14 +136,15 @@ pub enum MediaChoice {
     Tcp,
 }
 
-/// The surface of the stream and whether a decoder writes into it.
+/// The surface of the stream and how many decoders write into it.
 #[derive(Default)]
 struct SurfaceSlot {
     surface: Option<ExternalSurface>,
     /// Counts each creation and destruction, so the decoder thread sees a change
     generation: u64,
-    /// A decoder holds the surface
-    in_use: bool,
+    /// The decoders that hold the surface. A new session may start its decoder while the last
+    /// one still lets go of the surface, so this is a count.
+    holders: usize,
 }
 
 /// How long the destruction of the surface waits for the decoder to let go of it.
@@ -219,7 +220,7 @@ impl Hub {
         let mut slot = self.slot.lock().unwrap();
         slot.surface = None;
         slot.generation += 1;
-        let (slot, timeout) = self.released.wait_timeout_while(slot, RELEASE_WAIT, |slot| slot.in_use).unwrap();
+        let (slot, timeout) = self.released.wait_timeout_while(slot, RELEASE_WAIT, |slot| slot.holders > 0).unwrap();
         if timeout.timed_out() {
             log::warn!("the decoder did not let go of the stream surface within {RELEASE_WAIT:?}");
         }
@@ -232,10 +233,16 @@ impl Hub {
         (slot.generation, slot.surface.clone())
     }
 
-    /// The decoder thread tells whether a decoder holds the surface.
-    pub(crate) fn set_surface_in_use(&self, in_use: bool) {
-        self.slot.lock().unwrap().in_use = in_use;
-        if !in_use {
+    /// A decoder starts to write into the surface.
+    pub(crate) fn surface_taken(&self) {
+        self.slot.lock().unwrap().holders += 1;
+    }
+
+    /// A decoder let go of the surface.
+    pub(crate) fn surface_released(&self) {
+        let mut slot = self.slot.lock().unwrap();
+        slot.holders = slot.holders.saturating_sub(1);
+        if slot.holders == 0 {
             self.released.notify_all();
         }
     }
