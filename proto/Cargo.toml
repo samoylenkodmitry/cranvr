@@ -1,0 +1,13 @@
+[package]
+name = "cranvr-proto"
+description = "cranvr's own protocol between the Mac host and the Quest client (native mode)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cranvr-common.workspace = true
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+reed-solomon-simd = "3"
+socket2 = "0.6"

@@ -7,10 +7,16 @@
 //! display loop takes one image per refresh (see android.rs). The host then reaches it through
 //! `adb forward` of TCP ports 9943 and 9944.
 //!
+//! With `--protocol native` it is a client of cranvr's own protocol instead (see native.rs): it
+//! connects to the host's TCP port, sends synthetic tracking once per refresh and reports its frame
+//! timing and its loss, as a headset app does.
+//!
 //! Exit code 0 means at least half the expected frames arrived and decoded with the right badges.
 
 #[cfg(target_os = "android")]
 mod android;
+#[cfg(target_os = "macos")]
+mod native;
 
 use alvr_client_core::{ClientCapabilities, ClientCoreContext, ClientCoreEvent};
 use alvr_common::{
@@ -49,22 +55,57 @@ fn badge_points(foveation: Option<&Foveation>) -> Vec<(f32, f32)> {
         .collect()
 }
 
+fn usage() -> ! {
+    eprintln!(
+        "usage: cranvr-probe [--seconds N] [--game | --any-picture] [--protocol native|alvr]\n\
+         \n  --protocol native  connect to cranvr-host --protocol native, not to an ALVR host\
+         \n  --connect HOST:PORT  with native: the host's address (default 127.0.0.1:9950)\
+         \n  --tcp              with native: ask for the media over TCP, as a USB link needs it\
+         \n  --drop-percent P   with native: drop this share of the media packets, to test the parity"
+    );
+    std::process::exit(2);
+}
+
 fn main() {
     let mut seconds = 10.0f32;
     // --game: expect the fake game's badges (left blue, right red) instead of the test scene's.
     // --any-picture: count every frame of the right size, for a real game that draws no badges.
     let mut game = false;
     let mut any_picture = false;
+    // Native mode: the host's address, media over TCP, a share of media packets to drop
+    let mut native = false;
+    let mut connect = "127.0.0.1:9950".to_string();
+    let mut tcp = false;
+    let mut drop_percent = 0.0f32;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seconds" => seconds = args.next().and_then(|v| v.parse().ok()).expect("--seconds N"),
             "--game" => game = true,
             "--any-picture" => any_picture = true,
-            _ => {
-                eprintln!("usage: cranvr-probe [--seconds N] [--game | --any-picture]");
-                std::process::exit(2);
-            }
+            "--protocol" => match args.next().as_deref() {
+                Some("native") => native = true,
+                Some("alvr") => native = false,
+                _ => usage(),
+            },
+            "--connect" => connect = args.next().unwrap_or_else(|| usage()),
+            "--tcp" => tcp = true,
+            "--drop-percent" => drop_percent = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
+            _ => usage(),
+        }
+    }
+    if native {
+        #[cfg(target_os = "macos")]
+        {
+            use std::net::ToSocketAddrs;
+            let Some(address) = connect.to_socket_addrs().ok().and_then(|mut a| a.next()) else { usage() };
+            std::process::exit(native::run(native::Options { seconds, game, any_picture, connect: address, tcp, drop_percent }));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&connect, tcp, drop_percent);
+            eprintln!("probe: --protocol native runs on macOS only for now");
+            std::process::exit(2);
         }
     }
 

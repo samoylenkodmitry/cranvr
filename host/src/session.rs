@@ -8,10 +8,16 @@ use alvr_session::{
     BitrateModeDefaultVariant, CodecTypeDefaultVariant, FrameSizeDefaultVariant, MediacodecPropTypeDefault,
     MediacodecPropTypeDefaultVariant, MediacodecPropertyDefault, SocketProtocolDefaultVariant,
 };
+use crate::headset::Protocol;
 use cranvr_common::foveation::FoveationConfig;
+use cranvr_proto::wire::Codec;
 use std::{fs, net::IpAddr, path::Path};
 
 pub struct Options {
+    /// How the host talks to the headset's app
+    pub protocol: Protocol,
+    /// The TCP port of the native protocol
+    pub native_port: u16,
     pub fps: f32,
     pub eye_width: u32,
     pub mbps: u64,
@@ -98,8 +104,10 @@ pub struct Negotiated {
     pub eye_height: u32,
     pub fps: f32,
     pub full_range: bool,
-    pub codec: u64,
+    pub codec: Codec,
     pub foveated: bool,
+    /// The foveation parameters, which count when `foveated` is set
+    pub foveation: FoveationConfig,
 }
 
 pub fn read_negotiated(session_path: &Path) -> Option<Negotiated> {
@@ -111,8 +119,14 @@ pub fn read_negotiated(session_path: &Path) -> Option<Negotiated> {
         eye_height: c.get("eye_resolution_height")?.as_u64()? as u32,
         fps: c.get("refresh_rate")?.as_u64()? as f32,
         full_range: c.get("use_full_range_encoding")?.as_bool()?,
-        codec: c.get("codec")?.as_u64()?,
+        // ALVR's numbering: 0 H.264, 1 HEVC, 2 AV1
+        codec: match c.get("codec")?.as_u64()? {
+            0 => Codec::H264,
+            1 => Codec::Hevc,
+            _ => Codec::Av1,
+        },
         foveated: c.get("enable_foveated_encoding")?.as_bool()?,
+        foveation: foveation_config(),
     })
 }
 

@@ -13,6 +13,7 @@ alvr_session.workspace = true
 alvr_server_io.workspace = true
 alvr_server_core.workspace = true
 cranvr-vt.workspace = true
+cranvr-proto.workspace = true
 serde_json.workspace = true
 objc2 = "0.6"
 objc2-foundation = "0.3"
