@@ -382,47 +382,35 @@ fn horizon_seconds(valid_at: Nanos, target: Nanos) -> Option<f32> {
     Some((seconds as f32).clamp(0.0, MAX_HORIZON))
 }
 
-fn device_of(t: &Tracking, device: Device) -> Option<Motion> {
-    match device {
-        Device::Head => Some(t.head),
-        Device::LeftHand => t.left,
-        Device::RightHand => t.right,
-    }
+/// Which of a hand's two poses: the grip pose is where the hand holds the controller, the aim pose is
+/// where the controller points. The headset reports both for a tracked controller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandPose {
+    Grip,
+    Aim,
 }
 
-/// The offset that ALVR's client applies to a Quest controller's grip pose before it sends the
-/// pose (`get_controller_offset` in `quest/src/interaction.rs`, from ALVR v20): the runtimes'
-/// grip poses do not follow the OpenXR specification exactly. The native client sends the grip
-/// pose as the headset reports it. The host applies the offset, so a game, the desktop pointer
-/// (`--pointer-pitch` was tuned with ALVR's poses) and the test scene's markers see the pose that
-/// they see with ALVR. The offset is that of the left controller. The right one mirrors it.
-fn hand_offset(device: Device) -> AlvrPose {
-    let left = AlvrPose { orientation: Quat::from_rotation_x(-15f32.to_radians()), position: Vec3::new(-0.005, -0.005, 0.0) };
-    match device {
-        Device::RightHand => {
-            let (p, q) = (left.position, left.orientation);
-            AlvrPose { orientation: Quat::from_xyzw(-q.x, q.y, q.z, -q.w), position: Vec3::new(-p.x, p.y, p.z) }
-        }
-        Device::LeftHand | Device::Head => left,
+fn device_of(t: &Tracking, device: Device, pose: HandPose) -> Option<Motion> {
+    match (device, pose) {
+        (Device::Head, _) => Some(t.head),
+        (Device::LeftHand, HandPose::Grip) => t.left_grip,
+        (Device::RightHand, HandPose::Grip) => t.right_grip,
+        (Device::LeftHand, HandPose::Aim) => t.left_aim,
+        (Device::RightHand, HandPose::Aim) => t.right_aim,
     }
 }
 
 /// The motion for the host's scene or game. The poses of the headset lie in its room, whose origin
 /// is where the head was when the app started. The host's scenes and games want the floor at
 /// height 0, so the room moves up by the height of the floor below its origin. `floor` is 0 until
-/// the client says where its floor is. A hand's pose moves by `hand_offset`.
-fn device_motion(device: Device, motion: Motion, floor: f32) -> DeviceMotion {
-    let orientation = Quat::from_array(motion.pose.orientation);
-    let position = Vec3::from_array(motion.pose.position) - Vec3::new(0.0, floor, 0.0);
-    let pose = match device {
-        Device::Head => AlvrPose { orientation, position },
-        Device::LeftHand | Device::RightHand => {
-            let offset = hand_offset(device);
-            AlvrPose { orientation: orientation * offset.orientation, position: position + orientation * offset.position }
-        }
-    };
+/// the client says where its floor is. The poses of the controllers are the headset's own: the host
+/// adds no offset to them.
+fn device_motion(motion: Motion, floor: f32) -> DeviceMotion {
     DeviceMotion {
-        pose,
+        pose: AlvrPose {
+            orientation: Quat::from_array(motion.pose.orientation),
+            position: Vec3::from_array(motion.pose.position) - Vec3::new(0.0, floor, 0.0),
+        },
         linear_velocity: Vec3::from_array(motion.linear_velocity),
         angular_velocity: Vec3::from_array(motion.angular_velocity),
     }
@@ -744,30 +732,42 @@ impl Session {
     }
 }
 
+impl Native {
+    /// The pose of a device at a tracking sample. With a `target` display time the pose moves by its
+    /// velocities from the sample's display time to the target, as a frame shows it.
+    fn pose(&self, device: Device, kind: HandPose, sample_ns: u64, target: Option<u64>) -> Option<DeviceMotion> {
+        let session = self.shared.session()?;
+        let history = session.history.lock().unwrap();
+        let t = history.find(sample_ns)?;
+        let mut motion = device_of(t, device, kind)?;
+        // The pose is valid at the sample's display time. The frame shows at the target.
+        if let Some(seconds) = target.and_then(|target| horizon_seconds(t.display_time, target)) {
+            motion.pose = extrapolate(&motion, seconds);
+        }
+        let floor = session.floor.lock().unwrap().unwrap_or(0.0);
+        Some(device_motion(motion, floor))
+    }
+}
+
 impl Headset for Native {
     fn until_next_vsync(&self) -> Option<Duration> {
         self.shared.session()?.until_next_vsync()
     }
 
     fn motion(&self, device: Device, sample_ns: u64) -> Option<DeviceMotion> {
-        let session = self.shared.session()?;
-        let history = session.history.lock().unwrap();
-        let t = history.find(sample_ns)?;
-        let floor = session.floor.lock().unwrap().unwrap_or(0.0);
-        Some(device_motion(device, device_of(t, device)?, floor))
+        self.pose(device, HandPose::Grip, sample_ns, None)
     }
 
     fn motion_at(&self, device: Device, sample_ns: u64, target: u64) -> Option<DeviceMotion> {
-        let session = self.shared.session()?;
-        let history = session.history.lock().unwrap();
-        let t = history.find(sample_ns)?;
-        let mut motion = device_of(t, device)?;
-        // The pose is valid at the sample's display time. The frame shows at the target.
-        if let Some(seconds) = horizon_seconds(t.display_time, target) {
-            motion.pose = extrapolate(&motion, seconds);
-        }
-        let floor = session.floor.lock().unwrap().unwrap_or(0.0);
-        Some(device_motion(device, motion, floor))
+        self.pose(device, HandPose::Grip, sample_ns, Some(target))
+    }
+
+    fn aim_motion(&self, device: Device, sample_ns: u64) -> Option<DeviceMotion> {
+        self.pose(device, HandPose::Aim, sample_ns, None)
+    }
+
+    fn aim_motion_at(&self, device: Device, sample_ns: u64, target: u64) -> Option<DeviceMotion> {
+        self.pose(device, HandPose::Aim, sample_ns, Some(target))
     }
 
     fn frame_plan(&self) -> Option<FramePlan> {

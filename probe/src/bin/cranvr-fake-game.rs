@@ -4,16 +4,17 @@
 //! `cranvr-probe --game` can tell its frames from the host's test scene.
 //!
 //! It also reads the controller messages that the host sends and writes what arrived when it ends.
-//! A pull of the left grip makes it answer with a haptic pulse on the left hand, as a game does.
-//! `--expect-input` makes the exit code depend on the input: the probe's scripted controllers
-//! (`cranvr-probe --protocol native`) must have arrived on both hands with the Touch buttons.
+//! Like the runtime with cranvr's patch 0004, it tells the host in `runtime-features.txt` that it
+//! takes aim poses, so each hand arrives with a grip pose and an aim pose. A pull of the left grip
+//! makes it answer with a haptic pulse on the left hand, as a game does. `--expect-input` makes the
+//! exit code depend on the input: the probe's scripted controllers (`cranvr-probe --protocol
+//! native`) must have arrived on both hands with their own grip and aim poses, as `hands.rs`
+//! scripts them, and with the Touch buttons.
 //!
 //! Usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input]
 
-use alvr_common::{
-    glam::{Quat, Vec3},
-    LEFT_SQUEEZE_VALUE_ID, RIGHT_A_CLICK_ID, RIGHT_THUMBSTICK_X_ID, RIGHT_TRIGGER_VALUE_ID,
-};
+use alvr_common::{LEFT_SQUEEZE_VALUE_ID, RIGHT_A_CLICK_ID, RIGHT_THUMBSTICK_X_ID, RIGHT_TRIGGER_VALUE_ID};
+use cranvr_proto::wire::Motion;
 use cranvr_vt::PixelBuffer;
 use std::{
     collections::BTreeMap,
@@ -43,6 +44,16 @@ const INTERACTION_PROFILE: u16 = 13;
 const CONTROLLER_MASK: u16 = 16;
 const VIEW_CONFIG: u16 = 15;
 const FRAME_CONSUMED: u16 = 17;
+/// cranvr's runtime patch 0004: the grip and the aim pose of a hand in one message
+const CONTROLLER_MOTION_AIM: u16 = 18;
+/// The probe puts its floor 0.3 m below its room's origin (`PROBE_FLOOR` in probe/src/native.rs).
+/// The host lifts every pose by that much.
+const FLOOR_LIFT: f32 = 0.3;
+
+// The probe plays the script of hands.rs and uses all of it. The game only checks it.
+#[allow(dead_code)]
+#[path = "../hands.rs"]
+mod hands;
 const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
 const IMAGES: usize = 3;
 
@@ -67,10 +78,13 @@ fn read_message(stream: &mut TcpStream) -> std::io::Result<(u16, Vec<u8>)> {
 /// What the host sent about the controllers.
 #[derive(Default)]
 struct Input {
-    /// Pose messages per hand, and the last pose of each: orientation x, y, z, w then position
+    /// Pose messages per hand, and how many of them carried an aim pose
     poses: [u32; 2],
-    last_pose: [[f32; 7]; 2],
-    /// The smallest and the largest position that each hand reached, per axis
+    aim_poses: [u32; 2],
+    /// The last grip motion of each hand and its last aim motion
+    grip: [Motion; 2],
+    aim: [Option<Motion>; 2],
+    /// The smallest and the largest grip position that each hand reached, per axis
     reach: [[[f32; 2]; 3]; 2],
     /// The last mask: bit 0 left, bit 1 right
     mask: Option<u32>,
@@ -80,12 +94,33 @@ struct Input {
     resets: u32,
 }
 
+/// A motion from the 13 floats of a pose message: orientation x, y, z, w, position, then the
+/// linear and the angular velocity
+fn motion(values: &[f32]) -> Motion {
+    Motion {
+        pose: cranvr_proto::wire::Pose { orientation: values[..4].try_into().unwrap(), position: values[4..7].try_into().unwrap() },
+        linear_velocity: values[7..10].try_into().unwrap(),
+        angular_velocity: values[10..13].try_into().unwrap(),
+    }
+}
+
+/// The same turn, up to the sign of the quaternion
+fn same_turn(a: [f32; 4], b: [f32; 4]) -> bool {
+    a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>().abs() > 0.999_99
+}
+
+fn near(a: [f32; 3], b: [f32; 3]) -> bool {
+    a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-3)
+}
+
 impl Input {
-    fn pose(&mut self, hand: usize, values: [f32; 13]) {
+    fn pose(&mut self, hand: usize, grip: Motion, aim: Option<Motion>) {
         self.poses[hand] += 1;
-        self.last_pose[hand].copy_from_slice(&values[..7]);
+        self.aim_poses[hand] += u32::from(aim.is_some());
+        self.grip[hand] = grip;
+        self.aim[hand] = aim;
         for axis in 0..3 {
-            let v = values[4 + axis];
+            let v = grip.pose.position[axis];
             let r = &mut self.reach[hand][axis];
             *r = if self.poses[hand] == 1 { [v, v] } else { [r[0].min(v), r[1].max(v)] };
         }
@@ -104,11 +139,16 @@ impl Input {
     }
 
     /// What the probe's script must have brought: both hands tracked, the left one still, the
-    /// right one moving, a hand's pose pitched down by ALVR's controller offset, and the buttons.
+    /// right one moving, and each hand with the grip pose and the aim pose that the probe scripted
+    /// (`hands.rs`), with the floor's lift and with no offset of the host. A game that locates both
+    /// spaces of a hand finds these two poses. The buttons must have come too.
     fn problems(&self) -> Vec<String> {
         let mut out = Vec::new();
         if self.poses[0] < 50 || self.poses[1] < 50 {
             out.push(format!("poses: {} left, {} right", self.poses[0], self.poses[1]));
+        }
+        if self.aim_poses != self.poses {
+            out.push(format!("aim poses: {:?} of {:?} messages carried one", self.aim_poses, self.poses));
         }
         if self.mask != Some(3) {
             out.push(format!("controller mask {:?}, expected both hands", self.mask));
@@ -116,11 +156,42 @@ impl Input {
         if !self.profiles[0] || !self.profiles[1] {
             out.push("no interaction profile for a hand".into());
         }
-        for (hand, q) in self.last_pose.iter().enumerate() {
-            let forward = Quat::from_xyzw(q[0], q[1], q[2], q[3]) * Vec3::NEG_Z;
-            if (forward.y + 15f32.to_radians().sin()).abs() > 0.02 {
-                out.push(format!("hand {hand} points {forward:?}, expected 15 degrees down"));
+        for hand in 0..2 {
+            let name = ["left", "right"][hand];
+            let grip = &self.grip[hand];
+            if !same_turn(grip.pose.orientation, hands::grip_orientation(hand)) {
+                out.push(format!("{name} grip turned {:?}, expected {:?}", grip.pose.orientation, hands::grip_orientation(hand)));
             }
+            if grip.angular_velocity != [0.0; 3] {
+                out.push(format!("{name} grip angular velocity {:?}, expected none", grip.angular_velocity));
+            }
+            let Some(aim) = self.aim[hand] else {
+                out.push(format!("{name} hand has no aim pose"));
+                continue;
+            };
+            if !same_turn(aim.pose.orientation, hands::aim_orientation(hand)) {
+                out.push(format!("{name} aim turned {:?}, expected {:?}", aim.pose.orientation, hands::aim_orientation(hand)));
+            }
+            // The aim pose lies where the probe put it relative to the grip pose, and has its own velocities
+            let expected = hands::aim_with(hand, grip);
+            if !near(aim.pose.position, expected.pose.position) {
+                out.push(format!("{name} aim at {:?}, expected {:?}", aim.pose.position, expected.pose.position));
+            }
+            if !near(aim.linear_velocity, expected.linear_velocity) || !near(aim.angular_velocity, expected.angular_velocity) {
+                out.push(format!(
+                    "{name} aim moves {:?} and turns {:?}, expected {:?} and {:?}",
+                    aim.linear_velocity, aim.angular_velocity, expected.linear_velocity, expected.angular_velocity
+                ));
+            }
+        }
+        // The grip pose of the left hand is where the probe holds it. The host lifted it by the floor.
+        let lifted = |at: [f32; 3]| [at[0], at[1] + FLOOR_LIFT, at[2]];
+        if !near(self.grip[0].pose.position, lifted(hands::LEFT_AT)) {
+            out.push(format!("left grip at {:?}, expected {:?}", self.grip[0].pose.position, lifted(hands::LEFT_AT)));
+        }
+        let right_at = self.grip[1].pose.position;
+        if (right_at[1] - lifted(hands::RIGHT_AT)[1]).abs() > 1e-3 || (right_at[2] - hands::RIGHT_AT[2]).abs() > 1e-3 {
+            out.push(format!("right grip at {right_at:?}, expected y {} and z {}", lifted(hands::RIGHT_AT)[1], hands::RIGHT_AT[2]));
         }
         let x = self.reach[1][0];
         if x[1] - x[0] < 0.1 {
@@ -186,12 +257,17 @@ fn main() {
             }
         }
     }
-    let control = fs::read_to_string(control.expect("--control FILE")).expect("read the control file");
+    let control_path = control.expect("--control FILE");
+    let control = fs::read_to_string(&control_path).expect("read the control file");
     let fields: Vec<&str> = control.split_whitespace().collect();
     let port: u16 = fields[0].parse().expect("port");
     let token = fields[1];
     let (w, h): (u32, u32) = (fields[2].parse().unwrap(), fields[3].parse().unwrap());
 
+    // The runtime of cranvr's patch 0004 writes this file before it connects. Without it the host
+    // sends no aim poses, because a runtime without the patch drops the connection at the message.
+    let features = std::path::Path::new(&control_path).with_file_name("runtime-features.txt");
+    fs::write(&features, "aim\n").expect("write runtime-features.txt");
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the host");
     stream.set_nodelay(true).ok();
     let name = b"cranvr-fake-game";
@@ -230,10 +306,11 @@ fn main() {
                     FRAME_CONSUMED => {
                         consumed.send(u64_at(&p, 0)).ok();
                     }
-                    CONTROLLER_MOTION if p.len() == 16 + 13 * 4 => {
+                    CONTROLLER_MOTION | CONTROLLER_MOTION_AIM if p.len() == 16 + 13 * 4 * (1 + usize::from(kind == CONTROLLER_MOTION_AIM)) => {
                         let hand = u32::from_le_bytes(p[8..12].try_into().unwrap()) as usize;
-                        let values: [f32; 13] = std::array::from_fn(|i| f32_at(&p, 16 + i * 4));
-                        input.lock().unwrap().pose(hand.min(1), values);
+                        let values: Vec<f32> = (0..(p.len() - 16) / 4).map(|i| f32_at(&p, 16 + i * 4)).collect();
+                        let aim = (kind == CONTROLLER_MOTION_AIM).then(|| motion(&values[13..]));
+                        input.lock().unwrap().pose(hand.min(1), motion(&values[..13]), aim);
                     }
                     CONTROLLER_MASK if p.len() >= 12 => {
                         input.lock().unwrap().mask = Some(u32::from_le_bytes(p[8..12].try_into().unwrap()));
@@ -347,9 +424,21 @@ fn main() {
     println!("fake-game: {sent} frames sent, {done} consumed, {no_pose} waits for a first pose, {stalled} waits for a free image");
     let input = input.lock().unwrap();
     println!(
-        "fake-game: input: {} left and {} right poses (last left {:.3?}, last right {:.3?}), mask {:?}, profiles {:?}, {} input resets",
-        input.poses[0], input.poses[1], &input.last_pose[0][4..], &input.last_pose[1][4..], input.mask, input.profiles, input.resets
+        "fake-game: input: {} left and {} right poses, {} and {} of them with an aim pose, mask {:?}, profiles {:?}, {} input resets",
+        input.poses[0], input.poses[1], input.aim_poses[0], input.aim_poses[1], input.mask, input.profiles, input.resets
     );
+    for (hand, name) in ["left", "right"].into_iter().enumerate() {
+        let (grip, aim) = (&input.grip[hand], &input.aim[hand]);
+        println!(
+            "fake-game: input: last {name} grip at {:.3?} turned {:.3?}; aim at {:.3?} turned {:.3?}, moving {:.3?}, turning {:.3?}",
+            grip.pose.position,
+            grip.pose.orientation,
+            aim.map(|a| a.pose.position),
+            aim.map(|a| a.pose.orientation),
+            aim.map(|a| a.linear_velocity),
+            aim.map(|a| a.angular_velocity),
+        );
+    }
     println!("fake-game: input: {} button paths, buttons that changed: {:?}", input.buttons.len(), input.buttons.iter().filter(|(_, b)| b.1 > 0).map(|(id, b)| (id, b.0, b.1)).collect::<Vec<_>>());
     let problems = input.problems();
     for problem in &problems {

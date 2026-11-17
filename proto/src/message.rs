@@ -250,6 +250,9 @@ pub enum HostMsg {
 }
 
 /// Datagram messages from the client to the host.
+// A tracking sample is the large variant. A value lives for one datagram, and a box would allocate
+// on the path that sends a sample for every headset frame.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ClientDatagram {
     /// The first datagram on the UDP path
@@ -286,8 +289,18 @@ pub struct Tracking {
     /// of the client's display grid.
     pub display_time: Nanos,
     pub head: Motion,
-    pub left: Option<Motion>,
-    pub right: Option<Motion>,
+    /// The left hand's grip pose: the place of the hand that holds the controller. A game puts the
+    /// controller's model there. `None` while the headset does not track the controller.
+    pub left_grip: Option<Motion>,
+    /// The right hand's grip pose
+    pub right_grip: Option<Motion>,
+    /// The left controller's aim pose: where it points. A game casts its pointing ray from it. The
+    /// headset reports it next to the grip pose, so a hand with a grip pose has an aim pose too. A
+    /// client that has none leaves it `None`, and the host then gives a game the grip pose for both.
+    /// Both poses are the headset's own, with no offset. Version 3 added the two aim fields.
+    pub left_aim: Option<Motion>,
+    /// The right controller's aim pose
+    pub right_aim: Option<Motion>,
 }
 
 /// Bits of [`HandInput::buttons`] and [`HandInput::touches`].
