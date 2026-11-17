@@ -1153,7 +1153,7 @@ impl PanelControl {
         let knobs = self.shown_slots().map(|s| (s.id, s.panel)).chain(self.console.as_ref().map(|(p, _)| (CONSOLE_ID, *p)));
         for (id, panel) in knobs {
             let color = match knob_look(id) {
-                Look::Idle => [0.62, 0.64, 0.68, 1.0],
+                Look::Idle => [0.36, 0.38, 0.42, 1.0],
                 Look::Hover => [0.95, 0.96, 0.98, 1.0],
                 Look::Active => [0.45, 0.7, 1.0, 1.0],
             };
