@@ -3,7 +3,7 @@ use crate::headset::{FramePlan, FrameSlice};
 use cranvr_proto::{
     link::ClientLink,
     media::FrameReceiver,
-    message::{ClientCaps, Haptics, Recenter, Views},
+    message::{ClientCaps, FrameTiming, Haptics, Recenter, Views},
     wire::{Fov, Motion},
 };
 use std::{
@@ -153,8 +153,13 @@ fn the_display_grid_gives_the_next_refresh() {
     assert_eq!(grid_at_or_after(1000, 100, 1001), 1100);
     assert_eq!(grid_at_or_after(1000, 100, 1100), 1100);
     assert_eq!(grid_at_or_after(1000, 100, 1950), 2000);
-    // A time before the first known refresh waits for it
-    assert_eq!(grid_at_or_after(1000, 100, 400), 1000);
+    // The grid reaches back from the newest refresh: the display shows frames at those points too
+    assert_eq!(grid_at_or_after(1000, 100, 400), 400);
+    assert_eq!(grid_at_or_after(1000, 100, 401), 500);
+    assert_eq!(grid_at_or_after(1000, 100, 999), 1000);
+    assert_eq!(grid_at_or_after(1000, 100, 10), 100);
+    // A period that is not known leaves the later of the two
+    assert_eq!(grid_at_or_after(1000, 0, 400), 1000);
 }
 
 #[test]
@@ -292,8 +297,22 @@ fn a_native_client_connects_and_the_host_serves_it() {
     }
     // The hand lies at the room's origin, which the floor moves up. The hand offset lowers it by 5 mm.
     assert!((headset.motion_at(Device::LeftHand, sample, sample).unwrap().pose.position.y - 0.395).abs() < 1e-4);
+    // The headset reports the planned frame: it showed 20 ms after its arrival, and its compositor
+    // took it 17 ms before. The host then knows the display's grid and the lead.
+    let arrived = now_ns();
+    let timing = FrameTiming {
+        stream: 0,
+        frame: meta.frame,
+        tracking_sample: sample,
+        received: arrived,
+        decode_end: arrived + 2_000_000,
+        picked: arrived + 3_000_000,
+        display_time: arrived + 20_000_000,
+        next_display_time: arrived + 28_333_333,
+    };
     let mut seen = None;
     for _ in 0..20 {
+        client.duplex.send_datagram(&ClientDatagram::FrameTiming(timing)).unwrap();
         headset.send_frame(OutFrame {
             plan: None,
             sample_ns: sample,
@@ -312,6 +331,28 @@ fn a_native_client_connects_and_the_host_serves_it() {
     }
     let meta = seen.expect("a frame arrived after the floor");
     assert!((meta.eye_poses[0].position[1] - 1.6).abs() < 1e-4 && (meta.eye_poses[1].position[1] - 1.6).abs() < 1e-4);
+    // A frame that no plan started, such as a game's, aims for a display point at which the
+    // headset can show it: after the frame's arrival and after the headset's take, which comes one
+    // lead before the point. The report taught the host the lead of 17 ms. The first frames may
+    // come before the report, so the test sends more.
+    let mut target_ok = false;
+    for _ in 0..40 {
+        client.duplex.send_datagram(&ClientDatagram::FrameTiming(timing)).unwrap();
+        headset.send_frame(OutFrame {
+            plan: None,
+            sample_ns: sample,
+            idr: false,
+            eye_poses: Default::default(),
+            slices: vec![FrameSlice { rect: [0, 0, 2432, 1152], data: data.clone() }],
+        });
+        if let Ok(Heard::Frame(later, _)) = from_client.recv_timeout(Duration::from_millis(500)) {
+            if later.target_display >= later.sent + 17_000_000 {
+                target_ok = true;
+                break;
+            }
+        }
+    }
+    assert!(target_ok, "the target of an unplanned frame lies a lead after its arrival");
 
     // Haptics
     headset.send_haptics(Haptic { hand: 1, duration: Duration::from_millis(20), frequency: 160.0, amplitude: 0.5 });

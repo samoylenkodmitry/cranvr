@@ -524,13 +524,18 @@ struct Display {
     decode: f64,
 }
 
-/// The first point of the grid `start + k * period` that is at or after `t`.
-fn grid_at_or_after(start: Nanos, period: Nanos, t: Nanos) -> Nanos {
-    if t <= start || period == 0 {
-        start.max(t)
-    } else {
-        start + (t - start).div_ceil(period) * period
+/// The first point of the grid `origin + k * period` at or after `t`, for any whole `k`. The
+/// origin is the newest display time that the headset reported. It lies ahead of a frame that is
+/// quick, and the display shows frames at the points before it too. Taking the origin for every
+/// such frame gave frames that the host sent within one report's interval the same target, a
+/// point that the later frames could no longer make.
+fn grid_at_or_after(origin: Nanos, period: Nanos, t: Nanos) -> Nanos {
+    if period == 0 {
+        return origin.max(t);
     }
+    let (origin, period, t) = (i128::from(origin), i128::from(period), i128::from(t));
+    let steps = (t - origin + period - 1).div_euclid(period);
+    (origin + steps * period).max(0) as Nanos
 }
 
 /// Sums of what the client reported, since the last stats line.
