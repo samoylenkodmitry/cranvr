@@ -140,7 +140,7 @@ impl Shared {
     }
 }
 
-fn caps(tcp: bool) -> ClientCaps {
+fn caps(tcp: bool, identity: &cranvr_proto::identity::Identity) -> ClientCaps {
     let fov = Fov { left: -FRAC_PI_4, right: FRAC_PI_4, up: FRAC_PI_4, down: -FRAC_PI_4 };
     let eye = |x: f32| Pose { position: [x, 0.0, 0.0], ..Pose::IDENTITY };
     ClientCaps {
@@ -153,6 +153,7 @@ fn caps(tcp: bool) -> ClientCaps {
         decoders: 1,
         foveation: true,
         tcp_only: tcp,
+        public_key: identity.public_key(),
     }
 }
 
@@ -161,8 +162,11 @@ fn caps(tcp: bool) -> ClientCaps {
 pub fn run(o: Options) -> i32 {
     println!("probe: waiting for the host at {} (run cranvr-host --protocol native)", o.connect);
     let started = Instant::now();
+    // The probe runs on this Mac or against a host that trusts every client, so its key needs no
+    // pairing
+    let identity = cranvr_proto::identity::Identity::generate().expect("random numbers for the probe's key");
     let link = loop {
-        match ClientLink::connect(o.connect, &caps(o.tcp), Duration::from_secs(5)) {
+        match ClientLink::connect(o.connect, &caps(o.tcp, &identity), &identity, Duration::from_secs(5)) {
             Ok(link) => break link,
             // The host is not up yet, or not ready
             Err(Error::Io(_) | Error::Timeout | Error::Closed) if started.elapsed() < Duration::from_secs(60) => {
@@ -394,7 +398,14 @@ fn tracking_loop(shared: &Shared, period_ns: u64) {
             }
             sent.push_back((sample_time, head.pose));
         }
-        shared.link.duplex.send_datagram(&ClientDatagram::Tracking(Tracking { sample_time, head, left: Some(left), right: None })).ok();
+        shared.link.duplex.send_datagram(&ClientDatagram::Tracking(Tracking {
+                sample_time,
+                // The simulated display shows the frame two refreshes after the sample
+                display_time: sample_time + 2 * period_ns,
+                head,
+                left: Some(left),
+                right: None,
+            })).ok();
         // Squeeze the left grip for half a second every 3 seconds, as a game test may ask
         let squeeze = t % 3.0 > 2.5;
         if squeeze != squeezed {
@@ -523,6 +534,7 @@ fn decode_loop(
             tracking_sample: unit.meta.tracking_sample,
             received: unit.completed,
             decode_end,
+            picked: decode_end,
             display_time,
             next_display_time: display_time + period,
         };

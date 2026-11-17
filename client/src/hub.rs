@@ -11,7 +11,10 @@ use crate::{
 };
 use cranpose::{CropRect, DecodedFrames};
 use cranpose_xr::{FieldOfView, Haptics, HeadsetProperties, Pose as XrPose, StreamedView, StreamedViews};
-use cranvr_proto::wire::{Fov, Nanos, Pose};
+use cranvr_proto::{
+    clock::now_ns,
+    wire::{Fov, Nanos, Pose},
+};
 use std::{
     collections::VecDeque,
     sync::{
@@ -94,6 +97,12 @@ pub struct Stats {
     pub headset_gap_ms: f32,
     /// The newest head pose that the headset reported: x, y, z in meters
     pub head_position: Option<[f32; 3]>,
+    /// Of the frames that the headset took for its display, the share that showed at the display
+    /// time that the host aimed for, the share that showed after it and the share that showed
+    /// before it, in percent. Frames without a target do not count.
+    pub at_target_pct: f32,
+    pub late_pct: f32,
+    pub early_pct: f32,
     /// Whether the poses come from the headset or are placeholders (see `tracking.rs`)
     pub tracking_live: bool,
 }
@@ -124,6 +133,9 @@ impl Default for Stats {
             headset_fps: 0.0,
             headset_gap_ms: 0.0,
             head_position: None,
+            at_target_pct: 0.0,
+            late_pct: 0.0,
+            early_pct: 0.0,
             tracking_live: false,
         }
     }
@@ -179,6 +191,8 @@ pub struct Sent {
     pub received: Nanos,
     /// The frame went into the decoder
     pub submitted: Nanos,
+    /// The display time that the host aimed for, on the client's clock. 0 when the host gave none.
+    pub target_display: Nanos,
 }
 
 /// A frame that the headset took for its display.
@@ -191,6 +205,8 @@ pub struct Shown {
     pub display_time: Nanos,
     /// The time between two display frames
     pub period: Nanos,
+    /// When the compositor took the frame, on the client's clock
+    pub picked: Nanos,
 }
 
 /// The frames in the decoder and the frames that the headset took, in the order of arrival.
@@ -331,6 +347,7 @@ impl Hub {
                 decode_time: frames.stats().last_decode,
                 display_time: display.time,
                 period: display.period,
+                picked: now_ns(),
             });
         }
         sent.views

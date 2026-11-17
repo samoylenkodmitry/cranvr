@@ -12,6 +12,7 @@ mod headset;
 mod latency;
 mod network;
 mod pacer;
+mod pairing;
 mod pose_gaps;
 mod render;
 mod runtime_link;
@@ -109,13 +110,18 @@ impl Default for Views {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: cranvr-host [--protocol native|alvr, default alvr] [--native-port PORT] [--fps 72|80|90|120, default 120] [--eye-width PIXELS] [--mbps N] [--trust HOSTNAME]... [--trust-all] [--client-ip IP]... [--tcp] [--no-foveation] [--buffering-frames N] [--game-scale F] [--decoder-low-latency] [--strict-rate-control] [--no-game-audio] [--desktop] [--desktop-fps N] [--virtual-display WxH] [--vr-main-display] [--pointer-pitch DEG] [--screen-in-view] [--no-desktop-layer] [--config-dir DIR] [--status]\n\
+        "usage: cranvr-host [--protocol native|alvr, default alvr] [--native-port PORT] [--fps 72|80|90|120, default 120] [--eye-width PIXELS] [--mbps N] [--trust HOSTNAME]... [--trust-all] [--pair CODE] [--no-display-lock] [--client-ip IP]... [--tcp] [--no-foveation] [--buffering-frames N] [--game-scale F] [--decoder-low-latency] [--strict-rate-control] [--no-game-audio] [--desktop] [--desktop-fps N] [--virtual-display WxH] [--vr-main-display] [--pointer-pitch DEG] [--screen-in-view] [--no-desktop-layer] [--config-dir DIR] [--status]\n\
          \n  --protocol P      how the headset's app talks to the host: alvr (the stock ALVR client,\
          \n                    the default) or native (cranvr's own protocol and client). The\
          \n                    native mode has no game sound and no desktop layer yet.\
          \n  --native-port N   with --protocol native: the TCP port to listen on (default 9950)\
          \n  --trust HOSTNAME  accept this ALVR client (the hostname shows in the client's lobby)\
-         \n  --trust-all       accept any ALVR client on the network (for tests)\
+         \n  --trust-all       accept any client on the network, ALVR or native (for tests)\
+         \n  --pair CODE       with --protocol native: pair the headset that shows this code. The\
+         \n                    cranvr client shows a code of six digits when the host does not know it.\
+         \n                    The host remembers the headset in paired-headsets.txt.\
+         \n  --no-display-lock with --protocol native: render at the arrival of each pose, not at a\
+         \n                    time that follows the headset's display (for comparison)\
          \n  --client-ip IP    connect to a client at this address; 127.0.0.1 with `adb forward` of\
          \n                    TCP 9943 and 9944 reaches a client on a phone (needs --tcp)\
          \n  --tcp             stream over TCP instead of UDP (needed when the client runs on this Mac)\
@@ -161,6 +167,8 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
         mbps: 100,
         trust: vec![],
         trust_all: false,
+        pair_code: None,
+        display_lock: true,
         client_ips: vec![],
         tcp: false,
         foveation: true,
@@ -203,6 +211,13 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
             "--mbps" => options.mbps = value().parse().unwrap_or_else(|_| usage()),
             "--trust" => options.trust.push(value()),
             "--trust-all" => options.trust_all = true,
+            "--pair" => {
+                options.pair_code = Some(cranvr_proto::identity::parse_code(&value()).unwrap_or_else(|| {
+                    eprintln!("--pair takes the six digits that the headset shows");
+                    usage()
+                }))
+            }
+            "--no-display-lock" => options.display_lock = false,
             "--client-ip" => options.client_ips.push(value().parse().unwrap_or_else(|_| usage())),
             "--tcp" => options.tcp = true,
             "--no-foveation" => options.foveation = false,
@@ -302,11 +317,15 @@ fn raise_file_limit() {
 }
 
 /// What the native protocol takes from the command line.
-fn native_config(options: &Options) -> headset::native::Config {
+fn native_config(options: &Options, config_dir: &std::path::Path) -> headset::native::Config {
+    if !options.trust.is_empty() {
+        warn!("--trust does not count for the native protocol: pair the headset with --pair CODE");
+    }
     headset::native::Config {
         port: options.native_port,
-        trust: options.trust.clone(),
+        pairings: Arc::new(pairing::Pairings::load(config_dir, options.pair_code)),
         trust_all: options.trust_all,
+        display_lock: options.display_lock,
         tcp_media: options.tcp,
         wishes: HostWishes {
             eye_width: options.eye_width,
@@ -355,8 +374,8 @@ fn main() {
         options.mbps,
         config_dir.display()
     );
-    if options.trust_all && alvr {
-        warn!("--trust-all: any ALVR client on this network can connect");
+    if options.trust_all {
+        warn!("--trust-all: any client on this network can connect");
     }
 
     // The virtual display lives as long as this variable: to the end of main
@@ -377,7 +396,7 @@ fn main() {
 
     let (headset, mut events) = match options.protocol {
         Protocol::Alvr => headset::alvr::start(layout.session()),
-        Protocol::Native => headset::native::start(native_config(&options)).unwrap_or_else(|e| {
+        Protocol::Native => headset::native::start(native_config(&options, &config_dir)).unwrap_or_else(|e| {
             error!("Native protocol: cannot listen on port {}: {e}", options.native_port);
             std::process::exit(1)
         }),
@@ -578,6 +597,8 @@ struct FrameNote {
     eye_poses: [alvr_common::Pose; 2],
     /// The encoded frame's size
     rect: [u32; 4],
+    /// The plan that the frame followed
+    plan: Option<headset::FramePlan>,
 }
 
 /// Notes of frames that the encoder has not returned yet. The encoder holds at most
@@ -606,7 +627,7 @@ impl FrameNote {
                 return note;
             }
         }
-        FrameNote { sample, eye_poses: Default::default(), rect: [0; 4] }
+        FrameNote { sample, eye_poses: Default::default(), rect: [0; 4], plan: None }
     }
 }
 
@@ -782,6 +803,7 @@ fn frame_loop(
                     }
                     let note = FrameNote::take(&notes, frame.timestamp_ns);
                     headset.send_frame(OutFrame {
+                        plan: note.plan,
                         sample_ns: frame.timestamp_ns,
                         idr: frame.is_idr,
                         eye_poses: note.eye_poses,
@@ -813,9 +835,15 @@ fn frame_loop(
     let (mut no_sample, mut no_buffer, mut busy, mut dropped, mut missing) = (0u32, 0u32, 0u32, 0u32, 0u32);
 
     loop {
-        // While a game runs its frames set the pace; otherwise the headset's vsync does.
+        // While a game runs its frames set the pace. Otherwise the display lock plans the frame,
+        // when the link has one: the frame starts at a time that makes it reach the headset's
+        // display on its grid. Without a plan the headset's vsync sets the pace.
+        let planned = if game.active() { None } else { headset.frame_plan() };
+        let planned_at = Instant::now();
         let wait = if game.active() {
             GAME_IDLE
+        } else if let Some(plan) = &planned {
+            plan.start_in
         } else {
             headset.until_next_vsync().unwrap_or(Duration::from_millis(5))
         };
@@ -834,12 +862,18 @@ fn frame_loop(
                 // Without a game the host's own scene draws as soon as a pose arrives: waiting
                 // for the next vsync would add up to a frame between the pose and the picture.
                 // The pacer keeps it to the headset's refresh rate.
+                // A planned frame starts at its planned time, not at the arrival of a pose.
+                if planned.is_some() && game_frame.is_none() {
+                    continue;
+                }
                 if game_frame.is_none() && (game.active() || !pose || !pacer.ready()) {
                     continue;
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                if game.active() || !pacer.ready() {
+                // The plan holds the frame to the display's grid, so the pacer's budget does not
+                // refuse it.
+                if game.active() || (planned.is_none() && !pacer.ready()) {
                     continue;
                 }
             }
@@ -903,21 +937,39 @@ fn frame_loop(
             }
             None => shared.latest_sample_ns.load(Ordering::Relaxed),
         };
+        // A planned frame that cannot go out waits a moment, so the loop does not spin
+        let retry_later = || {
+            if planned.is_some() {
+                thread::sleep(Duration::from_micros(500));
+            }
+        };
         // The client shows each frame for its own tracking sample, so a sample is sent once.
         if sample == 0 || sample == last_sample {
             give_back(&game_frame);
             no_sample += 1;
+            retry_later();
             continue;
         }
         if enc.in_flight() >= MAX_IN_FLIGHT {
             give_back(&game_frame);
             busy += 1;
+            retry_later();
             continue;
         }
         let Some(buffer) = enc.pixel_buffer() else {
             give_back(&game_frame);
             no_buffer += 1;
+            retry_later();
             continue;
+        };
+        if let Some(plan) = &planned {
+            // The time that the wait took beyond the plan's start
+            headset.frame_started(plan.target, planned_at.elapsed().saturating_sub(plan.start_in));
+        }
+        // The pose of a device for this frame: at the plan's target when the frame follows a plan
+        let motion_of = |device: Device| match &planned {
+            Some(plan) => headset.motion_at(device, sample, plan.target),
+            None => headset.motion(device, sample),
         };
         let gpu_start = Instant::now();
 
@@ -970,7 +1022,7 @@ fn frame_loop(
                     ..Default::default()
                 };
                 params.set_foveation(foveation.as_ref());
-                let head = headset.motion(Device::Head, sample);
+                let head = motion_of(Device::Head);
                 if let Some(head) = &head {
                     params.head_q = head.pose.orientation.to_array();
                     let p = head.pose.position;
@@ -980,7 +1032,7 @@ fn frame_loop(
                 // cranvr's Quest app draws the controllers itself while it shows the layer
                 let layer = shared.layer.active.load(Ordering::Relaxed);
                 for (i, device) in [Device::LeftHand, Device::RightHand].into_iter().enumerate() {
-                    if let Some(hand) = headset.motion(device, sample) {
+                    if let Some(hand) = motion_of(device) {
                         let p = hand.pose.position;
                         if !layer {
                             params.ctl[i] = [p.x, p.y, p.z, 1.0];
@@ -1056,12 +1108,12 @@ fn frame_loop(
             bitrate: new_bitrate.take(),
         };
         let eye_poses = if headset.wants_eye_poses() {
-            let head = headset.motion(Device::Head, sample).map(|m| m.pose).unwrap_or_default();
+            let head = motion_of(Device::Head).map(|m| m.pose).unwrap_or_default();
             headset::eye_poses(&head, views.eye_q, views.eye_p)
         } else {
             Default::default()
         };
-        FrameNote::push(&notes, FrameNote { sample, eye_poses, rect: [0, 0, eye_w * 2, eye_h] });
+        FrameNote::push(&notes, FrameNote { sample, eye_poses, rect: [0, 0, eye_w * 2, eye_h], plan: planned });
         match jobs.try_send(job) {
             Ok(()) => {
                 headset.frame_submitted(sample);

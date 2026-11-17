@@ -1,5 +1,5 @@
 use super::*;
-use crate::headset::FrameSlice;
+use crate::headset::{FramePlan, FrameSlice};
 use cranvr_proto::{
     link::ClientLink,
     media::FrameReceiver,
@@ -22,14 +22,20 @@ fn caps(name: &str) -> ClientCaps {
         decoders: 1,
         foveation: true,
         tcp_only: false,
+        public_key: identity().public_key(),
     }
+}
+
+fn identity() -> cranvr_proto::identity::Identity {
+    cranvr_proto::identity::Identity::from_seed([5; 32])
 }
 
 fn config(port: u16) -> Config {
     Config {
         port,
-        trust: vec![],
+        pairings: Arc::new(crate::pairing::Pairings::load(&std::env::temp_dir().join(format!("cranvr-native-test-{port}")), None)),
         trust_all: false,
+        display_lock: true,
         tcp_media: false,
         wishes: HostWishes {
             eye_width: 2064,
@@ -52,7 +58,8 @@ fn free_port() -> u16 {
 fn tracking(sample: u64, x: f32) -> Tracking {
     Tracking {
         sample_time: sample,
-        head: Motion { pose: ProtoPose { position: [x, 1.6, 0.0], ..ProtoPose::IDENTITY }, ..Default::default() },
+        display_time: sample + 18_000_000,
+        head: Motion { pose: ProtoPose { position: [x, 1.6, 0.0], ..ProtoPose::IDENTITY }, linear_velocity: [1.0, 0.0, 0.0], ..Default::default() },
         left: Some(Motion::default()),
         right: None,
     }
@@ -131,7 +138,7 @@ fn the_display_grid_gives_the_next_refresh() {
 fn a_native_client_connects_and_the_host_serves_it() {
     let port = free_port();
     let (headset, mut events) = start(config(port)).unwrap();
-    let client = ClientLink::connect(([127, 0, 0, 1], port).into(), &caps("Test headset"), Duration::from_secs(10)).unwrap();
+    let client = ClientLink::connect(([127, 0, 0, 1], port).into(), &caps("Test headset"), &identity(), Duration::from_secs(10)).unwrap();
     let client = Arc::new(client);
 
     let Event::Connected { stream: Some(stream), ip } = wait_for(&mut *events, |e| matches!(e, Event::Connected { .. })) else { unreachable!() };
@@ -184,6 +191,17 @@ fn a_native_client_connects_and_the_host_serves_it() {
     assert_eq!(head.pose.position.x, 0.5);
     assert!(headset.motion(Device::LeftHand, sample).is_some());
     assert!(headset.motion(Device::RightHand, sample).is_none());
+    // The pose moves by its velocity to a later display time: 30 ms at 1 m/s are 3 cm. The sample
+    // is valid at its own display time, so a target at that time changes nothing. A target before
+    // it does not move the pose back.
+    let valid_at = sample + 18_000_000;
+    let later = headset.motion_at(Device::Head, sample, valid_at + 30_000_000).unwrap();
+    assert!((later.pose.position.x - 0.53).abs() < 1e-4, "{}", later.pose.position.x);
+    assert_eq!(headset.motion_at(Device::Head, sample, valid_at).unwrap().pose.position.x, 0.5);
+    assert_eq!(headset.motion_at(Device::Head, sample, valid_at - 5_000_000).unwrap().pose.position.x, 0.5);
+    // A target far away is cut at the limit of 80 ms
+    let far = headset.motion_at(Device::Head, sample, valid_at + 900_000_000).unwrap();
+    assert!((far.pose.position.x - 0.58).abs() < 1e-4);
 
     // The host answers a ping and sends its own, so both sides can estimate the clock offset
     client.duplex.send_datagram(&ClientDatagram::Ping(Ping { id: 9, sent: 1234 })).unwrap();
@@ -213,6 +231,7 @@ fn a_native_client_connects_and_the_host_serves_it() {
     let mut seen = None;
     for _ in 0..20 {
         headset.send_frame(OutFrame {
+            plan: Some(FramePlan { start_in: Duration::ZERO, target: 7_000_000_000, start: 6_990_000_000 }),
             sample_ns: sample,
             idr: true,
             eye_poses: [
@@ -237,6 +256,8 @@ fn a_native_client_connects_and_the_host_serves_it() {
     assert_eq!(meta.eye_poses[1].position, [0.532, 1.6, -0.25]);
     assert_eq!(meta.eye_poses[0].orientation, Quat::from_rotation_y(0.5).to_array());
     assert!(meta.sent > 0);
+    // The frame carries the target of its plan
+    assert_eq!(meta.target_display, 7_000_000_000);
 
     // Haptics
     headset.send_haptics(Haptic { hand: 1, duration: Duration::from_millis(20), frequency: 160.0, amplitude: 0.5 });
@@ -262,14 +283,14 @@ fn a_second_headset_gets_busy_and_the_host_takes_the_next_one() {
     let port = free_port();
     let (_headset, mut events) = start(config(port)).unwrap();
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    let first = ClientLink::connect(addr, &caps("First"), Duration::from_secs(10)).unwrap();
+    let first = ClientLink::connect(addr, &caps("First"), &identity(), Duration::from_secs(10)).unwrap();
     wait_for(&mut *events, |e| matches!(e, Event::Connected { .. }));
-    let second = ClientLink::connect(addr, &caps("Second"), Duration::from_secs(10));
+    let second = ClientLink::connect(addr, &caps("Second"), &identity(), Duration::from_secs(10));
     assert!(matches!(second, Err(cranvr_proto::Error::Rejected(RejectReason::Busy))), "{:?}", second.err());
     first.duplex.close();
     wait_for(&mut *events, |e| matches!(e, Event::Disconnected));
     // The host takes the next client
-    let third = ClientLink::connect(addr, &caps("Third"), Duration::from_secs(10)).unwrap();
+    let third = ClientLink::connect(addr, &caps("Third"), &identity(), Duration::from_secs(10)).unwrap();
     wait_for(&mut *events, |e| matches!(e, Event::Connected { .. }));
     third.duplex.close();
 }

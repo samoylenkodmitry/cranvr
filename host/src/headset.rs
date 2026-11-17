@@ -18,6 +18,7 @@ use serde_json::Value;
 use std::{net::IpAddr, sync::mpsc::RecvTimeoutError, time::Duration};
 
 pub mod alvr;
+pub mod display_lock;
 pub mod native;
 
 /// The protocol between the host and the headset's app.
@@ -80,8 +81,21 @@ pub struct FrameSlice {
     pub data: Vec<u8>,
 }
 
+/// When the next frame should start and which display time it aims for (see `display_lock.rs`).
+#[derive(Clone, Copy, Debug)]
+pub struct FramePlan {
+    /// The time until the frame should start. Zero when it is due.
+    pub start_in: Duration,
+    /// The headset's display time that the frame aims for, on the headset's clock
+    pub target: u64,
+    /// The planned start, on the headset's clock
+    pub start: u64,
+}
+
 /// An encoded frame and what the headset needs to show it.
 pub struct OutFrame {
+    /// The plan that the frame followed, when the link locks its frames to the display
+    pub plan: Option<FramePlan>,
     /// The tracking sample that the frame was rendered for
     pub sample_ns: u64,
     pub idr: bool,
@@ -96,6 +110,23 @@ pub trait Headset: Send + Sync {
 
     /// The pose of a device at a tracking sample.
     fn motion(&self, device: Device, sample_ns: u64) -> Option<DeviceMotion>;
+
+    /// The pose of a device at a tracking sample, moved by its velocities to the headset's display
+    /// time `target`. A link without a display clock gives the pose of the sample.
+    fn motion_at(&self, device: Device, sample_ns: u64, _target: u64) -> Option<DeviceMotion> {
+        self.motion(device, sample_ns)
+    }
+
+    /// Where the next frame of the host's own scene should start so that it reaches the headset's
+    /// display on its grid. `None` when the link does not lock its frames to the display, or does
+    /// not know the display yet. The frame loop then renders at the arrival of a pose.
+    fn frame_plan(&self) -> Option<FramePlan> {
+        None
+    }
+
+    /// The frame loop takes the plan with this target and renders. `late` is how long after the
+    /// planned start it began.
+    fn frame_started(&self, _target: u64, _late: Duration) {}
 
     /// The share of a frame's budget that the pacer needs before it draws a frame for a new pose
     /// (see `Pacer::with_ready`). A client that sends several poses per refresh keeps the default.
