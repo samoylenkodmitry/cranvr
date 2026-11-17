@@ -1,6 +1,6 @@
 //! cranvr-host: streams to a Quest through the stock ALVR client (v20.14.1). It shows a game
 //! when the BasaltVR OpenXR runtime inside Wine connects (see runtime_link.rs), and a
-//! head-tracked test scene otherwise.
+//! head-tracked test scene otherwise. The headset's link sits behind the interface in headset.rs.
 
 mod compat;
 mod desktop;
@@ -8,6 +8,7 @@ mod desktop_layer;
 mod display_modes;
 mod game_audio;
 mod game_sizes;
+mod headset;
 mod latency;
 mod network;
 mod pacer;
@@ -19,21 +20,18 @@ mod session;
 mod status;
 mod virtual_display;
 
-use alvr_common::{
-    error, info, warn, HAND_LEFT_ID, HAND_RIGHT_ID, HEAD_ID, RIGHT_THUMBSTICK_CLICK_ID, RIGHT_THUMBSTICK_Y_ID,
-    RIGHT_TRIGGER_VALUE_ID,
-};
+use alvr_common::{error, info, warn, RIGHT_THUMBSTICK_CLICK_ID, RIGHT_THUMBSTICK_Y_ID, RIGHT_TRIGGER_VALUE_ID};
 use alvr_filesystem::Layout;
-use alvr_packets::{ButtonValue, Haptics};
-use alvr_server_core::{ServerCoreContext, ServerCoreEvent};
-use alvr_session::CodecType;
 use cranvr_common::foveation::Foveation;
+use cranvr_proto::wire::Codec;
 use cranvr_vt::{EncodedFrame, Encoder, EncoderConfig, PixelBuffer};
+use headset::{Device, Event, FrameSlice, Headset, OutFrame};
 use render::{ComposeParams, Params, Renderer};
 use runtime_link::{GameEvent, GameFrame, RuntimeLink, Swapchains};
 use serde_json::json;
 use session::{Negotiated, Options};
 use std::{
+    collections::VecDeque,
     env,
     path::PathBuf,
     sync::{
@@ -295,8 +293,6 @@ fn main() {
 
     alvr_server_core::initialize_environment(layout.clone());
     alvr_server_core::init_logging(None, Some(layout.crash_log()));
-    latency::start();
-    compat::start();
     if options.game_audio {
         start_game_audio();
     }
@@ -327,8 +323,7 @@ fn main() {
         }
     }
 
-    let (context, events) = ServerCoreContext::new();
-    let context = Arc::new(context);
+    let (headset, mut events) = headset::alvr::start(layout.session());
     let shared = Arc::new(Shared {
         stream: Mutex::new(None),
         latest_sample_ns: AtomicU64::new(0),
@@ -338,42 +333,36 @@ fn main() {
         layer: Arc::default(),
         desktop_display: std::sync::atomic::AtomicU32::new(0),
     });
-    context.start_connection();
 
     let (link, game_events) = {
-        let context = Arc::clone(&context);
-        let on_haptic = move |h: runtime_link::Haptic| {
-            let device_id = if h.hand == 0 { *HAND_LEFT_ID } else { *HAND_RIGHT_ID };
-            context.send_haptics(Haptics { device_id, duration: h.duration, frequency: h.frequency, amplitude: h.amplitude });
-        };
+        let headset = Arc::clone(&headset);
+        let on_haptic = move |h: runtime_link::Haptic| headset.send_haptics(h);
         let control_file = config_dir.join("runtime-control.txt");
         RuntimeLink::start(&control_file, runtime_link::MAX_VIEW, options.fps as u32, on_haptic).expect("runtime control socket")
     };
     info!("Game runtime control file: {}", link.control_file().display());
 
     {
-        let context = Arc::clone(&context);
+        let headset = Arc::clone(&headset);
         let shared = Arc::clone(&shared);
         let link = Arc::clone(&link);
         thread::Builder::new()
             .name("frames".into())
-            .spawn(move || frame_loop(context, shared, link, game_events, (options.mbps, options.strict_rate, options.unscale_displays), desktop))
+            .spawn(move || frame_loop(headset, shared, link, game_events, (options.mbps, options.strict_rate, options.unscale_displays), desktop))
             .unwrap();
     }
 
-    let session_path = layout.session();
     let mut watch = network::StreamWatch::default();
     let mut layer_stop = Arc::new(AtomicBool::new(false));
     loop {
-        let event = match events.recv_timeout(Duration::from_millis(50)) {
+        let event = match events.next(Duration::from_millis(50)) {
             Ok(event) => event,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
         match event {
-            ServerCoreEvent::ClientConnected => {
+            Event::Connected { stream: negotiated, ip: client_ip } => {
                 watch.connected();
-                let client_ip = network::client_ip(&session_path);
                 layer_stop.store(true, Ordering::Relaxed);
                 layer_stop = Arc::new(AtomicBool::new(false));
                 let display = shared.desktop_display.load(Ordering::Relaxed);
@@ -385,10 +374,9 @@ fn main() {
                     warn!("{}", problem["message"].as_str().unwrap_or_default());
                     status::emit(problem);
                 }
-                let negotiated = session::read_negotiated(&session_path);
                 match &negotiated {
-                    Some(n) if n.codec == CodecType::Hevc as u64 => info!("Headset connected: {n:?}"),
-                    Some(n) => error!("Headset connected with codec {}, but this host only encodes HEVC", n.codec),
+                    Some(n) if n.codec == Codec::Hevc => info!("Headset connected: {n:?}"),
+                    Some(n) => error!("Headset connected with codec {:?}, but this host only encodes HEVC", n.codec),
                     None => error!("Headset connected, but session.json has no stream config"),
                 }
                 if let Some(n) = &negotiated {
@@ -399,10 +387,10 @@ fn main() {
                         warn!("Game runtime control file: {e}");
                     }
                 }
-                *shared.stream.lock().unwrap() = negotiated.filter(|n| n.codec == CodecType::Hevc as u64);
+                *shared.stream.lock().unwrap() = negotiated.filter(|n| n.codec == Codec::Hevc);
                 shared.force_idr.store(true, Ordering::Relaxed);
             }
-            ServerCoreEvent::ClientDisconnected => {
+            Event::Disconnected => {
                 info!("Headset disconnected");
                 layer_stop.store(true, Ordering::Relaxed);
                 if let Some(display) = virtual_display.as_mut().filter(|d| d.is_main()) {
@@ -419,8 +407,7 @@ fn main() {
                 *shared.stream.lock().unwrap() = None;
                 shared.latest_sample_ns.store(0, Ordering::Relaxed);
             }
-            ServerCoreEvent::Tracking { sample_timestamp } => {
-                let ns = sample_timestamp.as_nanos() as u64;
+            Event::Tracking { sample_ns: ns } => {
                 shared.latest_sample_ns.store(ns, Ordering::Relaxed);
                 pose_gaps::record();
                 watch.pose();
@@ -441,12 +428,12 @@ fn main() {
                 }
                 link.new_pose();
                 if link.is_connected() {
-                    if let Some(head) = context.get_device_motion(*HEAD_ID, sample_timestamp) {
+                    if let Some(head) = headset.motion(Device::Head, ns) {
                         link.head_pose(ns, &head);
                     }
                     let mut mask = 0;
-                    for (hand, id) in [*HAND_LEFT_ID, *HAND_RIGHT_ID].into_iter().enumerate() {
-                        if let Some(motion) = context.get_device_motion(id, sample_timestamp) {
+                    for (hand, device) in [Device::LeftHand, Device::RightHand].into_iter().enumerate() {
+                        if let Some(motion) = headset.motion(device, ns) {
                             link.controller(ns, hand as u32, &motion);
                             mask |= 1 << hand;
                         }
@@ -454,7 +441,7 @@ fn main() {
                     link.controller_mask(ns, mask);
                 }
             }
-            ServerCoreEvent::ViewsConfig(config) => {
+            Event::Views(config) => {
                 let mut views = shared.views.lock().unwrap();
                 let mut angles = [[0.0; 4]; 2];
                 for e in 0..2 {
@@ -475,32 +462,26 @@ fn main() {
                 );
                 link.set_view_config(ipd, angles);
             }
-            ServerCoreEvent::Buttons(entries) => {
+            Event::Buttons(buttons) => {
                 let mut inputs = shared.inputs.lock().unwrap();
-                for entry in entries {
-                    let value = match entry.value {
-                        ButtonValue::Binary(on) => on as u32 as f32,
-                        ButtonValue::Scalar(v) => v,
-                    };
-                    if entry.path_id == *RIGHT_TRIGGER_VALUE_ID {
+                for button in buttons {
+                    let value = button.value;
+                    if button.path_id == *RIGHT_TRIGGER_VALUE_ID {
                         inputs.right_trigger = value;
-                    } else if entry.path_id == *RIGHT_THUMBSTICK_Y_ID {
+                    } else if button.path_id == *RIGHT_THUMBSTICK_Y_ID {
                         inputs.right_stick_y = value;
-                    } else if entry.path_id == *RIGHT_THUMBSTICK_CLICK_ID && value > 0.5 {
+                    } else if button.path_id == *RIGHT_THUMBSTICK_CLICK_ID && value > 0.5 {
                         inputs.recenter = true;
                     }
-                    match entry.value {
-                        ButtonValue::Binary(on) => link.button(entry.path_id, false, on as u32 as f32),
-                        ButtonValue::Scalar(v) => link.button(entry.path_id, true, v),
-                    }
+                    link.button(button.path_id, button.scalar, value);
                 }
             }
-            ServerCoreEvent::RequestIDR => shared.force_idr.store(true, Ordering::Relaxed),
-            ServerCoreEvent::ShutdownPending | ServerCoreEvent::RestartPending => {
-                info!("ALVR asked the host to stop");
+            Event::RequestIdr => shared.force_idr.store(true, Ordering::Relaxed),
+            Event::Stop => {
+                info!("The headset link asked the host to stop");
                 break;
             }
-            _ => (),
+            Event::Other => {}
         }
     }
 }
@@ -527,6 +508,44 @@ fn encode_loop(jobs: mpsc::Receiver<EncodeJob>) {
         if let Err(e) = job.encoder.encode(&job.buffer, job.index, job.sample, job.idr) {
             error!("Encode: {e}");
         }
+    }
+}
+
+/// What the headset needs to show a frame, besides the encoder's output.
+struct FrameNote {
+    sample: u64,
+    eye_poses: [alvr_common::Pose; 2],
+    /// The encoded frame's size
+    rect: [u32; 4],
+}
+
+/// Notes of frames that the encoder has not returned yet. The encoder holds at most
+/// `MAX_IN_FLIGHT` frames. A frame that it drops leaves its note behind, so the list has a bound.
+const MAX_NOTES: usize = 16;
+
+impl FrameNote {
+    fn push(notes: &Mutex<VecDeque<FrameNote>>, note: FrameNote) {
+        let mut notes = notes.lock().unwrap();
+        if notes.len() >= MAX_NOTES {
+            notes.pop_front();
+        }
+        notes.push_back(note);
+    }
+
+    /// Forgets the note of a frame that the encoder refused.
+    fn cancel(notes: &Mutex<VecDeque<FrameNote>>, sample: u64) {
+        notes.lock().unwrap().retain(|n| n.sample != sample);
+    }
+
+    /// The note of the frame with this sample. Older notes belong to frames that never came back.
+    fn take(notes: &Mutex<VecDeque<FrameNote>>, sample: u64) -> FrameNote {
+        let mut notes = notes.lock().unwrap();
+        while let Some(note) = notes.pop_front() {
+            if note.sample == sample {
+                return note;
+            }
+        }
+        FrameNote { sample, eye_poses: Default::default(), rect: [0; 4] }
     }
 }
 
@@ -636,7 +655,7 @@ impl Game {
 /// Encodes one frame per game frame while a game runs, and one test scene frame per headset
 /// frame otherwise.
 fn frame_loop(
-    context: Arc<ServerCoreContext>,
+    headset: Arc<dyn Headset>,
     shared: Arc<Shared>,
     link: Arc<RuntimeLink>,
     game_events: mpsc::Receiver<GameEvent>,
@@ -678,8 +697,13 @@ fn frame_loop(
     // Encoder time of the frames encoded since the last stats line, and their count
     let encoder_time_us = Arc::new(AtomicU64::new(0));
     let encoded_frames = Arc::new(AtomicU64::new(0));
+    // What the video-send thread needs to know about each frame besides the encoder's output. The
+    // frame loop notes it when it hands the frame to the encoder. The thread takes it by the
+    // frame's tracking sample.
+    let notes = Arc::new(Mutex::new(VecDeque::<FrameNote>::new()));
     {
-        let context = Arc::clone(&context);
+        let headset = Arc::clone(&headset);
+        let notes = Arc::clone(&notes);
         let (encoder_time_us, encoded_frames) = (Arc::clone(&encoder_time_us), Arc::clone(&encoded_frames));
         thread::Builder::new()
             .name("video-send".into())
@@ -691,11 +715,17 @@ fn frame_loop(
                     encoded_frames.fetch_add(1, Ordering::Relaxed);
                     if let Some(config) = frame.config_nals {
                         if last_config.as_ref() != Some(&config) {
-                            context.set_video_config_nals(config.clone(), CodecType::Hevc);
+                            headset.set_decoder_config(config.clone());
                             last_config = Some(config);
                         }
                     }
-                    context.send_video_nal(Duration::from_nanos(frame.timestamp_ns), frame.data, frame.is_idr);
+                    let note = FrameNote::take(&notes, frame.timestamp_ns);
+                    headset.send_frame(OutFrame {
+                        sample_ns: frame.timestamp_ns,
+                        idr: frame.is_idr,
+                        eye_poses: note.eye_poses,
+                        slices: vec![FrameSlice { rect: note.rect, data: frame.data }],
+                    });
                 }
             })
             .unwrap();
@@ -726,7 +756,7 @@ fn frame_loop(
         let wait = if game.active() {
             GAME_IDLE
         } else {
-            context.duration_until_next_vsync().unwrap_or(Duration::from_millis(5))
+            headset.until_next_vsync().unwrap_or(Duration::from_millis(5))
         };
         let mut game_frame = None;
         match game_events.recv_timeout(wait) {
@@ -828,7 +858,6 @@ fn frame_loop(
             no_buffer += 1;
             continue;
         };
-        let timestamp = Duration::from_nanos(sample);
         let gpu_start = Instant::now();
 
         // A connected game hides the desktop, also while it loads and sends no frames
@@ -880,7 +909,7 @@ fn frame_loop(
                     ..Default::default()
                 };
                 params.set_foveation(foveation.as_ref());
-                let head = context.get_device_motion(*HEAD_ID, timestamp);
+                let head = headset.motion(Device::Head, sample);
                 if let Some(head) = &head {
                     params.head_q = head.pose.orientation.to_array();
                     let p = head.pose.position;
@@ -889,8 +918,8 @@ fn frame_loop(
                 let mut right_hand = None;
                 // cranvr's Quest app draws the controllers itself while it shows the layer
                 let layer = shared.layer.active.load(Ordering::Relaxed);
-                for (i, id) in [*HAND_LEFT_ID, *HAND_RIGHT_ID].into_iter().enumerate() {
-                    if let Some(hand) = context.get_device_motion(id, timestamp) {
+                for (i, device) in [Device::LeftHand, Device::RightHand].into_iter().enumerate() {
+                    if let Some(hand) = headset.motion(device, sample) {
                         let p = hand.pose.position;
                         if !layer {
                             params.ctl[i] = [p.x, p.y, p.z, 1.0];
@@ -951,8 +980,7 @@ fn frame_loop(
             pacer.spend();
         }
 
-        if let Some(p) = context.get_dynamic_encoder_params() {
-            let b = p.bitrate_bps as u64;
+        if let Some(b) = headset.bitrate_bps() {
             if b > 0 && b != bitrate {
                 bitrate = b;
                 new_bitrate = Some(b);
@@ -966,15 +994,22 @@ fn frame_loop(
             idr: shared.force_idr.swap(false, Ordering::Relaxed),
             bitrate: new_bitrate.take(),
         };
+        let eye_poses = if headset.wants_eye_poses() {
+            let head = headset.motion(Device::Head, sample).map(|m| m.pose).unwrap_or_default();
+            headset::eye_poses(&head, views.eye_q, views.eye_p)
+        } else {
+            Default::default()
+        };
+        FrameNote::push(&notes, FrameNote { sample, eye_poses, rect: [0, 0, eye_w * 2, eye_h] });
         match jobs.try_send(job) {
             Ok(()) => {
-                context.report_present(timestamp, Duration::ZERO);
-                context.report_composed(timestamp, Duration::ZERO);
+                headset.frame_submitted(sample);
                 frame_index += 1;
                 count += 1;
                 game_count += game_frame.is_some() as u32;
             }
             Err(mpsc::TrySendError::Full(job)) => {
+                FrameNote::cancel(&notes, sample);
                 busy += 1;
                 if job.idr {
                     shared.force_idr.store(true, Ordering::Relaxed);
@@ -997,7 +1032,7 @@ fn frame_loop(
             let n = count.max(1) as f64;
             let encoded = encoded_frames.swap(0, Ordering::Relaxed).max(1) as f64;
             let encode_ms = encoder_time_us.swap(0, Ordering::Relaxed) as f64 / 1000.0 / encoded;
-            let latency = latency::take();
+            let latency = headset.take_stats();
             if let Some(l) = &latency {
                 info!("Headset latency (ms, average of {} reports): {}", l["frames"], l);
             }

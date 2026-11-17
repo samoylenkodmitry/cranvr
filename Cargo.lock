@@ -1892,6 +1892,7 @@ dependencies = [
  "alvr_session",
  "block2 0.6.2",
  "cranvr-common",
+ "cranvr-proto",
  "cranvr-vt",
  "dispatch2",
  "objc2 0.6.5",
