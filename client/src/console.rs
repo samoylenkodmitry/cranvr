@@ -182,7 +182,7 @@ impl Default for Place {
 
 /// How long the left menu button must stay down to show or hide the console. A shorter press goes
 /// to the game only: games use the button for their own menu.
-pub const HOLD_NS: u64 = 600_000_000;
+pub const HOLD_NS: u64 = 800_000_000;
 
 /// What the UI draws of the console.
 #[derive(Clone, Debug, PartialEq)]
