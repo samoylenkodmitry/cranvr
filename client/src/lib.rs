@@ -1,9 +1,9 @@
 //! cranvr's client for headsets, as a Cranpose app. In a Quest its panels stand in the room. The
-//! stream is a surface that the hardware decoder writes into. Elsewhere the panels draw flat.
+//! game's picture is a streamed scene under them. Elsewhere the panels draw flat.
 //!
 //! The app uses Cranpose's public API and plain Rust crates. The protocol is `cranvr-proto`.
 //! `connection.rs` runs the link on its own threads. `hub.rs` hands the results to the UI.
-//! `tracking.rs` is the seam for the headset's per-frame data.
+//! `tracking.rs` turns the headset's frames into the tracking that the host takes.
 
 // The app has no unsafe code. The Android entry points that `android_main!` expands to carry
 // their own expectation of this lint.

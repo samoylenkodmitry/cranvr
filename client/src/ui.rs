@@ -1,23 +1,32 @@
-//! The app's composables: the connect panel, the stream surface and the stats panel.
+//! The app's composables: the connect panel, the stats panel, the streamed scene and the frame
+//! effect that feeds the host with the headset's tracking.
 //!
 //! In a headset each panel is a layer of the compositor and a controller's trigger presses its
-//! buttons. In a flat window the panels draw side by side. Every composable here is plain
-//! Cranpose. The state that the network threads produce arrives as a [`Snapshot`], which a
-//! `LaunchedEffect` copies into Cranpose state a few times a second.
+//! buttons. The game's picture is a streamed scene under the panels. In a flat window the panels
+//! draw side by side. Every composable here is plain Cranpose. The state that the network threads
+//! produce arrives as a [`Snapshot`], which a `LaunchedEffect` copies into Cranpose state a few
+//! times a second.
 
 use crate::{
     hub::{hub, DecoderView, LinkState, Snapshot, Stats},
     settings,
 };
+use crate::tracking::FrameReader;
 use cranpose::prelude::*;
 use cranpose::text::{FontWeight, TextUnit};
+use cranpose::DecodedFrames;
 use cranpose_xr::{
-    local_spatial_capabilities, SpatialExternalSurface, SpatialPanel, StereoMode, Subspace, SubspaceModifier,
+    local_haptics, local_headset_properties, local_spatial_capabilities, SpatialFrameEffect, SpatialPanel, StreamedScene,
+    Subspace, SubspaceModifier,
 };
-use std::time::Duration;
+use cranvr_proto::clock::now_ns;
+use std::{cell::RefCell, rc::Rc, time::Duration};
 
 /// How often the UI copies the link's numbers into its state
 const POLL: Duration = Duration::from_millis(250);
+/// How often the UI looks for a new decoder. The decoder drops pictures that nobody takes, so the
+/// streamed scene must start soon after the decoder does.
+const STREAM_POLL: Duration = Duration::from_millis(16);
 
 const PANEL_COLOR: Color = Color(0.09, 0.1, 0.13, 0.96);
 const FIELD_COLOR: Color = Color(0.16, 0.18, 0.23, 1.0);
@@ -30,30 +39,42 @@ const BAD_COLOR: Color = Color(0.95, 0.42, 0.4, 1.0);
 const ACCENT_COLOR: Color = Color(0.25, 0.45, 0.95, 1.0);
 const STOP_COLOR: Color = Color(0.75, 0.3, 0.3, 1.0);
 
-// One eye's image of the Quest 3 is nearly square, and the stream shows each eye on its own
-// layer. The surface takes the eye's proportions: 1680 by 1760 pixels. In a headset one dp is a
-// millimeter, so the stream is 92 centimeters wide, a meter in front of the viewer.
-const STREAM_SIZE: [f32; 2] = [920.0, 964.0];
 // The side panels stand on a circle of about a meter around the viewer, at 47 degrees to the left
 // and to the right of the stream, and face the viewer.
 const SIDE_OFFSET: [f32; 3] = [760.0, 0.0, 300.0];
 const SIDE_TURN: f32 = 45.0;
 
-/// The app. In a headset it shows the stream in front of the viewer, the connect panel to the left
-/// and the stats panel to the right.
+/// The app. In a headset it shows the game's picture around the viewer, the connect panel to the
+/// left and the stats panel to the right.
 #[composable]
 pub fn ClientApp() {
+    // The connection reads what the headset is from the hub. The values do not change in a
+    // session, so this runs before any panel can start a connection.
+    hub().attach(local_headset_properties().current(), local_haptics().current());
     let snapshot = rememberMutableStateOf(|| hub().snapshot());
     LaunchedEffect((), async move |_| loop {
         snapshot.set(hub().snapshot());
         delay(POLL).await;
     });
+    let frames = rememberMutableStateOf(|| None::<DecodedFrames>);
+    LaunchedEffect((), async move |_| {
+        let mut seen = None;
+        loop {
+            let (generation, current) = hub().stream();
+            if seen != Some(generation) {
+                seen = Some(generation);
+                frames.set(current);
+            }
+            delay(STREAM_POLL).await;
+        }
+    });
     Subspace(move || {
-        // A flat window shows the panels in this order, side by side. The stream's surface is
-        // empty there, so it comes last. In a headset each panel has its own place.
+        HeadsetFrames();
+        // A flat window shows the panels in this order, side by side. In a headset each panel has
+        // its own place.
         ConnectPanel(snapshot);
         StatsPanel(snapshot);
-        StreamSurface();
+        Stream(frames);
     });
 }
 
@@ -69,18 +90,25 @@ fn text_style(size: f32, color: Color, weight: Option<FontWeight>) -> TextStyle 
     }
 }
 
-/// The surface that the hardware decoder writes into. Each eye sees its half of the picture. The
-/// decoder starts when the compositor makes the surface and lets go of it before the surface ends.
+/// Hands each frame of the headset to the sender of the tracking. The callback runs on the frame
+/// loop once for each headset frame. It does no network call: the sender thread wakes and sends.
 #[composable]
-fn StreamSurface() {
-    SpatialExternalSurface(
-        StereoMode::SideBySide,
-        SubspaceModifier::new().size(STREAM_SIZE[0], STREAM_SIZE[1]).offset(0.0, 60.0, 0.0).movable(),
-        |scope| {
-            scope.on_surface_created(|surface| hub().surface_created(surface));
-            scope.on_surface_destroyed(|_| hub().surface_destroyed());
-        },
-    );
+fn HeadsetFrames() {
+    let reader = remember(|| Rc::new(RefCell::new(FrameReader::default()))).with(Clone::clone);
+    SpatialFrameEffect(move |frame| {
+        let read = reader.borrow_mut().read(frame, now_ns());
+        hub().feed.push(read);
+    });
+}
+
+/// The game's picture. The decoder outputs frames. The headset's compositor shows each one from
+/// the pose that the host rendered it for. It corrects the picture for the head's newer pose.
+#[composable]
+fn Stream(frames: MutableState<Option<DecodedFrames>>) {
+    if let Some(frames) = frames.get() {
+        let source = frames.clone();
+        StreamedScene(frames, move |metadata| hub().views_of(&source, metadata));
+    }
 }
 
 /// What the user presses on the keypad.
@@ -321,7 +349,7 @@ fn stat_lines(snap: &Snapshot) -> Vec<(&'static str, String, Color)> {
         if stats.tracking_live {
             "from the headset".to_string()
         } else {
-            "placeholder: the pose is not from the headset yet".to_string()
+            "placeholder values: no frames from a headset".to_string()
         },
         if stats.tracking_live { GOOD_COLOR } else { WARN_COLOR },
     ));
@@ -341,15 +369,15 @@ fn fps_color(fps: f32, target: f32) -> Color {
 
 fn frames_text(stats: &Stats, target_hz: f32) -> String {
     format!(
-        "{:.1} fps decoded of {:.0}, {:.1} fps received, {:.1} Mbps",
-        stats.decoded_fps, target_hz, stats.received_fps, stats.received_mbps
+        "{:.1} fps decoded of {:.0}, {:.1} fps shown of {:.1} headset frames, {:.1} fps received, {:.1} Mbps",
+        stats.decoded_fps, target_hz, stats.shown_fps, stats.headset_fps, stats.received_fps, stats.received_mbps
     )
 }
 
 fn decoder_text(stats: &Stats) -> (String, Color) {
     match &stats.decoder {
         DecoderView::Idle => ("waiting for the stream".into(), MUTED_COLOR),
-        DecoderView::NoSurface => ("none: this window has no headset surface to decode into".into(), WARN_COLOR),
+        DecoderView::NoHeadset => ("none: this window is not a headset, so nothing decodes".into(), WARN_COLOR),
         DecoderView::Failed(message) => (message.clone(), BAD_COLOR),
         DecoderView::Running => (
             format!(

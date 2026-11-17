@@ -3,7 +3,7 @@ use crate::headset::FrameSlice;
 use cranvr_proto::{
     link::ClientLink,
     media::FrameReceiver,
-    message::{ClientCaps, Haptics, Views},
+    message::{ClientCaps, Haptics, Recenter, Views},
     wire::{Fov, Motion},
 };
 use std::{
@@ -33,6 +33,7 @@ fn config(port: u16) -> Config {
         tcp_media: false,
         wishes: HostWishes {
             eye_width: 2064,
+            eye_width_unfoveated: 0,
             refresh_hz: 120.0,
             bitrate_bps: 100_000_000,
             codecs: vec![Codec::Hevc],
@@ -245,6 +246,10 @@ fn a_native_client_connects_and_the_host_serves_it() {
             break;
         }
     }
+
+    // A recenter of the headset reaches the frame loop as an event
+    client.duplex.send_control(&ClientMsg::Recenter(Recenter { change_time: now_ns(), origin: None })).unwrap();
+    wait_for(&mut *events, |e| matches!(e, Event::Recenter));
 
     // A client that leaves ends the session
     client.duplex.send_control(&ClientMsg::Bye).unwrap();

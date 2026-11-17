@@ -260,6 +260,14 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
         Incoming::Control(ClientMsg::RequestKeyFrame { .. }) => shared.emit(Event::RequestIdr),
         Incoming::Control(ClientMsg::Views(v)) => shared.emit(Event::Views(views_config(&v))),
         Incoming::Control(ClientMsg::Bye) => session.stop(),
+        Incoming::Control(ClientMsg::Recenter(recenter)) => {
+            let ahead_ms = session.clock.lock().unwrap().to_local(recenter.change_time).map(|at| (at as i64 - now as i64) as f64 / 1e6);
+            info!(
+                "Native protocol: the headset recentered, the new origin takes effect {} from now",
+                ahead_ms.map_or("at an unknown time".to_string(), |ms| format!("{ms:.1} ms"))
+            );
+            shared.emit(Event::Recenter);
+        }
         Incoming::Control(ClientMsg::Hello(_)) => {}
     }
 }

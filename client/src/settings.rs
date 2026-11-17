@@ -34,6 +34,14 @@ pub fn connect_on_launch() -> bool {
     launch_args().boolean("connect").unwrap_or(false)
 }
 
+/// How long the sender holds each tracking sample before it sends it, from the launch argument
+/// `hold_ms`. The default is 0. A hold moves the frames' arrival to the middle of the headset's
+/// frame interval, so fewer arrive in pairs. See the README.
+pub fn tracking_hold() -> std::time::Duration {
+    let ms = launch_args().string("hold_ms").and_then(|text| text.parse::<f64>().ok()).unwrap_or(0.0);
+    std::time::Duration::from_secs_f64(ms.max(0.0) / 1000.0)
+}
+
 /// How the media should travel, from the launch argument `media` (`udp` or `tcp`).
 pub fn media_choice() -> MediaChoice {
     match launch_args().string("media") {

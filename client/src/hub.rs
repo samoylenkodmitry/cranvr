@@ -2,18 +2,21 @@
 //!
 //! Cranpose state belongs to the UI thread. The network and decoder threads write into plain
 //! structures behind mutexes in this file. A `LaunchedEffect` of the UI copies a [`Snapshot`] into
-//! Cranpose state a few times a second. The surface that the headset's compositor makes for the
-//! stream also passes through here, from the UI thread to the decoder thread.
+//! Cranpose state a few times a second. The decoder's frames, the headset's properties and haptics
+//! and the table of the streamed frames' views also pass through here.
 
 use crate::{
     connection::Connection,
     tracking::Feed,
 };
-use cranpose::ExternalSurface;
+use cranpose::{CropRect, DecodedFrames};
+use cranpose_xr::{FieldOfView, Haptics, HeadsetProperties, Pose as XrPose, StreamedView, StreamedViews};
+use cranvr_proto::wire::{Fov, Nanos, Pose};
 use std::{
+    collections::VecDeque,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Condvar, Mutex, OnceLock,
+        Mutex, OnceLock,
     },
     time::Duration,
 };
@@ -45,8 +48,9 @@ pub struct StreamInfo {
 pub enum DecoderView {
     /// No stream yet
     Idle,
-    /// The stream runs and no surface exists to decode into. This is the case in a flat window.
-    NoSurface,
+    /// The stream runs and the app is not in a headset, so nothing decodes. This is the case in a
+    /// flat window.
+    NoHeadset,
     /// The decoder could not start
     Failed(String),
     Running,
@@ -82,6 +86,14 @@ pub struct Stats {
     /// The tracking sample to the end of the decode, averaged
     pub sample_to_decode_ms: Option<f32>,
     pub haptic_pulses: u64,
+    /// Frames that the headset took for its display, per second
+    pub shown_fps: f32,
+    /// The headset's own frames a second. `headset_gap_ms` is the longest gap between two of them
+    /// in a stats interval
+    pub headset_fps: f32,
+    pub headset_gap_ms: f32,
+    /// The newest head pose that the headset reported: x, y, z in meters
+    pub head_position: Option<[f32; 3]>,
     /// Whether the poses come from the headset or are placeholders (see `tracking.rs`)
     pub tracking_live: bool,
 }
@@ -108,6 +120,10 @@ impl Default for Stats {
             network_ms: None,
             sample_to_decode_ms: None,
             haptic_pulses: 0,
+            shown_fps: 0.0,
+            headset_fps: 0.0,
+            headset_gap_ms: 0.0,
+            head_position: None,
             tracking_live: false,
         }
     }
@@ -136,24 +152,65 @@ pub enum MediaChoice {
     Tcp,
 }
 
-/// The surface of the stream and how many decoders write into it.
+/// The decoded frames of the running session and a counter that changes with them
 #[derive(Default)]
-struct SurfaceSlot {
-    surface: Option<ExternalSurface>,
-    /// Counts each creation and destruction, so the decoder thread sees a change
+struct StreamSlot {
+    frames: Option<DecodedFrames>,
+    /// Counts each change, so the UI sees a new decoder
     generation: u64,
-    /// The decoders that hold the surface. A new session may start its decoder while the last
-    /// one still lets go of the surface, so this is a count.
-    holders: usize,
 }
 
-/// How long the destruction of the surface waits for the decoder to let go of it.
-const RELEASE_WAIT: Duration = Duration::from_secs(1);
+/// What the headset reports once for the session
+#[derive(Clone)]
+pub struct HeadsetInfo {
+    pub properties: HeadsetProperties,
+    pub haptics: Option<Haptics>,
+}
+
+/// A frame that went into the decoder, with what the headset needs to show and time it.
+#[derive(Clone, Copy, Debug)]
+pub struct Sent {
+    /// The decoder returns this number with the frame
+    pub metadata: u64,
+    pub views: StreamedViews,
+    pub frame: u32,
+    pub tracking_sample: Nanos,
+    /// The last packet of the frame arrived
+    pub received: Nanos,
+    /// The frame went into the decoder
+    pub submitted: Nanos,
+}
+
+/// A frame that the headset took for its display.
+#[derive(Clone, Copy, Debug)]
+pub struct Shown {
+    pub sent: Sent,
+    /// The decoder's time for the newest picture when the headset took it
+    pub decode_time: Duration,
+    /// When the headset's display shows the frame, on the client's clock
+    pub display_time: Nanos,
+    /// The time between two display frames
+    pub period: Nanos,
+}
+
+/// The frames in the decoder and the frames that the headset took, in the order of arrival.
+#[derive(Default)]
+struct StreamTable {
+    sent: VecDeque<Sent>,
+    shown: VecDeque<Shown>,
+}
+
+/// The frames that the table keeps. The decoder holds a few, so this is far more than needed.
+const TABLE_LEN: usize = 128;
 
 pub struct Hub {
     snapshot: Mutex<Snapshot>,
-    slot: Mutex<SurfaceSlot>,
-    released: Condvar,
+    headset: Mutex<Option<HeadsetInfo>>,
+    stream: Mutex<StreamSlot>,
+    table: Mutex<StreamTable>,
+    /// The numbers that frames carry through the decoder. They never repeat in a process, so a
+    /// frame of an earlier session finds no entry in the table of a later one.
+    next_metadata: AtomicU64,
     pub feed: Feed,
     /// The id of the connection whose reports count. 0 means none.
     current: AtomicU64,
@@ -166,8 +223,10 @@ pub fn hub() -> &'static Hub {
     static HUB: OnceLock<Hub> = OnceLock::new();
     HUB.get_or_init(|| Hub {
         snapshot: Mutex::new(Snapshot::idle()),
-        slot: Mutex::new(SurfaceSlot::default()),
-        released: Condvar::new(),
+        headset: Mutex::new(None),
+        stream: Mutex::new(StreamSlot::default()),
+        table: Mutex::new(StreamTable::default()),
+        next_metadata: AtomicU64::new(1),
         feed: Feed::default(),
         current: AtomicU64::new(0),
         last_id: AtomicU64::new(0),
@@ -207,43 +266,113 @@ impl Hub {
         }
     }
 
-    /// The compositor made the surface for the stream. Called on the UI thread.
-    pub fn surface_created(&self, surface: ExternalSurface) {
-        let mut slot = self.slot.lock().unwrap();
-        slot.surface = Some(surface);
+    /// Tells the hub what the headset is. Both are `None` outside a headset. Called on the UI
+    /// thread when the app composes.
+    pub fn attach(&self, properties: Option<HeadsetProperties>, haptics: Option<Haptics>) {
+        *self.headset.lock().unwrap() = properties.map(|properties| HeadsetInfo { properties, haptics });
+    }
+
+    pub fn headset(&self) -> Option<HeadsetInfo> {
+        self.headset.lock().unwrap().clone()
+    }
+
+    /// Hands the decoder's frames to the UI, which gives them to the streamed scene.
+    pub(crate) fn set_stream(&self, frames: DecodedFrames) {
+        let mut slot = self.stream.lock().unwrap();
+        slot.frames = Some(frames);
         slot.generation += 1;
     }
 
-    /// The surface goes away. The decoder must let go of it before this returns, so the call
-    /// waits for the decoder thread, which sees the change within a few milliseconds.
-    pub fn surface_destroyed(&self) {
-        let mut slot = self.slot.lock().unwrap();
-        slot.surface = None;
-        slot.generation += 1;
-        let (slot, timeout) = self.released.wait_timeout_while(slot, RELEASE_WAIT, |slot| slot.holders > 0).unwrap();
-        if timeout.timed_out() {
-            log::warn!("the decoder did not let go of the stream surface within {RELEASE_WAIT:?}");
+    /// Takes the frames of a decoder back from the UI. A newer decoder may have replaced them
+    /// already, as when a new session starts while the last one ends. Its frames then stay.
+    pub(crate) fn clear_stream(&self, frames: &DecodedFrames) {
+        let mut slot = self.stream.lock().unwrap();
+        if slot.frames.as_ref() == Some(frames) {
+            slot.frames = None;
+            slot.generation += 1;
         }
-        drop(slot);
     }
 
-    /// The current surface and its generation, for the decoder thread.
-    pub(crate) fn surface(&self) -> (u64, Option<ExternalSurface>) {
-        let slot = self.slot.lock().unwrap();
-        (slot.generation, slot.surface.clone())
+    /// The decoder's frames and the count of changes
+    pub fn stream(&self) -> (u64, Option<DecodedFrames>) {
+        let slot = self.stream.lock().unwrap();
+        (slot.generation, slot.frames.clone())
     }
 
-    /// A decoder starts to write into the surface.
-    pub(crate) fn surface_taken(&self) {
-        self.slot.lock().unwrap().holders += 1;
+    /// A number for the next frame that goes into a decoder
+    pub(crate) fn new_metadata(&self) -> u64 {
+        self.next_metadata.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// A decoder let go of the surface.
-    pub(crate) fn surface_released(&self) {
-        let mut slot = self.slot.lock().unwrap();
-        slot.holders = slot.holders.saturating_sub(1);
-        if slot.holders == 0 {
-            self.released.notify_all();
+    /// Notes a frame that goes into the decoder, before the decoder can return it.
+    pub(crate) fn frame_sent(&self, sent: Sent) {
+        let mut table = self.table.lock().unwrap();
+        if table.sent.len() >= TABLE_LEN {
+            table.sent.pop_front();
         }
+        table.sent.push_back(sent);
+    }
+
+    /// The views of the frame that carries `metadata`. The headset's frame loop calls this once
+    /// for each frame that it takes for its display, so the call also says that the frame reaches
+    /// the display at the display time of the frame that is in work. `frames` are the decoder's.
+    pub fn views_of(&self, frames: &DecodedFrames, metadata: u64) -> StreamedViews {
+        let mut table = self.table.lock().unwrap();
+        let Some(sent) = table.sent.iter().rev().find(|sent| sent.metadata == metadata).copied() else {
+            // A frame that the table lost has views that the headset refuses and logs
+            return StreamedViews { left: NO_VIEW, right: NO_VIEW };
+        };
+        if let Some(display) = self.feed.display() {
+            if table.shown.len() >= TABLE_LEN {
+                table.shown.pop_front();
+            }
+            table.shown.push_back(Shown {
+                sent,
+                decode_time: frames.stats().last_decode,
+                display_time: display.time,
+                period: display.period,
+            });
+        }
+        sent.views
+    }
+
+    /// The frames that the headset took since the last call
+    pub(crate) fn take_shown(&self) -> Vec<Shown> {
+        self.table.lock().unwrap().shown.drain(..).collect()
+    }
+}
+
+/// A view that the headset refuses, because its picture has no area
+const NO_VIEW: StreamedView = StreamedView {
+    pose: XrPose::IDENTITY,
+    fov: FieldOfView { angle_left: 0.0, angle_right: 0.0, angle_up: 0.0, angle_down: 0.0 },
+    rect: CropRect { x: 0, y: 0, width: 0, height: 0 },
+};
+
+/// The views of a frame from the render poses that the host sent with it. `eye` is one eye's
+/// image size in pixels. The two eyes lie side by side in the picture. `fov` is what the host
+/// renders with. The poses are in the headset's room.
+pub fn streamed_views(eye_poses: &[Pose; 2], fov: &[Fov; 2], eye: [u32; 2]) -> StreamedViews {
+    let view = |i: usize| StreamedView {
+        pose: XrPose { position: eye_poses[i].position, orientation: eye_poses[i].orientation },
+        fov: FieldOfView { angle_left: fov[i].left, angle_right: fov[i].right, angle_up: fov[i].up, angle_down: fov[i].down },
+        rect: CropRect { x: eye[0] * i as u32, y: 0, width: eye[0], height: eye[1] },
+    };
+    StreamedViews { left: view(0), right: view(1) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_two_eyes_lie_side_by_side_in_the_picture() {
+        let poses = [Pose { position: [-0.03, 1.0, 0.0], ..Pose::IDENTITY }, Pose { position: [0.03, 1.0, 0.0], ..Pose::IDENTITY }];
+        let fov = Fov { left: -0.8, right: 0.7, up: 0.75, down: -0.9 };
+        let views = streamed_views(&poses, &[fov, fov], [1248, 1306]);
+        assert_eq!(views.left.rect, CropRect { x: 0, y: 0, width: 1248, height: 1306 });
+        assert_eq!(views.right.rect, CropRect { x: 1248, y: 0, width: 1248, height: 1306 });
+        assert_eq!(views.right.pose.position, [0.03, 1.0, 0.0]);
+        assert_eq!((views.left.fov.angle_left, views.left.fov.angle_down), (-0.8, -0.9));
     }
 }

@@ -10,7 +10,7 @@ use cranvr_proto::{
     link::{ClientLink, HostLink, HostListener, Incoming, MediaMode},
     media::{FrameReceiver, DEFAULT_SHARD_LEN},
     message::*,
-    wire::{Codec, Error},
+    wire::{Codec, Error, Pose},
     PROTOCOL_VERSION,
 };
 use std::{
@@ -26,6 +26,7 @@ const WAIT: Duration = Duration::from_secs(10);
 fn wishes() -> HostWishes {
     HostWishes {
         eye_width: 2064,
+        eye_width_unfoveated: 1248,
         refresh_hz: 120.0,
         bitrate_bps: 100_000_000,
         codecs: vec![Codec::Av1, Codec::Hevc],
@@ -93,6 +94,9 @@ fn control_messages_cross_in_both_directions() {
     }
     client.duplex.send_control(&ClientMsg::RequestKeyFrame { stream: 0, frame: 17 }).unwrap();
     assert_eq!(host_inbox.recv_timeout(WAIT).unwrap(), ClientMsg::RequestKeyFrame { stream: 0, frame: 17 });
+    let recenter = ClientMsg::Recenter(Recenter { change_time: 5_000_000, origin: Some(Pose { position: [0.5, 0.0, -0.25], ..Pose::IDENTITY }) });
+    client.duplex.send_control(&recenter).unwrap();
+    assert_eq!(host_inbox.recv_timeout(WAIT).unwrap(), recenter);
     let config = HostMsg::DecoderConfig { stream: 0, codec: Codec::Hevc, config: vec![0, 0, 0, 1, 0x40, 1, 2, 3] };
     host.duplex.send_control(&config).unwrap();
     assert_eq!(client_inbox.recv_timeout(WAIT).unwrap(), config);
@@ -300,5 +304,16 @@ fn the_host_picks_the_nearest_rate_and_keeps_the_aspect() {
     assert_eq!(negotiate(&w, &caps()).unwrap().eye_size, [1000, 1070]);
     c = caps();
     c.foveation = false;
-    assert!(negotiate(&wishes(), &c).unwrap().foveation.is_none());
+    let stream = negotiate(&wishes(), &c).unwrap();
+    assert!(stream.foveation.is_none());
+    // A client that takes no foveation gets the smaller eye of the host's own choice
+    assert_eq!(stream.eye_size[0], 1248);
+    // Unless the user chose a width, which holds for every client
+    let mut w = wishes();
+    w.eye_width_unfoveated = 0;
+    assert_eq!(negotiate(&w, &c).unwrap().eye_size[0], 2064);
+    // A host that wishes no foveation keeps its width for every client
+    let mut w = wishes();
+    w.foveation = None;
+    assert_eq!(negotiate(&w, &c).unwrap().eye_size[0], 2064);
 }
