@@ -116,8 +116,7 @@ impl Input {
         if !self.profiles[0] || !self.profiles[1] {
             out.push("no interaction profile for a hand".into());
         }
-        for hand in 0..2 {
-            let q = self.last_pose[hand];
+        for (hand, q) in self.last_pose.iter().enumerate() {
             let forward = Quat::from_xyzw(q[0], q[1], q[2], q[3]) * Vec3::NEG_Z;
             if (forward.y + 15f32.to_radians().sin()).abs() > 0.02 {
                 out.push(format!("hand {hand} points {forward:?}, expected 15 degrees down"));
