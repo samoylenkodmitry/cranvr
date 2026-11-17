@@ -107,7 +107,7 @@ fn HeadsetFrames() {
 fn Stream(frames: MutableState<Option<DecodedFrames>>) {
     if let Some(frames) = frames.get() {
         let source = frames.clone();
-        StreamedScene(frames, move |metadata| hub().views_of(&source, metadata));
+        StreamedScene(frames, move |metadata| hub().views_of(&source, metadata), hub().stream_stats.clone());
     }
 }
 
@@ -328,9 +328,10 @@ fn stat_lines(snap: &Snapshot) -> Vec<(&'static str, String, Color)> {
     lines.push((
         "Stream",
         format!(
-            "{}x{} per eye, {} at {} Hz, {} media, {:.0} Mbps asked",
+            "{}x{} per eye{}, {} at {} Hz, {} media, {:.0} Mbps asked",
             stream.eye[0],
             stream.eye[1],
+            if stream.foveated { format!(", foveated into frames of {}x{}", stream.picture[0], stream.picture[1]) } else { String::new() },
             stream.codec,
             stream.refresh_hz,
             if stream.udp { "UDP" } else { "TCP" },
@@ -374,8 +375,8 @@ fn fps_color(fps: f32, target: f32) -> Color {
 
 fn frames_text(stats: &Stats, target_hz: f32) -> String {
     format!(
-        "{:.1} fps decoded of {:.0}, {:.1} fps shown of {:.1} headset frames, {:.1} fps received, {:.1} Mbps",
-        stats.decoded_fps, target_hz, stats.shown_fps, stats.headset_fps, stats.received_fps, stats.received_mbps
+        "{:.1} fps decoded of {:.0}, {:.1} received, {:.1} Mbps. The scene showed {:.1} a second, skipped {:.1} and repeated {:.1} of {:.1} headset frames",
+        stats.decoded_fps, target_hz, stats.received_fps, stats.received_mbps, stats.shown_fps, stats.skipped_fps, stats.repeated_fps, stats.headset_fps
     )
 }
 

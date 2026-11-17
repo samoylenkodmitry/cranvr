@@ -7,12 +7,16 @@
 
 use crate::{
     connection::Connection,
-    tracking::Feed,
+    tracking::{Display, Feed},
 };
 use cranpose::{CropRect, DecodedFrames};
-use cranpose_xr::{FieldOfView, Haptics, HeadsetProperties, Pose as XrPose, StreamedView, StreamedViews};
+use cranpose_xr::{
+    FieldOfView, FoveatedEncoding, Haptics, HeadsetProperties, Pose as XrPose, StreamStats, StreamedView, StreamedViews,
+};
+use cranvr_common::foveation::{Foveation, FoveationConfig};
 use cranvr_proto::{
     clock::now_ns,
+    message::FoveationParams,
     wire::{Fov, Nanos, Pose},
 };
 use std::{
@@ -41,6 +45,8 @@ pub struct StreamInfo {
     /// The decoded picture: both eyes side by side
     pub picture: [u32; 2],
     pub codec: String,
+    /// Whether the host foveates its pictures: the decoded frame holds the compressed layout
+    pub foveated: bool,
     pub refresh_hz: f32,
     pub target_mbps: f32,
     pub udp: bool,
@@ -89,20 +95,20 @@ pub struct Stats {
     /// The tracking sample to the end of the decode, averaged
     pub sample_to_decode_ms: Option<f32>,
     pub haptic_pulses: u64,
-    /// Frames that the headset took for its display, per second
+    /// What the streamed scene did with the decoded frames, per second: frames that it showed,
+    /// frames that it never showed. The last is headset frames that showed the last picture again
     pub shown_fps: f32,
+    pub skipped_fps: f32,
+    pub repeated_fps: f32,
     /// The headset's own frames a second. `headset_gap_ms` is the longest gap between two of them
     /// in a stats interval
     pub headset_fps: f32,
     pub headset_gap_ms: f32,
     /// The newest head pose that the headset reported: x, y, z in meters
     pub head_position: Option<[f32; 3]>,
-    /// Of the frames that the headset took for its display, the share that showed at the display
-    /// time that the host aimed for, the share that showed after it and the share that showed
-    /// before it, in percent. Frames without a target do not count.
-    pub at_target_pct: f32,
+    /// The share of the frames with a target that came after the headset frame of their own point,
+    /// in percent
     pub late_pct: f32,
-    pub early_pct: f32,
     /// Whether the poses come from the headset or are placeholders (see `tracking.rs`)
     pub tracking_live: bool,
 }
@@ -130,12 +136,12 @@ impl Default for Stats {
             sample_to_decode_ms: None,
             haptic_pulses: 0,
             shown_fps: 0.0,
+            skipped_fps: 0.0,
+            repeated_fps: 0.0,
             headset_fps: 0.0,
             headset_gap_ms: 0.0,
             head_position: None,
-            at_target_pct: 0.0,
             late_pct: 0.0,
-            early_pct: 0.0,
             tracking_live: false,
         }
     }
@@ -195,18 +201,27 @@ pub struct Sent {
     pub target_display: Nanos,
 }
 
-/// A frame that the headset took for its display.
+/// A frame that the headset's frame loop took out of the decoder. The streamed scene keeps up to
+/// three taken frames in a queue and shows the one whose target lies closest to the display time.
+/// The app is told when a frame enters the queue and not when it shows, so the display time is the
+/// one that the frame will have if it is not late for its target.
 #[derive(Clone, Copy, Debug)]
 pub struct Shown {
     pub sent: Sent,
-    /// The decoder's time for the newest picture when the headset took it
+    /// The decoder's time for the newest picture when the headset took the frame
     pub decode_time: Duration,
-    /// When the headset's display shows the frame, on the client's clock
+    /// When the headset's display shows the frame: the display time closest to its target, but not
+    /// before the display time of the headset frame that took it. A frame with no target shows at
+    /// the display time of that headset frame.
     pub display_time: Nanos,
     /// The time between two display frames
     pub period: Nanos,
-    /// When the compositor took the frame, on the client's clock
+    /// When the frame loop took the frame, or would have taken it for its own point if the frame
+    /// came early: the display time minus the time from the take to the display of the headset
+    /// frame
     pub picked: Nanos,
+    /// Whether the frame came after the headset frame of its own point
+    pub late: bool,
 }
 
 /// The frames in the decoder and the frames that the headset took, in the order of arrival.
@@ -228,6 +243,8 @@ pub struct Hub {
     /// frame of an earlier session finds no entry in the table of a later one.
     next_metadata: AtomicU64,
     pub feed: Feed,
+    /// What the streamed scene did with the frames: shown, skipped and repeated
+    pub stream_stats: StreamStats,
     /// The id of the connection whose reports count. 0 means none.
     current: AtomicU64,
     last_id: AtomicU64,
@@ -244,6 +261,7 @@ pub fn hub() -> &'static Hub {
         table: Mutex::new(StreamTable::default()),
         next_metadata: AtomicU64::new(1),
         feed: Feed::default(),
+        stream_stats: StreamStats::new(),
         current: AtomicU64::new(0),
         last_id: AtomicU64::new(0),
         connection: Mutex::new(None),
@@ -330,27 +348,37 @@ impl Hub {
     }
 
     /// The views of the frame that carries `metadata`. The headset's frame loop calls this once
-    /// for each frame that it takes for its display, so the call also says that the frame reaches
-    /// the display at the display time of the frame that is in work. `frames` are the decoder's.
+    /// for each decoded frame that it takes into its queue, at the start of a headset frame.
+    /// `frames` are the decoder's.
+    ///
+    /// The views carry the host's target display time on the runtime's clock, so the scene shows
+    /// the frame at its point. The call also gives the frame's timing: the frame loop took the
+    /// frame now. The headset frame that does so reaches the display `lead` after this moment.
     pub fn views_of(&self, frames: &DecodedFrames, metadata: u64) -> StreamedViews {
         let mut table = self.table.lock().unwrap();
         let Some(sent) = table.sent.iter().rev().find(|sent| sent.metadata == metadata).copied() else {
             // A frame that the table lost has views that the headset refuses and logs
-            return StreamedViews { left: NO_VIEW, right: NO_VIEW };
+            return StreamedViews { left: NO_VIEW, right: NO_VIEW, target_display_time: None };
         };
-        if let Some(display) = self.feed.display() {
-            if table.shown.len() >= TABLE_LEN {
-                table.shown.pop_front();
-            }
-            table.shown.push_back(Shown {
-                sent,
-                decode_time: frames.stats().last_decode,
-                display_time: display.time,
-                period: display.period,
-                picked: now_ns(),
-            });
+        let mut views = sent.views;
+        let Some(display) = self.feed.display() else { return views };
+        if sent.target_display != 0 {
+            views.target_display_time = self.feed.to_runtime_time(sent.target_display);
         }
-        sent.views
+        let intake = now_ns();
+        let timing = intake_timing(display, intake, sent.target_display);
+        if table.shown.len() >= TABLE_LEN {
+            table.shown.pop_front();
+        }
+        table.shown.push_back(Shown {
+            sent,
+            decode_time: frames.stats().last_decode,
+            display_time: timing.display_time,
+            period: display.period,
+            picked: timing.picked,
+            late: timing.late,
+        });
+        views
     }
 
     /// The frames that the headset took since the last call
@@ -359,37 +387,169 @@ impl Hub {
     }
 }
 
+/// The timing of a frame that the frame loop took at `intake`, in the headset frame whose display
+/// time is `display.time`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IntakeTiming {
+    display_time: Nanos,
+    picked: Nanos,
+    late: bool,
+}
+
+fn intake_timing(display: Display, intake: Nanos, target: Nanos) -> IntakeTiming {
+    // The headset frame reaches the display this long after the take
+    let lead = display.time.saturating_sub(intake);
+    let period = display.period.max(1);
+    let (display_time, late) = if target == 0 {
+        (display.time, false)
+    } else {
+        // The display time closest to the target, on the grid of the headset's display times
+        let steps = ((target as f64 - display.time as f64) / period as f64).round();
+        let point = (display.time as f64 + steps * period as f64).max(0.0) as Nanos;
+        // A frame whose point lies before this headset frame is late. It shows in this frame or
+        // later.
+        (point.max(display.time), point < display.time)
+    };
+    IntakeTiming { display_time, picked: display_time.saturating_sub(lead), late }
+}
+
 /// A view that the headset refuses, because its picture has no area
 const NO_VIEW: StreamedView = StreamedView {
     pose: XrPose::IDENTITY,
     fov: FieldOfView { angle_left: 0.0, angle_right: 0.0, angle_up: 0.0, angle_down: 0.0 },
     rect: CropRect { x: 0, y: 0, width: 0, height: 0 },
+    foveation: None,
 };
 
-/// The views of a frame from the render poses that the host sent with it. `eye` is one eye's
-/// image size in pixels. The two eyes lie side by side in the picture. `fov` is what the host
-/// renders with. The poses are in the headset's room.
-pub fn streamed_views(eye_poses: &[Pose; 2], fov: &[Fov; 2], eye: [u32; 2]) -> StreamedViews {
+/// How the host's pictures lie in the decoded frame: the size of one eye's full view and, when the
+/// host foveates, the layout that its encoder derived from the parameters.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StreamLayout {
+    /// One eye's full view in pixels
+    pub eye: [u32; 2],
+    pub foveation: Option<Foveation>,
+}
+
+impl StreamLayout {
+    /// The layout of a stream with an eye of `eye` pixels and the foveation that the host chose.
+    /// The host and the client derive the aligned sizes from the same parameters.
+    pub fn new(eye: [u32; 2], foveation: Option<FoveationParams>) -> Self {
+        Self { eye, foveation: foveation.map(|params| Foveation::new(eye, &FoveationConfig::from(params))) }
+    }
+
+    /// The size of one eye's picture in the frame: the encoded eye with its padding, or the eye
+    pub fn eye_picture(&self) -> [u32; 2] {
+        self.foveation.map_or(self.eye, |f| f.optimized)
+    }
+
+    /// The size of the decoded frame: both eyes side by side
+    pub fn frame(&self) -> [u32; 2] {
+        let [w, h] = self.eye_picture();
+        [w * 2, h]
+    }
+}
+
+/// The views of a frame from the render poses that the host sent with it. The two eyes lie side by
+/// side in the picture. A foveated picture has the host's compressed layout. The right eye is
+/// mirrored, as ALVR stores it. `fov` is the field of view of the full view that the host rendered.
+/// The poses are in the headset's room. The target display time comes later (see `views_of`).
+pub fn streamed_views(eye_poses: &[Pose; 2], fov: &[Fov; 2], layout: &StreamLayout) -> StreamedViews {
+    let [width, height] = layout.eye_picture();
     let view = |i: usize| StreamedView {
         pose: XrPose { position: eye_poses[i].position, orientation: eye_poses[i].orientation },
         fov: FieldOfView { angle_left: fov[i].left, angle_right: fov[i].right, angle_up: fov[i].up, angle_down: fov[i].down },
-        rect: CropRect { x: eye[0] * i as u32, y: 0, width: eye[0], height: eye[1] },
+        rect: CropRect { x: width * i as u32, y: 0, width, height },
+        foveation: layout.foveation.map(|f| FoveatedEncoding {
+            full_size: (layout.eye[0], layout.eye[1]),
+            center_size: f.center_size,
+            center_shift: f.center_shift,
+            edge_ratio: f.edge_ratio,
+            eye_size_ratio: f.eye_size_ratio,
+            mirrored: i == 1,
+        }),
     };
-    StreamedViews { left: view(0), right: view(1) }
+    StreamedViews { left: view(0), right: view(1), target_display_time: None }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn fov() -> [Fov; 2] {
+        let fov = Fov { left: -0.8, right: 0.7, up: 0.75, down: -0.9 };
+        [fov, fov]
+    }
+
+    fn poses() -> [Pose; 2] {
+        [Pose { position: [-0.03, 1.0, 0.0], ..Pose::IDENTITY }, Pose { position: [0.03, 1.0, 0.0], ..Pose::IDENTITY }]
+    }
+
     #[test]
     fn the_two_eyes_lie_side_by_side_in_the_picture() {
-        let poses = [Pose { position: [-0.03, 1.0, 0.0], ..Pose::IDENTITY }, Pose { position: [0.03, 1.0, 0.0], ..Pose::IDENTITY }];
-        let fov = Fov { left: -0.8, right: 0.7, up: 0.75, down: -0.9 };
-        let views = streamed_views(&poses, &[fov, fov], [1248, 1306]);
+        let layout = StreamLayout::new([1248, 1306], None);
+        let views = streamed_views(&poses(), &fov(), &layout);
         assert_eq!(views.left.rect, CropRect { x: 0, y: 0, width: 1248, height: 1306 });
         assert_eq!(views.right.rect, CropRect { x: 1248, y: 0, width: 1248, height: 1306 });
         assert_eq!(views.right.pose.position, [0.03, 1.0, 0.0]);
         assert_eq!((views.left.fov.angle_left, views.left.fov.angle_down), (-0.8, -0.9));
+        assert!(views.left.foveation.is_none() && views.target_display_time.is_none());
+        assert_eq!(layout.frame(), [2496, 1306]);
+    }
+
+    #[test]
+    fn a_foveated_eye_has_the_layout_that_the_hosts_encoder_aligned() {
+        // The aligned values of an eye of 640 by 720 pixels: Cranpose's demo clip holds them
+        let params = FoveationParams { center_size: [0.45, 0.4], center_shift: [0.4, 0.1], edge_ratio: [4.0, 5.0] };
+        let layout = StreamLayout::new([640, 720], Some(params));
+        assert_eq!(layout.eye_picture(), [384, 384]);
+        let views = streamed_views(&poses(), &fov(), &layout);
+        let left = views.left.foveation.unwrap();
+        assert_eq!(left.full_size, (640, 720));
+        assert!((left.center_size[0] - 0.45).abs() < 1e-3 && (left.center_size[1] - 0.3889).abs() < 1e-3);
+        assert!((left.center_shift[0] - 0.4091).abs() < 1e-3 && (left.center_shift[1] - 0.1136).abs() < 1e-3);
+        assert!((left.eye_size_ratio[0] - 0.9792).abs() < 1e-3 && (left.eye_size_ratio[1] - 0.9583).abs() < 1e-3);
+        assert_eq!(left.edge_ratio, [4.0, 5.0]);
+        assert!(!left.mirrored && views.right.foveation.unwrap().mirrored);
+        // Each eye's rectangle is the padded encoded eye. The right eye is the right half
+        assert_eq!(views.left.rect, CropRect { x: 0, y: 0, width: 384, height: 384 });
+        assert_eq!(views.right.rect, CropRect { x: 384, y: 0, width: 384, height: 384 });
+        assert_eq!(layout.frame(), [768, 384]);
+    }
+
+    #[test]
+    fn a_quest_3_eye_foveates_to_about_a_third_of_the_pixels() {
+        let params = FoveationParams { center_size: [0.45, 0.4], center_shift: [0.4, 0.1], edge_ratio: [4.0, 5.0] };
+        let layout = StreamLayout::new([1680, 1760], Some(params));
+        let [w, h] = layout.eye_picture();
+        assert_eq!((w % 32, h % 32), (0, 0));
+        let share = f64::from(w * h) / f64::from(1680 * 1760);
+        assert!((0.28..0.36).contains(&share), "{share}");
+    }
+
+    fn display(time: Nanos) -> Display {
+        Display { time, period: 8_333_333, offset: 0 }
+    }
+
+    #[test]
+    fn a_frame_taken_for_its_own_point_has_the_lead_of_the_headset_frame() {
+        // The headset frame reaches the display 16 ms after the take. The frame's target is that display time.
+        let d = display(1_000_000_000);
+        let t = intake_timing(d, 984_000_000, 1_000_000_000);
+        assert_eq!(t, IntakeTiming { display_time: 1_000_000_000, picked: 984_000_000, late: false });
+        // A target with a little jitter still means this point
+        assert_eq!(intake_timing(d, 984_000_000, 1_001_500_000).display_time, 1_000_000_000);
+        // A frame with no target shows at the headset frame's display time
+        assert_eq!(intake_timing(d, 984_000_000, 0), IntakeTiming { display_time: 1_000_000_000, picked: 984_000_000, late: false });
+    }
+
+    #[test]
+    fn an_early_frame_waits_for_its_point_and_a_late_frame_shows_at_once() {
+        let d = display(1_000_000_000);
+        // Two points early: the point lies two periods later. The pick moves with it
+        let early = intake_timing(d, 984_000_000, 1_016_666_666);
+        assert_eq!((early.display_time, early.picked, early.late), (1_016_666_666, 1_000_666_666, false));
+        // One point late: the frame shows in this headset frame, as it is the next chance
+        let late = intake_timing(d, 984_000_000, 991_666_667);
+        assert_eq!((late.display_time, late.picked, late.late), (1_000_000_000, 984_000_000, true));
     }
 }

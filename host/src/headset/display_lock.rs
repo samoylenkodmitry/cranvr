@@ -1,11 +1,14 @@
 //! The display lock: the host's frame clock follows the headset's display.
 //!
 //! The headset shows a new frame at each point of a grid, `D + k * period`. Its compositor takes
-//! the newest decoded frame some time before that point (the *lead*, from the pick to the display).
-//! A frame that is ready just before the pick shows at the next grid point. A frame that comes just
-//! after the pick waits one more point. The next frame then replaces it. A host that renders at the
-//! arrival of each pose has a fixed delay from pose to arrival. That delay can put the arrival at
-//! the edge of the pick, so jitter moves frames across it.
+//! decoded frames some time before that point (the *lead*, from the take to the display). The
+//! streamed scene keeps up to three taken frames in a queue and shows the one whose target lies
+//! closest to the display time. A frame that is ready before the take for its point shows at that
+//! point. An early frame waits in the queue. A frame that comes after the take for its point is
+//! late: the next frame is closer to the next point, so the late frame is skipped and its point
+//! shows the picture of the point before. A host that renders at the arrival of each pose has a
+//! fixed delay from pose to arrival. Jitter then moves frames across the take. With a newest frame
+//! rule (the scene before the queue) a frame at the edge of the take replaced its neighbor.
 //!
 //! This module plans each frame instead:
 //! - the target is the grid point at which the frame should show;
@@ -40,20 +43,21 @@ const FIRST_NEED_MS: f64 = 16.0;
 const FIRST_MARGIN_MS: f64 = 1.5;
 /// The margin falls and rises within these limits, in ms. The upper limit is a share of a period.
 const MIN_MARGIN_MS: f64 = 0.3;
-const MAX_MARGIN_PERIODS: f64 = 0.7;
+const MAX_MARGIN_PERIODS: f64 = 1.0;
 /// A missed frame raises the margin by this much, in ms. A frame that hit lowers it by the
 /// smaller step. The ratio sets the share of misses at which the margin rests: 0.01 / 0.41 is
 /// about 2.5 percent.
 const MISS_STEP_MS: f64 = 0.4;
 const HIT_STEP_MS: f64 = 0.01;
-/// A frame shown a point early lowers the margin by this much, in ms. The step is small: with a
-/// wide spread of the need, early frames come in any case. A large step would take the margin to
-/// its floor.
+/// A frame shown a point early lowers the margin by this much, in ms. The client reports a frame
+/// that the queue holds as on time, so this applies to a headset without a queue only.
 const EARLY_STEP_MS: f64 = 0.1;
 /// The planned need is at most the 10th percentile of the measured need plus this share of a
-/// period. A frame at the 10th percentile then still shows at its own point. A larger need would
-/// make every fast frame early. An early frame replaces the frame before it.
-const NEED_CAP_PERIODS: f64 = 0.9;
+/// period. With a queue an early frame waits, so the cap guards against a need that a few slow
+/// frames inflated. Without a queue (the scene before it) a cap of 0.9 kept a frame at the 10th
+/// percentile from replacing its neighbor. Measured on a Quest 3 with the queue: the cap of 0.9 and
+/// a margin limit of 0.7 periods gave 4 percent late frames. The limits of 2.5 and 1.0 gave 2.
+const NEED_CAP_PERIODS: f64 = 2.5;
 /// The percentile of the lead and of the need
 const PERCENTILE: f64 = 0.9;
 /// Frames that wait for their report. An older one is forgotten.

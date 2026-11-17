@@ -299,6 +299,14 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
         Incoming::Control(ClientMsg::RequestKeyFrame { .. }) => shared.emit(Event::RequestIdr),
         Incoming::Control(ClientMsg::Views(v)) => shared.emit(Event::Views(views_config(&v))),
         Incoming::Control(ClientMsg::Bye) => session.stop(),
+        Incoming::Control(ClientMsg::Floor(height)) if height.is_finite() => {
+            let mut floor = session.floor.lock().unwrap();
+            if floor.is_none_or(|known| (known - height).abs() > 0.005) {
+                info!("Native protocol: the headset's floor lies {:.2} m {} its origin", height.abs(), if height < 0.0 { "below" } else { "above" });
+            }
+            *floor = Some(height);
+        }
+        Incoming::Control(ClientMsg::Floor(_)) => {}
         Incoming::Control(ClientMsg::Recenter(recenter)) => {
             let ahead_ms = session.clock.lock().unwrap().to_local(recenter.change_time).map(|at| (at as i64 - now as i64) as f64 / 1e6);
             info!(
@@ -321,8 +329,11 @@ fn views_config(views: &ProtoViews) -> ViewsConfig {
     }
 }
 
-fn proto_pose(p: &AlvrPose) -> ProtoPose {
-    ProtoPose { orientation: p.orientation.to_array(), position: p.position.to_array() }
+/// The pose in the headset's room: the host's scene put the room up by `floor` (see `device_motion`),
+/// so the pose goes down again.
+fn proto_pose(p: &AlvrPose, floor: f32) -> ProtoPose {
+    let [x, y, z] = p.position.to_array();
+    ProtoPose { orientation: p.orientation.to_array(), position: [x, y + floor, z] }
 }
 
 /// A pose is not moved further than this. A wrong clock estimate or a pause of the client would
@@ -347,9 +358,16 @@ fn device_of(t: &Tracking, device: Device) -> Option<Motion> {
     }
 }
 
-fn device_motion(motion: Motion) -> DeviceMotion {
+/// The motion for the host's scene or game. The poses of the headset lie in its room, whose origin
+/// is where the head was when the app started. The host's scenes and games want the floor at
+/// height 0, so the room moves up by the height of the floor below its origin. `floor` is 0 until
+/// the client says where its floor is.
+fn device_motion(motion: Motion, floor: f32) -> DeviceMotion {
     DeviceMotion {
-        pose: AlvrPose { orientation: Quat::from_array(motion.pose.orientation), position: Vec3::from_array(motion.pose.position) },
+        pose: AlvrPose {
+            orientation: Quat::from_array(motion.pose.orientation),
+            position: Vec3::from_array(motion.pose.position) - Vec3::new(0.0, floor, 0.0),
+        },
         linear_velocity: Vec3::from_array(motion.linear_velocity),
         angular_velocity: Vec3::from_array(motion.angular_velocity),
     }
@@ -535,6 +553,8 @@ struct Session {
     /// its plans only when `lock_on` is set.
     lock: Mutex<DisplayLock>,
     lock_on: bool,
+    /// The height of the headset's floor in its room, once the client says it
+    floor: Mutex<Option<f32>>,
     next_frame: AtomicU32,
     heard: Mutex<Instant>,
     stopped: Mutex<bool>,
@@ -556,6 +576,7 @@ impl Session {
             sent: Mutex::new(VecDeque::new()),
             lock: Mutex::new(DisplayLock::new(period)),
             lock_on,
+            floor: Mutex::new(None),
             next_frame: AtomicU32::new(0),
             heard: Mutex::new(Instant::now()),
             stopped: Mutex::new(false),
@@ -662,7 +683,8 @@ impl Headset for Native {
         let session = self.shared.session()?;
         let history = session.history.lock().unwrap();
         let t = history.find(sample_ns)?;
-        Some(device_motion(device_of(t, device)?))
+        let floor = session.floor.lock().unwrap().unwrap_or(0.0);
+        Some(device_motion(device_of(t, device)?, floor))
     }
 
     fn motion_at(&self, device: Device, sample_ns: u64, target: u64) -> Option<DeviceMotion> {
@@ -674,7 +696,8 @@ impl Headset for Native {
         if let Some(seconds) = horizon_seconds(t.display_time, target) {
             motion.pose = extrapolate(&motion, seconds);
         }
-        Some(device_motion(motion))
+        let floor = session.floor.lock().unwrap().unwrap_or(0.0);
+        Some(device_motion(motion, floor))
     }
 
     fn frame_plan(&self) -> Option<FramePlan> {
@@ -718,6 +741,7 @@ impl Headset for Native {
         // time that it can make.
         let target_display = frame.plan.map_or_else(|| session.target_display(now), |plan| plan.target);
         let parity = session.parity.lock().unwrap().clone();
+        let floor = session.floor.lock().unwrap().unwrap_or(0.0);
         let rects: Vec<Rect> = frame.slices.iter().map(|s| Rect { x: s.rect[0], y: s.rect[1], w: s.rect[2], h: s.rect[3] }).collect();
         let mut sent_bytes = 0;
         let (mut data_packets, mut parity_packets) = (0u64, 0u64);
@@ -730,7 +754,7 @@ impl Headset for Native {
                 tracking_sample: frame.sample_ns,
                 target_display,
                 sent: now,
-                eye_poses: [proto_pose(&frame.eye_poses[0]), proto_pose(&frame.eye_poses[1])],
+                eye_poses: [proto_pose(&frame.eye_poses[0], floor), proto_pose(&frame.eye_poses[1], floor)],
                 slices: rects.clone(),
             };
             match session.link.send_unit(&meta, &slice.data, &parity) {

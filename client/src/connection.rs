@@ -12,11 +12,13 @@
 //! No thread touches Cranpose state. The threads write into the hub, and the UI reads from it.
 
 use crate::{
-    hub::{streamed_views, DecoderView, HeadsetInfo, Hub, LinkState, MediaChoice, Sent, Snapshot, Stats, StreamInfo},
-    tracking,
+    hub::{streamed_views, DecoderView, HeadsetInfo, Hub, LinkState, MediaChoice, Sent, Snapshot, Stats, StreamInfo, StreamLayout},
+    sizing, tracking,
 };
-use cranpose::{AccessUnit, DecodedFrames, DecoderConfig, DecoderError, DecoderOutput, VideoCodec, VideoDecoder};
-use cranpose_xr::{Hand, Vibration};
+use cranpose::{
+    AccessUnit, DecodedFrames, DecoderCapabilities, DecoderConfig, DecoderError, DecoderOutput, VideoCodec, VideoDecoder,
+};
+use cranpose_xr::{Hand, StreamCounts, Vibration};
 use cranvr_proto::{
     clock::{now_ns, ClockSync},
     identity::{format_code, Identity},
@@ -33,7 +35,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, RecvTimeoutError},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
@@ -63,9 +65,12 @@ fn pulse_vibration(pulse: &cranvr_proto::message::Haptics) -> (Hand, Vibration) 
 
 /// The shortest vibration that the client plays. A host that asks for none means a click.
 const MIN_PULSE: Duration = Duration::from_millis(10);
-/// The pictures that the decoder keeps for the headset: the ones in the decoder and the one that
-/// the headset holds while it draws
-const DECODER_DEPTH: usize = 4;
+/// The pictures that the decoder keeps for the headset. The streamed scene queues three decoded
+/// frames. The frame shown last holds an image too. The decoder needs one to write. The
+/// scene's doc says at least 5. Cranpose's demo uses 6.
+const DECODER_DEPTH: usize = 6;
+/// The highest refresh rate that the client sizes the eyes for. The host's default wish is 120 Hz.
+const SIZING_RATE: f32 = 120.0;
 
 /// One eye's image size that a flat window asks for, in pixels. It is the Quest 3's recommended
 /// size. A headset reports its own.
@@ -79,10 +84,49 @@ const DEFAULT_NAME: &str = "cranvr-client";
 /// after the app starts.
 const VIEWS_WAIT: Duration = Duration::from_secs(5);
 
+/// The limits of the hardware decoder for HEVC, asked once. `None` where the platform gives none.
+fn decoder_limits() -> Option<&'static DecoderCapabilities> {
+    static LIMITS: OnceLock<Option<DecoderCapabilities>> = OnceLock::new();
+    LIMITS
+        .get_or_init(|| match VideoDecoder::capabilities(VideoCodec::Hevc) {
+            Ok(limits) => {
+                log::info!(
+                    "decoder {}: hardware {:?}, at most {:?} by {:?} pixels, {:?} bit/s",
+                    limits.name,
+                    limits.hardware_accelerated,
+                    limits.max_width,
+                    limits.max_height,
+                    limits.max_bitrate
+                );
+                Some(limits)
+            }
+            Err(e) => {
+                log::info!("no decoder limits: {e}");
+                None
+            }
+        })
+        .as_ref()
+}
+
+/// The size of one eye's picture to ask the host for: the headset's recommended size, or a smaller
+/// one that the decoder takes at the refresh rate of the stream. The decoder's frame is the one
+/// that the host's foveation gives.
+fn eye_for(recommended: [u32; 2], refresh_rates: &[f32]) -> [u32; 2] {
+    let rate = refresh_rates.iter().copied().filter(|rate| *rate <= SIZING_RATE).fold(0.0, f32::max).max(1.0);
+    let eye = match decoder_limits() {
+        Some(limits) => sizing::choose_eye(recommended, true, |frame| sizing::decoder_takes(limits, frame, rate)),
+        None => recommended,
+    };
+    if eye != recommended {
+        log::info!("the decoder does not take the recommended eye of {recommended:?} at {rate} Hz: asking for {eye:?}");
+    }
+    eye
+}
+
 /// What the client tells the host about itself. A headset reports its name, the size of the
 /// pictures that its displays take and its refresh rates.
 fn device_caps(tcp_only: bool, headset: Option<&HeadsetInfo>, views: Views, identity: &Identity) -> ClientCaps {
-    let (name, eye_size, refresh_rates) = match headset {
+    let (name, recommended, refresh_rates) = match headset {
         Some(HeadsetInfo { properties, .. }) => {
             let size = properties.eye_image_sizes[0].recommended;
             (
@@ -93,15 +137,16 @@ fn device_caps(tcp_only: bool, headset: Option<&HeadsetInfo>, views: Views, iden
         }
         None => (None, EYE_SIZE, None),
     };
+    let refresh_rates = refresh_rates.unwrap_or_else(|| REFRESH_RATES.to_vec());
     ClientCaps {
         name: name.unwrap_or_else(|| DEFAULT_NAME.into()),
-        eye_size,
+        eye_size: eye_for(recommended, &refresh_rates),
         views,
-        refresh_rates: refresh_rates.unwrap_or_else(|| REFRESH_RATES.to_vec()),
+        refresh_rates,
         codecs: vec![Codec::Hevc],
         decoders: 1,
-        // The headset's compositor samples the picture as it is. It cannot unwarp a foveated one.
-        foveation: false,
+        // The headset's streamed scene unwarps ALVR's foveated encoding in its shader
+        foveation: true,
         tcp_only,
         public_key: identity.public_key(),
     }
@@ -285,12 +330,9 @@ struct Averages {
     network_n: u32,
     pose_to_decode_ms: f64,
     pose_to_decode_n: u32,
-    /// The frames that the headset took since the stats thread last looked
-    shown: u32,
-    /// Of those, the frames by their display time against the host's target
-    on_target: u32,
+    /// Of the frames with a target, those that came after the headset frame of their point
+    with_target: u32,
     late: u32,
-    early: u32,
 }
 
 struct Shared<'a> {
@@ -342,25 +384,38 @@ impl Shared<'_> {
 /// Runs a session until the link ends and returns the reason.
 fn session(hub: &'static Hub, id: u64, link: &ClientLink, in_headset: bool, hello_views: Views, stop: &AtomicBool) -> Error {
     let stream = link.welcome.stream.clone();
-    if stream.foveation.is_some() {
-        let message = "the host sent a foveated stream, which this client cannot unwarp".to_string();
-        hub.report(id, |snapshot| snapshot.state = LinkState::Failed(message));
-        return Error::Closed;
-    }
-    let picture = [stream.eye_size[0] * 2, stream.eye_size[1]];
+    let layout = StreamLayout::new(stream.eye_size, stream.foveation);
+    let picture = layout.frame();
     log::info!(
-        "streaming {}x{} per eye at {} Hz, {:?}, {} media",
+        "streaming {}x{} per eye at {} Hz, {:?}, {} media, {}decoded frames of {}x{}",
         stream.eye_size[0],
         stream.eye_size[1],
         stream.refresh_hz,
         stream.codec,
-        if link.duplex.has_udp() { "UDP" } else { "TCP" }
+        if link.duplex.has_udp() { "UDP" } else { "TCP" },
+        if stream.foveation.is_some() { "foveated, " } else { "" },
+        picture[0],
+        picture[1]
     );
+    // The decoder's limits were checked for the default foveation before the Hello. The host's
+    // own parameters and its wish give the frame now.
+    if let Some(limits) = decoder_limits() {
+        if !sizing::decoder_takes(limits, picture, stream.refresh_hz) {
+            log::warn!(
+                "the decoder may not take frames of {}x{} at {} Hz: it reports at most {:?} frames a second",
+                picture[0],
+                picture[1],
+                stream.refresh_hz,
+                limits.max_frame_rate(picture[0], picture[1])
+            );
+        }
+    }
     hub.report(id, |snapshot| {
         snapshot.state = LinkState::Streaming;
         snapshot.stream = Some(StreamInfo {
             eye: stream.eye_size,
             picture,
+            foveated: stream.foveation.is_some(),
             codec: format!("{:?}", stream.codec),
             refresh_hz: stream.refresh_hz,
             target_mbps: stream.bitrate_bps as f32 / 1e6,
@@ -527,6 +582,8 @@ struct Decode<'s, 'a> {
     frames: Option<DecodedFrames>,
     /// The epoch that the decoder was made for
     built_for: Option<u64>,
+    /// How the pictures lie in the decoder's frames, for the stream that the decoder was made for
+    layout: StreamLayout,
     last_pts_us: u64,
     last_frame: Option<u32>,
     /// Holds a key frame's parameter sets and its bytes together
@@ -540,7 +597,11 @@ struct Decode<'s, 'a> {
 const RETRY_AFTER: Duration = Duration::from_millis(500);
 
 fn decode_loop(s: &Shared<'_>, units: &mpsc::Receiver<Received>) {
-    let mut d = Decode { s, decoder: None, frames: None, built_for: None, last_pts_us: 0, last_frame: None, scratch: Vec::new(), retry_at: None };
+    let layout = {
+        let stream = s.stream.lock().unwrap();
+        StreamLayout::new(stream.eye_size, stream.foveation)
+    };
+    let mut d = Decode { s, decoder: None, frames: None, built_for: None, layout, last_pts_us: 0, last_frame: None, scratch: Vec::new(), retry_at: None };
     while !s.stopped() {
         d.sync_decoder();
         match units.recv_timeout(Duration::from_millis(2)) {
@@ -589,15 +650,13 @@ impl Decode<'_, '_> {
         self.release();
         self.built_for = Some(wanted);
         let stream = s.stream.lock().unwrap().clone();
-        let config = DecoderConfig::new(
-            video_codec(stream.codec),
-            stream.eye_size[0] * 2,
-            stream.eye_size[1],
-            DecoderOutput::Frames { depth: DECODER_DEPTH },
-        );
+        let layout = StreamLayout::new(stream.eye_size, stream.foveation);
+        let [width, height] = layout.frame();
+        let config = DecoderConfig::new(video_codec(stream.codec), width, height, DecoderOutput::Frames { depth: DECODER_DEPTH });
         match VideoDecoder::new(config) {
             Ok(decoder) => {
-                log::info!("decoder started for {}x{}", stream.eye_size[0] * 2, stream.eye_size[1]);
+                self.layout = layout;
+                log::info!("decoder started for {width}x{height}{}", if stream.foveation.is_some() { " (foveated)" } else { "" });
                 let frames = decoder.frames();
                 *s.decoder_frames.lock().unwrap() = Some(frames.clone());
                 self.decoder = Some(decoder);
@@ -652,7 +711,7 @@ impl Decode<'_, '_> {
             s.counters.decoded.fetch_add(1, Ordering::Relaxed);
             let sent = Sent {
                 metadata: 0,
-                views: streamed_views(&meta.eye_poses, &self.host_fov(), s.stream.lock().unwrap().eye_size),
+                views: streamed_views(&meta.eye_poses, &self.host_fov(), &self.layout),
                 frame: meta.frame,
                 tracking_sample: meta.tracking_sample,
                 received: unit.completed,
@@ -692,7 +751,7 @@ impl Decode<'_, '_> {
         // gets them first
         s.hub.frame_sent(Sent {
             metadata,
-            views: streamed_views(&meta.eye_poses, &self.host_fov(), s.stream.lock().unwrap().eye_size),
+            views: streamed_views(&meta.eye_poses, &self.host_fov(), &self.layout),
             frame: meta.frame,
             tracking_sample: meta.tracking_sample,
             received: unit.completed,
@@ -728,16 +787,9 @@ impl Decode<'_, '_> {
                 let mut averages = s.averages.lock().unwrap();
                 averages.pose_to_decode_ms += decode_end.saturating_sub(sent.tracking_sample) as f64 / 1e6;
                 averages.pose_to_decode_n += 1;
-                averages.shown += 1;
-                if sent.target_display != 0 && shown.period > 0 {
-                    let points = ((shown.display_time as f64 - sent.target_display as f64) / shown.period as f64).round();
-                    if points == 0.0 {
-                        averages.on_target += 1;
-                    } else if points > 0.0 {
-                        averages.late += 1;
-                    } else {
-                        averages.early += 1;
-                    }
+                if sent.target_display != 0 {
+                    averages.with_target += 1;
+                    averages.late += u32::from(shown.late);
                 }
             }
             self.send_timing(&sent, decode_end, shown.picked, shown.display_time, shown.period);
@@ -769,6 +821,8 @@ fn stats_loop(s: &Shared<'_>) {
     // The decoder's own count of the pictures that it output. A new decoder starts from 0.
     let (mut decoder_seen, mut decoder_total) = (0u64, 0u64);
     let (mut network_ms, mut sample_to_decode_ms) = (None, None);
+    // The streamed scene's counts at the last look. A new scene starts from 0.
+    let mut scene = StreamCounts::default();
     let mut log_due = Instant::now();
     while !s.stopped() {
         thread::sleep(Duration::from_millis(50));
@@ -787,10 +841,14 @@ fn stats_loop(s: &Shared<'_>) {
         let decoded_fps = (now_decoded - decoded) as f32 / seconds;
         let received_mbps = (now_bytes - bytes) as f32 * 8.0 / 1e6 / seconds;
         (frames, decoded, bytes) = (now_frames, now_decoded, now_bytes);
-        let (shown_fps, slots) = {
+        let counts = s.hub.stream_stats.counts();
+        let since = |now: u64, before: u64| if now >= before { now - before } else { now } as f32 / seconds;
+        let (shown_fps, skipped_fps, repeated_fps) =
+            (since(counts.shown, scene.shown), since(counts.skipped, scene.skipped), since(counts.repeated, scene.repeated));
+        scene = counts;
+        let late_pct = {
             let mut averages = s.averages.lock().unwrap();
-            let shown_fps = averages.shown as f32 / seconds;
-            let slots = (averages.on_target, averages.late, averages.early);
+            let late_pct = 100.0 * averages.late as f32 / averages.with_target.max(1) as f32;
             if averages.network_n > 0 {
                 network_ms = Some((averages.network_ms / f64::from(averages.network_n)) as f32);
             }
@@ -798,10 +856,8 @@ fn stats_loop(s: &Shared<'_>) {
                 sample_to_decode_ms = Some((averages.pose_to_decode_ms / f64::from(averages.pose_to_decode_n)) as f32);
             }
             *averages = Averages::default();
-            (shown_fps, slots)
+            late_pct
         };
-        let with_target = (slots.0 + slots.1 + slots.2).max(1) as f32;
-        let pct = |n: u32| 100.0 * n as f32 / with_target;
         let ms = |d: Duration| d.as_secs_f32() * 1000.0;
         let (headset_fps, headset_gap) = s.hub.feed.frame_rate().unwrap_or_default();
         let totals = s.totals.lock().unwrap();
@@ -826,29 +882,29 @@ fn stats_loop(s: &Shared<'_>) {
             sample_to_decode_ms,
             haptic_pulses: c.haptics.load(Ordering::Relaxed),
             shown_fps,
+            skipped_fps,
+            repeated_fps,
             headset_fps,
             headset_gap_ms: ms(headset_gap),
             head_position: s.hub.feed.head().map(|head| head.pose.position),
-            at_target_pct: pct(slots.0),
-            late_pct: pct(slots.1),
-            early_pct: pct(slots.2),
+            late_pct,
             tracking_live: s.hub.feed.is_live(),
         };
         drop(totals);
         if log_due.elapsed() >= LOG_EVERY {
             log_due = Instant::now();
             log::info!(
-                "{:.1} fps received, {:.1} fps decoded, {:.1} fps shown of {:.1} headset frames (gap up to {:.1} ms), at target {:.0}% late {:.0}% early {:.0}%, {} dropped by the decoder, {:.1} Mbps, decode {:.2} ms mean, rtt {} ms, \
+                "{:.1} fps received, {:.1} fps decoded, {:.1} fps shown, {:.1} skipped, {:.1} repeated of {:.1} headset frames (gap up to {:.1} ms), {:.0}% late at the take, {} dropped by the decoder, {:.1} Mbps, decode {:.2} ms mean, rtt {} ms, \
                  network {} ms, pose to decode {} ms, tracking {} at {:?}, {} of {} packets lost, {} units recovered, {} units lost, \
                  {} pulses",
                 stats.received_fps,
                 stats.decoded_fps,
                 stats.shown_fps,
+                stats.skipped_fps,
+                stats.repeated_fps,
                 stats.headset_fps,
                 stats.headset_gap_ms,
-                stats.at_target_pct,
                 stats.late_pct,
-                stats.early_pct,
                 stats.decoder_dropped,
                 stats.received_mbps,
                 stats.decode_mean_ms,

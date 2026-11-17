@@ -192,6 +192,11 @@ pub enum ClientMsg {
     Recenter(Recenter),
     /// The answer to the host's challenge: the signature of the client's key
     Proof(Vec<u8>),
+    /// The height of the floor in the headset's room in meters, from the headset's stage. It is
+    /// negative when the floor lies below the room's origin, which is where the head was when the
+    /// app started. The client sends it again when it changes. The host puts its scenes' floor
+    /// there. A host that does not know the message skips it.
+    Floor(f32),
 }
 
 /// A change of the origin of the poses that the client sends. Every pose with a display time at or

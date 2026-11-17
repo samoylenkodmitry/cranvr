@@ -34,14 +34,16 @@ android = ["renderer-wgpu", "cranpose/android", "cranpose-xr/openxr"]
 
 [dependencies]
 cranvr-proto = { path = "../proto" }
+# The foveated layout that the host encodes: the client derives the same sizes
+cranvr-common = { path = "../common" }
 # One Cranpose revision for every Cranpose crate: the branch cranpose-xr of the Cranpose repository
-cranpose = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "90a72b21729de935748b1d6026142ca60d07059b", features = ["embedded-default-font"] }
-cranpose-xr = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "90a72b21729de935748b1d6026142ca60d07059b" }
+cranpose = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "40abced053656782256aececf04a0bf182a893b5", features = ["embedded-default-font"] }
+cranpose-xr = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "40abced053656782256aececf04a0bf182a893b5" }
 log = "0.4"
 env_logger = { version = "0.11", optional = true }
 
 [build-dependencies]
-cranpose-capabilities = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "90a72b21729de935748b1d6026142ca60d07059b" }
+cranpose-capabilities = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "40abced053656782256aececf04a0bf182a893b5" }
 
 # The Reed-Solomon code of the protocol is about ten times slower without optimization.
 [profile.dev.package.reed-solomon-simd]
