@@ -18,6 +18,8 @@ mod stream;
 #[cfg(any(target_os = "android", test))]
 mod xr_eye;
 #[cfg(target_os = "android")]
+mod mirror;
+#[cfg(target_os = "android")]
 mod xr_scene;
 
 use crate::stream::ParsedStreamConfig;
