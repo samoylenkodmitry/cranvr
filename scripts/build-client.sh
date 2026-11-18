@@ -4,22 +4,27 @@
 # and adds the manifest entries of the `xr` service. Gradle takes the plugin and the Rust crates
 # from the Cranpose git checkout that client/Cargo.toml names, so the first build needs the network.
 #
-# Usage: scripts/build-client.sh [--install [SERIAL]]
+# Usage: scripts/build-client.sh [--phone] [--install [SERIAL]]
+#   --phone    builds cranvr-phone.apk instead: the same crate as a flat app for an Android phone or
+#              tablet, with no OpenXR. The screen shows the picture and the motion sensors are the
+#              head. It has the application id dev.cranvr.client2.phone, so it installs beside the
+#              headset's APK.
 #   --install  installs the APK with adb, beside the old client (dev.cranvr.client) and the ALVR app
 #
 # Environment:
 #   ANDROID_HOME      the Android SDK (default ~/Library/Android/sdk)
 #   ANDROID_NDK_HOME  the NDK (default: the newest 28.x in the SDK, else the newest)
 #
-# The APK carries the application id dev.cranvr.client2. The Android debug key signs it, so later
-# builds install over it.
+# The APK carries the application id dev.cranvr.client2 (dev.cranvr.client2.phone with --phone).
+# The Android debug key signs it, so later builds install over it.
 
 set -euo pipefail
 
 root=${0:A:h:h}
-install=0 serial=""
+install=0 serial="" phone=0
 while (( $# )); do
     case $1 in
+        --phone) phone=1; shift ;;
         --install)
             install=1; shift
             if (( $# )) && [[ $1 != --* ]]; then serial=$1; shift; fi ;;
@@ -37,18 +42,23 @@ for need in "${sdk}" "${ndk}"; do
     fi
 done
 work=${root}/target/client
-apk=${work}/cranvr-client.apk
+if (( phone )); then
+    name=cranvr-phone gradle_args=(-PcranvrPhone=true) app_id=dev.cranvr.client2.phone
+else
+    name=cranvr-client gradle_args=() app_id=dev.cranvr.client2
+fi
+apk=${work}/${name}.apk
 mkdir -p "${work}"
 
-print "Building the client with Gradle (log: ${work}/build.log)"
+print "Building ${name} with Gradle (log: ${work}/${name}.log)"
 if ! (cd "${root}/client/android" && ANDROID_HOME=${sdk} ANDROID_NDK_HOME=${ndk} ./gradlew --no-daemon \
-    :app:assembleRelease > "${work}/build.log" 2>&1); then
-    tail -30 "${work}/build.log" >&2
+    "${gradle_args[@]}" :app:assembleRelease > "${work}/${name}.log" 2>&1); then
+    tail -30 "${work}/${name}.log" >&2
     exit 1
 fi
 built=$(print -l "${root}"/client/android/app/build/outputs/apk/release/*.apk(N) | head -1)
 if [[ -z ${built} ]]; then
-    print -u2 "Gradle made no APK. See ${work}/build.log"
+    print -u2 "Gradle made no APK. See ${work}/${name}.log"
     exit 1
 fi
 cp "${built}" "${apk}"
@@ -58,5 +68,9 @@ if (( install )); then
     adb_cmd=(adb)
     [[ -n ${serial} ]] && adb_cmd+=(-s "${serial}")
     "${adb_cmd[@]}" install -r "${apk}"
-    print "Installed dev.cranvr.client2. Start it in the headset from the app library (Unknown Sources)."
+    if (( phone )); then
+        print "Installed ${app_id}. Start \"cranvr phone\" from the launcher."
+    else
+        print "Installed ${app_id}. Start it in the headset from the app library (Unknown Sources)."
+    fi
 fi

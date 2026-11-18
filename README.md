@@ -103,6 +103,39 @@ The app has four parts. In a headset the panels are movable panels in the room. 
 
 The launch arguments `host`, `connect` and `media` (`udp` or `tcp`) set the address, start the connection and choose the media path. On Android they are intent extras: `adb shell am start -n dev.cranvr.client2/dev.cranpose.android.CranposeActivity --es host 192.168.1.20:9950 --ez connect true`. On the desktop they are `--host=ADDRESS`, `--connect` and `--media=udp`.
 
+#### Phone mode
+
+`scripts/build-client.sh --phone [--install SERIAL]` builds `target/client/cranvr-phone.apk`. The APK holds the same crate as a flat Android app for a phone or a tablet that has no OpenXR runtime. Its application id is `dev.cranvr.client2.phone` and its label is "cranvr phone". It installs beside the headset's APK.
+
+The build differs from the headset's in four places.
+- The Cargo feature `phone` replaces `android`. The entry is `cranpose::android_main!`. The headset's APK keeps `cranpose_xr::android_main!`.
+- The build has no OpenXR loader and no `xr` service. `build.rs` declares `Use::device_motion()`.
+- The Gradle property `cranvrPhone=true` switches the module (`client/android/app/build.gradle.kts`). The script sets it.
+- The phone's manifest (`client/android/app/src/phone/AndroidManifest.xml`) turns the activity to landscape with the sensor. The headset's manifest stays as it was.
+
+The launch arguments are the headset app's: `adb shell am start -n dev.cranvr.client2.phone/dev.cranpose.android.CranposeActivity --es host 192.168.1.20:9950 --ez connect true`. The command `cargo run --manifest-path client/Cargo.toml -- --phone --host=127.0.0.1:9950 --connect` runs the phone's app in a desktop window. That window has no motion sensor, so its head looks straight ahead.
+
+`PhoneApp` in `client/src/ui.rs` is the app.
+- The picture fills the screen. A tap on the picture opens the connect panel and the stats panel over it. They stand side by side and scroll. They hold the bodies of the headset's two panels (`ConnectBody` and `StatsBody`). The connect panel has no keypad, because the phone has a keyboard. The Hide panels button closes them. They open again when the stream ends. The Recenter button puts the host's front where the screen points. The screen stays on while the stream runs (`set_keep_screen_on`).
+- Cranpose's `StreamedScene` draws nothing outside a headset at this revision. The function `TemporaryFlatPicture` in `ui.rs` draws the decoder's whole frame with `PlayerSurface`. Both eyes show side by side, scaled to fit. Delete the function and its call when `StreamedScene` has its flat mode (the branch `flat-streamed-scene` of Cranpose).
+- The head comes from `latest_device_motion()`. `client/src/phone.rs` reads it once for each frame of the screen. The screen frame (`Quaternion::in_screen_frame` with the display's rotation) is a head frame. One quarter turn about x takes the sensors' z-up frame to the host's room. The first look along the horizon becomes the host's front. The head stays at a height of 1.6 m. Two sensor samples give the angular velocity. The pose that goes out lies ahead at the display time. Each screen frame wakes the sender, so the host gets one tracking sample for each refresh.
+- The Hello carries one view shape for both eyes. It spans 90 degrees across the screen's long side. The screen's aspect gives the other side. Both eyes sit at the head's center. The host renders two eyes as usual and the phone shows the left one. The eye size has the screen's aspect. The host picks the width (1248 pixels at 120 Hz without foveation). Cranpose has no public call for the display's refresh rate, so the client measures it. The rate comes from the lower quartile of the frame clock's intervals in the first seconds, snapped to the nearest standard rate. The Hello asks for no foveation. It waits for the screen's size and rate, as the headset's Hello waits for the eye views.
+- The decoder, the sound and the connection are the headset's. The phone has no desktop panel, no console and no controller emulation. A host that runs with `--desktop` still puts the Mac's screen into the scene of the eye stream, because the phone never asks for the desktop panel. The phone sees that screen as part of the picture. It has no pointer for it.
+- A phone's scene shows the newest frame. Cranpose reports nothing about it. The client sends the frame timing when the frame arrives. The picture is ready one mean decode time after the last packet. The next screen frame takes it. That frame reaches the display one period later. The host's display lock plans with these estimates. The host's `total_ms` and `horizon_ms` rest on them.
+- The log has a `phone head:` line every 2 seconds. It shows the orientation that the client sent and the orientation for which the host rendered the newest frame. The stats panel shows the direction of each. A tablet that lies still sends the orientation that the frames come back with.
+
+On 18 November 2026 a Galaxy Tab S7+ ran against a copy of the main checkout's host binary. The Tab ran DeX with a window of 1618 by 1234 pixels. DeX held the display at 60 Hz. The host ran with `--protocol native --no-game-audio` and showed its test scene. The eyes were 1248 by 952 pixels at 60 Hz, HEVC without foveation. The numbers are the means of 2 s intervals after 10 s of warm-up. The "shown" rate of the picture is not counted: the decoder's `dropped` counter says how many decoded pictures the picture did not take.
+- Over USB (`adb reverse`, TCP media): 21 intervals. The client received 59.7 frames a second and decoded 60.0. The screen ran at 61.0 frames a second. The decoder dropped 0.5 pictures a second. Decode took 4.3 ms. The round trip took 1.6 ms. The network took 1.8 ms. The stream used 4.1 Mbps. The time from the tracking sample to the end of the decode was 35 ms.
+- Over Wi-Fi (192.168.50.44, UDP media, Tailscale paused for the run): 22 intervals. The client received 59.3 frames a second and decoded 59.5. The screen ran at 61.4 frames a second. The decoder dropped about 4 pictures a second. Decode took 4.5 ms. The round trip took 4.0 ms. The network took 7.7 ms. Of 30,632 packets 77 were lost. One unit was recovered and 2 were lost. The time from the sample to the end of the decode was 43 ms.
+- The tablet leaned on the desk and looked 44 degrees below the horizon. In each 2 s log line it sent the orientation (-0.372, 0.002, 0.004, 0.928). The host rendered the newest frame for the same orientation each time. The screenshot showed the checker floor from that angle. With `--desktop` the Mac's screen showed in the scene and the stream ran at the same rates.
+
+Not tested:
+- a moving head (nothing turned the tablet) and the yaw direction on a device
+- Recenter, a reconnect and a phone in portrait
+- a window in full screen mode and a 120 Hz display
+- the sound and a game
+- the headset's APK in a headset after the change to the shared panels
+
 #### Controllers in games
 
 The host feeds BasaltVR's runtime (`host/src/runtime_link.rs`) from the client's `Tracking` and `Input` messages in the same way as from ALVR's. For each tracking sample it sends the head pose, the grip pose and the aim pose of each controller that the headset tracks with the velocities of both, and the mask of tracked controllers. It sends every change of a button, a touch, the trigger, the grip and the thumbstick with the path ids that ALVR gives them, for the Touch profile. The runtime's haptic requests go back to the client as `Haptics` datagrams, which the client plays through Cranpose's `Haptics`.

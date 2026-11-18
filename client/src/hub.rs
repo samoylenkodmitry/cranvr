@@ -23,7 +23,7 @@ use cranvr_proto::{
 use std::{
     collections::VecDeque,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex, OnceLock,
     },
     time::{Duration, Instant},
@@ -107,6 +107,12 @@ pub struct Stats {
     pub headset_gap_ms: f32,
     /// The newest head pose that the headset reported: x, y, z in meters
     pub head_position: Option<[f32; 3]>,
+    /// The newest head orientation that the client sent (x, y, z, w). `rendered_orientation` is the
+    /// orientation of the left eye in the newest frame that arrived. The host rendered that frame
+    /// for it. When a phone lies on a desk, the two values show that the host takes the tracking.
+    /// The frames follow it.
+    pub head_orientation: Option<[f32; 4]>,
+    pub rendered_orientation: Option<[f32; 4]>,
     /// The share of the frames with a target that came after the headset frame of their own point,
     /// in percent
     pub late_pct: f32,
@@ -150,6 +156,8 @@ impl Default for Stats {
             headset_fps: 0.0,
             headset_gap_ms: 0.0,
             head_position: None,
+            head_orientation: None,
+            rendered_orientation: None,
             late_pct: 0.0,
             tracking_live: false,
             open_us_per_frame: 0.0,
@@ -196,6 +204,35 @@ struct StreamSlot {
 pub struct HeadsetInfo {
     pub properties: HeadsetProperties,
     pub haptics: Option<Haptics>,
+}
+
+/// What a phone or a tablet reports about its screen. The Hello gives the host the screen's
+/// shape and the rate at which the screen refreshes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PhoneInfo {
+    /// The screen's size in pixels with the long side first: the app shows the picture in landscape
+    pub screen: [u32; 2],
+    /// The screen's refresh rate in Hz, measured from the frame clock
+    pub refresh_hz: f32,
+}
+
+/// What the client runs on. It decides where the head comes from and whether anything decodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Device {
+    /// A flat window on a computer, for development: no sensors and no decoder
+    Window,
+    /// A headset: the runtime gives the head pose and the controllers
+    Headset,
+    /// A phone or a tablet: the screen shows the picture flat and the motion sensors give the head
+    Phone,
+}
+
+impl Device {
+    /// Whether the device gives a head pose of its own for each frame, decodes the host's video and
+    /// plays its sound. A window does none of this: the sender makes placeholder samples there.
+    pub fn is_live(self) -> bool {
+        self != Device::Window
+    }
 }
 
 /// A frame that went into the decoder, with what the headset needs to show and time it.
@@ -279,6 +316,11 @@ impl Wanted {
 pub struct Hub {
     snapshot: Mutex<Snapshot>,
     headset: Mutex<Option<HeadsetInfo>>,
+    /// Whether the app is the phone's. The phone's UI says so when it composes.
+    is_phone: AtomicBool,
+    phone: Mutex<Option<PhoneInfo>>,
+    /// The size of the window in pixels, which the phone's UI reads from its layout
+    screen: Mutex<Option<[u32; 2]>>,
     stream: Mutex<StreamSlot>,
     table: Mutex<StreamTable>,
     /// The numbers that frames carry through the decoder. They never repeat in a process, so a
@@ -301,6 +343,9 @@ pub fn hub() -> &'static Hub {
     HUB.get_or_init(|| Hub {
         snapshot: Mutex::new(Snapshot::idle()),
         headset: Mutex::new(None),
+        is_phone: AtomicBool::new(false),
+        phone: Mutex::new(None),
+        screen: Mutex::new(None),
         stream: Mutex::new(StreamSlot::default()),
         table: Mutex::new(StreamTable::default()),
         next_metadata: AtomicU64::new(1),
@@ -390,6 +435,43 @@ impl Hub {
         self.headset.lock().unwrap().clone()
     }
 
+    /// Tells the hub that the app is the phone's: a screen with motion sensors and no headset.
+    /// Called on the UI thread when the app composes, before any connection starts.
+    pub fn attach_phone(&self) {
+        self.is_phone.store(true, Ordering::Release);
+    }
+
+    /// Notes the phone's screen and its refresh rate. The phone's frame loop calls it once the
+    /// rate is known and again when either value changes.
+    pub fn set_phone_info(&self, info: PhoneInfo) {
+        *self.phone.lock().unwrap() = Some(info);
+    }
+
+    pub fn phone(&self) -> Option<PhoneInfo> {
+        *self.phone.lock().unwrap()
+    }
+
+    /// Notes the size of the phone's window in pixels. The layout knows it. The frame loop reads it
+    /// for the views that the Hello carries.
+    pub fn set_screen(&self, size: [u32; 2]) {
+        *self.screen.lock().unwrap() = Some(size);
+    }
+
+    pub fn screen(&self) -> Option<[u32; 2]> {
+        *self.screen.lock().unwrap()
+    }
+
+    /// What the app runs on
+    pub fn device(&self) -> Device {
+        if self.headset.lock().unwrap().is_some() {
+            Device::Headset
+        } else if self.is_phone.load(Ordering::Acquire) {
+            Device::Phone
+        } else {
+            Device::Window
+        }
+    }
+
     /// Hands the decoder's frames to the UI, which gives them to the streamed scene.
     pub(crate) fn set_stream(&self, frames: DecodedFrames) {
         let mut slot = self.stream.lock().unwrap();
@@ -441,6 +523,11 @@ impl Hub {
             return StreamedViews { left: NO_VIEW, right: NO_VIEW, target_display_time: None };
         };
         let mut views = sent.views;
+        // A phone's scene shows the newest frame, so it has no target. The connection reports the
+        // phone's timing when the frame arrives (see `connection.rs`).
+        if self.device() == Device::Phone {
+            return views;
+        }
         let Some(display) = self.feed.display() else { return views };
         if sent.target_display != 0 {
             views.target_display_time = self.feed.to_runtime_time(sent.target_display);

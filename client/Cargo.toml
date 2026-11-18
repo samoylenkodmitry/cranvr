@@ -24,13 +24,16 @@ name = "cranvr-client"
 path = "src/main.rs"
 required-features = ["desktop"]
 
-# The Gradle plugin builds the Android library with `android` and `renderer-wgpu`. There the
-# panels stand in the headset. On the desktop they draw flat.
+# The Gradle plugin builds the Quest's library with `android` and `renderer-wgpu`. There the
+# panels stand in the headset. On the desktop they draw flat. The phone's APK builds the same crate
+# with `phone` and `renderer-wgpu`. That is a flat Android app with no OpenXR. Its screen shows the
+# picture and its motion sensors are the head (`scripts/build-client.sh --phone`).
 [features]
 default = ["renderer-wgpu", "desktop"]
 renderer-wgpu = ["cranpose/renderer-wgpu"]
 desktop = ["cranpose/desktop", "dep:env_logger"]
 android = ["renderer-wgpu", "cranpose/android", "cranpose-xr/openxr"]
+phone = ["renderer-wgpu", "cranpose/android"]
 
 [dependencies]
 cranvr-proto = { path = "../proto" }

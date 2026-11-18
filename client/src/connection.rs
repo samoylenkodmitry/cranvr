@@ -12,8 +12,11 @@
 //! No thread touches Cranpose state. The threads write into the hub, and the UI reads from it.
 
 use crate::{
-    hub::{streamed_views, DecoderView, HeadsetInfo, Hub, LinkState, MediaChoice, Sent, Snapshot, Stats, StreamInfo, StreamLayout},
-    sizing, tracking,
+    hub::{
+        streamed_views, DecoderView, Device, HeadsetInfo, Hub, LinkState, MediaChoice, PhoneInfo, Sent, Snapshot, Stats, StreamInfo,
+        StreamLayout,
+    },
+    phone, sizing, tracking,
 };
 use cranpose::{
     AccessUnit, DecodedFrames, DecoderCapabilities, DecoderConfig, DecoderError, DecoderOutput, VideoCodec, VideoDecoder,
@@ -81,6 +84,8 @@ const EYE_SIZE: [u32; 2] = [1680, 1760];
 const REFRESH_RATES: [f32; 4] = [72.0, 80.0, 90.0, 120.0];
 /// The name that the host sees when the runtime gives none. The host trusts clients by this name.
 const DEFAULT_NAME: &str = "cranvr-client";
+/// The name of a phone or a tablet in the host's log
+const PHONE_NAME: &str = "cranvr phone";
 /// How long the Hello waits for the headset's first views. The headset reports them a moment
 /// after the app starts.
 const VIEWS_WAIT: Duration = Duration::from_secs(5);
@@ -109,13 +114,13 @@ fn decoder_limits() -> Option<&'static DecoderCapabilities> {
         .as_ref()
 }
 
-/// The size of one eye's picture to ask the host for: the headset's recommended size, or a smaller
-/// one that the decoder takes at the refresh rate of the stream. The decoder's frame is the one
-/// that the host's foveation gives.
-fn eye_for(recommended: [u32; 2], refresh_rates: &[f32]) -> [u32; 2] {
+/// The size of one eye's picture to ask the host for. It is the recommended size, or a smaller one
+/// that the decoder takes at the refresh rate of the stream. With `foveation` the decoder's frame
+/// has the layout that the host's foveation gives. Without it the frame holds both eyes whole.
+fn eye_for(recommended: [u32; 2], refresh_rates: &[f32], foveation: bool) -> [u32; 2] {
     let rate = refresh_rates.iter().copied().filter(|rate| *rate <= SIZING_RATE).fold(0.0, f32::max).max(1.0);
     let eye = match decoder_limits() {
-        Some(limits) => sizing::choose_eye(recommended, true, |frame| sizing::decoder_takes(limits, frame, rate)),
+        Some(limits) => sizing::choose_eye(recommended, foveation, |frame| sizing::decoder_takes(limits, frame, rate)),
         None => recommended,
     };
     if eye != recommended {
@@ -125,8 +130,23 @@ fn eye_for(recommended: [u32; 2], refresh_rates: &[f32]) -> [u32; 2] {
 }
 
 /// What the client tells the host about itself. A headset reports its name, the size of the
-/// pictures that its displays take and its refresh rates.
-fn device_caps(tcp_only: bool, headset: Option<&HeadsetInfo>, views: Views) -> ClientCaps {
+/// pictures that its displays take and its refresh rates. A phone reports its screen. The picture
+/// has the screen's shape. The rate is the screen's. The phone takes no foveation, because the flat
+/// picture cannot unwarp it.
+fn device_caps(tcp_only: bool, headset: Option<&HeadsetInfo>, phone: Option<PhoneInfo>, views: Views) -> ClientCaps {
+    if let Some(phone) = phone {
+        let refresh_rates = vec![phone.refresh_hz];
+        return ClientCaps {
+            name: PHONE_NAME.into(),
+            eye_size: eye_for(phone::eye_size(phone.screen), &refresh_rates, false),
+            views,
+            refresh_rates,
+            codecs: vec![Codec::Hevc],
+            decoders: 1,
+            foveation: false,
+            tcp_only,
+        };
+    }
     let (name, recommended, refresh_rates) = match headset {
         Some(HeadsetInfo { properties, .. }) => {
             let size = properties.eye_image_sizes[0].recommended;
@@ -141,7 +161,7 @@ fn device_caps(tcp_only: bool, headset: Option<&HeadsetInfo>, views: Views) -> C
     let refresh_rates = refresh_rates.unwrap_or_else(|| REFRESH_RATES.to_vec());
     ClientCaps {
         name: name.unwrap_or_else(|| DEFAULT_NAME.into()),
-        eye_size: eye_for(recommended, &refresh_rates),
+        eye_size: eye_for(recommended, &refresh_rates, true),
         views,
         refresh_rates,
         codecs: vec![Codec::Hevc],
@@ -262,17 +282,24 @@ fn run(
         MediaChoice::Tcp => true,
     };
     let headset = hub.headset();
-    let views = if headset.is_some() {
+    let device = hub.device();
+    let views = match device {
         // The Hello carries the eye views, which the headset reports once it tracks the head
-        hub.feed.wait_views(VIEWS_WAIT).unwrap_or_else(|| {
+        Device::Headset => hub.feed.wait_views(VIEWS_WAIT).unwrap_or_else(|| {
             log::warn!("the headset reported no eye views within {VIEWS_WAIT:?}; the Hello carries placeholders");
             tracking::placeholder_views()
-        })
-    } else {
-        tracking::placeholder_views()
+        }),
+        // A phone's frames give them once the screen's size and rate are known
+        Device::Phone => hub.feed.wait_views(VIEWS_WAIT).unwrap_or_else(|| {
+            log::warn!("the phone's screen was not measured within {VIEWS_WAIT:?}; the Hello carries placeholders");
+            phone::default_views()
+        }),
+        Device::Window => tracking::placeholder_views(),
     };
+    // A phone that did not measure its screen in time still connects, at an ordinary rate
+    let phone_info = (device == Device::Phone).then(|| hub.phone().unwrap_or(PhoneInfo { screen: [1920, 1080], refresh_hz: 60.0 }));
     let identity = crate::settings::identity();
-    let caps = device_caps(tcp_media, headset.as_ref(), views);
+    let caps = device_caps(tcp_media, headset.as_ref(), phone_info, views);
     log::info!(
         "Hello: {} with {}x{} pixels an eye, refresh rates {:?}, fov {:?}, eyes at {:?}",
         caps.name,
@@ -318,7 +345,7 @@ fn run(
         link.duplex.close();
         return;
     }
-    let reason = session(hub, id, &link, headset.is_some(), views, stop);
+    let reason = session(hub, id, &link, device, views, stop);
     // The threads of the session stop on this flag
     stop.store(true, Ordering::Relaxed);
     link.duplex.close();
@@ -387,8 +414,11 @@ struct Shared<'a> {
     averages: Mutex<Averages>,
     view: Mutex<DecoderView>,
     decoder_frames: Mutex<Option<DecodedFrames>>,
-    /// Whether the app runs in a headset. Only a headset decodes.
-    in_headset: bool,
+    /// What the app runs on. A headset and a phone decode. A window does not.
+    device: Device,
+    /// The orientation of the left eye in the newest frame that arrived. It is the pose for which
+    /// the host rendered the frame.
+    rendered: Mutex<Option<[f32; 4]>>,
 }
 
 impl Shared<'_> {
@@ -413,7 +443,7 @@ impl Shared<'_> {
 }
 
 /// Runs a session until the link ends and returns the reason.
-fn session(hub: &'static Hub, id: u64, link: &ClientLink, in_headset: bool, hello_views: Views, stop: &AtomicBool) -> Error {
+fn session(hub: &'static Hub, id: u64, link: &ClientLink, device: Device, hello_views: Views, stop: &AtomicBool) -> Error {
     let stream = link.welcome.stream.clone();
     let layout = StreamLayout::new(stream.eye_size, stream.foveation);
     let picture = layout.frame();
@@ -472,16 +502,18 @@ fn session(hub: &'static Hub, id: u64, link: &ClientLink, in_headset: bool, hell
         averages: Mutex::new(Averages::default()),
         view: Mutex::new(DecoderView::Idle),
         decoder_frames: Mutex::new(None),
-        in_headset,
+        device,
+        rendered: Mutex::new(None),
     };
     shared.set_stream(&stream);
     let shared = &shared;
     let (units_tx, units_rx) = mpsc::channel::<Received>();
     // The desktop panel and the sound have their own state (desktop.rs, audio.rs)
-    let desktop_units = crate::desktop::desktop().session_start(in_headset);
-    // Only a headset plays the sound. A flat window on the Mac that runs the host would play what
-    // the host captures. The host would capture it again: an echo that grows.
-    if let (Some(format), true) = (stream.audio, in_headset) {
+    // Only a headset shows the desktop panel
+    let desktop_units = crate::desktop::desktop().session_start(device == Device::Headset);
+    // Only a headset or a phone plays the sound. A flat window on the Mac that runs the host would
+    // play what the host captures. The host would capture it again: an echo that grows.
+    if let (Some(format), true) = (stream.audio, device.is_live()) {
         crate::audio::open(format);
     }
     let reason = thread::scope(|scope| {
@@ -492,7 +524,7 @@ fn session(hub: &'static Hub, id: u64, link: &ClientLink, in_headset: bool, hell
         }
         named("cranvr-upkeep").spawn_scoped(scope, move || upkeep(shared)).expect("the upkeep thread");
         named("cranvr-tracking")
-            .spawn_scoped(scope, move || tracking::send_loop(link, &hub.feed, in_headset, refresh_hz, hello_views, stop))
+            .spawn_scoped(scope, move || tracking::send_loop(link, &hub.feed, device.is_live(), refresh_hz, hello_views, stop))
             .expect("the tracking thread");
         named("cranvr-decode").spawn_scoped(scope, move || decode_loop(shared, &units_rx)).expect("the decoder thread");
         named("cranvr-stats").spawn_scoped(scope, move || stats_loop(shared)).expect("the stats thread");
@@ -637,6 +669,19 @@ fn video_codec(codec: Codec) -> VideoCodec {
     }
 }
 
+/// A frame that came in, as the timing report names it.
+struct Arrival {
+    frame: u32,
+    tracking_sample: Nanos,
+    received: Nanos,
+}
+
+impl From<&Sent> for Arrival {
+    fn from(sent: &Sent) -> Self {
+        Self { frame: sent.frame, tracking_sample: sent.tracking_sample, received: sent.received }
+    }
+}
+
 /// The decoder thread's state.
 struct Decode<'s, 'a> {
     s: &'s Shared<'a>,
@@ -692,7 +737,7 @@ impl Decode<'_, '_> {
     }
 
     /// Makes a decoder when the parameter sets are there. Makes a new one when they change. Only a
-    /// headset decodes: its streamed scene draws the decoder's frames.
+    /// headset or a phone decodes: its streamed scene draws the decoder's frames.
     fn sync_decoder(&mut self) {
         let s = self.s;
         let wanted = s.epoch.load(Ordering::Relaxed);
@@ -700,7 +745,7 @@ impl Decode<'_, '_> {
             return;
         }
         self.retry_at = None;
-        if !s.in_headset {
+        if !s.device.is_live() {
             self.built_for = Some(wanted);
             self.set_view(DecoderView::NoHeadset);
             return;
@@ -766,8 +811,11 @@ impl Decode<'_, '_> {
             averages.network_ms += unit.completed.saturating_sub(sent) as f64 / 1e6;
             averages.network_n += 1;
         }
+        *s.rendered.lock().unwrap() = Some(meta.eye_poses[0].orientation);
         if self.decoder.is_some() {
-            self.submit(unit);
+            if self.submit(unit) && s.device == Device::Phone {
+                self.send_phone_timing(unit);
+            }
         } else {
             // Without a decoder, as in a flat window, a frame counts as decoded when it arrives.
             // The host still gets its timing and keeps its pace.
@@ -782,8 +830,30 @@ impl Decode<'_, '_> {
                 target_display: meta.target_display,
             };
             let display_time = s.hub.feed.display_time_after(unit.completed, s.period_ns.load(Ordering::Relaxed));
-            self.send_timing(&sent, unit.completed, unit.completed, display_time, s.period_ns.load(Ordering::Relaxed));
+            self.send_timing(&Arrival::from(&sent), unit.completed, unit.completed, display_time, s.period_ns.load(Ordering::Relaxed));
         }
+    }
+
+    /// Tells the host when a phone could show the frame. A phone's scene shows the newest frame at
+    /// the next screen frame. Nothing tells the connection when the picture came out of the
+    /// decoder, so the timing is an estimate. The picture is ready the decoder's mean time after the
+    /// arrival. The first screen frame that starts after that takes it. That frame reaches the
+    /// display one period after it starts. The display time is therefore the first point of the
+    /// screen's grid at or after the ready time plus one period. The take lies one period before it.
+    fn send_phone_timing(&self, unit: &Received) {
+        let s = self.s;
+        let decode = s.decoder_frames.lock().unwrap().as_ref().map_or(Duration::ZERO, |frames| frames.stats().mean_decode);
+        let decode_end = unit.completed + decode.as_nanos() as u64;
+        let period = s.period_ns.load(Ordering::Relaxed);
+        let display_time = s.hub.feed.display_time_after(decode_end + period, period);
+        let picked = display_time.saturating_sub(period);
+        {
+            let mut averages = s.averages.lock().unwrap();
+            averages.pose_to_decode_ms += decode_end.saturating_sub(unit.meta.tracking_sample) as f64 / 1e6;
+            averages.pose_to_decode_n += 1;
+        }
+        let arrival = Arrival { frame: unit.meta.frame, tracking_sample: unit.meta.tracking_sample, received: unit.completed };
+        self.send_timing(&arrival, decode_end, picked, display_time, period);
     }
 
     /// The field of view that the host renders with
@@ -791,7 +861,8 @@ impl Decode<'_, '_> {
         self.s.hub.feed.host_views().unwrap_or_else(tracking::placeholder_views).fov
     }
 
-    fn submit(&mut self, unit: &Received) {
+    /// Puts the frame into the decoder. Returns whether the decoder took it.
+    fn submit(&mut self, unit: &Received) -> bool {
         let s = self.s;
         let meta = &unit.meta;
         // The decoder wants the parameter sets in front of each key frame
@@ -834,7 +905,9 @@ impl Decode<'_, '_> {
             }
             s.waiting_key.store(true, Ordering::Relaxed);
             s.request_key_frame(meta.frame);
+            return false;
         }
+        true
     }
 
     /// Tells the host about the frames that the headset took for its display since the last call.
@@ -855,18 +928,18 @@ impl Decode<'_, '_> {
                     averages.late += u32::from(shown.late);
                 }
             }
-            self.send_timing(&sent, decode_end, shown.picked, shown.display_time, shown.period);
+            self.send_timing(&Arrival::from(&sent), decode_end, shown.picked, shown.display_time, shown.period);
         }
     }
 
     /// Tells the host what the display did with a frame: when the picture came out of the decoder
     /// and when the display shows it.
-    fn send_timing(&self, sent: &Sent, decode_end: Nanos, picked: Nanos, display_time: Nanos, period: Nanos) {
+    fn send_timing(&self, arrival: &Arrival, decode_end: Nanos, picked: Nanos, display_time: Nanos, period: Nanos) {
         let timing = FrameTiming {
             stream: 0,
-            frame: sent.frame,
-            tracking_sample: sent.tracking_sample,
-            received: sent.received,
+            frame: arrival.frame,
+            tracking_sample: arrival.tracking_sample,
+            received: arrival.received,
             decode_end,
             picked,
             display_time,
@@ -958,6 +1031,8 @@ fn stats_loop(s: &Shared<'_>) {
             headset_fps,
             headset_gap_ms: ms(headset_gap),
             head_position: s.hub.feed.head().map(|head| head.pose.position),
+            head_orientation: s.hub.feed.head().map(|head| head.pose.orientation),
+            rendered_orientation: *s.rendered.lock().unwrap(),
             late_pct,
             tracking_live: s.hub.feed.is_live(),
             open_us_per_frame,
@@ -968,6 +1043,19 @@ fn stats_loop(s: &Shared<'_>) {
         drop(totals);
         if log_due.elapsed() >= LOG_EVERY {
             log_due = Instant::now();
+            if s.device == Device::Phone {
+                // The log line shows the orientation that the phone sent. It shows the orientation
+                // for which the host rendered the newest frame too. The two agree when the host
+                // takes the tracking. The time between the two moments makes a small difference.
+                let looks = |orientation: Option<[f32; 4]>| orientation.map(|q| phone::forward(q).map(|v| (v * 100.0).round() / 100.0));
+                log::info!(
+                    "phone head: sent {:?} looking {:?}; the newest frame was rendered for {:?} looking {:?}",
+                    stats.head_orientation.map(|q| q.map(|v| (v * 1000.0).round() / 1000.0)),
+                    looks(stats.head_orientation),
+                    stats.rendered_orientation.map(|q| q.map(|v| (v * 1000.0).round() / 1000.0)),
+                    looks(stats.rendered_orientation),
+                );
+            }
             log::info!(
                 "{:.1} fps received, {:.1} fps decoded, {:.1} fps shown, {:.1} skipped, {:.1} repeated of {:.1} headset frames (gap up to {:.1} ms), {:.0}% late at the take, {} dropped by the decoder, {:.1} Mbps, decode {:.2} ms mean, rtt {} ms, \
                  network {} ms, pose to decode {} ms, tracking {} at {:?}, {} of {} packets lost, {} units recovered, {} units lost, \
