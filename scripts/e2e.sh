@@ -37,7 +37,9 @@
 #                 scripts/build-client.sh) instead of the store ALVR app. The host then runs with
 #                 --protocol native --trust-all on --native-port. The app gets this Mac's address
 #                 as a launch extra. The run keeps the host's key in
-#                 target/e2e/host-identity.txt: a headset refuses a known address with a new key.
+#                 target/e2e/host-identity.txt: a headset refuses a known address and port with
+#                 a new key. Give a --native-port that the headset has not used with another
+#                 host at this Mac's address, such as 9961.
 #                 Without --quest or --android the client is cranvr-probe on this Mac, over
 #                 loopback TCP.
 #   --native      cranvr's own protocol instead of ALVR's: the host runs with --protocol native

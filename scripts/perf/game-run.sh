@@ -6,7 +6,7 @@
 #   SECONDS    how long to record, 25 s after the game connects
 #   PROGRAM    the game's Windows path (default: Beat Saber)
 #
-# The cranvr app must run with "cranvr client" as its Headset app (Settings tab), and the headset
+# The cranvr app must run with "cranvr client" as its Headset app (Settings tab). The headset
 # must be paired with it already (see "Pairing" in the README). The script wakes the headset
 # without a wearer (proximity sensor and guardian off), starts the Cranpose client
 # (dev.cranvr.client2) and the game without sound, records the host's stats and the Mac's GPU
