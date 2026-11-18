@@ -9,6 +9,7 @@
 //! state a few times a second.
 
 use crate::{
+    console::Backdrop,
     console_panel::{self, ConsolePanel},
     hub::{hub, DecoderView, Device, LinkState, Snapshot, Stats},
     phone::{self, PhoneFrames},
@@ -19,7 +20,7 @@ use cranpose::prelude::*;
 use cranpose::text::{FontWeight, TextUnit};
 use cranpose::DecodedFrames;
 use cranpose_xr::{
-    local_haptics, local_headset_properties, local_spatial_capabilities, FollowMode, FollowTarget, FollowingSubspace, Pose,
+    local_haptics, local_headset_properties, local_spatial_capabilities, local_spatial_environment, FollowMode, FollowTarget, FollowingSubspace, Pose,
     SpatialFrameEffect, SpatialPanel, StreamedScene, SubspaceModifier,
 };
 use cranvr_proto::{clock::now_ns, identity::format_code};
@@ -55,21 +56,25 @@ fn side_pose(side: f32) -> Pose {
     SubspaceModifier::new().offset(side * SIDE_OFFSET[0], SIDE_OFFSET[1], SIDE_OFFSET[2]).rotate(0.0, -side * SIDE_TURN, 0.0).pose()
 }
 
-/// The app. In a headset it shows the game's picture around the viewer, the connect panel to the
-/// left and the stats panel to the right.
+/// The app. In a headset it shows the game's picture around the viewer while a game runs, and the
+/// room otherwise. The connect panel stands to the left and the stats panel to the right.
 #[composable]
 pub fn ClientApp() {
     // The connection reads what the headset is from the hub. The values do not change in a
     // session, so this runs before any panel can start a connection.
     hub().attach(local_headset_properties().current(), local_haptics().current());
+    // The saved Room and Volume settings apply before any panel or link needs them
+    hub().load_settings();
     let Link { snapshot, frames } = link();
     let console = rememberMutableStateOf(|| hub().console());
+    let backdrop = rememberMutableStateOf(|| hub().backdrop());
     LaunchedEffect((), async move |_| {
         if settings::console_on_launch() {
             hub().pin_console();
         }
         loop {
             console.set(hub().console());
+            backdrop.set(hub().backdrop());
             delay(CONSOLE_POLL).await;
         }
     });
@@ -85,8 +90,30 @@ pub fn ClientApp() {
         StatsPanel(snapshot);
         crate::desktop::DesktopPanel();
         ConsolePanel(console, snapshot);
-        Stream(frames);
+        Behind(backdrop, frames);
     });
+}
+
+/// What fills the view behind the panels. While no game runs and the user kept the Room setting at
+/// Passthrough, the room shows and the streamed scene stays out of the composition. The host still
+/// sends its scene then and the decoder drops the pictures that nobody takes. While a game runs, or
+/// with the Room setting at Scene, the streamed scene shows the host's picture and the app asks for
+/// no passthrough. A headset that cannot show the room keeps the scene, because the app's own
+/// background is black.
+#[composable]
+fn Behind(backdrop: MutableState<Backdrop>, frames: MutableState<Option<DecodedFrames>>) {
+    let environment = local_spatial_environment().current();
+    let available = environment.is_some() && local_spatial_capabilities().current().is_passthrough_control_enabled();
+    let room = backdrop.get().shows_room(available);
+    LaunchedEffect(room, async move |_| {
+        if let Some(environment) = environment {
+            log::info!("the room behind the panels: {}", if room { "passthrough" } else { "the host's picture" });
+            environment.set_preferred_passthrough_opacity(Some(if room { 1.0 } else { 0.0 }));
+        }
+    });
+    if !room {
+        Stream(frames);
+    }
 }
 
 /// The app on a phone or a tablet. The picture fills the screen. The device's motion sensors move

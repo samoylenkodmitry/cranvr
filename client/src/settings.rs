@@ -5,6 +5,7 @@
 //! (`adb shell am start ... --es host 192.168.1.20:9950 --ez connect true`) and the command line
 //! on the desktop (`--host=192.168.1.20:9950 --connect`).
 
+use crate::console::{Room, Volume};
 use crate::hub::MediaChoice;
 use cranpose::{launch_args, preferences};
 use cranvr_proto::identity::{from_hex, random_bytes, to_hex, Identity};
@@ -12,6 +13,8 @@ use std::sync::OnceLock;
 
 const HOST_KEY: &str = "host";
 const IDENTITY_KEY: &str = "identity";
+const ROOM_KEY: &str = "room";
+const VOLUME_KEY: &str = "volume";
 /// The address that works over USB with `adb reverse tcp:9950 tcp:9950`, and on the same Mac
 const DEFAULT_HOST: &str = "127.0.0.1:9950";
 
@@ -29,6 +32,30 @@ pub fn initial_host() -> String {
 pub fn remember_host(host: &str) {
     if let Err(e) = preferences().set(HOST_KEY, host.trim()) {
         log::warn!("the host address was not saved: {e}");
+    }
+}
+
+/// What shows behind the panels while no game runs, as the console's Room setting saved it. A
+/// missing or unknown value gives the passthrough.
+pub fn room() -> Room {
+    preferences().get(ROOM_KEY).and_then(|text| Room::from_key(&text)).unwrap_or_default()
+}
+
+pub fn remember_room(room: Room) {
+    if let Err(e) = preferences().set(ROOM_KEY, room.key()) {
+        log::warn!("the room setting was not saved: {e}");
+    }
+}
+
+/// How loud the sound plays, as the console's Volume setting saved it. A missing or unknown value
+/// gives 150%.
+pub fn volume() -> Volume {
+    preferences().get(VOLUME_KEY).and_then(|text| Volume::from_key(&text)).unwrap_or_default()
+}
+
+pub fn remember_volume(volume: Volume) {
+    if let Err(e) = preferences().set(VOLUME_KEY, &volume.key()) {
+        log::warn!("the volume setting was not saved: {e}");
     }
 }
 
