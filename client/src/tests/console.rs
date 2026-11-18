@@ -52,37 +52,14 @@ fn the_height_grows_with_the_games_up_to_the_limit() {
 }
 
 #[test]
-fn the_console_stands_below_and_ahead_of_the_head_and_faces_it() {
-    // A head at 1.6 m above the start that looks ahead
-    let place = Place::below_ahead_of([0.0, 1.6, 0.0], [0.0, 0.0, 0.0, 1.0]);
-    // 0.6 m ahead of the head is 0.4 m ahead of the subspace's origin: 0.4 m toward the viewer from it
-    assert_eq!(place.offset[0], 0.0);
-    assert!((place.offset[1] - 1200.0).abs() < 1e-2 && (place.offset[2] - 400.0).abs() < 1e-2, "{place:?}");
-    assert_eq!((place.pitch, place.yaw), (-34.0, 0.0));
-    // The same head turned 90 degrees to the left stands the console to its left, turned to face it
-    let half = std::f32::consts::FRAC_PI_4;
-    let left = Place::below_ahead_of([0.0, 1.6, 0.0], [0.0, half.sin(), 0.0, half.cos()]);
-    assert!((left.offset[0] + 600.0).abs() < 1e-2 && (left.offset[2] - 1000.0).abs() < 1e-2, "{left:?}");
-    assert!((left.yaw - 90.0).abs() < 1e-3, "{left:?}");
-    // A head that nods down by 45 degrees still looks ahead for the console's sake
-    let nod = std::f32::consts::FRAC_PI_8;
-    let down = Place::below_ahead_of([0.0, 1.6, 0.0], [-nod.sin(), 0.0, 0.0, nod.cos()]);
-    assert!((down.offset[2] - 400.0).abs() < 1e-2 && down.yaw.abs() < 1e-3, "{down:?}");
-    // Straight down has no facing: the console goes ahead of the start
-    let straight = std::f32::consts::FRAC_PI_4;
-    let floor = Place::below_ahead_of([0.0, 1.6, 0.0], [-straight.sin(), 0.0, 0.0, straight.cos()]);
-    assert!((floor.offset[2] - 400.0).abs() < 1e-1 && floor.yaw.abs() < 1e-3, "{floor:?}");
-}
-
-#[test]
 fn the_first_menu_opens_the_console_and_a_game_closes_it() {
     let mut console = Console::default();
     assert!(!console.view().open);
     console.on_menu(menu(None));
-    assert!(console.view().open && console.view().opened == 1);
+    assert!(console.view().open);
     // The next menus change nothing while no game starts
     console.on_menu(menu(None));
-    assert_eq!(console.view().opened, 1);
+    assert!(console.view().open);
     // The user hides it. A menu without a change of the game keeps it hidden.
     console.close();
     console.on_menu(menu(None));
@@ -92,31 +69,29 @@ fn the_first_menu_opens_the_console_and_a_game_closes_it() {
     assert!(!console.view().open);
     console.on_menu(menu(Some("Beat Saber.exe")));
     console.on_menu(menu(None));
-    assert!(console.view().open && console.view().opened == 2);
+    assert!(console.view().open);
     // The link ends: no menu, no console
     console.clear();
     assert!(!console.view().open && console.view().menu.is_none());
 }
 
 #[test]
-fn a_hold_of_the_menu_button_shows_the_console_where_the_head_is() {
+fn a_hold_of_the_menu_button_shows_or_hides_the_console() {
     let mut console = Console::default();
-    let head = Some(([1.0, 1.5, 0.0], [0.0, 0.0, 0.0, 1.0]));
     let ms = 1_000_000;
     // A short press does nothing: the game gets it
-    assert!(!console.on_frame(head, true, 1_000 * ms));
-    assert!(!console.on_frame(head, true, 1_000 * ms + HOLD_NS - 1));
-    assert!(!console.on_frame(head, false, 1_000 * ms + HOLD_NS + ms));
+    assert!(!console.on_frame(true, 1_000 * ms));
+    assert!(!console.on_frame(true, 1_000 * ms + HOLD_NS - 1));
+    assert!(!console.on_frame(false, 1_000 * ms + HOLD_NS + ms));
     assert!(!console.view().open);
-    // A hold toggles once, and the console stands at the head
-    assert!(!console.on_frame(head, true, 2_000 * ms));
-    assert!(console.on_frame(head, true, 2_000 * ms + HOLD_NS));
-    assert!(!console.on_frame(head, true, 2_000 * ms + 2 * HOLD_NS), "one toggle for one hold");
-    let view = console.view();
-    assert!(view.open && (view.place.offset[0] - 1000.0).abs() < 1e-2, "{:?}", view.place);
+    // A hold toggles once
+    assert!(!console.on_frame(true, 2_000 * ms));
+    assert!(console.on_frame(true, 2_000 * ms + HOLD_NS));
+    assert!(!console.on_frame(true, 2_000 * ms + 2 * HOLD_NS), "one toggle for one hold");
+    assert!(console.view().open);
     // Another hold hides it
-    assert!(!console.on_frame(None, false, 3_000 * ms));
-    assert!(!console.on_frame(None, true, 4_000 * ms));
-    assert!(console.on_frame(None, true, 4_000 * ms + HOLD_NS));
+    assert!(!console.on_frame(false, 3_000 * ms));
+    assert!(!console.on_frame(true, 4_000 * ms));
+    assert!(console.on_frame(true, 4_000 * ms + HOLD_NS));
     assert!(!console.view().open);
 }

@@ -10,15 +10,15 @@
 use crate::{
     console_panel::{self, ConsolePanel},
     hub::{hub, DecoderView, LinkState, Snapshot, Stats},
-    settings,
+    place, settings,
 };
 use crate::tracking::FrameReader;
 use cranpose::prelude::*;
 use cranpose::text::{FontWeight, TextUnit};
 use cranpose::DecodedFrames;
 use cranpose_xr::{
-    local_haptics, local_headset_properties, local_spatial_capabilities, SpatialFrameEffect, SpatialPanel, StreamedScene,
-    Subspace, SubspaceModifier,
+    local_haptics, local_headset_properties, local_spatial_capabilities, FollowMode, FollowTarget, FollowingSubspace, Pose,
+    SpatialFrameEffect, SpatialPanel, StreamedScene, SubspaceModifier,
 };
 use cranvr_proto::{clock::now_ns, identity::format_code};
 use std::{cell::RefCell, rc::Rc, time::Duration};
@@ -46,6 +46,12 @@ pub(crate) const STOP_COLOR: Color = Color(0.75, 0.3, 0.3, 1.0);
 // and to the right of the stream, and face the viewer.
 const SIDE_OFFSET: [f32; 3] = [760.0, 0.0, 300.0];
 const SIDE_TURN: f32 = 45.0;
+
+/// The pose of a side panel before the user carries it, relative to the origin of the subspace, which
+/// lies a meter ahead of the head: `side` is -1 for the left and 1 for the right.
+fn side_pose(side: f32) -> Pose {
+    SubspaceModifier::new().offset(side * SIDE_OFFSET[0], SIDE_OFFSET[1], SIDE_OFFSET[2]).rotate(0.0, -side * SIDE_TURN, 0.0).pose()
+}
 
 /// The app. In a headset it shows the game's picture around the viewer, the connect panel to the
 /// left and the stats panel to the right.
@@ -87,7 +93,11 @@ pub fn ClientApp() {
             delay(STREAM_POLL).await;
         }
     });
-    Subspace(move || {
+    // The origin of the panels' frame stands a meter ahead of the head when the first frame tracks it,
+    // and again after each recenter. A panel that the user never carried starts at its default
+    // pose in that frame, so the first start opens in front of the user. A saved pose is in the same
+    // frame (see `place.rs`).
+    FollowingSubspace(FollowTarget::View(FollowMode::Snap), move || {
         HeadsetFrames();
         // A flat window shows the panels in this order, side by side. In a headset each panel has
         // its own place.
@@ -166,12 +176,9 @@ fn ConnectPanel(snapshot: MutableState<Snapshot>) {
     });
     // In a headset a focused field must not ask for a software keyboard
     let in_headset = local_spatial_capabilities().current().is_spatial_ui_enabled();
+    let pose = remember(|| place::start_pose("connect", side_pose(-1.0))).with(|pose| *pose);
     SpatialPanel(
-        SubspaceModifier::new()
-            .size(760.0, 840.0)
-            .offset(-SIDE_OFFSET[0], SIDE_OFFSET[1], SIDE_OFFSET[2])
-            .rotate(0.0, SIDE_TURN, 0.0)
-            .movable(),
+        place::movable("connect", SubspaceModifier::new().size(760.0, 840.0), pose, |_| {}),
         move || {
             let snap = snapshot.get();
             let state = snap.state.clone();
@@ -321,12 +328,9 @@ fn state_text(state: &LinkState, address: &str) -> (String, Color) {
 /// The numbers of the link: rates, decoder times, loss and latency.
 #[composable]
 fn StatsPanel(snapshot: MutableState<Snapshot>) {
+    let pose = remember(|| place::start_pose("stats", side_pose(1.0))).with(|pose| *pose);
     SpatialPanel(
-        SubspaceModifier::new()
-            .size(700.0, 840.0)
-            .offset(SIDE_OFFSET[0], SIDE_OFFSET[1], SIDE_OFFSET[2])
-            .rotate(0.0, -SIDE_TURN, 0.0)
-            .movable(),
+        place::movable("stats", SubspaceModifier::new().size(700.0, 840.0), pose, |_| {}),
         move || {
             let snap = snapshot.get();
             let lines = stat_lines(&snap);

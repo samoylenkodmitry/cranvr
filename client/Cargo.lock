@@ -743,8 +743,8 @@ dependencies = [
 
 [[package]]
 name = "cranpose"
-version = "0.25.0"
-source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=40abced053656782256aececf04a0bf182a893b5#40abced053656782256aececf04a0bf182a893b5"
+version = "0.26.0"
+source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=673817c9fab8ae3110dab11bfa9cd6108c2d6829#673817c9fab8ae3110dab11bfa9cd6108c2d6829"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -802,8 +802,8 @@ dependencies = [
 
 [[package]]
 name = "cranpose-animation"
-version = "0.25.0"
-source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=40abced053656782256aececf04a0bf182a893b5#40abced053656782256aececf04a0bf182a893b5"
+version = "0.26.0"
+source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=673817c9fab8ae3110dab11bfa9cd6108c2d6829#673817c9fab8ae3110dab11bfa9cd6108c2d6829"
 dependencies = [
  "cranpose-core",
  "cranpose-ui-graphics",
@@ -811,8 +811,8 @@ dependencies = [
 
 [[package]]
 name = "cranpose-app-shell"
-version = "0.25.0"
-source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=40abced053656782256aececf04a0bf182a893b5#40abced053656782256aececf04a0bf182a893b5"
+version = "0.26.0"
+source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=673817c9fab8ae3110dab11bfa9cd6108c2d6829#673817c9fab8ae3110dab11bfa9cd6108c2d6829"
 dependencies = [
  "arboard",
  "cranpose-core",
@@ -828,8 +828,8 @@ dependencies = [
 
 [[package]]
 name = "cranpose-audio"
-version = "0.25.0"
-source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=40abced053656782256aececf04a0bf182a893b5#40abced053656782256aececf04a0bf182a893b5"
+version = "0.26.0"
+source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=673817c9fab8ae3110dab11bfa9cd6108c2d6829#673817c9fab8ae3110dab11bfa9cd6108c2d6829"
 dependencies = [
  "block2 0.6.2",
  "cranpose-services",
@@ -844,16 +844,16 @@ dependencies = [
 
 [[package]]
 name = "cranpose-capabilities"
-version = "0.25.0"
-source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=40abced053656782256aececf04a0bf182a893b5#40abced053656782256aececf04a0bf182a893b5"
+version = "0.26.0"
+source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=673817c9fab8ae3110dab11bfa9cd6108c2d6829#673817c9fab8ae3110dab11bfa9cd6108c2d6829"
 dependencies = [
  "fluent-syntax",
 ]
 
 [[package]]
 name = "cranpose-core"
-version = "0.25.0"
-source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=40abced053656782256aececf04a0bf182a893b5#40abced053656782256aececf04a0bf182a893b5"
+version = "0.26.0"
+source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=673817c9fab8ae3110dab11bfa9cd6108c2d6829#673817c9fab8ae3110dab11bfa9cd6108c2d6829"
 dependencies = [
  "dispatch2",
  "event-listener",
@@ -873,8 +873,8 @@ dependencies = [
 
 [[package]]
 name = "cranpose-foundation"
-version = "0.25.0"
-source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=40abced053656782256aececf04a0bf182a893b5#40abced053656782256aececf04a0bf182a893b5"
+version = "0.26.0"
+source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=673817c9fab8ae3110dab11bfa9cd6108c2d6829#673817c9fab8ae3110dab11bfa9cd6108c2d6829"
 dependencies = [
  "cranpose-core",
  "cranpose-macros",
@@ -888,8 +888,8 @@ dependencies = [
 
 [[package]]
 name = "cranpose-liquid"
-version = "0.25.0"
-source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=40abced053656782256aececf04a0bf182a893b5#40abced053656782256aececf04a0bf182a893b5"
+version = "0.26.0"
+source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=673817c9fab8ae3110dab11bfa9cd6108c2d6829#673817c9fab8ae3110dab11bfa9cd6108c2d6829"
 dependencies = [
  "cranpose-animation",
  "cranpose-core",
@@ -904,8 +904,8 @@ dependencies = [
 
 [[package]]
 name = "cranpose-macros"
-version = "0.25.0"
-source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=40abced053656782256aececf04a0bf182a893b5#40abced053656782256aececf04a0bf182a893b5"
+version = "0.26.0"
+source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=673817c9fab8ae3110dab11bfa9cd6108c2d6829#673817c9fab8ae3110dab11bfa9cd6108c2d6829"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -915,16 +915,16 @@ dependencies = [
 
 [[package]]
 name = "cranpose-platform-android"
-version = "0.25.0"
-source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=40abced053656782256aececf04a0bf182a893b5#40abced053656782256aececf04a0bf182a893b5"
+version = "0.26.0"
+source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=673817c9fab8ae3110dab11bfa9cd6108c2d6829#673817c9fab8ae3110dab11bfa9cd6108c2d6829"
 dependencies = [
  "cranpose-ui-graphics",
 ]
 
 [[package]]
 name = "cranpose-platform-desktop-winit"
-version = "0.25.0"
-source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=40abced053656782256aececf04a0bf182a893b5#40abced053656782256aececf04a0bf182a893b5"
+version = "0.26.0"
+source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=673817c9fab8ae3110dab11bfa9cd6108c2d6829#673817c9fab8ae3110dab11bfa9cd6108c2d6829"
 dependencies = [
  "cranpose-foundation",
  "cranpose-ui-graphics",
@@ -933,8 +933,8 @@ dependencies = [
 
 [[package]]
 name = "cranpose-render-common"
-version = "0.25.0"
-source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=40abced053656782256aececf04a0bf182a893b5#40abced053656782256aececf04a0bf182a893b5"
+version = "0.26.0"
+source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=673817c9fab8ae3110dab11bfa9cd6108c2d6829#673817c9fab8ae3110dab11bfa9cd6108c2d6829"
 dependencies = [
  "ab_glyph_rasterizer",
  "bytemuck",
@@ -950,8 +950,8 @@ dependencies = [
 
 [[package]]
 name = "cranpose-render-wgpu"
-version = "0.25.0"
-source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=40abced053656782256aececf04a0bf182a893b5#40abced053656782256aececf04a0bf182a893b5"
+version = "0.26.0"
+source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=673817c9fab8ae3110dab11bfa9cd6108c2d6829#673817c9fab8ae3110dab11bfa9cd6108c2d6829"
 dependencies = [
  "bytemuck",
  "cranpose-core",
@@ -971,8 +971,8 @@ dependencies = [
 
 [[package]]
 name = "cranpose-runtime-std"
-version = "0.25.0"
-source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=40abced053656782256aececf04a0bf182a893b5#40abced053656782256aececf04a0bf182a893b5"
+version = "0.26.0"
+source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=673817c9fab8ae3110dab11bfa9cd6108c2d6829#673817c9fab8ae3110dab11bfa9cd6108c2d6829"
 dependencies = [
  "cranpose-core",
  "web-time",
@@ -980,8 +980,8 @@ dependencies = [
 
 [[package]]
 name = "cranpose-services"
-version = "0.25.0"
-source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=40abced053656782256aececf04a0bf182a893b5#40abced053656782256aececf04a0bf182a893b5"
+version = "0.26.0"
+source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=673817c9fab8ae3110dab11bfa9cd6108c2d6829#673817c9fab8ae3110dab11bfa9cd6108c2d6829"
 dependencies = [
  "cranpose-core",
  "cranpose-macros",
@@ -1013,16 +1013,16 @@ dependencies = [
 
 [[package]]
 name = "cranpose-shader-passes"
-version = "0.25.0"
-source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=40abced053656782256aececf04a0bf182a893b5#40abced053656782256aececf04a0bf182a893b5"
+version = "0.26.0"
+source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=673817c9fab8ae3110dab11bfa9cd6108c2d6829#673817c9fab8ae3110dab11bfa9cd6108c2d6829"
 dependencies = [
  "naga",
 ]
 
 [[package]]
 name = "cranpose-text"
-version = "0.25.0"
-source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=40abced053656782256aececf04a0bf182a893b5#40abced053656782256aececf04a0bf182a893b5"
+version = "0.26.0"
+source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=673817c9fab8ae3110dab11bfa9cd6108c2d6829#673817c9fab8ae3110dab11bfa9cd6108c2d6829"
 dependencies = [
  "ab_glyph_rasterizer",
  "cranpose-ui-graphics",
@@ -1038,8 +1038,8 @@ dependencies = [
 
 [[package]]
 name = "cranpose-ui"
-version = "0.25.0"
-source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=40abced053656782256aececf04a0bf182a893b5#40abced053656782256aececf04a0bf182a893b5"
+version = "0.26.0"
+source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=673817c9fab8ae3110dab11bfa9cd6108c2d6829#673817c9fab8ae3110dab11bfa9cd6108c2d6829"
 dependencies = [
  "cranpose-animation",
  "cranpose-core",
@@ -1059,8 +1059,8 @@ dependencies = [
 
 [[package]]
 name = "cranpose-ui-graphics"
-version = "0.25.0"
-source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=40abced053656782256aececf04a0bf182a893b5#40abced053656782256aececf04a0bf182a893b5"
+version = "0.26.0"
+source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=673817c9fab8ae3110dab11bfa9cd6108c2d6829#673817c9fab8ae3110dab11bfa9cd6108c2d6829"
 dependencies = [
  "arrayvec",
  "bytemuck",
@@ -1072,8 +1072,8 @@ dependencies = [
 
 [[package]]
 name = "cranpose-ui-layout"
-version = "0.25.0"
-source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=40abced053656782256aececf04a0bf182a893b5#40abced053656782256aececf04a0bf182a893b5"
+version = "0.26.0"
+source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=673817c9fab8ae3110dab11bfa9cd6108c2d6829#673817c9fab8ae3110dab11bfa9cd6108c2d6829"
 dependencies = [
  "cranpose-core",
  "cranpose-ui-graphics",
@@ -1240,8 +1240,8 @@ dependencies = [
 
 [[package]]
 name = "cranpose-xr"
-version = "0.25.0"
-source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=40abced053656782256aececf04a0bf182a893b5#40abced053656782256aececf04a0bf182a893b5"
+version = "0.26.0"
+source = "git+https://github.com/samoylenkodmitry/Cranpose?rev=673817c9fab8ae3110dab11bfa9cd6108c2d6829#673817c9fab8ae3110dab11bfa9cd6108c2d6829"
 dependencies = [
  "android-activity",
  "ash",

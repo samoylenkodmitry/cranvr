@@ -1,31 +1,40 @@
 //! The console as a Cranpose panel: the games to play and the main settings, over the host's
-//! menu (see `console.rs`). The panel stands below and ahead of the head, tilted up like a desk
-//! console, and the user can carry it with a controller. A hold of the left menu button shows or
-//! hides it. A press on a button sends the request to the host.
+//! menu (see `console.rs`). A hold of the left menu button shows or hides it. A press on a button
+//! sends the request to the host.
+//!
+//! Each opening of the console puts it in front of the head, in a `FollowingSubspace` of its own
+//! that the panel's composition creates. The panel starts below and ahead of the head, tilted up like
+//! a desk console. The user can carry it with a controller. The pose of the last carry is relative to
+//! that subspace's origin, so the next opening puts the console at the same place relative to the
+//! head.
 
 use crate::{
     console::{self, size, Action, Game, Menu, View, RATES, SCALES},
     hub::{hub, LinkState, Snapshot},
+    place,
     tracking::Read,
     ui::{text_style, ACCENT_COLOR, KEY_COLOR, MUTED_COLOR, PANEL_COLOR, STOP_COLOR, TEXT_COLOR, WARN_COLOR},
 };
 use cranpose::prelude::*;
 use cranpose::text::FontWeight;
-use cranpose_xr::{Hand, SpatialPanel, SubspaceModifier, Vibration};
+use cranpose_xr::{FollowMode, FollowTarget, FollowingSubspace, Hand, Pose, SpatialPanel, SubspaceModifier, Vibration};
 use cranvr_proto::{message::buttons, wire::Nanos};
 use std::time::Duration;
 
 /// The width of a setting's name, in dp
 const LABEL: f32 = 150.0;
 
-/// Gives the console one frame of the headset: its head, for the place that the console takes
-/// when it opens, and the left menu button, whose hold shows or hides it. The frame loop calls it.
+/// Where the console starts, relative to the origin of its subspace, which lies 1 m ahead of the
+/// head: 0.6 m ahead of the head and 0.4 m below it, tilted up toward it by 34 degrees. The offset
+/// is in dp, a millimeter each.
+const START_OFFSET: [f32; 3] = [0.0, -400.0, 400.0];
+const START_TILT_DEGREES: f32 = 34.0;
+
+/// Gives the console one frame of the headset: the left menu button, whose hold shows or hides it.
+/// The frame loop calls it.
 pub fn on_frame(read: &Read, now: Nanos) {
-    let (head, menu_down) = match &read.frame {
-        Some(frame) => (Some((frame.head.pose.position, frame.head.pose.orientation)), frame.input.hands[0].buttons & buttons::MENU != 0),
-        None => (None, false),
-    };
-    if hub().console_frame(head, menu_down, now) {
+    let menu_down = read.frame.as_ref().is_some_and(|frame| frame.input.hands[0].buttons & buttons::MENU != 0);
+    if hub().console_frame(menu_down, now) {
         // A click on the left hand tells the user that the hold took
         if let Some(haptics) = hub().headset().and_then(|headset| headset.haptics) {
             haptics.vibrate(Hand::Left, Vibration::new(0.4, Duration::from_millis(40)));
@@ -39,28 +48,32 @@ pub fn ConsolePanel(view: MutableState<View>, snapshot: MutableState<Snapshot>) 
     let view = view.get();
     let state = snapshot.get().state;
     if view.open {
-        let height = console::height(view.menu.as_ref());
-        let place = view.place;
-        SpatialPanel(
-            SubspaceModifier::new()
-                .size(size::WIDTH, height)
-                .offset(place.offset[0], place.offset[1], place.offset[2])
-                .rotate(place.pitch, place.yaw, 0.0)
-                .movable(),
-            move || {
-                let menu = view.menu.clone();
-                let state = state.clone();
-                Column(
-                    Modifier::empty().fill_max_size().background(PANEL_COLOR).rounded_corners(24.0).padding(size::PADDING),
-                    ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(size::GAP)),
-                    move || match &menu {
-                        Some(menu) => MenuRows(menu.clone()),
-                        None => NoMenu(state.clone()),
-                    },
-                );
+        // The subspace leaves the composition with the console, so the next opening snaps it to the
+        // head again
+        FollowingSubspace(FollowTarget::View(FollowMode::Snap), move || OpenConsole(view.clone(), state.clone()));
+    }
+}
+
+#[composable]
+fn OpenConsole(view: View, state: LinkState) {
+    let height = console::height(view.menu.as_ref());
+    let start = remember(|| {
+        let default = SubspaceModifier::new().offset(START_OFFSET[0], START_OFFSET[1], START_OFFSET[2]).rotate(-START_TILT_DEGREES, 0.0, 0.0).pose();
+        place::start_pose("console", default)
+    })
+    .with(|pose: &Pose| *pose);
+    SpatialPanel(place::movable("console", SubspaceModifier::new().size(size::WIDTH, height), start, |_| {}), move || {
+        let menu = view.menu.clone();
+        let state = state.clone();
+        Column(
+            Modifier::empty().fill_max_size().background(PANEL_COLOR).rounded_corners(24.0).padding(size::PADDING),
+            ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(size::GAP)),
+            move || match &menu {
+                Some(menu) => MenuRows(menu.clone()),
+                None => NoMenu(state.clone()),
             },
         );
-    }
+    });
 }
 
 fn bold(size: f32) -> TextStyle {
@@ -172,7 +185,8 @@ fn Choice(label: String, selected: bool, action: Action, selected_color: Color, 
     );
 }
 
-/// The Close button, and the Disconnect button when the link runs.
+/// The Close button, the Disconnect button when the link runs, and the Exit button. The host's menu
+/// has no Exit item, so the client adds its own.
 #[composable]
 fn CloseButtons(link: bool) {
     Row(
@@ -197,6 +211,21 @@ fn CloseButtons(link: bool) {
                     },
                 );
             }
+            Button(
+                Modifier::empty().height(size::BUTTON).background(STOP_COLOR).rounded_corners(12.0).weight(1.0),
+                ButtonSpec::default(),
+                exit_app,
+                || {
+                    Text("Exit", Modifier::empty(), bold(22.0));
+                },
+            );
         },
     );
+}
+
+/// Ends the link, then closes the app. The hub outlives the activity, so a link that stayed open
+/// would go on sending the headset's tracking to the host.
+fn exit_app() {
+    hub().disconnect();
+    cranpose::request_exit();
 }

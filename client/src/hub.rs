@@ -476,10 +476,10 @@ impl Hub {
         self.console.lock().unwrap().view()
     }
 
-    /// One frame of the headset for the console: the head and the left menu button. Returns
+    /// One frame of the headset for the console: whether the left menu button is down. Returns
     /// whether a hold of the button showed or hid the console.
-    pub fn console_frame(&self, head: Option<([f32; 3], [f32; 4])>, menu_down: bool, now: Nanos) -> bool {
-        self.console.lock().unwrap().on_frame(head, menu_down, now)
+    pub fn console_frame(&self, menu_down: bool, now: Nanos) -> bool {
+        self.console.lock().unwrap().on_frame(menu_down, now)
     }
 
     pub fn close_console(&self) {

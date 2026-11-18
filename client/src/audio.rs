@@ -23,9 +23,13 @@
 //! The renderer never locks, allocates or waits. It always says "continue": a stream that the
 //! renderer stops is gone for good.
 //!
-//! The device's own output latency is not known: Cranpose's backend does not report it. `Stats`
-//! gives the buffer's fill, which is what this file controls. It gives the age of the sound when the
-//! network thread queued it.
+//! Cranpose's output stream reports the device's own numbers: its output latency, the frames of a
+//! burst and the times that the device had no frame to play (`AudioSink::underrun_count`). That
+//! count differs from this file's own underruns, which count the times that the jitter buffer ran
+//! dry. A dry buffer writes silence into a full device buffer and raises only this file's count. A
+//! device that ran dry raises the device's count. `Stats` and the log show both, so a dry-out that a
+//! listener hears has a cause. `Stats` also gives the buffer's fill, which is what this file controls,
+//! and the age of the sound when the network thread queued it.
 
 use cranpose_audio::{
     backend::{self, AudioSink, Renderer},
@@ -112,7 +116,16 @@ pub struct Stats {
     pub packets: u64,
     pub lost_packets: u64,
     pub late_packets: u64,
+    /// Times that the jitter buffer ran dry while the renderer played
     pub underruns: u64,
+    /// Times that the device had no frame to play, since the stream opened. `None` where the
+    /// platform keeps no count (cpal on a desktop).
+    pub device_underruns: Option<u32>,
+    /// How long a frame takes from the renderer to the output hardware, in ms, once the device
+    /// reports it
+    pub output_latency_ms: Option<f32>,
+    /// The frames that the device fills in one burst
+    pub frames_per_burst: Option<u32>,
     pub dropped_ms: f32,
     pub overflow_ms: f32,
     /// Seconds of sound played so far
@@ -136,7 +149,8 @@ struct Player {
     producer: Mutex<Producer>,
     shared: Arc<Shared>,
     source_rate: f32,
-    _sink: Box<dyn AudioSink>,
+    /// Stops the device when the player drops. It also reports the device's numbers.
+    sink: Box<dyn AudioSink>,
 }
 
 static PLAYER: Mutex<Option<Arc<Player>>> = Mutex::new(None);
@@ -159,7 +173,7 @@ pub fn open(format: AudioFormat) {
                 format.sample_rate
             );
             let producer = Mutex::new(Producer { queue, expected: None, shared: Arc::clone(&shared) });
-            let player = Arc::new(Player { producer, shared, source_rate: format.sample_rate as f32, _sink: sink });
+            let player = Arc::new(Player { producer, shared, source_rate: format.sample_rate as f32, sink });
             *PLAYER.lock().unwrap() = Some(Arc::clone(&player));
             let spawned = std::thread::Builder::new().name("cranvr-audio-log".into()).spawn(move || log_loop(&player));
             if let Err(e) = spawned {
@@ -170,8 +184,8 @@ pub fn open(format: AudioFormat) {
     }
 }
 
-/// How often the player logs its numbers
-const LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+/// How often the player logs its numbers. Once a second ties a dry-out to the device's count.
+const LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Logs the player's numbers until a newer player or `close` replaces it.
 fn log_loop(player: &Arc<Player>) {
@@ -182,7 +196,7 @@ fn log_loop(player: &Arc<Player>) {
         }
         let s = stats_of(player, true);
         log::info!(
-            "audio: {}, buffer {:.1} ms now (range {:.1} to {:.1}, target {:.0}), device burst {:.1} ms at {} Hz, age when queued {} ms, {} packets, {} lost, {} late, {} underruns, {:.0} ms dropped, {:.0} ms overflow, rate {:+.2}%, {:.1} s played, peak level {:.3}",
+            "audio: {}, buffer {:.1} ms now (range {:.1} to {:.1}, target {:.0}), device burst {:.1} ms at {} Hz, age when queued {} ms, {} packets, {} lost, {} late, {} buffer underruns, device underruns {}, device latency {} ms, burst reported {} frames, {:.0} ms dropped, {:.0} ms overflow, rate {:+.2}%, {:.1} s played, peak level {:.3}",
             if s.playing { "playing" } else { "waiting for the buffer" },
             s.fill_ms,
             s.fill_min_ms,
@@ -195,6 +209,9 @@ fn log_loop(player: &Arc<Player>) {
             s.lost_packets,
             s.late_packets,
             s.underruns,
+            s.device_underruns.map_or("-".to_string(), |n| n.to_string()),
+            s.output_latency_ms.map_or("-".to_string(), |ms| format!("{ms:.1}")),
+            s.frames_per_burst.map_or("-".to_string(), |n| n.to_string()),
             s.dropped_ms,
             s.overflow_ms,
             s.rate_pct,
@@ -309,6 +326,9 @@ fn stats_of(player: &Player, reset: bool) -> Stats {
         lost_packets: s.lost_packets.load(Ordering::Relaxed),
         late_packets: s.late_packets.load(Ordering::Relaxed),
         underruns: s.underruns.load(Ordering::Relaxed),
+        device_underruns: player.sink.underrun_count(),
+        output_latency_ms: player.sink.output_latency().map(|latency| latency.as_secs_f32() * 1000.0),
+        frames_per_burst: player.sink.frames_per_burst(),
         dropped_ms: frames_to_ms(s.dropped_frames.load(Ordering::Relaxed)),
         overflow_ms: frames_to_ms(s.overflow_frames.load(Ordering::Relaxed)),
         played_s: popped as f32 / rate,
@@ -319,14 +339,17 @@ fn stats_of(player: &Player, reset: bool) -> Stats {
 
 /// The lines for the stats panel.
 pub fn stat_lines() -> Vec<(&'static str, String)> {
-    let s = stats();
+    stat_lines_of(&stats())
+}
+
+fn stat_lines_of(s: &Stats) -> Vec<(&'static str, String)> {
     if !s.open {
         return Vec::new();
     }
     vec![(
         "Sound",
         format!(
-            "{}; buffer {:.0} ms (target {:.0}, range {:.0} to {:.0}), burst {:.1} ms at {} Hz, age when queued {} ms; {} packets, {} lost, {} late, {} underruns, {:.0} ms dropped",
+            "{}; buffer {:.0} ms (target {:.0}, range {:.0} to {:.0}), burst {:.1} ms at {} Hz, age when queued {} ms; {} packets, {} lost, {} late, {} buffer underruns, {} device underruns, device latency {} ms, {:.0} ms dropped",
             if s.playing { "playing" } else { "waiting for the buffer" },
             s.fill_ms,
             s.target_ms,
@@ -339,6 +362,8 @@ pub fn stat_lines() -> Vec<(&'static str, String)> {
             s.lost_packets,
             s.late_packets,
             s.underruns,
+            s.device_underruns.map_or("-".to_string(), |n| n.to_string()),
+            s.output_latency_ms.map_or("-".to_string(), |ms| format!("{ms:.1}")),
             s.dropped_ms,
         ),
     )]
@@ -652,5 +677,48 @@ mod tests {
         let first = consumer.pop().unwrap();
         assert!((first[0] - 0.99997).abs() < 1e-4 && first[1] == -1.0);
         assert_eq!(consumer.pop().unwrap(), [0.0, 0.5]);
+    }
+
+    /// A device that reports numbers, as AAudio does on a Quest.
+    struct ReportingSink;
+
+    impl AudioSink for ReportingSink {
+        fn underrun_count(&self) -> Option<u32> {
+            Some(3)
+        }
+        fn output_latency(&self) -> Option<std::time::Duration> {
+            Some(std::time::Duration::from_millis(21))
+        }
+        fn frames_per_burst(&self) -> Option<u32> {
+            Some(96)
+        }
+    }
+
+    /// A device that reports nothing, as the desktop's cpal backend does for the count.
+    struct SilentSink;
+
+    impl AudioSink for SilentSink {}
+
+    fn player(sink: Box<dyn AudioSink>) -> Player {
+        let (producer, _consumer) = producer();
+        let shared = Arc::clone(&producer.shared);
+        Player { producer: Mutex::new(producer), shared, source_rate: 48_000.0, sink }
+    }
+
+    #[test]
+    fn the_stats_carry_the_devices_underruns_apart_from_the_buffers() {
+        let reporting = player(Box::new(ReportingSink));
+        // The jitter buffer ran dry twice. The device's count is its own.
+        reporting.shared.underruns.store(2, Ordering::Relaxed);
+        let s = stats_of(&reporting, false);
+        assert_eq!((s.underruns, s.device_underruns, s.frames_per_burst), (2, Some(3), Some(96)));
+        assert!((s.output_latency_ms.unwrap() - 21.0).abs() < 1e-3);
+        let line = stat_lines_of(&s)[0].1.clone();
+        assert!(line.contains("2 buffer underruns, 3 device underruns, device latency 21.0 ms"), "{line}");
+
+        // A platform that keeps no count shows a dash and not a zero
+        let s = stats_of(&player(Box::new(SilentSink)), false);
+        assert_eq!((s.device_underruns, s.output_latency_ms, s.frames_per_burst), (None, None, None));
+        assert!(stat_lines_of(&s)[0].1.contains("- device underruns, device latency - ms"));
     }
 }

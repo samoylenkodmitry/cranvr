@@ -37,16 +37,16 @@ cranvr-proto = { path = "../proto" }
 # The foveated layout that the host encodes: the client derives the same sizes
 cranvr-common = { path = "../common" }
 # One Cranpose revision for every Cranpose crate: the branch cranpose-xr of the Cranpose repository
-cranpose = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "40abced053656782256aececf04a0bf182a893b5", features = ["embedded-default-font"] }
-cranpose-xr = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "40abced053656782256aececf04a0bf182a893b5" }
+cranpose = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "673817c9fab8ae3110dab11bfa9cd6108c2d6829", features = ["embedded-default-font"] }
+cranpose-xr = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "673817c9fab8ae3110dab11bfa9cd6108c2d6829" }
 # The output device and the queue for the host's sound (see src/audio.rs)
-cranpose-audio = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "40abced053656782256aececf04a0bf182a893b5" }
+cranpose-audio = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "673817c9fab8ae3110dab11bfa9cd6108c2d6829" }
 log = "0.4"
 serde_json = "1"
 env_logger = { version = "0.11", optional = true }
 
 [build-dependencies]
-cranpose-capabilities = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "40abced053656782256aececf04a0bf182a893b5" }
+cranpose-capabilities = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "673817c9fab8ae3110dab11bfa9cd6108c2d6829" }
 
 # The Reed-Solomon code of the protocol is about ten times slower without optimization.
 [profile.dev.package.reed-solomon-simd]

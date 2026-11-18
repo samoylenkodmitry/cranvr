@@ -6,28 +6,37 @@
 //! compositor shows that surface as a layer of its own and samples the picture once at the
 //! display's resolution, so text stays sharp. The panel is mono.
 //!
-//! The controllers work as the mouse. `place.rs` finds where a controller's ray meets the panel and
-//! moves the panel when the user carries it. This file sends the point, the trigger and the
-//! thumbstick to the host as `ClientDatagram::Pointer` datagrams. The host moves the Mac's mouse,
-//! clicks and scrolls.
+//! The controllers work as the mouse. Cranpose finds where a controller's ray meets the surface and
+//! reports it as pointer events in dp from the surface's top left corner (`on_pointer_event`). This
+//! file turns each event into a point on the picture (u and v from 0 to 1), a trigger and a scroll,
+//! and sends them to the host as `ClientDatagram::Pointer` datagrams. The host moves the Mac's
+//! mouse, clicks and scrolls. The pointer events carry no scroll, so the thumbstick's lean comes
+//! from the headset's frame while the ray is on the surface.
+//!
+//! Cranpose carries the panel. Its move events give the pose that `place.rs` keeps for the next
+//! start. They also give the cursor ring its place. A move event carries no size, so the user
+//! resizes the panel with the thumbstick during a carry, and this file keeps the width.
 //!
 //! Threads and what they own:
 //! - the network threads call [`on_message`], [`push_unit`] and [`on_cursor`];
 //! - the desktop decode thread ([`decode_loop`]) feeds the decoder, so a decoder that waits for an
 //!   input buffer never holds up the eye stream;
 //! - the uplink thread ([`uplink`]) sends the wish, the pointer and the requests for key frames;
-//! - the composition thread creates and ends the surface ([`DesktopPanel`]) and the headset's frame
-//!   loop runs the panel's `SpatialFrameEffect`, which feeds `place.rs`.
+//! - the composition thread creates and ends the surface ([`DesktopPanel`]), receives its pointer
+//!   events and runs the panel's `SpatialFrameEffect` once in each headset frame.
 //!
 //! The decoder lives in a mutex because the composition thread must drop it before the surface's
 //! end callback returns, while the decode thread feeds it.
 
-use crate::place::{aim_at, Engine, Frame, Hand, Place, PointerNow};
+use crate::place;
 use cranpose::{
-    launch_args, preferences, prelude::*, AccessUnit, DecodedFrames, DecoderConfig, DecoderError, DecoderOutput, ExternalSurface,
-    VideoCodec, VideoDecoder,
+    launch_args, prelude::*, AccessUnit, DecodedFrames, DecoderConfig, DecoderError, DecoderOutput, ExternalSurface, PointerEvent,
+    PointerEventKind, VideoCodec, VideoDecoder,
 };
-use cranpose_xr::{Controller, Pose, SpatialExternalSurface, SpatialFrameEffect, SpatialPanel, StereoMode, XrFrame};
+use cranpose_xr::{
+    Pose, SpatialExternalSurface, SpatialFrameEffect, SpatialMoveEvent, SpatialMoveEventType, SpatialPanel, StereoMode,
+    SubspaceModifier, XrFrame, METERS_PER_DP,
+};
 use cranvr_proto::{
     clock::now_ns,
     link::ClientLink,
@@ -36,8 +45,6 @@ use cranvr_proto::{
     wire::Codec,
 };
 use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc::{self, RecvTimeoutError, Sender},
@@ -46,7 +53,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-const PLACE_KEY: &str = "desktop_place";
+/// The name under which `place.rs` keeps the panel's pose and width
+const PANEL: &str = "desktop";
+/// Where the panel starts when the user never carried it, relative to the origin of the subspace,
+/// which lies 1 m ahead of the head: 1.5 m ahead of the head and a little below eye level
+const START_POSE: Pose = Pose::at([0.0, -0.1, -0.5]);
+/// The panel's width in meters at the start, and the least and the most that the user may give it.
+/// 1.6 m wide fills 56 degrees at 1.5 m. The height follows the picture's aspect ratio.
+const START_WIDTH: f32 = 1.6;
+const WIDTH_RANGE: [f32; 2] = [0.4, 8.0];
+/// How fast the thumbstick resizes a carried panel, as a share of the width a second at full lean
+const RESIZE_SPEED: f32 = 0.7;
+/// A thumbstick leaning less than this counts as at rest
+const DEAD_ZONE: f32 = 0.12;
 
 /// How long the decoder waits for a free input buffer before it refuses a picture
 const INPUT_WAIT: Duration = Duration::from_millis(30);
@@ -71,6 +90,51 @@ pub struct View {
     pub visible: bool,
     /// The picture's width over its height
     pub aspect: f32,
+}
+
+/// What the app sends the host about the pointer.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PointerNow {
+    /// Where the controller points on the picture as u and v from its top left corner
+    pub hit: Option<[f32; 2]>,
+    /// 1 while the trigger is down and 0 while it is up. The host presses the button past 0.6 and
+    /// lets it go below 0.4.
+    pub trigger: f32,
+    /// How far the thumbstick leans forward, from -1 to 1
+    pub scroll: f32,
+}
+
+impl PointerNow {
+    /// Whether the host has something to do with it: a controller points at the panel or holds a
+    /// press.
+    pub fn busy(&self) -> bool {
+        self.hit.is_some() || self.trigger > 0.4
+    }
+
+    /// Whether `other` differs enough to send. A move of a fifth of a pixel of a 4K picture does not
+    /// count.
+    pub fn differs(&self, other: &Self) -> bool {
+        let moved = match (self.hit, other.hit) {
+            (Some(a), Some(b)) => (a[0] - b[0]).abs() > 5e-5 || (a[1] - b[1]).abs() > 5e-5,
+            (None, None) => false,
+            _ => true,
+        };
+        moved || (self.trigger - other.trigger).abs() > 0.02 || (self.scroll - other.scroll).abs() > 0.02
+    }
+
+    /// The pointer after a pointer event of the surface. `at` is the event's place as u and v.
+    /// The surface sends `Up` before `Exit` when the ray left the surface during a press, so an
+    /// `Exit` always ends with the button up.
+    fn after(mut self, kind: PointerEventKind, at: [f32; 2]) -> Self {
+        match kind {
+            PointerEventKind::Enter | PointerEventKind::Move => self.hit = Some(at),
+            PointerEventKind::Down => (self.hit, self.trigger) = (Some(at), 1.0),
+            PointerEventKind::Up => (self.hit, self.trigger) = (Some(at), 0.0),
+            PointerEventKind::Exit => self = Self::default(),
+            _ => {}
+        }
+        self
+    }
 }
 
 #[derive(Default)]
@@ -268,6 +332,10 @@ impl Desktop {
 
     /// The composition makes the surface: the decoder starts when the stream is ready.
     pub fn set_surface(&self, surface: Option<ExternalSurface>) {
+        if surface.is_none() {
+            // A surface that leaves sends no `Exit`: a press that was on would stay down
+            self.update_pointer(|pointer| *pointer = PointerNow::default());
+        }
         let mut inner = self.inner.lock().unwrap();
         log::info!("desktop: the surface {}", if surface.is_some() { "is there" } else { "is gone" });
         inner.surface = surface;
@@ -284,15 +352,24 @@ impl Desktop {
         self.quick.cursor.lock().unwrap().filter(|c| c.on).map(|c| [c.u, c.v])
     }
 
-    /// The pointer of this frame. It goes to the host when it changed.
-    fn set_pointer(&self, pointer: PointerNow) {
+    /// Changes the pointer. It goes to the host when it differs from the one that went last.
+    fn update_pointer(&self, change: impl FnOnce(&mut PointerNow)) {
         let mut uplink = self.uplink.lock().unwrap();
+        let mut pointer = uplink.pointer;
+        change(&mut pointer);
         if pointer.differs(&uplink.pointer) || pointer.busy() != uplink.pointer.busy() {
             uplink.pointer = pointer;
             uplink.dirty = true;
             drop(uplink);
             self.wake.notify_all();
         }
+    }
+
+    /// A controller's ray on the surface. `size` is the surface's width and height in dp, the units
+    /// of the event's position.
+    fn on_pointer_event(&self, event: &PointerEvent, size: [f32; 2]) {
+        let at = [event.position.x / size[0], event.position.y / size[1]].map(|v| v.clamp(0.0, 1.0));
+        self.update_pointer(|pointer| *pointer = pointer.after(event.kind, at));
     }
 }
 
@@ -600,66 +677,43 @@ pub fn uplink(link: &ClientLink, stop: &AtomicBool) {
     }
 }
 
-/// The place that the launch asks for, that the preferences keep, or the default.
-/// `desktop_place=x,y,z,yaw,pitch,width` sets one for a test.
-fn saved_place() -> Place {
-    launch_args()
-        .string("desktop_place")
-        .and_then(Place::from_text)
-        .or_else(|| preferences().get(PLACE_KEY).and_then(|text| Place::from_text(&text)))
-        .unwrap_or_default()
+/// The surface's width and height in dp (a millimeter each) for a panel `width` meters wide that
+/// shows a picture of `aspect` (width over height).
+fn surface_size(width: f32, aspect: f32) -> [f32; 2] {
+    let width = width / METERS_PER_DP;
+    [width, width / aspect.max(0.1)]
 }
 
-/// Whether the launch asks for the panel in front of the head's gaze at the first frame, tilt
-/// included: `--es desktop_place gaze`, for a headset that lies on a desk.
-fn place_in_gaze() -> bool {
-    launch_args().string("desktop_place") == Some("gaze")
-}
-
-fn save_place(place: &Place) {
-    if let Err(e) = preferences().set(PLACE_KEY, &place.to_text()) {
-        log::warn!("the desktop panel's place was not saved: {e}");
-    }
-}
-
-/// One controller as `place.rs` reads it.
-fn hand(controller: &Controller) -> Hand {
-    Hand {
-        aim: controller.aim.map(|aim| aim.pose),
-        trigger: controller.trigger.value,
-        squeeze: controller.squeeze,
-        stick: [controller.thumbstick.x, controller.thumbstick.y],
-    }
-}
-
-/// A test with no controller in the room: `--es desktop_pointer_test circle` makes the right
-/// controller circle over the panel, pull its trigger for 0.3 s every 3 s and lean its thumbstick
-/// forward for 2 s every 6 s. The real engine turns that into the pointer packets that go to the
-/// host.
+/// A test with no controller in the room: `--es desktop_pointer_test circle` sends the pointer of a
+/// controller that circles over the picture, pulls its trigger for 0.3 s every 3 s and leans its
+/// thumbstick forward for 2 s every 6 s. The packets go to the host as the surface's events do.
+/// Cranpose's ray is not part of the test.
 fn pointer_test() -> bool {
     launch_args().string("desktop_pointer_test") == Some("circle")
 }
 
-/// The right controller of the pointer test at the headset time `time`: at the head's place
-/// pointing at a point that circles the middle of the panel once in 4 seconds.
-fn synthetic_hand(time: Duration, head: &Pose, place: &Place, aspect: f32) -> Hand {
+/// The pointer of the pointer test at the headset time `time`: a point that circles the middle of
+/// the picture once in 4 seconds.
+fn synthetic_pointer(time: Duration) -> PointerNow {
     let t = time.as_secs_f32();
     let angle = t * std::f32::consts::TAU / 4.0;
-    let target = place.point_at(aspect, [0.5 + 0.3 * angle.cos(), 0.5 + 0.3 * angle.sin()]);
-    let origin = [head.position[0] + 0.2, head.position[1] - 0.3, head.position[2] - 0.2];
-    Hand {
-        aim: Some(aim_at(origin, target)),
+    PointerNow {
+        hit: Some([0.5 + 0.3 * angle.cos(), 0.5 + 0.3 * angle.sin()]),
         trigger: if t % 3.0 < 0.3 { 1.0 } else { 0.0 },
-        squeeze: 0.0,
-        stick: [0.0, if t % 6.0 > 4.0 { 0.6 } else { 0.0 }],
+        scroll: if t % 6.0 > 4.0 { 0.6 } else { 0.0 },
     }
 }
 
-/// What the headset's frame loop shares with the composition: the engine and the last saved place.
-struct Shared {
-    engine: RefCell<Engine>,
-    /// The panel was put in the gaze already
-    gazed: Cell<bool>,
+/// How far the thumbstick that leans furthest along `axis` (0 across, 1 forward) leans, from -1 to
+/// 1, with the dead zone left out. A pointer event of the surface does not say which controller
+/// points, so the stronger of the two sticks counts.
+fn stick_lean(frame: &XrFrame, axis: usize) -> f32 {
+    [&frame.left_controller, &frame.right_controller]
+        .map(|controller| [controller.thumbstick.x, controller.thumbstick.y][axis])
+        .into_iter()
+        .filter(|lean| lean.abs() >= DEAD_ZONE)
+        .max_by(|a, b| a.abs().total_cmp(&b.abs()))
+        .unwrap_or(0.0)
 }
 
 /// The desktop panel and the cursor over it. It composes nothing while the host has no desktop for
@@ -674,58 +728,50 @@ pub fn DesktopPanel() {
         }
         delay(POLL).await;
     });
-    let shared = remember(|| Rc::new(Shared { engine: RefCell::new(Engine::new(saved_place(), 16.0 / 9.0)), gazed: Cell::new(false) }))
-        .with(Clone::clone);
-    let place = rememberMutableStateOf({
-        let shared = Rc::clone(&shared);
-        move || shared.engine.borrow().place
+    // Where the user left the panel and how wide it is, as `place.rs` kept it
+    let pose = rememberMutableStateOf(|| place::start_pose(PANEL, START_POSE));
+    let width = rememberMutableStateOf(|| {
+        place::saved_width(PANEL).map_or(START_WIDTH, |width| width.clamp(WIDTH_RANGE[0], WIDTH_RANGE[1]))
     });
+    // Whether the user carries the panel now
+    let carrying = rememberMutableStateOf(|| false);
     let cursor = rememberMutableStateOf(|| None::<[f32; 2]>);
-    {
-        let shared = Rc::clone(&shared);
-        SpatialFrameEffect(move |frame: &XrFrame| {
-            let now = desktop().view();
-            let mut engine = shared.engine.borrow_mut();
-            engine.aspect = now.aspect;
-            if let (true, false, Some(head)) = (place_in_gaze(), shared.gazed.get(), frame.device_pose) {
-                shared.gazed.set(true);
-                engine.place = Place::in_gaze(&head, engine.place.width, 1.2);
-                log::info!("desktop: the panel is put in the gaze at {:?}", engine.place);
+    SpatialFrameEffect(move |frame: &XrFrame| {
+        if !desktop().view().visible {
+            desktop().update_pointer(|pointer| *pointer = PointerNow::default());
+            // A surface that leaves during a carry sends no `End`
+            if carrying.get_non_reactive() {
+                carrying.set(false);
             }
-            if !now.visible {
-                desktop().set_pointer(PointerNow::default());
-                return;
+            return;
+        }
+        if carrying.get_non_reactive() {
+            // The thumbstick's forward lean moves a carried panel away in Cranpose. Its lean across
+            // resizes the panel.
+            let lean = stick_lean(frame, 0);
+            let before = width.get_non_reactive();
+            let after = (before * (lean * RESIZE_SPEED * frame.period.as_secs_f32().clamp(0.0, 0.1)).exp()).clamp(WIDTH_RANGE[0], WIDTH_RANGE[1]);
+            if after != before {
+                width.set(after);
             }
-            let mut input = Frame {
-                hands: [hand(&frame.left_controller), hand(&frame.right_controller)],
-                head: frame.device_pose.map(|pose| pose.position),
-                dt: frame.period.as_secs_f32(),
-            };
-            if let (true, Some(head)) = (pointer_test(), frame.device_pose) {
-                input.hands[1] = synthetic_hand(frame.predicted_display_time, &head, &engine.place, now.aspect);
-            }
-            let step = engine.step(&input);
-            desktop().set_pointer(step.pointer);
-            if place.get_non_reactive() != engine.place {
-                place.set(engine.place);
-            }
-            if step.dropped {
-                log::info!("desktop: the panel stays at {:?}", engine.place);
-                save_place(&engine.place);
-            }
-            let at = desktop().cursor();
-            if cursor.get_non_reactive() != at {
-                cursor.set(at);
-            }
-        });
-    }
+        } else if pointer_test() {
+            desktop().update_pointer(|pointer| *pointer = synthetic_pointer(frame.predicted_display_time));
+        } else {
+            let lean = stick_lean(frame, 1);
+            desktop().update_pointer(|pointer| pointer.scroll = if pointer.hit.is_some() { lean } else { 0.0 });
+        }
+        let at = desktop().cursor();
+        if cursor.get_non_reactive() != at {
+            cursor.set(at);
+        }
+    });
     let view = view.get();
     if !view.visible {
         return;
     }
-    Surface(place, view.aspect);
+    Surface(pose, width, carrying, view.aspect);
     if draws_cursor() {
-        CursorRing(place, cursor, view.aspect);
+        CursorRing(pose, width, cursor, view.aspect);
     }
 }
 
@@ -734,22 +780,49 @@ pub fn DesktopPanel() {
 /// decoder's pictures are larger. A test with the swapchain at 1600 by 900 dp (2400 by 1350 pixels) and
 /// at 2560 by 1440 dp (3840 by 2160 pixels) showed the whole picture both times. The sharpness of a
 /// panel wider than the view is not tested.
+///
+/// The surface starts at the pose that `pose` holds at its composition. Cranpose keeps the pose that
+/// the user carries it to until the surface leaves the composition. The move events update `pose`,
+/// for the cursor ring, and the last one goes to `place.rs`.
 #[composable]
-fn Surface(place: MutableState<Place>, aspect: f32) {
-    let modifier = place.get().modifier(aspect);
+fn Surface(pose: MutableState<Pose>, width: MutableState<f32>, carrying: MutableState<bool>, aspect: f32) {
+    let [surface_width, surface_height] = surface_size(width.get(), aspect);
+    let modifier = place::movable(
+        PANEL,
+        SubspaceModifier::new().size(surface_width, surface_height),
+        pose.get_non_reactive(),
+        move |event: &SpatialMoveEvent| {
+            let ended = event.event_type == SpatialMoveEventType::End;
+            carrying.set(!ended);
+            pose.set(event.pose);
+            if ended {
+                place::save_width(PANEL, width.get_non_reactive());
+            }
+        },
+    );
     SpatialExternalSurface(StereoMode::Mono, modifier, move |scope| {
         scope.on_surface_created(|surface| desktop().set_surface(Some(surface)));
         // The decoder stops before the callback returns, as the surface's owner requires
         scope.on_surface_destroyed(|_| desktop().set_surface(None));
+        scope.on_pointer_event(move |event| {
+            desktop().on_pointer_event(&event, surface_size(width.get_non_reactive(), desktop().view().aspect));
+        });
     });
+}
+
+/// The pose of a ring that lies on the point `[u, v]` of a picture (from its top left corner) on
+/// a panel at `panel`, `CURSOR_LIFT` meters in front of it. `size` is the panel's width and height
+/// in meters.
+fn ring_pose(panel: &Pose, [width, height]: [f32; 2], [u, v]: [f32; 2]) -> Pose {
+    panel.then(&Pose::at([(u - 0.5) * width, (0.5 - v) * height, CURSOR_LIFT]))
 }
 
 /// The Mac's cursor as a small panel in front of the picture.
 #[composable]
-fn CursorRing(place: MutableState<Place>, cursor: MutableState<Option<[f32; 2]>>, aspect: f32) {
-    let Some([u, v]) = cursor.get() else { return };
-    let p = place.get();
-    SpatialPanel(p.cursor_modifier(aspect, [u, v], CURSOR_SIZE, CURSOR_LIFT), || {
+fn CursorRing(pose: MutableState<Pose>, width: MutableState<f32>, cursor: MutableState<Option<[f32; 2]>>, aspect: f32) {
+    let Some(at) = cursor.get() else { return };
+    let size = surface_size(width.get(), aspect).map(|dp| dp * METERS_PER_DP);
+    SpatialPanel(SubspaceModifier::new().size(CURSOR_SIZE, CURSOR_SIZE).with_pose(ring_pose(&pose.get(), size, at)), || {
         Box(
             Modifier::empty()
                 .fill_max_size()
@@ -760,4 +833,65 @@ fn CursorRing(place: MutableState<Place>, cursor: MutableState<Option<[f32; 2]>>
             || {},
         );
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-5
+    }
+
+    #[test]
+    fn the_panel_is_as_wide_as_the_user_made_it_and_as_high_as_the_picture_is() {
+        let [w, h] = surface_size(1.6, 16.0 / 9.0);
+        assert!(close(w, 1600.0) && close(h, 900.0), "{w} {h}");
+        let [w, h] = surface_size(1.0, 2.0);
+        assert!((w - 1000.0).abs() < 1e-2 && (h - 500.0).abs() < 1e-2, "{w} {h}");
+    }
+
+    #[test]
+    fn a_ray_on_the_surface_is_a_point_on_the_picture_a_press_and_a_release() {
+        let at = [0.25, 0.75];
+        let idle = PointerNow::default();
+        let hover = idle.after(PointerEventKind::Enter, at);
+        assert_eq!(hover, PointerNow { hit: Some(at), trigger: 0.0, scroll: 0.0 });
+        let moved = hover.after(PointerEventKind::Move, [0.3, 0.7]);
+        assert_eq!(moved.hit, Some([0.3, 0.7]));
+        let down = moved.after(PointerEventKind::Down, [0.3, 0.7]);
+        assert_eq!(down.trigger, 1.0);
+        // The thumbstick's lean survives the events of the same ray
+        let leaning = PointerNow { scroll: 0.5, ..down };
+        assert_eq!(leaning.after(PointerEventKind::Move, [0.31, 0.7]).scroll, 0.5);
+        let up = down.after(PointerEventKind::Up, [0.3, 0.7]);
+        assert_eq!((up.trigger, up.hit), (0.0, Some([0.3, 0.7])));
+        // The ray leaves: nothing points, nothing presses and nothing scrolls
+        assert_eq!(leaning.after(PointerEventKind::Exit, [0.3, 0.7]), PointerNow::default());
+        assert!(!PointerNow::default().busy() && hover.busy() && down.busy());
+    }
+
+    #[test]
+    fn a_pointer_that_barely_moved_is_not_worth_sending() {
+        let a = PointerNow { hit: Some([0.5, 0.5]), trigger: 0.0, scroll: 0.0 };
+        assert!(!a.differs(&PointerNow { hit: Some([0.500_02, 0.5]), ..a }));
+        assert!(a.differs(&PointerNow { hit: Some([0.501, 0.5]), ..a }));
+        assert!(a.differs(&PointerNow { hit: None, ..a }));
+        assert!(a.differs(&PointerNow { trigger: 1.0, ..a }));
+    }
+
+    #[test]
+    fn the_cursor_ring_lies_on_the_point_in_front_of_the_picture() {
+        // A panel 1.6 m by 0.9 m, 1.5 m ahead of the head, which is 0.5 m behind the subspace's
+        // origin. The cursor at one quarter across and one quarter down is 40 cm left of the
+        // middle and 22.5 cm above it, 4 mm in front.
+        let panel = Pose::at([0.0, 0.0, -0.5]);
+        let at = ring_pose(&panel, [1.6, 0.9], [0.25, 0.25]).position;
+        assert!(close(at[0], -0.4) && close(at[1], 0.225) && close(at[2], -0.5 + CURSOR_LIFT), "{at:?}");
+        // A panel turned to the right by 90 degrees carries the ring along: the picture's left
+        // edge then lies toward the viewer
+        let turned = Pose { position: [1.0, 0.0, 0.0], ..SubspaceModifier::new().rotate(0.0, 90.0, 0.0).pose() };
+        let at = ring_pose(&turned, [1.6, 0.9], [0.0, 0.5]).position;
+        assert!(close(at[0], 1.0 + CURSOR_LIFT) && close(at[2], 0.8), "{at:?}");
+    }
 }
