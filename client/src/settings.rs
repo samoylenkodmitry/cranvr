@@ -15,6 +15,7 @@ const HOST_KEY: &str = "host";
 const IDENTITY_KEY: &str = "identity";
 const ROOM_KEY: &str = "room";
 const VOLUME_KEY: &str = "volume";
+const PANELS_KEY: &str = "panels";
 /// The address that works over USB with `adb reverse tcp:9950 tcp:9950`, and on the same Mac
 const DEFAULT_HOST: &str = "127.0.0.1:9950";
 
@@ -56,6 +57,18 @@ pub fn volume() -> Volume {
 pub fn remember_volume(volume: Volume) {
     if let Err(e) = preferences().set(VOLUME_KEY, &volume.key()) {
         log::warn!("the volume setting was not saved: {e}");
+    }
+}
+
+/// Whether the connect and stats panels show, as the ball above the left controller left them. A
+/// missing or unknown value shows them.
+pub fn panels_shown() -> bool {
+    preferences().get(PANELS_KEY).is_none_or(|text| text != "hidden")
+}
+
+pub fn remember_panels_shown(shown: bool) {
+    if let Err(e) = preferences().set(PANELS_KEY, if shown { "shown" } else { "hidden" }) {
+        log::warn!("the panels setting was not saved: {e}");
     }
 }
 

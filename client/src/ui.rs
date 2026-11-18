@@ -11,6 +11,7 @@
 use crate::{
     console::Backdrop,
     console_panel::{self, ConsolePanel},
+    panels_ball::PanelsBall,
     hub::{hub, DecoderView, Device, LinkState, Snapshot, Stats},
     phone::{self, PhoneFrames},
     place, settings,
@@ -57,7 +58,8 @@ fn side_pose(side: f32) -> Pose {
 }
 
 /// The app. In a headset it shows the game's picture around the viewer while a game runs, and the
-/// room otherwise. The connect panel stands to the left and the stats panel to the right.
+/// room otherwise. The connect panel stands to the left and the stats panel to the right. The ball
+/// above the left controller hides them or shows them again.
 #[composable]
 pub fn ClientApp() {
     // The connection reads what the headset is from the hub. The values do not change in a
@@ -68,6 +70,7 @@ pub fn ClientApp() {
     let Link { snapshot, frames } = link();
     let console = rememberMutableStateOf(|| hub().console());
     let backdrop = rememberMutableStateOf(|| hub().backdrop());
+    let panels_shown = rememberMutableStateOf(settings::panels_shown);
     LaunchedEffect((), async move |_| {
         if settings::console_on_launch() {
             hub().pin_console();
@@ -86,12 +89,15 @@ pub fn ClientApp() {
         HeadsetFrames();
         // A flat window shows the panels in this order, side by side. In a headset each panel has
         // its own place.
-        ConnectPanel(snapshot);
-        StatsPanel(snapshot);
+        if panels_shown.get() {
+            ConnectPanel(snapshot);
+            StatsPanel(snapshot);
+        }
         crate::desktop::DesktopPanel();
         ConsolePanel(console, snapshot);
         Behind(backdrop, frames);
     });
+    PanelsBall(panels_shown);
 }
 
 /// What fills the view behind the panels. While no game runs and the user kept the Room setting at
