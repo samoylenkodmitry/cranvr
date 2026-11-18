@@ -20,7 +20,7 @@
 #                 size, since the desktop scene draws no eye badges. --host-arg --virtual-display
 #                 --host-arg 1920x1080 shows a virtual display instead of the main one.
 #   --android     the client is cranvr-probe on an Android phone attached by USB: ALVR's client
-#                 core with the Quest app's MediaCodec decoder and a display loop at the refresh
+#                 core with its MediaCodec decoder and a display loop at the refresh
 #                 rate. The host reaches it through `adb forward` over USB. The serial comes from
 #                 `adb devices`; without one the first device on Android 10 or newer is used.
 #   --wifi        with --android: the host reaches the phone over Wi-Fi with a UDP stream, as a
@@ -33,9 +33,13 @@
 #                 probe runs as the shell user and cannot.
 #   --quest       the client is the ALVR app on a Quest attached by USB. The Quest and the Mac
 #                 must share a network.
-#   --cranvr-client with --quest: the client is cranvr's own Quest app (dev.cranvr.client, see
-#                 scripts/build-quest.sh) instead of the store ALVR app.
-#                 Without either the client is cranvr-probe on this Mac, over loopback TCP.
+#   --cranvr-client with --quest: the client is cranvr's Cranpose client (dev.cranvr.client2, see
+#                 scripts/build-client.sh) instead of the store ALVR app. The host then runs with
+#                 --protocol native --trust-all on --native-port. The app gets this Mac's address
+#                 as a launch extra. The run keeps the host's key in
+#                 target/e2e/host-identity.txt: a headset refuses a known address with a new key.
+#                 Without --quest or --android the client is cranvr-probe on this Mac, over
+#                 loopback TCP.
 #   --native      cranvr's own protocol instead of ALVR's: the host runs with --protocol native
 #                 and cranvr-probe connects to it over loopback, with UDP media and parity packets.
 #                 The report's latency block comes from the headset's frame timing reports. It adds
@@ -137,7 +141,12 @@ case ${client} in
         fi
         ;;
     android) ;;
-    quest) host_args+=(--trust-all) ;;
+    quest)
+        host_args+=(--trust-all)
+        if (( cranvr_client )); then
+            host_args+=(--protocol native --native-port "${native_port}")
+        fi
+        ;;
 esac
 (( desktop )) && host_args+=(--desktop)
 host_args+=("${more_host_args[@]}")
@@ -199,10 +208,12 @@ headset_connected() {
     grep '"connected":true' "${work}/host.out" | grep -q '"type":"headset"'
 }
 
-# Warnings about the device's network: a VPN over this Mac's address, slow Wi-Fi
+# Warnings about the device's network: a VPN over this Mac's address, slow Wi-Fi. The check also
+# finds this Mac's address on the device's network (mac_ip), which the Cranpose client needs.
 device_warnings=()
+mac_ip=""
 check_device() {
-    local device_ip mac_ip interface line
+    local device_ip interface line
     device_ip=$("${adb_cmd[@]}" shell ip -4 addr show wlan0 | awk '/inet / { split($2, a, "/"); print a[1] }')
     [[ -n ${device_ip} ]] || return 0
     interface=$(route -n get "${device_ip}" 2>/dev/null | awk '/interface:/ { print $2 }')
@@ -271,10 +282,10 @@ case ${client} in
             exit 1
         fi
         if (( cranvr_client )); then
-            package=$("${adb_cmd[@]}" shell pm list packages dev.cranvr.client | sed -n 's/^package://p' | tr -d '\r')
+            package=$("${adb_cmd[@]}" shell pm list packages dev.cranvr.client2 | tr -d '\r' | sed -n 's/^package:\(dev\.cranvr\.client2\)$/\1/p')
             if [[ -z ${package} ]]; then
-                print -u2 "cranvr's Quest app is not on the Quest. Build and install it:"
-                print -u2 "  scripts/build-quest.sh --install ${serial}"
+                print -u2 "cranvr's Cranpose client is not on the Quest. Build and install it:"
+                print -u2 "  scripts/build-client.sh --install ${serial}"
                 exit 1
             fi
         else
@@ -286,6 +297,10 @@ case ${client} in
             exit 1
         fi
         check_device
+        if (( cranvr_client )) && [[ -z ${mac_ip} ]]; then
+            print -u2 "Cannot find this Mac's address on the Quest's network. The Cranpose client needs it."
+            exit 1
+        fi
         celsius_before=$(celsius)
         "${adb_cmd[@]}" shell input keyevent KEYCODE_WAKEUP
         # Keeps the display on without a face in the headset
@@ -297,6 +312,13 @@ case ${client} in
         ;;
 esac
 
+# A fresh config folder gives the host a new key. A headset refuses a known address with a new
+# key. A run with the Cranpose client therefore keeps the key of its first run.
+identity=${root}/target/e2e/host-identity.txt
+if [[ ${client} == quest ]] && (( cranvr_client )) && [[ -f ${identity} ]]; then
+    mkdir -p "${work}/config"
+    cp "${identity}" "${work}/config/host-identity.txt"
+fi
 print "Starting the host at ${fps} Hz (log: ${work}/host.log)"
 "${bin}/cranvr-host" "${host_args[@]}" > "${work}/host.out" 2> "${work}/host.log" &
 pids+=($!)
@@ -304,6 +326,9 @@ for i in {1..50}; do
     [[ -f ${work}/config/runtime-control.txt ]] && break
     sleep 0.2
 done
+if [[ ${client} == quest ]] && (( cranvr_client )) && [[ ! -f ${identity} && -f ${work}/config/host-identity.txt ]]; then
+    cp "${work}/config/host-identity.txt" "${identity}"
+fi
 
 game_pid=""
 if (( game )); then
@@ -352,7 +377,15 @@ case ${client} in
         ;;
     quest)
         print "Starting ${package} on ${serial}"
-        "${adb_cmd[@]}" shell monkey -p "${package}" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
+        if (( cranvr_client )); then
+            # The Cranpose client takes the host's address and the start of the connection from
+            # the extras of its launch
+            "${adb_cmd[@]}" shell am force-stop "${package}"
+            "${adb_cmd[@]}" shell am start -n "${package}/dev.cranpose.android.CranposeActivity" \
+                --es host "${mac_ip}:${native_port}" --ez connect true >/dev/null
+        else
+            "${adb_cmd[@]}" shell monkey -p "${package}" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
+        fi
         for i in {1..120}; do
             headset_connected && break
             sleep 0.5
@@ -387,6 +420,9 @@ if (( ${host_args[(Ie)--tcp]} )); then
     protocol=tcp
 fi
 (( native )) && mode+=-native
+if [[ ${client} == quest ]] && (( cranvr_client )); then
+    mode+=-native
+fi
 extra=(mode=${mode} protocol=${protocol} native_drop=${native_drop} "warnings=${(j: | :)device_warnings}" client_exit=${client_exit} game=${game} "wine=${wine}" desktop=${desktop} seconds=${seconds} \
     work=${work} "host_args=${more_host_args[*]}")
 # The probe's count of frames that reached its decoder, and of frames it showed with the right picture

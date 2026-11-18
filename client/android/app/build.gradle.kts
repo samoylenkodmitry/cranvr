@@ -34,8 +34,8 @@ android {
     compileSdk = 37
 
     defaultConfig {
-        // A different id from the ALVR based client in quest/, so both install side by side. The
-        // phone's APK has its own id, so it installs beside the Quest's.
+        // A different id from the ALVR app, so both install side by side. The phone's APK has its
+        // own id, so it installs beside the Quest's.
         applicationId = if (phone) "dev.cranvr.client2.phone" else "dev.cranvr.client2"
         minSdk = 24
         targetSdk = 36

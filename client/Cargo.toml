@@ -1,7 +1,7 @@
 # cranvr-client: the new Quest client of cranvr. It is a pure Cranpose app. It uses Cranpose's
 # public API and plain Rust crates such as cranvr-proto, and it has no ndk, JNI, GL, OpenXR or
 # platform code of its own. It speaks cranvr's own protocol: start the host with
-# `cranvr-host --protocol native`. The ALVR client in quest/ stays beside it for now.
+# `cranvr-host --protocol native`. The stock ALVR client needs `--protocol alvr` instead.
 #
 # Build the APK with scripts/build-client.sh. This crate is its own workspace, so the host's
 # builds do not touch it. The desktop binary runs the same app in a flat window.
