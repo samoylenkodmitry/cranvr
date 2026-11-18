@@ -178,7 +178,6 @@ cleanup() {
     fi
     if [[ -n ${package} ]]; then
         "${adb_cmd[@]}" shell am force-stop "${package}" >/dev/null 2>&1 || true
-        "${adb_cmd[@]}" shell am broadcast -a com.oculus.vrpowermanager.automation_disable >/dev/null 2>&1 || true
     fi
     if [[ ${client} == quest ]]; then
         "${adb_cmd[@]}" shell setprop debug.oculus.guardian_pause "${guardian_before:-0}" >/dev/null 2>&1 || true

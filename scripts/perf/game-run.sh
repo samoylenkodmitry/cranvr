@@ -10,7 +10,8 @@
 # must be paired with it already (see "Pairing" in the README). The script wakes the headset
 # without a wearer (proximity sensor and guardian off), starts the Cranpose client
 # (dev.cranvr.client2) and the game without sound, records the host's stats and the Mac's GPU
-# use, then stops the game and gives the headset its sensor and guardian back.
+# use, then stops the game and gives the headset its guardian back. The proximity sensor stays
+# closed, so the headset stays awake.
 #
 # Environment:
 #   ANDROID_SERIAL   the Quest, when adb sees more than one device
@@ -44,7 +45,6 @@ restore() {
     pkill -f "$(basename "${program//\\//}")" || true
     pkill -f UnityCrashHandler64 || true
     adb shell setprop debug.oculus.guardian_pause 0
-    adb shell am broadcast -a com.oculus.vrpowermanager.automation_disable > /dev/null
 }
 trap restore EXIT
 
