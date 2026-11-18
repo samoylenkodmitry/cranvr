@@ -58,6 +58,12 @@ const EARLY_STEP_MS: f64 = 0.1;
 /// percentile from replacing its neighbor. Measured on a Quest 3 with the queue: the cap of 0.9 and
 /// a margin limit of 0.7 periods gave 4 percent late frames. The limits of 2.5 and 1.0 gave 2.
 const NEED_CAP_PERIODS: f64 = 2.5;
+/// How far past the earliest point the next point may lie before a plan starts over at the
+/// earliest one. The frame loop starts a frame once its planned start has passed, so the planned
+/// point can lie up to the need minus the median need past the earliest point, which is at most
+/// `NEED_CAP_PERIODS`, plus one period of rounding to the grid. A next point further out means
+/// that the clock estimate jumped.
+const MAX_AHEAD_PERIODS: f64 = NEED_CAP_PERIODS + 2.0;
 /// The percentile of the lead and of the need
 const PERCENTILE: f64 = 0.9;
 /// Frames that wait for their report. An older one is forgotten.
@@ -248,12 +254,17 @@ impl DisplayLock {
             earliest
         } else {
             let next = self.last_target + period as Nanos;
-            // Wait for the point after the last one, but never more than one point past the
-            // earliest. A frame that cannot make the next point takes a later one.
-            if next > earliest {
-                next.min(earliest + period as Nanos)
-            } else {
+            // Wait for the point after the last one. A frame that cannot make it takes a later
+            // one. A frame never takes a point that a frame before it took: the headset's queue
+            // would drop one of the two. On a loaded Mac the need with its margin lies more than
+            // a period above the median need, so each start lies in the past when the plan is
+            // made, and the frame loop starts frames as fast as the encoder takes them. A cap at
+            // one point past the earliest gave those frames points that were taken already: the
+            // host sent 150 to 200 frames a second to a headset that showed 120.
+            if next > earliest + (MAX_AHEAD_PERIODS * period) as Nanos {
                 earliest
+            } else {
+                next.max(earliest)
             }
         };
         let start = (target as f64 - need - lead).max(0.0) as Nanos;
