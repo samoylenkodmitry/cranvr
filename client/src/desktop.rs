@@ -46,7 +46,7 @@ use cranvr_proto::{
 };
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
         mpsc::{self, RecvTimeoutError, Sender},
         Condvar, Mutex, OnceLock,
     },
@@ -185,8 +185,8 @@ struct Uplink {
 struct Quick {
     /// The host offers the desktop and shows it
     visible: AtomicBool,
-    /// The host offers the desktop and hides it, because a game runs
-    hidden: AtomicBool,
+    /// Whether the host hides the desktop for a game, as `HIDES_*`: unknown while it offers none
+    hides: AtomicU8,
     /// The picture's width over its height, as f32 bits
     aspect: AtomicU32,
     cursor_in_video: AtomicBool,
@@ -210,7 +210,7 @@ pub fn desktop() -> &'static Desktop {
     DESKTOP.get_or_init(|| Desktop {
         quick: Quick {
             visible: AtomicBool::new(false),
-            hidden: AtomicBool::new(false),
+            hides: AtomicU8::new(HIDES_UNKNOWN),
             aspect: AtomicU32::new((16.0f32 / 9.0).to_bits()),
             cursor_in_video: AtomicBool::new(false),
             cursor: Mutex::new(None),
@@ -223,10 +223,15 @@ pub fn desktop() -> &'static Desktop {
     })
 }
 
+/// What `Quick::hides` holds
+const HIDES_UNKNOWN: u8 = 0;
+const HIDES_NO: u8 = 1;
+const HIDES_YES: u8 = 2;
+
 /// Whether the host hides the desktop for a game. A session that shows no desktop, a host that
-/// offers none and a link that ended do not count: they say nothing of a game.
-fn hides_for_game(active: bool, params: Option<DesktopParams>) -> bool {
-    active && params.is_some_and(|p| !p.visible)
+/// offers none and a link that ended say nothing of a game: the answer is `None`.
+fn hides_for_game(active: bool, params: Option<DesktopParams>) -> Option<bool> {
+    params.filter(|_| active).map(|p| !p.visible)
 }
 
 /// Whether the app draws the Mac's cursor as a ring on a small panel in front of the picture. It
@@ -271,7 +276,12 @@ impl Desktop {
         }
         self.quick.cursor_in_video.store(inner.params.is_some_and(|p| p.cursor_in_video), Ordering::Relaxed);
         self.quick.visible.store(shown.is_some(), Ordering::Relaxed);
-        self.quick.hidden.store(hides_for_game(inner.active, inner.params), Ordering::Relaxed);
+        let hides = match hides_for_game(inner.active, inner.params) {
+            None => HIDES_UNKNOWN,
+            Some(false) => HIDES_NO,
+            Some(true) => HIDES_YES,
+        };
+        self.quick.hides.store(hides, Ordering::Relaxed);
         if shown.is_none() {
             *self.quick.cursor.lock().unwrap() = None;
         }
@@ -358,9 +368,14 @@ impl Desktop {
     }
 
     /// Whether the host hides the desktop, which it does while a game runs or loads. The app takes
-    /// it as a sign of a game, which the stream's picture then shows.
-    pub fn hidden_by_game(&self) -> bool {
-        self.quick.hidden.load(Ordering::Relaxed)
+    /// it as a sign of a game, which the stream's picture then shows. `None` while the host offers
+    /// no desktop to this session.
+    pub fn game_hides(&self) -> Option<bool> {
+        match self.quick.hides.load(Ordering::Relaxed) {
+            HIDES_NO => Some(false),
+            HIDES_YES => Some(true),
+            _ => None,
+        }
     }
 
     /// Where the Mac's cursor is on the picture as u and v, when it is on the desktop's display.
@@ -873,11 +888,11 @@ mod tests {
             visible,
             cursor_in_video: false,
         };
-        assert!(hides_for_game(true, Some(params(false))));
-        assert!(!hides_for_game(true, Some(params(true))));
+        assert_eq!(hides_for_game(true, Some(params(false))), Some(true));
+        assert_eq!(hides_for_game(true, Some(params(true))), Some(false));
         // A host with no desktop, and a session that ended or that shows none, say nothing of a game
-        assert!(!hides_for_game(true, None));
-        assert!(!hides_for_game(false, Some(params(false))));
+        assert_eq!(hides_for_game(true, None), None);
+        assert_eq!(hides_for_game(false, Some(params(false))), None);
     }
 
     #[test]

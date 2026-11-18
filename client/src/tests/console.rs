@@ -45,7 +45,7 @@ fn the_height_grows_with_the_games_up_to_the_limit() {
     assert_eq!(menu.listed().len(), MAX_GAMES);
     assert!(height(Some(&menu)) < 1000.0, "{}", height(Some(&menu)));
     // A console without a menu is short, and a menu without games keeps a line for the note
-    assert!(height(None) < 250.0);
+    assert!(height(None) < 400.0);
     menu.games.clear();
     assert!(height(Some(&menu)) > two - (size::BUTTON + size::GAP) - 1e-3);
 }
@@ -117,15 +117,21 @@ fn the_room_and_the_volume_come_back_from_their_saved_text() {
 }
 
 #[test]
-fn a_game_runs_when_the_host_hides_the_desktop_or_the_menu_names_a_game() {
+fn the_hosts_hiding_of_the_desktop_tells_a_game_and_the_menu_tells_it_without_a_desktop() {
     let idle = menu(None);
     let playing = menu(Some("Beat Saber.exe"));
-    assert!(!game_runs(None, false), "no menu and a visible desktop: no game");
-    assert!(!game_runs(Some(&idle), false));
-    assert!(game_runs(Some(&playing), false), "the menu names the game");
-    assert!(game_runs(None, true), "the host hides the desktop for a game, and sends no menu");
-    assert!(game_runs(Some(&idle), true), "the host's hiding counts while the menu is late");
-    assert!(game_runs(Some(&playing), true));
+    // The host offers a desktop and shows it: no game, whatever a late menu says
+    assert!(!game_runs(None, Some(false)));
+    assert!(!game_runs(Some(&idle), Some(false)));
+    assert!(!game_runs(Some(&playing), Some(false)), "the game ended and the menu is up to a second late");
+    // The host hides it for a game, also before its menu names the game
+    assert!(game_runs(None, Some(true)));
+    assert!(game_runs(Some(&idle), Some(true)));
+    assert!(game_runs(Some(&playing), Some(true)));
+    // The host offers no desktop: the menu says
+    assert!(!game_runs(None, None), "no menu and no desktop: no game");
+    assert!(!game_runs(Some(&idle), None));
+    assert!(game_runs(Some(&playing), None));
 }
 
 #[test]
@@ -145,26 +151,26 @@ fn the_room_shows_only_while_no_game_runs_and_the_setting_asks_for_it() {
 fn the_console_follows_the_game_and_the_setting_into_its_backdrop() {
     let mut console = Console::default();
     // No link and no menu: no game, so the room shows
-    assert!(console.backdrop(false).shows_room(true));
+    assert!(console.backdrop(None).shows_room(true));
     console.on_menu(menu(None));
-    assert!(console.backdrop(false).shows_room(true));
-    // A game starts. The menu and the desktop both say so, and either alone is enough.
+    assert!(console.backdrop(None).shows_room(true));
+    // A game starts. The desktop's hiding tells it first, the menu later.
+    assert!(!console.backdrop(Some(true)).shows_room(true));
     console.on_menu(menu(Some("Beat Saber.exe")));
-    assert!(!console.backdrop(false).shows_room(true));
-    console.on_menu(menu(None));
-    assert!(!console.backdrop(true).shows_room(true));
-    // The game ends: the room is back
-    assert!(console.backdrop(false).shows_room(true));
+    assert!(!console.backdrop(Some(true)).shows_room(true));
+    // The host has no desktop: the menu alone keeps the game on screen
+    assert!(!console.backdrop(None).shows_room(true));
+    // The game ends: the desktop's visibility brings the room back before the next menu
+    assert!(console.backdrop(Some(false)).shows_room(true));
     // The user keeps the host's scene
     console.set_room(Room::Scene);
-    assert!(!console.backdrop(false).shows_room(true));
+    assert!(!console.backdrop(Some(false)).shows_room(true));
     assert_eq!(console.view().room, Room::Scene);
     console.set_room(Room::Passthrough);
-    assert!(console.backdrop(false).shows_room(true));
-    // The link ends while a game ran: no menu, so the game is gone
-    console.on_menu(menu(Some("Beat Saber.exe")));
+    assert!(console.backdrop(Some(false)).shows_room(true));
+    // The link ends while a game ran: no menu and no desktop, so the game is gone
     console.clear();
-    assert!(console.backdrop(false).shows_room(true));
+    assert!(console.backdrop(None).shows_room(true));
     // The choices survive the end of a link
     console.set_volume(Volume::P300);
     console.clear();

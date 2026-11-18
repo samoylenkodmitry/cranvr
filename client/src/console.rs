@@ -213,11 +213,13 @@ impl Backdrop {
     }
 }
 
-/// Whether a game runs on the host. Two signals tell it. The host hides the desktop while a game
-/// sends frames and while it loads (`desktop_hidden`, see `desktop.rs`). The menu names the game
-/// that is connected. A host with no desktop and no menu tells nothing, so no game counts.
-pub fn game_runs(menu: Option<&Menu>, desktop_hidden: bool) -> bool {
-    desktop_hidden || menu.is_some_and(|menu| menu.status.game.is_some())
+/// Whether a game runs on the host. The host's hiding of the desktop tells it (`desktop_hides`, see
+/// `desktop.rs`): the host hides the desktop while a game sends frames and while it loads, and it
+/// says so as soon as that changes. `None` means that the host offers no desktop. The menu then
+/// tells: its status names the game that is connected. The menu comes at most once a second, so it
+/// is the slower signal. With neither, no game counts.
+pub fn game_runs(menu: Option<&Menu>, desktop_hides: Option<bool>) -> bool {
+    desktop_hides.unwrap_or_else(|| menu.is_some_and(|menu| menu.status.game.is_some()))
 }
 
 /// The sizes of the console's parts in dp. A dp is a millimeter in the room.
@@ -236,8 +238,8 @@ pub fn height(menu: Option<&Menu>) -> f32 {
     use size::*;
     let rows = |heights: &[f32]| heights.iter().map(|h| h + GAP).sum::<f32>();
     let Some(menu) = menu else {
-        // The title, a line of text and the Close button
-        return 2.0 * PADDING + rows(&[TITLE, TEXT, BUTTON]);
+        // The title, a line of text, the heading with the two settings of the client and the buttons
+        return 2.0 * PADDING + rows(&[TITLE, TEXT, HEADING, BUTTON, BUTTON, BUTTON]);
     };
     let games = menu.listed().len().max(1) as f32;
     // The title, the game's state, the heading and the games, the heading and six rows for the five
@@ -290,10 +292,10 @@ impl Console {
         self.volume = volume;
     }
 
-    /// What decides the room behind the panels. `desktop_hidden` is the host's hiding of the
-    /// desktop.
-    pub fn backdrop(&self, desktop_hidden: bool) -> Backdrop {
-        Backdrop { room: self.room, game_runs: game_runs(self.menu.as_ref(), desktop_hidden) }
+    /// What decides the room behind the panels. `desktop_hides` is the host's hiding of the desktop
+    /// (see `game_runs`).
+    pub fn backdrop(&self, desktop_hides: Option<bool>) -> Backdrop {
+        Backdrop { room: self.room, game_runs: game_runs(self.menu.as_ref(), desktop_hides) }
     }
 
     /// Shows the console, or hides it.

@@ -71,7 +71,7 @@ fn OpenConsole(view: View, state: LinkState) {
             ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(size::GAP)),
             move || match &menu {
                 Some(menu) => MenuRows(menu.clone(), room, volume),
-                None => NoMenu(state.clone()),
+                None => NoMenu(state.clone(), room, volume),
             },
         );
     });
@@ -83,13 +83,16 @@ fn bold(size: f32) -> TextStyle {
 
 /// What the console says while the host sends no menu: its app is not running, or no link exists.
 #[composable]
-fn NoMenu(state: LinkState) {
+fn NoMenu(state: LinkState, room: Room, volume: Volume) {
     Text("cranvr", Modifier::empty().height(size::TITLE), bold(34.0));
     let (text, color) = match state {
         LinkState::Streaming => ("The host offers no menu. Start the cranvr app on the Mac.", WARN_COLOR),
         _ => ("Not connected to a host.", MUTED_COLOR),
     };
     Text(text, Modifier::empty().height(size::TEXT), text_style(22.0, color, None));
+    // The settings of the client need no host
+    Heading("Settings");
+    ClientSettings(room, volume);
     CloseButtons(false);
 }
 
@@ -130,14 +133,21 @@ fn MenuRows(menu: Menu, room: Room, volume: Volume) {
         "Anti-aliasing",
         vec![("Limit 2x".into(), Press::Host(Action::Msaa(2)), menu.msaa == 2), ("No limit".into(), Press::Host(Action::Msaa(0)), menu.msaa == 0)],
     );
-    Setting("Room", Room::ALL.iter().map(|&choice| (choice.label().into(), Press::Room(choice), room == choice)).collect());
-    Setting("Volume", Volume::ALL.iter().map(|&choice| (choice.label(), Press::Volume(choice), volume == choice)).collect());
+    ClientSettings(room, volume);
     Text(
         "Refresh and game size restart the stream",
         Modifier::empty().height(size::TEXT),
         text_style(20.0, MUTED_COLOR, None),
     );
     CloseButtons(true);
+}
+
+/// The two settings that the client keeps for itself: what shows behind the panels while no game
+/// runs, and how loud the sound plays.
+#[composable]
+fn ClientSettings(room: Room, volume: Volume) {
+    Setting("Room", Room::ALL.iter().map(|&choice| (choice.label().into(), Press::Room(choice), room == choice)).collect());
+    Setting("Volume", Volume::ALL.iter().map(|&choice| (choice.label(), Press::Volume(choice), volume == choice)).collect());
 }
 
 #[composable]

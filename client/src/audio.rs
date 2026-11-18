@@ -143,8 +143,8 @@ struct Shared {
     age_n: AtomicU64,
     /// The playback rate's change in parts per million, as the bits of an f32
     rate_ppm: AtomicU32,
-    /// The largest absolute sample that the renderer wrote since the last log line, as the bits of
-    /// an f32. The bits of a non-negative float order like the floats, so `fetch_max` works.
+    /// The largest absolute sample that the renderer played since the last log line, before the
+    /// gain, as the bits of an f32. The bits of a non-negative float order like the floats, so `fetch_max` works.
     peak: AtomicU32,
 }
 
@@ -184,8 +184,8 @@ pub struct Stats {
     pub played_s: f32,
     /// The playback rate's change in percent
     pub rate_pct: f32,
-    /// The largest sample that reached the device since the last log line, from 0 to 1. 0 means
-    /// silence: the sound can be on while nothing plays.
+    /// The largest sample that the renderer played since the last log line, before the gain, from
+    /// 0 to 1. 0 means silence: the sound can be on while nothing plays.
     pub peak: f32,
 }
 

@@ -587,7 +587,7 @@ impl Hub {
 
     /// What decides the room behind the panels: the user's choice and whether a game runs.
     pub fn backdrop(&self) -> Backdrop {
-        self.console.lock().unwrap().backdrop(desktop().hidden_by_game())
+        self.console.lock().unwrap().backdrop(desktop().game_hides())
     }
 
     /// Takes the saved choices of the console's Room and Volume settings and applies them. The
