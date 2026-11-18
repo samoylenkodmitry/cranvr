@@ -149,6 +149,9 @@ pub struct RuntimeLink {
     aim_support: AtomicBool,
     /// The host has already said that the runtime lacks aim poses, for this connection
     aim_warned: AtomicBool,
+    /// The runtime dropped the controllers' interaction profiles at an INPUT_RESET. The next pose
+    /// of a controller sends them again.
+    profiles_dropped: AtomicBool,
     control_file: PathBuf,
     port: u16,
     token: String,
@@ -174,6 +177,7 @@ impl RuntimeLink {
             counters: InputCounters::default(),
             aim_support: AtomicBool::new(false),
             aim_warned: AtomicBool::new(false),
+            profiles_dropped: AtomicBool::new(false),
             control_file: control_file.to_owned(),
             port,
             token: random_token()?,
@@ -201,7 +205,10 @@ impl RuntimeLink {
             thread::Builder::new().name("runtime-keepalive".into()).spawn(move || loop {
                 thread::sleep(KEEPALIVE / 2);
                 if link.last_sent.lock().unwrap().elapsed() >= KEEPALIVE {
+                    // The reset also clears the profiles. Without them Unity removes the
+                    // controllers, and a game draws no hands when the poses come back.
                     link.send(msg::INPUT_RESET, &[]);
+                    link.profiles_dropped.store(true, Ordering::Relaxed);
                 }
             })?;
         }
@@ -279,12 +286,8 @@ impl RuntimeLink {
         if let Some(view) = self.calibration.lock().unwrap().view_config {
             self.send_view_config(view);
         }
-        for hand in 0..2u32 {
-            let mut p = Vec::with_capacity(12);
-            p.extend_from_slice(&hand.to_le_bytes());
-            p.extend_from_slice(&QUEST_TOUCH_PROFILE_ID.to_le_bytes());
-            self.send(msg::INTERACTION_PROFILE, &p);
-        }
+        self.profiles_dropped.store(false, Ordering::Relaxed);
+        self.send_profiles();
         events.send(GameEvent::Connected { renderer, program }).ok();
 
         let mut generation = 0u32;
@@ -353,6 +356,16 @@ impl RuntimeLink {
         }
     }
 
+    // The Quest Touch profile for both hands
+    fn send_profiles(&self) {
+        for hand in 0..2u32 {
+            let mut p = Vec::with_capacity(12);
+            p.extend_from_slice(&hand.to_le_bytes());
+            p.extend_from_slice(&QUEST_TOUCH_PROFILE_ID.to_le_bytes());
+            self.send(msg::INTERACTION_PROFILE, &p);
+        }
+    }
+
     fn send(&self, kind: u16, payload: &[u8]) {
         let mut writer = self.writer.lock().unwrap();
         let Some(stream) = writer.as_mut() else { return };
@@ -380,6 +393,9 @@ impl RuntimeLink {
     /// aim pose. A runtime without aim poses gets the grip pose alone, and a game then finds its aim
     /// space at the grip pose, as it did before aim poses existed.
     pub fn controller(&self, timestamp_ns: u64, hand: u32, grip: &DeviceMotion, aim: Option<&DeviceMotion>) {
+        if self.profiles_dropped.swap(false, Ordering::Relaxed) {
+            self.send_profiles();
+        }
         let index = (hand as usize).min(1);
         self.counters.poses[index].fetch_add(1, Ordering::Relaxed);
         let supported = self.aim_support.load(Ordering::Relaxed);
@@ -677,6 +693,24 @@ mod tests {
         let (kind, payload) = read_message(&mut runtime).unwrap();
         assert_eq!((kind, payload.len()), (msg::CONTROLLER_MOTION, 8 + 4 + 4 + 13 * 4));
         assert_eq!(link.take_counts().aim_poses, [0, 1]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn controllers_that_come_back_after_a_reset_get_their_profiles_again() {
+        let dir = std::env::temp_dir().join(format!("cranvr-link-reset-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (link, _events) = RuntimeLink::start(&dir.join("control.txt"), (1600, 1700), 120, |_| ()).unwrap();
+        let mut runtime = connected_runtime(&link, Some("aim\n"));
+        let motion = DeviceMotion { pose: Pose { orientation: Quat::IDENTITY, position: Vec3::new(0.2, 1.2, -0.4) }, linear_velocity: Vec3::ZERO, angular_velocity: Vec3::ZERO };
+        // No pose flows, as while the user sets up the room: the keepalive resets the input
+        assert_eq!(read_message(&mut runtime).unwrap().0, msg::INPUT_RESET);
+        link.controller(7, 1, &motion, Some(&motion));
+        let kinds: Vec<u16> = (0..3).map(|_| read_message(&mut runtime).unwrap().0).collect();
+        assert_eq!(kinds, [msg::INTERACTION_PROFILE, msg::INTERACTION_PROFILE, msg::CONTROLLER_MOTION_AIM]);
+        // The profiles go once per reset
+        link.controller(8, 1, &motion, Some(&motion));
+        assert_eq!(read_message(&mut runtime).unwrap().0, msg::CONTROLLER_MOTION_AIM);
         fs::remove_dir_all(&dir).ok();
     }
 
