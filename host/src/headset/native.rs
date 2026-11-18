@@ -20,6 +20,7 @@ use crate::{
     pairing::{Attempt, Pairings},
     runtime_link::Haptic,
     session::Negotiated,
+    status,
 };
 use alvr_common::{
     error,
@@ -128,6 +129,12 @@ impl EventSource for Events {
     }
 }
 
+/// The `native` status line (see status.rs): where the host listens and who may connect.
+fn status_line(port: u16, local_only: bool, pairings: &Pairings) -> Value {
+    let (paired, pairing_s) = pairings.summary();
+    json!({"type": "native", "port": port, "local_only": local_only, "paired": paired, "pairing_s": pairing_s})
+}
+
 /// Starts listening. A bind error comes back to the caller.
 pub fn start(config: Config) -> std::io::Result<(Arc<dyn Headset>, Box<dyn EventSource>)> {
     let local_only = !config.trust_all && !config.pairings.reachable();
@@ -138,16 +145,17 @@ pub fn start(config: Config) -> std::io::Result<(Arc<dyn Headset>, Box<dyn Event
         "Native protocol: listening on {address}{}",
         if local_only { " (this Mac only: start the host with --pair CODE to pair a headset)" } else { "" }
     );
+    status::emit(status_line(config.port, local_only, &config.pairings));
     let (events, receiver) = mpsc::channel();
     let shared = Arc::new(Shared { events, session: Mutex::new(None), decoder_config: Mutex::new(None) });
     {
         let shared = Arc::clone(&shared);
-        thread::Builder::new().name("native-accept".into()).spawn(move || accept_loop(listener, config, shared))?;
+        thread::Builder::new().name("native-accept".into()).spawn(move || accept_loop(listener, config, shared, local_only))?;
     }
     Ok((Arc::new(Native { shared }), Box::new(Events(receiver))))
 }
 
-fn accept_loop(listener: HostListener, config: Config, shared: Arc<Shared>) {
+fn accept_loop(listener: HostListener, config: Config, shared: Arc<Shared>, local_only: bool) {
     loop {
         let pending = match listener.accept() {
             Ok(pending) => pending,
@@ -168,7 +176,12 @@ fn accept_loop(listener: HostListener, config: Config, shared: Arc<Shared>) {
         if !(config.trust_all || pending.peer.ip().is_loopback()) {
             let key = pending.client_key;
             if !config.pairings.contains(&key) {
-                match config.pairings.try_pair(&key, &name) {
+                let outcome = config.pairings.try_pair(&key, &name);
+                if outcome != Attempt::NoWindow {
+                    // The window closed, or the headset is paired now
+                    status::emit(status_line(config.port, local_only, &config.pairings));
+                }
+                match outcome {
                     Attempt::Paired => info!("Native protocol: paired {name} at {}", pending.peer),
                     outcome => {
                         let code = format_code(pairing_code(&key));
@@ -177,6 +190,16 @@ fn accept_loop(listener: HostListener, config: Config, shared: Arc<Shared>) {
                             _ => format!("start the host with --pair {}", code.replace(' ', "")),
                         };
                         warn!("Native protocol: {name} at {} is not paired. Its code is {code}: {hint}", pending.peer);
+                        // The status line leaves the code out: the user reads it in the headset
+                        let advice = match outcome {
+                            Attempt::WrongCode => "It showed a code that differs from the one that was typed. Check the six digits in its connect panel.",
+                            _ => "Type the six digits that its connect panel shows into cranvr and press Pair.",
+                        };
+                        status::emit(json!({
+                            "type": "network",
+                            "problem": "not_paired",
+                            "message": format!("The headset {name} at {} is not paired. {advice}", pending.peer.ip()),
+                        }));
                         pending.reject(RejectReason::NotPaired);
                         continue;
                     }

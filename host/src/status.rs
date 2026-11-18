@@ -12,8 +12,12 @@
 //! - `stats`: fps, game_frames, render_ms, encode_ms, mbps, audio_s: seconds of the Mac's sound
 //!   captured for the headset (every 5 seconds), and latency: the
 //!   headset's reports since the last line, see `latency::take`, or null
-//! - `network`: problem ("no_poses" with protocol "udp" or "tcp", "vpn_route", or
-//!   "incompatible_client" with detail: ALVR's warning), and message
+//! - `network`: problem ("no_poses" with protocol "udp" or "tcp", "vpn_route",
+//!   "incompatible_client" with detail: ALVR's warning, or "not_paired": a native headset that
+//!   the host refused because it is not paired), and message
+//! - `native`: with `--protocol native`, at the start and after a try to pair that changed the
+//!   state: port, local_only (the host takes this Mac's clients only), paired (the names of the
+//!   paired headsets) and pairing_s (seconds that the pairing window stays open, or null)
 //! - `vr_request`: a button of the console in VR (see desktop_layer.rs): action "play" with game,
 //!   "stop", or "set" with one of fps, game_scale, msaa, low_latency
 //!
