@@ -9,7 +9,7 @@
 //! head.
 
 use crate::{
-    console::{self, size, Action, Game, Menu, View, RATES, SCALES},
+    console::{self, size, Action, Game, Menu, Press, Room, View, Volume, RATES, SCALES},
     hub::{hub, LinkState, Snapshot},
     place,
     tracking::Read,
@@ -64,12 +64,13 @@ fn OpenConsole(view: View, state: LinkState) {
     .with(|pose: &Pose| *pose);
     SpatialPanel(place::movable("console", SubspaceModifier::new().size(size::WIDTH, height), start, |_| {}), move || {
         let menu = view.menu.clone();
+        let (room, volume) = (view.room, view.volume);
         let state = state.clone();
         Column(
             Modifier::empty().fill_max_size().background(PANEL_COLOR).rounded_corners(24.0).padding(size::PADDING),
             ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(size::GAP)),
             move || match &menu {
-                Some(menu) => MenuRows(menu.clone()),
+                Some(menu) => MenuRows(menu.clone(), room, volume),
                 None => NoMenu(state.clone()),
             },
         );
@@ -93,7 +94,7 @@ fn NoMenu(state: LinkState) {
 }
 
 #[composable]
-fn MenuRows(menu: Menu) {
+fn MenuRows(menu: Menu, room: Room, volume: Volume) {
     let status = menu.status.clone();
     let stream = if status.refresh > 0.0 {
         let latency = status.latency_ms.map_or(String::new(), |ms| format!(", {ms:.0} ms"));
@@ -121,11 +122,16 @@ fn MenuRows(menu: Menu) {
     }
 
     Heading("Settings");
-    let rates = RATES.iter().map(|&rate| (format!("{rate} Hz"), Action::Fps(rate), menu.fps == rate)).collect();
+    let rates = RATES.iter().map(|&rate| (format!("{rate} Hz"), Press::Host(Action::Fps(rate)), menu.fps == rate)).collect();
     Setting("Refresh", rates);
-    let sizes = SCALES.iter().map(|&scale| (format!("{:.0}%", scale * 100.0), Action::Scale(scale), (menu.game_scale - scale).abs() < 0.01)).collect();
+    let sizes = SCALES.iter().map(|&scale| (format!("{:.0}%", scale * 100.0), Press::Host(Action::Scale(scale)), (menu.game_scale - scale).abs() < 0.01)).collect();
     Setting("Game size", sizes);
-    Setting("Anti-aliasing", vec![("Limit 2x".into(), Action::Msaa(2), menu.msaa == 2), ("No limit".into(), Action::Msaa(0), menu.msaa == 0)]);
+    Setting(
+        "Anti-aliasing",
+        vec![("Limit 2x".into(), Press::Host(Action::Msaa(2)), menu.msaa == 2), ("No limit".into(), Press::Host(Action::Msaa(0)), menu.msaa == 0)],
+    );
+    Setting("Room", Room::ALL.iter().map(|&choice| (choice.label().into(), Press::Room(choice), room == choice)).collect());
+    Setting("Volume", Volume::ALL.iter().map(|&choice| (choice.label(), Press::Volume(choice), volume == choice)).collect());
     Text(
         "Refresh and game size restart the stream",
         Modifier::empty().height(size::TEXT),
@@ -146,9 +152,9 @@ fn GameRow(game: Game, running: bool) {
         Modifier::empty().fill_max_width(),
         RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(size::GAP)),
         move || {
-            Choice(game.name.clone(), running, Action::Play(game.name.clone()), ACCENT_COLOR, true);
+            Choice(game.name.clone(), running, Press::Host(Action::Play(game.name.clone())), ACCENT_COLOR, true);
             if running {
-                Choice("Stop".into(), false, Action::Stop, STOP_COLOR, false);
+                Choice("Stop".into(), false, Press::Host(Action::Stop), STOP_COLOR, false);
             }
         },
     );
@@ -156,32 +162,41 @@ fn GameRow(game: Game, running: bool) {
 
 /// A setting's name and its choices, the current one marked.
 #[composable]
-fn Setting(name: &'static str, choices: Vec<(String, Action, bool)>) {
+fn Setting(name: &'static str, choices: Vec<(String, Press, bool)>) {
     Row(
         Modifier::empty().fill_max_width(),
         RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(size::GAP)),
         move || {
             Text(name, Modifier::empty().width(LABEL).padding_symmetric(0.0, 8.0), text_style(22.0, TEXT_COLOR, None));
-            for (label, action, selected) in choices.clone() {
-                Choice(label, selected, action, ACCENT_COLOR, true);
+            for (label, press, selected) in choices.clone() {
+                Choice(label, selected, press, ACCENT_COLOR, true);
             }
         },
     );
 }
 
-/// A button that sends `action`. `fill` makes it share the row's width with its neighbors.
+/// A button that does `press`. `fill` makes it share the row's width with its neighbors.
 #[composable]
-fn Choice(label: String, selected: bool, action: Action, selected_color: Color, fill: bool) {
+fn Choice(label: String, selected: bool, press: Press, selected_color: Color, fill: bool) {
     let mut modifier = Modifier::empty().height(size::BUTTON).background(if selected { selected_color } else { KEY_COLOR }).rounded_corners(12.0);
     modifier = if fill { modifier.weight(1.0) } else { modifier.padding_symmetric(24.0, 0.0) };
     Button(
         modifier,
         ButtonSpec::default(),
-        move || hub().press(&action),
+        move || run(&press),
         move || {
             Text(label.clone(), Modifier::empty(), bold(22.0));
         },
     );
+}
+
+/// Does what a button says: asks the host, or changes a setting of the client.
+fn run(press: &Press) {
+    match press {
+        Press::Host(action) => hub().press(action),
+        Press::Room(room) => hub().choose_room(*room),
+        Press::Volume(volume) => hub().choose_volume(*volume),
+    }
 }
 
 /// The buttons at the bottom. Close hides the console. Disconnect ends the link while it runs. Exit

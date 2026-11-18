@@ -5,6 +5,9 @@
 //! the stream's state and sends the text as `HostMsg::Menu`. A press on a button sends a request
 //! as `ClientMsg::Console`. The host hands it to the app as a `vr_request` status line.
 //!
+//! The console also holds two settings of the client itself: the room behind the panels and the
+//! sound's volume. They never go to the host. `settings.rs` saves them.
+//!
 //! This file holds the data and the rules, with no Cranpose state. `console_panel.rs` draws them
 //! and places the panel.
 
@@ -108,6 +111,115 @@ impl Action {
     }
 }
 
+/// What the headset shows behind the panels while no game runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Room {
+    /// The user's room, through the headset's cameras
+    #[default]
+    Passthrough,
+    /// The host's own scene, as the stream shows it
+    Scene,
+}
+
+impl Room {
+    pub const ALL: [Room; 2] = [Room::Passthrough, Room::Scene];
+
+    /// The text under which `settings.rs` saves the choice
+    pub fn key(self) -> &'static str {
+        match self {
+            Room::Passthrough => "passthrough",
+            Room::Scene => "scene",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|room| room.key() == key.trim())
+    }
+
+    /// The button's text
+    pub fn label(self) -> &'static str {
+        match self {
+            Room::Passthrough => "Passthrough",
+            Room::Scene => "Scene",
+        }
+    }
+}
+
+/// How loud the host's sound plays, as a multiple of the level that the host sends.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Volume {
+    P100,
+    #[default]
+    P150,
+    P200,
+    P300,
+}
+
+impl Volume {
+    pub const ALL: [Volume; 4] = [Volume::P100, Volume::P150, Volume::P200, Volume::P300];
+
+    pub fn percent(self) -> u32 {
+        match self {
+            Volume::P100 => 100,
+            Volume::P150 => 150,
+            Volume::P200 => 200,
+            Volume::P300 => 300,
+        }
+    }
+
+    /// The factor that multiplies each sample
+    pub fn gain(self) -> f32 {
+        self.percent() as f32 / 100.0
+    }
+
+    /// The text under which `settings.rs` saves the choice
+    pub fn key(self) -> String {
+        self.percent().to_string()
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        let percent = key.trim().parse::<u32>().ok()?;
+        Self::ALL.into_iter().find(|volume| volume.percent() == percent)
+    }
+
+    pub fn label(self) -> String {
+        format!("{}%", self.percent())
+    }
+}
+
+/// What a console button does. Most of them ask the host. The room and the volume are the client's
+/// own settings.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Press {
+    Host(Action),
+    Room(Room),
+    Volume(Volume),
+}
+
+/// What decides whether the room shows behind the panels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Backdrop {
+    pub room: Room,
+    /// A game runs on the host
+    pub game_runs: bool,
+}
+
+impl Backdrop {
+    /// Whether the room shows through the headset's cameras. It does while no game runs and the
+    /// user chose the room. A headset that cannot show the room (`available` is false) keeps the
+    /// host's scene, because the app's own background is black.
+    pub fn shows_room(&self, available: bool) -> bool {
+        available && self.room == Room::Passthrough && !self.game_runs
+    }
+}
+
+/// Whether a game runs on the host. Two signals tell it. The host hides the desktop while a game
+/// sends frames and while it loads (`desktop_hidden`, see `desktop.rs`). The menu names the game
+/// that is connected. A host with no desktop and no menu tells nothing, so no game counts.
+pub fn game_runs(menu: Option<&Menu>, desktop_hidden: bool) -> bool {
+    desktop_hidden || menu.is_some_and(|menu| menu.status.game.is_some())
+}
+
 /// The sizes of the console's parts in dp. A dp is a millimeter in the room.
 pub mod size {
     pub const WIDTH: f32 = 620.0;
@@ -128,9 +240,9 @@ pub fn height(menu: Option<&Menu>) -> f32 {
         return 2.0 * PADDING + rows(&[TITLE, TEXT, BUTTON]);
     };
     let games = menu.listed().len().max(1) as f32;
-    // The title, the game's state, the heading and the games, the heading and four settings, the
-    // note and the buttons at the bottom
-    2.0 * PADDING + rows(&[TITLE, TEXT, HEADING]) + games * (BUTTON + GAP) + rows(&[HEADING, BUTTON, BUTTON, BUTTON, BUTTON, TEXT, BUTTON])
+    // The title, the game's state, the heading and the games, the heading and six rows for the five
+    // settings (one row is spare), the note and the buttons at the bottom
+    2.0 * PADDING + rows(&[TITLE, TEXT, HEADING]) + games * (BUTTON + GAP) + rows(&[HEADING, BUTTON, BUTTON, BUTTON, BUTTON, BUTTON, BUTTON, TEXT, BUTTON])
 }
 
 /// How long the left menu button must stay down to show or hide the console. A shorter press goes
@@ -142,6 +254,8 @@ pub const HOLD_NS: u64 = 800_000_000;
 pub struct View {
     pub open: bool,
     pub menu: Option<Menu>,
+    pub room: Room,
+    pub volume: Volume,
 }
 
 /// The console's state: its menu and whether it shows.
@@ -158,11 +272,28 @@ pub struct Console {
     /// The console stays open when the link ends. A launch option sets it, for a run without a
     /// controller that could open the console.
     keep_open: bool,
+    /// The client's own settings. The hub loads the saved ones when the app starts.
+    room: Room,
+    volume: Volume,
 }
 
 impl Console {
     pub fn view(&self) -> View {
-        View { open: self.open, menu: self.menu.clone() }
+        View { open: self.open, menu: self.menu.clone(), room: self.room, volume: self.volume }
+    }
+
+    pub fn set_room(&mut self, room: Room) {
+        self.room = room;
+    }
+
+    pub fn set_volume(&mut self, volume: Volume) {
+        self.volume = volume;
+    }
+
+    /// What decides the room behind the panels. `desktop_hidden` is the host's hiding of the
+    /// desktop.
+    pub fn backdrop(&self, desktop_hidden: bool) -> Backdrop {
+        Backdrop { room: self.room, game_runs: game_runs(self.menu.as_ref(), desktop_hidden) }
     }
 
     /// Shows the console, or hides it.

@@ -24,6 +24,10 @@
 //! - A datagram that is missing in the sequence leaves a gap of silence of its length, so the
 //!   sound keeps its timing. A datagram that comes late is dropped.
 //!
+//! The console's Volume setting multiplies each sample by a gain, in the renderer, after the
+//! resampling. A sample that the gain pushes above `KNEE` goes through a soft limiter, so loud parts
+//! do not clip hard. A gain of 1 or less leaves the samples as the host sent them.
+//!
 //! The renderer never locks, allocates or waits. It always says "continue": a stream that the
 //! renderer stops is gone for good.
 //!
@@ -71,6 +75,41 @@ const SMOOTHING_S: f32 = 1.0;
 /// The longest gap of silence that a missing sequence leaves, in datagrams. A longer gap is a
 /// reconnect or a pause of the host.
 const MAX_GAP: u32 = 20;
+
+/// The sound's gain, as the bits of an f32. It starts at 1, which plays the host's level, so a
+/// player that no setting reached sounds as the host sent it. `set_gain` changes it.
+static GAIN: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
+/// The level above which the limiter bends a sample toward 1. Below it the samples pass unchanged.
+const KNEE: f32 = 0.8;
+
+/// Sets the gain by which the renderer multiplies each sample: 1 plays the host's level and 3 plays
+/// it three times as high.
+pub fn set_gain(gain: f32) {
+    let gain = if gain.is_finite() { gain.clamp(0.0, 8.0) } else { 1.0 };
+    log::info!("audio: gain {gain:.2}");
+    GAIN.store(gain.to_bits(), Ordering::Relaxed);
+}
+
+/// Limits `x` smoothly to the range -1 to 1. Up to `KNEE` it is the identity. Above it the curve
+/// has the same slope at first and then flattens toward 1, so it never reaches 1 and has no corner.
+fn soft_limit(x: f32) -> f32 {
+    let level = x.abs();
+    if level <= KNEE {
+        return x;
+    }
+    let over = (level - KNEE) / (1.0 - KNEE);
+    (KNEE + (1.0 - KNEE) * over / (1.0 + over)).copysign(x)
+}
+
+/// The sample after the gain. A gain of 1 or less cannot push a sample out of range, so it needs
+/// no limiter and leaves the loud samples alone.
+fn shape(sample: f32, gain: f32) -> f32 {
+    if gain <= 1.0 {
+        sample * gain
+    } else {
+        soft_limit(sample * gain)
+    }
+}
 
 /// What the two threads and the UI share. Every field is an atomic: the renderer runs in real
 /// time.
@@ -447,6 +486,14 @@ impl Renderer for Output {
     }
 
     fn render(&mut self, out: &mut [f32]) -> RenderStatus {
+        self.play(out, f32::from_bits(GAIN.load(Ordering::Relaxed)))
+    }
+}
+
+impl Output {
+    /// Fills one callback's buffer. `gain` multiplies the samples. The peak that the stats show is
+    /// the level before the gain, so it tells what the host sends.
+    fn play(&mut self, out: &mut [f32], gain: f32) -> RenderStatus {
         let channels = self.channels;
         let out_frames = out.len() / channels;
         self.shared.callback_frames.store(out_frames as u32, Ordering::Relaxed);
@@ -527,10 +574,10 @@ impl Renderer for Output {
             let right = self.before[1] + (self.after[1] - self.before[1]) * t;
             let at = frame * channels;
             match channels {
-                1 => out[at] = (left + right) * 0.5,
+                1 => out[at] = shape((left + right) * 0.5, gain),
                 _ => {
-                    out[at] = left;
-                    out[at + 1] = right;
+                    out[at] = shape(left, gain);
+                    out[at + 1] = shape(right, gain);
                 }
             }
             peak = peak.max(left.abs()).max(right.abs());
@@ -659,6 +706,51 @@ mod tests {
         push(&quiet, &mut queue, (0..2000).map(|_| [0.0, 0.0]));
         quiet.render(&mut buffer);
         assert_eq!(quiet.shared.peak.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_gain_raises_a_quiet_sample_and_the_limiter_keeps_a_loud_one_below_1() {
+        // A quiet sample is below the knee, so the gain alone multiplies it
+        assert!((shape(0.1, 3.0) - 0.3).abs() < 1e-6, "{}", shape(0.1, 3.0));
+        // 0.9 times 3 is 2.7, which the limiter brings under 1 and above the knee
+        let loud = shape(0.9, 3.0);
+        assert!(loud < 1.0 && loud > KNEE, "{loud}");
+        assert_eq!(shape(-0.9, 3.0), -loud);
+        // The limiter has no corner at the knee and never decreases
+        assert!((soft_limit(KNEE + 1e-4) - KNEE).abs() < 2e-4);
+        let mut last = -1.0;
+        for step in 0..=4000 {
+            let x = step as f32 / 1000.0 - 2.0;
+            let y = soft_limit(x);
+            assert!(y >= last && y.abs() < 1.0, "{x} gives {y}");
+            last = y;
+        }
+        // The largest gain and the largest sample still stay in range
+        assert!(shape(1.0, 8.0) < 1.0 && shape(-1.0, 8.0) > -1.0);
+        // A gain of 1 plays the host's level, also for a loud sample
+        assert_eq!(shape(0.95, 1.0), 0.95);
+        assert!((shape(0.5, 0.5) - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_renderer_applies_the_gain_after_it_takes_the_peak() {
+        let (mut queue, mut out) = output(48_000.0, 48_000.0, 2);
+        push(&out, &mut queue, (0..2000).map(|_| [0.1, -0.9]));
+        let mut buffer = [0.0f32; 2 * 240];
+        out.play(&mut buffer, 3.0);
+        for frame in buffer.chunks(2) {
+            assert!((frame[0] - 0.3).abs() < 1e-5 && (frame[1] - shape(-0.9, 3.0)).abs() < 1e-5, "{frame:?}");
+        }
+        assert!(buffer.iter().all(|s| s.abs() < 1.0));
+        // The stats show the level that the host sent
+        let peak = f32::from_bits(out.shared.peak.load(Ordering::Relaxed));
+        assert!((peak - 0.9).abs() < 1e-5, "{peak}");
+        // A mono device gets the limited mean of the channels
+        let (mut queue, mut mono) = output(48_000.0, 48_000.0, 1);
+        push(&mono, &mut queue, (0..2000).map(|_| [0.3, 0.1]));
+        let mut one = [0.0f32; 240];
+        mono.play(&mut one, 2.0);
+        assert!(one.iter().all(|s| (*s - 0.4).abs() < 1e-5), "{:?}", &one[..4]);
     }
 
     #[test]

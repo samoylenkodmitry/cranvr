@@ -185,6 +185,8 @@ struct Uplink {
 struct Quick {
     /// The host offers the desktop and shows it
     visible: AtomicBool,
+    /// The host offers the desktop and hides it, because a game runs
+    hidden: AtomicBool,
     /// The picture's width over its height, as f32 bits
     aspect: AtomicU32,
     cursor_in_video: AtomicBool,
@@ -208,6 +210,7 @@ pub fn desktop() -> &'static Desktop {
     DESKTOP.get_or_init(|| Desktop {
         quick: Quick {
             visible: AtomicBool::new(false),
+            hidden: AtomicBool::new(false),
             aspect: AtomicU32::new((16.0f32 / 9.0).to_bits()),
             cursor_in_video: AtomicBool::new(false),
             cursor: Mutex::new(None),
@@ -218,6 +221,12 @@ pub fn desktop() -> &'static Desktop {
         wake: Condvar::new(),
         units: Mutex::new(None),
     })
+}
+
+/// Whether the host hides the desktop for a game. A session that shows no desktop, a host that
+/// offers none and a link that ended do not count: they say nothing of a game.
+fn hides_for_game(active: bool, params: Option<DesktopParams>) -> bool {
+    active && params.is_some_and(|p| !p.visible)
 }
 
 /// Whether the app draws the Mac's cursor as a ring on a small panel in front of the picture. It
@@ -262,6 +271,7 @@ impl Desktop {
         }
         self.quick.cursor_in_video.store(inner.params.is_some_and(|p| p.cursor_in_video), Ordering::Relaxed);
         self.quick.visible.store(shown.is_some(), Ordering::Relaxed);
+        self.quick.hidden.store(hides_for_game(inner.active, inner.params), Ordering::Relaxed);
         if shown.is_none() {
             *self.quick.cursor.lock().unwrap() = None;
         }
@@ -345,6 +355,12 @@ impl Desktop {
     /// What the panel needs. It never waits for the decoder.
     pub fn view(&self) -> View {
         View { visible: self.quick.visible.load(Ordering::Relaxed), aspect: f32::from_bits(self.quick.aspect.load(Ordering::Relaxed)) }
+    }
+
+    /// Whether the host hides the desktop, which it does while a game runs or loads. The app takes
+    /// it as a sign of a game, which the stream's picture then shows.
+    pub fn hidden_by_game(&self) -> bool {
+        self.quick.hidden.load(Ordering::Relaxed)
     }
 
     /// Where the Mac's cursor is on the picture as u and v, when it is on the desktop's display.
@@ -841,6 +857,27 @@ mod tests {
 
     fn close(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-5
+    }
+
+    #[test]
+    fn the_host_hides_the_desktop_for_a_game_only_in_a_session_that_has_a_desktop() {
+        let params = |visible| DesktopParams {
+            stream: DESKTOP_STREAM,
+            codec: Codec::Hevc,
+            size: [3840, 2160],
+            points: [1920.0, 1080.0],
+            max_fps: 60.0,
+            bitrate_bps: 40_000_000,
+            full_range: true,
+            flipped: false,
+            visible,
+            cursor_in_video: false,
+        };
+        assert!(hides_for_game(true, Some(params(false))));
+        assert!(!hides_for_game(true, Some(params(true))));
+        // A host with no desktop, and a session that ended or that shows none, say nothing of a game
+        assert!(!hides_for_game(true, None));
+        assert!(!hides_for_game(false, Some(params(false))));
     }
 
     #[test]

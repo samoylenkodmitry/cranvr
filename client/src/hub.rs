@@ -6,8 +6,11 @@
 //! and the table of the streamed frames' views also pass through here.
 
 use crate::{
+    audio,
     connection::Connection,
-    console::{Action, Console, Menu, View as ConsoleView},
+    console::{Action, Backdrop, Console, Menu, Room, View as ConsoleView, Volume},
+    desktop::desktop,
+    settings,
     tracking::{Display, Feed},
 };
 use cranpose::{CropRect, DecodedFrames};
@@ -335,6 +338,9 @@ pub struct Hub {
     connection: Mutex<Option<Connection>>,
     wanted: Mutex<Option<Wanted>>,
     console: Mutex<Console>,
+    /// The saved settings of the console were loaded. A rebuilt composition must not load them
+    /// again, because the choices in memory are newer when a save failed.
+    settings_loaded: AtomicBool,
 }
 
 /// The one hub of the process. The activity may rebuild the composition, and the link outlives it.
@@ -356,6 +362,7 @@ pub fn hub() -> &'static Hub {
         connection: Mutex::new(None),
         wanted: Mutex::new(None),
         console: Mutex::new(Console::default()),
+        settings_loaded: AtomicBool::new(false),
     })
 }
 
@@ -576,6 +583,41 @@ impl Hub {
     /// Opens the console and keeps it open when the link ends (see `settings::console_on_launch`).
     pub fn pin_console(&self) {
         self.console.lock().unwrap().pin();
+    }
+
+    /// What decides the room behind the panels: the user's choice and whether a game runs.
+    pub fn backdrop(&self) -> Backdrop {
+        self.console.lock().unwrap().backdrop(desktop().hidden_by_game())
+    }
+
+    /// Takes the saved choices of the console's Room and Volume settings and applies them. The
+    /// headset's app calls it when it composes, before a link can start. Only the first call in
+    /// the process loads.
+    pub fn load_settings(&self) {
+        if self.settings_loaded.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let (room, volume) = (settings::room(), settings::volume());
+        {
+            let mut console = self.console.lock().unwrap();
+            console.set_room(room);
+            console.set_volume(volume);
+        }
+        audio::set_gain(volume.gain());
+    }
+
+    /// The user chose what shows behind the panels while no game runs.
+    pub fn choose_room(&self, room: Room) {
+        log::info!("the console sets the room to {}", room.key());
+        self.console.lock().unwrap().set_room(room);
+        settings::remember_room(room);
+    }
+
+    /// The user chose how loud the sound plays.
+    pub fn choose_volume(&self, volume: Volume) {
+        self.console.lock().unwrap().set_volume(volume);
+        audio::set_gain(volume.gain());
+        settings::remember_volume(volume);
     }
 
     /// Sends a press of a console button to the host.

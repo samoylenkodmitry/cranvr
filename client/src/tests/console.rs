@@ -94,3 +94,89 @@ fn a_hold_of_the_menu_button_shows_or_hides_the_console() {
     assert!(console.on_frame(true, 4_000 * ms + HOLD_NS));
     assert!(!console.view().open);
 }
+
+#[test]
+fn the_room_and_the_volume_come_back_from_their_saved_text() {
+    assert_eq!(Room::default(), Room::Passthrough);
+    assert_eq!(Volume::default(), Volume::P150);
+    for room in Room::ALL {
+        assert_eq!(Room::from_key(room.key()), Some(room));
+    }
+    for volume in Volume::ALL {
+        assert_eq!(Volume::from_key(&volume.key()), Some(volume));
+    }
+    // Text that no choice wrote gives no choice, so the setting falls back to its default
+    assert_eq!(Room::from_key("sky"), None);
+    assert_eq!(Volume::from_key("175"), None);
+    assert_eq!(Volume::from_key("loud"), None);
+    assert_eq!(Room::from_key(" scene "), Some(Room::Scene));
+    assert_eq!(Volume::ALL.map(Volume::percent), [100, 150, 200, 300]);
+    assert_eq!(Volume::ALL.map(Volume::gain), [1.0, 1.5, 2.0, 3.0]);
+    assert_eq!(Volume::P200.label(), "200%");
+    assert_eq!((Room::Passthrough.label(), Room::Scene.label()), ("Passthrough", "Scene"));
+}
+
+#[test]
+fn a_game_runs_when_the_host_hides_the_desktop_or_the_menu_names_a_game() {
+    let idle = menu(None);
+    let playing = menu(Some("Beat Saber.exe"));
+    assert!(!game_runs(None, false), "no menu and a visible desktop: no game");
+    assert!(!game_runs(Some(&idle), false));
+    assert!(game_runs(Some(&playing), false), "the menu names the game");
+    assert!(game_runs(None, true), "the host hides the desktop for a game, and sends no menu");
+    assert!(game_runs(Some(&idle), true), "the host's hiding counts while the menu is late");
+    assert!(game_runs(Some(&playing), true));
+}
+
+#[test]
+fn the_room_shows_only_while_no_game_runs_and_the_setting_asks_for_it() {
+    let backdrop = |room, game_runs| Backdrop { room, game_runs };
+    // The setting is Passthrough, which is the default
+    assert!(backdrop(Room::default(), false).shows_room(true));
+    assert!(!backdrop(Room::Passthrough, true).shows_room(true), "a game fills the view");
+    // The setting is Scene: the host's scene stays, with or without a game
+    assert!(!backdrop(Room::Scene, false).shows_room(true));
+    assert!(!backdrop(Room::Scene, true).shows_room(true));
+    // A headset or a window that cannot show the room keeps the stream
+    assert!(!backdrop(Room::Passthrough, false).shows_room(false));
+}
+
+#[test]
+fn the_console_follows_the_game_and_the_setting_into_its_backdrop() {
+    let mut console = Console::default();
+    // No link and no menu: no game, so the room shows
+    assert!(console.backdrop(false).shows_room(true));
+    console.on_menu(menu(None));
+    assert!(console.backdrop(false).shows_room(true));
+    // A game starts. The menu and the desktop both say so, and either alone is enough.
+    console.on_menu(menu(Some("Beat Saber.exe")));
+    assert!(!console.backdrop(false).shows_room(true));
+    console.on_menu(menu(None));
+    assert!(!console.backdrop(true).shows_room(true));
+    // The game ends: the room is back
+    assert!(console.backdrop(false).shows_room(true));
+    // The user keeps the host's scene
+    console.set_room(Room::Scene);
+    assert!(!console.backdrop(false).shows_room(true));
+    assert_eq!(console.view().room, Room::Scene);
+    console.set_room(Room::Passthrough);
+    assert!(console.backdrop(false).shows_room(true));
+    // The link ends while a game ran: no menu, so the game is gone
+    console.on_menu(menu(Some("Beat Saber.exe")));
+    console.clear();
+    assert!(console.backdrop(false).shows_room(true));
+    // The choices survive the end of a link
+    console.set_volume(Volume::P300);
+    console.clear();
+    assert_eq!(console.view().volume, Volume::P300);
+}
+
+#[test]
+fn the_new_settings_fit_the_consoles_height() {
+    let mut menu = menu(None);
+    menu.games.extend((0..10).map(|i| Game { name: format!("Game {i}"), program: format!("g{i}.exe") }));
+    assert_eq!(menu.listed().len(), MAX_GAMES);
+    // Five games, five settings, the note and the buttons: about 940 dp, a little under a meter
+    let tall = height(Some(&menu));
+    assert!(tall > 900.0 && tall < 1000.0, "{tall}");
+}
