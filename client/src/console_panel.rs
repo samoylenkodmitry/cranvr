@@ -126,9 +126,8 @@ fn MenuRows(menu: Menu) {
     let sizes = SCALES.iter().map(|&scale| (format!("{:.0}%", scale * 100.0), Action::Scale(scale), (menu.game_scale - scale).abs() < 0.01)).collect();
     Setting("Game size", sizes);
     Setting("Anti-aliasing", vec![("Limit 2x".into(), Action::Msaa(2), menu.msaa == 2), ("No limit".into(), Action::Msaa(0), menu.msaa == 0)]);
-    Setting("Latency", vec![("Low latency".into(), Action::LowLatency(!menu.low_latency), menu.low_latency)]);
     Text(
-        "Refresh, game size and latency restart the stream",
+        "Refresh and game size restart the stream",
         Modifier::empty().height(size::TEXT),
         text_style(20.0, MUTED_COLOR, None),
     );

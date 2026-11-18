@@ -14,7 +14,7 @@ fn menu(game: Option<&str>) -> Menu {
 fn the_menu_comes_from_the_hosts_json() {
     let menu = Menu::parse(MENU).unwrap();
     assert_eq!(menu.games, [Game { name: "Beat Saber".into(), program: "Beat Saber.exe".into() }, Game { name: "Half-Life: Alyx".into(), program: "hlvr.exe".into() }]);
-    assert_eq!((menu.fps, menu.msaa, menu.low_latency), (120, 2, false));
+    assert_eq!((menu.fps, menu.msaa), (120, 2));
     assert!((menu.game_scale - 0.6).abs() < 1e-6);
     assert_eq!(menu.status, Status { refresh: 120.0, fps: 119.4, game_fps: 117.0, latency_ms: Some(46.2), game: Some("Beat Saber.exe".into()) });
     assert!(menu.runs(&menu.games[0]) && !menu.runs(&menu.games[1]));
@@ -32,7 +32,6 @@ fn requests_are_the_json_that_the_app_reads() {
     assert_eq!(json(Action::Stop), json!({"action": "stop"}));
     assert_eq!(json(Action::Fps(90)), json!({"action": "set", "fps": 90}));
     assert_eq!(json(Action::Msaa(0)), json!({"action": "set", "msaa": 0}));
-    assert_eq!(json(Action::LowLatency(true)), json!({"action": "set", "low_latency": true}));
     assert!((json(Action::Scale(0.7))["game_scale"].as_f64().unwrap() - 0.7).abs() < 1e-6);
 }
 

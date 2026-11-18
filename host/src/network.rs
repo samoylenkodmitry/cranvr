@@ -45,7 +45,7 @@ impl StreamWatch {
                 "The headset connected, but none of its stream data reached this Mac. A VPN on \
                  the headset can send its UDP packets through another device that changes their \
                  sender address: Tailscale does this when the headset uses a subnet route for its \
-                 own network. Exclude the ALVR app from the VPN on the headset, or stream over TCP."
+                 own network. Exclude the headset's stream app (ALVR or cranvr) from the VPN on the headset, or stream over TCP."
             };
             json!({
                 "type": "network",
