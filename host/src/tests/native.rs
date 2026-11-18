@@ -437,3 +437,17 @@ fn a_second_headset_gets_busy_and_the_host_takes_the_next_one() {
     wait_for(&mut *events, |e| matches!(e, Event::Connected { .. }));
     third.duplex.close();
 }
+
+#[test]
+fn the_status_line_tells_the_app_who_may_connect_and_whether_pairing_is_open() {
+    let dir = std::env::temp_dir().join(format!("cranvr-native-status-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::remove_file(dir.join("paired-headsets.txt")).ok();
+    // No headset is paired and no code was given: only this Mac may connect
+    let closed = status_line(9950, true, &Pairings::load(&dir, None));
+    assert_eq!(closed, json!({"type": "native", "port": 9950, "local_only": true, "paired": [], "pairing_s": null}));
+    // A code opens the window for ten minutes
+    let open = status_line(9951, false, &Pairings::load(&dir, Some(123_456)));
+    assert_eq!((open["port"].as_u64(), open["local_only"].as_bool()), (Some(9951), Some(false)));
+    assert!(open["pairing_s"].as_u64().is_some_and(|s| (590..=600).contains(&s)), "{open}");
+}

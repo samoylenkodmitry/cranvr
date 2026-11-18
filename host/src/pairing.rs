@@ -101,6 +101,21 @@ impl Pairings {
         }
     }
 
+    /// What the `native` status line says about pairing: the names of the paired headsets (the
+    /// start of the key for a headset without a name) and the seconds that the window stays open,
+    /// or `None` while no window is open.
+    pub fn summary(&self) -> (Vec<String>, Option<u64>) {
+        let names = self
+            .keys
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(key, name)| if name.is_empty() { to_hex(&key[..4]) } else { name.clone() })
+            .collect();
+        let seconds = self.window.lock().unwrap().as_ref().and_then(|w| WINDOW_OPEN.checked_sub(w.opened.elapsed())).map(|left| left.as_secs());
+        (names, seconds)
+    }
+
     pub fn contains(&self, key: &[u8; KEY_LEN]) -> bool {
         self.keys.lock().unwrap().iter().any(|(known, _)| known == key)
     }
@@ -206,6 +221,22 @@ mod tests {
         // A damaged file gives a new key. The host does not crash.
         std::fs::write(dir.join(HOST_KEY_FILE), "not a key").unwrap();
         assert_ne!(host_identity(&dir).public_key(), first.public_key());
+    }
+
+    #[test]
+    fn the_summary_names_the_paired_headsets_and_the_open_window() {
+        let dir = dir("summary");
+        let (headset, code) = key(4);
+        let pairings = Pairings::load(&dir, Some(code));
+        let (names, open) = pairings.summary();
+        assert!(names.is_empty());
+        assert!(open.is_some_and(|s| s > WINDOW_OPEN.as_secs() - 5 && s <= WINDOW_OPEN.as_secs()));
+        pairings.try_pair(&headset, "Meta Quest 3");
+        // The pairing closed the window
+        assert_eq!(pairings.summary(), (vec!["Meta Quest 3".to_string()], None));
+        // A line without a name shows the start of the key
+        std::fs::write(dir.join(FILE), format!("{} \n", to_hex(&headset))).unwrap();
+        assert_eq!(Pairings::load(&dir, None).summary().0, [to_hex(&headset[..4])]);
     }
 
     #[test]
