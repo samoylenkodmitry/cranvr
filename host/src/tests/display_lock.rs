@@ -192,6 +192,30 @@ struct Outcome {
 /// `pipeline` ms from the start to the end of the decode with `jitter` ms of spread. The headset
 /// takes the newest frame that is ready at the pick. With `locked` the host follows the planner.
 /// Otherwise it starts a frame as each tracking sample arrives, as the host did before.
+#[test]
+fn a_frame_loop_that_starts_late_takes_each_point_once() {
+    // A loaded Mac, as measured on 18 November 2026: the needs spread from 19 to 35 ms and the
+    // misses raised the margin to a period, so the need with the margin lies 14 ms above the
+    // median need. Each plan's start then lies in the past, and the frame loop starts the frame
+    // as soon as the encoder takes one, every 5 ms.
+    let mut lock = lock_with_grid();
+    lock.need = (0..WINDOW).map(|i| (19.0 + 16.0 * i as f64 / (WINDOW - 1) as f64) * MS).collect();
+    lock.margin_ms = PERIOD as f64 / MS;
+    let begin = 1_100_000_000;
+    let mut now = begin;
+    let mut targets = Vec::new();
+    while now < begin + 1_000_000_000 {
+        let plan = lock.plan(now).unwrap();
+        lock.commit(plan.target, 0);
+        targets.push(plan.target);
+        now = plan.start.max(now) + 5 * MS as u64;
+    }
+    assert!(targets.windows(2).all(|pair| pair[1] > pair[0]), "a point was taken twice");
+    // One second holds 120 points; the first frames may reach a few points ahead
+    assert!(targets.len() <= 125, "{} frames in a second", targets.len());
+    assert!(targets.len() >= 115, "{} frames in a second", targets.len());
+}
+
 fn simulate(locked: bool, pipeline_ms: f64, jitter_ms: f64, seed: u64) -> Outcome {
     let (lead, ahead) = (17.0 * MS, 18.0 * MS);
     let d0 = 10_000_000_000u64;
