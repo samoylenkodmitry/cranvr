@@ -293,7 +293,7 @@ fn run(
         Err(e) => {
             let message = match &e {
                 Error::Rejected(RejectReason::NotPaired) => format!(
-                    "{host} does not know this headset. On the Mac, start cranvr-host with --pair {}",
+                    "{host} does not know this headset. On the Mac, choose the cranvr client in the cranvr app and pair the code {}, or start cranvr-host with --pair and the code",
                     format_code(identity.code()).replace(' ', "")
                 ),
                 Error::HostKeyChanged => format!(

@@ -46,7 +46,6 @@ pub struct Menu {
     pub game_scale: f32,
     /// The most MSAA samples a game may use; 0 lets the game choose
     pub msaa: u32,
-    pub low_latency: bool,
     pub status: Status,
 }
 
@@ -65,7 +64,6 @@ impl Menu {
             fps: v["fps"].as_u64().unwrap_or(120) as u32,
             game_scale: number(&v["game_scale"]).unwrap_or(1.0),
             msaa: v["msaa"].as_u64().unwrap_or(0) as u32,
-            low_latency: v["low_latency"].as_bool().unwrap_or(false),
             status: Status {
                 refresh: number(&s["refresh"]).unwrap_or(0.0),
                 fps: number(&s["fps"]).unwrap_or(0.0),
@@ -95,7 +93,6 @@ pub enum Action {
     Fps(u32),
     Scale(f32),
     Msaa(u32),
-    LowLatency(bool),
 }
 
 impl Action {
@@ -107,7 +104,6 @@ impl Action {
             Action::Fps(fps) => json!({"action": "set", "fps": fps}),
             Action::Scale(scale) => json!({"action": "set", "game_scale": scale}),
             Action::Msaa(samples) => json!({"action": "set", "msaa": samples}),
-            Action::LowLatency(on) => json!({"action": "set", "low_latency": on}),
         }
         .to_string()
     }
