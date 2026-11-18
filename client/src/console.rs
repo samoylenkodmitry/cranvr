@@ -3,8 +3,7 @@
 //!
 //! The cranvr app on the Mac writes the games and the settings into `vr-menu.json`. The host adds
 //! the stream's state and sends the text as `HostMsg::Menu`. A press on a button sends a request
-//! as `ClientMsg::Console`. The host hands it to the app as a `vr_request` status line. The texts
-//! are the JSON of the old Quest client's console, so the app serves both clients.
+//! as `ClientMsg::Console`. The host hands it to the app as a `vr_request` status line.
 //!
 //! This file holds the data and the rules, with no Cranpose state. `console_panel.rs` draws them
 //! and places the panel.
@@ -182,8 +181,8 @@ impl Console {
     }
 
     /// A new menu from the host. The console shows when the first menu comes and while no game
-    /// runs, and it hides when a game starts, as the old client's did. The user's own toggle holds
-    /// until the game starts or stops.
+    /// runs, and it hides when a game starts. The user's own toggle holds until the game starts or
+    /// stops.
     pub fn on_menu(&mut self, menu: Menu) {
         let runs = menu.status.game.is_some();
         if self.game_ran != Some(runs) {

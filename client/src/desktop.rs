@@ -70,7 +70,7 @@ const DEAD_ZONE: f32 = 0.12;
 /// How long the decoder waits for a free input buffer before it refuses a picture
 const INPUT_WAIT: Duration = Duration::from_millis(30);
 /// What the client asks for. The Quest 3's hardware decoder takes 3840 by 2160 at 60 pictures a
-/// second (the old Quest app ran it).
+/// second.
 const WISH_WIDTH: u32 = 3840;
 const WISH_FPS: u8 = 60;
 /// The pointer goes to the host this often while it points at the panel, if nothing changes
