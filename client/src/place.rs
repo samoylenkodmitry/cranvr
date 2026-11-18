@@ -11,11 +11,15 @@
 //! in the same frame, so the first start opens in front of the user.
 
 use cranpose::preferences;
-use cranpose_xr::{MovePolicy, Pose, SpatialMoveEvent, SpatialMoveEventType, SubspaceModifier};
+use cranpose::prelude::MutableState;
+use cranpose_xr::{MovePolicy, Pose, ResizeLimits, ResizePolicy, SpatialMoveEvent, SpatialMoveEventType, SpatialResizeEventType, SubspaceModifier};
 
 /// The farthest that a saved panel may stand from its subspace's origin, in meters. A pose from
 /// a damaged preference must not put a panel out of reach.
 const FAR: f32 = 12.0;
+
+/// How many times its own size the user may make a resizable panel
+const GROWTH: f32 = 2.5;
 
 fn pose_key(name: &str) -> String {
     format!("pose:{name}")
@@ -45,6 +49,43 @@ pub fn save_width(name: &str, width: f32) {
     if let Err(e) = preferences().set(&format!("width:{name}"), &format!("{width:.4}")) {
         log::warn!("the width of the {name} panel was not saved: {e}");
     }
+}
+
+/// The size in dp that the user gave the panel `name`, if they resized it.
+fn saved_size(name: &str) -> Option<[f32; 2]> {
+    let text = preferences().get(&format!("size:{name}"))?;
+    let (width, height) = text.split_once(',')?;
+    let size: [f32; 2] = [width.trim().parse().ok()?, height.trim().parse().ok()?];
+    size.iter().all(|side| side.is_finite()).then_some(size)
+}
+
+fn save_size(name: &str, size: [f32; 2]) {
+    if let Err(e) = preferences().set(&format!("size:{name}"), &format!("{:.0},{:.0}", size[0], size[1])) {
+        log::warn!("the size of the {name} panel was not saved: {e}");
+    }
+}
+
+/// The size in dp that the panel `name` starts at: the saved one within the panel's limits, else
+/// `smallest`, the size that its content was laid out for.
+pub fn start_size(name: &str, smallest: [f32; 2]) -> [f32; 2] {
+    saved_size(name).map_or(smallest, |size| [0, 1].map(|axis| size[axis].clamp(smallest[axis], smallest[axis] * GROWTH)))
+}
+
+/// The modifier of the panel `name` at the size that `size` holds. The sphere at the panel's bottom
+/// right corner resizes it from `smallest` up to `GROWTH` times that. The content lays out again at
+/// each size. The size of the last step of each resize goes to the preferences.
+pub fn resizable(name: &'static str, size: MutableState<[f32; 2]>, smallest: [f32; 2]) -> SubspaceModifier {
+    let [width, height] = size.get();
+    let limits = ResizeLimits::new().minimum_size(smallest[0], smallest[1]).maximum_size(smallest[0] * GROWTH, smallest[1] * GROWTH);
+    SubspaceModifier::new().size(width, height).resizable_with(
+        limits,
+        ResizePolicy::custom(move |event| {
+            size.set(event.size);
+            if event.event_type == SpatialResizeEventType::End {
+                save_size(name, event.size);
+            }
+        }),
+    )
 }
 
 /// The pose that the panel `name` starts at: the saved one, else `default`.

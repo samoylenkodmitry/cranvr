@@ -27,6 +27,9 @@ use cranpose_xr::{
 use cranvr_proto::{clock::now_ns, identity::format_code};
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
+/// The sizes in dp that the connect and stats panels start at. The user can make them larger.
+const CONNECT_SIZE: [f32; 2] = [760.0, 840.0];
+const STATS_SIZE: [f32; 2] = [700.0, 840.0];
 /// How often the UI copies the link's numbers into its state
 const POLL: Duration = Duration::from_millis(250);
 /// How often the UI looks for a new decoder. The decoder drops pictures that nobody takes, so the
@@ -339,8 +342,9 @@ fn ConnectPanel(snapshot: MutableState<Snapshot>) {
     // In a headset a focused field must not ask for a software keyboard
     let in_headset = local_spatial_capabilities().current().is_spatial_ui_enabled();
     let pose = remember(|| place::start_pose("connect", side_pose(-1.0))).with(|pose| *pose);
+    let size = rememberMutableStateOf(|| place::start_size("connect", CONNECT_SIZE));
     SpatialPanel(
-        place::movable("connect", SubspaceModifier::new().size(760.0, 840.0), pose, |_| {}),
+        place::movable("connect", place::resizable("connect", size, CONNECT_SIZE), pose, |_| {}),
         move || ConnectBody(snapshot, address, Modifier::empty().fill_max_size(), Entry::Keypad { system_keyboard: !in_headset }),
     );
 }
@@ -497,8 +501,9 @@ fn state_text(state: &LinkState, address: &str) -> (String, Color) {
 #[composable]
 fn StatsPanel(snapshot: MutableState<Snapshot>) {
     let pose = remember(|| place::start_pose("stats", side_pose(1.0))).with(|pose| *pose);
+    let size = rememberMutableStateOf(|| place::start_size("stats", STATS_SIZE));
     SpatialPanel(
-        place::movable("stats", SubspaceModifier::new().size(700.0, 840.0), pose, |_| {}),
+        place::movable("stats", place::resizable("stats", size, STATS_SIZE), pose, |_| {}),
         move || StatsBody(snapshot, Modifier::empty().fill_max_size()),
     );
 }

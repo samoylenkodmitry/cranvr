@@ -14,8 +14,8 @@
 //! from the headset's frame while the ray is on the surface.
 //!
 //! Cranpose carries the panel. Its move events give the pose that `place.rs` keeps for the next
-//! start. They also give the cursor ring its place. A move event carries no size, so the user
-//! resizes the panel with the thumbstick during a carry. This file keeps the width.
+//! start. They also give the cursor ring its place. The user resizes the panel with the sphere at
+//! its bottom right corner, or with the thumbstick during a carry. This file keeps the width.
 //!
 //! Threads and what they own:
 //! - the network threads call [`on_message`], [`push_unit`] and [`on_cursor`];
@@ -34,8 +34,8 @@ use cranpose::{
     PointerEventKind, VideoCodec, VideoDecoder,
 };
 use cranpose_xr::{
-    Pose, SpatialExternalSurface, SpatialFrameEffect, SpatialMoveEvent, SpatialMoveEventType, SpatialPanel, StereoMode,
-    SubspaceModifier, XrFrame, METERS_PER_DP,
+    Pose, ResizeLimits, ResizePolicy, SpatialExternalSurface, SpatialFrameEffect, SpatialMoveEvent, SpatialMoveEventType, SpatialPanel,
+    SpatialResizeEventType, StereoMode, SubspaceModifier, XrFrame, METERS_PER_DP,
 };
 use cranvr_proto::{
     clock::now_ns,
@@ -818,9 +818,18 @@ pub fn DesktopPanel() {
 #[composable]
 fn Surface(pose: MutableState<Pose>, width: MutableState<f32>, carrying: MutableState<bool>, aspect: f32) {
     let [surface_width, surface_height] = surface_size(width.get(), aspect);
+    // The sphere at the bottom right corner resizes the panel. The picture keeps its shape.
+    let [smallest, largest] = WIDTH_RANGE.map(|width| surface_size(width, aspect));
+    let limits = ResizeLimits::new().minimum_size(smallest[0], smallest[1]).maximum_size(largest[0], largest[1]).maintain_aspect_ratio(true);
+    let resize = ResizePolicy::custom(move |event| {
+        width.set((event.size[0] * METERS_PER_DP).clamp(WIDTH_RANGE[0], WIDTH_RANGE[1]));
+        if event.event_type == SpatialResizeEventType::End {
+            place::save_width(PANEL, width.get_non_reactive());
+        }
+    });
     let modifier = place::movable(
         PANEL,
-        SubspaceModifier::new().size(surface_width, surface_height),
+        SubspaceModifier::new().size(surface_width, surface_height).resizable_with(limits, resize),
         pose.get_non_reactive(),
         move |event: &SpatialMoveEvent| {
             let ended = event.event_type == SpatialMoveEventType::End;
