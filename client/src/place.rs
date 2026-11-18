@@ -6,8 +6,8 @@
 //!
 //! A pose is relative to the origin of the panel's subspace. All panels stand in a
 //! `FollowingSubspace`, whose origin lies a meter ahead of the head at the app's first tracked
-//! frame, and again after a recenter. A saved pose therefore means the same at each start: the
-//! place relative to where the user looked then. A panel with no saved pose takes its default pose
+//! frame. The origin moves there again after a recenter. A saved pose therefore means the same at
+//! each start: the place relative to where the user looked then. A panel with no saved pose takes its default pose
 //! in the same frame, so the first start opens in front of the user.
 
 use cranpose::preferences;
@@ -21,8 +21,8 @@ fn pose_key(name: &str) -> String {
     format!("pose:{name}")
 }
 
-/// The pose that the user left the panel `name` at, if they did. The next start places the panel
-/// there.
+/// The pose of the panel `name` where the user left it, if the user carried it. The next start
+/// places the panel there.
 pub fn saved_pose(name: &str) -> Option<Pose> {
     preferences().get(&pose_key(name)).and_then(|text| pose_from_text(&text))
 }
@@ -52,8 +52,8 @@ pub fn start_pose(name: &str, default: Pose) -> Pose {
     saved_pose(name).unwrap_or(default)
 }
 
-/// The modifier of the panel `name`: it stands at `pose`, and the user can carry it. The pose
-/// of the last step of each carry goes to the preferences. `on_move` hears of each step before.
+/// The modifier of the panel `name`. The panel stands at `pose`. The user can carry it. The pose of
+/// the last step of each carry goes to the preferences. `on_move` hears of each step first.
 pub fn movable(name: &'static str, modifier: SubspaceModifier, pose: Pose, on_move: impl Fn(&SpatialMoveEvent) + 'static) -> SubspaceModifier {
     modifier.with_pose(pose).movable_with(MovePolicy::system(move |event| {
         on_move(&event);

@@ -185,8 +185,8 @@ fn Choice(label: String, selected: bool, action: Action, selected_color: Color, 
     );
 }
 
-/// The Close button, the Disconnect button when the link runs, and the Exit button. The host's menu
-/// has no Exit item, so the client adds its own.
+/// The buttons at the bottom. Close hides the console. Disconnect ends the link while it runs. Exit
+/// closes the app. The host's menu has no Exit item, so the client adds its own.
 #[composable]
 fn CloseButtons(link: bool) {
     Row(

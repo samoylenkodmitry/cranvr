@@ -28,8 +28,8 @@
 //! count differs from this file's own underruns, which count the times that the jitter buffer ran
 //! dry. A dry buffer writes silence into a full device buffer and raises only this file's count. A
 //! device that ran dry raises the device's count. `Stats` and the log show both, so a dry-out that a
-//! listener hears has a cause. `Stats` also gives the buffer's fill, which is what this file controls,
-//! and the age of the sound when the network thread queued it.
+//! listener hears has a cause. `Stats` also gives the buffer's fill, which is what this file controls.
+//! It gives the age of the sound when the network thread queued it.
 
 use cranpose_audio::{
     backend::{self, AudioSink, Renderer},

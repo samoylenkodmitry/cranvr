@@ -8,14 +8,14 @@
 //!
 //! The controllers work as the mouse. Cranpose finds where a controller's ray meets the surface and
 //! reports it as pointer events in dp from the surface's top left corner (`on_pointer_event`). This
-//! file turns each event into a point on the picture (u and v from 0 to 1), a trigger and a scroll,
-//! and sends them to the host as `ClientDatagram::Pointer` datagrams. The host moves the Mac's
+//! file turns each event into a point on the picture (u and v from 0 to 1), a trigger and a scroll.
+//! It sends them to the host as `ClientDatagram::Pointer` datagrams. The host moves the Mac's
 //! mouse, clicks and scrolls. The pointer events carry no scroll, so the thumbstick's lean comes
 //! from the headset's frame while the ray is on the surface.
 //!
 //! Cranpose carries the panel. Its move events give the pose that `place.rs` keeps for the next
 //! start. They also give the cursor ring its place. A move event carries no size, so the user
-//! resizes the panel with the thumbstick during a carry, and this file keeps the width.
+//! resizes the panel with the thumbstick during a carry. This file keeps the width.
 //!
 //! Threads and what they own:
 //! - the network threads call [`on_message`], [`push_unit`] and [`on_cursor`];
@@ -58,7 +58,7 @@ const PANEL: &str = "desktop";
 /// Where the panel starts when the user never carried it, relative to the origin of the subspace,
 /// which lies 1 m ahead of the head: 1.5 m ahead of the head and a little below eye level
 const START_POSE: Pose = Pose::at([0.0, -0.1, -0.5]);
-/// The panel's width in meters at the start, and the least and the most that the user may give it.
+/// The panel's width in meters at the start. The user may give it a width within `WIDTH_RANGE`.
 /// 1.6 m wide fills 56 degrees at 1.5 m. The height follows the picture's aspect ratio.
 const START_WIDTH: f32 = 1.6;
 const WIDTH_RANGE: [f32; 2] = [0.4, 8.0];
@@ -781,9 +781,9 @@ pub fn DesktopPanel() {
 /// at 2560 by 1440 dp (3840 by 2160 pixels) showed the whole picture both times. The sharpness of a
 /// panel wider than the view is not tested.
 ///
-/// The surface starts at the pose that `pose` holds at its composition. Cranpose keeps the pose that
-/// the user carries it to until the surface leaves the composition. The move events update `pose`,
-/// for the cursor ring, and the last one goes to `place.rs`.
+/// The surface starts at the pose that `pose` holds at its composition. Cranpose keeps the pose of
+/// the user's last carry until the surface leaves the composition. The move events update `pose` for
+/// the cursor ring. The last event goes to `place.rs`.
 #[composable]
 fn Surface(pose: MutableState<Pose>, width: MutableState<f32>, carrying: MutableState<bool>, aspect: f32) {
     let [surface_width, surface_height] = surface_size(width.get(), aspect);

@@ -93,10 +93,10 @@ pub fn ClientApp() {
             delay(STREAM_POLL).await;
         }
     });
-    // The origin of the panels' frame stands a meter ahead of the head when the first frame tracks it,
-    // and again after each recenter. A panel that the user never carried starts at its default
-    // pose in that frame, so the first start opens in front of the user. A saved pose is in the same
-    // frame (see `place.rs`).
+    // The origin of the panels' frame stands a meter ahead of the head when the first frame tracks it.
+    // It moves there again after each recenter. A panel that the user never carried starts at its
+    // default pose in that frame, so the first start opens in front of the user. A saved pose is in
+    // the same frame (see `place.rs`).
     FollowingSubspace(FollowTarget::View(FollowMode::Snap), move || {
         HeadsetFrames();
         // A flat window shows the panels in this order, side by side. In a headset each panel has
