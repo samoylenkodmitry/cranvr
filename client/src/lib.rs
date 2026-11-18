@@ -17,6 +17,7 @@ mod console;
 mod console_panel;
 mod desktop;
 mod hub;
+mod panels_ball;
 mod phone;
 mod place;
 mod settings;
