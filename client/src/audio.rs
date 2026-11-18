@@ -9,9 +9,13 @@
 //! The two ends run on different clocks: the Mac's capture and the headset's output. A buffer
 //! between them absorbs the jitter of the network and of the capture, which hands over about 20 ms
 //! of sound at once. The buffer works like this:
-//! - The renderer starts to play when the buffer holds `TARGET_MS` of sound. It starts again from
-//!   silence after an underrun: it plays what it has, fills the rest with silence and waits until
-//!   the buffer holds the target again.
+//! - The renderer starts to play when the buffer holds the target of sound, at first `TARGET_MS`.
+//!   It starts again from silence after an underrun: it plays what it has, fills the rest with
+//!   silence and waits until the buffer holds the target again.
+//! - Each underrun raises the target by `TARGET_STEP_MS`, up to `MAX_TARGET_MS`. The target falls
+//!   back toward `TARGET_MS` by `TARGET_FALL_MS_PER_S` while the sound plays. A Mac under load hands
+//!   over its capture late now and then, and a fixed target of 30 ms ran dry once or twice a minute
+//!   while the device itself never did: the target holds one burst of 20 ms and only 10 ms more.
 //! - A small control loop changes the playback rate by at most 0.5% (the pitch moves by under nine
 //!   cents) so that the fill follows the target. It absorbs the drift between the two clocks and the
 //!   difference between 48 kHz and the device's own rate. Linear interpolation resamples.
@@ -44,6 +48,13 @@ use std::sync::{
 /// The buffer's target fill. A burst of the host's capture is about 20 ms, so the target holds
 /// one burst and a little more.
 pub const TARGET_MS: f32 = 30.0;
+/// What one underrun adds to the target
+const TARGET_STEP_MS: f32 = 10.0;
+/// The highest target. It stays below `MAX_MS`, so a buffer at its target keeps its samples.
+const MAX_TARGET_MS: f32 = 60.0;
+/// How fast the target falls back while the sound plays: 10 ms in 200 s. On a Quest 3 over Wi-Fi
+/// the fill dipped 27 ms below a target of 34 ms, so a target back at 30 ms soon runs dry again.
+const TARGET_FALL_MS_PER_S: f32 = 0.05;
 /// A buffer that holds more than this loses its oldest samples down to the target.
 const MAX_MS: f32 = 90.0;
 /// The queue's capacity in stereo frames. 16384 frames are 341 ms at 48 kHz.
@@ -86,6 +97,8 @@ struct Shared {
     fill_max: AtomicU64,
     /// The renderer plays. It does not wait for the buffer to fill
     playing: AtomicBool,
+    /// The buffer's target fill in ms, as the bits of an f32
+    target_ms: AtomicU32,
     /// The sum of the age of the sound when it was queued, in microseconds. The count
     age_us: AtomicU64,
     age_n: AtomicU64,
@@ -169,7 +182,7 @@ pub fn open(format: AudioFormat) {
     match backend::open(Box::new(renderer)) {
         Ok(sink) => {
             log::info!(
-                "audio: output open for {} Hz stereo, jitter buffer target {TARGET_MS} ms, at most {MAX_MS} ms",
+                "audio: output open for {} Hz stereo, jitter buffer target {TARGET_MS} to {MAX_TARGET_MS} ms, at most {MAX_MS} ms",
                 format.sample_rate
             );
             let producer = Mutex::new(Producer { queue, expected: None, shared: Arc::clone(&shared) });
@@ -320,7 +333,7 @@ fn stats_of(player: &Player, reset: bool) -> Stats {
         fill_ms: frames_to_ms(fill),
         fill_min_ms: if min == u64::MAX { frames_to_ms(fill) } else { frames_to_ms(min) },
         fill_max_ms: frames_to_ms(max.max(fill)),
-        target_ms: TARGET_MS,
+        target_ms: f32::from_bits(s.target_ms.load(Ordering::Relaxed)),
         age_ms: (age_n > 0).then(|| age_us as f32 / age_n as f32 / 1000.0),
         packets: s.packets.load(Ordering::Relaxed),
         lost_packets: s.lost_packets.load(Ordering::Relaxed),
@@ -384,10 +397,13 @@ struct Output {
     after: [f32; 2],
     phase: f32,
     started: bool,
+    /// The fill in ms at which the renderer starts and which the rate follows
+    target_ms: f32,
 }
 
 impl Output {
     fn new(queue: ring::Consumer<[f32; 2]>, shared: Arc<Shared>, source_rate: f32) -> Self {
+        shared.target_ms.store(TARGET_MS.to_bits(), Ordering::Relaxed);
         Self {
             queue,
             shared,
@@ -400,6 +416,7 @@ impl Output {
             after: [0.0; 2],
             phase: 1.0,
             started: false,
+            target_ms: TARGET_MS,
         }
     }
 
@@ -412,6 +429,11 @@ impl Output {
         let frame = self.queue.pop()?;
         self.shared.popped.fetch_add(1, Ordering::Release);
         Some(frame)
+    }
+
+    fn set_target(&mut self, ms: f32) {
+        self.target_ms = ms;
+        self.shared.target_ms.store(ms.to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -429,7 +451,10 @@ impl Renderer for Output {
         let out_frames = out.len() / channels;
         self.shared.callback_frames.store(out_frames as u32, Ordering::Relaxed);
         out.fill(0.0);
-        let target = (TARGET_MS * self.source_rate / 1000.0) as u64;
+        if self.primed && self.target_ms > TARGET_MS {
+            self.set_target((self.target_ms - out_frames as f32 / self.device_rate * TARGET_FALL_MS_PER_S).max(TARGET_MS));
+        }
+        let target = (self.target_ms * self.source_rate / 1000.0) as u64;
         let fill = self.fill();
         self.shared.fill_min.fetch_min(fill, Ordering::Relaxed);
         self.shared.fill_max.fetch_max(fill, Ordering::Relaxed);
@@ -489,6 +514,7 @@ impl Renderer for Output {
                         // The buffer ran dry: the rest of this callback stays silent. The
                         // renderer waits until the buffer holds the target again
                         self.shared.underruns.fetch_add(1, Ordering::Relaxed);
+                        self.set_target((self.target_ms + TARGET_STEP_MS).min(MAX_TARGET_MS));
                         self.primed = false;
                         self.started = false;
                         self.shared.playing.store(false, Ordering::Relaxed);
@@ -566,6 +592,47 @@ mod tests {
         push(&out, &mut queue, (0..100).map(|_| [0.25, -0.25]));
         out.render(&mut buffer);
         assert!(!out.shared.playing.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn an_underrun_raises_the_target_and_playing_lowers_it_slowly() {
+        let (mut queue, mut out) = output(48_000.0, 48_000.0, 2);
+        push(&out, &mut queue, (0..1500).map(|_| [0.25, -0.25]));
+        let mut buffer = [0.0f32; 2 * 960];
+        out.render(&mut buffer);
+        out.render(&mut buffer);
+        assert_eq!(out.shared.underruns.load(Ordering::Relaxed), 1);
+        assert_eq!(stats_target(&out), 40.0);
+        // 30 ms no longer start the sound; 40 ms do
+        push(&out, &mut queue, (0..1440).map(|_| [0.25, -0.25]));
+        out.render(&mut buffer);
+        assert!(!out.shared.playing.load(Ordering::Relaxed));
+        push(&out, &mut queue, (0..480).map(|_| [0.25, -0.25]));
+        let mut small = [0.0f32; 2 * 48];
+        out.render(&mut small);
+        assert!(out.shared.playing.load(Ordering::Relaxed));
+        // Ten seconds of playing at the target take half a millisecond off it
+        for _ in 0..10_000 {
+            push(&out, &mut queue, (0..48).map(|_| [0.25, -0.25]));
+            out.render(&mut small);
+        }
+        assert_eq!(out.shared.underruns.load(Ordering::Relaxed), 1);
+        assert!((stats_target(&out) - 39.5).abs() < 0.05, "{}", stats_target(&out));
+        // Underruns raise it no higher than the highest target
+        for _ in 0..5 {
+            out.render(&mut buffer);
+            push(&out, &mut queue, (0..4000).map(|_| [0.25, -0.25]));
+            out.render(&mut buffer);
+            while out.fill() > 0 {
+                out.render(&mut buffer);
+            }
+            out.render(&mut buffer);
+        }
+        assert_eq!(stats_target(&out), MAX_TARGET_MS);
+    }
+
+    fn stats_target(out: &Output) -> f32 {
+        f32::from_bits(out.shared.target_ms.load(Ordering::Relaxed))
     }
 
     #[test]
