@@ -121,22 +121,10 @@ pub fn PhoneApp() {
     });
 }
 
-/// The picture of the host.
+/// The picture of the host: the left eye of each frame, fitted to the screen.
 #[composable]
 fn PhonePicture(frames: MutableState<Option<DecodedFrames>>) {
     Stream(frames);
-    TemporaryFlatPicture(frames);
-}
-
-/// Temporary. `StreamedScene` draws nothing outside a headset until Cranpose's flat mode of it
-/// lands (the branch `flat-streamed-scene` of Cranpose). This function shows the decoder's whole
-/// frame with both eyes side by side, scaled to fit. The phone can run before then. Delete the
-/// function and its call in `PhonePicture` when the scene draws the picture.
-#[composable]
-fn TemporaryFlatPicture(frames: MutableState<Option<DecodedFrames>>) {
-    if let Some(frames) = frames.get() {
-        PlayerSurface(frames, Modifier::empty().fill_max_size(), ContentScale::Fit);
-    }
 }
 
 /// The connect and stats panels side by side over a dimmed picture. Each panel scrolls, because a
