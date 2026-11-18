@@ -385,16 +385,16 @@ const FLOOR_EPSILON: f32 = 0.01;
 /// How often the sender looks at the stop flag while it waits for a frame
 const STOP_CHECK: Duration = Duration::from_millis(20);
 
-/// Sends the headset's tracking to the host until `stop` is set. In a headset each frame of the
-/// feed goes out as it comes. Without a headset the sender makes placeholder frames once per
-/// refresh. `hello_views` are the views that the host got in the Hello.
-pub fn send_loop(link: &ClientLink, feed: &Feed, in_headset: bool, refresh_hz: f32, hello_views: Views, stop: &AtomicBool) {
+/// Sends the device's tracking to the host until `stop` is set. On a device that tracks (a headset
+/// or a phone) each frame of the feed goes out as it comes. Without one the sender makes placeholder
+/// frames once per refresh. `hello_views` are the views that the host got in the Hello.
+pub fn send_loop(link: &ClientLink, feed: &Feed, tracked: bool, refresh_hz: f32, hello_views: Views, stop: &AtomicBool) {
     let period = Duration::from_secs_f64(1.0 / f64::from(refresh_hz.max(1.0)));
     let mut deadline = Instant::now();
     let mut sent_views = hello_views;
     let mut sent_floor: Option<f32> = None;
     while !stop.load(Ordering::Relaxed) {
-        let wake = feed.wait(if in_headset { STOP_CHECK } else { period.min(STOP_CHECK) });
+        let wake = feed.wait(if tracked { STOP_CHECK } else { period.min(STOP_CHECK) });
         for recenter in wake.recenters {
             log::info!("the headset recentered; the new origin takes effect at {} ns", recenter.change_time);
             link.duplex.send_control(&ClientMsg::Recenter(recenter)).ok();
@@ -413,7 +413,7 @@ pub fn send_loop(link: &ClientLink, feed: &Feed, in_headset: bool, refresh_hz: f
         }
         let frame = match wake.frame {
             Some(frame) => frame,
-            None if !in_headset && Instant::now() >= deadline => {
+            None if !tracked && Instant::now() >= deadline => {
                 // The wait may end early, so the loop reads the clock. A thread that fell far
                 // behind starts again from now and sends no burst of samples.
                 deadline += period;

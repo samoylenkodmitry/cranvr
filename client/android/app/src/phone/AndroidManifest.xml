@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The manifest of the phone's APK. build.gradle.kts takes it in place of src/main's when the
+    property cranvrPhone is true. The app declares only what is its own. The activity, its
+    launcher entry and the library name come from the Cranpose Gradle plugin.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- The sockets of the link to the host -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:allowBackup="false"
+        android:supportsRtl="true">
+        <!-- The Cranpose library declares this activity in full. The phone's picture has the
+             screen's shape in landscape, so the activity turns to landscape with the sensor. The
+             Quest's activity gets its orientation from the xr service. -->
+        <activity
+            android:name="dev.cranpose.android.CranposeActivity"
+            android:screenOrientation="sensorLandscape" />
+    </application>
+</manifest>

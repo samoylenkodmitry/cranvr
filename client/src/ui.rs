@@ -3,13 +3,15 @@
 //!
 //! In a headset each panel is a layer of the compositor and a controller's trigger presses its
 //! buttons. The game's picture is a streamed scene under the panels. In a flat window the panels
-//! draw side by side. Every composable here is plain Cranpose. The state that the network threads
-//! produce arrives as a [`Snapshot`], which a `LaunchedEffect` copies into Cranpose state a few
-//! times a second.
+//! draw side by side. On a phone or a tablet (`PhoneApp`) the picture fills the screen and a tap
+//! opens the same two panels over it. Every composable here is plain Cranpose. The state that the
+//! network threads produce arrives as a [`Snapshot`], which a `LaunchedEffect` copies into Cranpose
+//! state a few times a second.
 
 use crate::{
     console_panel::{self, ConsolePanel},
-    hub::{hub, DecoderView, LinkState, Snapshot, Stats},
+    hub::{hub, DecoderView, Device, LinkState, Snapshot, Stats},
+    phone::{self, PhoneFrames},
     place, settings,
 };
 use crate::tracking::FrameReader;
@@ -60,17 +62,7 @@ pub fn ClientApp() {
     // The connection reads what the headset is from the hub. The values do not change in a
     // session, so this runs before any panel can start a connection.
     hub().attach(local_headset_properties().current(), local_haptics().current());
-    let snapshot = rememberMutableStateOf(|| hub().snapshot());
-    LaunchedEffect((), async move |_| loop {
-        snapshot.set(hub().snapshot());
-        delay(POLL).await;
-    });
-    // A link that streamed and ended without the user's say connects again, as after a restart of
-    // the host that a setting of the console asks for
-    LaunchedEffect((), async move |_| loop {
-        hub().reconnect_if_due();
-        delay(POLL).await;
-    });
+    let Link { snapshot, frames } = link();
     let console = rememberMutableStateOf(|| hub().console());
     LaunchedEffect((), async move |_| {
         if settings::console_on_launch() {
@@ -79,18 +71,6 @@ pub fn ClientApp() {
         loop {
             console.set(hub().console());
             delay(CONSOLE_POLL).await;
-        }
-    });
-    let frames = rememberMutableStateOf(|| None::<DecodedFrames>);
-    LaunchedEffect((), async move |_| {
-        let mut seen = None;
-        loop {
-            let (generation, current) = hub().stream();
-            if seen != Some(generation) {
-                seen = Some(generation);
-                frames.set(current);
-            }
-            delay(STREAM_POLL).await;
         }
     });
     // The origin of the panels' frame stands a meter ahead of the head when the first frame tracks it.
@@ -107,6 +87,150 @@ pub fn ClientApp() {
         ConsolePanel(console, snapshot);
         Stream(frames);
     });
+}
+
+/// The app on a phone or a tablet. The picture fills the screen. The device's motion sensors move
+/// the host's camera. A tap on the picture opens the connect and stats panels over it. The Hide
+/// panels button closes them. They open again when the stream ends.
+#[composable]
+pub fn PhoneApp() {
+    hub().attach_phone();
+    let Link { snapshot, frames } = link();
+    let address = address_field();
+    let panels = rememberMutableStateOf(|| true);
+    let streaming = snapshot.get().state == LinkState::Streaming;
+    LaunchedEffect(streaming, async move |_| {
+        panels.set(!streaming);
+        // Nobody touches the screen while the stream runs, and it must not go to sleep
+        set_keep_screen_on(streaming);
+    });
+    Box(Modifier::empty().fill_max_size().background(Color(0.0, 0.0, 0.0, 1.0)), BoxSpec::default(), move || {
+        PhoneFrames();
+        BoxWithConstraints(Modifier::empty().fill_max_size().clickable(move |_| panels.set(!panels.get())), move |scope| {
+            // The layout's size is in dp. The views of the Hello need the screen's pixels.
+            let (width, height) = (scope.max_width().0, scope.max_height().0);
+            let density = density().density();
+            if width.is_finite() && height.is_finite() {
+                hub().set_screen([(width * density).round() as u32, (height * density).round() as u32]);
+            }
+            PhonePicture(frames);
+            if panels.get() {
+                PhonePanels(snapshot, address, panels);
+            }
+        });
+    });
+}
+
+/// The picture of the host.
+#[composable]
+fn PhonePicture(frames: MutableState<Option<DecodedFrames>>) {
+    Stream(frames);
+    TemporaryFlatPicture(frames);
+}
+
+/// Temporary. `StreamedScene` draws nothing outside a headset until Cranpose's flat mode of it
+/// lands (the branch `flat-streamed-scene` of Cranpose). This function shows the decoder's whole
+/// frame with both eyes side by side, scaled to fit. The phone can run before then. Delete the
+/// function and its call in `PhonePicture` when the scene draws the picture.
+#[composable]
+fn TemporaryFlatPicture(frames: MutableState<Option<DecodedFrames>>) {
+    if let Some(frames) = frames.get() {
+        PlayerSurface(frames, Modifier::empty().fill_max_size(), ContentScale::Fit);
+    }
+}
+
+/// The connect and stats panels side by side over a dimmed picture. Each panel scrolls, because a
+/// phone's screen is lower than a panel.
+#[composable]
+fn PhonePanels(snapshot: MutableState<Snapshot>, address: TextFieldState, panels: MutableState<bool>) {
+    let left = remember(|| ScrollState::new(0.0)).with(|state| *state);
+    let right = remember(|| ScrollState::new(0.0)).with(|state| *state);
+    Row(
+        Modifier::empty().fill_max_size().background(Color(0.0, 0.0, 0.0, 0.55)).padding(16.0),
+        RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(16.0)),
+        move || {
+            // A panel takes the taps that miss its buttons. They do not reach the picture's tap
+            // handler under it.
+            Column(
+                Modifier::empty().weight(1.0).fill_max_height().vertical_scroll(left, false).clickable(|_| {}),
+                ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(16.0)),
+                move || {
+                    ConnectBody(snapshot, address, Modifier::empty().fill_max_width(), Entry::Keyboard);
+                    PhoneButtons(panels);
+                },
+            );
+            Column(
+                Modifier::empty().weight(1.0).fill_max_height().vertical_scroll(right, false).clickable(|_| {}),
+                ColumnSpec::default(),
+                move || StatsBody(snapshot, Modifier::empty().fill_max_width()),
+            );
+        },
+    );
+}
+
+/// The buttons of the phone app. Recenter puts the front of the host's room where the screen points.
+/// Hide panels closes the panels.
+#[composable]
+fn PhoneButtons(panels: MutableState<bool>) {
+    Row(
+        Modifier::empty(),
+        RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(16.0)),
+        move || {
+            Button(
+                Modifier::empty().background(KEY_COLOR).rounded_corners(12.0).padding_symmetric(26.0, 14.0),
+                ButtonSpec::default(),
+                phone::request_recenter,
+                move || {
+                    Text("Recenter", Modifier::empty(), text_style(24.0, TEXT_COLOR, Some(FontWeight::BOLD)));
+                },
+            );
+            Button(
+                Modifier::empty().background(ACCENT_COLOR).rounded_corners(12.0).padding_symmetric(26.0, 14.0),
+                ButtonSpec::default(),
+                move || panels.set(false),
+                move || {
+                    Text("Hide panels", Modifier::empty(), text_style(24.0, TEXT_COLOR, Some(FontWeight::BOLD)));
+                },
+            );
+        },
+    );
+}
+
+/// What the headset's app and the phone's app share. It holds the link's numbers for the UI and the
+/// decoder's frames for the scene.
+#[derive(Clone, Copy)]
+struct Link {
+    snapshot: MutableState<Snapshot>,
+    frames: MutableState<Option<DecodedFrames>>,
+}
+
+/// Starts the effects that copy the hub's state into Cranpose state and keep the link up. The
+/// caller composes it once.
+fn link() -> Link {
+    let snapshot = rememberMutableStateOf(|| hub().snapshot());
+    LaunchedEffect((), async move |_| loop {
+        snapshot.set(hub().snapshot());
+        delay(POLL).await;
+    });
+    // A link that streamed and ended without the user's say connects again, as after a restart of
+    // the host that a setting of the console asks for
+    LaunchedEffect((), async move |_| loop {
+        hub().reconnect_if_due();
+        delay(POLL).await;
+    });
+    let frames = rememberMutableStateOf(|| None::<DecodedFrames>);
+    LaunchedEffect((), async move |_| {
+        let mut seen = None;
+        loop {
+            let (generation, current) = hub().stream();
+            if seen != Some(generation) {
+                seen = Some(generation);
+                frames.set(current);
+            }
+            delay(STREAM_POLL).await;
+        }
+    });
+    Link { snapshot, frames }
 }
 
 pub(crate) fn text_style(size: f32, color: Color, weight: Option<FontWeight>) -> TextStyle {
@@ -164,61 +288,84 @@ fn toggle_connection(state: &LinkState, address: TextFieldState) {
     }
 }
 
-/// The host address, a keypad for it and the Connect button. A headset has no keyboard in the
-/// room, so the keypad edits the same text as the field does.
-#[composable]
-fn ConnectPanel(snapshot: MutableState<Snapshot>) {
+/// How the connect panel takes the address.
+#[derive(Clone, Copy, PartialEq)]
+enum Entry {
+    /// A keypad in the panel, because a headset has no keyboard in the room. A focused field asks
+    /// for the system keyboard too, where `system_keyboard` says so.
+    Keypad { system_keyboard: bool },
+    /// The system keyboard only, as on a phone
+    Keyboard,
+}
+
+/// The field's state for the host address. The caller composes it once. A launch with `connect`
+/// starts the connection.
+fn address_field() -> TextFieldState {
     let address = remember(|| TextFieldState::new(settings::initial_host())).with(|state| *state);
     LaunchedEffect((), async move |_| {
         if settings::connect_on_launch() {
             toggle_connection(&LinkState::Idle, address);
         }
     });
+    address
+}
+
+/// The host address, a keypad for it and the Connect button. A headset has no keyboard in the
+/// room, so the keypad edits the same text as the field does.
+#[composable]
+fn ConnectPanel(snapshot: MutableState<Snapshot>) {
+    let address = address_field();
     // In a headset a focused field must not ask for a software keyboard
     let in_headset = local_spatial_capabilities().current().is_spatial_ui_enabled();
     let pose = remember(|| place::start_pose("connect", side_pose(-1.0))).with(|pose| *pose);
     SpatialPanel(
         place::movable("connect", SubspaceModifier::new().size(760.0, 840.0), pose, |_| {}),
+        move || ConnectBody(snapshot, address, Modifier::empty().fill_max_size(), Entry::Keypad { system_keyboard: !in_headset }),
+    );
+}
+
+/// The content of the connect panel. `modifier` gives its size.
+#[composable]
+fn ConnectBody(snapshot: MutableState<Snapshot>, address: TextFieldState, modifier: Modifier, entry: Entry) {
+    let snap = snapshot.get();
+    let state = snap.state.clone();
+    Column(
+        modifier.background(PANEL_COLOR).rounded_corners(24.0).padding(36.0),
+        ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(20.0)),
         move || {
-            let snap = snapshot.get();
-            let state = snap.state.clone();
-            Column(
-                Modifier::empty().fill_max_size().background(PANEL_COLOR).rounded_corners(24.0).padding(36.0),
-                ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(20.0)),
+            Text("cranvr", Modifier::empty(), text_style(44.0, TEXT_COLOR, Some(FontWeight::BOLD)));
+            Text(
+                "Address of the Mac that runs cranvr-host --protocol native",
+                Modifier::empty(),
+                text_style(22.0, MUTED_COLOR, None),
+            );
+            Box(
+                Modifier::empty().fill_max_width().background(FIELD_COLOR).rounded_corners(14.0).padding(18.0),
+                BoxSpec::default(),
                 move || {
-                    Text("cranvr", Modifier::empty(), text_style(44.0, TEXT_COLOR, Some(FontWeight::BOLD)));
-                    Text(
-                        "Address of the Mac that runs cranvr-host --protocol native",
-                        Modifier::empty(),
-                        text_style(22.0, MUTED_COLOR, None),
-                    );
-                    Box(
-                        Modifier::empty().fill_max_width().background(FIELD_COLOR).rounded_corners(14.0).padding(18.0),
-                        BoxSpec::default(),
-                        move || {
-                            BasicTextFieldWithOptions(
-                                address,
-                                Modifier::empty().fill_max_width(),
-                                BasicTextFieldOptions {
-                                    text_style: text_style(34.0, TEXT_COLOR, None),
-                                    cursor_color: TEXT_COLOR,
-                                    line_limits: TextFieldLineLimits::SingleLine,
-                                    show_keyboard_on_focus: !in_headset,
-                                    ..BasicTextFieldOptions::default()
-                                },
-                            );
+                    BasicTextFieldWithOptions(
+                        address,
+                        Modifier::empty().fill_max_width(),
+                        BasicTextFieldOptions {
+                            text_style: text_style(34.0, TEXT_COLOR, None),
+                            cursor_color: TEXT_COLOR,
+                            line_limits: TextFieldLineLimits::SingleLine,
+                            show_keyboard_on_focus: entry != (Entry::Keypad { system_keyboard: false }),
+                            ..BasicTextFieldOptions::default()
                         },
                     );
-                    Keypad(address);
-                    ConnectButton(state.clone(), address);
-                    StatusLine(state.clone(), address);
-                    ForgetHostButton(address);
-                    Text(
-                        format!("Pairing code {}", format_code(settings::identity().code())),
-                        Modifier::empty(),
-                        text_style(22.0, MUTED_COLOR, None),
-                    );
                 },
+            );
+            if matches!(entry, Entry::Keypad { .. }) {
+                Keypad(address);
+            }
+            ConnectButton(state.clone(), address);
+            StatusLine(state.clone(), address);
+            ForgetHostButton(address);
+            Text(
+                format!("Pairing code {}", format_code(settings::identity().code())),
+                Modifier::empty(),
+                text_style(22.0, MUTED_COLOR, None),
             );
         },
     );
@@ -331,19 +478,23 @@ fn StatsPanel(snapshot: MutableState<Snapshot>) {
     let pose = remember(|| place::start_pose("stats", side_pose(1.0))).with(|pose| *pose);
     SpatialPanel(
         place::movable("stats", SubspaceModifier::new().size(700.0, 840.0), pose, |_| {}),
+        move || StatsBody(snapshot, Modifier::empty().fill_max_size()),
+    );
+}
+
+/// The content of the stats panel. `modifier` gives its size.
+#[composable]
+fn StatsBody(snapshot: MutableState<Snapshot>, modifier: Modifier) {
+    let snap = snapshot.get();
+    let lines = stat_lines(&snap);
+    Column(
+        modifier.background(PANEL_COLOR).rounded_corners(24.0).padding(36.0),
+        ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(14.0)),
         move || {
-            let snap = snapshot.get();
-            let lines = stat_lines(&snap);
-            Column(
-                Modifier::empty().fill_max_size().background(PANEL_COLOR).rounded_corners(24.0).padding(36.0),
-                ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(14.0)),
-                move || {
-                    Text("Stream", Modifier::empty(), text_style(44.0, TEXT_COLOR, Some(FontWeight::BOLD)));
-                    for (label, value, color) in lines.clone() {
-                        StatLine(label, value, color);
-                    }
-                },
-            );
+            Text("Stream", Modifier::empty(), text_style(44.0, TEXT_COLOR, Some(FontWeight::BOLD)));
+            for (label, value, color) in lines.clone() {
+                StatLine(label, value, color);
+            }
         },
     );
 }
@@ -394,20 +545,36 @@ fn stat_lines(snap: &Snapshot) -> Vec<(&'static str, String, Color)> {
     lines.push(("Latency", latency_text(stats), TEXT_COLOR));
     lines.push(("Key frames", format!("{} requested", stats.key_requests), TEXT_COLOR));
     lines.push(("Sealing", crypto_text(stats), if stats.packets_rejected > 0 { WARN_COLOR } else { TEXT_COLOR }));
-    lines.push((
-        "Tracking",
-        if stats.tracking_live {
-            "from the headset".to_string()
-        } else {
-            "placeholder values: no frames from a headset".to_string()
-        },
-        if stats.tracking_live { GOOD_COLOR } else { WARN_COLOR },
-    ));
+    lines.push(tracking_line(stats));
+    if hub().device() == Device::Phone {
+        lines.push((
+            "Host's pose",
+            stats.rendered_orientation.map_or("no frame yet".to_string(), |q| format!("the newest frame was rendered for looking {:.2?}", phone::forward(q))),
+            TEXT_COLOR,
+        ));
+    }
     lines.push(("Haptics", format!("{} pulses received", stats.haptic_pulses), TEXT_COLOR));
     for (label, value) in crate::desktop::stat_lines().into_iter().chain(crate::audio::stat_lines()) {
         lines.push((label, value, TEXT_COLOR));
     }
     lines
+}
+
+/// How the head's poses arise: from the headset, from the phone's motion sensors or as placeholders.
+fn tracking_line(stats: &Stats) -> (&'static str, String, Color) {
+    let (text, color) = match (hub().device(), stats.tracking_live) {
+        (Device::Phone, true) => (
+            format!(
+                "from the phone's motion sensors, looking {}",
+                stats.head_orientation.map_or("nowhere".to_string(), |q| format!("{:.2?}", phone::forward(q)))
+            ),
+            GOOD_COLOR,
+        ),
+        (Device::Phone, false) => ("no frames from the screen".to_string(), WARN_COLOR),
+        (_, true) => ("from the headset".to_string(), GOOD_COLOR),
+        (_, false) => ("placeholder values: no frames from a headset".to_string(), WARN_COLOR),
+    };
+    ("Tracking", text, color)
 }
 
 fn crypto_text(stats: &Stats) -> String {
@@ -428,9 +595,14 @@ fn fps_color(fps: f32, target: f32) -> Color {
 }
 
 fn frames_text(stats: &Stats, target_hz: f32) -> String {
+    let received = format!("{:.1} fps decoded of {:.0}, {:.1} received, {:.1} Mbps", stats.decoded_fps, target_hz, stats.received_fps, stats.received_mbps);
+    if hub().device() == Device::Phone {
+        // The picture of a phone draws the newest frame. Cranpose counts nothing for it.
+        return format!("{received}. The screen runs at {:.1} frames a second", stats.headset_fps);
+    }
     format!(
-        "{:.1} fps decoded of {:.0}, {:.1} received, {:.1} Mbps. The scene showed {:.1} a second, skipped {:.1} and repeated {:.1} of {:.1} headset frames",
-        stats.decoded_fps, target_hz, stats.received_fps, stats.received_mbps, stats.shown_fps, stats.skipped_fps, stats.repeated_fps, stats.headset_fps
+        "{received}. The scene showed {:.1} a second, skipped {:.1} and repeated {:.1} of {:.1} headset frames",
+        stats.shown_fps, stats.skipped_fps, stats.repeated_fps, stats.headset_fps
     )
 }
 
