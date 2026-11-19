@@ -13,7 +13,7 @@
 //! `--drop-percent` drops that share of the media packets before the receiver sees them, so a
 //! run on loopback can show the parity at work.
 
-use crate::{badge_points, compositor, hands, native_desktop::DesktopProbe};
+use crate::{badge_points, compositor, hands, native_desktop::DesktopProbe, tracked};
 use cranvr_common::foveation::{Foveation, FoveationConfig};
 use cranvr_proto::{
     clock::{now_ns as process_now_ns, ClockSync},
@@ -23,6 +23,7 @@ use cranvr_proto::{
         buttons, ClientCaps, ClientDatagram, ClientMsg, FrameTiming, HandInput, HostDatagram, HostMsg, Input, LossReport, Ping, Pong,
         Tracking, Views,
     },
+    tracking::{BodySet, Features},
     wire::{Codec, Fov, Motion, Pose},
     Error,
 };
@@ -32,7 +33,7 @@ use std::{
     f32::consts::FRAC_PI_4,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
@@ -51,6 +52,10 @@ pub struct Options {
     pub drop_percent: f32,
     /// Ask for the desktop stream, play a pointer script and count the sound
     pub desktop: bool,
+    /// Offer hands, body, face and eyes and send them when the host asks (see `tracked.rs`)
+    pub tracking: bool,
+    /// With `tracking`: no controller is tracked
+    pub no_controllers: bool,
 }
 
 /// The probe's clock runs this far ahead of the process clock, as a headset's clock has its own
@@ -133,6 +138,11 @@ struct Shared {
     stop: AtomicBool,
     /// The desktop stream and the sound, with `--desktop`
     desktop: Option<Arc<DesktopProbe>>,
+    /// The tracking that the host asked for last, as bits of `Features`, and what the probe sent
+    wish: AtomicU8,
+    tracking: bool,
+    no_controllers: bool,
+    sent_tracking: [AtomicU64; 4],
 }
 
 impl Shared {
@@ -217,7 +227,16 @@ pub fn run(o: Options) -> i32 {
         rng: Mutex::new(Rng(0x9E37_79B9_7F4A_7C15)),
         stop: AtomicBool::new(false),
         desktop: o.desktop.then(DesktopProbe::new),
+        wish: AtomicU8::new(0),
+        tracking: o.tracking,
+        no_controllers: o.no_controllers,
+        sent_tracking: Default::default(),
     });
+    if o.tracking {
+        // The probe offers every feature that the protocol has. Its head stands still for the
+        // script of tracked.rs.
+        shared.link.duplex.send_control(&ClientMsg::TrackingOffer(Features::ALL)).ok();
+    }
 
     // The headset's floor lies below the room's origin. The host moves its scene up by that much
     // and moves the render poses back, so the eye poses in the metadata stay what the probe sent.
@@ -304,6 +323,10 @@ pub fn run(o: Options) -> i32 {
         shared.counters.haptics.load(Ordering::Relaxed)
     );
     print_summary(&shared, &r, o.seconds, expected);
+    if o.tracking {
+        let sent = |i: usize| shared.sent_tracking[i].load(Ordering::Relaxed);
+        println!("probe: tracking sent: {} hand, {} body, {} face and {} eye datagrams", sent(0), sent(1), sent(2), sent(3));
+    }
     let desktop_ok = shared.desktop.as_ref().is_none_or(|d| d.summary());
     i32::from(r.good * 2 < expected || !desktop_ok)
 }
@@ -379,6 +402,15 @@ fn read_loop(shared: &Arc<Shared>, units: &mpsc::Sender<Received>, udp: bool) {
             }
         }
         Incoming::Control(HostMsg::Bye) => shared.stop.store(true, Ordering::Relaxed),
+        Incoming::Control(HostMsg::TrackingWish(wish)) => {
+            shared.wish.store(wish.0, Ordering::Relaxed);
+            // The wall clock lets a test compare this line with the game's
+            let unix_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+            println!(
+                "probe: the host asks for {} at unix {unix_ms} ms",
+                if wish.is_empty() { "no tracking".to_string() } else { wish.names().join(", ") }
+            );
+        }
         Incoming::Control(message) => {
             if let Some(desktop) = &shared.desktop {
                 desktop.on_message(&message);
@@ -437,7 +469,8 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
         // The simulated display shows the frame of this sample at its second refresh after the
         // sample. The head's pose is the one that is valid then, as a headset predicts it.
         let display_time = next_refresh(vsync_origin, period_ns, sample_time + 2 * period_ns);
-        let head = head_at(shared.pose_origin, display_time);
+        // A tracking script keeps the head still: the game's LOCAL space is then the room itself
+        let head = if shared.tracking { head_at(shared.pose_origin, shared.pose_origin) } else { head_at(shared.pose_origin, display_time) };
         // The left hand stays where it is. The right hand swings 10 cm to each side of a point in
         // front of the head, with its velocity. Each hand has a grip pose and its own aim pose
         // (see hands.rs).
@@ -455,29 +488,34 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
             }
             sent.push_back((sample_time, head.pose));
         }
+        let controllers = !shared.no_controllers;
         shared.link.duplex.send_datagram(&ClientDatagram::Tracking(Tracking {
                 sample_time,
                 display_time,
                 head,
-                left_grip: Some(left),
-                right_grip: Some(right),
-                left_aim: Some(hands::aim_with(0, &left)),
-                right_aim: Some(hands::aim_with(1, &right)),
+                left_grip: controllers.then_some(left),
+                right_grip: controllers.then_some(right),
+                left_aim: controllers.then(|| hands::aim_with(0, &left)),
+                right_aim: controllers.then(|| hands::aim_with(1, &right)),
             })).ok();
+        send_tracked(shared, sample_time, display_time);
         // The input goes out with each sample, as the client's does. For half a second in every
         // 3 seconds the left grip squeezes, the right trigger goes to 0.75, A is down and the right
         // stick leans to 0.5, as a game test may ask. A game answers the squeeze with a haptic pulse.
         let held = t % 3.0 > 2.5;
         let on = |v: f32| if held { v } else { 0.0 };
         let mut input = Input { sample_time, ..Default::default() };
-        input.hands[0] = HandInput { grip: on(1.0), buttons: buttons::GRIP_CLICK * u32::from(held), ..Default::default() };
-        input.hands[1] = HandInput {
-            trigger: on(0.75),
-            stick: [on(0.5), 0.0],
-            buttons: (buttons::PRIMARY | buttons::TRIGGER_CLICK) * u32::from(held),
-            touches: buttons::PRIMARY * u32::from(held),
-            ..Default::default()
-        };
+        // A headset with no controller reports every input at rest
+        if controllers {
+            input.hands[0] = HandInput { grip: on(1.0), buttons: buttons::GRIP_CLICK * u32::from(held), ..Default::default() };
+            input.hands[1] = HandInput {
+                trigger: on(0.75),
+                stick: [on(0.5), 0.0],
+                buttons: (buttons::PRIMARY | buttons::TRIGGER_CLICK) * u32::from(held),
+                touches: buttons::PRIMARY * u32::from(held),
+                ..Default::default()
+            };
+        }
         shared.link.duplex.send_datagram(&ClientDatagram::Input(input)).ok();
         if last_ping.elapsed() >= PING_EVERY {
             last_ping = Instant::now();
@@ -516,6 +554,34 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
             }
             thread::park_timeout(deadline - now);
         }
+    }
+}
+
+/// The script of tracked.rs for each feature that the host asked for. The host asks only after a game
+/// uses the feature, so a run with no such game sends nothing.
+fn send_tracked(shared: &Shared, sample_time: u64, display_time: u64) {
+    if !shared.tracking {
+        return;
+    }
+    let wish = Features(shared.wish.load(Ordering::Relaxed));
+    let send = |index: usize, datagram: ClientDatagram| {
+        if shared.link.duplex.send_datagram(&datagram).is_ok() {
+            shared.sent_tracking[index].fetch_add(1, Ordering::Relaxed);
+        }
+    };
+    if wish.contains(Features::HANDS) {
+        send(0, ClientDatagram::Hands(tracked::hands(sample_time, display_time)));
+    }
+    if wish.contains(Features::FULL_BODY) {
+        send(1, ClientDatagram::Body(tracked::body(sample_time, display_time, BodySet::Full)));
+    } else if wish.contains(Features::BODY) {
+        send(1, ClientDatagram::Body(tracked::body(sample_time, display_time, BodySet::Default)));
+    }
+    if wish.contains(Features::FACE) {
+        send(2, ClientDatagram::Face(tracked::face(sample_time, display_time)));
+    }
+    if wish.contains(Features::EYES) {
+        send(3, ClientDatagram::Eyes(tracked::eyes(sample_time, display_time)));
     }
 }
 

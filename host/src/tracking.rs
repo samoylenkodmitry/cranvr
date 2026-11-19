@@ -29,6 +29,10 @@ const MISSING_FOR: Nanos = 300_000_000;
 const BACK_FOR: Nanos = 3_000_000_000;
 /// A hand sample that is older than this no longer makes a controller.
 const HAND_FRESH: Nanos = 100_000_000;
+/// A game that has hand code creates its tracker soon after it starts. A hand makes no controller
+/// until the game has run this long without one, so that such a game never sees a controller that
+/// comes and goes.
+const GRACE: Nanos = 3_000_000_000;
 
 /// Decides when the host asks the headset for hands to make controllers from. It asks while a
 /// controller is missing, and keeps asking for a while after both are back.
@@ -75,6 +79,8 @@ pub struct Hub {
     /// The wish that the headset link has now
     wished: Features,
     need: HandNeed,
+    /// The sample time at which the game was first seen connected, until it leaves
+    connected_since: Option<Nanos>,
     /// The sample times of the newest hand samples that could make a controller
     seen: [Option<Nanos>; 2],
     /// A controller of that hand is tracked in the newest tracking sample
@@ -92,6 +98,7 @@ impl Hub {
             offered: Features::NONE,
             wished: Features::NONE,
             need: HandNeed::default(),
+            connected_since: None,
             seen: [None, None],
             real: [false; 2],
             made: [None, None],
@@ -105,14 +112,18 @@ impl Hub {
         if offered.is_empty() {
             self.seen = [None, None];
             self.made = [None, None];
+            // The next headset starts with no wish, whatever the last one was asked for
             self.wished = Features::NONE;
+            self.headset.set_tracking_wish(Features::NONE);
         }
     }
 
-    /// Whether a hand makes a controller now: the game has no hand code, a game runs, and the user
-    /// did not turn it off.
-    fn making_controllers(&self) -> bool {
-        self.hand_controllers && self.link.is_connected() && !self.link.requested_tracking().contains(Features::HANDS)
+    /// Whether a hand makes a controller at the sample time `ns`: a game runs, it has run for the
+    /// grace time without hand code, and the user did not turn it off.
+    fn making_controllers(&self, ns: Nanos) -> bool {
+        self.hand_controllers
+            && !self.link.requested_tracking().contains(Features::HANDS)
+            && self.connected_since.is_some_and(|since| ns.saturating_sub(since) >= GRACE)
     }
 
     /// One tracking sample came. `real_mask` has the controllers that the headset tracks: bit 0 for the
@@ -120,7 +131,12 @@ impl Hub {
     /// controller count too. The wish to the headset follows the game's use of tracking.
     pub fn on_sample(&mut self, ns: Nanos, real_mask: u32) -> u32 {
         self.real = [real_mask & 1 != 0, real_mask & 2 != 0];
-        let making = self.making_controllers();
+        if !self.link.is_connected() {
+            self.connected_since = None;
+        } else if self.connected_since.is_none() {
+            self.connected_since = Some(ns);
+        }
+        let making = self.making_controllers(ns);
         let need = making && self.offered.contains(Features::HANDS) && self.need.update(ns, real_mask == 3);
         if !making {
             self.need = HandNeed::default();
@@ -191,7 +207,7 @@ impl Hub {
         let head = self.headset.motion(Device::Head, ns).map(|m| m.pose);
         let controller = hand_controller::controller(index == 0, &motion(&hand.root), joints, head.as_ref());
         self.seen[index] = Some(ns);
-        if !self.making_controllers() || self.real[index] {
+        if !self.making_controllers(ns) || self.real[index] {
             return;
         }
         self.link.controller(ns, index as u32, &controller.grip, Some(&controller.aim));

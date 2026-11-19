@@ -245,15 +245,19 @@ fn a_game_without_hand_code_gets_the_controller_that_a_hand_makes() {
     let mut rig = rig("controller", "aim tracking\n", true);
     rig.hub.on_offer(Features::HANDS);
     let ms = |n: u64| n * 1_000_000;
-    // The headset tracks no controller. Before the pause the host asks for nothing
+    // The headset tracks no controller. A game that has hand code creates its tracker in the
+    // first seconds, so the host waits for 3 seconds and then for the pause of a missing controller
     assert_eq!(rig.hub.on_sample(ms(0), 0), 0);
     assert_eq!(rig.hub.on_sample(ms(100), 0), 0);
+    assert_eq!(rig.hub.on_sample(ms(3000), 0), 0);
+    assert_eq!(rig.hub.on_sample(ms(3200), 0), 0);
     assert_eq!(rig.headset.last_wish(), Features::NONE);
-    assert_eq!(rig.hub.on_sample(ms(400), 0), 0);
+    assert_eq!(rig.hub.on_sample(ms(3400), 0), 0);
     assert_eq!(rig.headset.last_wish(), Features::HANDS, "hands are asked for after the pause");
+    let ms = |n: u64| (3000 + n) * 1_000_000 + 400_000_000;
 
     // A hand arrives with its fingertips pinched
-    rig.hub.on_tracked(hands(ms(410), None, Some(tracked_hand([0.25, 1.25, -0.35], 0.018))));
+    rig.hub.on_tracked(hands(ms(10), None, Some(tracked_hand([0.25, 1.25, -0.35], 0.018))));
     let (kind, payload) = rig.next();
     assert_eq!(kind, msg::CONTROLLER_MOTION_AIM);
     assert_eq!(&payload[8..12], &1u32.to_le_bytes(), "the right hand");
@@ -274,14 +278,14 @@ fn a_game_without_hand_code_gets_the_controller_that_a_hand_makes() {
     assert_eq!(ids, [(RIGHT_TRIGGER_VALUE_ID, 1), (RIGHT_SQUEEZE_VALUE_ID, 1), (RIGHT_TRIGGER_TOUCH_ID, 0)]);
     assert!((seen[0].2 - 1.0).abs() < 1e-5 && seen[1].2 == 0.0 && seen[2].2 == 1.0, "{seen:?}");
     // The next sample counts the hand as a tracked controller
-    assert_eq!(rig.hub.on_sample(ms(420), 0), 2);
+    assert_eq!(rig.hub.on_sample(ms(20), 0), 2);
     // The same values do not go out again
-    rig.hub.on_tracked(hands(ms(421), None, Some(tracked_hand([0.25, 1.25, -0.35], 0.018))));
+    rig.hub.on_tracked(hands(ms(21), None, Some(tracked_hand([0.25, 1.25, -0.35], 0.018))));
     assert_eq!(rig.next().0, msg::CONTROLLER_MOTION_AIM);
     assert!(rig.quiet());
 
     // The user opens the fingers: the trigger value changes by itself
-    rig.hub.on_tracked(hands(ms(430), None, Some(tracked_hand([0.25, 1.25, -0.35], 0.08))));
+    rig.hub.on_tracked(hands(ms(30), None, Some(tracked_hand([0.25, 1.25, -0.35], 0.08))));
     assert_eq!(rig.next().0, msg::CONTROLLER_MOTION_AIM);
     let (kind, payload) = rig.next();
     assert_eq!((kind, f32::from_le_bytes(payload[12..16].try_into().unwrap())), (msg::BUTTON_STATE, 0.0));
@@ -289,10 +293,10 @@ fn a_game_without_hand_code_gets_the_controller_that_a_hand_makes() {
     assert_eq!(kind, msg::BUTTON_STATE, "the touch ends");
 
     // A real controller of that hand returns: the hand makes none, and the values go back to zero
-    assert_eq!(rig.hub.on_sample(ms(440), 2), 2);
+    assert_eq!(rig.hub.on_sample(ms(40), 2), 2);
     let ids: Vec<u64> = (0..3).map(|_| u64::from_le_bytes(rig.next().1[..8].try_into().unwrap())).collect();
     assert_eq!(ids, [RIGHT_TRIGGER_VALUE_ID, RIGHT_SQUEEZE_VALUE_ID, RIGHT_TRIGGER_TOUCH_ID]);
-    rig.hub.on_tracked(hands(ms(450), None, Some(tracked_hand([0.25, 1.25, -0.35], 0.018))));
+    rig.hub.on_tracked(hands(ms(50), None, Some(tracked_hand([0.25, 1.25, -0.35], 0.018))));
     assert!(rig.quiet(), "a tracked controller beats the hand");
 }
 
@@ -300,13 +304,13 @@ fn a_game_without_hand_code_gets_the_controller_that_a_hand_makes() {
 fn the_user_can_turn_off_controllers_made_of_hands() {
     let mut rig = rig("off", "aim tracking\n", false);
     rig.hub.on_offer(Features::HANDS);
-    for i in 0..60u64 {
+    for i in 0..600u64 {
         rig.hub.on_sample(i * 11_000_000, 0);
     }
     assert!(rig.headset.wishes.lock().unwrap().is_empty(), "no hands are asked for");
-    rig.hub.on_tracked(hands(1, None, Some(tracked_hand([0.25, 1.25, -0.35], 0.018))));
+    rig.hub.on_tracked(hands(6_600_000_000, None, Some(tracked_hand([0.25, 1.25, -0.35], 0.018))));
     assert!(rig.quiet());
-    assert_eq!(rig.hub.on_sample(700_000_000, 0), 0);
+    assert_eq!(rig.hub.on_sample(6_700_000_000, 0), 0);
 }
 
 #[test]
@@ -314,11 +318,11 @@ fn a_runtime_without_tracking_still_gets_a_controller_from_a_hand_in_the_old_mes
     // The older runtime wrote only "aim"
     let mut rig = rig("old", "aim\n", true);
     rig.hub.on_offer(Features::HANDS);
-    for i in 0..60u64 {
+    for i in 0..600u64 {
         rig.hub.on_sample(i * 11_000_000, 0);
     }
     assert_eq!(rig.headset.last_wish(), Features::HANDS);
-    rig.hub.on_tracked(hands(700_000_000, Some(tracked_hand([-0.2, 1.2, -0.4], 0.08)), None));
+    rig.hub.on_tracked(hands(6_600_000_000, Some(tracked_hand([-0.2, 1.2, -0.4], 0.08)), None));
     assert_eq!(rig.next().0, msg::CONTROLLER_MOTION_AIM);
     // It never gets a message that it does not know
     rig.hub.on_tracked(Tracked::Eyes(Eyes { sample_time: 1, display_time: 2, gaze: Some(ProtoPose::IDENTITY) }));
@@ -414,4 +418,28 @@ fn the_runtimes_request_ends_with_its_connection() {
     assert!(rig.link.requested_tracking().is_empty());
     rig.hub.on_sample(2, 3);
     assert_eq!(rig.headset.last_wish(), Features::NONE);
+}
+
+#[test]
+fn a_game_that_creates_its_hand_tracker_in_the_first_seconds_sees_no_controller_come_and_go() {
+    let mut rig = rig("grace", "aim tracking\n", true);
+    rig.hub.on_offer(Features::HANDS);
+    let ms = |n: u64| n * 1_000_000;
+    // The headset tracks no controller and a hand. The game starts its tracker after 1.5 seconds.
+    for t in (0..1500).step_by(11) {
+        assert_eq!(rig.hub.on_sample(ms(t), 0), 0);
+    }
+    rig.game_uses(Features::HANDS);
+    for t in (1500..9000).step_by(150) {
+        assert_eq!(rig.hub.on_sample(ms(t), 0), 0);
+        rig.hub.on_tracked(hands(ms(t), None, Some(tracked_hand([0.25, 1.25, -0.35], 0.018))));
+    }
+    // The runtime got the hand and no controller
+    let mut kinds = std::collections::BTreeSet::new();
+    rig.runtime.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+    while let Ok((kind, _)) = read_message(&mut rig.runtime) {
+        kinds.insert(kind);
+    }
+    assert!(kinds.contains(&msg::HAND_TRACKING));
+    assert!(!kinds.contains(&msg::CONTROLLER_MOTION_AIM) && !kinds.contains(&msg::CONTROLLER_MOTION) && !kinds.contains(&msg::BUTTON_STATE), "{kinds:?}");
 }
