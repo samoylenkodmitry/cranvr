@@ -67,7 +67,7 @@ The first build downloads ALVR v20.14.1 from GitHub with its submodules.
 
 ## Run with a Quest
 
-The host speaks two protocols. `--protocol alvr` is the default. It serves the stock ALVR client, from the Meta store or from ALVR's releases. `--protocol native` serves cranvr's own client, which "cranvr's Cranpose client" below describes. The window starts the host in ALVR mode while "Headset app" in its Settings tab says "ALVR client" (the default). It starts the host in native mode for "cranvr client". These steps use the stock ALVR client:
+The host speaks two protocols. `--protocol alvr` is the default. It serves the stock ALVR client, from the Meta store or from ALVR's releases. `--protocol native` serves cranvr's own client, which "cranvr's Cranpose client" below describes. The window starts the host in native mode while "Headset app" in its Settings tab says "cranvr client" (the default of a new install). It starts the host in ALVR mode for "ALVR client". A settings file from before this choice existed keeps the ALVR client. These steps use the stock ALVR client:
 
 1. Install the ALVR client on the Quest: 20.14 from the Meta store, or `alvr_client_android.apk` of v20.14.1 from the ALVR GitHub releases. Its major version (20) must match the server core's. A v21 nightly build does not connect. The window then shows a notice.
 2. Put the Mac and the Quest on the same network. Use 5 GHz or 6 GHz Wi-Fi. Connect the Mac by cable if you can.
@@ -197,7 +197,7 @@ A short code alone would not hold: the machine in the middle could try a million
 
 The protocol is at version 5. The crate still speaks version 4, so a headset and a Mac that updated apart and are paired keep working. The approval needs version 5 on both sides. A headset with the older app that the host does not know cannot wait: the host refuses it with `NotPaired` and the older `--pair CODE` window still pairs it. The host then tells the user in a `network` status line to update the app on the headset. A new headset that meets an older host that does not know it hears `NotPaired` as well. It says "Update cranvr on the Mac." A host and a client whose ranges do not meet say which side is older: the older side updates. The discovery answer carries the host's range, so the connect panel shows the advice on the Mac's entry before a press. An older host does not answer the search at all. The panel's empty text says to update cranvr on that Mac.
 
-The cranvr app starts the native mode for the cranvr client. Its Settings tab has a "Headset app" choice: "ALVR client" (the default) or "cranvr client". The cranvr client makes the app start the host with `--protocol native`. The Headset card then says "Open cranvr on the headset. It finds this Mac." and shows this Mac's address with the port below it, such as `192.168.1.20:9950`, for a headset that finds nothing. The host reports its state in a `native` status line: the port, the names of the paired headsets, the seconds that a `--pair` window stays open and the headsets that wait for the user. A version mismatch shows up as a `network` line with the problem `incompatible_client`. The Network choice, Low latency and the trusted names count for the ALVR client only. The app hides them in native mode. It does not pass the host options that belong to them.
+The cranvr app starts the native mode for the cranvr client. Its Settings tab has a "Headset app" choice: "cranvr client" (the default of a new install) or "ALVR client". A settings file without the choice, written by an older app, stays with the ALVR client. The cranvr client makes the app start the host with `--protocol native`. The Headset card then says "Open cranvr on the headset. It finds this Mac." and shows this Mac's address with the port below it, such as `192.168.1.20:9950`, for a headset that finds nothing. The host reports its state in a `native` status line: the port, the names of the paired headsets, the seconds that a `--pair` window stays open and the headsets that wait for the user. A version mismatch shows up as a `network` line with the problem `incompatible_client`. The Network choice, Low latency and the trusted names count for the ALVR client only. The app hides them in native mode. It does not pass the host options that belong to them.
 
 #### The sealed session
 
@@ -454,13 +454,17 @@ Not done or not measured:
 
 ## Games
 
-Games need Wine with cranvr's DXMT fork and BasaltVR's OpenXR runtime. The app's Play tab sets them up in three steps:
+Games need Wine with cranvr's DXMT fork and BasaltVR's OpenXR runtime. The app's Play tab has one button, "Set up games". It runs the steps that the Mac still lacks, in this order, with a line of progress for each step:
 
-1. Rosetta 2, which runs Wine's Intel code. macOS asks for an administrator's password.
+1. Rosetta 2, which runs Wine's Intel code. macOS asks for an administrator's password. The Play tab says so before the button is pressed.
 2. Game support: the app downloads `cranvr-game-support-macos.tar.xz` (about 240 MB) from the public release at https://github.com/samoylenkodmitry/cranvr-game-support, checks its SHA-256, unpacks it and installs it with `setup-wine.sh`. It takes about 1.2 GB on disk. `scripts/install-game-support.sh [ARCHIVE|URL]` does the same without the app.
-3. Steam for Windows (see below).
+3. Steam for Windows (see below). At the end the Steam window opens, and the user signs in there once.
 
-From an empty home folder the install took 79 seconds with the download. The OpenXR runtime's check through the Khronos loader passed, and the runtime's smoke program connected to the host.
+A failed step keeps its message on screen with a Retry button, which runs the steps that are not done. From an empty home folder the install of step 2 took 79 seconds with the download. The OpenXR runtime's check through the Khronos loader passed, and the runtime's smoke program connected to the host.
+
+Games on another disk need no setting in cranvr. In the Steam window, Settings, Storage adds a folder on that disk (it sits under `Z:\Volumes` for Wine). The Play tab lists the games of every Steam library folder.
+
+The game support has a version, a date such as `2026.11.19`, in `scripts/game-support-version.txt`. `package-game-support.sh` puts it into the archive as `VERSION`. `setup-wine.sh` stamps it into `wine/game-support-version.txt` in the config folder after a good install. The app holds the same file from its build as the version that it expects. When the stamp is older, or missing because the stack came from a release before stamps, the Play tab shows "Update game support". That button stops Steam and the games, then runs the same download and install. After a change of a runtime or DXMT patch: set a new date in the version file, run `build-basaltvr.sh` and `package-game-support.sh`, and publish the archive and its `.sha256` as a release of the public repository, tagged `v` plus the date.
 
 To build game support from source instead (about an hour, mostly LLVM):
 
@@ -488,7 +492,7 @@ The smoke program draws a green marker at the left controller and a pale grid. A
 
 Steam runs in the prefix with BasaltVR's web helper shim (`scripts/setup-steam.sh`). On 16 November 2026 the user started Beat Saber from the console and played a song on Expert in a worn headset. The game made 109 to 120 frames a second at the 60% render size with 2x anti-aliasing. From the pose to the display took 48 to 55 ms. The user found the picture not very sharp. Beat Saber is the only game installed in cranvr's Steam so far. The steps:
 
-1. In the window's "Play" tab, press "Open Steam". Log in. Install the game.
+1. In the window's "Play" tab, press "Open Steam" (after "Set up games" it has opened Steam already). Log in. Install the game.
 2. The tab lists the installed games. Press "Play" next to one: the window starts it by its .exe with the host's environment.
 3. Without the window, start Steam with `scripts/run-game.sh --steam`. While Steam runs, start the game by its .exe:
 
@@ -496,7 +500,7 @@ Steam runs in the prefix with BasaltVR's web helper shim (`scripts/setup-steam.s
    scripts/run-game.sh 'C:\Program Files (x86)\Steam\steamapps\common\Beat Saber\Beat Saber.exe'
    ```
 
-A rebuild of BasaltVR gives the web helper shim new bytes. The app then reports that Steam needs its setup step, and "Install Steam" runs `setup-steam.sh` again. The script puts only Valve's own helper into the backup that the shim starts; an older shim just gets replaced. Before 16 November 2026 it copied the old shim over the backup of Valve's helper.
+A rebuild of BasaltVR gives the web helper shim new bytes. The app then reports that Steam needs its setup step, and "Set up games" runs `setup-steam.sh` again. The script puts only Valve's own helper into the backup that the shim starts; an older shim just gets replaced. Before 16 November 2026 it copied the old shim over the backup of Valve's helper.
 
 Do not use `steam.exe -applaunch`: a game that Steam starts gets Steam's environment, not the one with the runtime's control file. For a game under `steamapps\common` the script and the window find the Steam app ID in Steam's `appmanifest` files. They set `SteamAppId`, which the game's Steam check needs.
 

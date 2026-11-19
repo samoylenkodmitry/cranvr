@@ -6,7 +6,14 @@
 #
 # It takes the files from a built tree (scripts/build-basaltvr.sh) and writes
 # cranvr-game-support-macos.tar.xz and its .sha256 into OUT_DIR (default target/game-support).
-# scripts/install-game-support.sh installs such an archive.
+# scripts/install-game-support.sh installs such an archive. The built tree is
+# third_party/basaltvr/src, or $CRANVR_BASALTVR_DIR when the build lives in another checkout.
+#
+# The version: scripts/game-support-version.txt names it (a date, YYYY.MM.DD, with a fourth number
+# for a second release on one day). The archive carries it as VERSION, and setup-wine.sh stamps it
+# into the installed stack. The app compares that stamp with the same file, which it holds from
+# its build, and offers "Update game support" when the stack is older. So a change of a runtime or
+# DXMT patch needs a new date in that file, a new archive and a release tagged v<version>.
 #
 # The archive holds:
 #   engine/      Wine 11.10 (Gcenx's macOS build), with DXMT's DLLs in place
@@ -14,12 +21,13 @@
 #   runtime/     the OpenXR runtime, its manifest, its checks and the Steam web helper shim
 #   LICENSES/    the licenses of Wine, DXMT, BasaltVR and the OpenXR SDK
 #   SOURCES.md   where each part comes from and which patches it carries
+#   VERSION      the version of this game support
 
 set -euo pipefail
 
 cranvr=${0:A:h:h}
 out=${1:-${cranvr}/target/game-support}
-basalt=${cranvr}/third_party/basaltvr/src
+basalt=${CRANVR_BASALTVR_DIR:-${cranvr}/third_party/basaltvr/src}
 runtime=${basalt}/runtime
 wine_app="${runtime}/build/dxmt/toolchain/wine-11.10/Wine Devel.app/Contents/Resources/wine"
 fork=${runtime}/build/dxmt/fork-install
@@ -32,6 +40,20 @@ for f in "${wine_app}/bin/wine" "${fork}/x86_64-windows/d3d11.dll" "${fork}/x86_
         exit 1
     fi
 done
+
+# A runtime DLL older than its sources was built before the last patch: the archive would lack it
+for source in "${runtime}"/pe/*.{cpp,hpp,h}(N) "${runtime}"/CMakeLists.txt; do
+    if [[ ${source} -nt ${runtime_bin}/basalt_openxr.dll ]]; then
+        print -u2 "${source:t} is newer than basalt_openxr.dll. Run scripts/build-basaltvr.sh first."
+        exit 1
+    fi
+done
+
+version=$(tr -d '[:space:]' < "${cranvr}/scripts/game-support-version.txt")
+if [[ ! ${version} =~ '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[0-9]+)?$' ]]; then
+    print -u2 "scripts/game-support-version.txt holds '${version}', not YYYY.MM.DD."
+    exit 1
+fi
 
 stage=$(mktemp -d)
 trap 'rm -rf "${stage}"' EXIT
@@ -73,10 +95,12 @@ dxmt_commit=$(git -C "${runtime}/build/dxmt/src" rev-parse HEAD)
     print "controller."
 } > "${root}/SOURCES.md"
 
+print -r -- "${version}" > "${root}/VERSION"
+
 mkdir -p "${out}"
 archive=${out}/cranvr-game-support-macos.tar.xz
 print "Packing ${archive:t} (this takes a few minutes)"
 tar -C "${stage}" -cf - cranvr-game-support | xz -T0 -6 > "${archive}"
 (cd "${out}" && shasum -a 256 "${archive:t}" > "${archive:t}.sha256")
-print "Wrote ${archive} ($(du -h "${archive}" | cut -f1))"
+print "Wrote ${archive} (version ${version}, $(du -h "${archive}" | cut -f1))"
 cat "${archive}.sha256"

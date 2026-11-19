@@ -13,6 +13,12 @@
 #        scripts/setup-wine.sh GAME_SUPPORT_DIR   (an unpacked archive from package-game-support.sh)
 # The stack goes to $CRANVR_HOME/wine (default: ~/Library/Application Support/cranvr/wine).
 # Run it again to update the stack; the prefix and its installed games stay.
+#
+# At the end it stamps the stack's version into $CRANVR_HOME/wine/game-support-version.txt. The
+# version comes from the archive's VERSION file, or from scripts/game-support-version.txt when the
+# stack is built from a BasaltVR checkout. An archive without VERSION (a release before the stamp)
+# removes the stamp, so the app sees an old stack. The cranvr app compares the stamp with the
+# version that it expects.
 
 set -euo pipefail
 
@@ -27,11 +33,13 @@ if [[ -x ${1:A}/engine/bin/wine && -f ${1:A}/runtime/basalt_openxr.dll ]]; then
     source_wine=${1:A}/engine
     fork=${1:A}/dxmt
     runtime_bin=${1:A}/runtime
+    version_file=${1:A}/VERSION
 else
     basalt=${1:A}/runtime
     source_wine="${basalt}/build/dxmt/toolchain/wine-11.10/Wine Devel.app/Contents/Resources/wine"
     fork=${basalt}/build/dxmt/fork-install
     runtime_bin=${basalt}/build/bin
+    version_file=${0:A:h}/game-support-version.txt
 fi
 
 for f in "${source_wine}/bin/wine" "${fork}/x86_64-windows/d3d11.dll" "${fork}/x86_64-unix/winemetal.so" \
@@ -47,6 +55,8 @@ if ! arch -x86_64 /usr/bin/true 2>/dev/null; then
 fi
 
 mkdir -p "${stack}"
+# An update that stops halfway leaves no stamp, so the app offers the update again
+rm -f "${stack}/game-support-version.txt"
 wine_root=${stack}/engine
 prefix=${stack}/prefix
 
@@ -87,5 +97,10 @@ done
 
 print "Checking the OpenXR runtime through the Khronos loader"
 (cd "${runtime_dir}" && DXMT_BASALT_IOSURFACE=1 BASALT_EXPECT_D3D11_EXTENSION=1 "${wine_root}/bin/wine" ./loader_smoke.exe >/dev/null 2>&1) || { print -u2 "FAIL: loader_smoke.exe (run it by hand for details)"; exit 1; }
+# The stamp comes last: a stack that failed a step above has none
+if [[ -f ${version_file} ]]; then
+    tr -d '[:space:]' < "${version_file}" > "${stack}/game-support-version.txt"
+    print "Game support version $(<"${stack}/game-support-version.txt")"
+fi
 print "Wine stack ready: ${stack}"
 print "Install games into the prefix, then start them with scripts/run-game.sh"

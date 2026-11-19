@@ -2,6 +2,7 @@ use crate::{
     backend::{self, HeadsetApp, Model, Settings, StreamProtocol},
     black_eye,
     launch::{self, GameOptions},
+    setup::{self, Progress, Setup},
     steam::{self, SteamState},
     system::{self, Permission},
 };
@@ -177,12 +178,16 @@ fn refresh(settings: MutableState<Settings>, model: MutableState<Model>, slow: b
     if waiting(&next).iter().any(|key| !known.contains(key)) {
         crate::vr_window::bring_to_front();
     }
-    if slow {
+    // A finished setup changed what the Play tab shows: read the state now, not in 2 s
+    let setup_ended = model.with(|m| m.setup.as_ref().is_some_and(Setup::running)) && !next.setup.as_ref().is_some_and(Setup::running);
+    if slow || setup_ended {
         next.clients = backend::read_clients();
         next.lan = system::lan_addresses();
         next.permissions = PERMISSIONS.map(Permission::granted);
         next.steam = steam::state();
         next.rosetta = steam::rosetta_ready();
+        next.game_support = steam::game_support_installed();
+        next.game_support_outdated = steam::game_support_outdated();
         next.steam_running = next.steam == SteamState::Ready && steam::running();
         next.steam_signed_in = steam::signed_in();
         next.games = steam::games();
@@ -507,35 +512,36 @@ fn NativeConnect(model: MutableState<Model>) {
 
 #[composable]
 fn PlayTab(settings: MutableState<Settings>, model: MutableState<Model>) {
-    let state = model.with(|m| m.steam);
+    let (state, rosetta, outdated, setup) = model.with(|m| (m.steam, m.rosetta, m.game_support_outdated, m.setup.clone()));
     let open_program = rememberMutableStateOf(|| false);
-    let task = model.with(|m| m.task.clone());
+    let plan = setup::plan(rosetta, state, outdated);
+    // Steam cannot start before the setup. An outdated game support alone leaves it working: the
+    // library shows an Update button then.
+    let needs_setup = !rosetta || state != SteamState::Ready;
+    let running = setup.as_ref().is_some_and(Setup::running);
     Card(move || {
         Heading("Steam".into());
-        if let Some(task) = task.clone() {
-            Label(format!("{task}: working. This takes a few minutes; the Log tab shows the progress."));
-            return;
-        }
-        match state {
-            SteamState::NoWine => SetupSteps(model),
-            SteamState::NotInstalled | SteamState::NeedsSetup => {
-                Label(if state == SteamState::NotInstalled {
-                    "Steam for Windows is not installed yet.".into()
-                } else {
-                    "Steam needs its setup step (after an install or a Steam update).".into()
-                });
-                Primary("Install Steam".into(), move || {
-                    let result = backend::run_script("Steam setup", "setup-steam.sh", &[]);
-                    model.update(|m| match result {
-                        Ok(()) => m.task = Some("Steam setup".into()),
-                        Err(e) => m.message = Some(e),
-                    });
-                });
-                Hint("cranvr downloads the installer from Valve, installs Steam and prepares it for this Mac. You only sign in.".into());
+        if running {
+            let setup = setup.clone().unwrap_or(Setup { steps: vec![] });
+            let steam_opens = setup.steps.iter().any(|(step, _)| *step == setup::Step::Steam);
+            SetupProgress(setup);
+            Hint(if steam_opens {
+                "Keep cranvr open. This takes a few minutes. Steam opens at the end: sign in there once."
+            } else {
+                "Keep cranvr open. Steam and running games stop while this runs."
             }
-            SteamState::Ready => SteamLibrary(settings, model),
+            .into());
+        } else if needs_setup {
+            SetupStart(model, plan.clone(), setup.clone());
+        } else {
+            SteamLibrary(settings, model, setup.clone());
         }
     });
+    // Before the game support step there is no Wine to start a program with or to set up. While a
+    // setup runs, its card is the one thing on the tab.
+    if running || state == SteamState::NoWine {
+        return;
+    }
     Card(move || {
         Heading("Other Windows programs".into());
         Hint("Any Windows VR program that uses OpenXR with Direct3D 11.".into());
@@ -583,61 +589,87 @@ fn PlayTab(settings: MutableState<Settings>, model: MutableState<Model>) {
     WineCard(settings);
 }
 
-/// The steps that prepare a Mac for Windows VR games, before Steam: Rosetta 2, then the game
-/// support archive from the public release (scripts/install-game-support.sh).
+/// The steps of a setup, each with its progress line.
 #[composable]
-fn SetupSteps(model: MutableState<Model>) {
-    let rosetta = model.with(|m| m.rosetta);
-    Label("Three steps prepare this Mac for Windows VR games.".into());
-    FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-        Text("1. Rosetta 2 runs Wine's Intel code.".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
-        if rosetta {
-            Text("Ready".to_string(), Modifier::empty().padding(8.0), colored(110, 200, 140));
-        } else {
-            Primary("Install Rosetta".into(), move || {
-                // softwareupdate takes a minute: keep the window responsive
-                thread::spawn(|| {
-                    if let Err(e) = steam::install_rosetta() {
-                        backend::notify(e);
-                    }
-                });
-            });
-        }
-    });
-    if !rosetta {
-        Hint("macOS asks for your password to install it.".into());
+fn SetupProgress(setup: Setup) {
+    for (step, progress) in setup.steps {
+        let (text, style) = match progress {
+            Progress::Waiting => ("Waiting".to_string(), dim_style()),
+            Progress::Working(text) => (text, TextStyle::default()),
+            Progress::Done => ("Done".to_string(), colored(110, 200, 140)),
+            Progress::Failed(message) => (format!("Failed: {message}"), colored(240, 170, 90)),
+        };
+        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+            Text(step.title().to_string(), Modifier::empty().width(170.0).padding(8.0), sized(16.0, true));
+            Text(text.clone(), Modifier::empty().padding(8.0), style.clone());
+        });
     }
-    FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-        Text(
-            "2. Game support: Wine, DXMT and the OpenXR runtime.".to_string(),
-            Modifier::empty().padding(8.0),
-            TextStyle::default(),
-        );
-        if rosetta {
-            Primary("Download and install".into(), move || {
-                let result = backend::run_script("Game support", "install-game-support.sh", &[]);
-                model.update(|m| match result {
-                    Ok(()) => m.task = Some("Game support".into()),
-                    Err(e) => m.message = Some(e),
-                });
-            });
-        }
-    });
-    Hint(if rosetta {
-        "cranvr downloads about 250 MB from github.com/samoylenkodmitry/cranvr-game-support, checks it and installs it. It takes about 1.2 GB on disk.".into()
+}
+
+/// Before the setup of a Mac that cannot run games yet: what the one button does, and what
+/// stays for the user. After a failed run the failure stays on screen above the button.
+#[composable]
+fn SetupStart(model: MutableState<Model>, plan: Vec<setup::Step>, last: Option<Setup>) {
+    let failed = last.as_ref().is_some_and(Setup::failed);
+    let state = model.with(|m| m.steam);
+    let steam_opens = plan.contains(&setup::Step::Steam);
+    Label(if state == SteamState::NoWine {
+        "This Mac needs a one-time setup before it can run Windows VR games. One button does it."
     } else {
-        "This step comes after Rosetta.".into()
+        "Steam needs a setup step. One button does it."
+    }
+    .into());
+    match last.filter(|_| failed) {
+        Some(last) => SetupProgress(last),
+        None => {
+            for step in plan {
+                FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+                    Text(step.title().to_string(), Modifier::empty().width(170.0).padding(8.0), sized(16.0, true));
+                    Text(step.describe(state).to_string(), Modifier::empty().padding(8.0), dim_style());
+                });
+            }
+        }
+    }
+    FlowRow(Modifier::empty(), flow(), move || {
+        Primary(if failed { "Retry".into() } else { "Set up games".into() }, setup::start);
     });
-    Text("3. Steam for Windows, after step 2.".to_string(), Modifier::empty().padding(8.0), dim_style());
+    if steam_opens {
+        Hint("When it ends, Steam opens. Sign in to Steam there once. Your installed games show up here afterwards.".into());
+    }
+}
+
+/// The notice of a game support that is older than this app expects, with its one button.
+#[composable]
+fn GameSupportUpdate(installed: Option<String>, last: Option<Setup>) {
+    let newest = steam::game_support_expected();
+    Label(match installed {
+        Some(version) => format!("Your game support is version {version}. Version {newest} is available."),
+        None => format!("Your game support is older than version {newest}."),
+    });
+    if let Some(last) = last.filter(Setup::failed) {
+        SetupProgress(last);
+    }
+    FlowRow(Modifier::empty(), flow(), move || {
+        Primary("Update game support".into(), setup::start);
+    });
+    Hint("The update replaces the OpenXR runtime and DXMT in Wine. It stops Steam and running games first. Your games and your Steam login stay.".into());
 }
 
 #[composable]
-fn SteamLibrary(settings: MutableState<Settings>, model: MutableState<Model>) {
-    let (running, signed_in, games) = model.with(|m| (m.steam_running, m.steam_signed_in, m.games.clone()));
+fn SteamLibrary(settings: MutableState<Settings>, model: MutableState<Model>, last: Option<Setup>) {
+    let (running, signed_in, games, outdated, installed) =
+        model.with(|m| (m.steam_running, m.steam_signed_in, m.games.clone(), m.game_support_outdated, m.game_support.clone()));
     // The game whose launch options are open, by its program
     let open = rememberMutableStateOf(|| None::<String>);
+    if outdated {
+        GameSupportUpdate(installed, last);
+    }
     if !signed_in {
-        Label("Open Steam and sign in once. Steam remembers you after that.".into());
+        Label(if running {
+            "Sign in to Steam in the Steam window. Steam remembers you after that.".into()
+        } else {
+            "Open Steam and sign in once. Steam remembers you after that.".into()
+        });
     }
     FlowRow(Modifier::empty(), flow(), move || {
         if running {
@@ -649,6 +681,7 @@ fn SteamLibrary(settings: MutableState<Settings>, model: MutableState<Model>) {
             });
         }
     });
+    Hint("Games on another disk: in the Steam window, open Settings, then Storage, and add a folder on that disk (it sits under Z:\\Volumes). The games installed there show up here.".into());
     if games.is_empty() {
         Hint(if signed_in {
             "No games installed yet. Install them in the Steam window; they show up here.".into()
@@ -695,9 +728,13 @@ fn SteamLibrary(settings: MutableState<Settings>, model: MutableState<Model>) {
 }
 
 /// The launch options of one program, under its row: what cranvr adds when the program starts.
+/// The common switch is in view. The raw fields sit behind "Advanced", which starts open for a
+/// program that already has values in them.
 #[composable]
 fn LaunchOptions(settings: MutableState<Settings>, program: String) {
     let (options, wine) = settings.with(|s| (s.launch.get(&program).cloned().unwrap_or_default(), s.wine.clone()));
+    let raw_fields_set = !(options.dll_overrides.is_empty() && options.env.is_empty() && options.args.is_empty());
+    let advanced = rememberMutableStateOf(move || raw_fields_set);
     let dll = cranpose_core::remember(|| TextFieldState::new(&options.dll_overrides)).with(|state| *state);
     let env = cranpose_core::remember(|| TextFieldState::new(&options.env)).with(|state| *state);
     let args = cranpose_core::remember(|| TextFieldState::new(&options.args)).with(|state| *state);
@@ -706,6 +743,7 @@ fn LaunchOptions(settings: MutableState<Settings>, program: String) {
         ColumnSpec::default().vertical_arrangement(LinearArrangement::SpacedBy(6.0)),
         move || {
             let key = program.clone();
+            let shown = advanced.get();
             FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
                 let key = key.clone();
                 Choice("Each eye in its own pass".into(), options.eye_per_pass, move || {
@@ -714,27 +752,30 @@ fn LaunchOptions(settings: MutableState<Settings>, program: String) {
                         o.eye_per_pass_reason.clear();
                     })
                 });
+                Choice("Advanced".into(), shown, move || advanced.set(!shown));
             });
             if options.eye_per_pass && !options.eye_per_pass_reason.is_empty() {
                 Hint(options.eye_per_pass_reason.clone());
             }
             Hint("For a game whose right eye stays black. The runtime then refuses two-eye images, so the game draws each eye apart. This costs frames.".into());
-            OptionField("Wine DLL overrides", dll);
-            Hint("As WINEDLLOVERRIDES takes them, such as winhttp=n,b to load a winhttp.dll from the game's folder before Wine's own. Beat Saber's mod loader BSIPA ran without it in cranvr's Wine.".into());
-            OptionField("Environment", env);
-            Hint("NAME=value entries, separated by spaces.".into());
-            OptionField("Arguments", args);
-            let key = program.clone();
-            FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-                let key = key.clone();
-                Primary("Save options".into(), move || {
-                    edit_launch(settings, &key, |o| {
-                        o.dll_overrides = dll.text().trim().to_owned();
-                        o.env = env.text().trim().to_owned();
-                        o.args = args.text().trim().to_owned();
-                    })
+            if shown {
+                OptionField("Wine DLL overrides", dll);
+                Hint("As WINEDLLOVERRIDES takes them, such as winhttp=n,b to load a winhttp.dll from the game's folder before Wine's own. Beat Saber's mod loader BSIPA ran without it in cranvr's Wine.".into());
+                OptionField("Environment", env);
+                Hint("NAME=value entries, separated by spaces.".into());
+                OptionField("Arguments", args);
+                let key = program.clone();
+                FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+                    let key = key.clone();
+                    Primary("Save options".into(), move || {
+                        edit_launch(settings, &key, |o| {
+                            o.dll_overrides = dll.text().trim().to_owned();
+                            o.env = env.text().trim().to_owned();
+                            o.args = args.text().trim().to_owned();
+                        })
+                    });
                 });
-            });
+            }
             let summary = launch::summary(&wine, &options);
             Hint(if summary.is_empty() { "The game starts with nothing added.".into() } else { format!("The game starts with: {summary}") });
         },
@@ -772,10 +813,13 @@ fn edit_launch(settings: MutableState<Settings>, program: &str, edit: impl FnOnc
     settings.with(Settings::save);
 }
 
-/// The Wine that runs the games and the options of every program that cranvr starts.
+/// The Wine that runs the games and the options of every program that cranvr starts. The raw
+/// fields sit behind "Advanced", which starts open when they hold values.
 #[composable]
 fn WineCard(settings: MutableState<Settings>) {
     let wine = settings.with(|s| s.wine.clone());
+    let raw_fields_set = !(wine.dll_overrides.is_empty() && wine.env.is_empty());
+    let advanced = rememberMutableStateOf(move || raw_fields_set);
     let dll = cranpose_core::remember(|| TextFieldState::new(&wine.dll_overrides)).with(|state| *state);
     let env = cranpose_core::remember(|| TextFieldState::new(&wine.env)).with(|state| *state);
     Card(move || {
@@ -783,30 +827,33 @@ fn WineCard(settings: MutableState<Settings>) {
         Label(format!("Wine: {}", steam::engine().display()));
         Label(format!("Prefix: {}", steam::prefix().display()));
         Hint("The game support step installs this Wine with DXMT and cranvr's OpenXR runtime into this prefix. Another Wine or prefix lacks them, so cranvr uses these.".into());
-        let mac_window = wine.mac_window;
+        let (mac_window, shown) = (wine.mac_window, advanced.get());
         FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
             Choice("Game window on the Mac shows the picture".into(), mac_window, move || {
                 settings.update(|s| s.wine.mac_window = !s.wine.mac_window);
                 settings.with(Settings::save);
             });
+            Choice("Advanced".into(), shown, move || advanced.set(!shown));
         });
         Hint("Off: a game's own window on the Mac stays empty and costs no GPU time. The headset shows the game either way.".into());
-        OptionField("DLL overrides", dll);
-        OptionField("Environment", env);
-        Hint("For every program that cranvr starts, before its own options. Steam does not get them.".into());
-        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-            Primary("Save Wine options".into(), move || {
-                settings.update(|s| {
-                    s.wine.dll_overrides = dll.text().trim().to_owned();
-                    s.wine.env = env.text().trim().to_owned();
+        if shown {
+            OptionField("DLL overrides", dll);
+            OptionField("Environment", env);
+            Hint("For every program that cranvr starts, before its own options. Steam does not get them.".into());
+            FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+                Primary("Save Wine options".into(), move || {
+                    settings.update(|s| {
+                        s.wine.dll_overrides = dll.text().trim().to_owned();
+                        s.wine.env = env.text().trim().to_owned();
+                    });
+                    settings.with(Settings::save);
                 });
-                settings.with(Settings::save);
             });
-        });
-        Hint(format!(
-            "cranvr also always sets WINEPREFIX, WINEARCH=win64, WINEDEBUG=-all, DXMT_BASALT_IOSURFACE=1 and BASALT_CONTROL, which its runtime needs, and DXMT_MAX_SAMPLE_COUNT from the anti-aliasing setting. Steam starts with {}.",
-            steam::STEAM_FLAGS.join(" ")
-        ));
+            Hint(format!(
+                "cranvr also always sets WINEPREFIX, WINEARCH=win64, WINEDEBUG=-all, DXMT_BASALT_IOSURFACE=1 and BASALT_CONTROL, which its runtime needs, and DXMT_MAX_SAMPLE_COUNT from the anti-aliasing setting. Steam starts with {}.",
+                steam::STEAM_FLAGS.join(" ")
+            ));
+        }
     });
 }
 
@@ -896,7 +943,7 @@ fn SettingsTab(settings: MutableState<Settings>, model: MutableState<Model>) {
         let headset_app = s1.headset_app;
         FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
             Text("Headset app".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
-            for (label, choice) in [("ALVR client", HeadsetApp::Alvr), ("cranvr client", HeadsetApp::Cranvr)] {
+            for (label, choice) in [("cranvr client", HeadsetApp::Cranvr), ("ALVR client", HeadsetApp::Alvr)] {
                 Choice(label.into(), headset_app == choice, move || {
                     model.update(|m| {
                         m.tcp_fallback = false;
