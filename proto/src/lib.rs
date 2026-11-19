@@ -39,6 +39,7 @@ pub mod media;
 pub mod message;
 pub mod motion;
 pub mod secure;
+pub mod tracking;
 pub mod wire;
 
 pub use wire::{Error, Nanos};
@@ -63,13 +64,22 @@ pub use wire::{Error, Nanos};
 /// sides show a code that comes from the session (see [`secure::approval_code`]). The user compares
 /// the two codes and allows the headset on the Mac. A version 4 client cannot wait: the host refuses
 /// it at once, as before. A headset that is paired already connects with either version.
-pub const PROTOCOL_VERSION: u16 = 5;
+///
+/// Version 6 adds the tracking of hands, body, face and eyes (see [`tracking`]): the offer of the
+/// client, the wish of the host and one datagram for each feature. They are new variants at the end
+/// of the message enums, so a peer of version 4 or 5 skips them and the two still talk. The host
+/// sends a wish only to a client of version 6, and a client of version 6 offers features only to a
+/// host that answered with version 6.
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// The oldest protocol version this crate still speaks.
 pub const MIN_PROTOCOL_VERSION: u16 = 4;
 
 /// The first protocol version with the approval of a new headset on the Mac.
 pub const APPROVAL_VERSION: u16 = 5;
+
+/// The first protocol version with the tracking messages of [`tracking`].
+pub const TRACKING_VERSION: u16 = tracking::TRACKING_VERSION;
 
 /// The largest datagram, in bytes, sealed: the counter and the tag are in it. A media packet and
 /// any datagram message fit in it. A typical path MTU of 1500 bytes minus the IP and UDP headers

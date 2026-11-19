@@ -71,6 +71,9 @@ pub struct Settings {
     pub game_msaa_limit: u32,
     /// While a game runs, a display in a scaled mode shows its panel's own pixels
     pub unscale_displays: bool,
+    /// A game without hand tracking gets controllers made of the headset's tracked hands, while the
+    /// headset tracks no controller
+    pub hand_controllers: bool,
     /// The launch options of each Windows program, by its Windows path. A program with no entry
     /// starts with the default options.
     pub launch: BTreeMap<String, GameOptions>,
@@ -96,6 +99,7 @@ impl Default for Settings {
             game_scale: 0.7,
             game_msaa_limit: 2,
             unscale_displays: true,
+            hand_controllers: true,
             launch: BTreeMap::new(),
             wine: WineOptions::default(),
         }
@@ -396,6 +400,9 @@ fn host_args(settings: &Settings, pair_code: Option<&str>, config_dir: &Path, te
     if !settings.unscale_displays {
         args.push("--keep-display-modes".into());
     }
+    if !settings.hand_controllers {
+        args.push("--no-hand-controllers".into());
+    }
     if settings.desktop {
         args.extend(["--desktop", "--desktop-fps", &settings.desktop_fps.to_string()].map(OsString::from));
         if let Some((width, height)) = settings.virtual_display {
@@ -688,9 +695,9 @@ mod tests {
 
     #[test]
     fn the_settings_reach_the_host() {
-        let quiet = Settings { foveation: false, game_audio: false, virtual_display: Some((1920, 1080)), ..Default::default() };
+        let quiet = Settings { foveation: false, game_audio: false, hand_controllers: false, virtual_display: Some((1920, 1080)), ..Default::default() };
         let args = host_options(&quiet, None);
-        for wanted in ["--no-foveation", "--no-game-audio", "--virtual-display", "1920x1080"] {
+        for wanted in ["--no-foveation", "--no-game-audio", "--no-hand-controllers", "--virtual-display", "1920x1080"] {
             assert!(args.contains(&wanted.to_string()), "{wanted} in {args:?}");
         }
     }

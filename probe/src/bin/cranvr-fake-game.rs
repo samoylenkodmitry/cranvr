@@ -11,9 +11,19 @@
 //! arrived on both hands with their own grip and aim poses, as `hands.rs` scripts them, and with
 //! the Touch buttons.
 //!
+//! With `--use-tracking hands,body,full_body,face,eyes` it plays a game that uses these features, as
+//! the runtime of patch 0005 does: it writes the word `tracking` to `runtime-features.txt`, tells the
+//! host a second after the start which features it uses (`TRACKING_REQUEST`). With `--release-tracking`
+//! it takes them away again six seconds before the end, while the probe still runs. The host then sends their data. With `cranvr-probe --tracking` the data
+//! is the script of `tracked.rs`, and `--expect-tracking` makes the exit code depend on it.
+//! `--expect-hand-controllers` plays a game without hand code: with `cranvr-probe --tracking
+//! --no-controllers` the host must make the controllers of the probe's hands.
+//!
 //! Usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input]
+//!        [--use-tracking FEATURES] [--release-tracking] [--expect-tracking] [--expect-hand-controllers]
+//!        [--expect-no-controllers]
 
-use cranvr_common::inputs::{LEFT_SQUEEZE_VALUE_ID, RIGHT_A_CLICK_ID, RIGHT_THUMBSTICK_X_ID, RIGHT_TRIGGER_VALUE_ID};
+use cranvr_common::inputs::{LEFT_SQUEEZE_VALUE_ID, LEFT_TRIGGER_VALUE_ID, RIGHT_A_CLICK_ID, RIGHT_SQUEEZE_VALUE_ID, RIGHT_THUMBSTICK_X_ID, RIGHT_TRIGGER_VALUE_ID};
 use cranvr_proto::wire::Motion;
 use cranvr_vt::PixelBuffer;
 use std::{
@@ -46,6 +56,12 @@ const VIEW_CONFIG: u16 = 15;
 const FRAME_CONSUMED: u16 = 17;
 /// cranvr's runtime patch 0004: the grip and the aim pose of a hand in one message
 const CONTROLLER_MOTION_AIM: u16 = 18;
+/// cranvr's runtime patch 0005: tracking of hands, body, face and eyes
+const TRACKING_REQUEST: u16 = 19;
+const HAND_TRACKING: u16 = 20;
+const BODY_TRACKING: u16 = 21;
+const FACE_TRACKING: u16 = 22;
+const EYE_GAZE: u16 = 23;
 /// The probe puts its floor 0.3 m below its room's origin (`PROBE_FLOOR` in probe/src/native.rs).
 /// The host lifts every pose by that much.
 const FLOOR_LIFT: f32 = 0.3;
@@ -54,6 +70,9 @@ const FLOOR_LIFT: f32 = 0.3;
 #[allow(dead_code)]
 #[path = "../hands.rs"]
 mod hands;
+#[allow(dead_code)]
+#[path = "../tracked.rs"]
+mod tracked;
 const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
 const IMAGES: usize = 3;
 
@@ -217,6 +236,205 @@ impl Input {
     }
 }
 
+/// What the host sent of hands, body, face and eyes: the newest message of each kind and how many came.
+#[derive(Default)]
+struct Tracked {
+    hands: [Option<Vec<u8>>; 2],
+    body: Option<Vec<u8>>,
+    face: Option<Vec<u8>>,
+    eyes: Option<Vec<u8>>,
+    counts: [u32; 4],
+}
+
+fn floats_of(bytes: &[u8]) -> Vec<f32> {
+    bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()
+}
+
+/// Whether the joints in `bytes` (a pose of 7 floats each, then a flags byte each) are the expected
+/// ones, with the floor's lift
+fn joints_match(bytes: &[u8], expected: &[cranvr_proto::tracking::Joint], what: &str, out: &mut Vec<String>) {
+    let count = expected.len();
+    if bytes.len() != count * 29 {
+        out.push(format!("{what}: {} bytes for {count} joints", bytes.len()));
+        return;
+    }
+    let poses = floats_of(&bytes[..count * 28]);
+    for (i, joint) in expected.iter().enumerate() {
+        let got = &poses[i * 7..i * 7 + 7];
+        let (q, p) = (<[f32; 4]>::try_from(&got[..4]).unwrap(), <[f32; 3]>::try_from(&got[4..7]).unwrap());
+        let mut want = joint.pose.position;
+        want[1] += FLOOR_LIFT;
+        if !same_turn_within(q, joint.pose.orientation, 1e-4) || p.iter().zip(want).any(|(a, b)| (a - b).abs() > 3e-4) {
+            out.push(format!("{what}: joint {i} at {p:?} turned {q:?}, expected {want:?} turned {:?}", joint.pose.orientation));
+            return;
+        }
+        if bytes[count * 28 + i] != joint.flags {
+            out.push(format!("{what}: joint {i} has flags {}, expected {}", bytes[count * 28 + i], joint.flags));
+            return;
+        }
+    }
+}
+
+/// The same turn within `tolerance` in the angle's sine, up to the quaternion's sign
+fn same_turn_within(a: [f32; 4], b: [f32; 4], tolerance: f32) -> bool {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>().abs();
+    (1.0 - dot) < tolerance * tolerance + 1e-6
+}
+
+impl Tracked {
+    /// What the script of tracked.rs must have brought for the features that the game used
+    fn problems(&self, used: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let uses = |name: &str| used.split(',').any(|f| f == name);
+        if uses("hands") {
+            for (side, hand) in self.hands.iter().enumerate() {
+                let Some(p) = hand else {
+                    out.push(format!("no message for hand {side}"));
+                    continue;
+                };
+                if p.len() != 16 + 13 * 4 + 26 * 29 || u32_at(p, 8) != side as u32 || u32_at(p, 12) != 1 {
+                    out.push(format!("hand {side}: {} bytes, hand {}, flags {}", p.len(), u32_at(p, 8), u32_at(p, 12)));
+                    continue;
+                }
+                let (root, joints) = tracked::hand_joints(side);
+                let got = floats_of(&p[16..16 + 52]);
+                let mut want = root.pose.position;
+                want[1] += FLOOR_LIFT;
+                if !same_turn_within(got[..4].try_into().unwrap(), root.pose.orientation, 1e-6) || !near(got[4..7].try_into().unwrap(), want) {
+                    out.push(format!("hand {side}: wrist at {:?} turned {:?}, expected {want:?}", &got[4..7], &got[..4]));
+                }
+                if got[7..10] != tracked::HAND_VELOCITY[side] || got[10..13].iter().any(|v| *v != 0.0) {
+                    out.push(format!("hand {side}: velocities {:?}, expected {:?} and no turn", &got[7..13], tracked::HAND_VELOCITY[side]));
+                }
+                joints_match(&p[16 + 52..], &joints, &format!("hand {side}"), &mut out);
+            }
+        }
+        if uses("body") || uses("full_body") {
+            let set = if uses("full_body") { cranvr_proto::tracking::BodySet::Full } else { cranvr_proto::tracking::BodySet::Default };
+            match &self.body {
+                None => out.push("no body message".into()),
+                Some(p) => {
+                    let count = set.joints();
+                    // The probe sends the set that the host asked for: the full one when it was asked
+                    if p.len() != 8 + 4 + 4 + 4 + 52 + count * 29 || u32_at(p, 8) != count as u32 || u32_at(p, 12) != 1 {
+                        out.push(format!("body: {} bytes, {} joints, flags {}", p.len(), u32_at(p, 8), u32_at(p, 12)));
+                    } else {
+                        if (f32::from_le_bytes(p[16..20].try_into().unwrap()) - 0.9).abs() > 1e-6 {
+                            out.push("body: confidence is not 0.9".into());
+                        }
+                        let (root, joints) = tracked::body_joints(set);
+                        let got = floats_of(&p[20..20 + 52]);
+                        let mut want = root.pose.position;
+                        want[1] += FLOOR_LIFT;
+                        if !near(got[4..7].try_into().unwrap(), want) {
+                            out.push(format!("body: root at {:?}, expected {want:?}", &got[4..7]));
+                        }
+                        joints_match(&p[20 + 52..], &joints, "body", &mut out);
+                    }
+                }
+            }
+        }
+        if uses("face") {
+            match &self.face {
+                None => out.push("no face message".into()),
+                Some(p) if p.len() == 8 + 4 + 8 + 280 && u32_at(p, 8) == 1 => {
+                    let values = floats_of(&p[12..]);
+                    for (k, want) in tracked::FACE_CONFIDENCES.iter().enumerate() {
+                        if (values[k] - want).abs() > 0.003 {
+                            out.push(format!("face: confidence {k} is {}, expected {want}", values[k]));
+                        }
+                    }
+                    for (i, want) in tracked::face_weights().iter().enumerate() {
+                        if (values[2 + i] - want).abs() > 0.003 {
+                            out.push(format!("face: weight {i} is {}, expected {want}", values[2 + i]));
+                            break;
+                        }
+                    }
+                }
+                Some(p) => out.push(format!("face: {} bytes, flags {}", p.len(), u32_at(p, 8))),
+            }
+        }
+        if uses("eyes") {
+            match &self.eyes {
+                None => out.push("no eye message".into()),
+                Some(p) if p.len() == 8 + 4 + 28 && u32_at(p, 8) == 1 => {
+                    let values = floats_of(&p[12..]);
+                    let gaze = tracked::gaze();
+                    let mut want = gaze.position;
+                    want[1] += FLOOR_LIFT;
+                    if !same_turn_within(values[..4].try_into().unwrap(), gaze.orientation, 1e-5) || !near(values[4..7].try_into().unwrap(), want) {
+                        out.push(format!("eyes: gaze at {:?} turned {:?}, expected {want:?} turned {:?}", &values[4..7], &values[..4], gaze.orientation));
+                    }
+                }
+                Some(p) => out.push(format!("eyes: {} bytes, flags {}", p.len(), u32_at(p, 8))),
+            }
+        }
+        out
+    }
+}
+
+fn u32_at(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+}
+
+impl Input {
+    /// What a game without hand code must have got from the probe's hands: a controller for each
+    /// hand, at the palm, with the trigger of a half-open pinch and the aim pose through the fingers
+    fn hand_controller_problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.mask != Some(3) {
+            out.push(format!("controller mask {:?}, expected both hands", self.mask));
+        }
+        for (side, (trigger_id, squeeze_id)) in [(LEFT_TRIGGER_VALUE_ID, LEFT_SQUEEZE_VALUE_ID), (RIGHT_TRIGGER_VALUE_ID, RIGHT_SQUEEZE_VALUE_ID)].into_iter().enumerate() {
+            if self.poses[side] == 0 || self.aim_poses[side] == 0 {
+                out.push(format!("hand {side} made no controller with an aim pose"));
+                continue;
+            }
+            let (root, joints) = tracked::hand_joints(side);
+            let mut palm = root.pose.position;
+            palm[1] += FLOOR_LIFT;
+            if !near(self.grip[side].pose.position, palm) || !same_turn_within(self.grip[side].pose.orientation, root.pose.orientation, 1e-5) {
+                out.push(format!("hand {side}: grip at {:?} turned {:?}, expected the palm at {palm:?}", self.grip[side].pose.position, self.grip[side].pose.orientation));
+            }
+            // The thumb tip and the index tip: 0.0418 m apart in the script. The trigger runs from 1
+            // at 18 mm to 0 at 60 mm.
+            let distance = |a: usize, b: usize| (0..3).map(|k| (joints[a].pose.position[k] - joints[b].pose.position[k]).powi(2)).sum::<f32>().sqrt();
+            let wanted = ((0.060 - distance(5, 10)) / (0.060 - 0.018)).clamp(0.0, 1.0);
+            match self.last(trigger_id) {
+                Some(v) if (v - wanted).abs() < 0.01 => {}
+                other => out.push(format!("hand {side}: trigger {other:?}, expected {wanted:.3}")),
+            }
+            if self.last(squeeze_id).is_none_or(|v| v != 0.0) {
+                out.push(format!("hand {side}: squeeze {:?}, expected an open hand", self.last(squeeze_id)));
+            }
+            // The aim pose lies between the thumb tip and the index tip and points away from the
+            // shoulder, which sits below the head at the hand's side
+            let aim = self.aim[side].expect("checked above");
+            let mut target = [0, 1, 2].map(|k| (joints[5].pose.position[k] + joints[10].pose.position[k]) / 2.0);
+            target[1] += FLOOR_LIFT;
+            if !near(aim.pose.position, target) {
+                out.push(format!("hand {side}: aim at {:?}, expected {target:?}", aim.pose.position));
+            }
+            let head = [0.0, 1.6 + FLOOR_LIFT, 0.0];
+            let side_sign = if side == 0 { -1.0 } else { 1.0 };
+            let shoulder = [head[0] + 0.17 * side_sign, head[1] - 0.25, head[2] + 0.05];
+            let ray = [0, 1, 2].map(|k| target[k] - shoulder[k]);
+            let length = ray.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let q = aim.pose.orientation;
+            // The -Z axis of the aim pose
+            let forward = {
+                let (x, y, z, w) = (q[0], q[1], q[2], q[3]);
+                [-(2.0 * (x * z + w * y)), -(2.0 * (y * z - w * x)), -(1.0 - 2.0 * (x * x + y * y))]
+            };
+            let along: f32 = (0..3).map(|k| forward[k] * ray[k] / length).sum();
+            if along < 0.9999 {
+                out.push(format!("hand {side}: aim points {forward:?}, expected along {:?}", ray.map(|v| v / length)));
+            }
+        }
+        out
+    }
+}
+
 fn u64_at(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
@@ -244,6 +462,8 @@ fn paint(image: &mut PixelBuffer, eye: usize) {
 
 fn main() {
     let (mut control, mut fps, mut seconds, mut expect_input) = (None, 72.0f64, 10.0f64, false);
+    let (mut use_tracking, mut expect_tracking, mut expect_hand_controllers, mut expect_no_controllers) = (String::new(), false, false, false);
+    let mut release_tracking = false;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -251,8 +471,13 @@ fn main() {
             "--fps" => fps = args.next().and_then(|v| v.parse().ok()).expect("--fps N"),
             "--seconds" => seconds = args.next().and_then(|v| v.parse().ok()).expect("--seconds N"),
             "--expect-input" => expect_input = true,
+            "--use-tracking" => use_tracking = args.next().expect("--use-tracking FEATURES"),
+            "--expect-tracking" => expect_tracking = true,
+            "--expect-hand-controllers" => expect_hand_controllers = true,
+            "--expect-no-controllers" => expect_no_controllers = true,
+            "--release-tracking" => release_tracking = true,
             _ => {
-                eprintln!("usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input]");
+                eprintln!("usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input] [--use-tracking FEATURES] [--expect-tracking] [--expect-hand-controllers] [--expect-no-controllers] [--release-tracking]");
                 std::process::exit(2);
             }
         }
@@ -267,7 +492,7 @@ fn main() {
     // The runtime of cranvr's patch 0004 writes this file before it connects. Without it the host
     // sends no aim poses, because a runtime without the patch drops the connection at the message.
     let features = std::path::Path::new(&control_path).with_file_name("runtime-features.txt");
-    fs::write(&features, "aim\n").expect("write runtime-features.txt");
+    fs::write(&features, "aim tracking\n").expect("write runtime-features.txt");
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the host");
     stream.set_nodelay(true).ok();
     let name = b"cranvr-fake-game";
@@ -282,10 +507,11 @@ fn main() {
     let head_ns = Arc::new(AtomicU64::new(0));
     let fov = Arc::new(Mutex::new([[-0.8f32, 0.8, 0.8, -0.8]; 2]));
     let input = Arc::new(Mutex::new(Input::default()));
+    let tracked_data = Arc::new(Mutex::new(Tracked::default()));
     let (acks, ack_rx) = mpsc::channel::<u16>();
     let (consumed, consumed_rx) = mpsc::channel::<u64>();
     {
-        let (head_ns, fov, input) = (Arc::clone(&head_ns), Arc::clone(&fov), Arc::clone(&input));
+        let (head_ns, fov, input, tracked_data) = (Arc::clone(&head_ns), Arc::clone(&fov), Arc::clone(&input), Arc::clone(&tracked_data));
         let mut reader = stream.try_clone().unwrap();
         let mut haptic_stream = stream.try_clone().unwrap();
         thread::spawn(move || {
@@ -333,6 +559,30 @@ fn main() {
                             haptic_stream.write_all(&message(HAPTIC, &pulse)).ok();
                         }
                     }
+                    HAND_TRACKING if p.len() >= 16 => {
+                        let mut t = tracked_data.lock().unwrap();
+                        t.counts[0] += 1;
+                        // An inactive hand has no joints: only a tracked one is kept
+                        if u32_at(&p, 12) == 1 {
+                            let side = (u32_at(&p, 8) as usize).min(1);
+                            t.hands[side] = Some(p);
+                        }
+                    }
+                    BODY_TRACKING => {
+                        let mut t = tracked_data.lock().unwrap();
+                        t.counts[1] += 1;
+                        t.body = Some(p);
+                    }
+                    FACE_TRACKING => {
+                        let mut t = tracked_data.lock().unwrap();
+                        t.counts[2] += 1;
+                        t.face = Some(p);
+                    }
+                    EYE_GAZE => {
+                        let mut t = tracked_data.lock().unwrap();
+                        t.counts[3] += 1;
+                        t.eyes = Some(p);
+                    }
                     14 => input.lock().unwrap().resets += 1,
                     TEARDOWN => break,
                     _ => {}
@@ -372,7 +622,26 @@ fn main() {
     let mut in_flight: [Option<u64>; IMAGES] = [None; IMAGES];
     let (mut sent, mut done, mut no_pose, mut stalled) = (0u64, 0u64, 0u64, 0u64);
     let mut number = 0u64;
+    let features_used = |names: &str| {
+        [("hands", 1u32), ("body", 2), ("full_body", 4), ("face", 8), ("eyes", 16)]
+            .into_iter()
+            .filter(|(name, _)| names.split(',').any(|f| f == *name))
+            .fold(0, |bits, (_, bit)| bits | bit)
+    };
+    // The game creates its trackers a second after the start. It may destroy them six seconds before the end.
+    let (mut requested, mut released) = (false, false);
     while start.elapsed().as_secs_f64() < seconds {
+        if !use_tracking.is_empty() {
+            let at = start.elapsed().as_secs_f64();
+            if !requested && at >= 1.0 {
+                requested = true;
+                println!("fake-game: tracking requested: {use_tracking} at unix {} ms", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis()));
+                stream.write_all(&message(TRACKING_REQUEST, &features_used(&use_tracking).to_le_bytes())).unwrap();
+            } else if release_tracking && requested && !released && at >= seconds - 6.0 {
+                released = true;
+                stream.write_all(&message(TRACKING_REQUEST, &0u32.to_le_bytes())).unwrap();
+            }
+        }
         next += period;
         if let Some(wait) = next.checked_duration_since(Instant::now()) {
             thread::sleep(wait);
@@ -440,10 +709,38 @@ fn main() {
         );
     }
     println!("fake-game: input: {} button paths, buttons that changed: {:?}", input.buttons.len(), input.buttons.iter().filter(|(_, b)| b.1 > 0).map(|(id, b)| (id, b.0, b.1)).collect::<Vec<_>>());
-    let problems = input.problems();
+    let problems = if expect_input { input.problems() } else { Vec::new() };
     for problem in &problems {
         println!("fake-game: input problem: {problem}");
     }
-    let input_ok = !expect_input || problems.is_empty();
-    std::process::exit(if sent > 0 && done * 10 >= sent * 9 && input_ok { 0 } else { 1 });
+    let mut ok = sent > 0 && done * 10 >= sent * 9 && problems.is_empty();
+    let tracked_data = tracked_data.lock().unwrap();
+    println!(
+        "fake-game: tracking: {} hand, {} body, {} face and {} eye messages",
+        tracked_data.counts[0], tracked_data.counts[1], tracked_data.counts[2], tracked_data.counts[3]
+    );
+    if expect_tracking {
+        let problems = tracked_data.problems(&use_tracking);
+        for problem in &problems {
+            println!("fake-game: tracking problem: {problem}");
+        }
+        ok &= problems.is_empty();
+        println!("fake-game: tracking {}", if ok { "matches the script" } else { "does not match the script" });
+    }
+    if expect_no_controllers {
+        // A game that uses hands has hand code of its own: no controller is made of a hand
+        if input.poses != [0, 0] || input.mask.is_some_and(|m| m != 0) {
+            println!("fake-game: controllers {:?} with mask {:?} came, expected none", input.poses, input.mask);
+            ok = false;
+        }
+    }
+    if expect_hand_controllers {
+        let problems = input.hand_controller_problems();
+        for problem in &problems {
+            println!("fake-game: hand controller problem: {problem}");
+        }
+        ok &= problems.is_empty();
+        println!("fake-game: controllers made of hands {}", if problems.is_empty() { "match the script" } else { "do not match the script" });
+    }
+    std::process::exit(if ok { 0 } else { 1 });
 }

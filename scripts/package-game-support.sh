@@ -70,7 +70,7 @@ cp "${fork}/x86_64-unix/winemetal.so" "${root}/engine/lib/wine/x86_64-unix/winem
 cp "${fork}/x86_64-unix/winemetal.so" "${root}/dxmt/x86_64-unix/winemetal.so"
 
 print "Copying the OpenXR runtime"
-for f in basalt_openxr.dll basalt_openxr.json loader_smoke.exe d3d11_runtime_smoke.exe steamwebhelper_compat.exe; do
+for f in basalt_openxr.dll basalt_openxr.json loader_smoke.exe d3d11_runtime_smoke.exe tracking_smoke.exe steamwebhelper_compat.exe; do
     cp "${runtime_bin}/${f}" "${root}/runtime/${f}"
 done
 
@@ -91,8 +91,9 @@ dxmt_commit=$(git -C "${runtime}/build/dxmt/src" rev-parse HEAD)
     print
     print "cranvr's DXMT patches add a limit on MSAA samples, an MSAA resolve without a sample store and an"
     print "optional skip of the Mac window's present. cranvr's runtime patches add the headset's refresh rate,"
-    print "a view size per game, an optional limit of one slice per swapchain and a separate aim pose for each"
-    print "controller."
+    print "a view size per game, an optional limit of one slice per swapchain, a separate aim pose for each"
+    print "controller and the tracking of hands, body, face and eyes (XR_EXT_hand_tracking, XR_FB_body_tracking,"
+    print "XR_META_body_tracking_full_body, XR_FB_face_tracking2 and XR_EXT_eye_gaze_interaction)."
 } > "${root}/SOURCES.md"
 
 print -r -- "${version}" > "${root}/VERSION"

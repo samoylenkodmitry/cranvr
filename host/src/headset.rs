@@ -13,6 +13,7 @@ use crate::{
     runtime_link::Haptic,
     session::Negotiated,
 };
+use cranvr_proto::tracking::{Features, Tracked};
 use serde_json::Value;
 use std::{net::IpAddr, sync::mpsc::RecvTimeoutError, time::Duration};
 
@@ -52,6 +53,12 @@ pub enum Event {
     Recenter,
     /// A press on a button of the headset's console, as a JSON text (see `status::console_request`).
     Console(String),
+    /// The tracking features that the headset offers (see `cranvr_proto::tracking`). The set is
+    /// empty while no headset is connected.
+    TrackingOffer(Features),
+    /// Hands, body, face or eyes of one headset frame, for a feature that the host wished. Poses lie
+    /// in the room of the host's scenes: the floor of the headset is at height 0.
+    Tracked(Tracked),
 }
 
 /// Where the events of a link come from. The host's event loop owns it.
@@ -160,6 +167,10 @@ pub trait Headset: Send + Sync {
 
     /// Sends the console's menu as a JSON text, when the link has a console.
     fn send_menu(&self, _menu: &str) {}
+
+    /// The tracking features that a game uses now. The link asks the headset for these, within what
+    /// the headset offers, and for nothing else. It asks again at each new connection.
+    fn set_tracking_wish(&self, _wish: Features) {}
 
     /// The averages since the last call: the time of each stage from the pose to the display, and
     /// the link's own counters. `None` when no report came.

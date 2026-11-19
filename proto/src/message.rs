@@ -16,6 +16,7 @@
 //!    With TCP media the host sends `MediaReady` at once.
 //! 6. The host sends [`HostMsg::DecoderConfig`] and then frames. The first frame is a key frame.
 
+use crate::tracking::{Body, Eyes, Face, Features, Hands};
 use crate::wire::{Codec, Fov, Motion, Nanos, Pose};
 use crate::{Error, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
 use cranvr_common::foveation::FoveationConfig;
@@ -232,6 +233,11 @@ pub enum ClientMsg {
     /// number that it sends after it saw the host's [`HostMsg::AwaitApproval`]. A host of version
     /// 4 does not know the message.
     PairNonce([u8; 32]),
+    /// The tracking features that the headset offers: hands, body, face and eyes (see
+    /// [`crate::tracking`]). The client sends it once after the welcome and again when the set
+    /// changes, for example when the user allows the headset's face tracking. A host that does not
+    /// know the message skips it. The message comes with protocol version 6.
+    TrackingOffer(Features),
 }
 
 /// A change of the origin of the poses that the client sends. Every pose with a display time at or
@@ -280,6 +286,11 @@ pub enum HostMsg {
     AwaitApproval { host_name: String, commit: [u8; 32] },
     /// The number that `commit` hides
     PairReveal([u8; 32]),
+    /// The tracking features that a game uses now. The client sends the datagrams of these features
+    /// and no others. The set is empty when no game asks. The host sends it when the headset
+    /// connects and when it changes, and only to a client of protocol version 6. A client that does
+    /// not know the message skips it.
+    TrackingWish(Features),
 }
 
 /// Datagram messages from the client to the host.
@@ -298,6 +309,15 @@ pub enum ClientDatagram {
     Pong(Pong),
     /// Where a controller points on the desktop panel, with its trigger and thumbstick
     Pointer(Pointer),
+    /// The hands' joints, for every headset frame while the host wishes [`Features::HANDS`].
+    /// Protocol version 6 added this datagram and the next three.
+    Hands(Hands),
+    /// The body's joints, while the host wishes [`Features::BODY`] or [`Features::FULL_BODY`]
+    Body(Body),
+    /// The face's blend shape weights, while the host wishes [`Features::FACE`]
+    Face(Face),
+    /// The gaze, while the host wishes [`Features::EYES`]
+    Eyes(Eyes),
 }
 
 /// Datagram messages from the host to the client.

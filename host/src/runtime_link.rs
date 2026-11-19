@@ -11,10 +11,19 @@
 //! The host sends the message only to such a runtime. Without it, a game gets the grip pose for
 //! its aim space too.
 //!
+//! Tracking of hands, body, face and eyes is cranvr's extension too (runtime patch 0005, messages 19
+//! to 23). The runtime tells the host which features its game uses (`TRACKING_REQUEST`), and the host
+//! sends their data. The runtime writes the word `tracking` to `runtime-features.txt`, and the host
+//! sends the data only to a runtime that did. The host also writes `tracking-features.txt` next to
+//! the control file: the features that the connected headset offers. The runtime reads it before a
+//! game creates its OpenXR instance, because the game asks for the instance's extensions first, and
+//! lists the extensions of those features only.
+//!
 //! The runtime finds the host through a control file: "<port> <token> <eye width> <eye height>".
 //! The launcher passes the file's Windows path to the game in the `BASALT_CONTROL` variable.
 
 use crate::pose::DeviceMotion;
+use cranvr_proto::tracking::{Body, Eyes, Face, Features, Joint, BODY_JOINTS, FACE_CONFIDENCES, FACE_WEIGHTS, FULL_BODY_JOINTS, HAND_JOINTS};
 use log::{info, warn};
 use cranvr_common::inputs::QUEST_TOUCH_PROFILE_ID;
 use cranvr_vt::PixelBuffer;
@@ -26,7 +35,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
@@ -38,11 +47,13 @@ const TOKEN_LENGTH: usize = 32;
 const MAX_MESSAGE: u32 = 4096;
 /// The longest silence toward the runtime; it gives up after 5 seconds
 const KEEPALIVE: Duration = Duration::from_secs(1);
+/// The file next to the control file with the features that the headset offers, as words
+pub const TRACKING_FILE: &str = "tracking-features.txt";
 /// The runtime accepts per-eye sizes up to this (BASALT_CONTROL_MAX_VIEW_*; cranvr's runtime
 /// patch raises them to the Quest 3 panel size).
 pub const MAX_VIEW: (u32, u32) = (2064, 2208);
 
-mod msg {
+pub(crate) mod msg {
     pub const HELLO: u16 = 1;
     pub const HELLO_ACK: u16 = 2;
     pub const CREATE_SWAPCHAIN: u16 = 3;
@@ -62,6 +73,12 @@ mod msg {
     pub const FRAME_CONSUMED: u16 = 17;
     /// cranvr's runtime patch 0004: the grip and the aim pose of a controller in one message
     pub const CONTROLLER_MOTION_AIM: u16 = 18;
+    /// cranvr's runtime patch 0005: the features that the game uses (runtime to host)
+    pub const TRACKING_REQUEST: u16 = 19;
+    pub const HAND_TRACKING: u16 = 20;
+    pub const BODY_TRACKING: u16 = 21;
+    pub const FACE_TRACKING: u16 = 22;
+    pub const EYE_GAZE: u16 = 23;
 }
 
 /// One eye of a finished game frame.
@@ -120,6 +137,10 @@ pub struct InputCounts {
     pub buttons: u32,
     /// Haptic pulses that the game asked for
     pub haptics: u32,
+    /// Tracking messages sent: hands, body, face and eyes
+    pub tracking: [u32; 4],
+    /// The features that the game asks for now
+    pub requested: Features,
 }
 
 #[derive(Default)]
@@ -129,6 +150,7 @@ struct InputCounters {
     mask: AtomicU32,
     buttons: AtomicU32,
     haptics: AtomicU32,
+    tracking: [AtomicU32; 4],
 }
 
 /// What the host knows about the headset, sent to each new runtime connection.
@@ -147,6 +169,12 @@ pub struct RuntimeLink {
     counters: InputCounters,
     /// The connected runtime takes aim poses (see the top of the file)
     aim_support: AtomicBool,
+    /// The connected runtime takes the tracking messages, and asks for them
+    tracking_support: AtomicBool,
+    /// The tracking features that the connected game asks for: the bits of `Features`
+    requested: AtomicU8,
+    /// The tracking features that the connected headset offers, as the file tells the runtime
+    offered: AtomicU8,
     /// The host has already said that the runtime lacks aim poses, for this connection
     aim_warned: AtomicBool,
     /// The runtime dropped the controllers' interaction profiles at an INPUT_RESET. The next pose
@@ -176,6 +204,9 @@ impl RuntimeLink {
             calibration: Mutex::new(Calibration::default()),
             counters: InputCounters::default(),
             aim_support: AtomicBool::new(false),
+            tracking_support: AtomicBool::new(false),
+            requested: AtomicU8::new(0),
+            offered: AtomicU8::new(0),
             aim_warned: AtomicBool::new(false),
             profiles_dropped: AtomicBool::new(false),
             control_file: control_file.to_owned(),
@@ -183,6 +214,8 @@ impl RuntimeLink {
             token: random_token()?,
         });
         link.write_control_file(eye_size, fps)?;
+        // A file from an earlier run names a headset that is gone
+        fs::remove_file(link.control_dir().join(TRACKING_FILE)).ok();
         {
             let link = Arc::clone(&link);
             thread::Builder::new().name("runtime-link".into()).spawn(move || {
@@ -191,6 +224,8 @@ impl RuntimeLink {
                         warn!("Game runtime connection: {e}");
                     }
                     *link.writer.lock().unwrap() = None;
+                    link.requested.store(0, Ordering::Relaxed);
+                    link.tracking_support.store(false, Ordering::Relaxed);
                     events.send(GameEvent::Disconnected).ok();
                 }
             })?;
@@ -272,12 +307,16 @@ impl RuntimeLink {
         let features = fs::read_to_string(&features_file).unwrap_or_default();
         fs::remove_file(&features_file).ok();
         let aim = features.split_whitespace().any(|feature| feature == "aim");
+        let tracking = features.split_whitespace().any(|feature| feature == "tracking");
         self.aim_support.store(aim, Ordering::Relaxed);
         self.aim_warned.store(false, Ordering::Relaxed);
+        self.tracking_support.store(tracking, Ordering::Relaxed);
+        self.requested.store(0, Ordering::Relaxed);
         info!(
-            "Game runtime connected: {renderer}, {}, {}",
+            "Game runtime connected: {renderer}, {}, {}, {}",
             program.as_deref().unwrap_or("program not named"),
-            if aim { "takes aim poses" } else { "takes no aim poses" }
+            if aim { "takes aim poses" } else { "takes no aim poses" },
+            if tracking { "takes hand, body, face and eye tracking" } else { "takes no hand, body, face or eye tracking" }
         );
 
         *self.last_sent.lock().unwrap() = Instant::now();
@@ -346,6 +385,12 @@ impl RuntimeLink {
                     let duration = Duration::from_nanos(r.u64()?);
                     self.counters.haptics.fetch_add(1, Ordering::Relaxed);
                     on_haptic(Haptic { hand, duration, frequency: r.f32()?, amplitude: r.f32()? });
+                }
+                msg::TRACKING_REQUEST => {
+                    let requested = Features(r.u32()? as u8).known();
+                    if self.requested.swap(requested.0, Ordering::Relaxed) != requested.0 {
+                        info!("Game runtime: the game uses {}", if requested.is_empty() { "no tracking".to_string() } else { requested.names().join(", ") });
+                    }
                 }
                 msg::TEARDOWN => {
                     info!("Game runtime closed the session");
@@ -444,7 +489,97 @@ impl RuntimeLink {
             mask: c.mask.load(Ordering::Relaxed),
             buttons: c.buttons.swap(0, Ordering::Relaxed),
             haptics: c.haptics.swap(0, Ordering::Relaxed),
+            tracking: std::array::from_fn(|i| c.tracking[i].swap(0, Ordering::Relaxed)),
+            requested: self.requested_tracking(),
         }
+    }
+
+    /// The tracking features that the connected game uses now. It is empty when no game runs, or when
+    /// the runtime lacks cranvr's tracking patch.
+    pub fn requested_tracking(&self) -> Features {
+        Features(self.requested.load(Ordering::Relaxed))
+    }
+
+    /// Tells the runtime which features the headset offers: a file next to the control file, which
+    /// the runtime reads when a game lists its OpenXR extensions. An empty set removes the file.
+    pub fn set_offered_tracking(&self, offered: Features) {
+        let path = self.control_dir().join(TRACKING_FILE);
+        self.offered.store(offered.0, Ordering::Relaxed);
+        let result = if offered.is_empty() {
+            match fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            }
+        } else {
+            // The runtime may read while the host writes: a rename leaves it the old file or the new
+            let partial = path.with_extension("tmp");
+            fs::write(&partial, format!("{}\n", offered.names().join(" "))).and_then(|()| fs::rename(&partial, &path))
+        };
+        if let Err(e) = result {
+            warn!("Game runtime: the offered tracking features did not reach {}: {e}", path.display());
+        }
+    }
+
+    /// One hand of a tracking sample, or `None` while the headset does not track it. `root` is the
+    /// pose of the wrist with its velocities. The joints lie in the host's room.
+    pub fn hand(&self, timestamp_ns: u64, hand: u32, tracked: Option<(&DeviceMotion, &[Joint; HAND_JOINTS])>) {
+        if !self.tracking_support.load(Ordering::Relaxed) {
+            return;
+        }
+        self.counters.tracking[0].fetch_add(1, Ordering::Relaxed);
+        let mut p = timestamp_ns.to_le_bytes().to_vec();
+        p.extend_from_slice(&hand.to_le_bytes());
+        p.extend_from_slice(&u32::from(tracked.is_some()).to_le_bytes());
+        if let Some((root, joints)) = tracked {
+            put_motion(&mut p, root);
+            put_joints(&mut p, joints);
+        }
+        self.send(msg::HAND_TRACKING, &p);
+    }
+
+    /// The body of a tracking sample. `root` is the pose of the first joint with its velocities.
+    pub fn body(&self, timestamp_ns: u64, root: &DeviceMotion, body: &Body, joints: &[Joint]) {
+        if !self.tracking_support.load(Ordering::Relaxed) || ![BODY_JOINTS, FULL_BODY_JOINTS].contains(&joints.len()) {
+            return;
+        }
+        self.counters.tracking[1].fetch_add(1, Ordering::Relaxed);
+        let mut p = timestamp_ns.to_le_bytes().to_vec();
+        p.extend_from_slice(&(joints.len() as u32).to_le_bytes());
+        p.extend_from_slice(&1u32.to_le_bytes());
+        p.extend_from_slice(&body.confidence.to_le_bytes());
+        put_motion(&mut p, root);
+        put_joints(&mut p, joints);
+        self.send(msg::BODY_TRACKING, &p);
+    }
+
+    /// The face of a tracking sample
+    pub fn face(&self, timestamp_ns: u64, face: &Face, weights: &[f32; FACE_WEIGHTS]) {
+        if !self.tracking_support.load(Ordering::Relaxed) {
+            return;
+        }
+        self.counters.tracking[2].fetch_add(1, Ordering::Relaxed);
+        let mut p = timestamp_ns.to_le_bytes().to_vec();
+        p.extend_from_slice(&u32::from(face.flags).to_le_bytes());
+        let confidences: [f32; FACE_CONFIDENCES] = face.confidences();
+        for c in confidences.iter().chain(weights) {
+            p.extend_from_slice(&c.to_le_bytes());
+        }
+        self.send(msg::FACE_TRACKING, &p);
+    }
+
+    /// The gaze of a tracking sample, or `None` while the headset has none
+    pub fn eyes(&self, timestamp_ns: u64, eyes: &Eyes) {
+        if !self.tracking_support.load(Ordering::Relaxed) {
+            return;
+        }
+        self.counters.tracking[3].fetch_add(1, Ordering::Relaxed);
+        let mut p = timestamp_ns.to_le_bytes().to_vec();
+        p.extend_from_slice(&u32::from(eyes.gaze.is_some()).to_le_bytes());
+        let gaze = eyes.gaze.unwrap_or_default();
+        for c in gaze.orientation.iter().chain(&gaze.position) {
+            p.extend_from_slice(&c.to_le_bytes());
+        }
+        self.send(msg::EYE_GAZE, &p);
     }
 
     /// IPD in meters and the field of view of each eye (left, right, up, down; radians).
@@ -479,7 +614,17 @@ fn put_motion(p: &mut Vec<u8>, motion: &DeviceMotion) {
     }
 }
 
-fn read_message(stream: &mut TcpStream) -> Result<(u16, Vec<u8>), String> {
+/// The poses of joints, then a flags byte for each: 7 floats and a byte per joint
+fn put_joints(p: &mut Vec<u8>, joints: &[Joint]) {
+    for joint in joints {
+        for c in joint.pose.orientation.iter().chain(&joint.pose.position) {
+            p.extend_from_slice(&c.to_le_bytes());
+        }
+    }
+    p.extend(joints.iter().map(|joint| joint.flags));
+}
+
+pub(crate) fn read_message(stream: &mut TcpStream) -> Result<(u16, Vec<u8>), String> {
     let mut head = [0u8; 4];
     stream.read_exact(&mut head).map_err(|e| e.to_string())?;
     let length = u32::from_le_bytes(head);

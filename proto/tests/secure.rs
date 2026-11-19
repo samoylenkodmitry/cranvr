@@ -760,7 +760,7 @@ fn a_host_of_version_4_that_does_not_know_the_client_is_the_side_to_update() {
     });
     let result = ClientLink::connect(addr, &caps(), &identity(), None, WAIT);
     let error = result.err().expect("the old host refuses");
-    assert!(matches!(error, Error::Version { ours: (4, 5), theirs: (4, 4) }), "{error:?}");
+    assert!(matches!(error, Error::Version { ours: (4, 6), theirs: (4, 4) }), "{error:?}");
     assert_eq!(error.peer_must_update(), Some(true));
     old.join().unwrap();
 }
