@@ -597,7 +597,10 @@ pub fn run_script(script: &str, args: &[&str], mut progress: impl FnMut(&str)) -
     if status.success() {
         return Ok(());
     }
-    Err(complaint.unwrap_or_else(|| format!("{script} stopped with {status}")))
+    Err(complaint.unwrap_or_else(|| {
+        log(format!("{script} stopped with {status}"));
+        "The step stopped without saying why".into()
+    }))
 }
 
 /// Calls `line` for each text that ends in a line feed or a carriage return: curl's progress bar

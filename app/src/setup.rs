@@ -187,7 +187,7 @@ pub fn plain_progress(line: &str) -> String {
     if let Some(percent) = backend::percent(line) {
         return format!("Downloading: {percent}%");
     }
-    let rules: [(&str, &str); 10] = [
+    let rules: [(&str, &str); 11] = [
         ("Downloading the game support", "Downloading"),
         ("Checked the archive", "Checked the download"),
         ("Unpacking", "Unpacking"),
@@ -198,6 +198,7 @@ pub fn plain_progress(line: &str) -> String {
         ("Installing Steam", "Installing Steam"),
         ("Starting Steam once", "Steam downloads its client. This takes several minutes."),
         ("Installed the web helper", "Preparing Steam's window"),
+        ("Steam is ready", "Steam is ready"),
     ];
     if let Some((_, text)) = rules.iter().find(|(prefix, _)| line.starts_with(prefix)) {
         return (*text).to_owned();

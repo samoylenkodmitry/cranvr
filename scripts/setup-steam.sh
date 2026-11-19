@@ -75,8 +75,8 @@ if [[ ! -f ${steam_dir}/steam.exe ]]; then
     fi
 fi
 
-# 2. First start: Steam updates itself, then gets stopped. The update is done when the web
-# helper exists and Steam's folder stops growing. Steam waits about 40 seconds before it starts
+# 2. First start: Steam updates itself, then gets stopped. The update is done when Steam's log
+# says so, the web helper exists and Steam's folder stops growing. Steam waits about 40 seconds before it starts
 # to download. A first start can also sit idle for good: its log stops after "Verification
 # complete", or at "Downloading manifest" with no request, and the folder stays at a few MB. A
 # second start asks for its update at once. So a start with no growth for two minutes is stopped
@@ -84,22 +84,31 @@ fi
 start_steam() {
     (cd "${steam_dir}" && "${wine_root}/bin/wine" ./steam.exe -noverifyfiles -no-cef-sandbox >/dev/null 2>&1 &)
 }
+# The web helper appears early in the update. Steam's own log says when the update ended, so a run
+# that stopped halfway starts Steam again instead of putting the shim into a half-updated client.
+update_done() {
+    grep -qs "Update complete, launching Steam" "${steam_dir}/logs/bootstrap_log.txt"
+}
 helper=$(find_helper)
-if [[ -z ${helper} ]]; then
+if [[ -z ${helper} ]] || ! update_done; then
     print "Starting Steam once to download its current client"
     start_steam
     last="" stable=0 idle=0 restarts=0
     for i in {1..180}; do
         sleep 5
-        size=$(du -sk "${steam_dir}" 2>/dev/null | cut -f1)
+        # du fails when Steam deletes a file while it counts: keep the last size then
+        size=$(du -sk "${steam_dir}" 2>/dev/null | cut -f1) || size=${last}
+        size=${size:-0}
         helper=$(find_helper)
-        if [[ -n ${helper} && ${size} == "${last}" ]]; then
+        ended=0
+        update_done && ended=1
+        if [[ -n ${helper} && ${ended} == 1 && ${size} == "${last}" ]]; then
             (( stable += 1 ))
             (( stable >= 4 )) && break
         else
             stable=0
         fi
-        if [[ -z ${helper} && ${size} == "${last}" ]]; then
+        if [[ ${ended} == 0 && ${size} == "${last}" ]]; then
             (( idle += 1 ))
         else
             idle=0
@@ -115,7 +124,7 @@ if [[ -z ${helper} ]]; then
         last=${size}
         (( i % 6 == 0 )) && print "  Steam folder: $(( size / 1024 )) MB"
     done
-    if [[ -z ${helper} ]]; then
+    if [[ -z ${helper} ]] || ! update_done; then
         "${wine_root}/bin/wineserver" -k 2>/dev/null || true
         print -u2 "FAIL: Steam did not finish its update in 15 minutes. Run this script again."
         exit 1

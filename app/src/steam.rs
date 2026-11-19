@@ -129,8 +129,10 @@ pub fn install_rosetta() -> Result<(), String> {
     Err(format!("Rosetta did not install: {}", stderr.trim()))
 }
 
+/// Whether Steam of this prefix runs. A Wine process maps its program's file, so the processes that
+/// hold this prefix's steam.exe are its Steam. Another prefix's Steam does not count.
 pub fn running() -> bool {
-    Command::new("pgrep").args(["-if", "steam\\\\steam\\.exe"]).output().is_ok_and(|o| !o.stdout.is_empty())
+    Command::new("lsof").arg("-t").arg(steam_dir().join("steam.exe")).output().is_ok_and(|o| !o.stdout.is_empty())
 }
 
 #[derive(Clone, Debug, PartialEq)]
