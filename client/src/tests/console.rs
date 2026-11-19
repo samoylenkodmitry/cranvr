@@ -26,6 +26,18 @@ fn the_menu_comes_from_the_hosts_json() {
 }
 
 #[test]
+fn the_apps_notice_shows_in_the_menu_and_adds_a_line_to_the_height() {
+    let mut with = Menu::parse(r#"{"games":[],"notice":"The right eye stayed black. The game restarts."}"#).unwrap();
+    assert_eq!(with.notice.as_deref(), Some("The right eye stayed black. The game restarts."));
+    let without = Menu::parse(r#"{"games":[],"notice":""}"#).unwrap();
+    assert_eq!(without.notice, None);
+    assert_eq!(Menu::parse(r#"{"games":[]}"#).unwrap().notice, None);
+    assert!((height(Some(&with)) - height(Some(&without)) - (size::TEXT + size::GAP)).abs() < 1e-3);
+    with.notice = None;
+    assert!((height(Some(&with)) - height(Some(&without))).abs() < 1e-3);
+}
+
+#[test]
 fn requests_are_the_json_that_the_app_reads() {
     let json = |action: Action| serde_json::from_str::<Value>(&action.request()).unwrap();
     assert_eq!(json(Action::Play("Beat Saber".into())), json!({"action": "play", "game": "Beat Saber"}));

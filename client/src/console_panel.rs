@@ -115,6 +115,9 @@ fn MenuRows(menu: Menu, room: Room, volume: Volume) {
         None => "No game runs".to_string(),
     };
     Text(line, Modifier::empty().height(size::TEXT), text_style(22.0, TEXT_COLOR, None));
+    if let Some(notice) = menu.notice.clone() {
+        Text(notice, Modifier::empty().height(size::TEXT), text_style(22.0, WARN_COLOR, None));
+    }
 
     Heading("Play");
     if menu.games.is_empty() {

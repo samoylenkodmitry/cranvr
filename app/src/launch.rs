@@ -12,8 +12,12 @@ pub struct GameOptions {
     /// patch 0003), so the game draws each eye in a pass of its own. A game that renders both eyes
     /// in one pass into a two-slice swapchain shows a black right eye, because DXMT leaves the
     /// second slice empty. SUPERHOT VR needed it and then made about 82 frames a second instead of
-    /// 119.
+    /// 119. The host sees the black right eye (host/src/eye_check.rs) and the app turns the option
+    /// on (black_eye.rs).
     pub eye_per_pass: bool,
+    /// Why `eye_per_pass` is on, when cranvr turned it on (see black_eye.rs). The Options panel
+    /// shows it. A change by the user clears it.
+    pub eye_per_pass_reason: String,
     /// Wine DLL overrides as WINEDLLOVERRIDES takes them, such as "winhttp=n,b" to load a
     /// winhttp.dll from the game's folder before Wine's own
     pub dll_overrides: String,
@@ -25,7 +29,12 @@ pub struct GameOptions {
 
 impl GameOptions {
     pub fn is_default(&self) -> bool {
-        *self == Self::default()
+        // A reason belongs to the option: with the option off it is a leftover
+        let mut plain = self.clone();
+        if !plain.eye_per_pass {
+            plain.eye_per_pass_reason.clear();
+        }
+        plain == Self::default()
     }
 }
 
@@ -87,6 +96,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_reason_without_its_option_leaves_the_options_at_their_defaults() {
+        let reason = GameOptions { eye_per_pass_reason: "because".into(), ..Default::default() };
+        assert!(reason.is_default());
+        assert!(!GameOptions { eye_per_pass: true, ..reason.clone() }.is_default());
+        assert!(!GameOptions { args: "-x".into(), ..reason }.is_default());
+    }
+
+    #[test]
     fn default_options_only_keep_the_mac_window_empty() {
         assert_eq!(environment(&WineOptions::default(), &GameOptions::default()), [("DXMT_SKIP_PRESENT".to_owned(), "1".to_owned())]);
         let wine = WineOptions { mac_window: true, ..Default::default() };
@@ -101,6 +118,7 @@ mod tests {
             dll_overrides: "winhttp=n,b".into(),
             env: "FOO=1  BAR=two =skipped noequals".into(),
             args: "fpfc  --verbose".into(),
+            ..Default::default()
         };
         let vars = environment(&WineOptions { mac_window: true, ..Default::default() }, &game);
         assert_eq!(

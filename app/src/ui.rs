@@ -1,5 +1,6 @@
 use crate::{
     backend::{self, HeadsetApp, Model, Settings, StreamProtocol},
+    black_eye,
     launch::{self, GameOptions},
     steam::{self, SteamState},
     system::{self, Permission},
@@ -152,6 +153,8 @@ fn refresh(settings: MutableState<Settings>, model: MutableState<Model>, slow: b
     backend::pump(&mut next);
     let requests = std::mem::take(&mut next.vr_requests);
     vr_requests(settings, &mut next, requests);
+    let reports = std::mem::take(&mut next.black_eyes);
+    black_eye_reports(settings, &mut next, reports);
     // In Auto mode the stream moves to TCP once, when the host finds that UDP data does not
     // arrive. A problem over TCP stays on screen: switching back would only repeat the first one.
     // The cranvr client picks its media path itself.
@@ -199,9 +202,33 @@ fn refresh(settings: MutableState<Settings>, model: MutableState<Model>, slow: b
             _ => (),
         }
     }
-    backend::write_vr_menu(&settings.with(Clone::clone), &next.games);
+    if next.notice.as_ref().is_some_and(|(_, until)| *until <= Instant::now()) {
+        next.notice = None;
+    }
+    backend::write_vr_menu(&settings.with(Clone::clone), &next.games, next.notice.as_ref().map(|(notice, _)| notice.headset.as_str()));
     if model.with(|m| *m != next) {
         model.set(next);
+    }
+}
+
+/// Answers the host's reports of a black right eye (see black_eye.rs): the program's option "Each
+/// eye in its own pass" turns on once, and the game starts again with it. A report with the option
+/// on already only shows a notice.
+fn black_eye_reports(settings: MutableState<Settings>, next: &mut Model, reports: Vec<serde_json::Value>) {
+    for report in reports {
+        let mut response = None;
+        settings.update(|s| response = Some(black_eye::respond(&mut s.launch, &next.games, report["program"].as_str())));
+        let Some(black_eye::Response { notice, restart }) = response else { continue };
+        next.notice = Some((notice, Instant::now() + black_eye::NOTICE_TIME));
+        if let Some(program) = restart {
+            // The new start reads the saved options
+            settings.with(Settings::save);
+            thread::spawn(move || {
+                if let Err(e) = steam::restart(&program) {
+                    backend::notify(e);
+                }
+            });
+        }
     }
 }
 
@@ -301,6 +328,9 @@ pub fn CranvrApp() {
             HeadsetCard(settings, model);
             if let Some(message) = model.with(|m| m.message.clone()) {
                 Text(message, Modifier::empty(), colored(240, 170, 90));
+            }
+            if let Some((notice, _)) = model.with(|m| m.notice.clone()) {
+                Text(notice.window, Modifier::empty(), colored(240, 170, 90));
             }
             let current = tab.get();
             FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
@@ -679,9 +709,15 @@ fn LaunchOptions(settings: MutableState<Settings>, program: String) {
             FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
                 let key = key.clone();
                 Choice("Each eye in its own pass".into(), options.eye_per_pass, move || {
-                    edit_launch(settings, &key, |o| o.eye_per_pass = !o.eye_per_pass)
+                    edit_launch(settings, &key, |o| {
+                        o.eye_per_pass = !o.eye_per_pass;
+                        o.eye_per_pass_reason.clear();
+                    })
                 });
             });
+            if options.eye_per_pass && !options.eye_per_pass_reason.is_empty() {
+                Hint(options.eye_per_pass_reason.clone());
+            }
             Hint("For a game whose right eye stays black. The runtime then refuses two-eye images, so the game draws each eye apart. This costs frames.".into());
             OptionField("Wine DLL overrides", dll);
             Hint("As WINEDLLOVERRIDES takes them, such as winhttp=n,b to load a winhttp.dll from the game's folder before Wine's own. Beat Saber's mod loader BSIPA ran without it in cranvr's Wine.".into());

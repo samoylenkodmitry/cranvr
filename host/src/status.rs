@@ -19,6 +19,9 @@
 //!   paired (the names of the paired headsets), pairing_s (seconds that a `--pair` window stays
 //!   open, or null) and pending (the headsets that wait for the user: key in hex, name, ip and
 //!   code). The user's answer comes back on the host's input as `allow KEY` or `deny KEY`.
+//! - `black_eye`: eye "right" and program (the game's program path, or null): the game's right
+//!   eye stayed black for several seconds while its left eye showed a picture (see eye_check.rs).
+//!   The host sends it once for each game run.
 //! - `vr_request`: a button of the console in VR (see desktop_layer.rs): action "play" with game,
 //!   "stop", or "set" with one of fps, game_scale, msaa, low_latency
 //!
