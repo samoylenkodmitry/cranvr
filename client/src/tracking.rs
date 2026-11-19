@@ -1124,6 +1124,36 @@ mod tests {
     }
 
     #[test]
+    fn a_face_of_android_xr_reaches_the_host_as_the_70_weights_of_meta() {
+        use cranpose_xr::{FaceBlendShapeType, FaceConfidenceRegion, FaceExpression, FaceState, FaceTrackingProvider};
+        let (link, inbox) = loopback();
+        let mut xr = frame();
+        xr.face = FaceState { tracking_state: cranpose_xr::TrackingState::Tracking, is_valid: true, ..FaceState::default() };
+        xr.face.blend_shapes[FaceBlendShapeType::JawDrop.index()] = 0.5;
+        xr.face.blend_shapes[FaceBlendShapeType::TongueOut.index()] = 1.0;
+        // Android XR has tongue shapes that Meta lacks: they reach no slot
+        xr.face.blend_shapes[FaceBlendShapeType::TongueLeft.index()] = 1.0;
+        xr.face.confidence_regions[FaceConfidenceRegion::Lower.index()] = 0.25;
+        xr.face.confidence_regions[FaceConfidenceRegion::LeftUpper.index()] = 0.5;
+        xr.face.confidence_regions[FaceConfidenceRegion::RightUpper.index()] = 1.0;
+        let mut reader = TrackedReader::default();
+        let tracked = reader.read_face_of(&xr, 10, 20, Features::FACE, Some(FaceTrackingProvider::Android)).clone();
+        assert!(send_tracked(&link, &tracked, Features::FACE, &mut Outgoing::default()));
+        let heard = heard_for_a_moment(&inbox);
+        let sent = datagrams(&heard);
+        let face = sent.iter().find_map(|d| if let ClientDatagram::Face(f) = d { Some(f) } else { None }).expect("a face datagram");
+        assert_eq!((face.sample_time, face.display_time), (10, 20));
+        assert_eq!(face.flags, cranvr_proto::tracking::face::VALID | cranvr_proto::tracking::face::EYES_FOLLOWING_VALID);
+        let weights = face.weights().unwrap();
+        // A weight crosses the wire as a byte: within half a step of 1/255
+        assert!((weights[FaceExpression::JawDrop.index()] - 0.5).abs() < 0.003);
+        assert_eq!(weights[FaceExpression::TongueOut.index()], 1.0);
+        assert_eq!(weights.iter().filter(|w| **w > 0.0).count(), 2, "nothing else is set");
+        let confidences = face.confidences();
+        assert!((confidences[0] - 0.25).abs() < 0.003 && (confidences[1] - 0.75).abs() < 0.003, "{confidences:?}");
+    }
+
+    #[test]
     fn a_frame_with_no_wish_reads_nothing_from_the_tracking() {
         // The reader returns before it copies a joint: the feed keeps no tracked frame
         let feed = Feed::default();

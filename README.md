@@ -261,10 +261,10 @@ A runtime without patch 0005 closes the connection at a message that it does not
 `XR_FB_face_tracking2` lets a game choose the data source of its face: the cameras (visual) or the microphone (audio). A Quest 3 has no camera that sees the mouth, so its face is the audio one. The offer carries the source, and runtime patch 0006 reports it to the game by the rules of the extension:
 
 - `xrGetSystemProperties` sets `supportsVisualFaceTracking` and `supportsAudioFaceTracking` from the offer. A Quest 3 supports audio only. A face of an unknown source reports both. An older headset app offers such a face, and so does a headset that has not yet given a valid sample.
-- `xrCreateFaceTracker2FB` reads `requestedDataSources` as the sources that the game accepts. An empty list accepts any source. A list without a source of the headset's face gets `XR_ERROR_FEATURE_UNSUPPORTED`. A duplicate, a value that is no source and a missing list for a counted one get `XR_ERROR_VALIDATION_FAILURE`. While no headset offers a face, the runtime makes the tracker and reads no face, so that a game survives a reconnect of the headset.
-- `xrGetFaceExpressionWeights2FB` sets `dataSource` from the newest sample, which says its own source. A sample from a source that the game did not accept is no face for that game.
+- `xrCreateFaceTracker2FB` takes `requestedDataSources` by the extension's rules. An empty list accepts any source. A duplicate, a value that is no source and a missing list for a counted one get `XR_ERROR_VALIDATION_FAILURE`. While no headset offers a face, the runtime makes the tracker and reads no face, so that a game survives a reconnect of the headset.
+- `xrGetFaceExpressionWeights2FB` sets `dataSource` from the newest sample, which says its own source.
 
-A game that asks for audio, for both sources or for none therefore reads the face of a Quest 3. A game that asks for the visual source only gets the error at creation, as it does on a Quest 3 itself. The same game reads the face of a headset with cameras.
+The runtime is more lenient than the extension in one case. The extension calls the list the sources that the game accepts. It lets a runtime refuse a list that holds no source of the headset's face with `XR_ERROR_FEATURE_UNSUPPORTED`. This runtime makes the tracker instead and serves the headset's face. A game that lists the cameras only still gets the face of a Quest 3, and `dataSource` tells it that the face comes from the microphone. Every game that creates a face tracker therefore reads the headset's face.
 
 ### Controllers made of hands
 
@@ -293,7 +293,7 @@ CRANVR_HOME=/path/to/a/test/stack scripts/e2e.sh --native-port 9961 --tracking-w
 CRANVR_HOME=/path/to/a/test/stack scripts/e2e.sh --native-port 9961 --tracking-wine --face-source visual
 ```
 
-`--tracking-wine` needs a stack built from the runtime under test (`CRANVR_HOME=... scripts/setup-wine.sh third_party/basaltvr/src`). `tracking_smoke.exe` checks that the runtime lists the extensions, answers the system properties, refuses a joint set that it lacks, returns a skeleton, and gives the 26 hand joints of both hands, 70 and 84 body joints, 70 face weights and the gaze within 0.5 mm and 0.1 degrees of the script. It also checks the joints in the view space and the joints' velocities. For the face it checks the support structure against `--face-source`, the answer of the creation to each list of sources and the `dataSource` of each sample. The run checks that the host asked the headset for tracking only after the game created its trackers and that it asked for none after the game left.
+`--tracking-wine` needs a stack built from the runtime under test (`CRANVR_HOME=... scripts/setup-wine.sh third_party/basaltvr/src`). `tracking_smoke.exe` checks that the runtime lists the extensions, answers the system properties, refuses a joint set that it lacks, returns a skeleton, and gives the 26 hand joints of both hands, 70 and 84 body joints, 70 face weights and the gaze within 0.5 mm and 0.1 degrees of the script. It also checks the joints in the view space and the joints' velocities. For the face it checks the support structure against `--face-source`, the answer of the creation to each list of sources and the `dataSource` of each sample. `--live-face` accepts any weights, so that the program can read the face of a real headset. The run checks that the host asked the headset for tracking only after the game created its trackers and that it asked for none after the game left.
 
 ## Games
 

@@ -233,7 +233,7 @@ impl TrackedReader {
 
     /// `read` for a face of the extension `face`. A test names it, because Cranpose builds its own
     /// capabilities only from a running runtime.
-    fn read_face_of(&mut self, xr: &XrFrame, sample_time: Nanos, display_time: Nanos, wish: Features, face: Option<FaceTrackingProvider>) -> &mut Box<TrackedFrame> {
+    pub(crate) fn read_face_of(&mut self, xr: &XrFrame, sample_time: Nanos, display_time: Nanos, wish: Features, face: Option<FaceTrackingProvider>) -> &mut Box<TrackedFrame> {
         let time = xr.predicted_display_time;
         let frame = &mut *self.scratch;
         frame.sample_time = sample_time;
