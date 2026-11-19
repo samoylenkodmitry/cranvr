@@ -59,7 +59,7 @@ use std::{
     collections::VecDeque,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         mpsc::{self, RecvTimeoutError},
         Arc, Condvar, Mutex,
     },
@@ -122,6 +122,36 @@ struct Shared {
     decoder_config: Mutex<Option<Vec<u8>>>,
     /// Held while a session starts, so two clients that were allowed together cannot both get one
     starting: Mutex<()>,
+    /// The threads that hold a client for the user's answer
+    asking: Asking,
+}
+
+/// The most threads that hold a client for the user's answer at once. A device that opens many
+/// connections and finishes each handshake cannot make the host start threads without end.
+const MAX_ASKING: usize = 4;
+
+/// Counts the threads in [`ask_user`].
+#[derive(Default)]
+struct Asking(Arc<AtomicUsize>);
+
+/// A place among the threads in [`ask_user`]. It frees the place when it goes.
+struct AskingPlace(Arc<AtomicUsize>);
+
+impl Asking {
+    fn enter(&self) -> Option<AskingPlace> {
+        let before = self.0.fetch_add(1, Ordering::AcqRel);
+        if before >= MAX_ASKING {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(AskingPlace(Arc::clone(&self.0)))
+    }
+}
+
+impl Drop for AskingPlace {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl Shared {
@@ -176,7 +206,7 @@ pub fn start(config: Config) -> std::io::Result<(Arc<dyn Headset>, Box<dyn Event
     }
     announce(&config);
     let (events, receiver) = mpsc::channel();
-    let shared = Arc::new(Shared { events, session: Mutex::new(None), decoder_config: Mutex::new(None), starting: Mutex::new(()) });
+    let shared = Arc::new(Shared { events, session: Mutex::new(None), decoder_config: Mutex::new(None), starting: Mutex::new(()), asking: Asking::default() });
     {
         let shared = Arc::clone(&shared);
         let config = Arc::new(config);
@@ -275,7 +305,15 @@ fn accept_loop(listener: HostListener, config: Arc<Config>, shared: Arc<Shared>)
             start_session(&config, &shared, pending, &name);
         } else if pending.version >= APPROVAL_VERSION {
             let (config, shared) = (Arc::clone(&config), Arc::clone(&shared));
-            let spawned = thread::Builder::new().name("native-approval".into()).spawn(move || ask_user(&config, &shared, pending, &name));
+            let Some(place) = shared.asking.enter() else {
+                warn!("Native protocol: {name} at {} was refused: too many headsets wait for the user", pending.peer);
+                pending.reject(RejectReason::Busy);
+                continue;
+            };
+            let spawned = thread::Builder::new().name("native-approval".into()).spawn(move || {
+                let _place = place;
+                ask_user(&config, &shared, pending, &name)
+            });
             if let Err(e) = spawned {
                 warn!("Native protocol: no thread for an approval: {e}");
             }

@@ -728,3 +728,14 @@ fn the_host_answers_a_search_with_its_name_its_port_and_its_key() {
     let client = ClientLink::connect(host.socket_addr(), &caps("Found it"), &identity(), None, Duration::from_secs(10));
     assert!(client.is_ok(), "{:?}", client.err());
 }
+
+#[test]
+fn only_a_few_threads_hold_clients_for_the_user_at_once() {
+    let asking = Asking::default();
+    let places: Vec<_> = (0..MAX_ASKING).map(|_| asking.enter().expect("a free place")).collect();
+    assert!(asking.enter().is_none(), "the next one waits for no one");
+    assert!(asking.enter().is_none());
+    // A place that ends frees itself, whatever ended the thread
+    drop(places);
+    assert!(asking.enter().is_some());
+}
