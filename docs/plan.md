@@ -14,7 +14,7 @@ cranvr's host and the Cranpose client speak one protocol (`proto/`). Both ends a
 
 Ordered by expected gain. The numbers are estimates unless the text says that they were measured.
 
-1. **Get past the encoder limit.** Measured: with VideoToolbox's low-latency rate control the M5 HEVC encoder needed about 2 ms per megapixel and took one frame at a time. Without it, and with two frames in flight, a foveated Quest 3 frame (2432 x 1152, 2.8 megapixels) takes 3.5 ms and the encoder keeps up with about 230 frames a second. Quest 3 shows about 9 megapixels per frame at native resolution.
+1. **Get past the encoder limit.** Measured: with VideoToolbox's low-latency rate control the M5 HEVC encoder needed about 2 ms per megapixel and took one frame at a time. Without it and with two frames in flight, a foveated Quest 3 frame (2432 x 1152, 2.8 megapixels) takes 3.5 ms and the encoder keeps up with about 230 frames a second. Quest 3 shows about 9 megapixels per frame at native resolution.
    - Foveated encoding (done): full density in the center, less at the edges. It cuts the encoded pixels to about a third.
    - Super resolution on the Quest: encode at a lower size, then upscale with Snapdragon Game Super Resolution in one GPU pass. Virtual Desktop ships this.
    - Together these fit Quest 3 sharpness into the encoder's limit at 120 Hz.

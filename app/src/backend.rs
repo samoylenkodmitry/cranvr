@@ -503,7 +503,7 @@ fn vr_menu(settings: &Settings, games: &[crate::steam::Game], notice: Option<&st
 pub fn stop_host() {
     HOST_INPUT.lock().unwrap().take();
     if let Some(mut child) = HOST.lock().unwrap().take() {
-        // SIGTERM first, so the host can end its sessions
+        // SIGTERM first. The host has no handler, so it ends at once. A host that is still there after 1.5 s is killed.
         Command::new("kill").args(["-TERM", &child.id().to_string()]).status().ok();
         for _ in 0..30 {
             if child.try_wait().ok().flatten().is_some() {

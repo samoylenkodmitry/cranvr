@@ -16,8 +16,11 @@
 #                 scripts/run-game.sh: a Windows path such as 'C:\basalt\runtime\d3d11_runtime_smoke.exe'.
 #                 The probe then counts every frame of the right size, since the program draws no
 #                 eye badges. --wine-arg passes one argument to the program.
-#   --desktop     the host shows this Mac's screen. The probe then counts every frame of the right
-#                 size, since the desktop scene draws no eye badges. --host-arg --virtual-display
+#   --desktop     the host shows this Mac's screen. The probe asks for the desktop stream, plays a
+#                 pointer script (the host only logs its mouse events: CRANVR_POINTER_DRY_RUN) and
+#                 counts the Mac's sound. It counts every frame of the right size, since the
+#                 desktop scene draws no eye badges. The run fails when the probe gets the sound
+#                 for less than 80 percent of the stream time. --host-arg --virtual-display
 #                 --host-arg 1920x1080 shows a virtual display instead of the main one.
 #   --quest       the client is cranvr's Cranpose client (dev.cranvr.client2, see
 #                 scripts/build-client.sh) on a Quest attached by USB. The Quest and the Mac must
@@ -42,8 +45,8 @@
 # The options --native and --cranvr-client are accepted and change nothing: cranvr's protocol and
 # client are the only ones.
 #
-# Take /tmp/quest-device.lock around a Quest run. The script exits with 0 when the median fps
-# reached 90 percent of the target and the client saw the right picture. It exits with 1 otherwise.
+# The script exits with 0 when the median fps reached 90 percent of the target and the client saw
+# the right picture. It exits with 1 otherwise.
 
 set -euo pipefail
 
@@ -110,7 +113,11 @@ case ${client} in
         host_args+=(--trust-all)
         ;;
 esac
-(( desktop )) && host_args+=(--desktop)
+if (( desktop )); then
+    host_args+=(--desktop)
+    # The probe's pointer script then moves no real mouse
+    [[ ${client} == mac ]] && export CRANVR_POINTER_DRY_RUN=1
+fi
 host_args+=("${more_host_args[@]}")
 
 pids=()
@@ -236,6 +243,8 @@ probe_args=(--seconds "${seconds}" --connect "127.0.0.1:${native_port}" --drop-p
 if [[ -n ${wine} ]] || (( desktop )); then
     probe_args+=(--any-picture)
 fi
+# The probe asks for the desktop stream, plays a pointer script and counts the Mac's sound
+(( desktop )) && probe_args+=(--desktop)
 client_exit=0
 case ${client} in
     mac)
@@ -288,8 +297,8 @@ if [[ ${done_line} =~ '([0-9]+) received, [0-9]+ decoded \(([0-9]+) good' ]]; th
 fi
 # The seconds of the Mac's sound that reached the probe. The capture sends silence too, so
 # the sound arrives without a sound playing.
-audio_line=$(grep -h "probe: game audio" "${work}/probe.log" 2>/dev/null || true)
-if [[ ${audio_line} =~ '([0-9.]+) s of stereo' ]] && (( ! ${host_args[(Ie)--no-game-audio]} )); then
+audio_line=$(grep -h "probe: audio:" "${work}/probe.log" 2>/dev/null || true)
+if [[ ${audio_line} =~ '([0-9.]+) s of sound in' ]] && (( ! ${host_args[(Ie)--no-game-audio]} )); then
     extra+=(audio_seconds=${match[1]})
 fi
 if [[ ${client} == quest ]]; then
@@ -300,6 +309,6 @@ result=0
 python3 -I "${root}/scripts/e2e-report.py" "${work}/host.out" "${fps}" "${report}" "${extra[@]}" || result=$?
 (( client_exit == 0 )) || result=1
 (( game_exit == 0 )) || result=1
-grep -hE "probe: (done|frame arrival|native|game audio)" "${work}/probe.log" 2>/dev/null || true
+grep -hE "probe: (done|frame arrival|native|desktop|audio)" "${work}/probe.log" 2>/dev/null || true
 print "Report: ${report}"
 exit ${result}

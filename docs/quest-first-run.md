@@ -27,7 +27,7 @@ This list covers a first run with cranvr's Cranpose client on a Quest.
 
 ## The USB cable
 
-A headset that sits on a USB cable at the Mac connects over the cable without a typed address. The cable gives the stream TCP and a steady link, and it needs no Wi-Fi. This is how it goes:
+A headset that sits on a USB cable at the Mac connects over the cable without a typed address. The cable gives the stream TCP and a steady link. It needs no Wi-Fi. This is how it goes:
 
 1. Developer mode must be on for the headset (see "On the Quest"). Plug the headset into the Mac. The headset asks to allow USB debugging: allow it. Until then the Headset card in the Mac window says "Put on the headset and allow USB debugging."
 2. The Mac looks for the adb tool of Android (the PATH, Android Studio's SDK, Homebrew's android-platform-tools). A Mac with none shows the button "Add USB support" in the Settings tab, under Connection. The button downloads Google's Android platform-tools for macOS (about 16 MB) from dl.google.com into cranvr's folder. A Mac that has a headset on the cable but no cranvr app on it does nothing: the Mac counts a device only when `dev.cranvr.client2` is installed on it.
@@ -42,7 +42,7 @@ An adb tool stops a running adb server of another version. The downloaded copy o
 
 The address entry stays for a Mac on another network, which the search does not reach. Without the Mac's setup, `adb reverse tcp:9950 tcp:9950` and the address `127.0.0.1:9950` still work. The client keeps the last address that you pressed or typed. A start with the extras `--es host ADDRESS --ez connect true` connects to a Mac without a press (`adb shell am start ...`). The extra `--ei usb_port PORT` moves the port that the headset asks on the cable, for a test host on another port.
 
-The Mac and the headset update apart. When the two apps speak different protocol versions, both say which one to update: "Update cranvr on the Mac." or "Update the cranvr app on the headset." A Mac with a cranvr older than the headset's does not appear in the list, because it does not answer the search. Press "Enter an address" and type its address to see the advice. A Mac with an older cranvr that never paired a headset listens on its own address only. The headset then says that the Mac refused the connection, and the text names the update of cranvr on the Mac as a cause. A headset that has paired with the Mac keeps connecting while both apps speak a common version. A headset with the older app that the Mac does not know cannot ask: the Mac shows a note that tells you to update the cranvr app on the headset.
+The Mac and the headset update apart. When the two apps speak different protocol versions, both say which one to update: "Update cranvr on the Mac." or "Update the cranvr app on the headset." A Mac with a cranvr older than the headset's does not appear in the list, because it does not answer the search. Press "Enter an address" and type its address to see the advice. A Mac with an older cranvr that never paired a headset listens on its own address only. The headset then says that the Mac refused the connection. The text names the update of cranvr on the Mac as a cause. A headset that has paired with the Mac keeps connecting while both apps speak a common version. A headset with the older app that the Mac does not know cannot ask: the Mac shows a note that tells you to update the cranvr app on the headset.
 
 ## Work from the headset
 
@@ -81,5 +81,6 @@ The headset shows the Mac's main display in a panel as a second video stream at 
 - The controller as a mouse on the virtual display in a real headset.
 - The search and the connect panel on a Quest with a router that drops broadcasts. The address field is the way around it.
 - A pulled USB cable. `adb reconnect` stands in for it in tests.
-- A headset that waits for you to allow USB debugging, and the first start of an adb server by the downloaded adb.
+- A headset that waits for you to allow USB debugging.
+- The first start of an adb server by the downloaded adb.
 - The click on Allow in the cranvr window by a user. The host's side of the answer is tested with a line on the host's input.
