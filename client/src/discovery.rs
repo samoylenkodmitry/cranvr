@@ -104,9 +104,21 @@ fn run(hub: &'static Hub) {
     }
 }
 
-/// The hosts for the panel, the paired ones first, then by name
+/// The hosts for the panel, the paired ones first, then by name. A host on this machine answers
+/// the query to the machine and the broadcast: the entry with the network address stays, as the
+/// one that a headset could use.
 fn list(seen: &[(FoundHost, Instant)]) -> Vec<FoundHost> {
-    let mut hosts: Vec<FoundHost> = seen.iter().map(|(host, _)| host.clone()).collect();
+    let mut hosts: Vec<FoundHost> = seen
+        .iter()
+        .map(|(host, _)| host)
+        .filter(|host| {
+            !host.address.ip().is_loopback()
+                || !seen.iter().any(|(other, _)| {
+                    !other.address.ip().is_loopback() && other.address.port() == host.address.port() && other.fingerprint == host.fingerprint
+                })
+        })
+        .cloned()
+        .collect();
     hosts.sort_by(|a, b| b.paired.cmp(&a.paired).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())).then(a.address.cmp(&b.address)));
     hosts
 }
@@ -133,6 +145,19 @@ mod tests {
         let new = VersionRange { min: ours.max + 1, max: ours.max + 2 };
         assert_eq!(host("Mac", 9950, false, old).update_advice(), Some("Update cranvr on the Mac."));
         assert_eq!(host("Mac", 9950, false, new).update_advice(), Some("Update the cranvr app on the headset."));
+    }
+
+    #[test]
+    fn a_host_on_this_machine_is_listed_once_by_its_network_address() {
+        let now = Instant::now();
+        let mut local = host("Mac", 9950, false, VersionRange::OURS);
+        local.address = ([127, 0, 0, 1], 9950).into();
+        let network = host("Mac", 9950, false, VersionRange::OURS);
+        // A host that answered on loopback only stays, and so does another host of the same Mac on another port
+        let mut only_local = host("Other", 9962, false, VersionRange::OURS);
+        only_local.address = ([127, 0, 0, 1], 9962).into();
+        let seen = vec![(local, now), (network.clone(), now), (only_local.clone(), now)];
+        assert_eq!(list(&seen), [network, only_local]);
     }
 
     #[test]
