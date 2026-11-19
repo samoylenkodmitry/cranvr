@@ -77,12 +77,18 @@ fi
 
 # 2. First start: Steam updates itself, then gets stopped. The update is done when the web
 # helper exists and Steam's folder stops growing. Steam waits about 40 seconds before it starts
-# to download.
+# to download. A first start can also sit idle for good: its log stops after "Verification
+# complete", or at "Downloading manifest" with no request, and the folder stays at a few MB. A
+# second start asks for its update at once. So a start with no growth for two minutes is stopped
+# and started again.
+start_steam() {
+    (cd "${steam_dir}" && "${wine_root}/bin/wine" ./steam.exe -noverifyfiles -no-cef-sandbox >/dev/null 2>&1 &)
+}
 helper=$(find_helper)
 if [[ -z ${helper} ]]; then
     print "Starting Steam once to download its current client"
-    (cd "${steam_dir}" && "${wine_root}/bin/wine" ./steam.exe -noverifyfiles -no-cef-sandbox >/dev/null 2>&1 &)
-    last="" stable=0
+    start_steam
+    last="" stable=0 idle=0 restarts=0
     for i in {1..180}; do
         sleep 5
         size=$(du -sk "${steam_dir}" 2>/dev/null | cut -f1)
@@ -92,6 +98,19 @@ if [[ -z ${helper} ]]; then
             (( stable >= 4 )) && break
         else
             stable=0
+        fi
+        if [[ -z ${helper} && ${size} == "${last}" ]]; then
+            (( idle += 1 ))
+        else
+            idle=0
+        fi
+        if (( idle >= 24 && restarts < 5 )); then
+            print "Steam did not start its download. Starting it again"
+            "${wine_root}/bin/wineserver" -k 2>/dev/null || true
+            sleep 3
+            start_steam
+            (( restarts += 1 ))
+            idle=0
         fi
         last=${size}
         (( i % 6 == 0 )) && print "  Steam folder: $(( size / 1024 )) MB"
