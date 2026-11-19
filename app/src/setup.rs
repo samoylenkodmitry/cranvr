@@ -4,7 +4,7 @@
 //! Retry runs the setup again: steps that are done no longer show up in the plan.
 
 use crate::{backend, steam, steam::SteamState};
-use std::{sync::Mutex, thread};
+use std::{sync::Mutex, thread, time::Duration};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
@@ -145,10 +145,25 @@ fn run() {
     }
     // The user only signs in now: the Steam window opens for it
     if current().is_some_and(|setup| setup.steps.iter().any(|(step, _)| *step == Step::Steam)) {
+        open_steam();
+    }
+}
+
+/// Opens Steam for the first login. Its first start after the setup crashed at the login window
+/// in a test, and the second start worked. So Steam starts again when it is gone after half a
+/// minute.
+fn open_steam() {
+    for _ in 0..2 {
         if let Err(e) = steam::start() {
             backend::notify(e);
+            return;
+        }
+        thread::sleep(Duration::from_secs(30));
+        if steam::running() {
+            return;
         }
     }
+    backend::notify("Steam closed right after it started. Press Open Steam to try again.".into());
 }
 
 fn run_step(step: Step, index: usize) -> Result<(), String> {
