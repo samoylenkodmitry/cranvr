@@ -39,8 +39,22 @@ android {
         applicationId = if (phone) "dev.cranvr.client2.phone" else "dev.cranvr.client2"
         minSdk = 24
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        // A store takes an upload only with a higher version code than the last one
+        versionCode = providers.gradleProperty("cranvrVersionCode").map { it.toInt() }.orElse(1).get()
+        versionName = providers.gradleProperty("cranvrVersionName").orElse("0.1.0").get()
+    }
+
+    // A store build signs with the app's own upload key: CRANVR_KEYSTORE names the keystore file,
+    // CRANVR_KEYSTORE_PASSWORD and CRANVR_KEY_ALIAS open it (the key's password is the store's).
+    // Without them the debug key signs, so later test builds install over earlier ones.
+    val keystore = providers.environmentVariable("CRANVR_KEYSTORE").orNull
+    if (keystore != null) {
+        signingConfigs.create("store") {
+            storeFile = file(keystore)
+            storePassword = providers.environmentVariable("CRANVR_KEYSTORE_PASSWORD").get()
+            keyAlias = providers.environmentVariable("CRANVR_KEY_ALIAS").get()
+            keyPassword = storePassword
+        }
     }
 
     buildTypes {
@@ -50,8 +64,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            // The debug key signs the APK, so later builds install over earlier ones
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName(if (keystore != null) "store" else "debug")
         }
     }
 
