@@ -11,7 +11,7 @@ This list covers a first run with cranvr's Cranpose client on a Quest. The clien
 ## On the Mac
 
 1. Open `/Applications/cranvr.app`. The host starts by itself.
-2. In the Settings tab, under "Headset app", pick "cranvr client". The app then starts the host with `--protocol native`. The Headset card shows this Mac's address with the port, such as `192.168.1.20:9950`.
+2. In the Settings tab, under "Headset app", pick "cranvr client". The app then starts the host with `--protocol native`. The Headset card says "Open cranvr on the headset. It finds this Mac." Below it, a line shows this Mac's address with the port, such as `192.168.1.20:9950`. You need the address only when the headset finds nothing.
 3. macOS asks for Screen Recording and Accessibility when cranvr starts. Until both are allowed, a card at the top of the window shows an "Allow" button for each. The game sound needs Screen Recording. Accessibility is only for the controller as a mouse in the desktop view.
 4. In the Play tab, press "Open Steam" and sign in. Steam may ask for a Steam Guard code.
 5. Install Beat Saber in the Steam window. Start the download early.
@@ -19,13 +19,15 @@ This list covers a first run with cranvr's Cranpose client on a Quest. The clien
 
 ## Connect
 
-1. In the headset, open the app library and pick "cranvr client" under Unknown Sources. macOS may ask whether cranvr may use the local network: allow it. Without it the host sees no headset.
-2. The connect panel shows a code of six digits. Type the Mac's address from the Headset card into the panel with its keypad.
-3. On the Mac, type the six digits into the field "Code from the headset" of the Headset card and press "Pair". Pairing stays open for 10 minutes or until one headset pairs.
-4. Press "Connect" in the headset. The panel shows the state of the link. A later connection needs no code.
+1. In the headset, open the app library and pick "cranvr client" under Unknown Sources. macOS may ask whether cranvr may use the local network: allow it. Without it the host sees no headset and answers no search.
+2. The connect panel lists the Macs that run cranvr on the same network, each as a button. Press your Mac. The list needs a few seconds. It shows the name that the Mac has in System Settings, such as "Dmitry's MacBook Pro".
+3. A headset that the Mac does not know yet shows a code of six digits and "Allow it on the Mac". The cranvr window on the Mac comes to the front with a card: "Meta Quest 3 wants to connect. It shows the code 482 913." Compare the code in the card with the code in the headset. Press Allow only if the two codes are the same. A different code means that another device sits between the headset and the Mac. Press Deny then. The headset connects at once after Allow. The Mac waits three minutes for your answer.
+4. A later connection needs no answer. Press the Mac again. The panel shows the state of the link.
 5. The Headset card should read "at 120 Hz". If it reads another rate, pick 120 Hz in the Settings tab. Below it, a line shows the frame rate and the time from motion to display. The stats panel in the headset shows the same numbers.
 
-A Quest that is not on the Mac's network connects over USB. Run `adb reverse tcp:9950 tcp:9950`, then type `127.0.0.1:9950` as the address. This path needs no code.
+A Quest that is not on the Mac's network connects over USB. Run `adb reverse tcp:9950 tcp:9950`, press "Enter an address" in the panel and type `127.0.0.1:9950`. The same button serves a Mac on another network, which the search does not reach. A connection over USB needs no code. The client keeps the last address that you pressed or typed. A start with the extras `--es host ADDRESS --ez connect true` connects to a Mac without a press (`adb shell am start ...`).
+
+The Mac and the headset update apart. When the two apps speak different protocol versions, both say which one to update: "Update cranvr on the Mac." or "Update the cranvr app on the headset." A Mac with a cranvr older than the headset's does not appear in the list, because it does not answer the search. Press "Enter an address" and type its address to see the advice. A headset that has paired with the Mac keeps connecting while both apps speak a common version. A headset with the older app that the Mac does not know cannot ask: the Mac shows a note that tells you to update the cranvr app on the headset.
 
 ## Work from the headset
 
@@ -44,7 +46,8 @@ The headset shows the Mac's main display in a panel as a second video stream at 
 
 ## When something goes wrong
 
-- The panel in the headset says that the host does not know the headset: do the pairing steps again. The pairing window closes after 10 minutes, after one pairing and after five wrong codes.
+- The panel in the headset shows a code and "Allow it on the Mac": look at the cranvr window on the Mac and press Allow. The headset says "Nobody answered on the Mac" after three minutes. Press the Mac again to ask once more. It says "The Mac denied this headset" after a Deny.
+- The list in the headset stays empty: check that the Mac and the headset use the same Wi-Fi. A router with client isolation blocks the search. Check that cranvr may use the local network in System Settings, under Privacy & Security. Check that the host runs: the cranvr window says "Host running". Use "Enter an address" as the way around.
 - The panel in the headset says that the host does not have the key that the headset paired with. This happens after a new install of the host. Press "Forget host key" in the connect panel, then connect again.
 - The headset does not connect: check the Wi-Fi. Check that cranvr may use the local network in System Settings, under Privacy & Security. Then read the Log tab. A notice in orange names network problems.
 - No sound in the headset: the headset card says why. Check Screen Recording in the Desktop tab. If it reads "not allowed" while System Settings shows cranvr as allowed, remove cranvr from that list, allow it again, then quit and reopen cranvr. The host tries the capture once per start: turn "Game sound in the headset" off and on in Settings to try again.

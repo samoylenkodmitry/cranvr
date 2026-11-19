@@ -1157,4 +1157,105 @@ mod tests {
         assert!(failure_text(&Error::Timeout, host).contains("Is cranvr open on the Mac?"));
         assert!(failure_text(&Error::HostKeyChanged, host).contains("Forget host key"));
     }
+
+    /// The whole way of a new headset to a Mac, against a real host process on this machine: the
+    /// search finds the host, a press connects, the headset waits with a code, the host's user
+    /// allows it and frames arrive. The window is not a headset, so nothing decodes, but the frames
+    /// reach the client whole. It needs a built host (`CRANVR_HOST_BIN`, else `target/debug`) and an
+    /// address of this Mac on a network, because the host asks about no client on loopback.
+    ///
+    /// `cargo test --manifest-path client/Cargo.toml -- --ignored finds_a_host`
+    #[test]
+    #[ignore = "starts a host process on port 9962"]
+    fn a_new_headset_finds_a_host_process_waits_for_the_user_and_gets_frames() {
+        use crate::hub::hub;
+        use cranvr_proto::discovery::{broadcast_targets, find, DEFAULT_PORT};
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+
+        const PORT: u16 = 9962;
+        cranpose::set_platform_preferences(Arc::new(cranpose::MemoryPreferences::default()));
+        let host_bin = std::env::var_os("CRANVR_HOST_BIN")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/debug/cranvr-host"));
+        let dir = std::env::temp_dir().join(format!("cranvr-find-mac-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut host = Command::new(&host_bin)
+            .args(["--protocol", "native", "--native-port", &PORT.to_string(), "--status", "--fps", "60", "--no-game-audio", "--config-dir"])
+            .arg(&dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("cannot start {}: {e}", host_bin.display()));
+        let (lines, status) = mpsc::channel();
+        let stdout = host.stdout.take().unwrap();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some(json) = line.strip_prefix("@cranvr ").and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok()) {
+                    lines.send(json).ok();
+                }
+            }
+        });
+        let cleanup_dir = dir.clone();
+        let finish = |host: &mut std::process::Child| {
+            hub().disconnect();
+            host.kill().ok();
+            host.wait().ok();
+            std::fs::remove_dir_all(&cleanup_dir).ok();
+        };
+
+        // The search: the Mac answers on its LAN address. A query to this machine would give loopback.
+        let found = (0..5)
+            .find_map(|_| {
+                find(broadcast_targets(DEFAULT_PORT), Duration::from_secs(1))
+                    .unwrap()
+                    .into_iter()
+                    .find(|host| host.answer.port == PORT && !host.address.is_loopback())
+            })
+            .expect("a host on port 9962 answers the search from a network address of this Mac");
+        assert!(!found.answer.name.is_empty());
+        assert_eq!(found.answer.versions, cranvr_proto::message::VersionRange::OURS);
+
+        // The press
+        hub().connect(found.socket_addr().to_string(), Some(found.answer.fingerprint), MediaChoice::Auto);
+        let wait_for = |what: &str, done: &mut dyn FnMut() -> bool| {
+            for _ in 0..400 {
+                if done() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            panic!("{what} did not happen: {:?}", hub().snapshot().state);
+        };
+        let mut shown = String::new();
+        wait_for("the wait for the Mac", &mut || match hub().snapshot().state {
+            LinkState::Waiting { code, .. } => {
+                shown = code;
+                true
+            }
+            _ => false,
+        });
+        // The host lists the same code with the headset's key
+        let request = loop {
+            let line = status.recv_timeout(Duration::from_secs(10)).expect("a status line");
+            if let Some(request) = line["pending"].as_array().and_then(|list| list.first()).cloned() {
+                break request;
+            }
+        };
+        assert_eq!(request["code"].as_str(), Some(shown.as_str()), "the host and the headset show one code");
+        assert_eq!(request["key"].as_str().map(str::len), Some(64));
+
+        // The user presses Allow
+        let key = request["key"].as_str().unwrap().to_owned();
+        writeln!(host.stdin.as_mut().unwrap(), "allow {key}").unwrap();
+        wait_for("the stream", &mut || hub().snapshot().state == LinkState::Streaming);
+        let mut best = 0.0f32;
+        wait_for("frames", &mut || {
+            best = best.max(hub().snapshot().stats.received_fps);
+            best > 10.0
+        });
+        println!("frames received: {best:.1} a second");
+        finish(&mut host);
+    }
 }
