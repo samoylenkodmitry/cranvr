@@ -822,3 +822,40 @@ fn tracking_goes_from_the_headset_to_the_events_only_when_the_host_asked() {
     client.duplex.send_control(&ClientMsg::Bye).unwrap();
     wait_for(&mut *events, |e| matches!(e, Event::TrackingOffer(offer) if offer.is_empty()));
 }
+
+#[test]
+fn a_value_that_the_runtime_would_refuse_never_reaches_it() {
+    use cranvr_proto::tracking::{Body, BodySet, Eyes, Hand, Hands, Joint, BODY_JOINTS, HAND_JOINTS};
+    let good = Motion { pose: ProtoPose { orientation: [0.0, 0.0, 0.0, 1.0], position: [0.1, 1.0, -0.4] }, ..Default::default() };
+    let zero_turn = Motion { pose: ProtoPose { orientation: [0.0; 4], ..good.pose }, ..good };
+    let not_a_number = Motion { linear_velocity: [f32::NAN, 0.0, 0.0], ..good };
+    let far = Motion { pose: ProtoPose { position: [f32::INFINITY, 0.0, 0.0], ..good.pose }, ..good };
+    let hand = |root: Motion| Hand::new(root, &[Joint::tracked(good.pose); HAND_JOINTS]);
+
+    // A hand with a zero quaternion at its wrist, as a tracker reports one that it lost, is untracked
+    let Some(Tracked::Hands(hands)) =
+        sanitized(Tracked::Hands(Hands { sample_time: 1, display_time: 2, left: Some(hand(zero_turn)), right: Some(hand(good)) }))
+    else {
+        panic!("hands stay")
+    };
+    assert!(hands.left.is_none() && hands.right.is_some());
+    for bad in [not_a_number, far] {
+        let Some(Tracked::Hands(hands)) = sanitized(Tracked::Hands(Hands { sample_time: 1, display_time: 2, left: Some(hand(bad)), right: None })) else {
+            panic!("hands stay")
+        };
+        assert!(hands.left.is_none());
+    }
+    // A body with an unsound root goes. A confidence that is not a number becomes 0 and a large one 1.
+    let joints = vec![Joint::tracked(good.pose); BODY_JOINTS];
+    assert!(sanitized(Tracked::Body(Body::new(1, 2, BodySet::Default, 1.0, zero_turn, &joints).unwrap())).is_none());
+    for (given, kept) in [(f32::NAN, 0.0), (7.0, 1.0), (0.5, 0.5)] {
+        let Some(Tracked::Body(body)) = sanitized(Tracked::Body(Body::new(1, 2, BodySet::Default, given, good, &joints).unwrap())) else { panic!("body stays") };
+        assert_eq!(body.confidence, kept);
+    }
+    // A gaze that is not a pose is no gaze
+    let nan_gaze = ProtoPose { position: [f32::NAN, 0.0, 0.0], ..good.pose };
+    let Some(Tracked::Eyes(eyes)) = sanitized(Tracked::Eyes(Eyes { sample_time: 1, display_time: 2, gaze: Some(nan_gaze) })) else { panic!("eyes stay") };
+    assert!(eyes.gaze.is_none());
+    let Some(Tracked::Eyes(eyes)) = sanitized(Tracked::Eyes(Eyes { sample_time: 1, display_time: 2, gaze: Some(good.pose) })) else { panic!("eyes stay") };
+    assert_eq!(eyes.gaze, Some(good.pose));
+}

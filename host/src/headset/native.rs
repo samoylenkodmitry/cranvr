@@ -568,8 +568,10 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
                 _ => return,
             };
             if session.wished(&tracked) {
-                raise_to_host_room(&mut tracked, session.floor.lock().unwrap().unwrap_or(0.0));
-                shared.emit(Event::Tracked(tracked));
+                if let Some(mut tracked) = sanitized(tracked) {
+                    raise_to_host_room(&mut tracked, session.floor.lock().unwrap().unwrap_or(0.0));
+                    shared.emit(Event::Tracked(tracked));
+                }
             }
         }
         Incoming::Control(ClientMsg::TrackingOffer(offer)) => {
@@ -710,6 +712,48 @@ fn describe(features: Features) -> String {
     } else {
         features.names().join(", ")
     }
+}
+
+/// Whether a pose is one that the game's runtime takes: finite numbers and a quaternion that is
+/// near a unit one. The runtime closes the link to the host at a value that is not, so a zero
+/// quaternion from a tracker that lost a hand would end the game's session.
+fn sound_pose(pose: &ProtoPose) -> bool {
+    let norm: f32 = pose.orientation.iter().map(|c| c * c).sum::<f32>().sqrt();
+    pose.orientation.iter().chain(&pose.position).all(|c| c.is_finite()) && (0.5..=1.5).contains(&norm)
+}
+
+fn sound_motion(motion: &Motion) -> bool {
+    sound_pose(&motion.pose) && motion.linear_velocity.iter().chain(&motion.angular_velocity).all(|c| c.is_finite())
+}
+
+/// The data of a tracking datagram without what the runtime would refuse. A hand with an unsound
+/// root counts as untracked, and so does a gaze. A body with one is dropped. `None` drops the
+/// datagram.
+fn sanitized(tracked: Tracked) -> Option<Tracked> {
+    Some(match tracked {
+        Tracked::Hands(mut hands) => {
+            for hand in [&mut hands.left, &mut hands.right] {
+                if hand.as_ref().is_some_and(|hand| !sound_motion(&hand.root)) {
+                    *hand = None;
+                }
+            }
+            Tracked::Hands(hands)
+        }
+        Tracked::Body(mut body) => {
+            if !sound_motion(&body.root) {
+                return None;
+            }
+            body.confidence = if body.confidence.is_finite() { body.confidence.clamp(0.0, 1.0) } else { 0.0 };
+            Tracked::Body(body)
+        }
+        Tracked::Eyes(mut eyes) => {
+            if eyes.gaze.as_ref().is_some_and(|gaze| !sound_pose(gaze)) {
+                eyes.gaze = None;
+            }
+            Tracked::Eyes(eyes)
+        }
+        face @ Tracked::Face(_) => face,
+    })
 }
 
 /// The datagram's data with its poses in the host's room: the floor goes to height 0, as for the head
