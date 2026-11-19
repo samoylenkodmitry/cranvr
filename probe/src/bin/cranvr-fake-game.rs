@@ -303,8 +303,8 @@ impl Tracked {
                 if !same_turn_within(got[..4].try_into().unwrap(), root.pose.orientation, 1e-6) || !near(got[4..7].try_into().unwrap(), want) {
                     out.push(format!("hand {side}: wrist at {:?} turned {:?}, expected {want:?}", &got[4..7], &got[..4]));
                 }
-                if got[7..13].iter().any(|v| *v != 0.0) {
-                    out.push(format!("hand {side}: velocities {:?}, expected none", &got[7..13]));
+                if got[7..10] != tracked::HAND_VELOCITY[side] || got[10..13].iter().any(|v| *v != 0.0) {
+                    out.push(format!("hand {side}: velocities {:?}, expected {:?} and no turn", &got[7..13], tracked::HAND_VELOCITY[side]));
                 }
                 joints_match(&p[16 + 52..], &joints, &format!("hand {side}"), &mut out);
             }

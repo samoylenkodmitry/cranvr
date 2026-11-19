@@ -1,8 +1,8 @@
 //! The hands, body, face and eyes that the probe's tracking script plays (`cranvr-probe --tracking`)
 //! and that `cranvr-fake-game` and the Windows test program `tracking_smoke.exe` look for at the
 //! game. The three take their numbers from here and from the formulas in the comments, so the script
-//! and the checks cannot drift apart. All of it stands still: the check compares values, and a
-//! moving hand would make the compared time matter.
+//! and the checks cannot drift apart. All of it stands still. Only the right wrist has a velocity,
+//! with no motion of its own, to test that the runtime moves a hand forward by it.
 //!
 //! The poses are in the probe's room. The host lifts each by the height of the probe's floor, and
 //! the game's runtime puts the room's origin under the head. The probe's head stands still while it
@@ -10,7 +10,8 @@
 //! lifted by the floor.
 //!
 //! The formulas, with `i` the joint's index:
-//! - a hand's wrist lies at [`HAND_AT`] for its side and turns about y by [`HAND_YAW`] degrees. Joint
+//! - a hand's wrist lies at [`HAND_AT`] for its side and turns about y by [`HAND_YAW`] degrees. It has
+//!   the velocity [`HAND_VELOCITY`]. Joint
 //!   `i` lies at (0.005 i, -0.003 i, -0.006 i) from the wrist, in the wrist's frame (x is negated
 //!   for the left hand), and turns about x by 2 i degrees relative to the wrist.
 //! - the body's root lies at [`BODY_AT`] and turns about y by [`BODY_YAW`] degrees. Joint `i` lies at
@@ -26,6 +27,11 @@ use glam::{Quat, Vec3};
 
 /// Where each hand's wrist lies, left then right
 pub const HAND_AT: [[f32; 3]; 2] = [[-0.20, 1.20, -0.40], [0.25, 1.10, -0.40]];
+/// How fast each wrist moves in m/s, left then right. The positions stand still: the velocity tells a
+/// game and the runtime where the hand goes, and the runtime moves the right hand forward by it for
+/// the time from the sample's arrival to the game's locate time, at most 50 ms. The test program
+/// checks that shift against the bound.
+pub const HAND_VELOCITY: [[f32; 3]; 2] = [[0.0; 3], [0.2, 0.0, 0.0]];
 /// The turn of each hand's wrist about y in degrees
 pub const HAND_YAW: [f32; 2] = [20.0, -15.0];
 pub const BODY_AT: [f32; 3] = [0.10, 0.0, -0.50];
@@ -46,7 +52,8 @@ fn compose(root: &Pose, relative: &Pose) -> Pose {
 pub fn hand_joints(side: usize) -> (Motion, [Joint; HAND_JOINTS]) {
     let root = Motion {
         pose: pose(Quat::from_rotation_y(HAND_YAW[side].to_radians()), Vec3::from_array(HAND_AT[side])),
-        ..Default::default()
+        linear_velocity: HAND_VELOCITY[side],
+        angular_velocity: [0.0; 3],
     };
     let mirror = if side == 0 { -1.0 } else { 1.0 };
     let joints = std::array::from_fn(|i| {

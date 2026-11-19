@@ -2137,10 +2137,10 @@ index ac6e0ec..7e0738a 100644
  target_link_options(frame_timer_probe PRIVATE -static -static-libgcc -static-libstdc++)
 diff --git a/runtime/tests/tracking_smoke.cpp b/runtime/tests/tracking_smoke.cpp
 new file mode 100644
-index 0000000..ba51da9
+index 0000000..aefd6c7
 --- /dev/null
 +++ b/runtime/tests/tracking_smoke.cpp
-@@ -0,0 +1,716 @@
+@@ -0,0 +1,753 @@
 +// cranvr: reads hands, body, face and eyes through the OpenXR extensions that the runtime offers for
 +// a headset's tracking, and compares them with the script of cranvr-probe's `--tracking` mode
 +// (probe/src/tracked.rs, whose formulas are repeated here). The probe's head stands still, so the
@@ -2696,18 +2696,30 @@ index 0000000..ba51da9
 +            if (result.isActive != XR_TRUE) {
 +                continue;
 +            }
++            // The right wrist moves at 0.2 m/s along +x in the script. The runtime moves the hand
++            // forward from the sample's arrival to this time, up to 50 ms: 0 to 10 mm, the same for
++            // every joint. The left hand stands still and must not move.
++            const Pose zeroJoint = handJoint(side, 0);
++            const float shift = locations[0].pose.position.x - zeroJoint.p.x;
++            const float maxShift = side == 1 ? 0.2f * 0.05f + 5e-4f : 5e-4f;
++            const bool shiftOk = shift >= -5e-4f && shift <= maxShift &&
++                                 std::fabs(locations[0].pose.position.y - zeroJoint.p.y) < 5e-4f &&
++                                 std::fabs(locations[0].pose.position.z - zeroJoint.p.z) < 5e-4f;
 +            float worstPosition = 0.0f;
 +            float worstAngle = 0.0f;
 +            bool flagsOk = true;
 +            bool radiiOk = true;
 +            for (int joint = 0; joint < XR_HAND_JOINT_COUNT_EXT; ++joint) {
-+                const Pose expected = handJoint(side, joint);
++                Pose expected = handJoint(side, joint);
++                expected.p.x += shift;
 +                worstPosition = std::max(worstPosition, distance(expected.p, locations[joint].pose.position));
 +                worstAngle = std::max(worstAngle, angleBetween(expected.q, locations[joint].pose.orientation));
 +                flagsOk = flagsOk && (locations[joint].locationFlags & kAllFlags) == kAllFlags;
 +                radiiOk = radiiOk && locations[joint].radius > 0.0f;
 +            }
-+            handsOk[side] = worstPosition < 5e-4f && worstAngle < 2e-3f && flagsOk && radiiOk;
++            handsOk[side] = worstPosition < 5e-4f && worstAngle < 2e-3f && flagsOk && radiiOk && shiftOk;
++            report(shiftOk, "%s hand moved forward by %.2f mm for its velocity (at most %.1f mm)", side == 0 ? "left" : "right",
++                   shift * 1000.0f, maxShift * 1000.0f);
 +            const XrPosef& first = locations[XR_HAND_JOINT_PALM_EXT].pose;
 +            report(handsOk[side],
 +                   "%s hand: 26 joints within %.3f mm and %.3f degrees of the script, flags %s, radii %s; joint 0 at (%.4f %.4f %.4f) "
@@ -2715,13 +2727,38 @@ index 0000000..ba51da9
 +                   side == 0 ? "left" : "right", worstPosition * 1000.0f, worstAngle * 57.29578f, flagsOk ? "valid" : "WRONG",
 +                   radiiOk ? "set" : "MISSING", first.position.x, first.position.y, first.position.z,
 +                   first.orientation.x, first.orientation.y, first.orientation.z, first.orientation.w);
-+            if (side == 0) {
-+                // The script stands still: the joints' velocities are valid and zero
++            {
++                // The joints' velocities are the wrist's: 0.2 m/s along +x for the right hand, none for the left
++                const float wanted = side == 1 ? 0.2f : 0.0f;
 +                velocitiesOk = (velocities[0].velocityFlags &
 +                                (XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT)) ==
 +                                   (XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) &&
-+                               std::fabs(velocities[0].linearVelocity.x) < 1e-4f;
-+                report(velocitiesOk, "hand joint velocities are valid and zero for a hand that stands still");
++                               std::fabs(velocities[0].linearVelocity.x - wanted) < 1e-3f &&
++                               std::fabs(velocities[0].linearVelocity.y) < 1e-3f &&
++                               std::fabs(velocities[0].angularVelocity.y) < 1e-3f;
++                report(velocitiesOk, "%s hand joint velocities are valid and %.1f m/s along x (got %.3f)",
++                       side == 0 ? "left" : "right", wanted, velocities[0].linearVelocity.x);
++            }
++            if (side == 1) {
++                // The shift grows with the time that the game asks for, to the limit of 50 ms, which is
++                // 10 mm at 0.2 m/s: 30 ms later gives at least 6 mm, 500 ms later gives the limit
++                XrHandJointLocationEXT later[XR_HAND_JOINT_COUNT_EXT]{};
++                XrHandJointLocationsEXT laterResult = make<XrHandJointLocationsEXT>(XR_TYPE_HAND_JOINT_LOCATIONS_EXT);
++                laterResult.jointCount = XR_HAND_JOINT_COUNT_EXT;
++                laterResult.jointLocations = later;
++                float shifts[2] = {-1.0f, -1.0f};
++                const XrTime offsets[2] = {30'000'000, 500'000'000};
++                for (int step = 0; step < 2; ++step) {
++                    info.time = time + offsets[step];
++                    if (XR_SUCCEEDED(locateHand(hands[side], &info, &laterResult)) && laterResult.isActive == XR_TRUE) {
++                        shifts[step] = later[0].pose.position.x - zeroJoint.p.x;
++                    }
++                }
++                info.time = time;
++                report(shifts[0] >= 0.0059f && shifts[0] <= 0.0105f && shifts[1] >= 0.0097f && shifts[1] <= 0.0103f &&
++                           shifts[0] < shifts[1],
++                       "the right hand moves forward by %.2f mm for 30 ms and %.2f mm for 500 ms, which stops at 50 ms (10 mm)",
++                       shifts[0] * 1000.0f, shifts[1] * 1000.0f);
 +            }
 +            // The base space matters: the same joints in the view space differ by the head's pose
 +            XrHandJointLocationEXT inView[XR_HAND_JOINT_COUNT_EXT]{};
