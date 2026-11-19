@@ -478,7 +478,7 @@ The smoke program draws a green marker at the left controller and a pale grid. A
 
 Steam runs in the prefix with BasaltVR's web helper shim (`scripts/setup-steam.sh`). On 16 November 2026 the user started Beat Saber from the console and played a song on Expert in a worn headset. The game made 109 to 120 frames a second at the 60% render size with 2x anti-aliasing. From the pose to the display took 48 to 55 ms. The user found the picture not very sharp. Beat Saber is the only game installed in cranvr's Steam so far. The steps:
 
-1. In the window's "Play" tab, press "Open Steam". Log in. Install the game.
+1. In the window's "Play" tab, press "Open Steam" (after "Set up games" it has opened Steam already). Log in. Install the game.
 2. The tab lists the installed games. Press "Play" next to one: the window starts it by its .exe with the host's environment.
 3. Without the window, start Steam with `scripts/run-game.sh --steam`. While Steam runs, start the game by its .exe:
 
@@ -486,7 +486,7 @@ Steam runs in the prefix with BasaltVR's web helper shim (`scripts/setup-steam.s
    scripts/run-game.sh 'C:\Program Files (x86)\Steam\steamapps\common\Beat Saber\Beat Saber.exe'
    ```
 
-A rebuild of BasaltVR gives the web helper shim new bytes. The app then reports that Steam needs its setup step, and "Install Steam" runs `setup-steam.sh` again. The script puts only Valve's own helper into the backup that the shim starts; an older shim just gets replaced. Before 16 November 2026 it copied the old shim over the backup of Valve's helper.
+A rebuild of BasaltVR gives the web helper shim new bytes. The app then reports that Steam needs its setup step, and "Set up games" runs `setup-steam.sh` again. The script puts only Valve's own helper into the backup that the shim starts; an older shim just gets replaced. Before 16 November 2026 it copied the old shim over the backup of Valve's helper.
 
 Do not use `steam.exe -applaunch`: a game that Steam starts gets Steam's environment, not the one with the runtime's control file. For a game under `steamapps\common` the script and the window find the Steam app ID in Steam's `appmanifest` files. They set `SteamAppId`, which the game's Steam check needs.
 

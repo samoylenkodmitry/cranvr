@@ -57,8 +57,10 @@ pub struct Setup {
 }
 
 impl Setup {
+    /// A step works or waits for its turn. A failed step ends the run, so the steps after it
+    /// wait for the next run.
     pub fn running(&self) -> bool {
-        self.steps.iter().any(|(_, progress)| matches!(progress, Progress::Waiting | Progress::Working(_)))
+        !self.failed() && self.steps.iter().any(|(_, progress)| matches!(progress, Progress::Waiting | Progress::Working(_)))
     }
 
     pub fn failed(&self) -> bool {
@@ -238,6 +240,10 @@ mod tests {
         assert!(setup.running());
         setup.steps[1].1 = Progress::Failed("no network".into());
         assert!(!setup.running() && setup.failed());
+        // The step after a failure waits for the next run
+        setup.steps.push((Step::Steam, Progress::Waiting));
+        assert!(!setup.running() && setup.failed());
+        setup.steps.pop();
         setup.steps[1].1 = Progress::Done;
         assert!(!setup.running() && !setup.failed());
     }
