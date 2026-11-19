@@ -10,6 +10,7 @@ mod compositor;
 mod hands;
 mod native;
 mod native_desktop;
+mod tracked;
 
 use cranvr_common::foveation::{view_to_frame, Foveation};
 use std::{env, net::ToSocketAddrs};
@@ -39,6 +40,10 @@ fn usage() -> ! {
          \n  --drop-percent P   drop this share of the media packets, to test the parity\
          \n  --desktop          ask for the Mac's desktop as a second stream, play a pointer script\
          \n                     and count the sound (start the host with --desktop and CRANVR_POINTER_DRY_RUN=1)\
+         \n  --tracking         offer hands, body, face and eyes, and send the script of tracked.rs for\
+         \n                     each feature that the host asks for. The head stands still.\
+         \n  --no-controllers   with --tracking: no controller is tracked, so a game without hand code\
+         \n                     gets controllers made of the hands\
          \n  --protocol native  accepted and ignored: cranvr's protocol is the only one"
     );
     std::process::exit(2);
@@ -53,6 +58,8 @@ fn main() {
         tcp: false,
         drop_percent: 0.0,
         desktop: false,
+        tracking: false,
+        no_controllers: false,
     };
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -69,6 +76,8 @@ fn main() {
             "--connect" => options.connect = value().to_socket_addrs().ok().and_then(|mut a| a.next()).unwrap_or_else(|| usage()),
             "--tcp" => options.tcp = true,
             "--desktop" => options.desktop = true,
+            "--tracking" => options.tracking = true,
+            "--no-controllers" => options.no_controllers = true,
             "--drop-percent" => options.drop_percent = value().parse().unwrap_or_else(|_| usage()),
             _ => usage(),
         }

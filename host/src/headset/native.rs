@@ -42,6 +42,7 @@ use cranvr_proto::{
         LossReport, Ping, Pong, RejectReason, Tracking, VersionRange, Views as ProtoViews, UPDATE_HEADSET, UPDATE_MAC,
     },
     motion::extrapolate,
+    tracking::{Features, Tracked, TRACKING_VERSION},
     wire::{Codec, Error as ProtoError, Motion, Nanos, Pose as ProtoPose, Rect},
     APPROVAL_VERSION,
 };
@@ -115,6 +116,8 @@ struct Shared {
     starting: Mutex<()>,
     /// The threads that hold a client for the user's answer
     asking: Asking,
+    /// The tracking features that a game uses now. A new session gets them at once.
+    wish: Mutex<Features>,
 }
 
 /// The most threads that hold a client for the user's answer at once. A device that opens many
@@ -197,7 +200,7 @@ pub fn start(config: Config) -> std::io::Result<(Arc<dyn Headset>, Box<dyn Event
     }
     announce(&config);
     let (events, receiver) = mpsc::channel();
-    let shared = Arc::new(Shared { events, session: Mutex::new(None), decoder_config: Mutex::new(None), starting: Mutex::new(()), asking: Asking::default() });
+    let shared = Arc::new(Shared { events, session: Mutex::new(None), decoder_config: Mutex::new(None), starting: Mutex::new(()), asking: Asking::default(), wish: Mutex::new(Features::NONE) });
     {
         let shared = Arc::clone(&shared);
         let config = Arc::new(config);
@@ -501,6 +504,7 @@ fn run_session(shared: &Shared, session: &Arc<Session>, stream: cranvr_proto::me
     }
     audio::detach(session);
     *shared.session.lock().unwrap() = None;
+    shared.emit(Event::TrackingOffer(Features::NONE));
     shared.emit(Event::Disconnected);
 }
 
@@ -552,6 +556,31 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
         }
         Incoming::Datagram(ClientDatagram::Pong(p)) => {
             session.clock.lock().unwrap().add(p.ping_sent, p.received, p.sent, now);
+        }
+        Incoming::Datagram(
+            data @ (ClientDatagram::Hands(_) | ClientDatagram::Body(_) | ClientDatagram::Face(_) | ClientDatagram::Eyes(_)),
+        ) => {
+            let tracked = match data {
+                ClientDatagram::Hands(h) => Tracked::Hands(h),
+                ClientDatagram::Body(b) => Tracked::Body(b),
+                ClientDatagram::Face(f) => Tracked::Face(f),
+                ClientDatagram::Eyes(e) => Tracked::Eyes(e),
+                _ => return,
+            };
+            if session.wished(&tracked) {
+                if let Some(mut tracked) = sanitized(tracked) {
+                    raise_to_host_room(&mut tracked, session.floor.lock().unwrap().unwrap_or(0.0));
+                    shared.emit(Event::Tracked(tracked));
+                }
+            }
+        }
+        Incoming::Control(ClientMsg::TrackingOffer(offer)) => {
+            let offer = offer.known();
+            *session.offered.lock().unwrap() = offer;
+            info!("Native protocol: the headset offers {}", describe(offer));
+            shared.emit(Event::TrackingOffer(offer));
+            // A game may have asked before the offer came
+            session.apply_wish(*shared.wish.lock().unwrap());
         }
         Incoming::Datagram(ClientDatagram::Hello { .. }) | Incoming::Media(_) => {}
         Incoming::Control(ClientMsg::RequestKeyFrame { stream, .. }) if stream == cranvr_proto::message::DESKTOP_STREAM => {
@@ -655,6 +684,95 @@ fn device_motion(motion: Motion, floor: f32) -> DeviceMotion {
         },
         linear_velocity: Vec3::from_array(motion.linear_velocity),
         angular_velocity: Vec3::from_array(motion.angular_velocity),
+    }
+}
+
+/// The wish that goes to a client, or `None` when nothing goes. A client of an older protocol version
+/// knows no such message. The wish stays within what the client offers. The host asks again only
+/// when the answer changes, and the first ask for nothing is no ask.
+fn wish_to_send(version: u16, wish: Features, offered: Features, asked: Option<Features>) -> Option<Features> {
+    if version < TRACKING_VERSION {
+        return None;
+    }
+    // The first 70 joints of the full body are the default set: a headset that offers the full body
+    // serves a game that asks for the default one
+    let wish = if wish.contains(Features::BODY) && !offered.contains(Features::BODY) && offered.contains(Features::FULL_BODY) {
+        wish.union(Features::FULL_BODY)
+    } else {
+        wish
+    };
+    let effective = wish.known().intersect(offered);
+    (asked != Some(effective) && !(asked.is_none() && effective.is_empty())).then_some(effective)
+}
+
+/// The names of a set of tracking features, for the log
+fn describe(features: Features) -> String {
+    if features.is_empty() {
+        "no tracking".to_string()
+    } else {
+        features.names().join(", ")
+    }
+}
+
+/// Whether a pose is one that the game's runtime takes: finite numbers and a quaternion that is
+/// near a unit one. The runtime closes the link to the host at a value that is not, so a zero
+/// quaternion from a tracker that lost a hand would end the game's session.
+fn sound_pose(pose: &ProtoPose) -> bool {
+    let norm: f32 = pose.orientation.iter().map(|c| c * c).sum::<f32>().sqrt();
+    pose.orientation.iter().chain(&pose.position).all(|c| c.is_finite()) && (0.5..=1.5).contains(&norm)
+}
+
+fn sound_motion(motion: &Motion) -> bool {
+    sound_pose(&motion.pose) && motion.linear_velocity.iter().chain(&motion.angular_velocity).all(|c| c.is_finite())
+}
+
+/// The data of a tracking datagram without what the runtime would refuse. A hand with an unsound
+/// root counts as untracked, and so does a gaze. A body with one is dropped. `None` drops the
+/// datagram.
+fn sanitized(tracked: Tracked) -> Option<Tracked> {
+    Some(match tracked {
+        Tracked::Hands(mut hands) => {
+            for hand in [&mut hands.left, &mut hands.right] {
+                if hand.as_ref().is_some_and(|hand| !sound_motion(&hand.root)) {
+                    *hand = None;
+                }
+            }
+            Tracked::Hands(hands)
+        }
+        Tracked::Body(mut body) => {
+            if !sound_motion(&body.root) {
+                return None;
+            }
+            body.confidence = if body.confidence.is_finite() { body.confidence.clamp(0.0, 1.0) } else { 0.0 };
+            Tracked::Body(body)
+        }
+        Tracked::Eyes(mut eyes) => {
+            if eyes.gaze.as_ref().is_some_and(|gaze| !sound_pose(gaze)) {
+                eyes.gaze = None;
+            }
+            Tracked::Eyes(eyes)
+        }
+        face @ Tracked::Face(_) => face,
+    })
+}
+
+/// The datagram's data with its poses in the host's room: the floor goes to height 0, as for the head
+/// and the controllers (see `device_motion`).
+fn raise_to_host_room(tracked: &mut Tracked, floor: f32) {
+    let lower = |position: &mut [f32; 3]| position[1] -= floor;
+    match tracked {
+        Tracked::Hands(hands) => {
+            for hand in [&mut hands.left, &mut hands.right].into_iter().flatten() {
+                lower(&mut hand.root.pose.position);
+            }
+        }
+        Tracked::Body(body) => lower(&mut body.root.pose.position),
+        Tracked::Eyes(eyes) => {
+            if let Some(gaze) = &mut eyes.gaze {
+                lower(&mut gaze.position);
+            }
+        }
+        Tracked::Face(_) => {}
     }
 }
 
@@ -848,6 +966,12 @@ struct Session {
     lock_on: bool,
     /// The height of the headset's floor in its room, once the client says it
     floor: Mutex<Option<f32>>,
+    /// The protocol version of the session
+    version: u16,
+    /// The tracking features that the headset offered: none until it says so
+    offered: Mutex<Features>,
+    /// The tracking features that the host asked the headset for last. `None` before the first ask.
+    asked: Mutex<Option<Features>>,
     /// The desktop panel's stream and pointer. It starts after the session exists, because its
     /// threads share the session.
     desktop: std::sync::OnceLock<desktop::Desktop>,
@@ -859,6 +983,7 @@ struct Session {
 
 impl Session {
     fn new(link: HostLink, stream: &cranvr_proto::message::StreamParams, lock_on: bool) -> Self {
+        let version = link.version;
         let period = (1e9 / stream.refresh_hz.max(1.0) as f64) as Nanos;
         let udp = link.duplex.has_udp();
         Self {
@@ -873,6 +998,9 @@ impl Session {
             lock: Mutex::new(DisplayLock::new(period)),
             lock_on,
             floor: Mutex::new(None),
+            version,
+            offered: Mutex::new(Features::NONE),
+            asked: Mutex::new(None),
             desktop: std::sync::OnceLock::new(),
             next_frame: AtomicU32::new(0),
             heard: Mutex::new(Instant::now()),
@@ -892,6 +1020,30 @@ impl Session {
         let message = HostMsg::DecoderConfig { stream: 0, codec: Codec::Hevc, config };
         if let Err(e) = self.link.duplex.send_control(&message) {
             warn!("Native protocol: the decoder config did not go out: {e}");
+        }
+    }
+
+    /// Asks the headset for the tracking features that a game uses, within what it offers. A client
+    /// of an older protocol version knows no such message, so it hears nothing. The host asks again
+    /// when the set changes, and sends nothing when the answer stays the same.
+    fn apply_wish(&self, wish: Features) {
+        let offered = *self.offered.lock().unwrap();
+        let mut asked = self.asked.lock().unwrap();
+        let Some(effective) = wish_to_send(self.version, wish, offered, *asked) else { return };
+        *asked = Some(effective);
+        match self.link.duplex.send_control(&HostMsg::TrackingWish(effective)) {
+            Ok(()) => info!("Native protocol: the headset is asked for {}", describe(effective)),
+            Err(e) => warn!("Native protocol: the tracking wish did not go out: {e}"),
+        }
+    }
+
+    /// Whether the host asked the headset for the feature that `tracked` belongs to. A datagram of a
+    /// feature that was not asked for is dropped.
+    fn wished(&self, tracked: &Tracked) -> bool {
+        let asked = self.asked.lock().unwrap().unwrap_or(Features::NONE);
+        match tracked {
+            Tracked::Body(_) => !asked.intersect(Features::BODY.union(Features::FULL_BODY)).is_empty(),
+            other => asked.contains(other.feature()),
         }
     }
 
@@ -1142,6 +1294,13 @@ impl Headset for Native {
                 amplitude: haptic.amplitude,
             };
             session.link.duplex.send_datagram(&HostDatagram::Haptics(message)).ok();
+        }
+    }
+
+    fn set_tracking_wish(&self, wish: Features) {
+        *self.shared.wish.lock().unwrap() = wish;
+        if let Some(session) = self.shared.session() {
+            session.apply_wish(wish);
         }
     }
 

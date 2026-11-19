@@ -5,7 +5,8 @@
 //!
 //! The app uses Cranpose's public API and plain Rust crates. The protocol is `cranvr-proto`.
 //! `connection.rs` runs the link on its own threads. `hub.rs` hands the results to the UI.
-//! `tracking.rs` turns the headset's frames into the tracking that the host takes.
+//! `tracking.rs` turns the headset's frames into the tracking that the host takes. `tracked.rs` does
+//! the same for the user's hands, body, face and eyes.
 
 // The app has no unsafe code. The Android entry points that `android_main!` expands to carry
 // their own expectation of this lint.
@@ -23,6 +24,7 @@ mod phone;
 mod place;
 mod settings;
 mod sizing;
+mod tracked;
 mod tracking;
 mod ui;
 mod usb;

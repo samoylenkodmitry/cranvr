@@ -97,6 +97,7 @@ The client's modules: `connection.rs` runs the link on its own threads. `hub.rs`
 - A recenter of the headset goes to the host as a `Recenter` message. The host then puts its desktop screen in front of the user again.
 - The floor goes to the host as a `Floor` message. It comes from the stage that the runtime gives. The poses are in the app's room (OpenXR's LOCAL space), whose origin lies where the head was when the app started. The host moves the room up by the height of the floor before it gives the poses to its test scene or to a game, so the floor lies at height 0 there.
 - The host's haptic pulses play on the controllers through Cranpose's `Haptics`.
+- Hands, body, face and eyes (`tracked.rs`): the Quest build asks Cranpose for the four kinds of tracking in `build.rs` (`Use::hand_tracking()` and its siblings). An OpenXR instance fixes its extensions before the app runs, so the declaration cannot wait for a game. It writes the permissions to the manifest, and Cranpose asks the user for them before the OpenXR instance exists. The headset offers a kind to the host (`ClientMsg::TrackingOffer`) only while its tracker runs, which is after the user allowed it. A Quest 3 has no eye cameras, so it never offers the eyes. Its face comes from the microphone: the data source is audio, and the runtime marks it so a game can tell. A face from Android XR's own extension has the 68 weights of Jetpack XR and is not offered. The client sends a feature only while the host wishes it (`HostMsg::TrackingWish`): one datagram per headset frame, from a buffer that it allocated once. Cranpose gives no velocities for joints, so the client estimates the velocity of each wrist and of the body's root from the poses of two frames, as it does for the head.
 
 ### The eye size and the decoder
 
@@ -175,7 +176,7 @@ A short code alone would not hold: the machine in the middle could try a million
 
 ### Versions
 
-The protocol is at version 5. The crate still speaks version 4, so a headset and a Mac that updated apart and are paired keep working. The approval needs version 5 on both sides. A headset with the older app that the host does not know cannot wait: the host refuses it with `NotPaired` and the older `--pair CODE` window still pairs it. The host then tells the user in a `network` status line to update the app on the headset. A new headset that meets an older host that does not know it hears `NotPaired` as well and says "Update cranvr on the Mac." A host and a client whose ranges do not meet say which side is older: the older side updates. The discovery answer carries the host's range, so the connect panel shows the advice on the Mac's entry before a press. An older host does not answer the search at all.
+The protocol is at version 6. The crate still speaks version 4, so a headset and a Mac that updated apart and are paired keep working. The approval needs version 5 on both sides. Version 6 adds the tracking of hands, body, face and eyes ("Hands, body, face and eyes in games"). Its messages are new variants at the end of the message enums, so a peer of version 4 or 5 skips them. A headset with the older app that the host does not know cannot wait: the host refuses it with `NotPaired` and the older `--pair CODE` window still pairs it. The host then tells the user in a `network` status line to update the app on the headset. A new headset that meets an older host that does not know it hears `NotPaired` as well and says "Update cranvr on the Mac." A host and a client whose ranges do not meet say which side is older: the older side updates. The discovery answer carries the host's range, so the connect panel shows the advice on the Mac's entry before a press. An older host does not answer the search at all.
 
 ## The USB cable
 
@@ -250,6 +251,54 @@ Each controller has two poses. The grip pose is the place of the hand that holds
 A runtime without patch 0004 closes the connection at a message that it does not know. The patched runtime therefore writes `runtime-features.txt` next to the control file when its session starts. The host sends the new message only to a runtime that wrote the file. An older runtime gets the grip pose alone. The host then logs a warning. The runtime's control protocol keeps its version 9.
 
 The host's stats line shows what reached the game in each 5 seconds: `Game input: 601 left and 601 right controller poses (tracked mask 0b11), 21 button and axis values, 2 haptic pulses from the game`. `scripts/e2e.sh --game` runs a fake game (`cranvr-fake-game`) that checks the input of the probe's script: both hands tracked, each hand with the grip pose and the aim pose that the probe scripted (`probe/src/hands.rs`), the right hand moving, a pull of the right trigger, a press of A, the right stick and the left grip. The fake game reads the runtime's control messages. It does not call `xrLocateSpace`, so this run checks the way from the probe through the host to the runtime's control channel.
+
+## Hands, body, face and eyes in games
+
+A Windows VR game under cranvr's Wine stack gets the user's hands, body, face and eyes through the OpenXR extensions that a PC headset offers. The runtime lists an extension only while the connected headset offers its feature:
+
+| Feature | Extensions | Data |
+| --- | --- | --- |
+| hands | `XR_EXT_hand_tracking` | 26 joints for each hand, with the joints' velocities |
+| body | `XR_FB_body_tracking` | 70 joints, the default set, with a T-pose skeleton |
+| full body | `XR_META_body_tracking_full_body` | 84 joints with the legs |
+| face | `XR_FB_face_tracking2` | 70 blend shape weights and two confidences |
+| eyes | `XR_EXT_eye_gaze_interaction` | a gaze pose on `/user/eyes_ext/input/gaze_ext/pose` |
+
+The way from the headset to the game:
+
+1. After its welcome, a client of protocol version 6 sends `ClientMsg::TrackingOffer` with the features that its headset has and its user allowed. The host writes them as words to `tracking-features.txt` next to the runtime's control file (`hands body full_body face eyes`) and removes the file when the headset leaves. A game lists its instance extensions before its session exists, so the runtime reads the file at that moment. A game that starts before the headset connects sees no tracking extension.
+2. The patched runtime (patch 0005) tells the host which features its game uses (`TRACKING_REQUEST`, message 19): a hand tracker, a body tracker or a face tracker, or an eye gaze action that the game attached. The host asks the headset for exactly these (`HostMsg::TrackingWish`) and asks again when the set changes. A feature that no game uses costs no traffic.
+3. For each headset frame the client sends one datagram for each wished feature (`Hands`, `Body`, `Face`, `Eyes`, in `proto/src/tracking.rs`). Each carries the sample time and display time of the frame's `Tracking` message. Joints travel as poses relative to a root pose with full precision and a velocity. The relative part is quantized: a position to 0.1 mm and an orientation to its three smaller components in 16 bits, so the error stays below 0.1 mm and 0.005 degrees. The largest datagram, the 84 joint body, takes 1197 of the 1400 bytes of a packet. A face weight takes one byte.
+4. The host lowers the poses by the headset's floor, as for the head and the controllers, and sends them to the runtime (messages 20 to 23, documented in `basalt_control_protocol.h`). The runtime sends the joints in the base space that the game names. A hand and a body move forward by their velocity for the time from the sample's arrival to the game's locate time, at most 50 ms. The runtime has no map from the headset's clock to the game's `XrTime`, so the arrival time stands in for the sample's time. The headset has already predicted the sample to its own display time.
+
+A runtime without patch 0005 closes the connection at a message that it does not know. The patched runtime therefore writes the word `tracking` to `runtime-features.txt`, and the host sends messages 20 to 23 only to a runtime that wrote it. Without the word the host still makes controllers from hands. An older host never writes `tracking-features.txt`, so a patched runtime then lists no tracking extension. A host or a client of protocol version 5 or older skips the new messages and takes no harm.
+
+### Controllers made of hands
+
+A game without hand code binds the Oculus Touch controller profile and knows nothing of hands. While the headset tracks a hand and no controller of that hand, the host makes the controller from the hand (`host/src/hand_controller.rs`):
+
+- The grip pose is the palm's pose. The aim pose starts between the thumb tip and the index tip and points from an estimated shoulder through that point, with no roll.
+- Pinching thumb and index finger pulls the trigger: the value runs from 0 at 60 mm between the tips to 1 at 18 mm, and the runtime reads a trigger from 0.5 as a click. Closing middle, ring and little finger presses the squeeze button.
+- The host does this with the existing controller messages, so it works with a runtime of any version.
+- A game that creates a hand tracker has hand code of its own and gets no controller made of a hand. The host also waits for 3 seconds after the game connected before it makes any, because a game with hand code creates its tracker soon after it starts. Neither follows the game's name. `--no-hand-controllers` turns the controllers off.
+- While no controller is tracked for 0.3 s, the host asks the headset for hands. It stops asking when both controllers have been back for 3 s.
+
+`XR_EXT_hand_interaction` is not offered. A game that binds only its interaction profile finds no input. The grip and aim poses of the Touch profile cover a game that has no hand code.
+
+### Tests
+
+`cargo test` covers the messages (`proto/tests/tracking.rs`: quantization, packet sizes, what an older peer decodes), the host's link to the runtime (`host/src/tests/tracking.rs`) and the conversion of hands to controllers (`host/src/hand_controller.rs`). Three runs of `scripts/e2e.sh` cover the whole way. They use the probe's script of `probe/src/tracked.rs`, in which the head, the hands, the body and the face stand still:
+
+```bash
+# The fake game asks for the features. It checks every joint, weight and the gaze against the script.
+scripts/e2e.sh --native-port 9961 --tracking
+# A game without hand code: the probe tracks hands and no controller.
+scripts/e2e.sh --native-port 9961 --hand-controllers
+# The real runtime: tracking_smoke.exe reads everything through OpenXR in Wine.
+CRANVR_HOME=/path/to/a/test/stack scripts/e2e.sh --native-port 9961 --tracking-wine
+```
+
+`--tracking-wine` needs a stack built from the runtime under test (`CRANVR_HOME=... scripts/setup-wine.sh third_party/basaltvr/src`). `tracking_smoke.exe` checks that the runtime lists the extensions, answers the system properties, refuses a joint set that it lacks, returns a skeleton, and gives the 26 hand joints of both hands, 70 and 84 body joints, 70 face weights and the gaze within 0.5 mm and 0.1 degrees of the script. It also checks the joints in the view space and the joints' velocities. The run checks that the host asked the headset for tracking only after the game created its trackers and that it asked for none after the game left.
 
 ## Games
 
@@ -392,6 +441,7 @@ Use pairing for real use. `--trust-all` accepts any client on the network and is
 
 ## Not tested yet
 
+- Hands, body, face and eyes from a worn headset. The tests run with the probe's script and the client's own tests. A real hand in view, a real face and the permission prompts of a user who answers them have not been tried.
 - The cranvr client in a worn headset: the controllers in a game, the carry of the desktop panel by a ray, a recenter and the cable from a Quest.
 - Beat Saber during a song. The game's frame rate and latency were measured on its first screen with the headset on a desk.
 - A game that hides the desktop together with a recenter.

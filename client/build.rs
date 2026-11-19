@@ -1,13 +1,18 @@
 // Tells the Cranpose Android build which services and permissions the app declares. The Quest's
-// app needs none beyond the `xr` and `network` services that the Gradle module lists. The phone's
-// app reads the device's rotation from its motion sensors. That asks the person for nothing. The
-// declaration brings the sensor's Java class and the permission for fast sampling.
+// app needs the `xr` and `network` services that the Gradle module lists. Its build also asks for
+// the four kinds of tracking, because the host's games may read the user's hands, body, face and
+// eyes (`src/tracked.rs`): an OpenXR instance fixes its extensions before the app runs, so the
+// declaration cannot wait for a game. The declaration writes the permissions of each kind to the
+// manifest. Cranpose asks the user for them before the OpenXR instance exists, and the headset
+// offers a kind to the host only after the user allowed it. The phone's app reads the device's
+// rotation from its motion sensors. That asks the person for nothing. The declaration brings the
+// sensor's Java class and the permission for fast sampling.
 use cranpose_capabilities::{declare, Use};
 
 fn main() {
     if std::env::var_os("CARGO_FEATURE_PHONE").is_some() {
         declare(&[Use::device_motion()]).emit();
     } else {
-        declare(&[]).emit();
+        declare(&[Use::hand_tracking(), Use::body_tracking(), Use::face_tracking(), Use::eye_tracking()]).emit();
     }
 }

@@ -1008,6 +1008,13 @@ fn SettingsTab(settings: MutableState<Settings>, model: MutableState<Model>) {
             });
         });
         Hint("A display in a scaled mode, such as 3008 x 1692 on a 4K TV, makes macOS draw every change at 6016 x 3384 pixels. While a game runs, cranvr gives such a display its panel's own pixels with at least as much room, so windows stay where they are. The mode comes back when the game ends. In a test the Mac's desktop then took about a third of the GPU time.".into());
+        let hand_controllers = s1.hand_controllers;
+        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+            Choice("Controllers from your hands".into(), hand_controllers, move || {
+                change(settings, model, |s| s.hand_controllers = !s.hand_controllers)
+            });
+        });
+        Hint("A game that has no hand tracking gets controllers made of your hands, while the headset tracks no controller. A pinch of thumb and index finger pulls the trigger. A fist presses the grip button. A game that tracks hands itself gets your hands and no controllers.".into());
         let _ = model.with(|m| m.sizes_version);
         let learned = backend::learned_game_sizes();
         if !learned.is_empty() {

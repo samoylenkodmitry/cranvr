@@ -48,6 +48,35 @@ applies these patches and builds both parts.
 - The test daemon sends the new message for the left hand and a plain one when the controller comes
   back. The smoke test locates the aim space and the grip space of that hand and checks both.
 
+`0005-tracking-hands-body-face-eyes.patch`
+
+- The runtime offers `XR_EXT_hand_tracking`, `XR_FB_body_tracking`, `XR_META_body_tracking_full_body`,
+  `XR_FB_face_tracking2` and `XR_EXT_eye_gaze_interaction`, each while the connected headset offers its
+  feature. cranvr-host writes the features as words to `tracking-features.txt` next to the control file.
+  The runtime reads it when a game lists the instance extensions, before the control session exists. It
+  also fills the support structures of `xrGetSystemProperties`. Without the file the runtime lists what
+  it listed before, and the gate `DXMT_BASALT_IOSURFACE=1` must be on.
+- New control messages: `TRACKING_REQUEST` (19, to the host: the features that the game uses),
+  `HAND_TRACKING` (20), `BODY_TRACKING` (21), `FACE_TRACKING` (22) and `EYE_GAZE` (23). They are
+  documented in `basalt_control_protocol.h`. The runtime writes the word `tracking` to
+  `runtime-features.txt`, and cranvr-host sends 20 to 23 only to a runtime that wrote it. The
+  control protocol keeps its version 9.
+- A hand and a body arrive as a root pose with velocities and joints in the headset's tracking
+  space. The runtime moves them into LOCAL like the head and the controllers, and moves them forward
+  by their velocity from the sample's arrival to the game's locate time, at most 50 ms. A sample older
+  than 500 ms is inactive, as for a controller. `xrLocateHandJointsEXT` also fills `XrHandJointVelocitiesEXT`.
+- The body tracker has the default set of 70 joints, and the full body set of 84 when
+  `XR_META_body_tracking_full_body` is enabled. `xrGetBodySkeletonFB` returns a T-pose skeleton with
+  an adult's proportions, because the headset sends none.
+- `XR_EXT_eye_gaze_interaction` is an interaction profile: `/interaction_profiles/ext/eye_gaze_interaction`
+  with a pose on `/user/eyes_ext/input/gaze_ext/pose`. The runtime binds an action to it, reports
+  it active while the gaze is tracked, and gives the pose in `xrLocateSpace` with
+  `XrEyeGazeSampleTimeEXT`. `XR_EXT_hand_interaction` is not implemented.
+- The runtime tells the host which features the game uses when a game creates or destroys a
+  tracker, or attaches an eye gaze action. The host asks the headset for these only.
+- `tests/tracking_smoke.cpp` reads every feature through the loader and compares it with the script
+  of cranvr-probe (`scripts/e2e.sh --tracking-wine`).
+
 ## patches/dxmt
 
 `0005-public-atomic-for-new-metal-compiler.patch`: DXMT 0.80 calls a private Metal builtin

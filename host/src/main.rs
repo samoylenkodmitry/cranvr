@@ -8,6 +8,7 @@ mod display_modes;
 mod eye_check;
 mod game_audio;
 mod game_sizes;
+mod hand_controller;
 mod headset;
 mod logger;
 mod network;
@@ -20,6 +21,7 @@ mod runtime_link;
 mod screen_capture;
 mod session;
 mod status;
+mod tracking;
 mod virtual_display;
 
 use cranvr_common::{
@@ -112,7 +114,7 @@ impl Default for Views {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: cranvr-host [--protocol native] [--native-port PORT] [--fps 72|80|90|120, default 120] [--eye-width PIXELS] [--mbps N] [--trust-all] [--pair CODE] [--discovery-port N] [--no-display-lock] [--tcp] [--no-foveation] [--game-scale F] [--strict-rate-control] [--no-game-audio] [--desktop] [--desktop-fps N] [--virtual-display WxH] [--vr-main-display] [--pointer-pitch DEG] [--screen-in-view] [--no-desktop-layer] [--config-dir DIR] [--status]\n\
+        "usage: cranvr-host [--protocol native] [--native-port PORT] [--fps 72|80|90|120, default 120] [--eye-width PIXELS] [--mbps N] [--trust-all] [--pair CODE] [--discovery-port N] [--no-display-lock] [--tcp] [--no-foveation] [--game-scale F] [--strict-rate-control] [--no-game-audio] [--no-hand-controllers] [--desktop] [--desktop-fps N] [--virtual-display WxH] [--vr-main-display] [--pointer-pitch DEG] [--screen-in-view] [--no-desktop-layer] [--config-dir DIR] [--status]\n\
          \n  --protocol native the headset protocol; cranvr's own is the only one. The option stays so\
          \n                    that older command lines work.\
          \n  --native-port N   the TCP port to listen on (default 9950)\
@@ -136,6 +138,9 @@ fn usage() -> ! {
          \n  --strict-rate-control  VideoToolbox's low-latency rate control: even frame sizes, one\
          \n                    frame at a time; slower per frame on an M5 (6.1 ms against 3.6 to 5.0)\
          \n  --no-game-audio   do not send this Mac's sound to the headset (it needs Screen Recording)\
+         \n  --no-hand-controllers  a game without hand tracking gets no controllers made of the headset's\
+         \n                    tracked hands. By default a tracked hand is the controller of its hand,\
+         \n                    while the headset tracks no controller: a pinch is the trigger.\
          \n  --keep-display-modes  keep the Mac's displays in their modes while a game runs (by\
          \n                    default a scaled display gets its panel's own pixels: less GPU time)\
          \n  --desktop         show the Mac's main display as a panel in the headset while no game\
@@ -177,6 +182,7 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
         strict_rate: false,
         game_audio: true,
         unscale_displays: true,
+        hand_controllers: true,
     };
     let mut desktop = DesktopOptions {
         enabled: false,
@@ -227,6 +233,7 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
             "--strict-rate-control" => options.strict_rate = true,
             "--no-game-audio" => options.game_audio = false,
             "--keep-display-modes" => options.unscale_displays = false,
+            "--no-hand-controllers" => options.hand_controllers = false,
             "--desktop" => desktop.enabled = true,
             "--pointer-pitch" => desktop.pointer_pitch = value().parse().unwrap_or_else(|_| usage()),
             "--screen-in-view" => desktop.screen_in_view = true,
@@ -439,6 +446,8 @@ fn main() {
     }
 
     let mut watch = network::StreamWatch::default();
+    // Hands, body, face and eyes between the headset and the game (tracking.rs)
+    let mut tracking = tracking::Hub::new(Arc::clone(&link), Arc::clone(&headset), options.hand_controllers);
     // The console in the headset gets the menu when it connects and when it changes
     let mut console = ConsoleMenu::default();
     loop {
@@ -514,13 +523,20 @@ fn main() {
                     if let Some(head) = headset.motion(Device::Head, ns) {
                         link.head_pose(ns, &head);
                     }
-                    let mut mask = 0;
-                    for (hand, device) in [Device::LeftHand, Device::RightHand].into_iter().enumerate() {
-                        if let Some(grip) = headset.motion(device, ns) {
+                }
+                let mut mask = 0;
+                for (hand, device) in [Device::LeftHand, Device::RightHand].into_iter().enumerate() {
+                    if let Some(grip) = headset.motion(device, ns) {
+                        if link.is_connected() {
                             link.controller(ns, hand as u32, &grip, headset.aim_motion(device, ns).as_ref());
-                            mask |= 1 << hand;
                         }
+                        mask |= 1 << hand;
                     }
+                }
+                // A hand that makes a controller counts as tracked. The hub also sets the wish for
+                // the headset's tracking from what the game uses.
+                let mask = tracking.on_sample(ns, mask);
+                if link.is_connected() {
                     link.controller_mask(ns, mask);
                 }
             }
@@ -565,6 +581,8 @@ fn main() {
                     warn!("A console request that is no JSON object");
                 }
             }
+            Event::TrackingOffer(offered) => tracking.on_offer(offered),
+            Event::Tracked(data) => tracking.on_tracked(data),
             Event::RequestIdr => shared.force_idr.store(true, Ordering::Relaxed),
             // The headset's new origin makes the old screen place wrong: put the screen in front
             // of the user again, as a click of the right thumbstick does
@@ -1279,6 +1297,16 @@ fn frame_loop(
             }
             let poses = pose_gaps::take(secs);
             let input = link.take_counts();
+            if input.tracking.iter().any(|n| *n > 0) {
+                info!(
+                    "Game tracking: the game uses {}; {} hand, {} body, {} face and {} eye messages sent",
+                    if input.requested.is_empty() { "none".to_string() } else { input.requested.names().join(", ") },
+                    input.tracking[0],
+                    input.tracking[1],
+                    input.tracking[2],
+                    input.tracking[3]
+                );
+            }
             if game.connected || input.buttons > 0 || input.haptics > 0 {
                 info!(
                     "Game input: {} left and {} right controller poses, {} and {} of them with an aim pose (tracked mask {:#b}), {} button and axis values, {} haptic pulses from the game",

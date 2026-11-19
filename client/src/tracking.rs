@@ -8,6 +8,9 @@
 //! - the eye views with their field of view, which the host renders with;
 //! - the recenter event, when the user recentered the headset.
 //!
+//! The hands, body, face and eyes come from the same frames (`tracked.rs`). The reader copies only
+//! the features that the host wished, into a buffer that the feed trades with the sender's.
+//!
 //! [`Feed`] carries them from the frame loop to the sender thread. Each frame wakes the sender, so
 //! the host gets one tracking sample for each headset frame and no placeholder between them. The
 //! sender sends placeholder values only when no headset exists, as in a flat window on a desktop.
@@ -19,17 +22,19 @@
 //! controllers' poses go as they are too: the grip pose and the aim pose, each with its own
 //! velocities and with no offset. The host hands both to a game, which picks the one that it needs.
 
+use crate::tracked::{self, TrackedFrame, TrackedReader};
 use cranpose_xr::{Controller, Pose as XrPose, Recenter as XrRecenter, RenderViewpoint, TrackedPose, XrFrame};
 use cranvr_proto::{
     clock::now_ns,
     link::ClientLink,
     message::{buttons as bit, ClientDatagram, ClientMsg, HandInput, Input, Recenter, Tracking, Views},
     motion::velocities,
+    tracking::{Body, Eyes, Face, Features, Hand, Hands, Joint, TRACKING_VERSION},
     wire::{Fov, Motion, Nanos, Pose},
 };
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Condvar, Mutex,
     },
     time::{Duration, Instant},
@@ -82,6 +87,7 @@ pub struct Read {
 #[derive(Default)]
 pub struct FrameReader {
     last_head: Option<(Duration, XrPose)>,
+    tracked: TrackedReader,
 }
 
 /// Two head poses further apart in time than this give no velocity.
@@ -118,6 +124,21 @@ impl FrameReader {
             self.last_head = None;
         }
         Read { display, frame, views: views(xr), recenter, floor: xr.floor_height().filter(|height| height.is_finite()) }
+    }
+
+    /// Hands the frame's hands, body, face and eyes to the feed: the features that the host wished,
+    /// and the features that the headset offers. `read` is the result of `read` for the same frame.
+    /// The call comes before `Feed::push` of that result, so the sender finds the tracked data when it
+    /// wakes for the frame.
+    pub fn push_tracked(&mut self, xr: &XrFrame, read: &Read, feed: &Feed) {
+        feed.set_offer(tracked::offer(&xr.tracking));
+        let Some(frame) = read.frame else { return };
+        let wish = feed.wish();
+        if wish.is_empty() {
+            return;
+        }
+        let scratch = self.tracked.read(xr, frame.sample_time, frame.display_time, wish);
+        feed.swap_tracked(scratch);
     }
 
     /// The head's motion. The runtime's own velocities count. A runtime that gives none leaves the
@@ -208,6 +229,10 @@ pub struct Wake {
 pub struct Feed {
     inner: Mutex<FeedInner>,
     wake: Condvar,
+    /// The tracking features that the host wishes, as bits of `Features`. The link's reader sets it.
+    wish: AtomicU8,
+    /// The tracking features that the headset offers now, from its newest frame
+    offer: AtomicU8,
 }
 
 #[derive(Default)]
@@ -226,6 +251,9 @@ struct FeedInner {
     head: Option<Motion>,
     /// The floor's height in the room, from the newest frame that had it
     floor: Option<f32>,
+    /// The hands, body, face and eyes of the newest frame, until the sender takes them
+    tracked: Option<Box<TrackedFrame>>,
+    tracked_fresh: bool,
 }
 
 #[derive(Default)]
@@ -264,6 +292,50 @@ impl Feed {
         }
         drop(inner);
         self.wake.notify_all();
+    }
+
+    /// The tracking features that the host wishes now.
+    pub fn wish(&self) -> Features {
+        Features(self.wish.load(Ordering::Relaxed)).known()
+    }
+
+    /// The host's wish changed. The link's reader calls it, and a new session starts with none.
+    pub fn set_wish(&self, wish: Features) {
+        self.wish.store(wish.known().0, Ordering::Relaxed);
+    }
+
+    /// The tracking features that the headset offers, from its newest frame.
+    pub fn offer(&self) -> Features {
+        Features(self.offer.load(Ordering::Relaxed))
+    }
+
+    pub fn set_offer(&self, offer: Features) {
+        self.offer.store(offer.0, Ordering::Relaxed);
+    }
+
+    /// Trades the buffer of the frame that the reader filled for the one that the sender left. The
+    /// sender takes the data with [`Feed::take_tracked`]. The call allocates only the first time.
+    pub fn swap_tracked(&self, frame: &mut Box<TrackedFrame>) {
+        let mut inner = self.inner.lock().unwrap();
+        match &mut inner.tracked {
+            Some(slot) => std::mem::swap(slot, frame),
+            none => *none = Some(std::mem::replace(frame, Box::new(TrackedFrame::new()))),
+        }
+        inner.tracked_fresh = true;
+    }
+
+    /// Takes the newest hands, body, face and eyes, if a frame brought them since the last call. The
+    /// buffer `out` goes back to the feed in trade.
+    pub fn take_tracked(&self, out: &mut Box<TrackedFrame>) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let fresh = std::mem::take(&mut inner.tracked_fresh);
+        match &mut inner.tracked {
+            Some(slot) if fresh => {
+                std::mem::swap(slot, out);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Waits up to `timeout` for a frame or a recenter.
@@ -380,6 +452,97 @@ fn placeholder_frame(at: Nanos, display_time: Nanos) -> HeadsetFrame {
     }
 }
 
+/// The datagrams of hands, body and face, kept from one frame to the next. A sample refills them, so
+/// their joint blocks keep their capacity and a frame allocates nothing.
+#[derive(Default)]
+struct Outgoing {
+    hands: Hands,
+    /// The hands' joint blocks while a hand is not tracked
+    spare: [Hand; 2],
+    /// A tracked hand went out, so the host must hear when the last one is gone
+    hands_sent: bool,
+    body: Body,
+    face: Face,
+}
+
+/// Sends a datagram that `value` fills and takes the value back, with its allocations. `false` when
+/// the link failed.
+fn send_value<T: Default>(link: &ClientLink, value: &mut T, wrap: fn(T) -> ClientDatagram, unwrap: fn(ClientDatagram) -> Option<T>) -> bool {
+    let datagram = wrap(std::mem::take(value));
+    let sent = link.duplex.send_datagram(&datagram).is_ok();
+    if let Some(taken) = unwrap(datagram) {
+        *value = taken;
+    }
+    sent
+}
+
+/// Sends one datagram for each wished feature that the frame has. A hand that the cameras lost goes
+/// once, as an absent hand, and then nothing. A body, a face or a gaze that is not there sends
+/// nothing: the game's runtime takes data that stops for an inactive tracker. `false` when the link
+/// failed.
+fn send_tracked(link: &ClientLink, frame: &TrackedFrame, wish: Features, out: &mut Outgoing) -> bool {
+    let mut ok = true;
+    if wish.contains(Features::HANDS) {
+        let any = frame.hands.iter().any(|hand| hand.tracked);
+        if any || out.hands_sent {
+            out.hands_sent = any;
+            out.hands.sample_time = frame.sample_time;
+            out.hands.display_time = frame.display_time;
+            let load = |slot: &mut Option<Hand>, spare: &mut Hand, sample: &crate::tracked::HandSample| {
+                *slot = sample.tracked.then(|| {
+                    let mut hand = std::mem::take(spare);
+                    hand.set(sample.root, &sample.joints);
+                    hand
+                });
+            };
+            let [spare_left, spare_right] = &mut out.spare;
+            load(&mut out.hands.left, spare_left, &frame.hands[0]);
+            load(&mut out.hands.right, spare_right, &frame.hands[1]);
+            ok &= send_value(link, &mut out.hands, ClientDatagram::Hands, |d| match d {
+                ClientDatagram::Hands(hands) => Some(hands),
+                _ => None,
+            });
+            let [spare_left, spare_right] = &mut out.spare;
+            for (slot, spare) in [(&mut out.hands.left, spare_left), (&mut out.hands.right, spare_right)] {
+                if let Some(hand) = slot.take() {
+                    *spare = hand;
+                }
+            }
+        }
+    }
+    let body = &frame.body;
+    if (wish.contains(Features::BODY) || wish.contains(Features::FULL_BODY)) && body.active {
+        let joints: &[Joint] = &body.joints[..body.set.joints()];
+        if out.body.set(frame.sample_time, frame.display_time, body.set, body.confidence, body.root, joints).is_ok() {
+            ok &= send_value(link, &mut out.body, ClientDatagram::Body, |d| match d {
+                ClientDatagram::Body(body) => Some(body),
+                _ => None,
+            });
+        }
+    }
+    if wish.contains(Features::FACE) && frame.face.valid {
+        out.face.set(frame.sample_time, frame.display_time, frame.face.flags, frame.face.confidence, &frame.face.weights);
+        ok &= send_value(link, &mut out.face, ClientDatagram::Face, |d| match d {
+            ClientDatagram::Face(face) => Some(face),
+            _ => None,
+        });
+    }
+    if let (true, Some(gaze)) = (wish.contains(Features::EYES), frame.gaze) {
+        let eyes = Eyes { sample_time: frame.sample_time, display_time: frame.display_time, gaze: Some(gaze) };
+        ok &= link.duplex.send_datagram(&ClientDatagram::Eyes(eyes)).is_ok();
+    }
+    ok
+}
+
+/// The names of a set of features for the log.
+fn describe(features: Features) -> String {
+    if features.is_empty() {
+        "no tracking".to_string()
+    } else {
+        features.names().join(", ")
+    }
+}
+
 /// The floor's height changes by more than this before the client tells the host again, in meters
 const FLOOR_EPSILON: f32 = 0.01;
 /// How often the sender looks at the stop flag while it waits for a frame
@@ -393,6 +556,12 @@ pub fn send_loop(link: &ClientLink, feed: &Feed, tracked: bool, refresh_hz: f32,
     let mut deadline = Instant::now();
     let mut sent_views = hello_views;
     let mut sent_floor: Option<f32> = None;
+    // The features that the host heard that the headset offers. A host of an older protocol version
+    // knows no such message.
+    let mut sent_offer: Option<Features> = None;
+    let sends_tracking = link.welcome.version >= TRACKING_VERSION;
+    let mut outgoing = Outgoing::default();
+    let mut buffer = Box::new(TrackedFrame::new());
     while !stop.load(Ordering::Relaxed) {
         let wake = feed.wait(if tracked { STOP_CHECK } else { period.min(STOP_CHECK) });
         for recenter in wake.recenters {
@@ -411,6 +580,7 @@ pub fn send_loop(link: &ClientLink, feed: &Feed, tracked: bool, refresh_hz: f32,
             sent_floor = Some(floor);
             link.duplex.send_control(&ClientMsg::Floor(floor)).ok();
         }
+        let from_headset = wake.frame.is_some();
         let frame = match wake.frame {
             Some(frame) => frame,
             None if !tracked && Instant::now() >= deadline => {
@@ -425,6 +595,18 @@ pub fn send_loop(link: &ClientLink, feed: &Feed, tracked: bool, refresh_hz: f32,
             }
             None => continue,
         };
+        // The offer follows the permissions that the user gives, so it goes with a frame of the headset
+        // when it changes. A window without a headset offers nothing.
+        if from_headset {
+            let offer = feed.offer();
+            if sent_offer != Some(offer) {
+                log::info!("the headset offers {}", describe(offer));
+                if sends_tracking && !(sent_offer.is_none() && offer.is_empty()) {
+                    link.duplex.send_control(&ClientMsg::TrackingOffer(offer)).ok();
+                }
+                sent_offer = Some(offer);
+            }
+        }
         let tracking = Tracking {
             sample_time: frame.sample_time,
             display_time: frame.display_time,
@@ -440,6 +622,11 @@ pub fn send_loop(link: &ClientLink, feed: &Feed, tracked: bool, refresh_hz: f32,
         // The input goes out with every sample. A datagram may get lost, and the host takes the
         // changes from the values that it sees, so a lost one leaves a button wrong for one frame.
         link.duplex.send_datagram(&ClientDatagram::Input(frame.input)).ok();
+        // The hands, the body, the face and the eyes that the host wished, of the same sample
+        let wish = feed.wish();
+        if from_headset && !wish.is_empty() && feed.take_tracked(&mut buffer) && buffer.sample_time == frame.sample_time && !send_tracked(link, &buffer, wish, &mut outgoing) {
+            return;
+        }
     }
 }
 
@@ -447,6 +634,8 @@ pub fn send_loop(link: &ClientLink, feed: &Feed, tracked: bool, refresh_hz: f32,
 mod tests {
     use super::*;
     use cranpose_xr::{Button, FieldOfView, Thumbstick, Trigger};
+    /// The wrist's place among the hand's joints
+    const HAND_WRIST: usize = cranpose_xr::HandJointType::Wrist.index();
     use cranvr_proto::{
         identity::Identity,
         link::{HostListener, Incoming, MediaMode},
@@ -790,6 +979,162 @@ mod tests {
         }
         stop.store(true, Ordering::Relaxed);
         sender.join().unwrap();
+    }
+
+    #[test]
+    fn the_feed_trades_the_tracked_buffers_without_a_copy_and_gives_each_frame_once() {
+        let feed = Feed::default();
+        let mut scratch = Box::new(TrackedFrame::new());
+        let mut taken = Box::new(TrackedFrame::new());
+        assert!(!feed.take_tracked(&mut taken), "nothing came yet");
+        scratch.sample_time = 7;
+        feed.swap_tracked(&mut scratch);
+        scratch.sample_time = 8;
+        feed.swap_tracked(&mut scratch);
+        // The newest frame is the one that the sender gets, once
+        assert!(feed.take_tracked(&mut taken));
+        assert_eq!(taken.sample_time, 8);
+        assert!(!feed.take_tracked(&mut taken));
+        // The wish and the offer keep only the bits that this version knows
+        feed.set_wish(Features(0xff));
+        assert_eq!(feed.wish(), Features::ALL);
+        feed.set_offer(Features::HANDS);
+        assert_eq!(feed.offer(), Features::HANDS);
+    }
+
+    fn tracked_right_hand(xr: &mut XrFrame, x: f32) {
+        let mut hand = cranpose_xr::HandState { tracking_state: cranpose_xr::TrackingState::Tracking, ..Default::default() };
+        for (i, joint) in hand.joints.iter_mut().enumerate() {
+            *joint = cranpose_xr::HandJoint { pose: pose_at(x + 0.005 * i as f32, 1.2, -0.4), radius: 0.01, valid: true, tracked: true };
+        }
+        xr.right_hand = hand;
+    }
+
+    /// Everything that the host hears for about a third of a second
+    fn heard_for_a_moment(inbox: &mpsc::Receiver<Heard>) -> Vec<Heard> {
+        let mut all = Vec::new();
+        while let Ok(heard) = inbox.recv_timeout(Duration::from_millis(400)) {
+            all.push(heard);
+        }
+        all
+    }
+
+    fn datagrams(heard: &[Heard]) -> Vec<&ClientDatagram> {
+        heard.iter().filter_map(|h| if let Heard::Datagram(d) = h { Some(d) } else { None }).collect()
+    }
+
+    #[test]
+    fn the_sender_offers_what_the_headset_has_and_sends_only_what_the_host_wished() {
+        let (link, inbox) = loopback();
+        let link = std::sync::Arc::new(link);
+        let feed = std::sync::Arc::new(Feed::default());
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let sender = {
+            let (link, feed, stop) = (link.clone(), feed.clone(), stop.clone());
+            let hello = FrameReader::default().read(&frame(), 1).views.unwrap();
+            thread::spawn(move || send_loop(&link, &feed, true, 120.0, hello, &stop))
+        };
+        let mut reader = FrameReader::default();
+        // A headset frame, as the frame loop hands it over: the tracked data first, then the frame
+        let mut push = |xr: &XrFrame, at: Nanos, offer: Features| {
+            let read = reader.read(xr, at);
+            reader.push_tracked(xr, &read, &feed);
+            // The test's capabilities cannot be Active: Cranpose builds them from a runtime
+            feed.set_offer(offer);
+            feed.push(read);
+        };
+        let offered = Features::HANDS.union(Features::BODY).union(Features::FACE);
+
+        // The host wished nothing: the offer goes once, and no tracking datagram besides the head's
+        let mut xr = frame();
+        tracked_right_hand(&mut xr, 0.25);
+        push(&xr, 100, offered);
+        let heard = heard_for_a_moment(&inbox);
+        let offers: Vec<Features> = heard.iter().filter_map(|h| if let Heard::Control(ClientMsg::TrackingOffer(f)) = h { Some(*f) } else { None }).collect();
+        assert_eq!(offers, [offered]);
+        assert!(datagrams(&heard).iter().all(|d| matches!(d, ClientDatagram::Tracking(_) | ClientDatagram::Input(_))), "nothing was wished");
+
+        // The same offer again goes no more. The host wishes the hands: the right one arrives with its joints.
+        feed.set_wish(Features::HANDS);
+        push(&xr, 200, offered);
+        let heard = heard_for_a_moment(&inbox);
+        assert!(!heard.iter().any(|h| matches!(h, Heard::Control(ClientMsg::TrackingOffer(_)))));
+        let hands: Vec<&Hands> = datagrams(&heard).into_iter().filter_map(|d| if let ClientDatagram::Hands(h) = d { Some(h) } else { None }).collect();
+        assert_eq!(hands.len(), 1);
+        assert_eq!(hands[0].sample_time, 200);
+        assert!(hands[0].left.is_none());
+        let joints = hands[0].right.as_ref().unwrap().joints().unwrap();
+        assert!((joints[HAND_WRIST].pose.position[0] - (0.25 + 0.005)).abs() < 2e-4 && (joints[25].pose.position[0] - (0.25 + 0.125)).abs() < 2e-4);
+        assert_eq!(hands[0].right.as_ref().unwrap().root.pose.position, [0.25 + 0.005, 1.2, -0.4]);
+
+        // A lost hand goes once, as no hand at all. Then the sender sends no hands.
+        let lost = frame();
+        push(&lost, 300, offered);
+        push(&lost, 400, offered);
+        let heard = heard_for_a_moment(&inbox);
+        let hands: Vec<&Hands> = datagrams(&heard).into_iter().filter_map(|d| if let ClientDatagram::Hands(h) = d { Some(h) } else { None }).collect();
+        assert_eq!(hands.len(), 1, "the loss goes once");
+        assert!(hands[0].left.is_none() && hands[0].right.is_none());
+
+        // The host wishes the full body and the face. The face is valid, the body has 84 joints.
+        feed.set_wish(Features::FULL_BODY.union(Features::FACE));
+        let mut xr = frame();
+        xr.body.active = true;
+        xr.body.joint_count = 84;
+        xr.body.confidence = 0.5;
+        for (i, joint) in xr.body.joints.iter_mut().enumerate() {
+            *joint = cranpose_xr::BodyJoint { pose: pose_at(0.0, 0.02 * i as f32, 0.0), valid: true, tracked: true };
+        }
+        xr.meta_face.is_valid = true;
+        xr.meta_face.weights[3] = 1.0;
+        push(&xr, 500, offered);
+        let heard = heard_for_a_moment(&inbox);
+        let sent = datagrams(&heard);
+        let body = sent.iter().find_map(|d| if let ClientDatagram::Body(b) = d { Some(b) } else { None }).expect("a body");
+        assert_eq!((body.set, body.sample_time, body.confidence), (cranvr_proto::tracking::BodySet::Full, 500, 0.5));
+        assert!((body.joints().unwrap()[83].pose.position[1] - 0.02 * 83.0).abs() < 2e-4);
+        let face = sent.iter().find_map(|d| if let ClientDatagram::Face(f) = d { Some(f) } else { None }).expect("a face");
+        assert_eq!(face.weights().unwrap()[3], 1.0);
+        assert!(!sent.iter().any(|d| matches!(d, ClientDatagram::Hands(_) | ClientDatagram::Eyes(_))), "the hands and the eyes were not wished");
+
+        // The host wishes the eyes only
+        feed.set_wish(Features::EYES);
+        let mut xr = frame();
+        xr.eyes.gaze = Some(XrPose { position: [0.0, 1.6, 0.0], orientation: [0.0, 0.0, 0.0, 1.0] });
+        push(&xr, 600, Features::EYES);
+        let heard = heard_for_a_moment(&inbox);
+        assert!(heard.iter().any(|h| matches!(h, Heard::Control(ClientMsg::TrackingOffer(f)) if *f == Features::EYES)), "a changed offer goes again");
+        assert!(datagrams(&heard).iter().any(|d| matches!(d, ClientDatagram::Eyes(e) if e.sample_time == 600 && e.gaze.is_some())));
+
+        stop.store(true, Ordering::Relaxed);
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn a_frame_with_no_wish_reads_nothing_from_the_tracking() {
+        // The reader returns before it copies a joint: the feed keeps no tracked frame
+        let feed = Feed::default();
+        let mut reader = FrameReader::default();
+        let mut xr = frame();
+        tracked_right_hand(&mut xr, 0.25);
+        let read = reader.read(&xr, 100);
+        reader.push_tracked(&xr, &read, &feed);
+        assert!(!feed.take_tracked(&mut Box::new(TrackedFrame::new())));
+        // A frame without a tracked head has no sample to pair the data with
+        feed.set_wish(Features::HANDS);
+        let mut headless = frame();
+        headless.device_pose = None;
+        headless.left_eye = None;
+        let read = reader.read(&headless, 200);
+        reader.push_tracked(&headless, &read, &feed);
+        assert!(!feed.take_tracked(&mut Box::new(TrackedFrame::new())));
+        // With a wish and a head, the hand arrives with the frame's sample time
+        let read = reader.read(&xr, 300);
+        reader.push_tracked(&xr, &read, &feed);
+        let mut taken = Box::new(TrackedFrame::new());
+        assert!(feed.take_tracked(&mut taken));
+        assert_eq!(taken.sample_time, 300);
+        assert!(taken.hands[1].tracked && !taken.hands[0].tracked);
     }
 
     #[test]
