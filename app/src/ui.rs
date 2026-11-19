@@ -749,6 +749,7 @@ fn LaunchOptions(settings: MutableState<Settings>, program: String) {
                 Choice("Each eye in its own pass".into(), options.eye_per_pass, move || {
                     edit_launch(settings, &key, |o| {
                         o.eye_per_pass = !o.eye_per_pass;
+                        o.eye_per_pass_declined = !o.eye_per_pass;
                         o.eye_per_pass_reason.clear();
                     })
                 });

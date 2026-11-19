@@ -3,6 +3,8 @@
 //! the launch option "Each eye in its own pass": it turns the option on for the program, records
 //! why, shows a notice and starts the game again. When the option is on already, the picture is
 //! still black with it. The app then says so once and changes nothing, so no run ends in a loop.
+//! When the user turned the option off by hand, the choice stays the user's: the app only says how
+//! to fix the picture.
 //!
 //! The option is data of the program's launch options, as the Play tab shows it. Nothing here
 //! depends on which game it is.
@@ -23,6 +25,8 @@ pub enum Outcome {
     Restart { program: String },
     /// The option was on already: the right eye stays black with it. Nothing changes.
     Leave { program: String },
+    /// The user turned the option off by hand. Nothing changes.
+    Declined { program: String },
     /// The host named no program, so no option can change.
     Unknown,
 }
@@ -36,6 +40,9 @@ pub fn apply(launch: &mut BTreeMap<String, GameOptions>, known: &[String], progr
     let options = launch.entry(key.clone()).or_default();
     if options.eye_per_pass {
         return Outcome::Leave { program: key };
+    }
+    if options.eye_per_pass_declined {
+        return Outcome::Declined { program: key };
     }
     options.eye_per_pass = true;
     options.eye_per_pass_reason = REASON.to_owned();
@@ -60,6 +67,10 @@ pub fn notice(outcome: &Outcome, name: &str) -> Notice {
             format!("The right eye of {name} is still black with \"Each eye in its own pass\". cranvr leaves the game as it is."),
             "The right eye is still black. No restart.",
         ),
+        Outcome::Declined { .. } => (
+            format!("The right eye of {name} stays black. Turn on \"Each eye in its own pass\" in its options in the Play tab to fix it."),
+            "The right eye stays black. See the cranvr window.",
+        ),
         Outcome::Unknown => (
             "The right eye of the game stays black. Open the options of the game in the Play tab and turn on \"Each eye in its own pass\"."
                 .to_owned(),
@@ -82,7 +93,7 @@ pub struct Response {
 pub fn respond(launch: &mut BTreeMap<String, GameOptions>, games: &[Game], program: Option<&str>) -> Response {
     let known: Vec<String> = games.iter().filter_map(crate::steam::program).collect();
     let outcome = apply(launch, &known, program);
-    let (Outcome::Restart { program } | Outcome::Leave { program }) = &outcome else {
+    let (Outcome::Restart { program } | Outcome::Leave { program } | Outcome::Declined { program }) = &outcome else {
         return Response { notice: notice(&outcome, ""), restart: None };
     };
     let notice = notice(&outcome, &name(games, program));
@@ -145,6 +156,16 @@ mod tests {
         assert_eq!(apply(&mut launch, &[], Some(PROGRAM)), Outcome::Leave { program: PROGRAM.into() });
         // The user's own choice has no reason from cranvr
         assert_eq!(launch[PROGRAM].eye_per_pass_reason, "");
+    }
+
+    #[test]
+    fn a_program_whose_option_the_user_turned_off_keeps_it_off() {
+        let mut launch = BTreeMap::new();
+        launch.insert(PROGRAM.to_owned(), GameOptions { eye_per_pass_declined: true, ..Default::default() });
+        let response = respond(&mut launch, &[], Some(PROGRAM));
+        assert_eq!(response.restart, None);
+        assert!(!launch[PROGRAM].eye_per_pass);
+        assert!(response.notice.window.contains("Turn on"));
     }
 
     #[test]
