@@ -630,6 +630,47 @@ impl ConnectObserver for NoObserver {
     fn waiting(&mut self, _code: u32, _host_name: &str) {}
 }
 
+/// What a host shows to anyone who opens a connection, before it knows who asks: the protocol
+/// versions that it speaks and, when they match ours, its key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostProbe {
+    /// The protocol versions of the host
+    pub versions: VersionRange,
+    /// The host's key. `None` when the host speaks no version that this side speaks: it then ends
+    /// the exchange after the version exchange.
+    pub key: Option<[u8; KEY_LEN]>,
+}
+
+/// Opens a connection to `host`, runs the version exchange and the first two flights of the key
+/// exchange, checks the host's signature and closes. The client says nothing about itself: the host
+/// sees a connection that ends before the client's key. The call tells a host that answers from
+/// one that only accepts a connection. Behind `adb reverse` the headset's own end of the cable
+/// accepts the connection whether or not a host runs on the Mac, so only bytes from the host prove
+/// that it is there. `timeout` bounds each step.
+pub fn probe_host(host: SocketAddr, timeout: Duration) -> Result<HostProbe, Error> {
+    let mut tcp = TcpStream::connect_timeout(&host, timeout)?;
+    tcp.set_nodelay(true)?;
+    tcp.set_read_timeout(Some(timeout))?;
+    tcp.set_write_timeout(Some(timeout))?;
+    let client_pre = client_preamble(VersionRange::OURS);
+    tcp.write_all(&client_pre)?;
+    let mut host_pre = [0u8; HOST_PREAMBLE_LEN];
+    tcp.read_exact(&mut host_pre)?;
+    let (chosen, theirs) = parse_host_preamble(&host_pre)?;
+    if chosen.is_none() {
+        return Ok(HostProbe { versions: theirs, key: None });
+    }
+    let mut buf = Vec::new();
+    let fresh = Ephemeral::new()?;
+    write_flight(&mut tcp, &fresh.public())?;
+    let hello = HostHello::parse(read_flight(&mut tcp, &mut buf, HOST_HELLO_LEN)?)?;
+    let transcript = transcript_hash(&client_pre, &host_pre, &fresh.public(), &hello.ephemeral, &hello.key);
+    if !verify_host(&hello.key, &transcript, &hello.signature) {
+        return Err(Error::Crypto("the host's signature is not valid"));
+    }
+    Ok(HostProbe { versions: theirs, key: Some(hello.key) })
+}
+
 /// The client's end of a session.
 pub struct ClientLink {
     pub duplex: Duplex<ClientSide>,

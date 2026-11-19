@@ -16,6 +16,7 @@ use crate::{
     hub::{hub, DecoderView, Device, LinkState, Snapshot, Stats},
     phone::{self, PhoneFrames},
     place, settings,
+    usb::{self, Line, Path, UsbMac, CABLE_NAME},
 };
 use crate::tracking::FrameReader;
 use cranpose::prelude::*;
@@ -242,6 +243,8 @@ struct Link {
 fn link() -> Link {
     // The panel lists the Macs that answer. The search runs while no link does.
     crate::discovery::start(hub());
+    // and the Mac behind the USB cable, which a headset on the cable shows first
+    crate::usb::start(hub());
     let snapshot = rememberMutableStateOf(|| hub().snapshot());
     LaunchedEffect((), async move |_| loop {
         snapshot.set(hub().snapshot());
@@ -324,6 +327,12 @@ fn toggle_connection(state: &LinkState, address: TextFieldState) {
     }
 }
 
+/// Connects to the Mac behind the USB cable. It leaves the address field alone: the field belongs
+/// to the Wi-Fi entry and to the typed address.
+fn connect_cable(mac: &UsbMac) {
+    hub().connect(mac.address.to_string(), mac.fingerprint(), settings::media_choice());
+}
+
 /// Connects to a Mac that the search found. The address field takes the Mac's address, so the next
 /// launch starts with it and Forget host key knows it.
 fn connect_found(host: &FoundHost, address: TextFieldState) {
@@ -380,7 +389,8 @@ fn ConnectPanel(snapshot: MutableState<Snapshot>, address: TextFieldState) {
 fn ConnectBody(snapshot: MutableState<Snapshot>, address: TextFieldState, modifier: Modifier, entry: Entry) {
     let snap = snapshot.get();
     let state = snap.state.clone();
-    let found = snap.found.clone();
+    let found = usb::entries(&snap.found, snap.usb.as_ref());
+    let path = snap.path;
     let typing = rememberMutableStateOf(|| false);
     Column(
         modifier.background(PANEL_COLOR).rounded_corners(24.0).padding(36.0),
@@ -395,7 +405,7 @@ fn ConnectBody(snapshot: MutableState<Snapshot>, address: TextFieldState, modifi
                     } else {
                         HostList(found.clone(), address);
                     }
-                    StatusLine(state.clone(), address);
+                    StatusLine(state.clone(), address, path);
                     AddressButtons(typing, address);
                 }
                 LinkState::Waiting { code, host } => {
@@ -403,7 +413,7 @@ fn ConnectBody(snapshot: MutableState<Snapshot>, address: TextFieldState, modifi
                     StopButton(state.clone());
                 }
                 LinkState::Connecting | LinkState::Streaming => {
-                    StatusLine(state.clone(), address);
+                    StatusLine(state.clone(), address, path);
                     StopButton(state.clone());
                 }
             }
@@ -411,10 +421,10 @@ fn ConnectBody(snapshot: MutableState<Snapshot>, address: TextFieldState, modifi
     );
 }
 
-/// The Macs that answered the search, each as a button, or the words that say what to do when none
-/// answered.
+/// The Macs that answered, the cable's first, each as a button, or the words that say what to do
+/// when none answered.
 #[composable]
-fn HostList(found: Vec<FoundHost>, address: TextFieldState) {
+fn HostList(found: Vec<Line>, address: TextFieldState) {
     if found.is_empty() {
         Text("Looking for a Mac that runs cranvr...", Modifier::empty(), text_style(28.0, TEXT_COLOR, None));
         Text(
@@ -425,9 +435,41 @@ fn HostList(found: Vec<FoundHost>, address: TextFieldState) {
         return;
     }
     Text("Press your Mac to connect.", Modifier::empty(), text_style(26.0, MUTED_COLOR, None));
-    for host in found {
-        FoundHostButton(host, address);
+    for entry in found {
+        match entry {
+            Line::Cable(mac) => CableButton(mac),
+            Line::WiFi(host) => FoundHostButton(host, address),
+        }
     }
+}
+
+/// The Mac behind the USB cable. The cable needs no code, because the Mac trusts a headset on its
+/// own cable.
+#[composable]
+fn CableButton(mac: UsbMac) {
+    let host = mac.as_found();
+    if let Some(advice) = host.update_advice() {
+        Column(
+            Modifier::empty().fill_max_width().background(KEY_COLOR).rounded_corners(16.0).padding_symmetric(28.0, 18.0),
+            ColumnSpec::default(),
+            move || {
+                Text(CABLE_NAME, Modifier::empty(), text_style(30.0, MUTED_COLOR, Some(FontWeight::BOLD)));
+                Text(advice, Modifier::empty(), text_style(22.0, WARN_COLOR, None));
+            },
+        );
+        return;
+    }
+    Button(
+        Modifier::empty().fill_max_width().background(ACCENT_COLOR).rounded_corners(16.0).padding_symmetric(28.0, 18.0),
+        ButtonSpec::default(),
+        move || connect_cable(&mac),
+        move || {
+            Column(Modifier::empty(), ColumnSpec::default(), move || {
+                Text(CABLE_NAME, Modifier::empty(), text_style(32.0, TEXT_COLOR, Some(FontWeight::BOLD)));
+                Text("No code needed", Modifier::empty(), text_style(20.0, TEXT_COLOR, None));
+            });
+        },
+    );
 }
 
 #[composable]
@@ -621,17 +663,27 @@ fn ForgetHostButton(address: TextFieldState) {
 
 /// The state of the link in words: connecting, streaming or the error.
 #[composable]
-fn StatusLine(state: LinkState, address: TextFieldState) {
-    let (text, color) = state_text(&state, &address.text());
+fn StatusLine(state: LinkState, address: TextFieldState, path: Option<Path>) {
+    let (text, color) = state_text(&state, &address.text(), path);
     Text(text, Modifier::empty(), text_style(24.0, color, None));
 }
 
-fn state_text(state: &LinkState, address: &str) -> (String, Color) {
+/// The path shows in the words of the Mac's Headset card.
+fn state_text(state: &LinkState, address: &str, path: Option<Path>) -> (String, Color) {
     match state {
         LinkState::Idle => ("Not connected".into(), MUTED_COLOR),
+        LinkState::Connecting if path == Some(Path::Usb) => ("Connecting by USB cable...".into(), WARN_COLOR),
         LinkState::Connecting => (format!("Connecting to {}...", address.trim()), WARN_COLOR),
         LinkState::Waiting { host, .. } => (format!("Waiting for {host} to allow this headset"), WARN_COLOR),
-        LinkState::Streaming => ("Connected".into(), GOOD_COLOR),
+        LinkState::Streaming => (
+            match path {
+                Some(Path::Usb) => "Connected by USB cable",
+                Some(Path::WiFi) => "Connected over Wi-Fi",
+                None => "Connected",
+            }
+            .into(),
+            GOOD_COLOR,
+        ),
         LinkState::Failed(message) => (message.clone(), BAD_COLOR),
     }
 }
@@ -679,7 +731,7 @@ fn StatLine(label: &'static str, value: String, color: Color) {
 /// The lines of the stats panel: a label, a value and the value's color.
 fn stat_lines(snap: &Snapshot) -> Vec<(&'static str, String, Color)> {
     let stats = &snap.stats;
-    let (link, link_color) = state_text(&snap.state, "the host");
+    let (link, link_color) = state_text(&snap.state, "the host", snap.path);
     let mut lines = vec![("Link", link, link_color)];
     let Some(stream) = &snap.stream else {
         return lines;

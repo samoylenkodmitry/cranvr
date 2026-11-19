@@ -1,6 +1,7 @@
 //! Status lines for a GUI that runs the host as a child process (`--status`). Each line on
 //! stdout reads `@cranvr ` followed by one JSON object with a "type" field:
-//! - `headset`: connected, and when connected: eye [w, h], fps, foveated
+//! - `headset`: connected, and when connected: eye [w, h], fps, foveated, ip (the headset's address:
+//!   loopback means that the stream runs over the USB cable)
 //! - `game`: connected, and when connected: name (the game's renderer) and program (its
 //!   program's path, or null)
 //! - `desktop`: ok, message, and when ok: display (its ID) and virtual (whether it is the

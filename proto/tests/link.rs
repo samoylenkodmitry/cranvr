@@ -7,7 +7,7 @@ mod common;
 use common::{caps, host_identity, identity, meta, Rng};
 use cranvr_proto::{
     fec::ParityController,
-    link::{ClientLink, ConnectObserver, HostLink, HostListener, Incoming, MediaMode},
+    link::{probe_host, ClientLink, ConnectObserver, HostLink, HostListener, Incoming, MediaMode},
     media::{FrameReceiver, DEFAULT_SHARD_LEN},
     message::*,
     wire::{Codec, Error, Motion, Pose},
@@ -457,4 +457,66 @@ fn a_client_that_gives_up_while_it_waits_is_noticed_by_the_host() {
     let (before, noticed) = host.join().unwrap();
     assert!(!before, "a client that waits has not left");
     assert!(noticed, "the host saw the client go");
+}
+
+// A probe learns the host's key without saying who it is. The host sees a client that leaves before
+// its key, and it serves the next client as before.
+#[test]
+fn a_probe_learns_the_hosts_key_and_the_host_serves_the_next_client() {
+    let listener = HostListener::bind("127.0.0.1:0", host_identity()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let key = listener.public_key();
+    let host = thread::spawn(move || {
+        let probe_error = listener.accept().err();
+        let pending = listener.accept().unwrap();
+        (probe_error, pending.caps.name)
+    });
+    let probe = probe_host(addr, WAIT).unwrap();
+    assert_eq!(probe.key, Some(key));
+    assert_eq!(probe.versions, VersionRange::OURS);
+    let _client = thread::spawn(move || ClientLink::connect(addr, &caps(), &identity(), None, Duration::from_secs(1)));
+    let (probe_error, name) = host.join().unwrap();
+    assert!(matches!(probe_error, Some(Error::Closed)), "the host sees the probe leave: {probe_error:?}");
+    assert_eq!(name, caps().name);
+}
+
+// A host of another protocol version ends the exchange after the versions. The probe returns them.
+#[test]
+fn a_probe_of_a_host_of_another_version_gets_its_versions_and_no_key() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let host = thread::spawn(move || {
+        let (mut tcp, _) = listener.accept().unwrap();
+        let mut hello = [0u8; CLIENT_PREAMBLE_LEN];
+        tcp.read_exact(&mut hello).unwrap();
+        tcp.write_all(&host_preamble(None, VersionRange { min: 7, max: 9 })).unwrap();
+    });
+    let probe = probe_host(addr, WAIT).unwrap();
+    assert_eq!((probe.versions, probe.key), (VersionRange { min: 7, max: 9 }, None));
+    host.join().unwrap();
+}
+
+// Behind `adb reverse` the headset's own end of the cable accepts every connection. When no host
+// runs on the Mac it closes the connection at once. A probe must tell this from a host.
+#[test]
+fn a_probe_of_a_port_that_accepts_and_says_nothing_fails() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let closer = thread::spawn(move || drop(listener.accept().unwrap()));
+    let closed = probe_host(addr, WAIT);
+    assert!(matches!(closed, Err(Error::Closed)), "{closed:?}");
+    closer.join().unwrap();
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = silent.local_addr().unwrap();
+    let quiet = thread::spawn(move || {
+        let held = silent.accept().unwrap();
+        thread::sleep(Duration::from_millis(600));
+        drop(held);
+    });
+    let timed_out = probe_host(addr, Duration::from_millis(200));
+    assert!(matches!(timed_out, Err(Error::Timeout)), "{timed_out:?}");
+    quiet.join().unwrap();
+    // Nothing listens at all
+    let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    assert!(probe_host(unused, Duration::from_millis(200)).is_err());
 }

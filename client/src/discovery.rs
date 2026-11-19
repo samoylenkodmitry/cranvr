@@ -4,7 +4,7 @@
 
 use crate::{hub::Hub, settings};
 use cranvr_proto::{
-    discovery::{broadcast_targets, Finder, DEFAULT_PORT},
+    discovery::{broadcast_targets, find, Finder, Found, DEFAULT_PORT},
     message::{VersionRange, UPDATE_HEADSET, UPDATE_MAC},
 };
 use std::{
@@ -63,6 +63,28 @@ pub fn start(hub: &'static Hub) {
     });
 }
 
+fn host_of(found: &Found) -> FoundHost {
+    FoundHost {
+        name: found.answer.name.clone(),
+        address: found.socket_addr(),
+        fingerprint: found.answer.fingerprint,
+        versions: found.answer.versions,
+        paired: settings::host_key_by_fingerprint(&found.answer.fingerprint).is_some(),
+    }
+}
+
+/// Asks the network for `wait` and returns the Macs that answered. A connection that lost its
+/// cable calls it on its own thread, to find the Mac's Wi-Fi address.
+pub fn search_now(wait: Duration) -> Vec<FoundHost> {
+    match find(broadcast_targets(DEFAULT_PORT), wait) {
+        Ok(found) => found.iter().map(host_of).collect(),
+        Err(e) => {
+            log::warn!("no socket for the search for Macs: {e}");
+            Vec::new()
+        }
+    }
+}
+
 fn run(hub: &'static Hub) {
     let mut seen: Vec<(FoundHost, Instant)> = Vec::new();
     loop {
@@ -87,13 +109,7 @@ fn run(hub: &'static Hub) {
             }
             let wait = next_ask.min(round_end).saturating_duration_since(Instant::now());
             let Some(found) = finder.receive(wait) else { continue };
-            let host = FoundHost {
-                name: found.answer.name.clone(),
-                address: found.socket_addr(),
-                fingerprint: found.answer.fingerprint,
-                versions: found.answer.versions,
-                paired: settings::host_key_by_fingerprint(&found.answer.fingerprint).is_some(),
-            };
+            let host = host_of(&found);
             match seen.iter_mut().find(|(known, _)| known.address == host.address) {
                 Some(entry) => *entry = (host, Instant::now()),
                 None => seen.push((host, Instant::now())),

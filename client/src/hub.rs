@@ -13,6 +13,7 @@ use crate::{
     discovery::FoundHost,
     settings,
     tracking::{Display, Feed},
+    usb::{Path, UsbMac},
 };
 use cranpose::{CropRect, DecodedFrames};
 use cranpose_xr::{
@@ -183,11 +184,15 @@ pub struct Snapshot {
     pub stats: Stats,
     /// The Macs that answered the search (see `discovery.rs`). `Hub::snapshot` fills it.
     pub found: Vec<FoundHost>,
+    /// The Mac that answers behind the USB cable (see `usb.rs`). `Hub::snapshot` fills it.
+    pub usb: Option<UsbMac>,
+    /// The way that the link goes, once a connection has chosen it
+    pub path: Option<Path>,
 }
 
 impl Snapshot {
     fn idle() -> Self {
-        Self { state: LinkState::Idle, stream: None, stats: Stats::default(), found: Vec::new() }
+        Self { state: LinkState::Idle, stream: None, stats: Stats::default(), found: Vec::new(), usb: None, path: None }
     }
 }
 
@@ -301,8 +306,11 @@ const RECONNECT_AFTER: Duration = Duration::from_secs(2);
 /// without the user's say connects again. A connection that never streamed stays failed, so the
 /// panel shows why.
 struct Wanted {
+    /// The address that the user pressed or typed. Each connection chooses its own way to the
+    /// Mac behind it (see `usb::target`).
     host: String,
-    /// The start of the host's key fingerprint, when the host came from the search
+    /// The start of the host's key fingerprint, when the host came from the search or an earlier
+    /// connection reached it
     fingerprint: Option<[u8; 8]>,
     media: MediaChoice,
     streamed: bool,
@@ -310,6 +318,12 @@ struct Wanted {
 }
 
 impl Wanted {
+    /// Forgets that the link streamed, so a failure stays on screen and no new try follows.
+    fn give_up(&mut self) {
+        self.streamed = false;
+        self.failed_at = None;
+    }
+
     /// Notes the link's state and says whether the client should connect again at `now`.
     fn due(&mut self, state: &LinkState, now: Instant) -> bool {
         match state {
@@ -347,6 +361,8 @@ pub struct Hub {
     wanted: Mutex<Option<Wanted>>,
     /// The Macs that answered the search
     found: Mutex<Vec<FoundHost>>,
+    /// The Mac that answers behind the USB cable
+    usb: Mutex<Option<UsbMac>>,
     console: Mutex<Console>,
     /// The saved settings of the console were loaded. A rebuilt composition must not load them
     /// again, because the choices in memory are newer when a save failed.
@@ -372,6 +388,7 @@ pub fn hub() -> &'static Hub {
         connection: Mutex::new(None),
         wanted: Mutex::new(None),
         found: Mutex::new(Vec::new()),
+        usb: Mutex::new(None),
         console: Mutex::new(Console::default()),
         settings_loaded: AtomicBool::new(false),
     })
@@ -381,7 +398,23 @@ impl Hub {
     pub fn snapshot(&self) -> Snapshot {
         let mut snapshot = self.snapshot.lock().unwrap().clone();
         snapshot.found = self.found.lock().unwrap().clone();
+        snapshot.usb = self.usb.lock().unwrap().clone();
         snapshot
+    }
+
+    /// The Macs that answered the search
+    pub fn found(&self) -> Vec<FoundHost> {
+        self.found.lock().unwrap().clone()
+    }
+
+    /// Notes the Mac that answers behind the USB cable, or that none does. The cable's thread
+    /// calls it.
+    pub fn set_usb(&self, usb: Option<UsbMac>) {
+        *self.usb.lock().unwrap() = usb;
+    }
+
+    pub fn usb(&self) -> Option<UsbMac> {
+        self.usb.lock().unwrap().clone()
     }
 
     /// Notes the Macs that answered the search. The search thread calls it after each round.
@@ -455,6 +488,30 @@ impl Hub {
         // A link that streamed for any time counts, also when the UI never saw the state
         if let Some(wanted) = self.wanted.lock().unwrap().as_mut().filter(|_| streaming) {
             wanted.streamed = true;
+        }
+    }
+
+    /// The connection `id` met a failure that ends only when the user acts: the Mac's user said no
+    /// or did not answer, the Mac's key changed, or the apps speak no common version. It stops
+    /// retrying. A cable that fell back to Wi-Fi would otherwise ask the Mac's user again every few
+    /// seconds.
+    pub(crate) fn give_up(&self, id: u64) {
+        if self.current.load(Ordering::Acquire) != id {
+            return;
+        }
+        if let Some(wanted) = self.wanted.lock().unwrap().as_mut() {
+            wanted.give_up();
+        }
+    }
+
+    /// Notes which Mac the connection `id` reached. A connection to a typed address learns it
+    /// there, so a later connection can tell the Mac's cable from its Wi-Fi.
+    pub(crate) fn learn_mac(&self, id: u64, fingerprint: [u8; 8]) {
+        if self.current.load(Ordering::Acquire) != id {
+            return;
+        }
+        if let Some(wanted) = self.wanted.lock().unwrap().as_mut() {
+            wanted.fingerprint.get_or_insert(fingerprint);
         }
     }
 
@@ -815,6 +872,22 @@ mod tests {
         // The attempt fails again (the host is still down): the next try follows after a new pause.
         // The caller starts it with `streamed` kept, so the failed state does not end the retries.
         assert!(wanted.streamed);
+    }
+
+    // A cable that fell back to Wi-Fi meets the Mac's card for a new headset. A no from the Mac's
+    // user ends the tries: the panel keeps the answer until the user presses the Mac again.
+    #[test]
+    fn a_refusal_ends_the_tries_of_a_link_that_streamed() {
+        let start = Instant::now();
+        let failed = LinkState::Failed("The Mac denied this headset. Press the Mac to ask again.".into());
+        let mut wanted = Wanted { host: "mac".into(), fingerprint: None, media: MediaChoice::Auto, streamed: false, failed_at: None };
+        assert!(!wanted.due(&LinkState::Streaming, start));
+        wanted.give_up();
+        assert!(!wanted.due(&failed, start) && !wanted.due(&failed, start + Duration::from_secs(60)));
+        // A new press starts a new connection, whose streaming makes retries count again
+        assert!(!wanted.due(&LinkState::Streaming, start));
+        assert!(!wanted.due(&failed, start));
+        assert!(wanted.due(&failed, start + Duration::from_secs(3)));
     }
 
     #[test]

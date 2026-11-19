@@ -1,7 +1,10 @@
 //! Everything outside the window: the host child process, settings on disk, paired headsets
 //! from ALVR's session.json, and games under Wine.
 
-use crate::launch::{GameOptions, WineOptions};
+use crate::{
+    launch::{GameOptions, WineOptions},
+    usb::Connection,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -23,6 +26,12 @@ use std::{
 
 /// The TCP port of the native protocol, `cranvr-host`'s default for `--native-port`.
 pub const NATIVE_PORT: u16 = 9950;
+
+/// The port that the host listens on for the native protocol. `CRANVR_NATIVE_PORT` replaces it for a
+/// test app that runs beside the user's: the user's host keeps 9950.
+pub fn native_port() -> u16 {
+    env::var("CRANVR_NATIVE_PORT").ok().and_then(|port| port.parse().ok()).unwrap_or(NATIVE_PORT)
+}
 
 /// The host's config dir; `cranvr-host` uses the same default.
 pub fn config_dir() -> PathBuf {
@@ -53,6 +62,9 @@ pub struct Settings {
     pub headset_app: HeadsetApp,
     /// Counts for the ALVR client only: the cranvr client picks its media path itself
     pub stream_protocol: StreamProtocol,
+    /// How the stream reaches the headset: by the USB cable when the headset is plugged into
+    /// this Mac, or by Wi-Fi, or by the cable only (see usb.rs)
+    pub connection: Connection,
     /// The headset plays this Mac's sound
     pub game_audio: bool,
     /// The desktop view shows a virtual display made for the headset, of this size in points;
@@ -121,6 +133,7 @@ impl Default for Settings {
             autostart: true,
             headset_app: HeadsetApp::default(),
             stream_protocol: StreamProtocol::Auto,
+            connection: Connection::Automatic,
             game_audio: true,
             virtual_display: None,
             vr_main_display: false,
@@ -157,6 +170,24 @@ pub struct Headset {
     pub eye: (u32, u32),
     pub fps: f64,
     pub foveated: bool,
+    /// Which way the stream travels, once the host says: the USB cable shows as a loopback address
+    pub path: Option<StreamPath>,
+}
+
+/// The way that the stream of a connected headset travels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamPath {
+    Usb,
+    WiFi,
+}
+
+impl StreamPath {
+    /// From the headset's address in the host's `headset` line. The cable ends at this Mac's own
+    /// address, because `adb reverse` hands the connection to the host from loopback.
+    fn of(ip: &str) -> Option<Self> {
+        let ip: std::net::IpAddr = ip.parse().ok()?;
+        Some(if ip.is_loopback() { StreamPath::Usb } else { StreamPath::WiFi })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -220,6 +251,8 @@ pub struct Model {
     pub native: Option<Native>,
     /// This Mac's addresses on the local network: the headset connects to one of them
     pub lan: Vec<Ipv4Addr>,
+    /// The USB cable: adb, the headsets on it and the download of adb (see usb.rs)
+    pub usb: crate::usb::Status,
     pub log: VecDeque<String>,
     pub message: Option<String>,
     /// Screen Recording and Accessibility
@@ -287,6 +320,7 @@ impl Model {
                     eye: (v["eye"][0].as_u64().unwrap_or(0) as u32, v["eye"][1].as_u64().unwrap_or(0) as u32),
                     fps: v["fps"].as_f64().unwrap_or(0.0),
                     foveated: v["foveated"].as_bool().unwrap_or(false),
+                    path: v["ip"].as_str().and_then(StreamPath::of),
                 });
                 if self.headset.is_none() {
                     self.stats = None;
@@ -407,6 +441,9 @@ fn host_args(settings: &Settings, tcp_fallback: bool, pair_code: Option<&str>, c
     args.extend(["--status", "--fps", &settings.fps.to_string(), "--mbps", &settings.mbps.to_string()].map(OsString::from));
     if native {
         args.extend(["--protocol", "native"].map(OsString::from));
+        if native_port() != NATIVE_PORT {
+            args.extend(["--native-port".into(), native_port().to_string().into()]);
+        }
         if let Some(code) = pair_code {
             args.extend(["--pair", code].map(OsString::from));
         }
@@ -855,6 +892,30 @@ mod tests {
         assert_eq!((stats.fps, stats.mbps, stats.latency_ms), (119.6, 100, Some(21.5)));
         model.apply_status(&serde_json::json!({"type": "headset", "connected": false}));
         assert!(model.headset.is_none() && model.stats.is_none());
+    }
+
+    // The host's `headset` line carries the headset's address. This Mac's own address means that
+    // the stream runs over the USB cable.
+    #[test]
+    fn the_headset_line_tells_whether_the_stream_uses_the_cable() {
+        let line = |ip: serde_json::Value| serde_json::json!({"type": "headset", "connected": true, "eye": [2064, 2208], "fps": 120.0, "foveated": true, "ip": ip});
+        let path = |ip: serde_json::Value| {
+            let mut model = Model::default();
+            model.apply_status(&line(ip));
+            model.headset.unwrap().path
+        };
+        assert_eq!(path("127.0.0.1".into()), Some(StreamPath::Usb));
+        assert_eq!(path("::1".into()), Some(StreamPath::Usb));
+        assert_eq!(path("192.168.1.30".into()), Some(StreamPath::WiFi));
+        // A host that does not say, or says nonsense, leaves the path unknown
+        assert_eq!(path(serde_json::Value::Null), None);
+        assert_eq!(path("not an address".into()), None);
+    }
+
+    #[test]
+    fn a_settings_file_without_the_connection_key_uses_automatic() {
+        assert_eq!(serde_json::from_str::<Settings>(r#"{"fps": 90}"#).unwrap().connection, Connection::Automatic);
+        assert_eq!(serde_json::from_str::<Settings>(r#"{"connection": "Usb"}"#).unwrap().connection, Connection::Usb);
     }
 
     #[test]
