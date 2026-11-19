@@ -170,13 +170,13 @@ mod tests {
         let game = Game { app_id: "1".into(), name: "Some Game".into(), exe: Some(PathBuf::from("/Users/x/game.exe")) };
         let program = "Z:\\Users\\x\\game.exe";
         let mut launch = BTreeMap::new();
-        let first = respond(&mut launch, &[game.clone()], Some(program));
+        let first = respond(&mut launch, std::slice::from_ref(&game), Some(program));
         assert_eq!(first.restart.as_deref(), Some(program));
         assert!(first.notice.window.contains("Some Game") && first.notice.window.contains("starts again"));
         assert_eq!(launch[program].eye_per_pass_reason, REASON);
         // The game starts again with the option and is still black: the app leaves it
         for _ in 0..3 {
-            let later = respond(&mut launch, &[game.clone()], Some(program));
+            let later = respond(&mut launch, std::slice::from_ref(&game), Some(program));
             assert_eq!(later.restart, None);
             assert!(later.notice.window.contains("still black") && later.notice.window.contains("Some Game"));
         }
@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn the_name_is_the_listed_game_or_the_program_file() {
         let game = Game { app_id: "1".into(), name: "Some Game".into(), exe: Some(PathBuf::from("/Users/x/game.exe")) };
-        assert_eq!(name(&[game.clone()], "Z:\\Users\\x\\game.exe"), "Some Game");
+        assert_eq!(name(std::slice::from_ref(&game), "Z:\\Users\\x\\game.exe"), "Some Game");
         assert_eq!(name(&[game], "C:\\Other\\Thing.exe"), "Thing.exe");
         assert_eq!(name(&[], "Thing.exe"), "Thing.exe");
     }
