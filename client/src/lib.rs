@@ -16,6 +16,7 @@ mod connection;
 mod console;
 mod console_panel;
 mod desktop;
+mod discovery;
 mod hub;
 mod panels_ball;
 mod phone;

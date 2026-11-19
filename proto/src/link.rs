@@ -10,15 +10,15 @@
 
 use crate::{
     fec::ParityController,
-    identity::{Identity, KEY_LEN},
+    identity::{random_bytes, Identity, KEY_LEN},
     media::{FrameMeta, FrameSender, SendStats},
     message::*,
     secure::{
-        derive, sign_as_client, sign_as_host, transcript_hash, verify_client, verify_host, Channels, ClientAuth, Ephemeral, HostHello, Role,
-        TcpRx, TcpTx, UdpRx, UdpTx, CLIENT_HELLO_LEN, HOST_HELLO_LEN, OVERHEAD,
+        approval_code, approval_commit, derive, sign_as_client, sign_as_host, transcript_hash, verify_client, verify_host, Channels,
+        ClientAuth, Ephemeral, HostHello, Role, TcpRx, TcpTx, UdpRx, UdpTx, CLIENT_HELLO_LEN, HOST_HELLO_LEN, OVERHEAD,
     },
     wire::{decode, encode, read_tcp_packet, read_tcp_packet_limited, Error, PacketBuf, KIND_CONTROL, KIND_DATAGRAM, KIND_HANDSHAKE, KIND_MEDIA},
-    MTU,
+    APPROVAL_VERSION, MTU,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -37,6 +37,10 @@ use std::{
 
 /// The time that handshake reads and writes may take.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often a client that waits for its approval looks at its observer
+const WAIT_POLL: Duration = Duration::from_millis(200);
+/// How much longer than the host a client waits for the host's answer
+const APPROVAL_SLACK: Duration = Duration::from_secs(15);
 /// The longest packet that the handshake reads. The Hello with the capabilities is the largest.
 const HANDSHAKE_PACKET_LIMIT: usize = 64 << 10;
 /// A write to the TCP connection that takes longer than this ends the session: the peer is gone.
@@ -416,6 +420,8 @@ pub struct Pending {
     /// up in its pairings. The host does that after this call: a client on this Mac needs no
     /// pairing.
     pub client_key: [u8; KEY_LEN],
+    /// The hash that both sides signed. The approval code comes from it.
+    transcript: [u8; 32],
 }
 
 impl HostListener {
@@ -472,13 +478,50 @@ impl HostListener {
             return Err(Error::Crypto("the client does not hold the key that it claims"));
         }
         match read_control::<ClientMsg>(&mut tcp, &mut channels.tcp_rx, &mut buf)? {
-            ClientMsg::Hello(caps) => Ok(Pending { tcp, channels, peer, version, caps, client_key: auth.key }),
+            ClientMsg::Hello(caps) => Ok(Pending { tcp, channels, peer, version, caps, client_key: auth.key, transcript }),
             _ => Err(Error::Unexpected("the client's first message is not Hello")),
         }
     }
 }
 
 impl Pending {
+    /// Tells a client that the host's user must allow it, and runs the exchange of numbers that
+    /// gives both sides the approval code (see [`approval_code`]). It returns the code. The caller
+    /// shows it to the host's user, then calls [`Pending::accept`] or [`Pending::reject`]. It fails
+    /// for a client of version 4, which cannot wait: the caller rejects it with
+    /// [`RejectReason::NotPaired`]. The call takes up to the handshake timeout, for a client that
+    /// does not answer.
+    pub fn hold_for_approval(&mut self, host_name: &str) -> Result<u32, Error> {
+        if self.version < APPROVAL_VERSION {
+            return Err(Error::Unexpected("a client of this version cannot wait for an approval"));
+        }
+        let nonce = random_bytes()?;
+        let commit = approval_commit(&nonce, &self.transcript, &self.client_key);
+        write_control(&mut self.tcp, &mut self.channels.tcp_tx, &HostMsg::AwaitApproval { host_name: host_name.to_owned(), commit })?;
+        let mut buf = Vec::new();
+        let client_nonce = match read_control::<ClientMsg>(&mut self.tcp, &mut self.channels.tcp_rx, &mut buf)? {
+            ClientMsg::PairNonce(client_nonce) => client_nonce,
+            _ => return Err(Error::Unexpected("expected the client's number for the approval code")),
+        };
+        write_control(&mut self.tcp, &mut self.channels.tcp_tx, &HostMsg::PairReveal(nonce))?;
+        Ok(approval_code(&self.transcript, &self.client_key, &nonce, &client_nonce))
+    }
+
+    /// Whether the client closed the connection, or sent anything, while the host waits for its
+    /// user. A waiting client sends nothing except its goodbye.
+    pub fn client_left(&mut self) -> bool {
+        if self.tcp.set_nonblocking(true).is_err() {
+            return true;
+        }
+        let mut byte = [0u8; 1];
+        let left = match self.tcp.peek(&mut byte) {
+            Ok(_) => true,
+            Err(e) => e.kind() != io::ErrorKind::WouldBlock,
+        };
+        self.tcp.set_nonblocking(false).ok();
+        left
+    }
+
     pub fn reject(mut self, reason: RejectReason) {
         write_control(&mut self.tcp, &mut self.channels.tcp_tx, &HostMsg::Reject(reason)).ok();
     }
@@ -568,6 +611,25 @@ impl HostLink {
 // ---------------------------------------------------------------------------------------------
 // Client
 
+/// What [`ClientLink::connect_with`] tells its caller while the host's user decides.
+pub trait ConnectObserver {
+    /// The host does not know this client and asks its user. `code` is the approval code: the
+    /// host's user sees the same one. `host_name` is the name that the host gave itself.
+    fn waiting(&mut self, code: u32, host_name: &str);
+
+    /// Whether the caller gave up. The wait then ends with [`Error::Closed`].
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+
+/// An observer that watches nothing.
+pub struct NoObserver;
+
+impl ConnectObserver for NoObserver {
+    fn waiting(&mut self, _code: u32, _host_name: &str) {}
+}
+
 /// The client's end of a session.
 pub struct ClientLink {
     pub duplex: Duplex<ClientSide>,
@@ -590,6 +652,20 @@ impl ClientLink {
         expected_host: Option<[u8; KEY_LEN]>,
         timeout: Duration,
     ) -> Result<Self, Error> {
+        Self::connect_with(host, caps, identity, expected_host, timeout, &mut NoObserver)
+    }
+
+    /// [`ClientLink::connect`] with an observer. A host that does not know this client holds the
+    /// connection until its user answers. The observer then gets the approval code to show, and
+    /// can end the wait.
+    pub fn connect_with(
+        host: SocketAddr,
+        caps: &ClientCaps,
+        identity: &Identity,
+        expected_host: Option<[u8; KEY_LEN]>,
+        timeout: Duration,
+        observer: &mut dyn ConnectObserver,
+    ) -> Result<Self, Error> {
         let mut tcp = TcpStream::connect_timeout(&host, timeout)?;
         tcp.set_nodelay(true)?;
         tcp.set_read_timeout(Some(timeout))?;
@@ -599,7 +675,7 @@ impl ClientLink {
         let mut host_pre = [0u8; HOST_PREAMBLE_LEN];
         tcp.read_exact(&mut host_pre)?;
         let (chosen, theirs) = parse_host_preamble(&host_pre)?;
-        chosen.ok_or(Error::Version {
+        let version = chosen.ok_or(Error::Version {
             ours: (VersionRange::OURS.min, VersionRange::OURS.max),
             theirs: (theirs.min, theirs.max),
         })?;
@@ -621,10 +697,43 @@ impl ClientLink {
         body.extend_from_slice(&sign_as_client(identity, &transcript));
         tcp.write_all(channels.tcp_tx.seal(&mut auth)?)?;
         write_control(&mut tcp, &mut channels.tcp_tx, &ClientMsg::Hello(caps.clone()))?;
-        let welcome = match read_control::<HostMsg>(&mut tcp, &mut channels.tcp_rx, &mut buf)? {
-            HostMsg::Welcome(w) => w,
-            HostMsg::Reject(reason) => return Err(Error::Rejected(reason)),
-            _ => return Err(Error::Unexpected("the host's first answer is not Welcome")),
+        let mut waiting_since: Option<Instant> = None;
+        let welcome = loop {
+            match read_control::<HostMsg>(&mut tcp, &mut channels.tcp_rx, &mut buf) {
+                Ok(HostMsg::Welcome(w)) => break w,
+                // A host of version 4 has no approval: it refuses a client that it does not know.
+                // This side could have asked its user, so the host is the side to update.
+                Ok(HostMsg::Reject(RejectReason::NotPaired)) if version < APPROVAL_VERSION && VersionRange::OURS.max >= APPROVAL_VERSION => {
+                    return Err(Error::Version {
+                        ours: (VersionRange::OURS.min, VersionRange::OURS.max),
+                        theirs: (theirs.min, theirs.max),
+                    })
+                }
+                Ok(HostMsg::Reject(reason)) => return Err(Error::Rejected(reason)),
+                Ok(HostMsg::AwaitApproval { host_name, commit }) if waiting_since.is_none() && version >= APPROVAL_VERSION => {
+                    let nonce = random_bytes()?;
+                    write_control(&mut tcp, &mut channels.tcp_tx, &ClientMsg::PairNonce(nonce))?;
+                    let host_nonce = match read_control::<HostMsg>(&mut tcp, &mut channels.tcp_rx, &mut buf)? {
+                        HostMsg::PairReveal(host_nonce) => host_nonce,
+                        _ => return Err(Error::Unexpected("expected the host's number for the approval code")),
+                    };
+                    let key = identity.public_key();
+                    if approval_commit(&host_nonce, &transcript, &key) != commit {
+                        return Err(Error::Crypto("the host's number does not match its commitment"));
+                    }
+                    observer.waiting(approval_code(&transcript, &key, &host_nonce, &nonce), &host_name);
+                    waiting_since = Some(Instant::now());
+                    // The host answers when its user does. A short timeout lets the loop see a cancel.
+                    tcp.set_read_timeout(Some(WAIT_POLL))?;
+                }
+                Ok(_) => return Err(Error::Unexpected("the host's first answer is not Welcome")),
+                Err(Error::Timeout) if waiting_since.is_some_and(|since| since.elapsed() < APPROVAL_WAIT + APPROVAL_SLACK) => {
+                    if observer.cancelled() {
+                        return Err(Error::Closed);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         };
         let udp = match welcome.media {
             MediaPlan::Udp { port } => {

@@ -126,7 +126,8 @@ fn change(settings: MutableState<Settings>, model: MutableState<Model>, edit: im
 }
 
 // A start by hand begins a fresh check of the network: old notices go away. A pairing code opens
-// the pairing window of the native protocol for this start only.
+// the pairing window of the native protocol for this start only. It serves a headset with the older
+// cranvr app. The window's field for it is gone: a newer headset asks the user with a card.
 fn start_host(settings: MutableState<Settings>, model: MutableState<Model>, pair_code: Option<&str>) {
     model.update(|m| {
         m.network.clear();
@@ -156,7 +157,7 @@ fn refresh(settings: MutableState<Settings>, model: MutableState<Model>, slow: b
     black_eye_reports(settings, &mut next, reports);
     // In Auto mode the stream moves to TCP once, when the host finds that UDP data does not
     // arrive. A problem over TCP stays on screen: switching back would only repeat the first one.
-    // The cranvr client picks its media path itself. A restart would close the pairing window.
+    // The cranvr client picks its media path itself.
     if std::mem::take(&mut next.udp_blocked)
         && !next.tcp_fallback
         && settings.with(|s| s.headset_app == HeadsetApp::Alvr && s.stream_protocol == StreamProtocol::Auto)
@@ -170,9 +171,11 @@ fn refresh(settings: MutableState<Settings>, model: MutableState<Model>, slow: b
             next.message = Some(e);
         }
     }
-    // The host does not say when its pairing window runs out
-    if let Some(native) = next.native.as_mut().filter(|n| n.pairing_until.is_some_and(|until| until <= Instant::now())) {
-        native.pairing_until = None;
+    // A headset that asks to connect has a user who may not look at the Mac: the window comes up
+    let waiting = |m: &Model| m.native.iter().flat_map(|n| n.pending.iter().map(|r| r.key.clone())).collect::<Vec<_>>();
+    let known = model.with(|m| waiting(m));
+    if waiting(&next).iter().any(|key| !known.contains(key)) {
+        crate::vr_window::bring_to_front();
     }
     if slow {
         next.clients = backend::read_clients();
@@ -321,6 +324,7 @@ pub fn CranvrApp() {
         move || {
             Header(settings, model);
             PermissionCard(model);
+            PairingCard(model);
             HeadsetCard(settings, model);
             if let Some(message) = model.with(|m| m.message.clone()) {
                 Text(message, Modifier::empty(), colored(240, 170, 90));
@@ -389,6 +393,31 @@ fn PermissionCard(model: MutableState<Model>) {
     });
 }
 
+/// A headset asks to connect. The headset shows a code, and the card shows the same one. The user
+/// allows the headset only when the two codes match: a device that poses as this Mac to the
+/// headset shows another code.
+#[composable]
+fn PairingCard(model: MutableState<Model>) {
+    let waiting = model.with(|m| m.native.as_ref().map(|n| n.pending.clone()).unwrap_or_default());
+    for request in waiting {
+        Card(move || {
+            Text(format!("{} wants to connect.", request.name), Modifier::empty(), {
+                let mut style = sized(18.0, true);
+                style.span_style.color = Some(Color::from_rgb_u8(240, 170, 90));
+                style
+            });
+            Text(format!("It shows the code {}.", request.code), Modifier::empty(), sized(28.0, true));
+            Hint(format!("Press Allow only when the headset shows the same code. Its address is {}.", request.ip));
+            let key = request.key.clone();
+            FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+                let (allow, deny) = (key.clone(), key.clone());
+                Primary("Allow".into(), move || backend::answer_pairing(&allow, true));
+                Action("Deny".into(), move || backend::answer_pairing(&deny, false));
+            });
+        });
+    }
+}
+
 #[composable]
 fn HeadsetCard(settings: MutableState<Settings>, model: MutableState<Model>) {
     Card(move || {
@@ -417,7 +446,7 @@ fn HeadsetCard(settings: MutableState<Settings>, model: MutableState<Model>) {
             None => {
                 Label("No headset connected".into());
                 if native {
-                    NativeConnect(settings, model);
+                    NativeConnect(model);
                 } else {
                     Hint("On the Quest, open the ALVR app (version 20.14, from the Meta store). Use the same Wi-Fi as this Mac, on 5 GHz.".into());
                 }
@@ -455,51 +484,25 @@ fn HeadsetCard(settings: MutableState<Settings>, model: MutableState<Model>) {
     });
 }
 
-/// What the cranvr client needs before it connects: the host's address and a pairing for a
-/// headset that the host does not know yet.
+/// What the user does to connect the cranvr client: open it on the headset. The headset finds this
+/// Mac. The Mac's address is the way for a headset that finds nothing.
 #[composable]
-fn NativeConnect(settings: MutableState<Settings>, model: MutableState<Model>) {
-    let code = cranpose_core::remember(|| TextFieldState::new("")).with(|state| *state);
+fn NativeConnect(model: MutableState<Model>) {
     let (native, lan) = model.with(|m| (m.native.clone(), m.lan.clone()));
     let port = native.as_ref().map_or(backend::NATIVE_PORT, |n| n.port);
-    if lan.is_empty() {
-        Label("This Mac has no address on a local network. Connect it to Wi-Fi or Ethernet.".into());
-    } else {
-        let addresses: Vec<String> = lan.iter().map(|ip| format!("{ip}:{port}")).collect();
-        Label(format!("Address for the headset: {}", addresses.join(" or ")));
-    }
-    Hint("Open the cranvr app on the Quest and type this address into its connect panel. Use the same Wi-Fi as this Mac, on 5 GHz.".into());
+    Label("Open cranvr on the headset. It finds this Mac.".into());
+    Hint("Put the headset on the same Wi-Fi as this Mac, on 5 GHz. The first time, this window asks you to allow the headset.".into());
     match &native {
         None => Hint("The host tells which headsets are paired while it runs.".into()),
-        Some(n) if n.paired.is_empty() => Label("No headset is paired yet.".into()),
-        Some(n) => Label(format!("Paired headsets: {}", n.paired.join(", "))),
+        Some(n) if n.paired.is_empty() => Hint("No headset is paired yet.".into()),
+        Some(n) => Hint(format!("Paired headsets: {}", n.paired.join(", "))),
     }
-    if native.as_ref().is_some_and(|n| n.local_only) {
-        Hint("The host takes connections from this Mac only until a headset is paired.".into());
+    if lan.is_empty() {
+        Hint("This Mac has no address on a local network. Connect it to Wi-Fi or Ethernet.".into());
+    } else {
+        let addresses: Vec<String> = lan.iter().map(|ip| format!("{ip}:{port}")).collect();
+        Hint(format!("If the headset does not find this Mac, enter its address in the headset: {}", addresses.join(" or ")));
     }
-    FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-        Text("Code from the headset".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
-        BasicTextField(
-            code,
-            Modifier::empty()
-                .width(120.0)
-                .rounded_corners(8.0)
-                .background(Color::from_rgb_u8(BUTTON.0, BUTTON.1, BUTTON.2))
-                .padding(8.0)
-                .content_description("Pairing code"),
-            TextStyle::default(),
-        );
-        Primary("Pair".into(), move || match backend::pair_digits(&code.text()) {
-            Some(digits) => start_host(settings, model, Some(&digits)),
-            None => model.update(|m| {
-                m.message = Some("A pairing code has six digits. The cranvr app on the headset shows them in its connect panel.".into())
-            }),
-        });
-    });
-    if native.is_some_and(|n| n.pairing_until.is_some()) {
-        Text("Pairing is open. Press Connect in the headset.".to_string(), Modifier::empty(), colored(110, 200, 140));
-    }
-    Hint("Type the six digits from the headset's connect panel and press Pair. Then press Connect in the headset. Pairing stays open for 10 minutes or until one headset pairs. A change of a setting restarts the host and closes it.".into());
 }
 
 #[composable]
@@ -905,7 +908,7 @@ fn SettingsTab(settings: MutableState<Settings>, model: MutableState<Model>) {
             }
         });
         Hint(if native {
-            "The cranvr client is cranvr's own app on the headset. The host speaks cranvr's protocol. Each headset pairs once with a code. The Network choice, Low latency and trusted names count for the ALVR client only, so they are hidden."
+            "The cranvr client is cranvr's own app on the headset. The host speaks cranvr's protocol. A new headset asks you to allow it once. The Network choice, Low latency and trusted names count for the ALVR client only, so they are hidden."
         } else {
             "The ALVR client is the ALVR app from the Meta store. Choose the cranvr client to use cranvr's own app on the headset."
         }
@@ -1011,7 +1014,7 @@ fn SettingsTab(settings: MutableState<Settings>, model: MutableState<Model>) {
             match &paired {
                 None => Hint("The host tells which headsets are paired while it runs.".into()),
                 Some(names) if names.is_empty() => {
-                    Hint("None yet. Type the code that the cranvr app on the headset shows into the box at the top of this window. Then press Pair.".into())
+                    Hint("None yet. Open the cranvr app on the headset. This window then asks you to allow it.".into())
                 }
                 Some(names) => {
                     for name in names {

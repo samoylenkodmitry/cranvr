@@ -7,7 +7,7 @@ mod common;
 use common::{caps, host_identity, identity, meta, Rng};
 use cranvr_proto::{
     fec::ParityController,
-    link::{ClientLink, HostLink, HostListener, Incoming, MediaMode},
+    link::{ClientLink, ConnectObserver, HostLink, HostListener, Incoming, MediaMode},
     media::{FrameReceiver, DEFAULT_SHARD_LEN},
     message::*,
     wire::{Codec, Error, Motion, Pose},
@@ -362,4 +362,99 @@ fn a_foveated_stream_takes_the_clients_eye_size_when_the_host_has_no_width() {
     c.foveation = false;
     let stream = negotiate(&w, &c).unwrap();
     assert_eq!((stream.eye_size[0], stream.foveation.is_none()), (1248, true));
+}
+
+/// An observer that tells the test what the client shows, and gives up when the test says so.
+struct Watch {
+    shown: mpsc::Sender<(u32, String)>,
+    give_up: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ConnectObserver for Watch {
+    fn waiting(&mut self, code: u32, host_name: &str) {
+        self.shown.send((code, host_name.to_owned())).unwrap();
+    }
+
+    fn cancelled(&self) -> bool {
+        self.give_up.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+fn watch() -> (Watch, mpsc::Receiver<(u32, String)>, Arc<std::sync::atomic::AtomicBool>) {
+    let (shown, seen) = mpsc::channel();
+    let give_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    (Watch { shown, give_up: Arc::clone(&give_up) }, seen, give_up)
+}
+
+#[test]
+fn a_host_holds_an_unknown_client_and_both_sides_show_the_same_code_until_the_user_allows_it() {
+    let listener = HostListener::bind("127.0.0.1:0", host_identity()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (user_says, user) = mpsc::channel::<bool>();
+    let host = thread::spawn(move || {
+        let mut pending = listener.accept().unwrap();
+        let code = pending.hold_for_approval("Test Mac").unwrap();
+        let allowed = user.recv_timeout(WAIT).unwrap();
+        assert!(allowed);
+        let stream = negotiate(&wishes(), &pending.caps).unwrap();
+        (code, pending.client_key, pending.accept(stream, MediaMode::Udp, DEFAULT_SHARD_LEN).unwrap())
+    });
+    let (mut observer, seen, _) = watch();
+    let client = thread::spawn(move || ClientLink::connect_with(addr, &caps(), &identity(), None, WAIT, &mut observer));
+    // The client shows a code while the host waits for its user
+    let (client_code, host_name) = seen.recv_timeout(WAIT).unwrap();
+    assert_eq!(host_name, "Test Mac");
+    assert!(client_code < 1_000_000);
+    // The user allows the client on the host
+    user_says.send(true).unwrap();
+    let (host_code, key, link) = host.join().unwrap();
+    assert_eq!(host_code, client_code, "the user compares these two");
+    assert_eq!(key, identity().public_key());
+    let client = client.join().unwrap().unwrap();
+    assert_eq!(client.welcome.session, link.session);
+    assert!(client.duplex.has_udp() && link.duplex.has_udp());
+}
+
+#[test]
+fn a_denied_client_hears_that_the_user_said_no() {
+    for reason in [RejectReason::Denied, RejectReason::NoAnswer] {
+        let listener = HostListener::bind("127.0.0.1:0", host_identity()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sent = reason.clone();
+        let host = thread::spawn(move || {
+            let mut pending = listener.accept().unwrap();
+            pending.hold_for_approval("Test Mac").unwrap();
+            pending.reject(sent);
+        });
+        let (mut observer, _seen, _give_up) = watch();
+        let result = ClientLink::connect_with(addr, &caps(), &identity(), None, WAIT, &mut observer);
+        assert!(matches!(&result, Err(Error::Rejected(got)) if *got == reason), "{:?}", result.err());
+        host.join().unwrap();
+    }
+}
+
+#[test]
+fn a_client_that_gives_up_while_it_waits_is_noticed_by_the_host() {
+    let listener = HostListener::bind("127.0.0.1:0", host_identity()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let host = thread::spawn(move || {
+        let mut pending = listener.accept().unwrap();
+        pending.hold_for_approval("Test Mac").unwrap();
+        // The host looks as often as the app does while it shows its card
+        let started = std::time::Instant::now();
+        let before = pending.client_left();
+        while !pending.client_left() && started.elapsed() < WAIT {
+            thread::sleep(Duration::from_millis(20));
+        }
+        (before, started.elapsed() < WAIT)
+    });
+    let (mut observer, seen, give_up) = watch();
+    let client = thread::spawn(move || ClientLink::connect_with(addr, &caps(), &identity(), None, WAIT, &mut observer));
+    seen.recv_timeout(WAIT).unwrap();
+    give_up.store(true, std::sync::atomic::Ordering::Relaxed);
+    let result = client.join().unwrap();
+    assert!(matches!(result, Err(Error::Closed)), "{:?}", result.err());
+    let (before, noticed) = host.join().unwrap();
+    assert!(!before, "a client that waits has not left");
+    assert!(noticed, "the host saw the client go");
 }

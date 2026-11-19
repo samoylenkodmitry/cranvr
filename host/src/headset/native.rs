@@ -10,6 +10,10 @@
 //!
 //! One client connects at a time. A second one gets the reason `Busy`.
 //!
+//! A client that the host does not know waits for the user (see `pairing.rs`): the host holds its
+//! connection, lists it in the status line and starts the session when the user allows it.
+//! The host also answers the headsets' discovery queries (`cranvr_proto::discovery`).
+//!
 //! The desktop panel and the game sound are in `native/desktop.rs` and `native/audio.rs`.
 
 pub mod audio;
@@ -17,7 +21,7 @@ pub mod desktop;
 
 use super::{display_lock::{DisplayLock, Report}, Button, Device, Event, EventSource, FramePlan, Headset, OutFrame};
 use crate::{
-    pairing::{Attempt, Pairings},
+    pairing::{display_name, Attempt, Pairings},
     runtime_link::Haptic,
     session::Negotiated,
     status,
@@ -37,23 +41,25 @@ use alvr_server_core::ViewsConfig;
 use cranvr_common::foveation::FoveationConfig;
 use cranvr_proto::{
     clock::{now_ns, ClockSync},
+    discovery::{self, clean_name},
     fec::ParityController,
-    identity::{format_code, pairing_code, Identity},
-    link::{HostLink, HostListener, HostSide, Incoming, MediaMode},
+    identity::{fingerprint, format_code, from_hex, pairing_code, to_hex, Identity, KEY_LEN},
+    link::{HostLink, HostListener, HostSide, Incoming, MediaMode, Pending},
     media::{FrameMeta, DEFAULT_SHARD_LEN},
     message::{
         buttons, negotiate, ClientDatagram, ClientMsg, FrameTiming, HostDatagram, HostMsg, HostWishes, Input,
-        LossReport, Ping, Pong, RejectReason, Tracking, Views as ProtoViews,
+        LossReport, Ping, Pong, RejectReason, Tracking, VersionRange, Views as ProtoViews, UPDATE_HEADSET, UPDATE_MAC,
     },
     motion::extrapolate,
-    wire::{Codec, Motion, Nanos, Pose as ProtoPose, Rect},
+    wire::{Codec, Error as ProtoError, Motion, Nanos, Pose as ProtoPose, Rect},
+    APPROVAL_VERSION,
 };
 use serde_json::{json, Value};
 use std::{
     collections::VecDeque,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         mpsc::{self, RecvTimeoutError},
         Arc, Condvar, Mutex,
     },
@@ -69,6 +75,15 @@ pub struct Config {
     pub identity: Identity,
     /// The headsets that the user paired. A client on this machine needs no pairing.
     pub pairings: Arc<Pairings>,
+    /// The name of this Mac in the discovery answer and on the headset's panel
+    pub name: String,
+    /// The UDP port that answers discovery queries. `None` turns discovery off.
+    pub discovery_port: Option<u16>,
+    /// How long the host holds a client that it does not know for the user's answer
+    pub approval_wait: Duration,
+    /// Ask the user about a client on this machine as well. The USB link and a flat window of the
+    /// client are on this machine and need no approval. Tests turn this on to reach the approval.
+    pub approve_loopback: bool,
     /// Accept every client without a pairing (for tests)
     pub trust_all: bool,
     /// Send the media over TCP, as a USB link needs it
@@ -105,6 +120,38 @@ struct Shared {
     /// The last decoder config. A new session gets it at once, because the encoder sends it only
     /// when it changes.
     decoder_config: Mutex<Option<Vec<u8>>>,
+    /// Held while a session starts, so two clients that were allowed together cannot both get one
+    starting: Mutex<()>,
+    /// The threads that hold a client for the user's answer
+    asking: Asking,
+}
+
+/// The most threads that hold a client for the user's answer at once. A device that opens many
+/// connections and finishes each handshake cannot make the host start threads without end.
+const MAX_ASKING: usize = 4;
+
+/// Counts the threads in [`ask_user`].
+#[derive(Default)]
+struct Asking(Arc<AtomicUsize>);
+
+/// A place among the threads in [`ask_user`]. It frees the place when it goes.
+struct AskingPlace(Arc<AtomicUsize>);
+
+impl Asking {
+    fn enter(&self) -> Option<AskingPlace> {
+        let before = self.0.fetch_add(1, Ordering::AcqRel);
+        if before >= MAX_ASKING {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(AskingPlace(Arc::clone(&self.0)))
+    }
+}
+
+impl Drop for AskingPlace {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl Shared {
@@ -129,42 +176,120 @@ impl EventSource for Events {
     }
 }
 
-/// The `native` status line (see status.rs): where the host listens and who may connect.
-fn status_line(port: u16, local_only: bool, pairings: &Pairings) -> Value {
+/// The `native` status line (see status.rs): where the host listens, the paired headsets, the
+/// seconds that a `--pair` window stays open, and the headsets that wait for the user. A waiting
+/// headset has its key (the answer names it), its name, its address and the code that both screens
+/// show.
+fn status_line(port: u16, pairings: &Pairings) -> Value {
     let (paired, pairing_s) = pairings.summary();
-    json!({"type": "native", "port": port, "local_only": local_only, "paired": paired, "pairing_s": pairing_s})
+    let pending: Vec<Value> = pairings
+        .waiting()
+        .iter()
+        .map(|request| json!({"key": to_hex(&request.key), "name": request.name, "ip": request.ip.to_string(), "code": format_code(request.code)}))
+        .collect();
+    json!({"type": "native", "port": port, "paired": paired, "pairing_s": pairing_s, "pending": pending})
+}
+
+fn announce(config: &Config) {
+    status::emit(status_line(config.port, &config.pairings));
 }
 
 /// Starts listening. A bind error comes back to the caller.
 pub fn start(config: Config) -> std::io::Result<(Arc<dyn Headset>, Box<dyn EventSource>)> {
-    let local_only = !config.trust_all && !config.pairings.reachable();
-    let address: SocketAddr = if local_only { ([127, 0, 0, 1], config.port).into() } else { ([0, 0, 0, 0], config.port).into() };
+    // Any machine on the network may connect. A client that the host does not know waits for the user.
+    let address: SocketAddr = ([0, 0, 0, 0], config.port).into();
     let listener = HostListener::bind(address, config.identity.clone()).map_err(|e| std::io::Error::other(e.to_string()))?;
-    info!("Native protocol: this host's key starts with {}", cranvr_proto::identity::to_hex(&config.identity.public_key()[..8]));
-    info!(
-        "Native protocol: listening on {address}{}",
-        if local_only { " (this Mac only: start the host with --pair CODE to pair a headset)" } else { "" }
-    );
-    status::emit(status_line(config.port, local_only, &config.pairings));
+    info!("Native protocol: this host's key starts with {}", to_hex(&config.identity.public_key()[..8]));
+    info!("Native protocol: listening on {address}");
+    if let Some(port) = config.discovery_port {
+        start_discovery(port, &config);
+    }
+    announce(&config);
     let (events, receiver) = mpsc::channel();
-    let shared = Arc::new(Shared { events, session: Mutex::new(None), decoder_config: Mutex::new(None) });
+    let shared = Arc::new(Shared { events, session: Mutex::new(None), decoder_config: Mutex::new(None), starting: Mutex::new(()), asking: Asking::default() });
     {
         let shared = Arc::clone(&shared);
-        thread::Builder::new().name("native-accept".into()).spawn(move || accept_loop(listener, config, shared, local_only))?;
+        let config = Arc::new(config);
+        thread::Builder::new().name("native-accept".into()).spawn(move || accept_loop(listener, config, shared))?;
     }
     Ok((Arc::new(Native { shared }), Box::new(Events(receiver))))
 }
 
-fn accept_loop(listener: HostListener, config: Config, shared: Arc<Shared>, local_only: bool) {
+/// Answers the headsets' queries on the local network: the Mac's name, the port and the start of
+/// the key's fingerprint. A bind error only costs the discovery: a headset can still connect to a
+/// typed address.
+fn start_discovery(port: u16, config: &Config) {
+    static NEVER: AtomicBool = AtomicBool::new(false);
+    let responder = match discovery::Responder::bind(port) {
+        Ok(responder) => responder,
+        Err(e) => {
+            warn!("Native protocol: no discovery on UDP port {port}: {e}. A headset needs the address of this Mac typed in.");
+            return;
+        }
+    };
+    let answer = discovery::Answer {
+        versions: VersionRange::OURS,
+        port: config.port,
+        fingerprint: fingerprint(&config.identity.public_key()),
+        nonce: 0,
+        name: config.name.clone(),
+    };
+    info!("Native protocol: answering discovery queries on UDP port {port} as \"{}\"", clean_name(&config.name));
+    thread::Builder::new().name("native-discovery".into()).spawn(move || responder.run(&NEVER, &answer)).ok();
+}
+
+/// Reads the user's answers from the host's input: `allow KEY` or `deny KEY`, with the key that the
+/// status line shows. The cranvr app writes them. A person who runs the host by hand may type them.
+pub fn read_answers(pairings: Arc<Pairings>) {
+    thread::Builder::new()
+        .name("native-answers".into())
+        .spawn(move || {
+            for line in std::io::stdin().lines().map_while(Result::ok) {
+                let Some((allow, key)) = parse_answer(&line) else { continue };
+                if !pairings.answer(&key, allow) {
+                    info!("Native protocol: no headset with the key {} waits for an answer", to_hex(&key[..4]));
+                }
+            }
+        })
+        .ok();
+}
+
+/// `allow KEY` or `deny KEY` as the user's answer. The key is 64 hex digits.
+fn parse_answer(line: &str) -> Option<(bool, [u8; KEY_LEN])> {
+    let mut words = line.split_whitespace();
+    let allow = match words.next()? {
+        "allow" => true,
+        "deny" => false,
+        _ => return None,
+    };
+    let key = from_hex(words.next()?)?;
+    words.next().is_none().then_some((allow, key))
+}
+
+/// What a version mismatch says to the host's user. The client that could not talk is gone, so the
+/// message names no address.
+fn version_notice(error: &ProtoError) -> Option<String> {
+    let headset_is_older = error.peer_must_update()?;
+    Some(format!(
+        "A headset tried to connect with a cranvr app of {} version. {}",
+        if headset_is_older { "an older" } else { "a newer" },
+        if headset_is_older { UPDATE_HEADSET } else { UPDATE_MAC }
+    ))
+}
+
+fn accept_loop(listener: HostListener, config: Arc<Config>, shared: Arc<Shared>) {
     loop {
         let pending = match listener.accept() {
             Ok(pending) => pending,
             Err(e) => {
                 warn!("Native protocol: a connection failed before its hello: {e}");
+                if let Some(message) = version_notice(&e) {
+                    status::emit(json!({"type": "network", "problem": "incompatible_client", "message": message}));
+                }
                 continue;
             }
         };
-        let name = pending.caps.name.clone();
+        let name = display_name(&pending.caps.name);
         if shared.session().is_some() {
             warn!("Native protocol: {name} at {} was refused: another headset is connected", pending.peer);
             pending.reject(RejectReason::Busy);
@@ -173,74 +298,179 @@ fn accept_loop(listener: HostListener, config: Config, shared: Arc<Shared>, loca
         // A client on this Mac needs no pairing. For another one the host looks up the key.
         // The handshake proved that the client holds it, so a client cannot claim the key of
         // another client.
-        if !(config.trust_all || pending.peer.ip().is_loopback()) {
-            let key = pending.client_key;
-            if !config.pairings.contains(&key) {
-                let outcome = config.pairings.try_pair(&key, &name);
-                if outcome != Attempt::NoWindow {
-                    // The window closed, or the headset is paired now
-                    status::emit(status_line(config.port, local_only, &config.pairings));
-                }
-                match outcome {
-                    Attempt::Paired => info!("Native protocol: paired {name} at {}", pending.peer),
-                    outcome => {
-                        let code = format_code(pairing_code(&key));
-                        let hint = match outcome {
-                            Attempt::WrongCode => "its code is not the one that --pair has".to_string(),
-                            _ => format!("start the host with --pair {}", code.replace(' ', "")),
-                        };
-                        warn!("Native protocol: {name} at {} is not paired. Its code is {code}: {hint}", pending.peer);
-                        // The status line leaves the code out: the user reads it in the headset
-                        let advice = match outcome {
-                            Attempt::WrongCode => "It showed a code that differs from the one that was typed. Check the six digits in its connect panel.",
-                            _ => "Type the six digits that its connect panel shows into cranvr and press Pair.",
-                        };
-                        status::emit(json!({
-                            "type": "network",
-                            "problem": "not_paired",
-                            "message": format!("The headset {name} at {} is not paired. {advice}", pending.peer.ip()),
-                        }));
-                        pending.reject(RejectReason::NotPaired);
-                        continue;
-                    }
-                }
-            }
-        }
-        let mut stream = match negotiate(&config.wishes, &pending.caps) {
-            Ok(stream) => stream,
-            Err(reason) => {
-                warn!("Native protocol: no stream for {name}: {reason:?}");
-                pending.reject(reason);
+        let known = config.trust_all
+            || (pending.peer.ip().is_loopback() && !config.approve_loopback)
+            || config.pairings.contains(&pending.client_key);
+        if known {
+            start_session(&config, &shared, pending, &name);
+        } else if pending.version >= APPROVAL_VERSION {
+            let (config, shared) = (Arc::clone(&config), Arc::clone(&shared));
+            let Some(place) = shared.asking.enter() else {
+                warn!("Native protocol: {name} at {} was refused: too many headsets wait for the user", pending.peer);
+                pending.reject(RejectReason::Busy);
                 continue;
+            };
+            let spawned = thread::Builder::new().name("native-approval".into()).spawn(move || {
+                let _place = place;
+                ask_user(&config, &shared, pending, &name)
+            });
+            if let Err(e) = spawned {
+                warn!("Native protocol: no thread for an approval: {e}");
             }
-        };
-        stream.audio = config.audio.then_some(cranvr_proto::message::AudioFormat::HOST_CAPTURE);
-        let (mode, shard_len) = if config.tcp_media || pending.caps.tcp_only {
-            (MediaMode::Tcp, 60_000)
         } else {
-            (MediaMode::Udp, DEFAULT_SHARD_LEN)
-        };
-        let (peer, caps_views) = (pending.peer, pending.caps.views);
-        let link = match pending.accept(stream.clone(), mode, shard_len) {
-            Ok(link) => link,
-            Err(e) => {
-                warn!("Native protocol: the handshake with {name} failed: {e}");
-                continue;
-            }
-        };
-        info!("Native protocol: {name} at {peer} connected, {} media, sealed", if link.duplex.has_udp() { "UDP" } else { "TCP" });
-        let session = Arc::new(Session::new(link, &stream, config.display_lock));
-        session.desktop.set(desktop::Desktop::start(config.desktop.clone(), Arc::clone(&session))).ok();
-        if config.audio {
-            audio::attach(&session);
+            refuse_old_headset(&config, &shared, pending, &name);
         }
-        *shared.session.lock().unwrap() = Some(Arc::clone(&session));
-        let shared = Arc::clone(&shared);
-        thread::Builder::new()
-            .name("native-session".into())
-            .spawn(move || run_session(&shared, &session, stream, caps_views, peer))
-            .expect("session thread");
     }
+}
+
+/// A client of protocol version 4 cannot wait for the user. It pairs with `--pair CODE` as before,
+/// or the host refuses it and tells the user to update the headset's app.
+fn refuse_old_headset(config: &Config, shared: &Arc<Shared>, pending: Pending, name: &str) {
+    let key = pending.client_key;
+    let outcome = config.pairings.try_pair(&key, name);
+    if outcome != Attempt::NoWindow {
+        // The window closed, or the headset is paired now
+        announce(config);
+    }
+    if outcome == Attempt::Paired {
+        info!("Native protocol: paired {name} at {}", pending.peer);
+        return start_session(config, shared, pending, name);
+    }
+    warn!("Native protocol: {name} at {} runs an older cranvr app and is not paired. Its code is {}", pending.peer, format_code(pairing_code(&key)));
+    status::emit(json!({
+        "type": "network",
+        "problem": "incompatible_client",
+        "message": format!("The headset {name} at {} is not paired, and its cranvr app is too old to ask. {UPDATE_HEADSET}", pending.peer.ip()),
+    }));
+    pending.reject(RejectReason::NotPaired);
+}
+
+/// How an approval ended.
+enum Outcome {
+    Allowed,
+    Denied,
+    /// The client closed the connection
+    Left,
+    NoAnswer,
+}
+
+/// Ends the request of a waiting headset on every path out of [`ask_user`], and tells the app.
+struct Held<'a> {
+    config: &'a Config,
+    key: [u8; KEY_LEN],
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        self.config.pairings.withdraw(&self.key);
+        announce(self.config);
+    }
+}
+
+/// Holds a client that the host does not know until the user answers. The client and the host
+/// compute the same code. The app shows it to the user with Allow and Deny. The user compares it with
+/// the code in the headset. The thread ends with the answer, a timeout or the client's departure.
+fn ask_user(config: &Config, shared: &Arc<Shared>, mut pending: Pending, name: &str) {
+    let (key, peer) = (pending.client_key, pending.peer);
+    let code = match pending.hold_for_approval(&config.name) {
+        Ok(code) => code,
+        Err(e) => {
+            warn!("Native protocol: {name} at {peer} did not take part in the approval: {e}");
+            return;
+        }
+    };
+    if !config.pairings.ask(key, name, peer.ip(), code) {
+        warn!("Native protocol: {name} at {peer} was refused: another headset waits for the user");
+        pending.reject(RejectReason::Busy);
+        return;
+    }
+    let held = Held { config, key };
+    announce(config);
+    info!(
+        "Native protocol: {name} at {peer} wants to connect and shows the code {}. Allow it in the cranvr app, or type `allow {key}` or `deny {key}` into this host's input.",
+        format_code(code),
+        key = to_hex(&key)
+    );
+    let deadline = Instant::now() + config.approval_wait;
+    let outcome = loop {
+        match config.pairings.answered(&key) {
+            Some(true) => break Outcome::Allowed,
+            Some(false) => break Outcome::Denied,
+            None => {}
+        }
+        if pending.client_left() {
+            break Outcome::Left;
+        }
+        if Instant::now() >= deadline {
+            break Outcome::NoAnswer;
+        }
+        thread::sleep(APPROVAL_POLL);
+    };
+    match outcome {
+        Outcome::Allowed => {
+            config.pairings.add(&key, name);
+            drop(held);
+            info!("Native protocol: paired {name} at {peer}");
+            start_session(config, shared, pending, name);
+        }
+        Outcome::Denied => {
+            info!("Native protocol: the user denied {name} at {peer}");
+            pending.reject(RejectReason::Denied);
+        }
+        Outcome::Left => info!("Native protocol: {name} at {peer} left before the user answered"),
+        Outcome::NoAnswer => {
+            info!("Native protocol: nobody answered for {name} at {peer} within {} s", config.approval_wait.as_secs());
+            pending.reject(RejectReason::NoAnswer);
+        }
+    }
+}
+
+/// How often a waiting approval looks for the user's answer and for the client's departure
+const APPROVAL_POLL: Duration = Duration::from_millis(100);
+
+/// Negotiates a stream with a client that may connect, sends the welcome and starts the session.
+fn start_session(config: &Config, shared: &Arc<Shared>, pending: Pending, name: &str) {
+    let _starting = shared.starting.lock().unwrap();
+    // Another headset may have connected while this one waited for the user
+    if shared.session().is_some() {
+        warn!("Native protocol: {name} at {} was refused: another headset is connected", pending.peer);
+        pending.reject(RejectReason::Busy);
+        return;
+    }
+    let mut stream = match negotiate(&config.wishes, &pending.caps) {
+        Ok(stream) => stream,
+        Err(reason) => {
+            warn!("Native protocol: no stream for {name}: {reason:?}");
+            pending.reject(reason);
+            return;
+        }
+    };
+    stream.audio = config.audio.then_some(cranvr_proto::message::AudioFormat::HOST_CAPTURE);
+    let (mode, shard_len) = if config.tcp_media || pending.caps.tcp_only {
+        (MediaMode::Tcp, 60_000)
+    } else {
+        (MediaMode::Udp, DEFAULT_SHARD_LEN)
+    };
+    let (peer, caps_views) = (pending.peer, pending.caps.views);
+    let link = match pending.accept(stream.clone(), mode, shard_len) {
+        Ok(link) => link,
+        Err(e) => {
+            warn!("Native protocol: the handshake with {name} failed: {e}");
+            return;
+        }
+    };
+    info!("Native protocol: {name} at {peer} connected, {} media, sealed", if link.duplex.has_udp() { "UDP" } else { "TCP" });
+    let session = Arc::new(Session::new(link, &stream, config.display_lock));
+    session.desktop.set(desktop::Desktop::start(config.desktop.clone(), Arc::clone(&session))).ok();
+    if config.audio {
+        audio::attach(&session);
+    }
+    *shared.session.lock().unwrap() = Some(Arc::clone(&session));
+    let shared = Arc::clone(shared);
+    thread::Builder::new()
+        .name("native-session".into())
+        .spawn(move || run_session(&shared, &session, stream, caps_views, peer))
+        .expect("session thread");
 }
 
 fn run_session(shared: &Shared, session: &Arc<Session>, stream: cranvr_proto::message::StreamParams, views: ProtoViews, peer: SocketAddr) {
@@ -362,8 +592,8 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
             );
             shared.emit(Event::Recenter);
         }
-        // The proof belongs to the handshake. A later one means nothing.
-        Incoming::Control(ClientMsg::Hello(_)) => {}
+        // The proof and the approval belong to the handshake. A later one means nothing.
+        Incoming::Control(ClientMsg::Hello(_) | ClientMsg::PairNonce(_)) => {}
     }
 }
 

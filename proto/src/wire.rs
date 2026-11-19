@@ -85,6 +85,17 @@ impl fmt::Display for Error {
     }
 }
 
+impl Error {
+    /// For a version mismatch: whether the peer is the side that must update. `None` for any other
+    /// error.
+    pub fn peer_must_update(&self) -> Option<bool> {
+        match self {
+            Error::Version { ours, theirs } => Some(theirs.1 < ours.1),
+            _ => None,
+        }
+    }
+}
+
 impl std::error::Error for Error {}
 
 impl From<io::Error> for Error {

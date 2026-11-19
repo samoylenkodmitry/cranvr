@@ -1,11 +1,13 @@
 //! Keys: every client and every host has an Ed25519 key that it generated. A side that is paired
 //! with another one remembers that side's public key.
 //!
-//! The client keeps a 32-byte seed. Its public key goes to the host in the handshake. A client
-//! that the host does not know shows a short code that comes from its public key. The user enters
-//! the code at the host (`cranvr-host --pair CODE`). The host then remembers the public key. The
-//! host has a key of its own. A client remembers the key of the host that it paired with, and
-//! refuses a host with another key.
+//! The client keeps a 32-byte seed. Its public key goes to the host in the handshake. A host
+//! that does not know the key asks its user (protocol version 5): both screens show a code that
+//! comes from the session (see [`crate::secure::approval_code`]), and the user allows the headset
+//! on the Mac. The host then remembers the public key. A version 4 client shows a short code that
+//! comes from its public key. The user enters it at the host (`cranvr-host --pair CODE`). The host
+//! has a key of its own. A client remembers the key of the host that it paired with, and refuses a
+//! host with another key.
 //!
 //! Each connection proves the keys. Both sides sign a hash of the handshake with their seeds (see
 //! [`crate::secure`]). The hash covers the fresh keys of that connection, so a signature serves for
@@ -30,6 +32,10 @@ pub const KEY_LEN: usize = 32;
 pub const SIGNATURE_LEN: usize = 64;
 /// What the pairing code hashes in front of the public key
 const CODE_LABEL: &[u8] = b"cranvr pairing code v1";
+/// What the fingerprint hashes in front of the public key
+const FINGERPRINT_LABEL: &[u8] = b"cranvr key fingerprint v1";
+/// The bytes of a fingerprint
+pub const FINGERPRINT_LEN: usize = 8;
 /// The pairing code has this many digits.
 pub const CODE_DIGITS: u32 = 6;
 
@@ -80,6 +86,14 @@ pub fn verify_message(public_key: &[u8; KEY_LEN], message: &[u8], signature: &[u
 pub fn pairing_code(public_key: &[u8; KEY_LEN]) -> u32 {
     let hash = Sha256::new().chain_update(CODE_LABEL).chain_update(public_key).finalize();
     u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]) % 10u32.pow(CODE_DIGITS)
+}
+
+/// The start of a key's SHA-256 hash. A host names itself with it in the discovery answer, and a
+/// client that paired with a host finds the key again by it. It is no proof of the key: only the
+/// handshake proves a key.
+pub fn fingerprint(public_key: &[u8; KEY_LEN]) -> [u8; FINGERPRINT_LEN] {
+    let hash = Sha256::new().chain_update(FINGERPRINT_LABEL).chain_update(public_key).finalize();
+    hash[..FINGERPRINT_LEN].try_into().expect("a hash is longer than a fingerprint")
 }
 
 /// The code as the user reads and types it: six digits, with a space in the middle.
@@ -150,6 +164,14 @@ mod tests {
         assert_eq!(parse_code("12345"), None);
         assert_eq!(parse_code("12a456"), None);
         assert_eq!(parse_code("1234567"), None);
+    }
+
+    #[test]
+    fn a_fingerprint_is_the_start_of_a_hash_of_the_key() {
+        let (a, b) = (Identity::from_seed([1; KEY_LEN]).public_key(), Identity::from_seed([2; KEY_LEN]).public_key());
+        assert_eq!(fingerprint(&a), fingerprint(&a));
+        assert_ne!(fingerprint(&a), fingerprint(&b));
+        assert_eq!(fingerprint(&a).len(), FINGERPRINT_LEN);
     }
 
     #[test]
