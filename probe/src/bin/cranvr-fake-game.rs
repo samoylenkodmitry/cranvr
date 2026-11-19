@@ -247,7 +247,7 @@ struct Tracked {
 }
 
 fn floats_of(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+    bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()
 }
 
 /// Whether the joints in `bytes` (a pose of 7 floats each, then a flags byte each) are the expected
@@ -287,8 +287,8 @@ impl Tracked {
         let mut out = Vec::new();
         let uses = |name: &str| used.split(',').any(|f| f == name);
         if uses("hands") {
-            for side in 0..2 {
-                let Some(p) = &self.hands[side] else {
+            for (side, hand) in self.hands.iter().enumerate() {
+                let Some(p) = hand else {
                     out.push(format!("no message for hand {side}"));
                     continue;
                 };
