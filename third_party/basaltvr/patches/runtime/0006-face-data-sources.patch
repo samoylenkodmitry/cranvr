@@ -16,13 +16,14 @@ offers one too.
 
 xrCreateFaceTracker2FB follows the extension for requestedDataSources. An empty
 list takes any source. A duplicate, a value that is no source and a missing list
-for a counted one are XR_ERROR_VALIDATION_FAILURE. The runtime is more lenient
-than the extension's word "accepts" in one case. The extension lets a runtime
-refuse a list that holds no source of the headset's face with
-XR_ERROR_FEATURE_UNSUPPORTED. This runtime makes the tracker instead and serves
-the headset's face. A game that lists the cameras only still gets the face of a
-Quest 3. While the headset offers no face (it may reconnect), a tracker is made
-and reads none.
+for a counted one are XR_ERROR_VALIDATION_FAILURE. One case deviates from the
+extension on purpose. The extension says that a runtime must return
+XR_ERROR_FEATURE_UNSUPPORTED when it believes that it will never serve the list,
+and a list without a source of the headset's face is such a list. This runtime
+makes the tracker instead and serves the headset's face. A game that lists the
+cameras only still gets the face of a Quest 3. One condition in
+createFaceTracker2 restores the error. While the headset offers no face (it may
+reconnect), a tracker is made and reads none.
 
 xrGetFaceExpressionWeights2FB reports the source of the newest sample as
 dataSource. The daemon says it with flag 4 of FACE_TRACKING. Before a sample
@@ -122,7 +123,7 @@ index a18b708..ac41eab 100644
      uint32_t flags;
      float confidences[kTrackedFaceConfidences];
 diff --git a/runtime/pe/tracking.cpp b/runtime/pe/tracking.cpp
-index 3210d42..2389f5a 100644
+index 3210d42..2873417 100644
 --- a/runtime/pe/tracking.cpp
 +++ b/runtime/pe/tracking.cpp
 @@ -64,8 +64,11 @@ struct TrackerRecord {
@@ -193,7 +194,7 @@ index 3210d42..2389f5a 100644
              break;
          }
          case XR_TYPE_SYSTEM_EYE_GAZE_INTERACTION_PROPERTIES_EXT:
-@@ -656,22 +684,38 @@ XrResult XRAPI_CALL createFaceTracker2(
+@@ -656,22 +684,41 @@ XrResult XRAPI_CALL createFaceTracker2(
      *faceTracker = XR_NULL_HANDLE;
      if (createInfo == nullptr || createInfo->type != XR_TYPE_FACE_TRACKER_CREATE_INFO2_FB ||
          createInfo->faceExpressionSet != XR_FACE_EXPRESSION_SET2_DEFAULT_FB ||
@@ -224,11 +225,14 @@ index 3210d42..2389f5a 100644
 +        // The game takes any source
 +        sources = kSourceVisual | kSourceAudio;
 +    }
-+    // The extension lets a runtime refuse a list that holds no source of the headset's face
-+    // (XR_ERROR_FEATURE_UNSUPPORTED). This runtime makes the tracker instead and serves the
-+    // headset's face with its true dataSource: a game that lists only the cameras then still gets
-+    // the face of a Quest 3, which comes from the microphone. While no headset offers a face (it
-+    // may reconnect), the tracker is made and reads none.
++    // Deviation from the extension: it says that a runtime must return
++    // XR_ERROR_FEATURE_UNSUPPORTED when it believes that it will never serve the list, and a list
++    // that holds no source of the headset's face is such a list. This runtime makes the tracker
++    // instead and serves the headset's face with its true dataSource, so that a game which lists
++    // only the cameras still gets the face of a Quest 3, which comes from the microphone. To follow
++    // the extension, return XR_ERROR_FEATURE_UNSUPPORTED here when `sources & supported` is 0 and
++    // `supported` is not 0. While no headset offers a face (it may reconnect), the tracker is made
++    // and reads none.
 +    const uint32_t supported = offeredFaceSources(controlTrackingOffered());
      uintptr_t handle = 0;
 -    const XrResult result = createTracker(session, TrackerKind::kFace, 0, 0, sources, &handle);
@@ -236,7 +240,7 @@ index 3210d42..2389f5a 100644
      if (XR_SUCCEEDED(result)) {
          *faceTracker = reinterpret_cast<XrFaceTracker2FB>(handle);
      }
-@@ -705,9 +749,13 @@ XrResult XRAPI_CALL getFaceExpressionWeights2(
+@@ -705,9 +752,13 @@ XrResult XRAPI_CALL getFaceExpressionWeights2(
      }
      ControlFaceState state{};
      controlFaceState(tracker.session, &state);
@@ -254,7 +258,7 @@ index 3210d42..2389f5a 100644
      expressionWeights->confidenceCount = kTrackedFaceConfidences;
      for (uint32_t index = 0; index < kTrackedFaceWeights; ++index) {
 diff --git a/runtime/tests/tracking_smoke.cpp b/runtime/tests/tracking_smoke.cpp
-index aefd6c7..4cf9a1d 100644
+index aefd6c7..12f1efc 100644
 --- a/runtime/tests/tracking_smoke.cpp
 +++ b/runtime/tests/tracking_smoke.cpp
 @@ -4,9 +4,16 @@
@@ -345,7 +349,7 @@ index aefd6c7..4cf9a1d 100644
      if ((wanted & kEyes) != 0) report(eyeSupport.supportsEyeGazeInteraction == XR_TRUE, "the system supports eye gaze interaction");
  
      // The tracking functions answer only for enabled extensions
-@@ -420,14 +464,63 @@ int main(int argc, char** argv) {
+@@ -420,14 +464,64 @@ int main(int argc, char** argv) {
              CHECK_XR(createBody(session, &info, &bodies[1]));
          }
      }
@@ -382,8 +386,9 @@ index aefd6c7..4cf9a1d 100644
 +        }
 +
 +        // What the creation answers for each list of sources. The extension makes a duplicate and a
-+        // value that is no source a validation failure, and an empty list takes any source. A list
-+        // that holds no source of the headset's face may be refused; this runtime makes the tracker.
++        // value that is no source a validation failure, and an empty list takes any source. It also
++        // says that a list which the runtime can never serve gets XR_ERROR_FEATURE_UNSUPPORTED. This
++        // runtime deviates on purpose: a list without a source of the headset's face makes a tracker.
 +        auto tryCreate = [&](const char* what, XrFaceTrackingDataSource2FB* list, uint32_t count, XrResult expected) {
 +            XrFaceTrackerCreateInfo2FB probe = make<XrFaceTrackerCreateInfo2FB>(XR_TYPE_FACE_TRACKER_CREATE_INFO2_FB);
 +            probe.faceExpressionSet = XR_FACE_EXPRESSION_SET2_DEFAULT_FB;
@@ -412,7 +417,7 @@ index aefd6c7..4cf9a1d 100644
      }
  
      // The eyes: an action on /user/eyes_ext/input/gaze_ext/pose
-@@ -519,6 +612,8 @@ int main(int argc, char** argv) {
+@@ -519,6 +613,8 @@ int main(int argc, char** argv) {
      bool handsOk[2] = {false, false};
      bool bodyOk[2] = {false, false};
      bool faceOk = false;
@@ -421,7 +426,7 @@ index aefd6c7..4cf9a1d 100644
      bool eyesOk = false;
      bool velocitiesOk = false;
      const uint64_t dataStart = unixMilliseconds();
-@@ -664,7 +759,10 @@ int main(int argc, char** argv) {
+@@ -664,7 +760,10 @@ int main(int argc, char** argv) {
                     bodyJoints[set], worstPosition * 1000.0f, worstAngle * 57.29578f, flagsOk ? "valid" : "WRONG", result.confidence);
          }
  
@@ -433,7 +438,7 @@ index aefd6c7..4cf9a1d 100644
              float weights[XR_FACE_EXPRESSION2_COUNT_FB]{};
              float confidences[XR_FACE_CONFIDENCE2_COUNT_FB]{};
              XrFaceExpressionWeights2FB result = make<XrFaceExpressionWeights2FB>(XR_TYPE_FACE_EXPRESSION_WEIGHTS2_FB);
-@@ -674,17 +772,57 @@ int main(int argc, char** argv) {
+@@ -674,17 +773,57 @@ int main(int argc, char** argv) {
              result.confidences = confidences;
              XrFaceExpressionInfo2FB info = make<XrFaceExpressionInfo2FB>(XR_TYPE_FACE_EXPRESSION_INFO2_FB);
              info.time = time;
@@ -502,7 +507,7 @@ index aefd6c7..4cf9a1d 100644
              }
          }
  
-@@ -720,13 +858,14 @@ int main(int argc, char** argv) {
+@@ -720,13 +859,14 @@ int main(int argc, char** argv) {
  
          const bool allDone = ((wanted & kHands) == 0 || (handsOk[0] && handsOk[1])) &&
                               (!wantBody || ((bodyOk[0] || bodies[0] == XR_NULL_HANDLE) && (bodyOk[1] || bodies[1] == XR_NULL_HANDLE))) &&
@@ -520,7 +525,7 @@ index aefd6c7..4cf9a1d 100644
              break;
          }
      }
-@@ -742,7 +881,9 @@ int main(int argc, char** argv) {
+@@ -742,7 +882,9 @@ int main(int argc, char** argv) {
      for (XrBodyTrackerFB body : bodies) {
          if (body != XR_NULL_HANDLE) destroyBody(body);
      }

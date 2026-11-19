@@ -281,7 +281,7 @@ A runtime without patch 0005 closes the connection at a message that it does not
 - `xrCreateFaceTracker2FB` takes `requestedDataSources` by the extension's rules. An empty list accepts any source. A duplicate, a value that is no source and a missing list for a counted one get `XR_ERROR_VALIDATION_FAILURE`. While no headset offers a face, the runtime makes the tracker and reads no face, so that a game survives a reconnect of the headset.
 - `xrGetFaceExpressionWeights2FB` sets `dataSource` from the newest sample, which says its own source.
 
-The runtime is more lenient than the extension in one case. The extension calls the list the sources that the game accepts. It lets a runtime refuse a list that holds no source of the headset's face with `XR_ERROR_FEATURE_UNSUPPORTED`. This runtime makes the tracker instead and serves the headset's face. A game that lists the cameras only still gets the face of a Quest 3, and `dataSource` tells it that the face comes from the microphone. Every game that creates a face tracker therefore reads the headset's face.
+One case deviates from the extension on purpose. The extension calls the list the sources that the game accepts. It says that a runtime must return `XR_ERROR_FEATURE_UNSUPPORTED` when it believes that it will never serve the list, and a list without a source of the headset's face is such a list. This runtime makes the tracker instead and serves the headset's face. One condition in `createFaceTracker2` (patch 0006) restores the error. A game that lists the cameras only still gets the face of a Quest 3, and `dataSource` tells it that the face comes from the microphone. Every game that creates a face tracker therefore reads the headset's face.
 
 ### Controllers made of hands
 
