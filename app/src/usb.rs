@@ -229,11 +229,12 @@ fn is_executable(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-/// The adb that this Mac has, and whether it is the copy that cranvr downloaded. `CRANVR_ADB`
-/// names one by hand, or says `none` to see the window of a Mac without adb.
+/// The adb that this Mac has. `CRANVR_ADB` names one by hand, or says `none` to act as a Mac
+/// without adb: only the copy that cranvr downloaded counts then.
 pub fn locate_adb() -> Option<PathBuf> {
     if let Some(chosen) = env::var_os("CRANVR_ADB") {
-        return (chosen != "none").then(|| PathBuf::from(chosen));
+        let own = own_adb_in(&config_dir());
+        return if chosen == "none" { Some(own).filter(|path| is_executable(path)) } else { Some(PathBuf::from(chosen)) };
     }
     let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     let sdk_homes: Vec<PathBuf> = ["ANDROID_HOME", "ANDROID_SDK_ROOT"].iter().filter_map(|name| env::var_os(name).map(PathBuf::from)).collect();

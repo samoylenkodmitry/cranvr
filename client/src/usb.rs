@@ -206,7 +206,6 @@ pub fn target(aim: &Aim, usb: Option<&UsbMac>, found: &[FoundHost]) -> Target {
 mod tests {
     use super::*;
 
-    const A: [u8; FINGERPRINT_LEN] = [1; FINGERPRINT_LEN];
     const B: [u8; FINGERPRINT_LEN] = [2; FINGERPRINT_LEN];
 
     fn wifi(name: &str, ip: [u8; 4], fingerprint: [u8; FINGERPRINT_LEN]) -> FoundHost {

@@ -62,7 +62,7 @@ pub struct Settings {
     pub headset_app: HeadsetApp,
     /// Counts for the ALVR client only: the cranvr client picks its media path itself
     pub stream_protocol: StreamProtocol,
-    /// How the stream reaches the cranvr client: by the USB cable when the headset is plugged into
+    /// How the stream reaches the headset: by the USB cable when the headset is plugged into
     /// this Mac, or by Wi-Fi, or by the cable only (see usb.rs)
     pub connection: Connection,
     /// The headset plays this Mac's sound

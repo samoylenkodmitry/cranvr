@@ -149,12 +149,18 @@ fn ensure_host(settings: MutableState<Settings>, model: MutableState<Model>) {
     }
 }
 
+/// What the cable thread works to: the Connection setting. It does not depend on the headset app
+/// or the stream protocol.
+fn connection_of(settings: MutableState<Settings>) -> Connection {
+    settings.with(|s| s.connection)
+}
+
 /// Reads what changes outside the window: host output every 150 ms, the rest every 2 s.
 fn refresh(settings: MutableState<Settings>, model: MutableState<Model>, slow: bool) {
     let mut next = model.with(Clone::clone);
     backend::pump(&mut next);
     // The cable counts for the cranvr client only: the ALVR client does not use it
-    usb::set_choice(settings.with(|s| if s.headset_app == HeadsetApp::Cranvr { s.connection } else { Connection::WiFi }));
+    usb::set_choice(connection_of(settings));
     next.usb = usb::status();
     let requests = std::mem::take(&mut next.vr_requests);
     vr_requests(settings, &mut next, requests);
@@ -303,6 +309,8 @@ pub fn CranvrApp() {
     let tab = rememberMutableStateOf(|| Tab::Play);
 
     LaunchedEffect((), async move |_| {
+        // The choice comes first: a Mac set to Wi-Fi must not get a link in the thread's first look
+        usb::set_choice(connection_of(settings));
         usb::start(backend::native_port());
         refresh(settings, model, true);
         // macOS asks for each missing permission once, when cranvr starts
@@ -547,11 +555,11 @@ fn UsbNote(settings: MutableState<Settings>, model: MutableState<Model>) {
         Text("Put on the headset and allow USB debugging.".to_string(), Modifier::empty(), colored(240, 170, 90));
     }
     if status.headsets.iter().any(|h| h.reversed) {
-        Text("The headset is on the USB cable. Open cranvr on the headset to stream over it.".to_string(), Modifier::empty(), colored(110, 200, 140));
+        Text("The headset is on the USB cable. It connects over the cable.".to_string(), Modifier::empty(), colored(110, 200, 140));
     } else if choice == Connection::Usb && !status.unauthorized {
         Text(
             if status.adb.is_none() && status.looked {
-                "USB needs a tool that cranvr does not have yet. Press Add USB support in the Settings tab."
+                "The USB cable needs a tool from Google. Press Add USB support in the Settings tab."
             } else {
                 "Plug the headset into this Mac with a USB cable."
             }
@@ -991,6 +999,8 @@ fn SettingsTab(settings: MutableState<Settings>, model: MutableState<Model>) {
     let s = settings.with(Clone::clone);
     let s1 = s.clone();
     let native = s.headset_app == HeadsetApp::Cranvr;
+    // The way of the stream comes first: the cable is the choice that a user looks for
+    ConnectionCard(settings, model);
     Card(move || {
         Heading("Stream".into());
         let headset_app = s1.headset_app;
@@ -1108,7 +1118,6 @@ fn SettingsTab(settings: MutableState<Settings>, model: MutableState<Model>) {
         Hint("Changes restart the host; the headset reconnects by itself.".into());
     });
     if native {
-        ConnectionCard(settings, model);
         let paired = model.with(|m| m.native.as_ref().map(|n| n.paired.clone()));
         Card(move || {
             Heading("Paired headsets".into());
@@ -1175,7 +1184,7 @@ fn ConnectionCard(settings: MutableState<Settings>, model: MutableState<Model>) 
         Hint("A change counts from the next connection of the headset. A running stream keeps its path.".into());
         Hint("The cable needs developer mode on the headset. Turn it on in the Meta Horizon app on your phone.".into());
         if choice.allows_usb() && status.adb.is_none() && status.looked {
-            Label("This Mac has no adb tool, which the cable needs.".into());
+            Label("The USB cable needs a tool from Google that this Mac does not have.".into());
             match status.download.clone() {
                 Download::Working(text) => {
                     Text(text, Modifier::empty(), colored(230, 180, 90));
@@ -1188,7 +1197,7 @@ fn ConnectionCard(settings: MutableState<Settings>, model: MutableState<Model>) 
                     FlowRow(Modifier::empty(), flow(), || Primary("Add USB support".into(), usb::download_tools));
                 }
             }
-            Hint(format!("The button downloads Google's Android platform-tools for macOS ({}) from dl.google.com into {}.", usb::TOOLS_SIZE, backend::config_dir().display()).into());
+            Hint(format!("The button downloads Google's Android platform-tools for macOS ({}) from dl.google.com into {}.", usb::TOOLS_SIZE, backend::config_dir().display()));
         }
     });
 }
