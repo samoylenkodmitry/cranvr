@@ -86,8 +86,13 @@ start_steam() {
 }
 # The web helper appears early in the update. Steam's own log says when the update ended, so a run
 # that stopped halfway starts Steam again instead of putting the shim into a half-updated client.
+# Steam may rotate its log. A backup of Valve's helper beside the helper shows that an earlier
+# run of this script finished its update and put the shim in.
 update_done() {
-    grep -qs "Update complete, launching Steam" "${steam_dir}/logs/bootstrap_log.txt"
+    grep -qs "Update complete, launching Steam" "${steam_dir}/logs/bootstrap_log.txt" && return 0
+    local current
+    current=$(find_helper)
+    [[ -n ${current} && -f ${current:r}.basalt-original.exe ]]
 }
 helper=$(find_helper)
 if [[ -z ${helper} ]] || ! update_done; then
