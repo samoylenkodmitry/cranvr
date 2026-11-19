@@ -1,6 +1,9 @@
 //! Windows Steam in cranvr's Wine prefix: its state, its game library, and starting games.
 
-use crate::backend::{self, config_dir};
+use crate::{
+    backend::{self, config_dir},
+    launch,
+};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -12,6 +15,15 @@ use std::{
 pub fn prefix() -> PathBuf {
     config_dir().join("wine/prefix")
 }
+
+/// The Wine that the game support step installs, with DXMT and cranvr's OpenXR runtime
+pub fn engine() -> PathBuf {
+    config_dir().join("wine/engine")
+}
+
+/// Steam's start flags under Wine on macOS, as BasaltVR found them: no update at start (an update
+/// would replace the web helper shim), no file check, no CEF sandbox
+pub const STEAM_FLAGS: [&str; 3] = ["-inhibitbootstrap", "-noverifyfiles", "-no-cef-sandbox"];
 
 pub fn wine_ready() -> bool {
     config_dir().join("wine/engine/bin/wine").exists()
@@ -191,30 +203,17 @@ pub fn wine(program: &str) -> Command {
     wine_with(program, backend::Settings::load().game_msaa_limit)
 }
 
-/// `wine` with an MSAA limit for the game: 0 leaves it to the game.
-/// A game's Wine command. A VR game draws into the headset: its mirror window on the Mac stays
-/// empty and costs no GPU time (cranvr's DXMT patch 0008). Steam does not get this: its own
-/// window draws with DXMT too.
+/// A game's Wine command: `wine` with the options for every program and the program's own, which
+/// the Play tab shows. Steam does not get them.
 fn game_wine(program: &str) -> Command {
-    let mut command = wine(program);
-    command.env("DXMT_SKIP_PRESENT", "1");
-    if one_draw_per_eye(program) {
-        command.env("BASALT_MAX_ARRAY_SIZE", "1");
-    }
+    let settings = backend::Settings::load();
+    let options = settings.launch.get(program).cloned().unwrap_or_default();
+    let mut command = wine_with(program, settings.game_msaa_limit);
+    command.envs(launch::environment(&settings.wine, &options)).args(launch::arguments(&options));
     command
 }
 
-/// Games that need one draw per eye: they render both eyes in one pass into a two-slice
-/// swapchain, and DXMT leaves the second slice empty, so the right eye stays black. With
-/// BASALT_MAX_ARRAY_SIZE=1 (cranvr's runtime patch 0003) the runtime rejects such swapchains
-/// and Unity draws each eye apart. SUPERHOT VR then showed both eyes at about 82 frames a
-/// second instead of 119.
-fn one_draw_per_eye(program: &str) -> bool {
-    const GAMES: [&str; 1] = ["superhot_vr.exe"];
-    let file = program.rsplit(['\\', '/']).next().unwrap_or(program).to_lowercase();
-    GAMES.contains(&file.as_str())
-}
-
+/// `wine` with an MSAA limit for the game: 0 leaves it to the game.
 fn wine_with(program: &str, msaa_limit: u32) -> Command {
     let home = config_dir();
     let control = home.join("runtime-control.txt");
@@ -251,7 +250,7 @@ pub fn start() -> Result<(), String> {
     }
     let dir = steam_dir();
     wine("steam.exe")
-        .args(["-inhibitbootstrap", "-noverifyfiles", "-no-cef-sandbox"])
+        .args(STEAM_FLAGS)
         .current_dir(&dir)
         .stdout(log_file("steam.log"))
         .stderr(log_file("steam.err.log"))
@@ -273,8 +272,7 @@ pub fn play(game: &Game) -> Result<(), String> {
         }
         thread::sleep(Duration::from_secs(5));
     }
-    let windows = mac_to_windows(&exe);
-    game_wine(&windows)
+    game_wine(&mac_to_windows(&exe))
         .current_dir(exe.parent().unwrap_or(Path::new("/")))
         .env("SteamAppId", &game.app_id)
         .env("SteamGameId", &game.app_id)
@@ -303,8 +301,13 @@ pub fn run_program(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// A game's program as Wine sees it, the key of its launch options.
+pub fn program(game: &Game) -> Option<String> {
+    game.exe.as_deref().map(mac_to_windows)
+}
+
 /// A Mac path as Wine sees it: C:\ inside the prefix, Z:\ elsewhere.
-fn mac_to_windows(path: &Path) -> String {
+pub fn mac_to_windows(path: &Path) -> String {
     let drive_c = prefix().join("drive_c");
     match path.strip_prefix(&drive_c) {
         Ok(rest) => format!("C:\\{}", rest.display().to_string().replace('/', "\\")),
@@ -349,11 +352,6 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn superhot_gets_one_draw_per_eye() {
-        assert!(one_draw_per_eye("C:\\Program Files (x86)\\Steam\\steamapps\\common\\SUPERHOT VR\\SUPERHOT_VR.exe"));
-        assert!(!one_draw_per_eye("C:\\Program Files (x86)\\Steam\\steamapps\\common\\Beat Saber\\Beat Saber.exe"));
-    }
 
     #[test]
     fn finds_a_program_in_a_64_bit_subfolder() {

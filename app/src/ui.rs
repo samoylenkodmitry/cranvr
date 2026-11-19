@@ -1,5 +1,6 @@
 use crate::{
     backend::{self, HeadsetApp, Model, Settings, StreamProtocol},
+    launch::{self, GameOptions},
     steam::{self, SteamState},
     system::{self, Permission},
 };
@@ -474,6 +475,7 @@ fn NativeConnect(settings: MutableState<Settings>, model: MutableState<Model>) {
 #[composable]
 fn PlayTab(settings: MutableState<Settings>, model: MutableState<Model>) {
     let state = model.with(|m| m.steam);
+    let open_program = rememberMutableStateOf(|| false);
     let task = model.with(|m| m.task.clone());
     Card(move || {
         Heading("Steam".into());
@@ -522,6 +524,20 @@ fn PlayTab(settings: MutableState<Settings>, model: MutableState<Model>) {
             });
             Action("Stop Steam and games".into(), steam::stop_all);
         });
+        // The options of the program chosen last, which the button above starts
+        let last = settings.with(|s| s.game.clone());
+        if last.starts_with('/') {
+            let program = steam::mac_to_windows(std::path::Path::new(&last));
+            let name = std::path::Path::new(&last).file_name().map_or(last.clone(), |name| name.to_string_lossy().into_owned());
+            let own = settings.with(|s| s.launch.contains_key(&program));
+            let shown = open_program.get();
+            FlowRow(Modifier::empty(), flow(), move || {
+                Choice(format!("Options of {name}{}", if own { " (own)" } else { "" }), shown, move || open_program.set(!shown));
+            });
+            if shown {
+                LaunchOptions(settings, program);
+            }
+        }
         match model.with(|m| m.game.clone()) {
             Some(name) => {
                 Text(format!("A game is connected ({name})."), Modifier::empty(), colored(110, 200, 140));
@@ -531,6 +547,7 @@ fn PlayTab(settings: MutableState<Settings>, model: MutableState<Model>) {
             }
         }
     });
+    WineCard(settings);
 }
 
 /// The steps that prepare a Mac for Windows VR games, before Steam: Rosetta 2, then the game
@@ -584,6 +601,8 @@ fn SetupSteps(model: MutableState<Model>) {
 #[composable]
 fn SteamLibrary(settings: MutableState<Settings>, model: MutableState<Model>) {
     let (running, signed_in, games) = model.with(|m| (m.steam_running, m.steam_signed_in, m.games.clone()));
+    // The game whose launch options are open, by its program
+    let open = rememberMutableStateOf(|| None::<String>);
     if !signed_in {
         Label("Open Steam and sign in once. Steam remembers you after that.".into());
     }
@@ -605,11 +624,21 @@ fn SteamLibrary(settings: MutableState<Settings>, model: MutableState<Model>) {
         });
         return;
     }
-    Hint("Play starts Steam if needed, then the game. Put on the headset first.".into());
+    Hint("Play starts Steam if needed, then the game. Put on the headset first. Options sets what the game starts with.".into());
     for game in games {
         let g = game.clone();
+        let program = steam::program(&game);
+        let shown = program.as_ref().is_some_and(|program| open.with(|open| open.as_ref() == Some(program)));
+        let own = program.as_ref().is_some_and(|program| settings.with(|s| s.launch.contains_key(program)));
+        let toggled = program.clone();
         FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
             Text(g.name.clone(), Modifier::empty().padding(8.0), TextStyle::default());
+            if let Some(program) = toggled.clone() {
+                Choice(if own { "Options (own)".into() } else { "Options".into() }, shown, move || {
+                    let program = program.clone();
+                    open.update(move |open| *open = if open.as_ref() == Some(&program) { None } else { Some(program) });
+                });
+            }
             if g.exe.is_some() {
                 let game = g.clone();
                 Primary("Play".into(), move || {
@@ -626,7 +655,120 @@ fn SteamLibrary(settings: MutableState<Settings>, model: MutableState<Model>) {
                 Hint("no program found in its folder".into());
             }
         });
+        if let Some(program) = program.filter(|_| shown) {
+            LaunchOptions(settings, program);
+        }
     }
+}
+
+/// The launch options of one program, under its row: what cranvr adds when the program starts.
+#[composable]
+fn LaunchOptions(settings: MutableState<Settings>, program: String) {
+    let (options, wine) = settings.with(|s| (s.launch.get(&program).cloned().unwrap_or_default(), s.wine.clone()));
+    let dll = cranpose_core::remember(|| TextFieldState::new(&options.dll_overrides)).with(|state| *state);
+    let env = cranpose_core::remember(|| TextFieldState::new(&options.env)).with(|state| *state);
+    let args = cranpose_core::remember(|| TextFieldState::new(&options.args)).with(|state| *state);
+    Column(
+        Modifier::empty().fill_max_width().padding_symmetric(16.0, 0.0),
+        ColumnSpec::default().vertical_arrangement(LinearArrangement::SpacedBy(6.0)),
+        move || {
+            let key = program.clone();
+            FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+                let key = key.clone();
+                Choice("Each eye in its own pass".into(), options.eye_per_pass, move || {
+                    edit_launch(settings, &key, |o| o.eye_per_pass = !o.eye_per_pass)
+                });
+            });
+            Hint("For a game whose right eye stays black. The runtime then refuses two-eye images, so the game draws each eye apart. This costs frames.".into());
+            OptionField("Wine DLL overrides", dll);
+            Hint("As WINEDLLOVERRIDES takes them, such as winhttp=n,b to load a winhttp.dll from the game's folder before Wine's own. Beat Saber's mod loader BSIPA ran without it in cranvr's Wine.".into());
+            OptionField("Environment", env);
+            Hint("NAME=value entries, separated by spaces.".into());
+            OptionField("Arguments", args);
+            let key = program.clone();
+            FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+                let key = key.clone();
+                Primary("Save options".into(), move || {
+                    edit_launch(settings, &key, |o| {
+                        o.dll_overrides = dll.text().trim().to_owned();
+                        o.env = env.text().trim().to_owned();
+                        o.args = args.text().trim().to_owned();
+                    })
+                });
+            });
+            let summary = launch::summary(&wine, &options);
+            Hint(if summary.is_empty() { "The game starts with nothing added.".into() } else { format!("The game starts with: {summary}") });
+        },
+    );
+}
+
+/// A labeled text field of the launch options.
+#[composable]
+fn OptionField(label: &'static str, state: TextFieldState) {
+    FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+        Text(label.to_string(), Modifier::empty().width(170.0).padding(8.0), TextStyle::default());
+        BasicTextField(
+            state,
+            Modifier::empty()
+                .width(420.0)
+                .rounded_corners(8.0)
+                .background(Color::from_rgb_u8(BUTTON.0, BUTTON.1, BUTTON.2))
+                .padding(8.0)
+                .content_description(label),
+            TextStyle::default(),
+        );
+    });
+}
+
+/// Saves a change of the launch options of `program`. They apply when the program starts next, so
+/// the host keeps running. Options equal to the defaults leave no entry.
+fn edit_launch(settings: MutableState<Settings>, program: &str, edit: impl FnOnce(&mut GameOptions)) {
+    settings.update(|s| {
+        let options = s.launch.entry(program.to_owned()).or_default();
+        edit(options);
+        if options.is_default() {
+            s.launch.remove(program);
+        }
+    });
+    settings.with(Settings::save);
+}
+
+/// The Wine that runs the games and the options of every program that cranvr starts.
+#[composable]
+fn WineCard(settings: MutableState<Settings>) {
+    let wine = settings.with(|s| s.wine.clone());
+    let dll = cranpose_core::remember(|| TextFieldState::new(&wine.dll_overrides)).with(|state| *state);
+    let env = cranpose_core::remember(|| TextFieldState::new(&wine.env)).with(|state| *state);
+    Card(move || {
+        Heading("Wine".into());
+        Label(format!("Wine: {}", steam::engine().display()));
+        Label(format!("Prefix: {}", steam::prefix().display()));
+        Hint("The game support step installs this Wine with DXMT and cranvr's OpenXR runtime into this prefix. Another Wine or prefix lacks them, so cranvr uses these.".into());
+        let mac_window = wine.mac_window;
+        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+            Choice("Game window on the Mac shows the picture".into(), mac_window, move || {
+                settings.update(|s| s.wine.mac_window = !s.wine.mac_window);
+                settings.with(Settings::save);
+            });
+        });
+        Hint("Off: a game's own window on the Mac stays empty and costs no GPU time. The headset shows the game either way.".into());
+        OptionField("DLL overrides", dll);
+        OptionField("Environment", env);
+        Hint("For every program that cranvr starts, before its own options. Steam does not get them.".into());
+        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+            Primary("Save Wine options".into(), move || {
+                settings.update(|s| {
+                    s.wine.dll_overrides = dll.text().trim().to_owned();
+                    s.wine.env = env.text().trim().to_owned();
+                });
+                settings.with(Settings::save);
+            });
+        });
+        Hint(format!(
+            "cranvr also always sets WINEPREFIX, WINEARCH=win64, WINEDEBUG=-all, DXMT_BASALT_IOSURFACE=1 and BASALT_CONTROL, which its runtime needs, and DXMT_MAX_SAMPLE_COUNT from the anti-aliasing setting. Steam starts with {}.",
+            steam::STEAM_FLAGS.join(" ")
+        ));
+    });
 }
 
 #[composable]
