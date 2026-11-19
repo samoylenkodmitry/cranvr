@@ -318,6 +318,12 @@ struct Wanted {
 }
 
 impl Wanted {
+    /// Forgets that the link streamed, so a failure stays on screen and no new try follows.
+    fn give_up(&mut self) {
+        self.streamed = false;
+        self.failed_at = None;
+    }
+
     /// Notes the link's state and says whether the client should connect again at `now`.
     fn due(&mut self, state: &LinkState, now: Instant) -> bool {
         match state {
@@ -482,6 +488,19 @@ impl Hub {
         // A link that streamed for any time counts, also when the UI never saw the state
         if let Some(wanted) = self.wanted.lock().unwrap().as_mut().filter(|_| streaming) {
             wanted.streamed = true;
+        }
+    }
+
+    /// The connection `id` met a failure that ends only when the user acts: the Mac's user said no
+    /// or did not answer, the Mac's key changed, or the apps speak no common version. It stops
+    /// retrying. A cable that fell back to Wi-Fi would otherwise ask the Mac's user again every few
+    /// seconds.
+    pub(crate) fn give_up(&self, id: u64) {
+        if self.current.load(Ordering::Acquire) != id {
+            return;
+        }
+        if let Some(wanted) = self.wanted.lock().unwrap().as_mut() {
+            wanted.give_up();
         }
     }
 
@@ -853,6 +872,22 @@ mod tests {
         // The attempt fails again (the host is still down): the next try follows after a new pause.
         // The caller starts it with `streamed` kept, so the failed state does not end the retries.
         assert!(wanted.streamed);
+    }
+
+    // A cable that fell back to Wi-Fi meets the Mac's card for a new headset. A no from the Mac's
+    // user ends the tries: the panel keeps the answer until the user presses the Mac again.
+    #[test]
+    fn a_refusal_ends_the_tries_of_a_link_that_streamed() {
+        let start = Instant::now();
+        let failed = LinkState::Failed("The Mac denied this headset. Press the Mac to ask again.".into());
+        let mut wanted = Wanted { host: "mac".into(), fingerprint: None, media: MediaChoice::Auto, streamed: false, failed_at: None };
+        assert!(!wanted.due(&LinkState::Streaming, start));
+        wanted.give_up();
+        assert!(!wanted.due(&failed, start) && !wanted.due(&failed, start + Duration::from_secs(60)));
+        // A new press starts a new connection, whose streaming makes retries count again
+        assert!(!wanted.due(&LinkState::Streaming, start));
+        assert!(!wanted.due(&failed, start));
+        assert!(wanted.due(&failed, start + Duration::from_secs(3)));
     }
 
     #[test]

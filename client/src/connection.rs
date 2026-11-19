@@ -400,6 +400,11 @@ fn run(
         Err(e) => {
             let message = failure_text(&e, &shown);
             log::warn!("{message}");
+            // These end only when the user acts: the Mac's user answers or the headset forgets the
+            // key or an app updates. A new try every few seconds would ask the Mac's user again.
+            if matches!(e, Error::Rejected(RejectReason::Denied | RejectReason::NoAnswer) | Error::HostKeyChanged | Error::Version { .. }) {
+                hub.give_up(id);
+            }
             hub.report(id, |snapshot| snapshot.state = LinkState::Failed(message));
             return;
         }
