@@ -691,6 +691,10 @@ fn realtime_thread() {
 
 /// A game that sent no frame for this long counts as paused, and the test scene comes back.
 const GAME_IDLE: Duration = Duration::from_millis(500);
+/// A planned frame's wait ends this long before its start, and the loop spins until the start. A
+/// timer wakes the thread up to a millisecond late: the lateness counted as part of the frame's need
+/// and widened its spread.
+const START_SPIN: Duration = Duration::from_micros(1500);
 /// A game that sent frames and then none for this long gives the desktop back, with the console
 /// and its Stop button. SUPERHOT VR sent no frame after the headset left for 11 seconds and came
 /// back, and the user saw only black.
@@ -923,11 +927,13 @@ fn frame_loop(
         let wait = if game.active() {
             GAME_IDLE
         } else if let Some(plan) = &planned {
-            plan.start_in
+            plan.start_in.saturating_sub(START_SPIN)
         } else {
             headset.until_next_vsync().unwrap_or(Duration::from_millis(5))
         };
         let mut game_frame = None;
+        // How long before its planned start a planned frame began, at the arrival of a pose
+        let mut early = Duration::ZERO;
         match game_events.recv_timeout(wait) {
             Ok(event) => {
                 let mut pose = false;
@@ -942,11 +948,19 @@ fn frame_loop(
                 // Without a game the host's own scene draws as soon as a pose arrives: waiting
                 // for the next vsync would add up to a frame between the pose and the picture.
                 // The pacer keeps it to the headset's refresh rate.
-                // A planned frame starts at its planned time, not at the arrival of a pose.
-                if planned.is_some() && game_frame.is_none() {
-                    continue;
+                // A planned frame starts at its planned time, or at the arrival of the pose that
+                // it renders for when the next pose is not due before that time (see
+                // `DisplayLock::starts_early`).
+                let mut start_now = false;
+                if let (Some(plan), true) = (&planned, game_frame.is_none()) {
+                    if pose && headset.start_early(plan) {
+                        early = plan.start_in.saturating_sub(planned_at.elapsed());
+                        start_now = true;
+                    } else {
+                        continue;
+                    }
                 }
-                if game_frame.is_none() && (game.active() || !pose || !pacer.ready()) {
+                if !start_now && game_frame.is_none() && (game.active() || !pose || !pacer.ready()) {
                     continue;
                 }
             }
@@ -956,9 +970,18 @@ fn frame_loop(
                 if game.active() || (planned.is_none() && !pacer.ready()) {
                     continue;
                 }
+                // The wait ended early: the loop spins until the start
+                if let Some(plan) = &planned {
+                    while planned_at.elapsed() < plan.start_in {
+                        std::hint::spin_loop();
+                    }
+                }
             }
             Err(RecvTimeoutError::Disconnected) => thread::sleep(wait),
         }
+        // A frame that began at the arrival of a pose started before its plan: its need counts from
+        // there
+        let planned = planned.map(|plan| headset::FramePlan { start: plan.start.saturating_sub(early.as_nanos() as u64), ..plan });
         let give_back = |frame: &Option<GameFrame>| {
             if let Some(f) = frame {
                 link.frame_consumed(f.number);
@@ -1056,6 +1079,8 @@ fn frame_loop(
         if let Some(plan) = &planned {
             // The time that the wait took beyond the plan's start
             headset.frame_started(plan.target, planned_at.elapsed().saturating_sub(plan.start_in));
+            // The plan is used up, also when the frame began before its start
+            pending_plan = None;
         }
         // The pose of a device for this frame: at the plan's target when the frame follows a plan
         let motion_of = |device: Device| match &planned {
