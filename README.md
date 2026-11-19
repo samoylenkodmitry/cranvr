@@ -67,7 +67,7 @@ The first build downloads ALVR v20.14.1 from GitHub with its submodules.
 
 ## Run with a Quest
 
-The host speaks two protocols. `--protocol alvr` is the default. It serves the stock ALVR client, from the Meta store or from ALVR's releases. `--protocol native` serves cranvr's own client, which "cranvr's Cranpose client" below describes. The window starts the host in ALVR mode while "Headset app" in its Settings tab says "ALVR client" (the default). It starts the host in native mode for "cranvr client". These steps use the stock ALVR client:
+The host speaks two protocols. `--protocol alvr` is the default. It serves the stock ALVR client, from the Meta store or from ALVR's releases. `--protocol native` serves cranvr's own client, which "cranvr's Cranpose client" below describes. The window starts the host in native mode while "Headset app" in its Settings tab says "cranvr client" (the default of a new install). It starts the host in ALVR mode for "ALVR client". A settings file from before this choice existed keeps the ALVR client. These steps use the stock ALVR client:
 
 1. Install the ALVR client on the Quest: 20.14 from the Meta store, or `alvr_client_android.apk` of v20.14.1 from the ALVR GitHub releases. Its major version (20) must match the server core's. A v21 nightly build does not connect. The window then shows a notice.
 2. Put the Mac and the Quest on the same network. Use 5 GHz or 6 GHz Wi-Fi. Connect the Mac by cable if you can.
@@ -183,7 +183,7 @@ The first connection of a headset to an address trusts the host's key on first u
 
 The host listens on this Mac only until a headset is paired or `--pair` is given. `--trust-all` accepts every client without pairing, for tests. `--trust NAME` counts for the ALVR protocol only. A client on this Mac connects without pairing. So does a headset over USB through `adb reverse`, because its connection comes from the loopback address. The headset does not check the host's key when it connects to a loopback address. The session is sealed in every case.
 
-The cranvr app starts the native mode for the cranvr client. Its Settings tab has a "Headset app" choice: "ALVR client" (the default) or "cranvr client". The cranvr client makes the app start the host with `--protocol native`. The Headset card then shows this Mac's address with the port, such as `192.168.1.20:9950`, for the headset's connect panel. The card has a field for the six digits of that panel. The Pair button restarts the host with `--pair CODE`. The app does not save the code, so a later start of the host opens no pairing window. The host reports the pairing state in a `native` status line: the port, whether it takes this Mac's clients only, the names of the paired headsets and the seconds that the pairing window stays open. A headset that the host refuses because it is not paired shows up as a `network` line with the problem `not_paired`. The Network choice, Low latency and the trusted names count for the ALVR client only. The app hides them in native mode. It does not pass the host options that belong to them.
+The cranvr app starts the native mode for the cranvr client. Its Settings tab has a "Headset app" choice: "cranvr client" (the default of a new install) or "ALVR client". A settings file without the choice, written by an older app, stays with the ALVR client. The cranvr client makes the app start the host with `--protocol native`. The Headset card then shows this Mac's address with the port, such as `192.168.1.20:9950`, for the headset's connect panel. The card has a field for the six digits of that panel. The Pair button restarts the host with `--pair CODE`. The app does not save the code, so a later start of the host opens no pairing window. The host reports the pairing state in a `native` status line: the port, whether it takes this Mac's clients only, the names of the paired headsets and the seconds that the pairing window stays open. A headset that the host refuses because it is not paired shows up as a `network` line with the problem `not_paired`. The Network choice, Low latency and the trusted names count for the ALVR client only. The app hides them in native mode. It does not pass the host options that belong to them.
 
 #### The sealed session
 
@@ -440,13 +440,17 @@ Not done or not measured:
 
 ## Games
 
-Games need Wine with cranvr's DXMT fork and BasaltVR's OpenXR runtime. The app's Play tab sets them up in three steps:
+Games need Wine with cranvr's DXMT fork and BasaltVR's OpenXR runtime. The app's Play tab has one button, "Set up games". It runs the steps that the Mac still lacks, in this order, with a line of progress for each step:
 
-1. Rosetta 2, which runs Wine's Intel code. macOS asks for an administrator's password.
+1. Rosetta 2, which runs Wine's Intel code. macOS asks for an administrator's password. The Play tab says so before the button is pressed.
 2. Game support: the app downloads `cranvr-game-support-macos.tar.xz` (about 240 MB) from the public release at https://github.com/samoylenkodmitry/cranvr-game-support, checks its SHA-256, unpacks it and installs it with `setup-wine.sh`. It takes about 1.2 GB on disk. `scripts/install-game-support.sh [ARCHIVE|URL]` does the same without the app.
-3. Steam for Windows (see below).
+3. Steam for Windows (see below). At the end the Steam window opens, and the user signs in there once.
 
-From an empty home folder the install took 79 seconds with the download. The OpenXR runtime's check through the Khronos loader passed, and the runtime's smoke program connected to the host.
+A failed step keeps its message on screen with a Retry button, which runs the steps that are not done. From an empty home folder the install of step 2 took 79 seconds with the download. The OpenXR runtime's check through the Khronos loader passed, and the runtime's smoke program connected to the host.
+
+Games on another disk need no setting in cranvr. In the Steam window, Settings, Storage adds a folder on that disk (it sits under `Z:\Volumes` for Wine). The Play tab lists the games of every Steam library folder.
+
+The game support has a version, a date such as `2026.11.19`, in `scripts/game-support-version.txt`. `package-game-support.sh` puts it into the archive as `VERSION`. `setup-wine.sh` stamps it into `wine/game-support-version.txt` in the config folder after a good install. The app holds the same file from its build as the version that it expects. When the stamp is older, or missing because the stack came from a release before stamps, the Play tab shows "Update game support". That button stops Steam and the games, then runs the same download and install. After a change of a runtime or DXMT patch: set a new date in the version file, run `build-basaltvr.sh` and `package-game-support.sh`, and publish the archive and its `.sha256` as a release of the public repository, tagged `v` plus the date.
 
 To build game support from source instead (about an hour, mostly LLVM):
 

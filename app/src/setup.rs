@@ -22,14 +22,15 @@ impl Step {
         }
     }
 
-    /// What the step does, shown before it runs. `update` is a game support that is installed
-    /// but older than this app expects.
-    pub fn describe(self, update: bool) -> &'static str {
-        match self {
-            Step::Rosetta => "Runs Wine's Intel code. macOS asks for your Mac password.",
-            Step::GameSupport if update => "Updates the OpenXR runtime and DXMT in Wine.",
-            Step::GameSupport => "Wine, DXMT and the OpenXR runtime. A download of about 250 MB.",
-            Step::Steam => "Installs Steam and prepares it for this Mac. A download of about 1.6 GB.",
+    /// What the step does, shown before it runs. Wine in place means the game support step
+    /// updates it. A Steam that needs setup is installed already.
+    pub fn describe(self, state: SteamState) -> &'static str {
+        match (self, state) {
+            (Step::Rosetta, _) => "Runs Wine's Intel code. macOS asks for your Mac password.",
+            (Step::GameSupport, SteamState::NoWine) => "Wine, DXMT and the OpenXR runtime. A download of about 250 MB.",
+            (Step::GameSupport, _) => "Updates the OpenXR runtime and DXMT in Wine.",
+            (Step::Steam, SteamState::NeedsSetup) => "Steam needs a repair after its own update. This takes a minute.",
+            (Step::Steam, _) => "Installs Steam and prepares it for this Mac. A download of about 1.6 GB.",
         }
     }
 

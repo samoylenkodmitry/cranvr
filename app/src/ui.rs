@@ -482,18 +482,32 @@ fn PlayTab(settings: MutableState<Settings>, model: MutableState<Model>) {
     let (state, rosetta, outdated, setup) = model.with(|m| (m.steam, m.rosetta, m.game_support_outdated, m.setup.clone()));
     let open_program = rememberMutableStateOf(|| false);
     let plan = setup::plan(rosetta, state, outdated);
+    // Steam cannot start before the setup. An outdated game support alone leaves it working: the
+    // library shows an Update button then.
+    let needs_setup = !rosetta || state != SteamState::Ready;
     let running = setup.as_ref().is_some_and(Setup::running);
     Card(move || {
         Heading("Steam".into());
         if running {
-            SetupProgress(setup.clone().unwrap_or(Setup { steps: vec![] }));
-            Hint("Keep cranvr open. This takes a few minutes. Steam opens at the end: sign in there once.".into());
-        } else if !plan.is_empty() {
+            let setup = setup.clone().unwrap_or(Setup { steps: vec![] });
+            let steam_opens = setup.steps.iter().any(|(step, _)| *step == setup::Step::Steam);
+            SetupProgress(setup);
+            Hint(if steam_opens {
+                "Keep cranvr open. This takes a few minutes. Steam opens at the end: sign in there once."
+            } else {
+                "Keep cranvr open. Steam and running games stop while this runs."
+            }
+            .into());
+        } else if needs_setup {
             SetupStart(model, plan.clone(), setup.clone());
         } else {
             SteamLibrary(settings, model, setup.clone());
         }
     });
+    // Before the game support step there is no Wine to start a program with or to set up
+    if state == SteamState::NoWine {
+        return;
+    }
     Card(move || {
         Heading("Other Windows programs".into());
         Hint("Any Windows VR program that uses OpenXR with Direct3D 11.".into());
@@ -563,16 +577,21 @@ fn SetupProgress(setup: Setup) {
 #[composable]
 fn SetupStart(model: MutableState<Model>, plan: Vec<setup::Step>, last: Option<Setup>) {
     let failed = last.as_ref().is_some_and(Setup::failed);
-    // With Wine in place the game support step updates it
-    let update = model.with(|m| m.steam != SteamState::NoWine);
-    Label("This Mac needs a one-time setup before it can run Windows VR games. One button does it.".into());
+    let state = model.with(|m| m.steam);
+    let steam_opens = plan.contains(&setup::Step::Steam);
+    Label(if state == SteamState::NoWine {
+        "This Mac needs a one-time setup before it can run Windows VR games. One button does it."
+    } else {
+        "Steam needs a setup step. One button does it."
+    }
+    .into());
     match last.filter(|_| failed) {
         Some(last) => SetupProgress(last),
         None => {
             for step in plan {
                 FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
                     Text(step.title().to_string(), Modifier::empty().width(170.0).padding(8.0), sized(16.0, true));
-                    Text(step.describe(update).to_string(), Modifier::empty().padding(8.0), dim_style());
+                    Text(step.describe(state).to_string(), Modifier::empty().padding(8.0), dim_style());
                 });
             }
         }
@@ -580,7 +599,9 @@ fn SetupStart(model: MutableState<Model>, plan: Vec<setup::Step>, last: Option<S
     FlowRow(Modifier::empty(), flow(), move || {
         Primary(if failed { "Retry".into() } else { "Set up games".into() }, setup::start);
     });
-    Hint("When it ends, Steam opens. Sign in to Steam there once. Your installed games show up here afterwards.".into());
+    if steam_opens {
+        Hint("When it ends, Steam opens. Sign in to Steam there once. Your installed games show up here afterwards.".into());
+    }
 }
 
 /// The notice of a game support that is older than this app expects, with its one button.
