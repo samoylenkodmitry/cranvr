@@ -25,11 +25,11 @@ use cranpose_xr::{Hand, StreamCounts, Vibration};
 use cranvr_proto::{
     clock::{now_ns, ClockSync},
     identity::format_code,
-    link::{ClientLink, ClientSide, Incoming},
+    link::{ClientLink, ClientSide, ConnectObserver, Incoming},
     media::{FrameReceiver, Received},
     message::{
         ClientCaps, ClientDatagram, ClientMsg, FrameTiming, HostDatagram, HostMsg, LossReport, Ping, Pong, RejectReason,
-        StreamParams, Views, DESKTOP_STREAM,
+        StreamParams, Views, DESKTOP_STREAM, UPDATE_HEADSET, UPDATE_MAC,
     },
     media::LostUnit,
     wire::{Codec, Error, Nanos},
@@ -179,14 +179,15 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Connects in the background. The hub gets the progress under `id`.
-    pub fn start(hub: &'static Hub, id: u64, host: String, media: MediaChoice) -> Self {
+    /// Connects in the background. The hub gets the progress under `id`. `fingerprint` is the start
+    /// of the host's key fingerprint when the host came from the search.
+    pub fn start(hub: &'static Hub, id: u64, host: String, fingerprint: Option<[u8; 8]>, media: MediaChoice) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let link = Arc::new(Mutex::new(None));
         let (thread_stop, thread_link) = (Arc::clone(&stop), Arc::clone(&link));
         let spawned = thread::Builder::new()
             .name("cranvr-link".into())
-            .spawn(move || run(hub, id, &host, media, &thread_stop, &thread_link));
+            .spawn(move || run(hub, id, &host, fingerprint, media, &thread_stop, &thread_link));
         if let Err(e) = spawned {
             hub.report(id, |snapshot| snapshot.state = LinkState::Failed(format!("no thread for the link: {e}")));
         }
@@ -211,15 +212,48 @@ impl Connection {
     }
 }
 
-/// Says in words why a connection ended.
-fn describe(error: &Error, host: SocketAddr) -> String {
+/// Says in words why a connection ended, and what the user does next.
+fn failure_text(error: &Error, host: SocketAddr) -> String {
     match error {
-        Error::Timeout => format!("{host} did not answer. Does cranvr-host run with --protocol native?"),
+        Error::Version { .. } => {
+            if error.peer_must_update() == Some(true) {
+                format!("The cranvr on {host} is older than this app. {UPDATE_MAC}")
+            } else {
+                format!("The cranvr on {host} is newer than this app. {UPDATE_HEADSET}")
+            }
+        }
+        Error::Rejected(RejectReason::Denied) => "The Mac denied this headset. Press the Mac to ask again.".into(),
+        Error::Rejected(RejectReason::NoAnswer) => "Nobody answered on the Mac. Press the Mac to ask again.".into(),
+        Error::Rejected(RejectReason::Busy) => "The Mac is busy with another headset.".into(),
+        Error::Rejected(RejectReason::NotPaired) => format!("{host} does not know this headset."),
+        Error::HostKeyChanged => format!(
+            "{host} does not have the key that this headset paired with. Someone may pose as the Mac. If you reinstalled cranvr on the Mac, press Forget host key and connect again."
+        ),
+        Error::Timeout => format!("{host} did not answer. Is cranvr open on the Mac?"),
         Error::Closed => format!("{host} closed the connection"),
         Error::Io(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-            format!("{host} refused the connection. Does cranvr-host run with --protocol native?")
+            format!("{host} refused the connection. Is cranvr open on the Mac?")
         }
         other => other.to_string(),
+    }
+}
+
+/// Shows the approval code in the panel while the Mac's user decides.
+struct Waiting<'a> {
+    hub: &'static Hub,
+    id: u64,
+    stop: &'a AtomicBool,
+}
+
+impl ConnectObserver for Waiting<'_> {
+    fn waiting(&mut self, code: u32, host_name: &str) {
+        let (code, host) = (format_code(code), host_name.to_owned());
+        log::info!("the Mac {host:?} asks its user to allow this headset: the code is {code}");
+        self.hub.report(self.id, |snapshot| snapshot.state = LinkState::Waiting { code, host });
+    }
+
+    fn cancelled(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
     }
 }
 
@@ -252,7 +286,7 @@ pub fn host_name(text: &str) -> String {
 fn resolve(text: &str) -> Result<SocketAddr, String> {
     let text = text.trim();
     if text.is_empty() {
-        return Err("Enter the address of the Mac that runs cranvr-host".into());
+        return Err("Enter the address of the Mac".into());
     }
     with_port(text)
         .to_socket_addrs()
@@ -265,6 +299,7 @@ fn run(
     hub: &'static Hub,
     id: u64,
     text: &str,
+    fingerprint: Option<[u8; 8]>,
     media: MediaChoice,
     stop: &AtomicBool,
     slot: &Mutex<Option<Arc<ClientLink>>>,
@@ -314,20 +349,16 @@ fn run(
     // host) is reached through no network. Its key is not checked, as the host does not check the
     // pairing of a client on loopback. Any other host must be the one that this headset paired with.
     let name = host_name(text);
-    let pinned = if host.ip().is_loopback() { None } else { crate::settings::host_key(&name) };
-    let link = match ClientLink::connect(host, &caps, identity, pinned, CONNECT_TIMEOUT) {
+    // A Mac from the search may have a new address since the last pairing: the fingerprint finds its key
+    let pinned = if host.ip().is_loopback() {
+        None
+    } else {
+        crate::settings::host_key(&name).or_else(|| fingerprint.and_then(|fp| crate::settings::host_key_by_fingerprint(&fp)))
+    };
+    let link = match ClientLink::connect_with(host, &caps, identity, pinned, CONNECT_TIMEOUT, &mut Waiting { hub, id, stop }) {
         Ok(link) => Arc::new(link),
         Err(e) => {
-            let message = match &e {
-                Error::Rejected(RejectReason::NotPaired) => format!(
-                    "{host} does not know this headset. On the Mac, choose the cranvr client in the cranvr app and pair the code {}, or start cranvr-host with --pair and the code",
-                    format_code(identity.code()).replace(' ', "")
-                ),
-                Error::HostKeyChanged => format!(
-                    "{host} does not have the key that this headset paired with. Someone may pose as the host. If you reinstalled the host or lost its host-identity.txt, press Forget host key and connect again."
-                ),
-                other => describe(other, host),
-            };
+            let message = failure_text(&e, host);
             log::warn!("{message}");
             hub.report(id, |snapshot| snapshot.state = LinkState::Failed(message));
             return;
@@ -1105,5 +1136,25 @@ mod tests {
         // A pulse with no length is a click, a frequency of 0 leaves the choice to the controller,
         // and a strength beyond 1 is the strongest
         assert_eq!((hand, vibration.duration(), vibration.frequency(), vibration.amplitude()), (Hand::Left, MIN_PULSE, None, 1.0));
+    }
+
+    #[test]
+    fn a_failure_says_which_side_to_update() {
+        let host: SocketAddr = ([192, 168, 1, 20], 9950).into();
+        // An older Mac: its range ends below the client's
+        let old_mac = failure_text(&Error::Version { ours: (4, 5), theirs: (4, 4) }, host);
+        assert!(old_mac.ends_with("Update cranvr on the Mac."), "{old_mac}");
+        // A newer Mac
+        let new_mac = failure_text(&Error::Version { ours: (4, 5), theirs: (6, 6) }, host);
+        assert!(new_mac.ends_with("Update the cranvr app on the headset."), "{new_mac}");
+    }
+
+    #[test]
+    fn a_refusal_tells_the_user_what_to_press() {
+        let host: SocketAddr = ([192, 168, 1, 20], 9950).into();
+        assert_eq!(failure_text(&Error::Rejected(RejectReason::Denied), host), "The Mac denied this headset. Press the Mac to ask again.");
+        assert_eq!(failure_text(&Error::Rejected(RejectReason::NoAnswer), host), "Nobody answered on the Mac. Press the Mac to ask again.");
+        assert!(failure_text(&Error::Timeout, host).contains("Is cranvr open on the Mac?"));
+        assert!(failure_text(&Error::HostKeyChanged, host).contains("Forget host key"));
     }
 }

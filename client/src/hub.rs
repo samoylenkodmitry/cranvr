@@ -10,6 +10,7 @@ use crate::{
     connection::Connection,
     console::{Action, Backdrop, Console, Menu, Room, View as ConsoleView, Volume},
     desktop::desktop,
+    discovery::FoundHost,
     settings,
     tracking::{Display, Feed},
 };
@@ -37,6 +38,9 @@ use std::{
 pub enum LinkState {
     Idle,
     Connecting,
+    /// The Mac does not know this headset yet. Its user compares the code that both show and allows
+    /// the headset there. `host` is the name that the Mac gave itself.
+    Waiting { code: String, host: String },
     Streaming,
     Failed(String),
 }
@@ -177,11 +181,13 @@ pub struct Snapshot {
     pub state: LinkState,
     pub stream: Option<StreamInfo>,
     pub stats: Stats,
+    /// The Macs that answered the search (see `discovery.rs`). `Hub::snapshot` fills it.
+    pub found: Vec<FoundHost>,
 }
 
 impl Snapshot {
     fn idle() -> Self {
-        Self { state: LinkState::Idle, stream: None, stats: Stats::default() }
+        Self { state: LinkState::Idle, stream: None, stats: Stats::default(), found: Vec::new() }
     }
 }
 
@@ -296,6 +302,8 @@ const RECONNECT_AFTER: Duration = Duration::from_secs(2);
 /// panel shows why.
 struct Wanted {
     host: String,
+    /// The start of the host's key fingerprint, when the host came from the search
+    fingerprint: Option<[u8; 8]>,
     media: MediaChoice,
     streamed: bool,
     failed_at: Option<Instant>,
@@ -311,7 +319,7 @@ impl Wanted {
                 false
             }
             LinkState::Failed(_) if self.streamed => now.duration_since(*self.failed_at.get_or_insert(now)) >= RECONNECT_AFTER,
-            LinkState::Failed(_) | LinkState::Idle | LinkState::Connecting => false,
+            LinkState::Failed(_) | LinkState::Idle | LinkState::Connecting | LinkState::Waiting { .. } => false,
         }
     }
 }
@@ -337,6 +345,8 @@ pub struct Hub {
     last_id: AtomicU64,
     connection: Mutex<Option<Connection>>,
     wanted: Mutex<Option<Wanted>>,
+    /// The Macs that answered the search
+    found: Mutex<Vec<FoundHost>>,
     console: Mutex<Console>,
     /// The saved settings of the console were loaded. A rebuilt composition must not load them
     /// again, because the choices in memory are newer when a save failed.
@@ -361,6 +371,7 @@ pub fn hub() -> &'static Hub {
         last_id: AtomicU64::new(0),
         connection: Mutex::new(None),
         wanted: Mutex::new(None),
+        found: Mutex::new(Vec::new()),
         console: Mutex::new(Console::default()),
         settings_loaded: AtomicBool::new(false),
     })
@@ -368,22 +379,35 @@ pub fn hub() -> &'static Hub {
 
 impl Hub {
     pub fn snapshot(&self) -> Snapshot {
-        self.snapshot.lock().unwrap().clone()
+        let mut snapshot = self.snapshot.lock().unwrap().clone();
+        snapshot.found = self.found.lock().unwrap().clone();
+        snapshot
     }
 
-    /// Starts a connection to `host`, an address with an optional port. An earlier connection ends
+    /// Notes the Macs that answered the search. The search thread calls it after each round.
+    pub fn set_found(&self, found: Vec<FoundHost>) {
+        *self.found.lock().unwrap() = found;
+    }
+
+    /// Whether the search should ask the network: no link runs and none is being made.
+    pub fn is_searching(&self) -> bool {
+        matches!(self.snapshot.lock().unwrap().state, LinkState::Idle | LinkState::Failed(_))
+    }
+
+    /// Starts a connection to `host`, an address with an optional port. `fingerprint` is the start
+    /// of the host's key fingerprint when the host came from the search. An earlier connection ends
     /// first.
-    pub fn connect(&'static self, host: String, media: MediaChoice) {
-        self.start(host, media, false);
+    pub fn connect(&'static self, host: String, fingerprint: Option<[u8; 8]>, media: MediaChoice) {
+        self.start(host, fingerprint, media, false);
     }
 
-    fn start(&'static self, host: String, media: MediaChoice, streamed: bool) {
+    fn start(&'static self, host: String, fingerprint: Option<[u8; 8]>, media: MediaChoice, streamed: bool) {
         self.end_connection();
         let id = self.last_id.fetch_add(1, Ordering::Relaxed) + 1;
         self.current.store(id, Ordering::Release);
         *self.snapshot.lock().unwrap() = Snapshot { state: LinkState::Connecting, ..Snapshot::idle() };
-        *self.wanted.lock().unwrap() = Some(Wanted { host: host.clone(), media, streamed, failed_at: None });
-        *self.connection.lock().unwrap() = Some(Connection::start(self, id, host, media));
+        *self.wanted.lock().unwrap() = Some(Wanted { host: host.clone(), fingerprint, media, streamed, failed_at: None });
+        *self.connection.lock().unwrap() = Some(Connection::start(self, id, host, fingerprint, media));
     }
 
     /// Ends the connection, because the user asked. Its threads end in the background.
@@ -407,11 +431,13 @@ impl Hub {
         let state = self.snapshot.lock().unwrap().state.clone();
         let again = {
             let mut wanted = self.wanted.lock().unwrap();
-            wanted.as_mut().and_then(|wanted| wanted.due(&state, Instant::now()).then(|| (wanted.host.clone(), wanted.media)))
+            wanted
+                .as_mut()
+                .and_then(|wanted| wanted.due(&state, Instant::now()).then(|| (wanted.host.clone(), wanted.fingerprint, wanted.media)))
         };
-        if let Some((host, media)) = again {
+        if let Some((host, fingerprint, media)) = again {
             log::info!("the link ended: connecting to {host} again");
-            self.start(host, media, true);
+            self.start(host, fingerprint, media, true);
         }
     }
 
@@ -777,7 +803,7 @@ mod tests {
     fn a_link_that_streamed_connects_again_after_a_pause_and_one_that_never_did_does_not() {
         let start = Instant::now();
         let failed = LinkState::Failed("the link ended".into());
-        let mut wanted = Wanted { host: "mac".into(), media: MediaChoice::Auto, streamed: false, failed_at: None };
+        let mut wanted = Wanted { host: "mac".into(), fingerprint: None, media: MediaChoice::Auto, streamed: false, failed_at: None };
         // Never streamed: the failure stays, as the panel shows why
         assert!(!wanted.due(&LinkState::Connecting, start));
         assert!(!wanted.due(&failed, start) && !wanted.due(&failed, start + Duration::from_secs(60)));
@@ -789,6 +815,15 @@ mod tests {
         // The attempt fails again (the host is still down): the next try follows after a new pause.
         // The caller starts it with `streamed` kept, so the failed state does not end the retries.
         assert!(wanted.streamed);
+    }
+
+    #[test]
+    fn a_link_that_waits_for_the_mac_is_neither_streaming_nor_due_for_a_new_try() {
+        let start = Instant::now();
+        let mut wanted = Wanted { host: "mac".into(), fingerprint: None, media: MediaChoice::Auto, streamed: false, failed_at: None };
+        let waiting = LinkState::Waiting { code: "123 456".into(), host: "Mac".into() };
+        assert!(!wanted.due(&waiting, start) && !wanted.due(&waiting, start + Duration::from_secs(60)));
+        assert!(!wanted.streamed);
     }
 
     fn display(time: Nanos) -> Display {

@@ -12,13 +12,13 @@ use std::{
     io::{BufRead, BufReader, Write},
     net::Ipv4Addr,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, ChildStdin, Command, Stdio},
     sync::{
         mpsc::{self, Receiver, Sender},
         Arc, Mutex, OnceLock,
     },
     thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 /// The TCP port of the native protocol, `cranvr-host`'s default for `--native-port`.
@@ -163,12 +163,22 @@ pub struct Stats {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Native {
     pub port: u16,
-    /// The host takes clients on this Mac only: no headset is paired and no window is open
-    pub local_only: bool,
     /// The names of the paired headsets
     pub paired: Vec<String>,
-    /// When the pairing window closes, while it is open
-    pub pairing_until: Option<Instant>,
+    /// The headsets that wait for the user's answer. The host lists one at a time.
+    pub pending: Vec<PairRequest>,
+}
+
+/// A headset that waits for the user to allow it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PairRequest {
+    /// The headset's key in hex. The answer names it.
+    pub key: String,
+    pub name: String,
+    /// The headset's address on the network
+    pub ip: String,
+    /// The code that the headset shows too, such as "482 913"
+    pub code: String,
 }
 
 /// A headset that announced itself to the host.
@@ -290,11 +300,18 @@ impl Model {
                 }
             }
             Some("native") => {
+                let text = |request: &Value, field: &str| request[field].as_str().map(str::to_string);
                 self.native = Some(Native {
                     port: v["port"].as_u64().and_then(|p| u16::try_from(p).ok()).unwrap_or(NATIVE_PORT),
-                    local_only: v["local_only"].as_bool().unwrap_or(false),
                     paired: v["paired"].as_array().into_iter().flatten().filter_map(|n| n.as_str().map(str::to_string)).collect(),
-                    pairing_until: v["pairing_s"].as_u64().map(|s| Instant::now() + Duration::from_secs(s)),
+                    pending: v["pending"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|r| {
+                            Some(PairRequest { key: text(r, "key")?, name: text(r, "name")?, ip: text(r, "ip").unwrap_or_default(), code: text(r, "code")? })
+                        })
+                        .collect(),
                 });
             }
             Some("vr_request") => self.vr_requests.push(v.clone()),
@@ -335,6 +352,8 @@ fn channel() -> &'static (Sender<HostLine>, Mutex<Receiver<HostLine>>) {
 }
 
 static HOST: Mutex<Option<Child>> = Mutex::new(None);
+/// The host's input. The user's answers to a headset's request go there.
+static HOST_INPUT: Mutex<Option<ChildStdin>> = Mutex::new(None);
 
 /// `cranvr-host` next to this executable, or at $CRANVR_HOST_BIN.
 fn host_binary() -> Result<PathBuf, String> {
@@ -345,11 +364,18 @@ fn host_binary() -> Result<PathBuf, String> {
     host.exists().then_some(host.clone()).ok_or(format!("{} is missing; build it with cargo build --release", host.display()))
 }
 
-/// The six digits of a pairing code as the user typed them. The headset shows them as "482 913",
-/// so spaces are allowed. Anything else gives `None`: the host exits on a code that it cannot read.
-pub fn pair_digits(text: &str) -> Option<String> {
-    let digits: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    (digits.len() == 6 && digits.chars().all(|c| c.is_ascii_digit())).then_some(digits)
+/// The line that tells the host the user's answer to a headset's request (see host/src/headset/native.rs).
+fn answer_line(key: &str, allow: bool) -> String {
+    format!("{} {key}\n", if allow { "allow" } else { "deny" })
+}
+
+/// Tells the host that the user allowed or denied the headset with this key.
+pub fn answer_pairing(key: &str, allow: bool) {
+    let mut input = HOST_INPUT.lock().unwrap();
+    let sent = input.as_mut().map(|input| input.write_all(answer_line(key, allow).as_bytes()).and_then(|()| input.flush()));
+    if !matches!(sent, Some(Ok(()))) {
+        notify("The host did not take the answer. Start the host and let the headset ask again.".into());
+    }
 }
 
 /// The command line of `cranvr-host`. `tcp_fallback` is the window's switch to TCP in Auto mode.
@@ -416,7 +442,8 @@ pub fn start_host(settings: &Settings, tcp_fallback: bool, pair_code: Option<&st
     stop_host();
     let mut command = Command::new(host_binary()?);
     command.args(host_args(settings, tcp_fallback, pair_code, &config_dir(), env::var_os("CRANVR_TEST_TRUST_ALL").is_some()));
-    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
+    let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
+    *HOST_INPUT.lock().unwrap() = child.stdin.take();
     let sender = channel().0.clone();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
@@ -494,6 +521,7 @@ pub fn write_vr_menu(settings: &Settings, games: &[crate::steam::Game]) {
 }
 
 pub fn stop_host() {
+    HOST_INPUT.lock().unwrap().take();
     if let Some(mut child) = HOST.lock().unwrap().take() {
         // SIGTERM first, so ALVR can say goodbye to the headset
         Command::new("kill").args(["-TERM", &child.id().to_string()]).status().ok();
@@ -694,24 +722,28 @@ mod tests {
     }
 
     #[test]
-    fn a_pairing_code_is_six_digits_with_spaces_allowed() {
-        assert_eq!(pair_digits("482 913").as_deref(), Some("482913"));
-        assert_eq!(pair_digits(" 000123\n").as_deref(), Some("000123"));
-        for bad in ["", "48291", "4829133", "48291a", "482-913", "٤٨٢٩١٣"] {
-            assert_eq!(pair_digits(bad), None, "{bad:?}");
-        }
+    fn the_answer_to_a_request_names_the_headsets_key() {
+        assert_eq!(answer_line("ab12", true), "allow ab12\n");
+        assert_eq!(answer_line("ab12", false), "deny ab12\n");
     }
 
     #[test]
-    fn the_hosts_native_line_shows_the_paired_headsets_and_the_pairing_window() {
+    fn the_hosts_native_line_shows_the_paired_headsets_and_the_one_that_waits() {
         let mut model = Model::default();
-        model.apply_status(&serde_json::json!({"type": "native", "port": 9950, "local_only": true, "paired": [], "pairing_s": null}));
+        model.apply_status(&serde_json::json!({"type": "native", "port": 9950, "paired": [], "pairing_s": null, "pending": []}));
         let native = model.native.clone().unwrap();
-        assert_eq!((native.port, native.local_only, native.paired.len(), native.pairing_until), (9950, true, 0, None));
-        model.apply_status(&serde_json::json!({"type": "native", "port": 9951, "local_only": false, "paired": ["Meta Quest 3"], "pairing_s": 600}));
+        assert_eq!((native.port, native.paired.len(), native.pending.len()), (9950, 0, 0));
+        model.apply_status(&serde_json::json!({
+            "type": "native", "port": 9951, "paired": ["Meta Quest 3"], "pairing_s": null,
+            "pending": [{"key": "ab12", "name": "Meta Quest 3", "ip": "192.168.1.30", "code": "482 913"}, {"name": "no key"}]
+        }));
         let native = model.native.unwrap();
-        assert_eq!((native.port, native.local_only, native.paired), (9951, false, vec!["Meta Quest 3".to_string()]));
-        assert!(native.pairing_until.is_some_and(|until| until > Instant::now() + Duration::from_secs(590)));
+        assert_eq!((native.port, native.paired), (9951, vec!["Meta Quest 3".to_string()]));
+        // A request without a key or a code cannot be answered, so the window skips it
+        assert_eq!(
+            native.pending,
+            [PairRequest { key: "ab12".into(), name: "Meta Quest 3".into(), ip: "192.168.1.30".into(), code: "482 913".into() }]
+        );
     }
 
     // The native host sends the same `headset` and `stats` lines as the ALVR host. Its latency

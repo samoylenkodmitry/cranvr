@@ -11,6 +11,7 @@
 use crate::{
     console::Backdrop,
     console_panel::{self, ConsolePanel},
+    discovery::FoundHost,
     panels_ball::PanelsBall,
     hub::{hub, DecoderView, Device, LinkState, Snapshot, Stats},
     phone::{self, PhoneFrames},
@@ -24,7 +25,7 @@ use cranpose_xr::{
     local_haptics, local_headset_properties, local_spatial_capabilities, local_spatial_environment, FollowMode, FollowTarget, FollowingSubspace, Pose,
     SpatialFrameEffect, SpatialPanel, StreamedScene, SubspaceModifier,
 };
-use cranvr_proto::{clock::now_ns, identity::format_code};
+use cranvr_proto::clock::now_ns;
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
 /// The sizes in dp that the connect and stats panels start at. The user can make them larger.
@@ -231,6 +232,8 @@ struct Link {
 /// Starts the effects that copy the hub's state into Cranpose state and keep the link up. The
 /// caller composes it once.
 fn link() -> Link {
+    // The panel lists the Macs that answer. The search runs while no link does.
+    crate::discovery::start(hub());
     let snapshot = rememberMutableStateOf(|| hub().snapshot());
     LaunchedEffect((), async move |_| loop {
         snapshot.set(hub().snapshot());
@@ -300,16 +303,29 @@ enum KeyPress {
     Clear,
 }
 
-/// Starts or ends the connection, as the button of the panel says.
+/// Starts or ends the connection, as the button of the panel says. A start connects to the typed
+/// address.
 fn toggle_connection(state: &LinkState, address: TextFieldState) {
     match state {
         LinkState::Idle | LinkState::Failed(_) => {
             let host = address.text();
             settings::remember_host(&host);
-            hub().connect(host, settings::media_choice());
+            hub().connect(host, None, settings::media_choice());
         }
-        LinkState::Connecting | LinkState::Streaming => hub().disconnect(),
+        LinkState::Connecting | LinkState::Waiting { .. } | LinkState::Streaming => hub().disconnect(),
     }
+}
+
+/// Connects to a Mac that the search found. The address field takes the Mac's address, so the next
+/// launch starts with it and Forget host key knows it.
+fn connect_found(host: &FoundHost, address: TextFieldState) {
+    let text = host.address_text();
+    address.edit(|buffer| {
+        buffer.clear();
+        buffer.insert(&text);
+    });
+    settings::remember_host(&text);
+    hub().connect(text, Some(host.fingerprint), settings::media_choice());
 }
 
 /// How the connect panel takes the address.
@@ -349,51 +365,153 @@ fn ConnectPanel(snapshot: MutableState<Snapshot>) {
     );
 }
 
-/// The content of the connect panel. `modifier` gives its size.
+/// The content of the connect panel. `modifier` gives its size. While no link runs, it lists the
+/// Macs that answered the search. A press on one connects. The address field and the keypad stay
+/// behind the small button "Enter an address", for a headset on USB and for another network.
 #[composable]
 fn ConnectBody(snapshot: MutableState<Snapshot>, address: TextFieldState, modifier: Modifier, entry: Entry) {
     let snap = snapshot.get();
     let state = snap.state.clone();
+    let found = snap.found.clone();
+    let typing = rememberMutableStateOf(|| false);
     Column(
         modifier.background(PANEL_COLOR).rounded_corners(24.0).padding(36.0),
         ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(20.0)),
         move || {
             Text("cranvr", Modifier::empty(), text_style(44.0, TEXT_COLOR, Some(FontWeight::BOLD)));
-            Text(
-                "Address of the Mac that runs cranvr-host --protocol native",
-                Modifier::empty(),
-                text_style(22.0, MUTED_COLOR, None),
-            );
-            Box(
-                Modifier::empty().fill_max_width().background(FIELD_COLOR).rounded_corners(14.0).padding(18.0),
-                BoxSpec::default(),
+            match state.clone() {
+                LinkState::Idle | LinkState::Failed(_) => {
+                    HostList(found.clone(), address);
+                    StatusLine(state.clone(), address);
+                    AddressButtons(typing, address);
+                    if typing.get() {
+                        AddressEntry(address, state.clone(), entry);
+                    }
+                }
+                LinkState::Waiting { code, host } => {
+                    WaitingBody(code, host);
+                    StopButton(state.clone());
+                }
+                LinkState::Connecting | LinkState::Streaming => {
+                    StatusLine(state.clone(), address);
+                    StopButton(state.clone());
+                }
+            }
+        },
+    );
+}
+
+/// The Macs that answered the search, each as a button, or the words that say what to do when none
+/// answered.
+#[composable]
+fn HostList(found: Vec<FoundHost>, address: TextFieldState) {
+    if found.is_empty() {
+        Text("Looking for a Mac that runs cranvr...", Modifier::empty(), text_style(28.0, TEXT_COLOR, None));
+        Text(
+            "Open cranvr on the Mac. Put the Mac and this headset on the same Wi-Fi. A Mac with an older cranvr does not appear here: update cranvr on that Mac.",
+            Modifier::empty(),
+            text_style(22.0, MUTED_COLOR, None),
+        );
+        return;
+    }
+    Text("Press your Mac to connect.", Modifier::empty(), text_style(26.0, MUTED_COLOR, None));
+    for host in found {
+        FoundHostButton(host, address);
+    }
+}
+
+#[composable]
+fn FoundHostButton(host: FoundHost, address: TextFieldState) {
+    let detail = format!("{}{}", host.address.ip(), if host.paired { ", paired" } else { "" });
+    let name = host.name.clone();
+    if let Some(advice) = host.update_advice() {
+        // The two apps speak no common protocol: a press would only fail
+        Column(
+            Modifier::empty().fill_max_width().background(KEY_COLOR).rounded_corners(16.0).padding_symmetric(28.0, 18.0),
+            ColumnSpec::default(),
+            move || {
+                Text(name.clone(), Modifier::empty(), text_style(30.0, MUTED_COLOR, Some(FontWeight::BOLD)));
+                Text(advice, Modifier::empty(), text_style(22.0, WARN_COLOR, None));
+            },
+        );
+        return;
+    }
+    let pressed = host.clone();
+    Button(
+        Modifier::empty().fill_max_width().background(ACCENT_COLOR).rounded_corners(16.0).padding_symmetric(28.0, 18.0),
+        ButtonSpec::default(),
+        move || connect_found(&pressed, address),
+        move || {
+            Column(Modifier::empty(), ColumnSpec::default(), {
+                let (name, detail) = (name.clone(), detail.clone());
                 move || {
-                    BasicTextFieldWithOptions(
-                        address,
-                        Modifier::empty().fill_max_width(),
-                        BasicTextFieldOptions {
-                            text_style: text_style(34.0, TEXT_COLOR, None),
-                            cursor_color: TEXT_COLOR,
-                            line_limits: TextFieldLineLimits::SingleLine,
-                            show_keyboard_on_focus: entry != (Entry::Keypad { system_keyboard: false }),
-                            ..BasicTextFieldOptions::default()
-                        },
-                    );
+                    Text(name.clone(), Modifier::empty(), text_style(32.0, TEXT_COLOR, Some(FontWeight::BOLD)));
+                    Text(detail.clone(), Modifier::empty(), text_style(20.0, TEXT_COLOR, None));
+                }
+            });
+        },
+    );
+}
+
+/// What the headset shows while the Mac's user decides: the code, which the Mac shows too.
+#[composable]
+fn WaitingBody(code: String, host: String) {
+    Text("Allow it on the Mac", Modifier::empty(), text_style(38.0, TEXT_COLOR, Some(FontWeight::BOLD)));
+    Text(code, Modifier::empty(), text_style(96.0, GOOD_COLOR, Some(FontWeight::BOLD)));
+    Text(
+        format!("{host} shows the same code. Press Allow on the Mac only if the two codes match."),
+        Modifier::empty(),
+        text_style(24.0, MUTED_COLOR, None),
+    );
+}
+
+/// The small buttons under the list.
+#[composable]
+fn AddressButtons(typing: MutableState<bool>, address: TextFieldState) {
+    let shown = typing.get();
+    Row(
+        Modifier::empty(),
+        RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(12.0)),
+        move || {
+            Button(
+                Modifier::empty().background(KEY_COLOR).rounded_corners(12.0).padding_symmetric(24.0, 12.0),
+                ButtonSpec::default(),
+                move || typing.set(!shown),
+                move || {
+                    Text(if shown { "Hide the address" } else { "Enter an address" }, Modifier::empty(), text_style(22.0, MUTED_COLOR, None));
                 },
             );
-            if matches!(entry, Entry::Keypad { .. }) {
-                Keypad(address);
-            }
-            ConnectButton(state.clone(), address);
-            StatusLine(state.clone(), address);
             ForgetHostButton(address);
-            Text(
-                format!("Pairing code {}", format_code(settings::identity().code())),
-                Modifier::empty(),
-                text_style(22.0, MUTED_COLOR, None),
+        },
+    );
+}
+
+/// The address of a Mac that the search does not find: a headset on USB (`127.0.0.1`) or on another
+/// network. A headset has no keyboard in the room, so the keypad edits the same text as the field.
+#[composable]
+fn AddressEntry(address: TextFieldState, state: LinkState, entry: Entry) {
+    Text("Address of the Mac", Modifier::empty(), text_style(22.0, MUTED_COLOR, None));
+    Box(
+        Modifier::empty().fill_max_width().background(FIELD_COLOR).rounded_corners(14.0).padding(18.0),
+        BoxSpec::default(),
+        move || {
+            BasicTextFieldWithOptions(
+                address,
+                Modifier::empty().fill_max_width(),
+                BasicTextFieldOptions {
+                    text_style: text_style(34.0, TEXT_COLOR, None),
+                    cursor_color: TEXT_COLOR,
+                    line_limits: TextFieldLineLimits::SingleLine,
+                    show_keyboard_on_focus: entry != (Entry::Keypad { system_keyboard: false }),
+                    ..BasicTextFieldOptions::default()
+                },
             );
         },
     );
+    if matches!(entry, Entry::Keypad { .. }) {
+        Keypad(address);
+    }
+    ConnectButton(state, address);
 }
 
 #[composable]
@@ -449,17 +567,27 @@ fn Key(press: KeyPress, address: TextFieldState) {
     );
 }
 
+/// Connects to the typed address.
 #[composable]
 fn ConnectButton(state: LinkState, address: TextFieldState) {
-    let (label, color) = match state {
-        LinkState::Idle | LinkState::Failed(_) => ("Connect", ACCENT_COLOR),
-        LinkState::Connecting => ("Cancel", STOP_COLOR),
-        LinkState::Streaming => ("Disconnect", STOP_COLOR),
-    };
     Button(
-        Modifier::empty().background(color).rounded_corners(16.0).padding_symmetric(44.0, 20.0),
+        Modifier::empty().background(ACCENT_COLOR).rounded_corners(16.0).padding_symmetric(44.0, 20.0),
         ButtonSpec::default(),
         move || toggle_connection(&state, address),
+        move || {
+            Text("Connect", Modifier::empty(), text_style(32.0, TEXT_COLOR, Some(FontWeight::BOLD)));
+        },
+    );
+}
+
+/// Ends the connection that runs or that waits for the Mac.
+#[composable]
+fn StopButton(state: LinkState) {
+    let label = if state == LinkState::Streaming { "Disconnect" } else { "Cancel" };
+    Button(
+        Modifier::empty().background(STOP_COLOR).rounded_corners(16.0).padding_symmetric(44.0, 20.0),
+        ButtonSpec::default(),
+        move || hub().disconnect(),
         move || {
             Text(label, Modifier::empty(), text_style(32.0, TEXT_COLOR, Some(FontWeight::BOLD)));
         },
@@ -492,6 +620,7 @@ fn state_text(state: &LinkState, address: &str) -> (String, Color) {
     match state {
         LinkState::Idle => ("Not connected".into(), MUTED_COLOR),
         LinkState::Connecting => (format!("Connecting to {}...", address.trim()), WARN_COLOR),
+        LinkState::Waiting { host, .. } => (format!("Waiting for {host} to allow this headset"), WARN_COLOR),
         LinkState::Streaming => ("Connected".into(), GOOD_COLOR),
         LinkState::Failed(message) => (message.clone(), BAD_COLOR),
     }
