@@ -301,6 +301,41 @@ pub fn run_program(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Ends a running program and starts it again with the launch options that are saved now. The
+/// program is a Windows path, as the host reports it. Steam keeps running, so the game needs no
+/// new start of Steam.
+pub fn restart(program: &str) -> Result<(), String> {
+    let name = program.rsplit('\\').next().unwrap_or(program);
+    end_program(name);
+    let path = windows_to_mac(program).ok_or(format!("cranvr cannot start {program} again"))?;
+    match games().into_iter().find(|game| self::program(game).is_some_and(|own| own.eq_ignore_ascii_case(program))) {
+        Some(game) => play(&game),
+        None => run_program(&path),
+    }
+}
+
+/// Ends the Windows program with this file name and waits until its process is gone.
+fn end_program(name: &str) {
+    wine("taskkill").args(["/IM", name, "/F"]).stdout(Stdio::null()).stderr(Stdio::null()).status().ok();
+    for _ in 0..30 {
+        if !program_running(name) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    // The host sees the end of the old connection first, then the new game connects
+    thread::sleep(Duration::from_secs(2));
+}
+
+fn program_running(name: &str) -> bool {
+    Command::new("pgrep").args(["-if", &regex_escaped(name)]).output().is_ok_and(|o| !o.stdout.is_empty())
+}
+
+/// `text` for a regular expression that matches it as it is.
+fn regex_escaped(text: &str) -> String {
+    text.chars().flat_map(|c| if "\\.+*?()[]{}|^$".contains(c) { vec!['\\', c] } else { vec![c] }).collect()
+}
+
 /// A game's program as Wine sees it, the key of its launch options.
 pub fn program(game: &Game) -> Option<String> {
     game.exe.as_deref().map(mac_to_windows)
@@ -364,6 +399,12 @@ mod tests {
         fs::write(dir.join("Redist/big.exe"), vec![0u8; 9000]).unwrap();
         assert_eq!(find_exe(&dir, "Serious Sam VR The Last Hope"), Some(dir.join("Bin/x64/SamTLH.exe")));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_file_name_matches_itself_in_a_regular_expression() {
+        assert_eq!(regex_escaped("Beat Saber.exe"), "Beat Saber\\.exe");
+        assert_eq!(regex_escaped("a(1)+b[x]"), "a\\(1\\)\\+b\\[x\\]");
     }
 
     #[test]

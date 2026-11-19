@@ -219,6 +219,10 @@ pub struct Model {
     pub udp_blocked: bool,
     /// Requests from the console in VR that the window has not run yet
     pub vr_requests: Vec<Value>,
+    /// Reports of a black right eye that the window has not answered yet (see black_eye.rs)
+    pub black_eyes: Vec<Value>,
+    /// What the window and the console in VR say about the last black right eye, until it expires
+    pub notice: Option<(crate::black_eye::Notice, Instant)>,
 }
 
 const LOG_LINES: usize = 200;
@@ -298,6 +302,7 @@ impl Model {
                 });
             }
             Some("vr_request") => self.vr_requests.push(v.clone()),
+            Some("black_eye") => self.black_eyes.push(v.clone()),
             Some("stats") => {
                 self.stats = Some(Stats {
                     fps: v["fps"].as_f64().unwrap_or(0.0),
@@ -468,10 +473,20 @@ impl HostLog {
     }
 }
 
-/// Writes vr-menu.json for the console in VR: the games and the settings that it offers. The host
-/// reads it, adds the stream's state and sends it to the headset. Writes only on a change.
-pub fn write_vr_menu(settings: &Settings, games: &[crate::steam::Game]) {
+/// Writes vr-menu.json for the console in VR: the games and the settings that it offers, and a
+/// short notice while there is one. The host reads it, adds the stream's state and sends it to the
+/// headset. Writes only on a change.
+pub fn write_vr_menu(settings: &Settings, games: &[crate::steam::Game], notice: Option<&str>) {
     static WRITTEN: Mutex<String> = Mutex::new(String::new());
+    let menu = vr_menu(settings, games, notice);
+    let mut written = WRITTEN.lock().unwrap();
+    if *written != menu && fs::write(config_dir().join("vr-menu.json"), &menu).is_ok() {
+        *written = menu;
+    }
+}
+
+/// The text of vr-menu.json.
+fn vr_menu(settings: &Settings, games: &[crate::steam::Game], notice: Option<&str>) -> String {
     let games: Vec<Value> = games
         .iter()
         .filter_map(|g| {
@@ -479,18 +494,17 @@ pub fn write_vr_menu(settings: &Settings, games: &[crate::steam::Game]) {
             Some(serde_json::json!({"name": g.name, "program": program}))
         })
         .collect();
-    let menu = serde_json::json!({
+    let mut menu = serde_json::json!({
         "games": games,
         "fps": settings.fps,
         "game_scale": settings.game_scale,
         "msaa": settings.game_msaa_limit,
         "low_latency": settings.low_latency,
-    })
-    .to_string();
-    let mut written = WRITTEN.lock().unwrap();
-    if *written != menu && fs::write(config_dir().join("vr-menu.json"), &menu).is_ok() {
-        *written = menu;
+    });
+    if let Some(notice) = notice {
+        menu["notice"] = notice.into();
     }
+    menu.to_string()
 }
 
 pub fn stop_host() {
@@ -712,6 +726,22 @@ mod tests {
         let native = model.native.unwrap();
         assert_eq!((native.port, native.local_only, native.paired), (9951, false, vec!["Meta Quest 3".to_string()]));
         assert!(native.pairing_until.is_some_and(|until| until > Instant::now() + Duration::from_secs(590)));
+    }
+
+    #[test]
+    fn the_hosts_black_eye_line_waits_in_the_model_for_the_window_to_answer() {
+        let mut model = Model::default();
+        model.apply_status(&serde_json::json!({"type": "black_eye", "eye": "right", "program": "C:\\Games\\game.exe"}));
+        assert_eq!(model.black_eyes.len(), 1);
+        assert_eq!(model.black_eyes[0]["program"], "C:\\Games\\game.exe");
+    }
+
+    #[test]
+    fn the_console_menu_carries_the_notice_only_while_there_is_one() {
+        let read = |notice| serde_json::from_str::<Value>(&vr_menu(&Settings::default(), &[], notice)).unwrap();
+        assert!(read(None).get("notice").is_none());
+        assert_eq!(read(Some("The right eye stayed black. The game restarts."))["notice"], "The right eye stayed black. The game restarts.");
+        assert_eq!(read(None)["fps"], Settings::default().fps);
     }
 
     // The native host sends the same `headset` and `stats` lines as the ALVR host. Its latency

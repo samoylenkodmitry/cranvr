@@ -49,6 +49,9 @@ pub struct Menu {
     /// The most MSAA samples a game may use; 0 lets the game choose
     pub msaa: u32,
     pub status: Status,
+    /// One short line from the app about something that happens now, such as a game that restarts.
+    /// The app writes it into vr-menu.json while it applies.
+    pub notice: Option<String>,
 }
 
 impl Menu {
@@ -73,6 +76,7 @@ impl Menu {
                 latency_ms: number(&s["latency_ms"]),
                 game: s["game"].as_str().map(str::to_string),
             },
+            notice: v["notice"].as_str().filter(|notice| !notice.is_empty()).map(str::to_string),
         })
     }
 
@@ -242,9 +246,11 @@ pub fn height(menu: Option<&Menu>) -> f32 {
         return 2.0 * PADDING + rows(&[TITLE, TEXT, HEADING, BUTTON, BUTTON, BUTTON]);
     };
     let games = menu.listed().len().max(1) as f32;
+    // The notice has a line of its own
+    let notice = if menu.notice.is_some() { TEXT + GAP } else { 0.0 };
     // The title, the game's state, the heading and the games, the heading and six rows for the five
     // settings (one row is spare), the note and the buttons at the bottom
-    2.0 * PADDING + rows(&[TITLE, TEXT, HEADING]) + games * (BUTTON + GAP) + rows(&[HEADING, BUTTON, BUTTON, BUTTON, BUTTON, BUTTON, BUTTON, TEXT, BUTTON])
+    2.0 * PADDING + notice + rows(&[TITLE, TEXT, HEADING]) + games * (BUTTON + GAP) + rows(&[HEADING, BUTTON, BUTTON, BUTTON, BUTTON, BUTTON, BUTTON, TEXT, BUTTON])
 }
 
 /// How long the left menu button must stay down to show or hide the console. A shorter press goes
