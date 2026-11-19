@@ -18,6 +18,9 @@ pub struct GameOptions {
     /// Why `eye_per_pass` is on, when cranvr turned it on (see black_eye.rs). The Options panel
     /// shows it. A change by the user clears it.
     pub eye_per_pass_reason: String,
+    /// The user turned `eye_per_pass` off by hand. cranvr then leaves the option to the user: a
+    /// black right eye gives a notice, not a change.
+    pub eye_per_pass_declined: bool,
     /// Wine DLL overrides as WINEDLLOVERRIDES takes them, such as "winhttp=n,b" to load a
     /// winhttp.dll from the game's folder before Wine's own
     pub dll_overrides: String,
