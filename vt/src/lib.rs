@@ -87,6 +87,22 @@ impl PixelBuffer {
         }
     }
 
+    /// Calls `f` with the single plane of a buffer of 4-byte pixels and its bytes per row, for CPU
+    /// reads. The lock is read-only. `None` when the buffer cannot be locked.
+    pub fn with_pixels<R>(&self, f: impl FnOnce(&[u8], usize) -> R) -> Option<R> {
+        const LOCK_READ_ONLY: u64 = 1;
+        unsafe {
+            if CVPixelBufferLockBaseAddress(self.0, LOCK_READ_ONLY) != 0 {
+                return None;
+            }
+            let base = cv_base_address(self.0) as *const u8;
+            let stride = cv_bytes_per_row(self.0);
+            let result = (!base.is_null()).then(|| f(std::slice::from_raw_parts(base, stride * self.height()), stride));
+            CVPixelBufferUnlockBaseAddress(self.0, LOCK_READ_ONLY);
+            result
+        }
+    }
+
     pub fn pixel_format(&self) -> u32 {
         unsafe { CVPixelBufferGetPixelFormatType(self.0) }
     }

@@ -6,6 +6,7 @@ mod compat;
 mod desktop;
 mod desktop_layer;
 mod display_modes;
+mod eye_check;
 mod game_audio;
 mod game_sizes;
 mod headset;
@@ -749,6 +750,8 @@ struct Game {
     rates: Vec<f64>,
     /// Frames the game delivered since the last stats window, encoded or not
     delivered: u32,
+    /// Looks for a black right eye in this run (see eye_check.rs)
+    eye_watch: eye_check::Watch,
     /// Set the displays to their panels' pixels while the game runs
     unscale: bool,
     /// The helper that holds those modes
@@ -770,6 +773,7 @@ impl Game {
         self.connected && self.last_frame.is_some_and(|t| t.elapsed() < GAME_IDLE)
     }
 
+
     /// Applies one event. A frame replaces `newest`; the replaced frame goes back to the game.
     fn apply(&mut self, event: GameEvent, newest: &mut Option<GameFrame>, link: &RuntimeLink, dropped: &mut u32) {
         match event {
@@ -777,6 +781,7 @@ impl Game {
                 info!("Game connected ({renderer})");
                 self.program = program;
                 self.rates.clear();
+                self.eye_watch = Default::default();
                 status::emit(json!({"type": "game", "connected": true, "name": renderer, "program": self.program}));
                 self.swapchains.clear();
                 self.connected = true;
@@ -807,11 +812,22 @@ impl Game {
                 self.swapchains.clear();
                 self.connected = false;
                 self.since = None;
+                self.eye_watch = Default::default();
                 // The displays get their modes back
                 self.unscaled = None;
                 self.last_frame = None;
             }
         }
+    }
+}
+
+/// Checks the two eyes of a game frame about once a second. The cranvr app hears of a black right
+/// eye once for each game run, as a `black_eye` status line, and decides what to do. The caller
+/// holds the images, so this takes the fields of `Game` that it needs, not the whole of it.
+fn watch_eyes(watch: &mut eye_check::Watch, program: Option<&str>, frame: &GameFrame, left: &PixelBuffer, right: &PixelBuffer) {
+    if watch.due() && watch.check([left, right], [frame.views[0].rect, frame.views[1].rect]) {
+        warn!("The right eye of the game stays black while the left eye shows a picture");
+        status::emit(json!({"type": "black_eye", "eye": "right", "program": program}));
     }
 }
 
@@ -1101,6 +1117,7 @@ fn frame_loop(
                 let images = (game.swapchains.image(&frame.views[0]), game.swapchains.image(&frame.views[1]));
                 let result = match images {
                     (Some(left), Some(right)) => {
+                        watch_eyes(&mut game.eye_watch, game.program.as_deref(), frame, left, right);
                         let mut params = ComposeParams {
                             fov: views.fov,
                             eye_w,

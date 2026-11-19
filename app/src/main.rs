@@ -2,6 +2,7 @@
 //! stream quality, shows the Mac desktop in VR, and starts Windows games under Wine.
 
 mod backend;
+mod black_eye;
 mod launch;
 mod setup;
 mod steam;

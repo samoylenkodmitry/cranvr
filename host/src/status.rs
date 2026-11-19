@@ -18,6 +18,9 @@
 //! - `native`: with `--protocol native`, at the start and after a try to pair that changed the
 //!   state: port, local_only (the host takes this Mac's clients only), paired (the names of the
 //!   paired headsets) and pairing_s (seconds that the pairing window stays open, or null)
+//! - `black_eye`: eye "right" and program (the game's program path, or null): the game's right
+//!   eye stayed black for several seconds while its left eye showed a picture (see eye_check.rs).
+//!   The host sends it once for each game run.
 //! - `vr_request`: a button of the console in VR (see desktop_layer.rs): action "play" with game,
 //!   "stop", or "set" with one of fps, game_scale, msaa, low_latency
 //!
