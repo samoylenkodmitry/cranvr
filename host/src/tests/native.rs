@@ -755,6 +755,9 @@ fn the_wish_for_tracking_stays_within_the_offer_and_the_version() {
     assert_eq!(wish_to_send(6, hands, Features::ALL, Some(hands)), None);
     assert_eq!(wish_to_send(6, face, Features::ALL, Some(hands)), Some(face));
     assert_eq!(wish_to_send(6, Features::NONE, Features::ALL, Some(hands)), Some(Features::NONE));
+    // A headset that offers the full body serves a game that asks for the default body
+    assert_eq!(wish_to_send(6, Features::BODY, Features::FULL_BODY, None), Some(Features::FULL_BODY));
+    assert_eq!(wish_to_send(6, Features::BODY, Features::BODY.union(Features::FULL_BODY), None), Some(Features::BODY));
     // Bits that this version does not know are dropped
     assert_eq!(wish_to_send(6, Features(0xe0 | 1), Features(0xff), None), Some(hands));
 }

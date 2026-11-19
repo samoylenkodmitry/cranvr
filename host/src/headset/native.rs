@@ -692,6 +692,13 @@ fn wish_to_send(version: u16, wish: Features, offered: Features, asked: Option<F
     if version < TRACKING_VERSION {
         return None;
     }
+    // The first 70 joints of the full body are the default set: a headset that offers the full body
+    // serves a game that asks for the default one
+    let wish = if wish.contains(Features::BODY) && !offered.contains(Features::BODY) && offered.contains(Features::FULL_BODY) {
+        wish.union(Features::FULL_BODY)
+    } else {
+        wish
+    };
     let effective = wish.known().intersect(offered);
     (asked != Some(effective) && !(asked.is_none() && effective.is_empty())).then_some(effective)
 }

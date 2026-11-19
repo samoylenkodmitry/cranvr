@@ -8,6 +8,7 @@ cranvr's host and the Cranpose client speak one protocol (`proto/`). Both ends a
 - The host: a Metal test scene, Windows OpenXR games under Wine through BasaltVR's runtime, the Mac desktop as a second stream, the Mac's sound as PCM, foveated HEVC encoding and the display lock.
 - The client: a Cranpose app for the Quest and for Android phones and tablets.
 - The `cranvr` window: it starts the host, shows the headsets that wait for the user's answer, sets up Wine and Steam and starts games.
+- Hands, body, face and eyes for games: the protocol, the host, the runtime's OpenXR extensions and the controllers that a hand makes for a game without hand code (README, "Hands, body, face and eyes in games"). The client sends the data when Cranpose has the API.
 - `scripts/e2e.sh`: a test client on the Mac or a Quest, with the latency by stage in the host's report.
 
 ## What the protocol allows next
