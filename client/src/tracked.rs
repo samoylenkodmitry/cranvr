@@ -4,7 +4,8 @@
 //! The build script asks Cranpose for the four kinds of tracking (`build.rs`). Cranpose then reads
 //! them in each frame whatever the host wants, because an OpenXR instance fixes its extensions
 //! before the app runs. This file keeps the cost of the host's wish down:
-//! - [`offer`] turns the frame's capabilities into the features that the headset offers;
+//! - [`TrackedReader::offer`] turns the frame's capabilities into the features that the headset offers,
+//!   with the source of the face (cameras or microphone), which a game of the host's runtime reads;
 //! - [`TrackedReader`] copies only the wished features out of the frame into a buffer that it
 //!   allocated once, and estimates the velocity of the wrists and of the body's root from successive
 //!   frames, because Cranpose gives no velocities for joints;
@@ -12,8 +13,8 @@
 //!   wished feature. Nothing allocates in a frame.
 
 use cranpose_xr::{
-    BodyJointType, BodyState, Eyes, FaceDataSource, HandJointType, HandState, MetaFaceState, Pose as XrPose, TrackingAvailability,
-    TrackingCapabilities, TrackingFeature, TrackingState, XrFrame,
+    BodyJointType, BodyState, Eyes, FaceBlendShapeType, FaceConfidenceRegion, FaceDataSource, FaceExpression, FaceState, FaceTrackingProvider,
+    HandJointType, HandState, MetaFaceState, Pose as XrPose, TrackingAvailability, TrackingCapabilities, TrackingFeature, TrackingState, XrFrame,
 };
 use cranvr_proto::{
     motion::velocities,
@@ -34,8 +35,10 @@ pub struct Capabilities {
     pub active: [bool; 4],
     /// The runtime also tracks the legs and the feet
     pub full_body: bool,
-    /// The face comes through `XR_FB_face_tracking2`, which has the 70 weights that the host takes
-    pub meta_face: bool,
+    /// The extension that gives the face: Meta's `XR_FB_face_tracking2` with the 70 weights that the
+    /// host takes, or Android XR's own with the 68 weights of Jetpack XR, which the reader maps to
+    /// Meta's
+    pub face: Option<FaceTrackingProvider>,
     /// The gaze is one pose, through `XR_EXT_eye_gaze_interaction`
     pub eye_gaze: bool,
 }
@@ -45,7 +48,7 @@ impl Capabilities {
         Self {
             active: TrackingFeature::ALL.map(|feature| tracking.availability(feature) == TrackingAvailability::Active),
             full_body: tracking.is_full_body_available(),
-            meta_face: tracking.face_tracking_provider() == Some(cranpose_xr::FaceTrackingProvider::Meta),
+            face: tracking.face_tracking_provider(),
             eye_gaze: tracking.is_eye_gaze_interaction_available(),
         }
     }
@@ -55,10 +58,13 @@ impl Capabilities {
     }
 
     /// The features that the headset can send to the host now. The user's permissions decide: a feature
-    /// that waits for a permission or lacks one is not offered. A face that comes from Android XR's own
-    /// extension has the 68 weights of Jetpack XR, which the host's runtime has no use for, so it is not
-    /// offered either.
-    pub fn features(&self) -> Features {
+    /// that waits for a permission or lacks one is not offered. The face comes with its source:
+    /// - Android XR's extension reads the face with the headset's cameras: visual.
+    /// - Meta's extension picks the source itself, and a Quest 3 has no camera for the mouth, so it
+    ///   gives the microphone's. `face_seen` holds the sources that its samples came from (see
+    ///   [`TrackedReader::offer`]). The face of an unknown source is offered with no source, until a
+    ///   sample names one.
+    pub fn features(&self, face_seen: Features) -> Features {
         let mut offered = Features::NONE;
         if self.running(TrackingFeature::Hands) {
             offered = offered.union(Features::HANDS);
@@ -69,19 +75,18 @@ impl Capabilities {
                 offered = offered.union(Features::FULL_BODY);
             }
         }
-        if self.running(TrackingFeature::Face) && self.meta_face {
-            offered = offered.union(Features::FACE);
+        if self.running(TrackingFeature::Face) {
+            match self.face {
+                Some(FaceTrackingProvider::Android) => offered = offered.union(Features::FACE).union(Features::FACE_VISUAL),
+                Some(_) => offered = offered.union(Features::FACE).union(face_seen.intersect(Features::FACE_SOURCES)),
+                None => {}
+            }
         }
         if self.running(TrackingFeature::Eyes) && self.eye_gaze {
             offered = offered.union(Features::EYES);
         }
         offered
     }
-}
-
-/// The features that the headset offers, from the capabilities of a frame.
-pub fn offer(tracking: &TrackingCapabilities) -> Features {
-    Capabilities::of(tracking).features()
 }
 
 /// What the headset knows of a joint: valid and tracked, in the bits of the wire.
@@ -174,11 +179,14 @@ pub struct TrackedReader {
     last_root: Option<(Duration, XrPose)>,
     /// The buffer that the next frame fills. A push to the feed trades it for the sender's.
     scratch: Box<TrackedFrame>,
+    /// The sources (`Features::FACE_VISUAL` and `FACE_AUDIO`) that a valid face came from since the
+    /// face tracker started
+    face_seen: Features,
 }
 
 impl Default for TrackedReader {
     fn default() -> Self {
-        Self { last_wrist: [None; 2], last_root: None, scratch: Box::new(TrackedFrame::new()) }
+        Self { last_wrist: [None; 2], last_root: None, scratch: Box::new(TrackedFrame::new()), face_seen: Features::NONE }
     }
 }
 
@@ -198,10 +206,34 @@ fn finite(pose: &XrPose) -> bool {
 }
 
 impl TrackedReader {
+    /// The features that the headset offers, from the capabilities of a frame. The face's source comes
+    /// from the samples, because Cranpose names it only per frame. A sample that is not valid says
+    /// nothing: the runtime fills in the source of a face that it does not have. A source that a valid
+    /// sample came from stays in the offer until the face tracker stops, so that a headset which
+    /// switches between its sources does not send a new offer at each switch.
+    pub fn offer(&mut self, xr: &XrFrame) -> Features {
+        self.offer_with(&Capabilities::of(&xr.tracking), xr)
+    }
+
+    fn offer_with(&mut self, capabilities: &Capabilities, xr: &XrFrame) -> Features {
+        if !capabilities.running(TrackingFeature::Face) {
+            self.face_seen = Features::NONE;
+        } else if let Some(source) = face_source(capabilities.face, xr) {
+            self.face_seen = self.face_seen.union(source);
+        }
+        capabilities.features(self.face_seen)
+    }
+
     /// Fills the buffer with the wished features of `xr` and returns it. `sample_time` and
     /// `display_time` are those of the frame's `Tracking` message. A feature that the host did not
     /// wish stays untracked, so the sender sends nothing for it and the reader reads nothing.
     pub fn read(&mut self, xr: &XrFrame, sample_time: Nanos, display_time: Nanos, wish: Features) -> &mut Box<TrackedFrame> {
+        self.read_face_of(xr, sample_time, display_time, wish, xr.tracking.face_tracking_provider())
+    }
+
+    /// `read` for a face of the extension `face`. A test names it, because Cranpose builds its own
+    /// capabilities only from a running runtime.
+    fn read_face_of(&mut self, xr: &XrFrame, sample_time: Nanos, display_time: Nanos, wish: Features, face: Option<FaceTrackingProvider>) -> &mut Box<TrackedFrame> {
         let time = xr.predicted_display_time;
         let frame = &mut *self.scratch;
         frame.sample_time = sample_time;
@@ -219,7 +251,11 @@ impl TrackedReader {
         if !frame.body.active {
             self.last_root = None;
         }
-        frame.face.valid = wish.contains(Features::FACE) && fill_face(&mut frame.face, &xr.meta_face);
+        frame.face.valid = wish.contains(Features::FACE)
+            && match face {
+                Some(FaceTrackingProvider::Android) => fill_android_face(&mut frame.face, &xr.face),
+                _ => fill_meta_face(&mut frame.face, &xr.meta_face),
+            };
         frame.gaze = if wish.contains(Features::EYES) { gaze_of(&xr.eyes) } else { None };
         &mut self.scratch
     }
@@ -257,7 +293,22 @@ fn fill_body(out: &mut BodySample, state: &BodyState, full: bool, last: &mut Opt
     true
 }
 
-fn fill_face(out: &mut FaceSample, state: &MetaFaceState) -> bool {
+/// The source that the frame's valid face came from, as a bit of the offer. `None` while the face is
+/// not valid.
+fn face_source(provider: Option<FaceTrackingProvider>, xr: &XrFrame) -> Option<Features> {
+    match provider {
+        // Android XR reads the face with the headset's cameras
+        Some(FaceTrackingProvider::Android) => xr.face.is_valid.then_some(Features::FACE_VISUAL),
+        Some(_) if xr.meta_face.is_valid => match xr.meta_face.data_source {
+            Some(FaceDataSource::Audio) => Some(Features::FACE_AUDIO),
+            Some(FaceDataSource::Visual) => Some(Features::FACE_VISUAL),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn fill_meta_face(out: &mut FaceSample, state: &MetaFaceState) -> bool {
     if !state.is_valid {
         return false;
     }
@@ -266,6 +317,45 @@ fn fill_face(out: &mut FaceSample, state: &MetaFaceState) -> bool {
         | if state.data_source == Some(FaceDataSource::Audio) { face::FROM_AUDIO } else { 0 };
     out.confidence = [state.lower_face_confidence, state.upper_face_confidence];
     out.weights = state.weights;
+    true
+}
+
+/// For each blend shape of Jetpack XR (by its index), the slot of Meta's weight with the same meaning.
+/// It is `None` for the tongue shapes that only Android XR has.
+const META_SLOT: [Option<usize>; FaceBlendShapeType::COUNT] = {
+    let mut table = [None; FaceBlendShapeType::COUNT];
+    let mut i = 0;
+    while i < FaceBlendShapeType::COUNT {
+        table[i] = match FaceBlendShapeType::ALL[i].expression() {
+            Some(expression) => Some(expression.index()),
+            None => None,
+        };
+        i += 1;
+    }
+    table
+};
+
+// The wire's weights are Meta's, in the order of `FaceExpression`
+const _: () = assert!(FaceExpression::COUNT == FACE_WEIGHTS);
+
+/// The face that Android XR gave, in the weights of Meta that the host takes. A weight that Android
+/// XR does not give stays 0. The Jetpack XR names map to Meta's by `FaceBlendShapeType::expression`.
+/// Android XR reports no separate validity for the eyes' look weights: they come with the rest, so
+/// they follow `is_valid`. Meta has one confidence for the upper face: the mean of the two upper
+/// regions.
+fn fill_android_face(out: &mut FaceSample, state: &FaceState) -> bool {
+    if !state.is_valid {
+        return false;
+    }
+    out.flags = face::VALID | face::EYES_FOLLOWING_VALID;
+    out.weights = [0.0; FACE_WEIGHTS];
+    for (slot, weight) in META_SLOT.iter().zip(&state.blend_shapes) {
+        if let Some(slot) = slot {
+            out.weights[*slot] = *weight;
+        }
+    }
+    let region = |r: FaceConfidenceRegion| state.confidence_regions[r.index()];
+    out.confidence = [region(FaceConfidenceRegion::Lower), (region(FaceConfidenceRegion::LeftUpper) + region(FaceConfidenceRegion::RightUpper)) / 2.0];
     true
 }
 
@@ -306,28 +396,89 @@ mod tests {
 
     #[test]
     fn the_offer_follows_what_runs_and_what_the_host_can_use() {
-        let headset = Capabilities { active: [true, true, true, false], full_body: true, meta_face: true, eye_gaze: false };
-        // A Quest 3 as the coordinator's desk check found it: no eyes
-        assert_eq!(headset.features(), Features::HANDS.union(Features::BODY).union(Features::FULL_BODY).union(Features::FACE));
+        let meta = Some(FaceTrackingProvider::Meta);
+        let headset = Capabilities { active: [true, true, true, false], full_body: true, face: meta, eye_gaze: false };
+        // A Quest 3 as the coordinator's desk check found it: no eyes. Its face has no source until
+        // a sample names one.
+        let no_source = Features::NONE;
+        assert_eq!(headset.features(no_source), Features::HANDS.union(Features::BODY).union(Features::FULL_BODY).union(Features::FACE));
         // Nothing runs yet: the user has not answered
-        assert_eq!(Capabilities { full_body: true, meta_face: true, eye_gaze: true, ..Capabilities::default() }.features(), Features::NONE);
+        assert_eq!(Capabilities { full_body: true, face: meta, eye_gaze: true, ..Capabilities::default() }.features(no_source), Features::NONE);
         // The legs only count with a running body tracker
-        assert_eq!(Capabilities { active: [false, false, false, false], full_body: true, ..Capabilities::default() }.features(), Features::NONE);
+        assert_eq!(Capabilities { active: [false, false, false, false], full_body: true, ..Capabilities::default() }.features(no_source), Features::NONE);
         let upper = Capabilities { active: [false, true, false, false], full_body: false, ..Capabilities::default() };
-        assert_eq!(upper.features(), Features::BODY);
-        // A face from Android XR's extension has the 68 weights of Jetpack XR: no offer
-        let android = Capabilities { active: [false, false, true, false], meta_face: false, ..Capabilities::default() };
-        assert_eq!(android.features(), Features::NONE);
+        assert_eq!(upper.features(no_source), Features::BODY);
         // The gaze needs a running tracker and the combined gaze pose
         let eyes = Capabilities { active: [false, false, false, true], eye_gaze: true, ..Capabilities::default() };
-        assert_eq!(eyes.features(), Features::EYES);
+        assert_eq!(eyes.features(no_source), Features::EYES);
         let social = Capabilities { active: [false, false, false, true], eye_gaze: false, ..Capabilities::default() };
-        assert_eq!(social.features(), Features::NONE);
+        assert_eq!(social.features(no_source), Features::NONE);
+    }
+
+    #[test]
+    fn the_face_is_offered_with_the_source_that_it_comes_from() {
+        let face = |provider| Capabilities { active: [false, false, true, false], face: provider, ..Capabilities::default() };
+        let meta = face(Some(FaceTrackingProvider::Meta));
+        // Meta's extension picks the source: the offer names what valid samples came from
+        let audio = Features::FACE.union(Features::FACE_AUDIO);
+        assert_eq!(meta.features(Features::FACE_AUDIO), audio);
+        assert_eq!(meta.features(Features::FACE_VISUAL), Features::FACE.union(Features::FACE_VISUAL));
+        assert_eq!(meta.features(Features::FACE_SOURCES), Features::FACE.union(Features::FACE_SOURCES));
+        // Bits that are no source stay out of the offer
+        assert_eq!(meta.features(Features::HANDS.union(Features::FACE_AUDIO)), audio);
+        // Android XR's own extension reads the face with cameras. Its 68 weights go to the host as
+        // Meta's 70, so the face is offered.
+        let android = face(Some(FaceTrackingProvider::Android));
+        assert_eq!(android.features(Features::NONE), Features::FACE.union(Features::FACE_VISUAL));
+        // No provider, no face, and a face that does not run is not offered
+        assert_eq!(face(None).features(Features::FACE_AUDIO), Features::NONE);
+        assert_eq!(Capabilities { face: Some(FaceTrackingProvider::Android), ..Capabilities::default() }.features(Features::NONE), Features::NONE);
+    }
+
+    fn meta_face_frame(source: Option<FaceDataSource>, valid: bool) -> XrFrame {
+        let mut xr = at(100);
+        xr.meta_face = MetaFaceState { is_valid: valid, data_source: source, ..MetaFaceState::default() };
+        xr
+    }
+
+    #[test]
+    fn the_offer_learns_the_face_source_from_valid_samples_and_keeps_it_while_the_tracker_runs() {
+        let running = Capabilities { active: [false, false, true, false], face: Some(FaceTrackingProvider::Meta), ..Capabilities::default() };
+        let mut reader = TrackedReader::default();
+        // A sample that is not valid says nothing, whatever source it names: the runtime fills it in
+        let invalid = meta_face_frame(Some(FaceDataSource::Visual), false);
+        assert_eq!(reader.offer_with(&running, &invalid), Features::FACE);
+        // A Quest 3: the first valid sample names the microphone
+        let audio = meta_face_frame(Some(FaceDataSource::Audio), true);
+        let quest_3 = Features::FACE.union(Features::FACE_AUDIO);
+        assert_eq!(reader.offer_with(&running, &audio), quest_3);
+        // The offer stays while the samples are not valid
+        assert_eq!(reader.offer_with(&running, &invalid), quest_3);
+        // A headset that switches sources offers both from then on and does not flap
+        let both = Features::FACE.union(Features::FACE_SOURCES);
+        assert_eq!(reader.offer_with(&running, &meta_face_frame(Some(FaceDataSource::Visual), true)), both);
+        assert_eq!(reader.offer_with(&running, &audio), both);
+        // A valid sample with no source says nothing
+        let mut fresh = TrackedReader::default();
+        assert_eq!(fresh.offer_with(&running, &meta_face_frame(None, true)), Features::FACE);
+        // The tracker stops, as when the user takes the permission away: the sources go. It starts again with none.
+        let stopped = Capabilities { active: [false; 4], ..running };
+        assert_eq!(reader.offer_with(&stopped, &audio), Features::NONE);
+        assert_eq!(reader.offer_with(&running, &invalid), Features::FACE);
+        // Android XR: cameras, with no wait for a sample
+        let android = Capabilities { face: Some(FaceTrackingProvider::Android), ..running };
+        assert_eq!(TrackedReader::default().offer_with(&android, &at(100)), Features::FACE.union(Features::FACE_VISUAL));
+    }
+
+    #[test]
+    fn a_frame_with_no_tracking_capabilities_has_no_face_source() {
+        let mut reader = TrackedReader::default();
+        assert_eq!(reader.offer(&meta_face_frame(Some(FaceDataSource::Audio), true)), Features::NONE);
     }
 
     #[test]
     fn a_frame_with_no_tracking_offers_nothing() {
-        assert_eq!(offer(&TrackingCapabilities::default()), Features::NONE);
+        assert_eq!(TrackedReader::default().offer(&at(0)), Features::NONE);
         assert_eq!(Capabilities::of(&TrackingCapabilities::default()), Capabilities::default());
     }
 
@@ -494,6 +645,95 @@ mod tests {
         assert_eq!(reader.read(&xr, 1, 2, Features::FACE).face.flags, face::VALID);
         xr.meta_face.is_valid = false;
         assert!(!reader.read(&xr, 1, 2, Features::FACE).face.valid);
+    }
+
+    /// A face of Android XR in which each shape has its own weight, so a swap of two shows
+    fn android_face() -> FaceState {
+        let mut state = FaceState { tracking_state: TrackingState::Tracking, is_valid: true, ..FaceState::default() };
+        for shape in FaceBlendShapeType::ALL {
+            state.blend_shapes[shape.index()] = (shape.index() + 1) as f32 / 100.0;
+        }
+        state.confidence_regions[FaceConfidenceRegion::Lower.index()] = 0.5;
+        state.confidence_regions[FaceConfidenceRegion::LeftUpper.index()] = 0.25;
+        state.confidence_regions[FaceConfidenceRegion::RightUpper.index()] = 0.75;
+        state
+    }
+
+    #[test]
+    fn android_xrs_68_weights_land_on_the_70_of_meta_and_the_unmapped_stay_zero() {
+        let mut xr = at(100);
+        xr.face = android_face();
+        let android = Some(FaceTrackingProvider::Android);
+        let mut reader = TrackedReader::default();
+        let frame = reader.read_face_of(&xr, 1, 2, Features::FACE, android);
+        assert!(frame.face.valid);
+        assert_eq!(frame.face.flags, face::VALID | face::EYES_FOLLOWING_VALID, "the cameras give it: no audio flag");
+        // Every shape that has a Meta name lands on that name's slot
+        let mut covered = [false; FACE_WEIGHTS];
+        let mut mapped = 0;
+        for shape in FaceBlendShapeType::ALL {
+            match shape.expression() {
+                Some(expression) => {
+                    mapped += 1;
+                    covered[expression.index()] = true;
+                    assert_eq!(frame.face.weights[expression.index()], (shape.index() + 1) as f32 / 100.0, "{shape:?}");
+                }
+                None => assert!(matches!(shape, FaceBlendShapeType::TongueLeft | FaceBlendShapeType::TongueRight | FaceBlendShapeType::TongueUp | FaceBlendShapeType::TongueDown), "{shape:?}"),
+            }
+        }
+        assert_eq!(mapped, 64, "63 shapes by index and the tongue's out");
+        // The slots that no shape fills are the six tongue shapes of Meta. They stay 0, so the 70 weights are filled by 64.
+        let unmapped: Vec<usize> = (0..FACE_WEIGHTS).filter(|i| !covered[*i]).collect();
+        assert_eq!(unmapped.len(), 6);
+        assert!(unmapped.iter().all(|i| frame.face.weights[*i] == 0.0), "{unmapped:?}");
+        // The tongue's out has different places on the two sides
+        assert_eq!(frame.face.weights[FaceExpression::TongueOut.index()], (FaceBlendShapeType::TongueOut.index() + 1) as f32 / 100.0);
+        assert_eq!(frame.face.weights[FaceExpression::JawDrop.index()], (FaceBlendShapeType::JawDrop.index() + 1) as f32 / 100.0);
+        // The lower region goes as it is, the two upper ones as their mean
+        assert_eq!(frame.face.confidence, [0.5, 0.5]);
+    }
+
+    #[test]
+    fn a_face_of_android_xr_that_is_not_valid_sends_nothing_and_a_refill_leaves_no_old_weight() {
+        let mut xr = at(100);
+        xr.face = android_face();
+        let android = Some(FaceTrackingProvider::Android);
+        let mut reader = TrackedReader::default();
+        assert!(reader.read_face_of(&xr, 1, 2, Features::FACE, android).face.valid);
+        // The next sample has a weight at 0 where the one before had one: the buffer is cleared first
+        xr.face.blend_shapes[FaceBlendShapeType::JawDrop.index()] = 0.0;
+        xr.face.blend_shapes[FaceBlendShapeType::TongueLeft.index()] = 1.0;
+        let frame = reader.read_face_of(&xr, 3, 4, Features::FACE, android);
+        assert_eq!(frame.face.weights[FaceExpression::JawDrop.index()], 0.0);
+        assert!(frame.face.weights.iter().all(|w| *w <= 0.69), "a shape that Meta lacks reaches no slot");
+        xr.face.is_valid = false;
+        assert!(!reader.read_face_of(&xr, 5, 6, Features::FACE, android).face.valid);
+        // The host did not wish the face: nothing is read
+        xr.face.is_valid = true;
+        assert!(!reader.read_face_of(&xr, 7, 8, Features::HANDS, android).face.valid);
+        // The provider decides which state the reader takes: Meta's tracker leaves `face` alone, and
+        // an Android face leaves `meta_face` alone
+        xr.meta_face = MetaFaceState { is_valid: true, data_source: Some(FaceDataSource::Audio), ..MetaFaceState::default() };
+        let from_meta = reader.read_face_of(&xr, 9, 10, Features::FACE, Some(FaceTrackingProvider::Meta));
+        assert_eq!(from_meta.face.flags, face::VALID | face::FROM_AUDIO);
+        assert_eq!(from_meta.face.weights, [0.0; FACE_WEIGHTS]);
+        xr.meta_face.is_valid = false;
+        assert!(!reader.read_face_of(&xr, 11, 12, Features::FACE, android.filter(|_| false)).face.valid, "no provider reads Meta's state");
+    }
+
+    #[test]
+    fn every_shape_that_the_two_runtimes_share_keeps_its_slot() {
+        // The names of the Meta shapes and the Jetpack XR shapes differ by their side letters only, which
+        // Cranpose's own tests check. Here the index map holds the property that the client relies on:
+        // no two shapes share a slot, and the map is the same as the one that Cranpose makes.
+        let mut seen = [false; FACE_WEIGHTS];
+        for (shape, slot) in FaceBlendShapeType::ALL.iter().zip(META_SLOT) {
+            assert_eq!(slot, shape.expression().map(|e| e.index()), "{shape:?}");
+            if let Some(slot) = slot {
+                assert!(!seen[slot], "{shape:?} shares slot {slot}");
+                seen[slot] = true;
+            }
+        }
     }
 
     #[test]

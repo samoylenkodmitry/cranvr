@@ -320,9 +320,31 @@ fn feature_sets_keep_their_names_and_drop_unknown_bits() {
     assert_eq!(Features(0xff).known(), Features::ALL);
     assert!(Features::ALL.contains(Features::FACE) && !Features::HANDS.contains(Features::FACE));
     assert!(Features::NONE.is_empty() && Features::NONE.names().is_empty());
-    for set in 0..=0x1f {
+    for set in 0..=0x7f {
         assert_eq!(Features::from_names(Features(set).names()), Features(set));
     }
+}
+
+#[test]
+fn the_face_sources_belong_to_the_offer_and_an_older_peer_keeps_the_face() {
+    let quest_3 = Features::HANDS.union(Features::FACE).union(Features::FACE_AUDIO);
+    assert_eq!(quest_3.names(), ["hands", "face", "face_audio"]);
+    assert!(quest_3.offers_face_audio() && !quest_3.offers_face_visual());
+    assert!(Features::FACE.union(Features::FACE_VISUAL).offers_face_visual());
+    // A face that names no source is of an unknown one
+    assert!(!Features::FACE.offers_face_audio() && !Features::FACE.offers_face_visual());
+    // A source without a face is no source, and a source is no feature: a wish never keeps it
+    assert!(!Features::FACE_AUDIO.offers_face_audio());
+    assert_eq!(Features::FACE_AUDIO.union(Features::HANDS).offered(), Features::HANDS);
+    assert_eq!(quest_3.offered(), quest_3);
+    assert_eq!(Features(0xff).offered(), Features::ALL.union(Features::FACE_SOURCES));
+    assert_eq!(quest_3.known(), Features::HANDS.union(Features::FACE), "an older peer drops the sources and keeps the face");
+    assert!(Features::FACE_SOURCES.known().is_empty());
+    // The sources travel as bits of the same byte
+    let mut bytes = Vec::new();
+    encode(&ClientMsg::TrackingOffer(quest_3), &mut bytes).unwrap();
+    assert!(matches!(decode::<ClientMsg>(&bytes).unwrap(), ClientMsg::TrackingOffer(f) if f == quest_3));
+    assert_eq!(bytes.len(), 2, "the offer is still a variant tag and one byte");
 }
 
 #[test]

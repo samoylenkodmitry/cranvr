@@ -93,7 +93,8 @@ dxmt_commit=$(git -C "${runtime}/build/dxmt/src" rev-parse HEAD)
     print "optional skip of the Mac window's present. cranvr's runtime patches add the headset's refresh rate,"
     print "a view size per game, an optional limit of one slice per swapchain, a separate aim pose for each"
     print "controller and the tracking of hands, body, face and eyes (XR_EXT_hand_tracking, XR_FB_body_tracking,"
-    print "XR_META_body_tracking_full_body, XR_FB_face_tracking2 and XR_EXT_eye_gaze_interaction)."
+    print "XR_META_body_tracking_full_body, XR_FB_face_tracking2 and XR_EXT_eye_gaze_interaction). Patch 0006"
+    print "makes the face's data source the headset's own: the microphone on a Quest 3."
 } > "${root}/SOURCES.md"
 
 print -r -- "${version}" > "${root}/VERSION"

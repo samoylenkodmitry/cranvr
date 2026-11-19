@@ -575,7 +575,8 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
             }
         }
         Incoming::Control(ClientMsg::TrackingOffer(offer)) => {
-            let offer = offer.known();
+            // The offer keeps the face's sources, which the game's runtime reports to the game
+            let offer = offer.offered();
             *session.offered.lock().unwrap() = offer;
             info!("Native protocol: the headset offers {}", describe(offer));
             shared.emit(Event::TrackingOffer(offer));

@@ -760,6 +760,9 @@ fn the_wish_for_tracking_stays_within_the_offer_and_the_version() {
     assert_eq!(wish_to_send(6, Features::BODY, Features::BODY.union(Features::FULL_BODY), None), Some(Features::BODY));
     // Bits that this version does not know are dropped
     assert_eq!(wish_to_send(6, Features(0xe0 | 1), Features(0xff), None), Some(hands));
+    // The face's source is a detail of the offer: the wish for the face has none, whatever the offer says
+    let audio = face.union(Features::FACE_AUDIO);
+    assert_eq!(wish_to_send(6, audio, audio, None), Some(face));
 }
 
 #[test]
@@ -790,9 +793,12 @@ fn tracking_goes_from_the_headset_to_the_events_only_when_the_host_asked() {
     // A game asks before the headset offers: nothing goes out yet
     headset.set_tracking_wish(Features::HANDS.union(Features::EYES));
     assert!(from_client.recv_timeout(Duration::from_millis(300)).is_err());
-    client.duplex.send_control(&ClientMsg::TrackingOffer(Features::HANDS.union(Features::FACE))).unwrap();
+    // The face comes from the microphone, as on a Quest 3. The offer keeps the source for the game's
+    // runtime. A source of no face is dropped, and the wish never carries one.
+    let offered = Features::HANDS.union(Features::FACE).union(Features::FACE_AUDIO);
+    client.duplex.send_control(&ClientMsg::TrackingOffer(offered.union(Features(1 << 7)))).unwrap();
     let Event::TrackingOffer(offer) = wait_for(&mut *events, |e| matches!(e, Event::TrackingOffer(_))) else { unreachable!() };
-    assert_eq!(offer, Features::HANDS.union(Features::FACE));
+    assert_eq!(offer, offered);
     assert_eq!(from_client.recv_timeout(Duration::from_secs(10)).unwrap(), Features::HANDS);
 
     // Eyes were not asked for and not offered: the datagram is dropped. Hands come through, with

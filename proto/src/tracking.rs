@@ -16,6 +16,12 @@
 //! A peer that does not know a message skips it (see `link.rs`), so an older host or client takes no
 //! harm from them. The host sends a wish only to a client of version [`TRACKING_VERSION`] or newer.
 //!
+//! The offer also says where the face comes from: [`Features::FACE_VISUAL`] for cameras and
+//! [`Features::FACE_AUDIO`] for the microphone. A Quest 3 has no camera that sees the mouth, so its
+//! face is the audio one. The game's runtime reports these sources in `XR_FB_face_tracking2`, and a
+//! game decides from them which data source it asks for. The bits sit above the five features. An
+//! older peer drops them with [`Features::known`] and keeps the face as a face of an unknown source.
+//!
 //! All poses are in the headset's room, like the head's and the controllers'. Joints travel as poses
 //! relative to a root pose that has full precision and a velocity. The relative parts are quantized:
 //! a position to 0.1 mm in an `i16` (a joint lies within 3.2 m of its root), an orientation to its
@@ -62,6 +68,12 @@ impl Features {
     pub const EYES: Features = Features(1 << 4);
     /// Every feature that this version knows
     pub const ALL: Features = Features(0b1_1111);
+    /// Only in an offer, with [`Features::FACE`]: the face comes from the cameras. A wish never has it.
+    pub const FACE_VISUAL: Features = Features(1 << 5);
+    /// Only in an offer, with [`Features::FACE`]: the face comes from the microphone.
+    pub const FACE_AUDIO: Features = Features(1 << 6);
+    /// The two face sources
+    pub const FACE_SOURCES: Features = Features(0b110_0000);
 
     /// Whether every feature of `other` is in this set
     pub fn contains(self, other: Features) -> bool {
@@ -81,15 +93,46 @@ impl Features {
         Features(self.0 & other.0)
     }
 
-    /// Drops the bits that this version does not know, so that a newer peer's bits do no harm.
+    /// Keeps the five features. A wish uses it: a newer peer's bits and the face sources do no harm
+    /// there.
     pub fn known(self) -> Features {
         self.intersect(Features::ALL)
+    }
+
+    /// What a headset's offer keeps of a received set: the features and, with the face, its sources.
+    /// A source without a face is no source.
+    pub fn offered(self) -> Features {
+        let known = self.known();
+        if known.contains(Features::FACE) {
+            known.union(self.intersect(Features::FACE_SOURCES))
+        } else {
+            known
+        }
+    }
+
+    /// Whether the offered face comes from the cameras. It is false for a face of an unknown source,
+    /// which an older client or a headset that has not yet given a face offers.
+    pub fn offers_face_visual(self) -> bool {
+        self.contains(Features::FACE.union(Features::FACE_VISUAL))
+    }
+
+    /// Whether the offered face comes from the microphone.
+    pub fn offers_face_audio(self) -> bool {
+        self.contains(Features::FACE.union(Features::FACE_AUDIO))
     }
 
     /// The names of the features in the set, in a fixed order. They are the words of the
     /// `tracking-features.txt` file that the host writes for the game's runtime.
     pub fn names(self) -> Vec<&'static str> {
-        [(Features::HANDS, "hands"), (Features::BODY, "body"), (Features::FULL_BODY, "full_body"), (Features::FACE, "face"), (Features::EYES, "eyes")]
+        [
+            (Features::HANDS, "hands"),
+            (Features::BODY, "body"),
+            (Features::FULL_BODY, "full_body"),
+            (Features::FACE, "face"),
+            (Features::EYES, "eyes"),
+            (Features::FACE_VISUAL, "face_visual"),
+            (Features::FACE_AUDIO, "face_audio"),
+        ]
             .into_iter()
             .filter(|(feature, _)| self.contains(*feature))
             .map(|(_, name)| name)
@@ -105,6 +148,8 @@ impl Features {
                 "full_body" => Features::FULL_BODY,
                 "face" => Features::FACE,
                 "eyes" => Features::EYES,
+                "face_visual" => Features::FACE_VISUAL,
+                "face_audio" => Features::FACE_AUDIO,
                 _ => Features::NONE,
             })
         })

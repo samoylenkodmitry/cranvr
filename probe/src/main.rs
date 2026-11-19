@@ -44,6 +44,8 @@ fn usage() -> ! {
          \n                     each feature that the host asks for. The head stands still.\
          \n  --no-controllers   with --tracking: no controller is tracked, so a game without hand code\
          \n                     gets controllers made of the hands\
+         \n  --face-source S    with --tracking: where the face comes from, visual (cameras), audio\
+         \n                     (the microphone, the default) or unknown (the offer names no source)\
          \n  --protocol native  accepted and ignored: cranvr's protocol is the only one"
     );
     std::process::exit(2);
@@ -60,6 +62,7 @@ fn main() {
         desktop: false,
         tracking: false,
         no_controllers: false,
+        face_source: Default::default(),
     };
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -78,6 +81,7 @@ fn main() {
             "--desktop" => options.desktop = true,
             "--tracking" => options.tracking = true,
             "--no-controllers" => options.no_controllers = true,
+            "--face-source" => options.face_source = tracked::FaceSource::parse(&value()).unwrap_or_else(|| usage()),
             "--drop-percent" => options.drop_percent = value().parse().unwrap_or_else(|_| usage()),
             _ => usage(),
         }
