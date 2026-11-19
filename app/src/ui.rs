@@ -1,10 +1,11 @@
 use crate::{
-    backend::{self, HeadsetApp, Model, Settings, StreamProtocol},
+    backend::{self, HeadsetApp, Model, Settings, StreamPath, StreamProtocol},
     black_eye,
     launch::{self, GameOptions},
     setup::{self, Progress, Setup},
     steam::{self, SteamState},
     system::{self, Permission},
+    usb::{self, Connection, Download},
 };
 use cranpose::prelude::*;
 use cranpose::text::{FontWeight, TextUnit};
@@ -152,6 +153,9 @@ fn ensure_host(settings: MutableState<Settings>, model: MutableState<Model>) {
 fn refresh(settings: MutableState<Settings>, model: MutableState<Model>, slow: bool) {
     let mut next = model.with(Clone::clone);
     backend::pump(&mut next);
+    // The cable counts for the cranvr client only: the ALVR client does not use it
+    usb::set_choice(settings.with(|s| if s.headset_app == HeadsetApp::Cranvr { s.connection } else { Connection::WiFi }));
+    next.usb = usb::status();
     let requests = std::mem::take(&mut next.vr_requests);
     vr_requests(settings, &mut next, requests);
     let reports = std::mem::take(&mut next.black_eyes);
@@ -299,6 +303,7 @@ pub fn CranvrApp() {
     let tab = rememberMutableStateOf(|| Tab::Play);
 
     LaunchedEffect((), async move |_| {
+        usb::start(backend::native_port());
         refresh(settings, model, true);
         // macOS asks for each missing permission once, when cranvr starts
         if system::in_app_bundle() {
@@ -440,6 +445,20 @@ fn HeadsetCard(settings: MutableState<Settings>, model: MutableState<Model>) {
                     Modifier::empty(),
                     colored(110, 200, 140),
                 );
+                // The way of the stream: the user who chose the cable sees when it is not used
+                if let Some(path) = h.path {
+                    let (text, wanted_cable) = (
+                        match path {
+                            StreamPath::Usb => "Connected by USB cable",
+                            StreamPath::WiFi => "Connected over Wi-Fi",
+                        },
+                        settings.with(|s| s.connection == Connection::Usb),
+                    );
+                    Text(text.to_string(), Modifier::empty(), colored(110, 200, 140));
+                    if wanted_cable && path == StreamPath::WiFi {
+                        Hint("The USB cable is chosen, but this headset is not on it. Plug it into this Mac.".into());
+                    }
+                }
                 if let Some(st) = model.with(|m| m.stats.clone()) {
                     let latency = st.latency_ms.map(|ms| format!(", {ms:.0} ms from motion to display")).unwrap_or_default();
                     Hint(format!(
@@ -451,7 +470,7 @@ fn HeadsetCard(settings: MutableState<Settings>, model: MutableState<Model>) {
             None => {
                 Label("No headset connected".into());
                 if native {
-                    NativeConnect(model);
+                    NativeConnect(settings, model);
                 } else {
                     Hint("On the Quest, open the ALVR app (version 20.14, from the Meta store). Use the same Wi-Fi as this Mac, on 5 GHz.".into());
                 }
@@ -492,9 +511,10 @@ fn HeadsetCard(settings: MutableState<Settings>, model: MutableState<Model>) {
 /// What the user does to connect the cranvr client: open it on the headset. The headset finds this
 /// Mac. The Mac's address is the way for a headset that finds nothing.
 #[composable]
-fn NativeConnect(model: MutableState<Model>) {
+fn NativeConnect(settings: MutableState<Settings>, model: MutableState<Model>) {
     let (native, lan) = model.with(|m| (m.native.clone(), m.lan.clone()));
-    let port = native.as_ref().map_or(backend::NATIVE_PORT, |n| n.port);
+    let port = native.as_ref().map_or(backend::native_port(), |n| n.port);
+    UsbNote(settings, model);
     Label("Open cranvr on the headset. It finds this Mac.".into());
     Hint("Put the headset on the same Wi-Fi as this Mac, on 5 GHz. The first time, this window asks you to allow the headset.".into());
     match &native {
@@ -507,6 +527,38 @@ fn NativeConnect(model: MutableState<Model>) {
     } else {
         let addresses: Vec<String> = lan.iter().map(|ip| format!("{ip}:{port}")).collect();
         Hint(format!("If the headset does not find this Mac, enter its address in the headset: {}", addresses.join(" or ")));
+    }
+}
+
+/// What the cable does, in words, while no headset streams. A Mac whose user never plugs a headset
+/// in sees nothing here: the lines need a device on the cable or the choice of the cable.
+#[composable]
+fn UsbNote(settings: MutableState<Settings>, model: MutableState<Model>) {
+    let choice = settings.with(|s| s.connection);
+    if !choice.allows_usb() {
+        return;
+    }
+    let status = model.with(|m| m.usb.clone());
+    if let Some(blocked) = &status.blocked {
+        Text(blocked.clone(), Modifier::empty(), colored(240, 170, 90));
+        return;
+    }
+    if status.unauthorized {
+        Text("Put on the headset and allow USB debugging.".to_string(), Modifier::empty(), colored(240, 170, 90));
+    }
+    if status.headsets.iter().any(|h| h.reversed) {
+        Text("The headset is on the USB cable. Open cranvr on the headset to stream over it.".to_string(), Modifier::empty(), colored(110, 200, 140));
+    } else if choice == Connection::Usb && !status.unauthorized {
+        Text(
+            if status.adb.is_none() && status.looked {
+                "USB needs a tool that cranvr does not have yet. Press Add USB support in the Settings tab."
+            } else {
+                "Plug the headset into this Mac with a USB cable."
+            }
+            .to_string(),
+            Modifier::empty(),
+            colored(230, 180, 90),
+        );
     }
 }
 
@@ -1056,6 +1108,7 @@ fn SettingsTab(settings: MutableState<Settings>, model: MutableState<Model>) {
         Hint("Changes restart the host; the headset reconnects by itself.".into());
     });
     if native {
+        ConnectionCard(settings, model);
         let paired = model.with(|m| m.native.as_ref().map(|n| n.paired.clone()));
         Card(move || {
             Heading("Paired headsets".into());
@@ -1089,6 +1142,53 @@ fn SettingsTab(settings: MutableState<Settings>, model: MutableState<Model>) {
                     change(settings, model, move |s| s.trusted.retain(|t| *t != name));
                 });
             });
+        }
+    });
+}
+
+/// How the stream reaches the headset (see usb.rs), and the button that adds the tool that the
+/// cable needs when this Mac has none.
+#[composable]
+fn ConnectionCard(settings: MutableState<Settings>, model: MutableState<Model>) {
+    let choice = settings.with(|s| s.connection);
+    let status = model.with(|m| m.usb.clone());
+    Card(move || {
+        Heading("Connection".into());
+        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+            Text("Stream by".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
+            for (label, option) in [("Automatic", Connection::Automatic), ("Wi-Fi", Connection::WiFi), ("USB cable", Connection::Usb)] {
+                Choice(label.into(), choice == option, move || {
+                    // The cable is an adb matter: the host keeps running and a stream keeps its path
+                    settings.update(|s| s.connection = option);
+                    settings.with(Settings::save);
+                });
+            }
+        });
+        Hint(
+            match choice {
+                Connection::Automatic => "The stream uses the USB cable while the headset is plugged into this Mac. Otherwise it uses Wi-Fi.",
+                Connection::WiFi => "The stream always uses Wi-Fi. This Mac gives the headset no link over the cable.",
+                Connection::Usb => "The stream uses the USB cable. This window says when the headset is not on it.",
+            }
+            .into(),
+        );
+        Hint("A change counts from the next connection of the headset. A running stream keeps its path.".into());
+        Hint("The cable needs developer mode on the headset. Turn it on in the Meta Horizon app on your phone.".into());
+        if choice.allows_usb() && status.adb.is_none() && status.looked {
+            Label("This Mac has no adb tool, which the cable needs.".into());
+            match status.download.clone() {
+                Download::Working(text) => {
+                    Text(text, Modifier::empty(), colored(230, 180, 90));
+                }
+                Download::Failed(text) => {
+                    Text(text, Modifier::empty(), colored(240, 170, 90));
+                    FlowRow(Modifier::empty(), flow(), || Primary("Try again".into(), usb::download_tools));
+                }
+                Download::Idle => {
+                    FlowRow(Modifier::empty(), flow(), || Primary("Add USB support".into(), usb::download_tools));
+                }
+            }
+            Hint(format!("The button downloads Google's Android platform-tools for macOS ({}) from dl.google.com into {}.", usb::TOOLS_SIZE, backend::config_dir().display()).into());
         }
     });
 }

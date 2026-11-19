@@ -8,6 +8,7 @@ mod setup;
 mod steam;
 mod system;
 mod ui;
+mod usb;
 mod vr_window;
 
 use cranpose::AppLauncher;

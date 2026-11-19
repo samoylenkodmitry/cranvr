@@ -25,6 +25,7 @@ mod settings;
 mod sizing;
 mod tracking;
 mod ui;
+mod usb;
 
 pub use ui::{ClientApp, PhoneApp};
 

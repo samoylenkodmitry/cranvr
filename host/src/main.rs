@@ -515,7 +515,8 @@ fn main() {
                     None => error!("Headset connected, but session.json has no stream config"),
                 }
                 if let Some(n) = &negotiated {
-                    status::emit(json!({"type": "headset", "connected": true, "eye": [n.eye_width, n.eye_height], "fps": n.fps, "foveated": n.foveated}));
+                    // `ip` tells the app which way the stream travels: loopback is the USB cable
+                    status::emit(json!({"type": "headset", "connected": true, "eye": [n.eye_width, n.eye_height], "fps": n.fps, "foveated": n.foveated, "ip": client_ip.map(|ip| ip.to_string())}));
                     // games that start from now on render at the stream's eye size
                     let scaled = |v: u32| (v as f32 * options.game_scale).round() as u32;
                     if let Err(e) = link.write_control_file((scaled(n.eye_width), scaled(n.eye_height)), n.fps.round() as u32) {

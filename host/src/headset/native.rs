@@ -27,7 +27,7 @@ use crate::{
     status,
 };
 use alvr_common::{
-    error,
+    debug, error,
     glam::{Quat, Vec3},
     info, warn, DeviceMotion, Fov as AlvrFov, Pose as AlvrPose, LEFT_MENU_CLICK_ID, LEFT_SQUEEZE_CLICK_ID, LEFT_SQUEEZE_VALUE_ID,
     LEFT_THUMBREST_TOUCH_ID, LEFT_THUMBSTICK_CLICK_ID, LEFT_THUMBSTICK_TOUCH_ID, LEFT_THUMBSTICK_X_ID, LEFT_THUMBSTICK_Y_ID,
@@ -281,6 +281,12 @@ fn accept_loop(listener: HostListener, config: Arc<Config>, shared: Arc<Shared>)
     loop {
         let pending = match listener.accept() {
             Ok(pending) => pending,
+            // A connection that ends before the client's key is a probe: the headset app asks a
+            // cabled Mac every second whether it answers (see `cranvr_proto::link::probe_host`).
+            Err(ProtoError::Closed) => {
+                debug!("Native protocol: a connection ended before its hello");
+                continue;
+            }
             Err(e) => {
                 warn!("Native protocol: a connection failed before its hello: {e}");
                 if let Some(message) = version_notice(&e) {

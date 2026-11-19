@@ -17,6 +17,7 @@ use crate::{
         StreamLayout,
     },
     phone, sizing, tracking,
+    usb::{self, Aim, Path},
 };
 use cranpose::{
     AccessUnit, DecodedFrames, DecoderCapabilities, DecoderConfig, DecoderError, DecoderOutput, VideoCodec, VideoDecoder,
@@ -213,7 +214,7 @@ impl Connection {
 }
 
 /// Says in words why a connection ended, and what the user does next.
-fn failure_text(error: &Error, host: SocketAddr) -> String {
+fn failure_text(error: &Error, host: &str) -> String {
     match error {
         Error::Version { .. } => {
             if error.peer_must_update() == Some(true) {
@@ -296,6 +297,36 @@ fn resolve(text: &str) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("{text} has no address"))
 }
 
+/// Where a connection to `text` goes and which path that is. A phone or a headset asks the cable
+/// now: the panel's list may be old, and a link that ended connects again through here. A flat
+/// window goes where the text says, because a host beside it is no cable.
+fn route(hub: &'static Hub, text: &str, fingerprint: Option<[u8; 8]>) -> (String, Option<Path>) {
+    if !hub.device().is_live() {
+        return (text.to_string(), None);
+    }
+    let loopback = usb::is_loopback(text);
+    let cable = usb::probe();
+    // A Mac that this headset paired with is known by its address. Another Mac behind a typed
+    // address shows itself to a question, which is asked only when a cable could take its place.
+    let mut mac = fingerprint.or_else(|| {
+        let key = crate::settings::host_key(&host_name(text)).filter(|_| !loopback)?;
+        Some(cranvr_proto::identity::fingerprint(&key))
+    });
+    if mac.is_none() && !loopback && cable.is_some() {
+        mac = resolve(text).ok().and_then(usb::identify);
+    }
+    let mut found = hub.found();
+    if cable.is_none() && loopback && mac.is_some_and(|mac| !found.iter().any(|host| host.fingerprint == mac)) {
+        // The cable is out and the search has not listed the Mac yet: ask the network now
+        found = crate::discovery::search_now(Duration::from_millis(1500));
+    }
+    let target = usb::target(&Aim { address: text.to_string(), fingerprint: mac }, cable.as_ref(), &found);
+    if target.address != text.trim() {
+        log::info!("{text} connects as {} over {:?}", target.address, target.path);
+    }
+    (target.address, Some(target.path))
+}
+
 fn run(
     hub: &'static Hub,
     id: u64,
@@ -305,6 +336,10 @@ fn run(
     stop: &AtomicBool,
     slot: &Mutex<Option<Arc<ClientLink>>>,
 ) {
+    // The cable or Wi-Fi: chosen now, so a link that ended and connects again chooses anew
+    let (text, path) = route(hub, text, fingerprint);
+    let text = text.as_str();
+    hub.report(id, |snapshot| snapshot.path = path);
     let host = match resolve(text) {
         Ok(host) => host,
         Err(message) => {
@@ -312,6 +347,9 @@ fn run(
             return;
         }
     };
+    // How the host is called in the panel's words
+    let by_cable = path == Some(Path::Usb);
+    let shown = if by_cable { "The Mac on the USB cable".to_string() } else { host.to_string() };
     let tcp_media = match media {
         MediaChoice::Auto => host.ip().is_loopback(),
         MediaChoice::Udp => false,
@@ -360,7 +398,7 @@ fn run(
     let link = match ClientLink::connect_with(host, &caps, identity, pinned, CONNECT_TIMEOUT, &mut Waiting { hub, id, stop }) {
         Ok(link) => Arc::new(link),
         Err(e) => {
-            let message = failure_text(&e, host);
+            let message = failure_text(&e, &shown);
             log::warn!("{message}");
             hub.report(id, |snapshot| snapshot.state = LinkState::Failed(message));
             return;
@@ -371,6 +409,7 @@ fn run(
         log::info!("paired with the host key {} at {host}", cranvr_proto::identity::to_hex(&link.host_key[..8]));
         crate::settings::remember_host_key(&name, &link.host_key);
     }
+    hub.learn_mac(id, cranvr_proto::identity::fingerprint(&link.host_key));
     *slot.lock().unwrap() = Some(Arc::clone(&link));
     if stop.load(Ordering::Relaxed) {
         // The user ended the attempt while the handshake ran
@@ -384,7 +423,7 @@ fn run(
     link.duplex.close();
     hub.report(id, |snapshot| {
         if !matches!(snapshot.state, LinkState::Failed(_)) {
-            snapshot.state = LinkState::Failed(format!("the link to {host} ended: {reason}"));
+            snapshot.state = LinkState::Failed(format!("the link to {} ended: {reason}", if by_cable { "the Mac on the USB cable".to_string() } else { host.to_string() }));
         }
     });
 }
@@ -1142,22 +1181,22 @@ mod tests {
 
     #[test]
     fn a_failure_says_which_side_to_update() {
-        let host: SocketAddr = ([192, 168, 1, 20], 9950).into();
+        let host = SocketAddr::from(([192, 168, 1, 20], 9950)).to_string();
         // An older Mac: its range ends below the client's
-        let old_mac = failure_text(&Error::Version { ours: (4, 5), theirs: (4, 4) }, host);
+        let old_mac = failure_text(&Error::Version { ours: (4, 5), theirs: (4, 4) }, &host);
         assert!(old_mac.ends_with("Update cranvr on the Mac."), "{old_mac}");
         // A newer Mac
-        let new_mac = failure_text(&Error::Version { ours: (4, 5), theirs: (6, 6) }, host);
+        let new_mac = failure_text(&Error::Version { ours: (4, 5), theirs: (6, 6) }, &host);
         assert!(new_mac.ends_with("Update the cranvr app on the headset."), "{new_mac}");
     }
 
     #[test]
     fn a_refusal_tells_the_user_what_to_press() {
-        let host: SocketAddr = ([192, 168, 1, 20], 9950).into();
-        assert_eq!(failure_text(&Error::Rejected(RejectReason::Denied), host), "The Mac denied this headset. Press the Mac to ask again.");
-        assert_eq!(failure_text(&Error::Rejected(RejectReason::NoAnswer), host), "Nobody answered on the Mac. Press the Mac to ask again.");
-        assert!(failure_text(&Error::Timeout, host).contains("Is cranvr open on the Mac?"));
-        assert!(failure_text(&Error::HostKeyChanged, host).contains("Forget host key"));
+        let host = SocketAddr::from(([192, 168, 1, 20], 9950)).to_string();
+        assert_eq!(failure_text(&Error::Rejected(RejectReason::Denied), &host), "The Mac denied this headset. Press the Mac to ask again.");
+        assert_eq!(failure_text(&Error::Rejected(RejectReason::NoAnswer), &host), "Nobody answered on the Mac. Press the Mac to ask again.");
+        assert!(failure_text(&Error::Timeout, &host).contains("Is cranvr open on the Mac?"));
+        assert!(failure_text(&Error::HostKeyChanged, &host).contains("Forget host key"));
     }
 
     /// The whole way of a new headset to a Mac, against a real host process on this machine: the

@@ -13,6 +13,7 @@ use crate::{
     discovery::FoundHost,
     settings,
     tracking::{Display, Feed},
+    usb::{Path, UsbMac},
 };
 use cranpose::{CropRect, DecodedFrames};
 use cranpose_xr::{
@@ -183,11 +184,15 @@ pub struct Snapshot {
     pub stats: Stats,
     /// The Macs that answered the search (see `discovery.rs`). `Hub::snapshot` fills it.
     pub found: Vec<FoundHost>,
+    /// The Mac that answers behind the USB cable (see `usb.rs`). `Hub::snapshot` fills it.
+    pub usb: Option<UsbMac>,
+    /// The way that the link goes, once a connection has chosen it
+    pub path: Option<Path>,
 }
 
 impl Snapshot {
     fn idle() -> Self {
-        Self { state: LinkState::Idle, stream: None, stats: Stats::default(), found: Vec::new() }
+        Self { state: LinkState::Idle, stream: None, stats: Stats::default(), found: Vec::new(), usb: None, path: None }
     }
 }
 
@@ -301,8 +306,11 @@ const RECONNECT_AFTER: Duration = Duration::from_secs(2);
 /// without the user's say connects again. A connection that never streamed stays failed, so the
 /// panel shows why.
 struct Wanted {
+    /// The address that the user pressed or typed. Each connection chooses its own way to the
+    /// Mac behind it (see `usb::target`).
     host: String,
-    /// The start of the host's key fingerprint, when the host came from the search
+    /// The start of the host's key fingerprint, when the host came from the search or an earlier
+    /// connection reached it
     fingerprint: Option<[u8; 8]>,
     media: MediaChoice,
     streamed: bool,
@@ -347,6 +355,8 @@ pub struct Hub {
     wanted: Mutex<Option<Wanted>>,
     /// The Macs that answered the search
     found: Mutex<Vec<FoundHost>>,
+    /// The Mac that answers behind the USB cable
+    usb: Mutex<Option<UsbMac>>,
     console: Mutex<Console>,
     /// The saved settings of the console were loaded. A rebuilt composition must not load them
     /// again, because the choices in memory are newer when a save failed.
@@ -372,6 +382,7 @@ pub fn hub() -> &'static Hub {
         connection: Mutex::new(None),
         wanted: Mutex::new(None),
         found: Mutex::new(Vec::new()),
+        usb: Mutex::new(None),
         console: Mutex::new(Console::default()),
         settings_loaded: AtomicBool::new(false),
     })
@@ -381,7 +392,23 @@ impl Hub {
     pub fn snapshot(&self) -> Snapshot {
         let mut snapshot = self.snapshot.lock().unwrap().clone();
         snapshot.found = self.found.lock().unwrap().clone();
+        snapshot.usb = self.usb.lock().unwrap().clone();
         snapshot
+    }
+
+    /// The Macs that answered the search
+    pub fn found(&self) -> Vec<FoundHost> {
+        self.found.lock().unwrap().clone()
+    }
+
+    /// Notes the Mac that answers behind the USB cable, or that none does. The cable's thread
+    /// calls it.
+    pub fn set_usb(&self, usb: Option<UsbMac>) {
+        *self.usb.lock().unwrap() = usb;
+    }
+
+    pub fn usb(&self) -> Option<UsbMac> {
+        self.usb.lock().unwrap().clone()
     }
 
     /// Notes the Macs that answered the search. The search thread calls it after each round.
@@ -455,6 +482,17 @@ impl Hub {
         // A link that streamed for any time counts, also when the UI never saw the state
         if let Some(wanted) = self.wanted.lock().unwrap().as_mut().filter(|_| streaming) {
             wanted.streamed = true;
+        }
+    }
+
+    /// Notes which Mac the connection `id` reached. A connection to a typed address learns it
+    /// there, so a later connection can tell the Mac's cable from its Wi-Fi.
+    pub(crate) fn learn_mac(&self, id: u64, fingerprint: [u8; 8]) {
+        if self.current.load(Ordering::Acquire) != id {
+            return;
+        }
+        if let Some(wanted) = self.wanted.lock().unwrap().as_mut() {
+            wanted.fingerprint.get_or_insert(fingerprint);
         }
     }
 
