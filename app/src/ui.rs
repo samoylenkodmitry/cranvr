@@ -504,8 +504,9 @@ fn PlayTab(settings: MutableState<Settings>, model: MutableState<Model>) {
             SteamLibrary(settings, model, setup.clone());
         }
     });
-    // Before the game support step there is no Wine to start a program with or to set up
-    if state == SteamState::NoWine {
+    // Before the game support step there is no Wine to start a program with or to set up. While a
+    // setup runs, its card is the one thing on the tab.
+    if running || state == SteamState::NoWine {
         return;
     }
     Card(move || {

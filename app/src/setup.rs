@@ -26,8 +26,8 @@ impl Step {
     /// updates it. A Steam that needs setup is installed already.
     pub fn describe(self, state: SteamState) -> &'static str {
         match (self, state) {
-            (Step::Rosetta, _) => "Runs Wine's Intel code. macOS asks for your Mac password.",
-            (Step::GameSupport, SteamState::NoWine) => "Wine, DXMT and the OpenXR runtime. A download of about 250 MB.",
+            (Step::Rosetta, _) => "Lets this Mac run Wine's Intel code. macOS asks for your Mac password once.",
+            (Step::GameSupport, SteamState::NoWine) => "Wine runs Windows games on a Mac. This adds its graphics layer (DXMT) and the VR runtime (OpenXR). A download of about 250 MB.",
             (Step::GameSupport, _) => "Updates the OpenXR runtime and DXMT in Wine.",
             (Step::Steam, SteamState::NeedsSetup) => "Steam needs a repair after its own update. This takes a minute.",
             (Step::Steam, _) => "Installs Steam and prepares it for this Mac. A download of about 1.6 GB.",
