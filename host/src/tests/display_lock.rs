@@ -328,3 +328,64 @@ fn the_lock_copes_with_a_jittery_pipeline() {
     let locked = simulate(true, 14.0, 4.0, 7);
     assert!(locked.new_frames as f64 / locked.slots as f64 > 0.9, "{} of {}", locked.new_frames, locked.slots);
 }
+
+#[test]
+fn a_pose_that_comes_within_a_period_before_the_start_starts_the_frame() {
+    let lock = lock_with_grid();
+    let now = 5_000_000_000;
+    let ms = MS as u64;
+    // The next pose is due a period after this one. A start that lies sooner than that, less the
+    // guard, comes before the next pose.
+    assert!(lock.starts_early(now, now + ms));
+    assert!(lock.starts_early(now, now + 7 * ms));
+    // A start further away leaves time for the next pose, which the frame renders for
+    assert!(!lock.starts_early(now, now + 8 * ms));
+    assert!(!lock.starts_early(now, now + PERIOD));
+    // A start that has passed is not early
+    assert!(!lock.starts_early(now, now));
+    assert!(!lock.starts_early(now, now - ms));
+}
+
+/// The poses reach the host one per period, 14 ms before their display times, each late or early by
+/// up to 0.3 ms. The frame loop starts a planned frame at the arrival of the first pose for which
+/// `starts_early` holds, or at the planned start. The pose that it renders for is the newest one at
+/// the start. It must never be an older one than the planned start would take.
+#[test]
+fn starting_at_the_arrival_renders_for_the_pose_that_the_planned_start_would_take() {
+    let mut rng = Rng(7);
+    let display = |k: u64| 10_000_000_000 + k * PERIOD;
+    let arrivals: Vec<Nanos> = (0..2000).map(|k| (display(k) as f64 - 14.0 * MS + rng.jitter(0.3 * MS)) as Nanos).collect();
+    let lock = lock_with_grid();
+    let (mut early_starts, mut gained) = (0, 0.0);
+    for _ in 0..1000 {
+        // A planned start at any point of the period
+        let start = arrivals[500] + (rng.unit() * PERIOD as f64) as u64;
+        let by_timer = arrivals.iter().rposition(|&a| a <= start).unwrap();
+        let early = arrivals.iter().position(|&a| a < start && lock.starts_early(a, start));
+        if let Some(early) = early {
+            assert_eq!(early, by_timer, "the frame renders for pose {early} and not for {by_timer}");
+            early_starts += 1;
+            gained += (start - arrivals[early]) as f64 / MS;
+        }
+    }
+    // Most plans start early: those that lie within the guard of the next pose do not
+    assert!(early_starts > 900, "{early_starts}");
+    // The frames gain half a period on average
+    let mean = gained / early_starts as f64;
+    assert!(mean > 3.5 && mean < 4.5, "{mean}");
+}
+
+#[test]
+fn a_frame_does_not_start_early_when_it_would_wait_in_the_headsets_queue_beyond_the_cap() {
+    let mut lock = lock_with_grid();
+    let now = 5_000_000_000;
+    // A loaded Mac: one frame in ten is quick, the others need 30 ms. The planned need is at its cap.
+    lock.need = (0..WINDOW).map(|i| if i % 10 == 0 { 11.0 * MS } else { 30.0 * MS }).collect();
+    let cap = 11.0 * MS + NEED_CAP_PERIODS * PERIOD as f64;
+    assert!((lock.need() - cap).abs() < MS, "{} {}", lock.need(), cap);
+    assert!(!lock.starts_early(now, now + MS as u64), "a start a millisecond ahead leaves the cap");
+    assert!(lock.starts_early(now, now + 100_000));
+    // With a rested need the whole period fits under the cap
+    lock.need = (0..WINDOW).map(|_| 13.0 * MS).collect();
+    assert!(lock.starts_early(now, now + 7 * MS as u64));
+}
