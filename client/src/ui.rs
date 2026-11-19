@@ -291,6 +291,8 @@ fn HeadsetFrames() {
     SpatialFrameEffect(move |frame| {
         let now = now_ns();
         let read = reader.borrow_mut().read(frame, now);
+        // The hands, body, face and eyes go in before the frame, so the sender finds them when it wakes
+        reader.borrow_mut().push_tracked(frame, &read, &hub().feed);
         console_panel::on_frame(&read, now);
         hub().feed.push(read);
     });

@@ -401,3 +401,29 @@ fn tracking_travels_through_a_session_and_an_older_client_is_not_asked() {
     assert!(seen.contains(&ClientDatagram::Hands(sent)));
     assert!(seen.iter().any(|d| matches!(d, ClientDatagram::Eyes(e) if e.gaze == Some(Pose::IDENTITY))));
 }
+
+#[test]
+fn a_sample_that_replaces_another_is_the_same_as_a_new_one() {
+    let mut rng = Rng(21);
+    let root = root_motion(&mut rng);
+    let first = joints(&mut rng, HAND_JOINTS, &root.pose, 0.2);
+    let second = joints(&mut rng, HAND_JOINTS, &root.pose, 0.2);
+    let mut hand = Hand::new(root, first.as_slice().try_into().unwrap());
+    let other_root = Motion { linear_velocity: [1.0, 2.0, 3.0], ..root };
+    hand.set(other_root, second.as_slice().try_into().unwrap());
+    assert_eq!(hand, Hand::new(other_root, second.as_slice().try_into().unwrap()));
+
+    let body_joints = joints(&mut rng, FULL_BODY_JOINTS, &root.pose, 1.0);
+    let mut body = Body::new(1, 2, BodySet::Full, 0.5, root, &body_joints).unwrap();
+    // A smaller set in the same value: the block shrinks to its 70 joints
+    body.set(3, 4, BodySet::Default, 0.75, root, &body_joints[..BODY_JOINTS]).unwrap();
+    assert_eq!(body, Body::new(3, 4, BodySet::Default, 0.75, root, &body_joints[..BODY_JOINTS]).unwrap());
+    assert!(body.set(5, 6, BodySet::Full, 1.0, root, &body_joints[..BODY_JOINTS]).is_err());
+
+    let mut face = Face::new(1, 2, face::VALID, [1.0; 2], &[0.5; FACE_WEIGHTS]);
+    face.set(3, 4, 0, [0.0; 2], &[0.25; FACE_WEIGHTS]);
+    assert_eq!(face, Face::new(3, 4, 0, [0.0; 2], &[0.25; FACE_WEIGHTS]));
+    // A default value is what `mem::take` leaves in a sender's slot
+    assert_eq!(Hand::default().root, Motion::default());
+    assert_eq!(Body::default().set, BodySet::Default);
+}

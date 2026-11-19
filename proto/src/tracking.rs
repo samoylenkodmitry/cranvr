@@ -226,13 +226,14 @@ fn unpack_joint(bytes: &[u8]) -> Option<(Pose, u8)> {
     Some((Pose { orientation: normalized(q), position }, flags))
 }
 
-/// Packs joints that lie in the room as poses in the frame of `root`.
-fn pack(root: &Pose, joints: &[Joint]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(joints.len() * PACKED_JOINT_LEN);
+/// Packs joints that lie in the room as poses in the frame of `root`. `out` keeps its capacity, so a
+/// sender that packs a joint block for every headset frame allocates only for the first.
+fn pack_into(out: &mut Vec<u8>, root: &Pose, joints: &[Joint]) {
+    out.clear();
+    out.reserve(joints.len() * PACKED_JOINT_LEN);
     for joint in joints {
-        pack_joint(&mut out, &relative(root, &joint.pose), joint.flags);
+        pack_joint(out, &relative(root, &joint.pose), joint.flags);
     }
-    out
 }
 
 fn unpack(root: &Pose, bytes: &[u8], count: usize) -> Result<Vec<Joint>, Error> {
@@ -251,7 +252,7 @@ fn unpack(root: &Pose, bytes: &[u8], count: usize) -> Result<Vec<Joint>, Error> 
 
 /// One hand: the pose of its root with the velocities, and the 26 joints in the frame of the root.
 /// The root is the wrist joint of `XR_EXT_hand_tracking`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Hand {
     pub root: Motion,
     packed: Vec<u8>,
@@ -261,7 +262,16 @@ impl Hand {
     /// A hand from the poses of its joints in the room. `root` leads the packing, so its velocities
     /// carry the motion of the whole hand: the host moves all joints with them.
     pub fn new(root: Motion, joints: &[Joint; HAND_JOINTS]) -> Hand {
-        Hand { root, packed: pack(&root.pose, joints) }
+        let mut hand = Hand::default();
+        hand.set(root, joints);
+        hand
+    }
+
+    /// Replaces the hand with another sample. The joint block keeps its capacity, so a client that
+    /// sends a hand for every frame allocates nothing after the first.
+    pub fn set(&mut self, root: Motion, joints: &[Joint; HAND_JOINTS]) {
+        self.root = root;
+        pack_into(&mut self.packed, &root.pose, joints);
     }
 
     /// The joints as they lay in the room, within the quantization step.
@@ -283,9 +293,10 @@ pub struct Hands {
 }
 
 /// Which joints a body message holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BodySet {
     /// 70 joints
+    #[default]
     Default,
     /// 84 joints
     Full,
@@ -301,7 +312,7 @@ impl BodySet {
 }
 
 /// The body at one sample.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Body {
     pub sample_time: Nanos,
     pub display_time: Nanos,
@@ -317,10 +328,19 @@ impl Body {
     /// A body of the joint set `set` from the room poses of its joints. `joints` holds as many as the
     /// set has, the root joint first.
     pub fn new(sample_time: Nanos, display_time: Nanos, set: BodySet, confidence: f32, root: Motion, joints: &[Joint]) -> Result<Body, Error> {
+        let mut body = Body::default();
+        body.set(sample_time, display_time, set, confidence, root, joints)?;
+        Ok(body)
+    }
+
+    /// Replaces the body with another sample. The joint block keeps its capacity.
+    pub fn set(&mut self, sample_time: Nanos, display_time: Nanos, set: BodySet, confidence: f32, root: Motion, joints: &[Joint]) -> Result<(), Error> {
         if joints.len() != set.joints() {
             return Err(Error::Malformed("a body with the wrong joint count"));
         }
-        Ok(Body { sample_time, display_time, set, confidence, root, packed: pack(&root.pose, joints) })
+        (self.sample_time, self.display_time, self.set, self.confidence, self.root) = (sample_time, display_time, set, confidence, root);
+        pack_into(&mut self.packed, &root.pose, joints);
+        Ok(())
     }
 
     pub fn joints(&self) -> Result<Vec<Joint>, Error> {
@@ -339,7 +359,7 @@ pub mod face {
 }
 
 /// The face at one sample: blend shape weights in the order of `XrFaceExpression2FB`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Face {
     pub sample_time: Nanos,
     pub display_time: Nanos,
@@ -356,7 +376,16 @@ fn to_byte(value: f32) -> u8 {
 
 impl Face {
     pub fn new(sample_time: Nanos, display_time: Nanos, flags: u8, confidence: [f32; FACE_CONFIDENCES], weights: &[f32; FACE_WEIGHTS]) -> Face {
-        Face { sample_time, display_time, flags, confidence: confidence.map(to_byte), weights: weights.iter().map(|w| to_byte(*w)).collect() }
+        let mut face = Face::default();
+        face.set(sample_time, display_time, flags, confidence, weights);
+        face
+    }
+
+    /// Replaces the face with another sample. The weights keep their capacity.
+    pub fn set(&mut self, sample_time: Nanos, display_time: Nanos, flags: u8, confidence: [f32; FACE_CONFIDENCES], weights: &[f32; FACE_WEIGHTS]) {
+        (self.sample_time, self.display_time, self.flags, self.confidence) = (sample_time, display_time, flags, confidence.map(to_byte));
+        self.weights.clear();
+        self.weights.extend(weights.iter().map(|w| to_byte(*w)));
     }
 
     /// The weights from 0 to 1, within half a step of 1/255

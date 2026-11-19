@@ -564,6 +564,8 @@ fn session(hub: &'static Hub, id: u64, link: &ClientLink, device: Device, hello_
         });
     });
     let refresh_hz = stream.refresh_hz;
+    // The host asks again for what its games use. A session starts with no wish.
+    hub.feed.set_wish(cranvr_proto::tracking::Features::NONE);
     let shared = Shared {
         hub,
         id,
@@ -619,6 +621,7 @@ fn session(hub: &'static Hub, id: u64, link: &ClientLink, device: Device, hello_
     });
     crate::desktop::desktop().session_end();
     crate::audio::close();
+    hub.feed.set_wish(cranvr_proto::tracking::Features::NONE);
     reason
 }
 
@@ -659,6 +662,10 @@ fn read_loop(s: &Shared<'_>, units: mpsc::Sender<Received>, udp: bool) -> Error 
             s.epoch.fetch_add(1, Ordering::Relaxed);
         }
         Incoming::Control(HostMsg::Menu(text)) => s.hub.set_menu(s.id, &text),
+        Incoming::Control(HostMsg::TrackingWish(wish)) => {
+            log::info!("the host asks for {}", if wish.is_empty() { "no tracking".to_string() } else { wish.names().join(", ") });
+            s.hub.feed.set_wish(wish);
+        }
         Incoming::Control(HostMsg::Bye) => {
             s.stop.store(true, Ordering::Relaxed);
             s.link.duplex.close();
