@@ -1,8 +1,11 @@
 #!/bin/zsh
 # Builds cranvr.app: the window (cranvr), the host (cranvr-host) and the setup scripts.
 #
-# Usage: scripts/bundle-app.sh [--install]
+# Usage: scripts/bundle-app.sh [--install] [--release]
 #   --install  copies the app to /Applications
+#   --release  signs for people who download the app: the "Developer ID Application" identity
+#              with the hardened runtime and a secure timestamp, as notarization needs.
+#              scripts/release-app.sh runs this, then notarizes the app.
 #
 # macOS keeps permissions (Screen Recording, Accessibility, Local Network) per signed app. The
 # script signs with your first "Apple Development" identity, so a rebuilt app keeps them.
@@ -13,7 +16,14 @@ set -euo pipefail
 
 root=${0:A:h:h}
 install=false
-[[ ${1:-} == --install ]] && install=true
+release=false
+for arg in "$@"; do
+    case ${arg} in
+        --install) install=true ;;
+        --release) release=true ;;
+        *) print -u2 "Unknown argument: ${arg}"; exit 1 ;;
+    esac
+done
 
 cd "${root}"
 cargo build --release -p cranvr-app -p cranvr-host
@@ -48,11 +58,21 @@ cat > "${app}/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
-identity=${CRANVR_SIGN_IDENTITY:-$(security find-identity -v -p codesigning | grep -m1 'Apple Development' | awk '{print $2}' || true)}
+kind='Apple Development'
+sign_options=()
+if ${release}; then
+    kind='Developer ID Application'
+    sign_options=(--options runtime --timestamp)
+fi
+identity=${CRANVR_SIGN_IDENTITY:-$(security find-identity -v -p codesigning | grep -m1 "${kind}" | awk '{print $2}' || true)}
+if ${release} && [[ -z ${identity} || ${identity} == - ]]; then
+    print -u2 "A release needs a \"Developer ID Application\" identity in the keychain."
+    exit 1
+fi
 identity=${identity:--}
-codesign --force --sign "${identity}" --identifier dev.cranvr.host "${app}/Contents/MacOS/cranvr-host"
-codesign --force --sign "${identity}" --identifier dev.cranvr.cranvr "${app}"
-codesign --verify --deep "${app}"
+codesign --force "${sign_options[@]}" --sign "${identity}" --identifier dev.cranvr.host "${app}/Contents/MacOS/cranvr-host"
+codesign --force "${sign_options[@]}" --sign "${identity}" --identifier dev.cranvr.cranvr "${app}"
+codesign --verify --deep --strict "${app}"
 print "Built ${app}"
 
 if ${install}; then
