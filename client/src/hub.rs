@@ -785,7 +785,7 @@ impl StreamLayout {
 
 /// The views of a frame from the render poses that the host sent with it. The two eyes lie side by
 /// side in the picture. A foveated picture has the host's compressed layout. The right eye is
-/// mirrored, as ALVR stores it. `fov` is the field of view of the full view that the host rendered.
+/// mirrored, as the foveated layout stores it. `fov` is the field of view of the full view that the host rendered.
 /// The poses are in the headset's room. The target display time comes later (see `views_of`).
 pub fn streamed_views(eye_poses: &[Pose; 2], fov: &[Fov; 2], layout: &StreamLayout) -> StreamedViews {
     let [width, height] = layout.eye_picture();

@@ -200,8 +200,8 @@ impl Unscaled {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                 match line.as_str() {
                     "done" => break,
-                    l if l.starts_with("error ") => alvr_common::warn!("Display modes: {}", &l[6..]),
-                    l => alvr_common::info!("Display modes while the game runs: {l}"),
+                    l if l.starts_with("error ") => log::warn!("Display modes: {}", &l[6..]),
+                    l => log::info!("Display modes while the game runs: {l}"),
                 }
             }
         });

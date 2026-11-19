@@ -1,5 +1,5 @@
-//! cranvr's own protocol between the Mac host and the Quest client ("native mode"). The crate
-//! has no dependency on ALVR. It builds for macOS and for `aarch64-linux-android`.
+//! cranvr's protocol between the Mac host and the headset client. The crate builds for macOS and
+//! for `aarch64-linux-android`.
 //!
 //! A session has three paths:
 //!

@@ -9,7 +9,7 @@ use crate::hub::StreamLayout;
 use cranpose::DecoderCapabilities;
 use cranvr_proto::message::FoveationParams;
 
-/// The foveation that the host uses by default (ALVR's). The client takes foveated frames, so it
+/// The foveation that the host uses by default. The client takes foveated frames, so it
 /// sizes the eye for the frame that this layout gives. The host's own parameters decide the stream.
 pub const DEFAULT_FOVEATION: FoveationParams =
     FoveationParams { center_size: [0.45, 0.4], center_shift: [0.4, 0.1], edge_ratio: [4.0, 5.0] };

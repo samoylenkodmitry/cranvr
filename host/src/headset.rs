@@ -1,6 +1,6 @@
-//! What the host's frame loop needs from a headset's link. Two protocols stand behind it. ALVR's
-//! v20 protocol serves the stock ALVR client (`alvr.rs`). cranvr's own protocol serves cranvr's
-//! client (`native.rs`). The frame loop, the encoder and the pacer do not know which one runs.
+//! What the host's frame loop needs from a headset's link. cranvr's own protocol (`native.rs`)
+//! stands behind it. The frame loop, the encoder and the pacer see only this interface, so tests
+//! can put a fake link behind it.
 //!
 //! The interface has four parts:
 //! - events from the headset: a connection, a tracking sample, buttons (`EventSource`);
@@ -8,27 +8,16 @@
 //! - what goes to the headset: encoded frames, the decoder configuration, haptics;
 //! - numbers about the link, for the stats line.
 
-use crate::{runtime_link::Haptic, session::Negotiated};
-use alvr_common::{
-    glam::{Quat, Vec3},
-    DeviceMotion, Pose,
+use crate::{
+    pose::{DeviceMotion, Pose, Quat, Vec3, ViewsConfig},
+    runtime_link::Haptic,
+    session::Negotiated,
 };
-use alvr_server_core::ViewsConfig;
 use serde_json::Value;
 use std::{net::IpAddr, sync::mpsc::RecvTimeoutError, time::Duration};
 
-pub mod alvr;
 pub mod display_lock;
 pub mod native;
-
-/// The protocol between the host and the headset's app.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Protocol {
-    /// cranvr's own protocol (`cranvr-proto`), for cranvr's own Quest client
-    Native,
-    /// ALVR v20, for the stock ALVR client
-    Alvr,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Device {
@@ -37,8 +26,8 @@ pub enum Device {
     RightHand,
 }
 
-/// A button or an analog input of a controller, under the path id that ALVR gives it. The
-/// runtime in Wine reads these ids, so the native protocol maps its inputs to them.
+/// A button or an analog input of a controller, under its path id (`cranvr_common::inputs`). The
+/// runtime in Wine reads these ids, so the link maps its inputs to them.
 #[derive(Clone, Copy, Debug)]
 pub struct Button {
     pub path_id: u64,
@@ -48,28 +37,21 @@ pub struct Button {
 }
 
 pub enum Event {
-    /// A headset connected. `stream` is what the two sides agreed on: `None` when the link cannot
-    /// tell.
-    Connected { stream: Option<Negotiated>, ip: Option<IpAddr> },
+    /// A headset connected. `stream` is what the two sides agreed on.
+    Connected { stream: Negotiated, ip: IpAddr },
     Disconnected,
-    /// The headset sent a new tracking sample. With the native protocol the sample time is on the
-    /// headset's clock. With ALVR it is on ALVR's. Frames carry it back.
+    /// The headset sent a new tracking sample. The sample time is on the headset's clock. Frames
+    /// carry it back.
     Tracking { sample_ns: u64 },
     Views(ViewsConfig),
     Buttons(Vec<Button>),
     /// The client lost video and wants a frame that it can start from
     RequestIdr,
     /// The headset's origin moved, because the user recentered. The poses that follow are relative
-    /// to the new origin. Only the native protocol reports it.
+    /// to the new origin.
     Recenter,
     /// A press on a button of the headset's console, as a JSON text (see `status::console_request`).
-    /// Only the native protocol reports it. With ALVR the console's request travels through the
-    /// desktop layer.
     Console(String),
-    /// The link wants the host to stop
-    Stop,
-    /// An event that the host has no use for
-    Other,
 }
 
 /// Where the events of a link come from. The host's event loop owns it.
@@ -79,7 +61,7 @@ pub trait EventSource: Send {
 
 /// A part of an encoded frame. Today the encoder makes one slice per frame, which covers all of it.
 pub struct FrameSlice {
-    /// x, y, width, height in the encoded frame's pixels. ALVR's client needs no slice layout.
+    /// x, y, width, height in the encoded frame's pixels
     pub rect: [u32; 4],
     /// The encoded bytes, Annex B
     pub data: Vec<u8>,
@@ -123,7 +105,7 @@ pub trait Headset: Send + Sync {
 
     /// The aim pose of a controller at a tracking sample: where it points. `motion` gives the grip
     /// pose, the place of the hand that holds the controller. A link whose headset reports one
-    /// pose per hand has no separate aim pose and returns `None`, as ALVR's does.
+    /// pose per hand has no separate aim pose and returns `None`.
     fn aim_motion(&self, _device: Device, _sample_ns: u64) -> Option<DeviceMotion> {
         None
     }
@@ -157,8 +139,7 @@ pub trait Headset: Send + Sync {
     }
 
     /// Whether the link takes a second frame for the same tracking sample, which the frame loop
-    /// numbers with the sample's time plus a few nanoseconds. A link whose client names frames
-    /// by the samples that it sent cannot: ALVR's client sees a timestamp that it never sent.
+    /// numbers with the sample's time plus a few nanoseconds.
     fn repeats_samples(&self) -> bool {
         false
     }
@@ -177,8 +158,7 @@ pub trait Headset: Send + Sync {
 
     fn send_haptics(&self, haptic: Haptic);
 
-    /// Sends the console's menu as a JSON text, when the link has a console. With ALVR the
-    /// desktop layer sends the menu to the Quest app instead.
+    /// Sends the console's menu as a JSON text, when the link has a console.
     fn send_menu(&self, _menu: &str) {}
 
     /// The averages since the last call: the time of each stage from the pose to the display, and

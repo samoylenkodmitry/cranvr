@@ -14,22 +14,6 @@ unsafe impl<T> Send for SendBox<T> {}
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGMainDisplayID() -> u32;
-    fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
-}
-
-/// The main display's ID.
-pub fn main_display_id() -> u32 {
-    unsafe { CGMainDisplayID() }
-}
-
-/// The IDs of the displays that draw: a display mirrored onto another is not one of them.
-pub fn active_displays() -> Vec<u32> {
-    let mut ids = [0u32; 32];
-    let mut count = 0;
-    if unsafe { CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) } != 0 {
-        return Vec::new();
-    }
-    ids[..count as usize].to_vec()
 }
 
 /// The main display, or the first one when ScreenCaptureKit does not list the main display.

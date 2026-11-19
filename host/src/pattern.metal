@@ -21,7 +21,7 @@ struct Params {
     uint pad[3];
 };
 
-// ALVR's CompressAxisAlignedPixelShader: a point of the encoded eye (mirrored for the right
+// The port of ALVR's CompressAxisAlignedPixelShader: a point of the encoded eye (mirrored for the right
 // eye, divided by the eye size ratio) to the point of the full view it shows.
 static float2 foveated_to_view(float2 e, float4 fov_center, float4 fov_edge) {
     float2 cs = fov_center.xy, sh = fov_center.zw, er = fov_edge.xy;
@@ -54,7 +54,7 @@ static float2 compression(float2 e, float4 fov_center, float4 fov_edge) {
 }
 
 // The most taps along one axis of an encoded pixel that `compose` takes. A bilinear tap averages
-// two texels, so three taps cover the edge ratio of 5 that ALVR's defaults give the vertical axis.
+// two texels, so three taps cover the edge ratio of 5 that the default foveation gives the vertical axis.
 constant uint MAX_TAPS = 3;
 
 static float3 qrot(float4 q, float3 v) {

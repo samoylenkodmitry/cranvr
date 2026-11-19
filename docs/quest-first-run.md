@@ -1,6 +1,6 @@
 # First run on a Quest: Steam Beat Saber at 120 Hz
 
-This list covers a first run with cranvr's Cranpose client on a Quest. The client ran on a Quest 3 on a desk with the host's test scene and with Beat Saber's first screen. Nobody has played a song in a worn headset yet. The stock ALVR client works too: see "With the stock ALVR client" below.
+This list covers a first run with cranvr's Cranpose client on a Quest.
 
 ## On the Quest
 
@@ -11,7 +11,7 @@ This list covers a first run with cranvr's Cranpose client on a Quest. The clien
 ## On the Mac
 
 1. Open `/Applications/cranvr.app`. The host starts by itself.
-2. In the Settings tab, under "Headset app", pick "cranvr client". The app then starts the host with `--protocol native`. The Headset card says "Open cranvr on the headset. It finds this Mac." Below it, a line shows this Mac's address with the port, such as `192.168.1.20:9950`. You need the address only when the headset finds nothing.
+2. The Headset card says "Open cranvr on the headset. It finds this Mac." Below it, a line shows this Mac's address with the port, such as `192.168.1.20:9950`. You need the address only when the headset finds nothing.
 3. macOS asks for Screen Recording and Accessibility when cranvr starts. Until both are allowed, a card at the top of the window shows an "Allow" button for each. The game sound needs Screen Recording. Accessibility is only for the controller as a mouse in the desktop view.
 4. In the Play tab, press "Open Steam" and sign in. Steam may ask for a Steam Guard code.
 5. Install Beat Saber in the Steam window. Start the download early.
@@ -73,42 +73,13 @@ The headset shows the Mac's main display in a panel as a second video stream at 
 - Beat Saber does not start: `~/Library/Application Support/cranvr/game.log` and `game.err.log` hold its output.
 - Send me the line under the headset card and the end of the Log tab.
 
-## With the stock ALVR client
+## Not tested yet
 
-The host serves the stock ALVR client with `--protocol alvr`, its default. In the Settings tab, "Headset app" says "ALVR client" for this mode.
-
-1. Install ALVR from the Meta store. The store has 20.14.0. cranvr works with every 20.x version. A v21 nightly build does not connect. The cranvr window then shows a notice.
-2. Connect the Quest to the same Wi-Fi as the Mac, on 5 GHz or 6 GHz.
-3. If Tailscale runs on the Quest, exclude the ALVR app from it in the Tailscale app. Without that, cranvr's "Network: Auto" setting moves the stream to TCP after about 10 seconds. TCP adds about 2 ms.
-4. Open ALVR on the Quest. The headset shows up in the cranvr window with a "Pair with ..." button. Press it. On the first connection the Quest shows "The streamer is restarting" once and reconnects by itself.
-
-The Network choice and the Low latency switch in the Settings tab count for this client only. If the headset connects but no picture comes after about 20 seconds, pick TCP under Network. The automatic switch to TCP has not run in the window yet. If the game feels late, try the Low latency switch. It saved about 4 ms in a test on a desk. If the picture then stutters, turn it off. ALVR buffers about 50 ms of sound.
-
-## What the tests covered
-
-- Beat Saber's first screen through the Wine stack on a Quest 3 on a desk, with the cranvr client and the native protocol: 117.8 frames a second shown.
-- The stream at 120 Hz to the Galaxy Tab S7+ through ALVR's own client core and its MediaCodec decoder: 119.5 to 120 frames a second, 34 ms from motion to display, 97% of the frames shown.
-- A real Direct3D 11 OpenXR program under Wine at 120 Hz to the Tab: 119.7 frames a second.
-- The game sound from the Mac to the client: 20.5 seconds of sound in a 20-second run, over USB with TCP and over Wi-Fi with UDP.
-- The notice for an ALVR app of another version: a discovery packet with another protocol ID produced it.
-- The way of a new headset to the Mac, with a real host process on port 9962 and the client's connection code in a flat window on the Mac (`cargo test --manifest-path client/Cargo.toml -- --ignored a_new_headset`): the search found the host by its network address, the panel showed the code 172 624 and the host's status line listed the same code, Allow on the host's input paired the headset, and the client received 55 to 64 frames a second at 60 to 72 Hz with no loss. A second start of the client connected without a question. The phone build of the client on a Galaxy Tab S7+ over Wi-Fi to a test host on port 9962 did the same: the panel listed "s's MacBook Pro" from the UDP broadcast, a press showed the code 301 028 and the host's status line listed the same code, Allow on the host's input started the stream (the test scene at 60 Hz: the host sent 59.4 frames a second, the Tab showed 41.9 a second in a DeX window, 89 ms from motion to display), and a second start of the app connected without a question. Unit and integration tests cover the messages of the search, the code, a middle machine (two different codes), a host that lies about its commitment, a refusal, a timeout, a headset that leaves, a second headset, a headset with the older protocol and a version mismatch.
-
-- The USB cable with a Galaxy Tab S7+ on the phone build of the client and a test app on port 9961, on this Mac with its real adb: the app set `adb reverse tcp:9961 tcp:9961` on the Tab and on no other device (an attached phone without cranvr got none). The connect panel listed "This Mac by USB cable" first. A press and a launch with the Wi-Fi address of the same Mac (`--es host 192.168.50.194:9961 --ez connect true`) both connected over the cable: the host's log shows the peer 127.0.0.1 with TCP media. The host's `headset` line carries `"ip":"127.0.0.1"`. The Headset card said "Connected by USB cable". The test scene at 60 Hz over the cable: the Tab decoded 59.8 frames a second, the round trip took 1.5 ms, the network 2.0 ms, the decode 5.8 ms. The host reported 61 ms from motion to display. Wi-Fi to the same Mac gave 24 to 47 frames a second, a round trip of 40 to 100 ms and 180 to 250 ms from motion to display. The Wi-Fi in the room was poor at that time, so these Wi-Fi numbers say little about a good network.
-- The Connection choice in the Mac window with a click on Wi-Fi: the app removed the link from the Tab at once. The running stream stayed on the cable. `adb reconnect` for the Tab ended the cable's TCP link (a removed link alone does not end a running stream). The Tab then connected to the same Mac over Wi-Fi after 3 seconds with UDP media. The host's log shows the peer 192.168.50.97. The Headset card said "Connected over Wi-Fi". A click on Automatic set the link again within 3 seconds. The running Wi-Fi stream did not move. After the host restarted, the next connection took the cable. The same test ran with a host started by hand on port 9962 and a hand-made `adb reverse`.
-- A new headset that fell back to Wi-Fi: with a fresh host that knew no headset, the Tab streamed over the cable, then lost it. The Tab showed the code 774 382 and "Allow it on the Mac". The Mac window came up with the card "cranvr phone wants to connect. It shows the code 774 382." Deny ended it with "The Mac denied this headset. Press the Mac to ask again." The earlier build of the client then asked again every two seconds with a new code. The build of this branch stops the tries after a Deny, after no answer, after a changed host key and after a version mismatch. A run on the Tab showed one request and no more in 15 seconds.
-- The button "Add USB support" ran with a local zip in the layout of Google's file (`CRANVR_PLATFORM_TOOLS_URL`), on a Mac set to have no adb (`CRANVR_ADB=none`): it unpacked `platform-tools/adb` and checked that it runs. A copy of another version than the running adb server was refused with the notice above.
-- Unit tests cover the lines of `adb devices -l` (a device on the cable, unauthorized, offline, an unusual state, wireless debugging, an emulator, the lines of adb's server start), `pm list packages` (the Tab's real answer: the phone build counts, the retired `dev.cranvr.client` and a longer name do not), `adb reverse --list`, the places where adb is looked for, the plan of calls for each choice, a probe of a real host, of a closed link behind `adb reverse` and of nothing. They cover the headset's choice between the cable and a Wi-Fi entry (the list, the same Mac, another Mac, a dropped cable, a typed address).
-
-## What the tests did not cover
-
-- The cranvr client in a worn headset: the controllers in a game, the carry of the desktop panel by a ray, a recenter and the USB path from the Quest. The cable ran on the Tab only. Nothing here ran with the Quest and with Meta's own adb daemon.
-- A pulled cable. `adb reconnect` stood in for it.
-- A headset that waits for you to allow USB debugging. A Mac that sees it "unauthorized" shows the line "Put on the headset and allow USB debugging." The parser covers the state. The line did not show in a run, because no device was in that state. The first start of an adb server by the downloaded adb did not run either.
-- The download from dl.google.com. The test used a local file.
-- Beat Saber during a song and in a worn headset. The frame rates and latencies in the README come from the game's first screen, the health and safety warning, with the headset on a desk.
-- Sound with the Mac muted. A tone at a Mac volume of 15% reached the client at its full level.
-- The controller as a mouse on the virtual display in a real headset. The switch of the main display ran with a test client on the Mac only.
-- The automatic switch to TCP in the window, for the ALVR client.
-- The search and the connect panel on a Quest. The Tab ran them (see above). A router that drops broadcasts leaves the list empty on any device, and the address field is the way around it.
-- The click on Allow in the cranvr app. The app's window showed the card for a request from a stand-in host and came to the front. A click of a script did not reach it. The host's side of the answer ran with a line on the host's input.
-- A headset of the old protocol against the new Mac, and the reverse, on a device. A hand-written client of version 4 and a hand-written host of version 4 covered both in tests.
+- The client in a worn headset: the controllers in a game, the carry of the desktop panel by a ray, a recenter and the USB cable from a Quest.
+- Beat Saber during a song and in a worn headset. The frame rates and latencies come from the game's first screen, the health and safety warning, with the headset on a desk.
+- Sound with the Mac muted.
+- The controller as a mouse on the virtual display in a real headset.
+- The search and the connect panel on a Quest with a router that drops broadcasts. The address field is the way around it.
+- A pulled USB cable. `adb reconnect` stands in for it in tests.
+- A headset that waits for you to allow USB debugging, and the first start of an adb server by the downloaded adb.
+- The click on Allow in the cranvr window by a user. The host's side of the answer is tested with a line on the host's input.

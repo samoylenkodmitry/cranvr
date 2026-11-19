@@ -167,7 +167,7 @@ fn device_caps(tcp_only: bool, headset: Option<&HeadsetInfo>, phone: Option<Phon
         refresh_rates,
         codecs: vec![Codec::Hevc],
         decoders: 1,
-        // The headset's streamed scene unwarps ALVR's foveated encoding in its shader
+        // The headset's streamed scene unwarps the foveated encoding in its shader
         foveation: true,
         tcp_only,
     }
@@ -1235,7 +1235,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cranvr-find-mac-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut host = Command::new(&host_bin)
-            .args(["--protocol", "native", "--native-port", &PORT.to_string(), "--status", "--fps", "60", "--no-game-audio", "--config-dir"])
+            .args(["--native-port", &PORT.to_string(), "--status", "--fps", "60", "--no-game-audio", "--config-dir"])
             .arg(&dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

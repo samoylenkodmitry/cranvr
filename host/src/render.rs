@@ -341,7 +341,7 @@ mod tests {
         }
     }
 
-    /// With foveation the badges move to where the stock ALVR client expects them.
+    /// With foveation the badges move to where the client unwarps them.
     #[test]
     fn foveated_badges_land_where_the_client_unwarps_them() {
         use cranvr_common::foveation::{view_to_frame, FoveationConfig};
@@ -374,7 +374,7 @@ mod tests {
 
     /// A game's thin line in the compressed edge of a foveated frame stays continuous. The test
     /// paints a line of one pixel across the top left of the game's eye image, composes the
-    /// frame with ALVR's default foveation and follows the line through the encoded picture. A
+    /// frame with the default foveation and follows the line through the encoded picture. A
     /// compose that takes one sample for each encoded pixel misses the line in some columns,
     /// which the headset unwarps into a row of dots.
     #[test]

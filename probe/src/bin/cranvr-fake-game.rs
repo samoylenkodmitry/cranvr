@@ -7,13 +7,13 @@
 //! Like the runtime with cranvr's patch 0004, it tells the host in `runtime-features.txt` that it
 //! takes aim poses, so each hand arrives with a grip pose and an aim pose. A pull of the left grip
 //! makes it answer with a haptic pulse on the left hand, as a game does. `--expect-input` makes the
-//! exit code depend on the input: the probe's scripted controllers (`cranvr-probe --protocol
-//! native`) must have arrived on both hands with their own grip and aim poses, as `hands.rs`
-//! scripts them, and with the Touch buttons.
+//! exit code depend on the input: the probe's scripted controllers (`cranvr-probe`) must have
+//! arrived on both hands with their own grip and aim poses, as `hands.rs` scripts them, and with
+//! the Touch buttons.
 //!
 //! Usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input]
 
-use alvr_common::{LEFT_SQUEEZE_VALUE_ID, RIGHT_A_CLICK_ID, RIGHT_THUMBSTICK_X_ID, RIGHT_TRIGGER_VALUE_ID};
+use cranvr_common::inputs::{LEFT_SQUEEZE_VALUE_ID, RIGHT_A_CLICK_ID, RIGHT_THUMBSTICK_X_ID, RIGHT_TRIGGER_VALUE_ID};
 use cranvr_proto::wire::Motion;
 use cranvr_vt::PixelBuffer;
 use std::{
@@ -202,13 +202,13 @@ impl Input {
             out.push("the left hand moved, expected it to stay still".into());
         }
         // The probe pulls the right trigger to 0.75, presses A and tilts the right stick to 0.5, as it squeezes the left grip
-        for (name, id, wanted) in [("right trigger", *RIGHT_TRIGGER_VALUE_ID, 0.75), ("right stick x", *RIGHT_THUMBSTICK_X_ID, 0.5)] {
+        for (name, id, wanted) in [("right trigger", RIGHT_TRIGGER_VALUE_ID, 0.75), ("right stick x", RIGHT_THUMBSTICK_X_ID, 0.5)] {
             match self.buttons.get(&id) {
                 Some((_, changes)) if *changes >= 2 => {}
                 other => out.push(format!("{name} {other:?}: expected changes up to {wanted}")),
             }
         }
-        for (name, id) in [("right A", *RIGHT_A_CLICK_ID), ("left squeeze", *LEFT_SQUEEZE_VALUE_ID)] {
+        for (name, id) in [("right A", RIGHT_A_CLICK_ID), ("left squeeze", LEFT_SQUEEZE_VALUE_ID)] {
             if self.buttons.get(&id).is_none_or(|b| b.1 < 2) {
                 out.push(format!("{name} did not go down and up"));
             }
@@ -325,7 +325,7 @@ fn main() {
                         let was = input.last(path).unwrap_or(0.0);
                         input.button(path, value);
                         // A game answers a pull of the left grip with a pulse
-                        if path == *LEFT_SQUEEZE_VALUE_ID && was < 0.5 && value >= 0.5 {
+                        if path == LEFT_SQUEEZE_VALUE_ID && was < 0.5 && value >= 0.5 {
                             let mut pulse = 0u32.to_le_bytes().to_vec();
                             pulse.extend_from_slice(&20_000_000u64.to_le_bytes());
                             pulse.extend_from_slice(&160.0f32.to_le_bytes());

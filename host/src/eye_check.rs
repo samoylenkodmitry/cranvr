@@ -13,7 +13,7 @@
 //! The cost is two read-only locks and 512 pixel reads once a second, with no allocation. A frame
 //! between the checks costs one clock read.
 
-use alvr_common::info;
+use log::info;
 use cranvr_vt::PixelBuffer;
 use std::time::{Duration, Instant};
 

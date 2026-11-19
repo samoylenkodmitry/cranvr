@@ -5,10 +5,8 @@
 //! macOS asks for two permissions on first use: Screen Recording (for the capture) and
 //! Accessibility (for the mouse events). Without Accessibility the screen still shows.
 
-use alvr_common::{
-    glam::{Quat, Vec3},
-    warn, Pose,
-};
+use crate::pose::{Pose, Quat, Vec3};
+use log::warn;
 use cranvr_vt::PixelBuffer;
 use crate::screen_capture::{self, SendBox};
 use dispatch2::DispatchQueue;
@@ -126,10 +124,6 @@ pub struct CaptureSpec {
     pub yuv: bool,
     /// Hears of each new frame
     pub notify: Option<SyncSender<()>>,
-    /// Only this part of the display: x, y, width and height in points from its top left corner
-    pub source: Option<[f64; 4]>,
-    /// The capture's size in pixels, instead of the display's shape at `max_width`
-    pub size: Option<(usize, usize)>,
 }
 
 /// A running capture of the main display.
@@ -148,27 +142,13 @@ pub struct Capture {
     /// When a start or stop failed last. The next try waits RETRY_AFTER: ScreenCaptureKit kept
     /// pipes open for each failed start, and a display that left made the host try every 10 ms.
     failed_at: Arc<Mutex<Option<std::time::Instant>>>,
-    /// YUV, cursor
-    format: (bool, bool),
-    fps: std::sync::atomic::AtomicI32,
-    source: Mutex<Option<[f64; 4]>>,
     /// The display's size in points
     pub points: (f64, f64),
 }
 
-fn configuration(
-    (width, height): (usize, usize),
-    yuv: bool,
-    cursor: bool,
-    fps: i32,
-    source: Option<[f64; 4]>,
-) -> Retained<SCStreamConfiguration> {
+fn configuration((width, height): (usize, usize), yuv: bool, cursor: bool, fps: i32) -> Retained<SCStreamConfiguration> {
     let config = unsafe { SCStreamConfiguration::new() };
     unsafe {
-        if let Some([x, y, w, h]) = source {
-            use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-            config.setSourceRect(CGRect { origin: CGPoint { x, y }, size: CGSize { width: w, height: h } });
-        }
         config.setWidth(width);
         config.setHeight(height);
         config.setPixelFormat(if yuv { K_CV_PIXEL_FORMAT_420_FULL } else { K_CV_PIXEL_FORMAT_32BGRA });
@@ -183,24 +163,22 @@ impl Capture {
     /// Captures a display (the main one without `display_id`) at up to `max_width` pixels wide,
     /// up to `fps` times per second (only when something on the display changes).
     pub fn start(display_id: Option<u32>, max_width: usize, fps: i32) -> Result<Self, String> {
-        Self::start_with(display_id, CaptureSpec { max_width, fps, cursor: true, yuv: false, notify: None, source: None, size: None })
+        Self::start_with(display_id, CaptureSpec { max_width, fps, cursor: true, yuv: false, notify: None })
     }
 
     /// A capture as `spec` describes it.
     pub fn start_with(display_id: Option<u32>, spec: CaptureSpec) -> Result<Self, String> {
-        let CaptureSpec { max_width, fps, cursor, yuv, notify, source, size } = spec;
+        let CaptureSpec { max_width, fps, cursor, yuv, notify } = spec;
         let display = screen_capture::display(display_id)?;
         let main_id = unsafe { display.displayID() };
         let (points_w, points_h) = unsafe { (display.width() as usize, display.height() as usize) };
-        let (width, height) = size.unwrap_or_else(|| {
-            let width = (points_w * 2).min(max_width) & !1;
-            (width, (width * points_h / points_w.max(1)) & !1)
-        });
+        let width = (points_w * 2).min(max_width) & !1;
+        let height = (width * points_h / points_w.max(1)) & !1;
 
         let filter = unsafe {
             SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &display, &NSArray::new())
         };
-        let config = configuration((width, height), yuv, cursor, fps, source);
+        let config = configuration((width, height), yuv, cursor, fps);
         let stream = unsafe { SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, None) };
         let latest: Latest = Arc::default();
         let output = Output::new(OutputState { latest: Arc::clone(&latest), notify });
@@ -226,35 +204,8 @@ impl Capture {
             size: (width as u32, height as u32),
             running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             failed_at: Arc::new(Mutex::new(None)),
-            format: (yuv, cursor),
-            fps: std::sync::atomic::AtomicI32::new(fps),
-            source: Mutex::new(source),
             points: (points_w as f64, points_h as f64),
         })
-    }
-
-    /// Captures another part of the display from now on, at the same size. `done` turns true
-    /// once ScreenCaptureKit took the change: frames that come after it show the new part.
-    pub fn set_source(&self, source: [f64; 4], done: Arc<std::sync::atomic::AtomicBool>) {
-        *self.source.lock().unwrap() = Some(source);
-        let size = (self.size.0 as usize, self.size.1 as usize);
-        let fps = self.fps.load(std::sync::atomic::Ordering::Relaxed);
-        let config = configuration(size, self.format.0, self.format.1, fps, Some(source));
-        let block = block2::RcBlock::new(move |_error: *mut objc2_foundation::NSError| {
-            done.store(true, std::sync::atomic::Ordering::Relaxed);
-        });
-        unsafe { self._stream.0.updateConfiguration_completionHandler(&config, Some(&block)) };
-    }
-
-    /// Changes the most captures per second without a restart.
-    pub fn set_fps(&self, fps: i32) {
-        if self.fps.swap(fps, std::sync::atomic::Ordering::Relaxed) == fps {
-            return;
-        }
-        let size = (self.size.0 as usize, self.size.1 as usize);
-        let source = *self.source.lock().unwrap();
-        let config = configuration(size, self.format.0, self.format.1, fps, source);
-        unsafe { self._stream.0.updateConfiguration_completionHandler(&config, None) };
     }
 
     /// Stops or restarts the capture. A stopped capture costs the Mac nothing, and `latest` keeps
@@ -367,7 +318,7 @@ impl Screen {
     }
 }
 
-/// The direction a controller points. ALVR sends the grip pose, whose -Z axis runs along the
+/// The direction a controller points, from its grip pose. The grip pose's -Z axis runs along the
 /// handle; the pointing ray of a Touch controller goes out lower, by `pitch_deg`.
 pub fn pointing_ray(grip: &Pose, pitch_deg: f32) -> (Vec3, Vec3) {
     let tilt = Quat::from_rotation_x(pitch_deg.to_radians());
@@ -429,7 +380,7 @@ impl Pointer {
             self.checked = std::time::Instant::now();
             self.trusted = unsafe { AXIsProcessTrusted() };
             if self.trusted {
-                alvr_common::info!("Desktop: Accessibility allowed, the controller moves the mouse");
+                log::info!("Desktop: Accessibility allowed, the controller moves the mouse");
             }
         }
         // A dry run goes through all the logic and posts no event, so a test with a controller on
@@ -505,7 +456,7 @@ fn dry_run() -> bool {
     *ON.get_or_init(|| {
         let on = std::env::var("CRANVR_POINTER_DRY_RUN").is_ok_and(|v| v == "1");
         if on {
-            alvr_common::info!("Desktop: dry run, the pointer logs its mouse events and posts none");
+            log::info!("Desktop: dry run, the pointer logs its mouse events and posts none");
         }
         on
     })
@@ -514,7 +465,7 @@ fn dry_run() -> bool {
 fn post_scroll(pixels: i32) {
     SCROLL_PIXELS.fetch_add(u64::from(pixels.unsigned_abs()), Ordering::Relaxed);
     if dry_run() {
-        alvr_common::info!("Desktop (dry run): scroll {pixels} pixels");
+        log::info!("Desktop (dry run): scroll {pixels} pixels");
         return;
     }
     unsafe {
@@ -542,7 +493,7 @@ fn post_mouse(kind: u32, point: CGPoint) {
             _ => "move",
         };
         if matches!(kind, LEFT_MOUSE_DOWN | LEFT_MOUSE_UP) || count == 1 || count % 100 == 0 {
-            alvr_common::info!("Desktop (dry run): mouse {name} at ({:.0}, {:.0}) points, event {count} of its kind", point.x, point.y);
+            log::info!("Desktop (dry run): mouse {name} at ({:.0}, {:.0}) points, event {count} of its kind", point.x, point.y);
         }
         return;
     }
@@ -575,7 +526,7 @@ mod tests {
             }
             panic!("no frame after {seq}");
         };
-        let spec = CaptureSpec { max_width: 640, fps: 60, cursor: true, yuv: true, notify: None, source: None, size: None };
+        let spec = CaptureSpec { max_width: 640, fps: 60, cursor: true, yuv: true, notify: None };
         let capture = Capture::start_with(None, spec).unwrap();
         let mut seq = wait_past(&capture, 0);
         for gap_ms in [10, 0, 1, 10] {

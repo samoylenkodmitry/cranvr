@@ -1,6 +1,6 @@
-//! ALVR's foveated encoding, ported from ALVR v20.14.1 so the stock ALVR client can unwarp what
-//! the host encodes:
-//! - server side: `FFR.cpp` and `CompressAxisAlignedPixelShader.hlsl`;
+//! Foveated encoding for the host and the clients. The math is a port of ALVR v20.14.1 (MIT,
+//! `third_party/licenses/ALVR-MIT.txt`):
+//! - host side: `FFR.cpp` and `CompressAxisAlignedPixelShader.hlsl`;
 //! - client side: `foveated_encoding_shader_constants` and `stream.wgsl`.
 //!
 //! Each eye keeps full pixel density in a center region. The edges are compressed by
@@ -15,7 +15,7 @@ pub struct FoveationConfig {
 }
 
 impl Default for FoveationConfig {
-    /// ALVR's defaults.
+    /// The defaults of the port.
     fn default() -> Self {
         Self { center_size: [0.45, 0.4], center_shift: [0.4, 0.1], edge_ratio: [4.0, 5.0] }
     }

@@ -10,7 +10,7 @@
 //! "<share> <fps> <program>". When a smaller share did not speed a game up, its size is not
 //! what limits it, and the host stops lowering it.
 
-use alvr_common::warn;
+use log::warn;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -43,7 +43,7 @@ impl Sizes {
                 let (share, rest) = line.split_once(' ')?;
                 rest.eq_ignore_ascii_case(program).then(|| share.parse::<f32>().ok()).flatten()
             })
-            .last()
+            .next_back()
             .unwrap_or(1.0)
     }
 
@@ -56,7 +56,7 @@ impl Sizes {
                 let (share, fps, rest) = (fields.next()?, fields.next()?, fields.next()?);
                 rest.eq_ignore_ascii_case(program).then(|| Some((share.parse().ok()?, fps.parse().ok()?))).flatten()
             })
-            .last()
+            .next_back()
     }
 
     /// Decides from the game's frame rates in WINDOWS stats windows at the headset's `rate`.
