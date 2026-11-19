@@ -3,6 +3,7 @@
 
 mod backend;
 mod launch;
+mod setup;
 mod steam;
 mod system;
 mod ui;

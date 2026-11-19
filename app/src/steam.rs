@@ -29,6 +29,40 @@ pub fn wine_ready() -> bool {
     config_dir().join("wine/engine/bin/wine").exists()
 }
 
+/// The game support version that this build of the app expects: the date of the release with the
+/// newest runtime and DXMT patches. scripts/game-support-version.txt names it, and
+/// scripts/package-game-support.sh puts the same name into the archive.
+pub const GAME_SUPPORT_VERSION: &str = include_str!("../../scripts/game-support-version.txt");
+
+/// The version that setup-wine.sh stamped into the Wine folder with the last install, if any.
+pub fn game_support_installed() -> Option<String> {
+    let text = fs::read_to_string(config_dir().join("wine/game-support-version.txt")).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// The version that this build of the app expects, as plain text.
+pub fn game_support_expected() -> &'static str {
+    GAME_SUPPORT_VERSION.trim()
+}
+
+/// Whether the installed game support is older than this app expects. A stack without a stamp
+/// came from a release before stamps existed, so it is older. No Wine stack at all is not
+/// outdated: it is missing, and the setup installs it.
+pub fn game_support_outdated() -> bool {
+    wine_ready() && is_older(game_support_installed().as_deref(), game_support_expected())
+}
+
+/// Whether `installed` is older than `expected`. Versions are dates, "2026.11.19", with an optional
+/// fourth number for a second release on one day. A missing or unreadable version is older.
+fn is_older(installed: Option<&str>, expected: &str) -> bool {
+    let numbers = |text: &str| text.split('.').map(|part| part.parse::<u64>().ok()).collect::<Option<Vec<u64>>>();
+    match installed.and_then(numbers) {
+        Some(installed) => numbers(expected).is_some_and(|expected| installed < expected),
+        None => true,
+    }
+}
+
 pub fn steam_dir() -> PathBuf {
     prefix().join("drive_c/Program Files (x86)/Steam")
 }
@@ -85,10 +119,14 @@ pub fn install_rosetta() -> Result<(), String> {
     let script = "do shell script \"/usr/sbin/softwareupdate --install-rosetta --agree-to-license\" with administrator privileges";
     let output = Command::new("/usr/bin/osascript").args(["-e", script]).output().map_err(|e| e.to_string())?;
     if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!("Rosetta did not install: {}", String::from_utf8_lossy(&output.stderr).trim()))
+        return Ok(());
     }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // osascript reports the Cancel button of the password dialog as error -128
+    if stderr.contains("(-128)") {
+        return Err("You cancelled the password request. Retry when you are ready to type your Mac password.".into());
+    }
+    Err(format!("Rosetta did not install: {}", stderr.trim()))
 }
 
 pub fn running() -> bool {
@@ -364,6 +402,22 @@ mod tests {
         fs::write(dir.join("Redist/big.exe"), vec![0u8; 9000]).unwrap();
         assert_eq!(find_exe(&dir, "Serious Sam VR The Last Hope"), Some(dir.join("Bin/x64/SamTLH.exe")));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn game_support_is_outdated_by_its_date_and_by_a_missing_stamp() {
+        assert!(is_older(None, "2026.11.19"));
+        assert!(is_older(Some(""), "2026.11.19"));
+        assert!(is_older(Some("garbage"), "2026.11.19"));
+        assert!(is_older(Some("2026.11.16"), "2026.11.19"));
+        assert!(is_older(Some("2025.12.31"), "2026.01.01"));
+        assert!(is_older(Some("2026.11.19"), "2026.11.19.2"));
+        assert!(!is_older(Some("2026.11.19"), "2026.11.19"));
+        assert!(!is_older(Some("2026.11.19.2"), "2026.11.19"));
+        assert!(!is_older(Some("2027.01.01"), "2026.11.19"));
+        // The version file of this build is a date that the comparison reads
+        assert!(is_older(Some("2026.11.16"), game_support_expected()));
+        assert!(!is_older(Some(game_support_expected()), game_support_expected()));
     }
 
     #[test]

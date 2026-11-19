@@ -9,7 +9,7 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::Ipv4Addr,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -46,7 +46,10 @@ pub struct Settings {
     pub game: String,
     /// Start the host when the window opens
     pub autostart: bool,
-    /// The app on the headset, and with it the protocol that the host speaks
+    /// The app on the headset, and with it the protocol that the host speaks. A new install uses
+    /// the cranvr app. A settings file from before this choice existed has no such key and
+    /// stays with the ALVR client that it was written for.
+    #[serde(default = "HeadsetApp::before_the_choice")]
     pub headset_app: HeadsetApp,
     /// Counts for the ALVR client only: the cranvr client picks its media path itself
     pub stream_protocol: StreamProtocol,
@@ -81,10 +84,18 @@ pub struct Settings {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum HeadsetApp {
     /// The ALVR client, version 20.14
-    #[default]
     Alvr,
     /// cranvr's own client, `dev.cranvr.client2`: the host runs with `--protocol native`
+    #[default]
     Cranvr,
+}
+
+impl HeadsetApp {
+    /// What a settings file without the `headset_app` key means: it predates the choice, so its
+    /// headset runs the ALVR client.
+    fn before_the_choice() -> Self {
+        Self::Alvr
+    }
 }
 
 /// How the stream travels between this Mac and the headset.
@@ -108,7 +119,7 @@ impl Default for Settings {
             trusted: vec![],
             game: String::new(),
             autostart: true,
-            headset_app: HeadsetApp::Alvr,
+            headset_app: HeadsetApp::default(),
             stream_protocol: StreamProtocol::Auto,
             game_audio: true,
             virtual_display: None,
@@ -209,8 +220,12 @@ pub struct Model {
     pub steam_running: bool,
     pub steam_signed_in: bool,
     pub games: Vec<crate::steam::Game>,
-    /// A setup script that runs now, by name
-    pub task: Option<String>,
+    /// The game setup that runs now or ran last: the steps with their progress
+    pub setup: Option<crate::setup::Setup>,
+    /// The version of the game support in the Wine folder, when it has a stamp
+    pub game_support: Option<String>,
+    /// The game support is older than this build of the app expects
+    pub game_support_outdated: bool,
     /// Problems on the network path that the host found, newest last
     pub network: Vec<String>,
     /// The host found that UDP stream data does not arrive: in Auto mode the stream uses TCP
@@ -317,7 +332,6 @@ enum HostLine {
     Status(Value),
     Log(String),
     Exited,
-    TaskDone { name: String, ok: bool },
     Message(String),
 }
 
@@ -529,13 +543,10 @@ pub fn pump(model: &mut Model) {
                 }
             }
             HostLine::Message(text) => model.message = Some(text),
-            HostLine::TaskDone { name, ok } => {
-                model.task = None;
-                model.message = (!ok).then(|| format!("{name} failed; see the log"));
-            }
         }
     }
     model.running = host_running();
+    model.setup = crate::setup::current();
 }
 
 /// The setup scripts: in the app bundle's Resources, or in the source tree.
@@ -547,8 +558,15 @@ pub fn scripts_dir() -> PathBuf {
     }
 }
 
-/// Runs a setup script in the background; its output goes to the log.
-pub fn run_script(title: &str, script: &str, args: &[&str]) -> Result<(), String> {
+/// Adds a line to the Log tab, from any thread.
+pub fn log(line: String) {
+    channel().0.send(HostLine::Log(line)).ok();
+}
+
+/// Runs a setup script and waits for it. Its output goes to the Log tab. `progress` sees each
+/// line, and each update of curl's progress bar, as they come. The error holds the script's last
+/// complaint on stderr, or the exit code when it said nothing.
+pub fn run_script(script: &str, args: &[&str], mut progress: impl FnMut(&str)) -> Result<(), String> {
     let path = scripts_dir().join(script);
     let mut child = Command::new("/bin/zsh")
         .arg(&path)
@@ -558,23 +576,61 @@ pub fn run_script(title: &str, script: &str, args: &[&str]) -> Result<(), String
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    let sender = channel().0.clone();
-    let (stdout, stderr) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
-    let err_sender = sender.clone();
-    thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            err_sender.send(HostLine::Log(line)).ok();
+    let (sender, receiver) = mpsc::channel::<(bool, String)>();
+    for (is_stderr, stream) in [(false, Box::new(child.stdout.take().unwrap()) as Box<dyn Read + Send>), (true, Box::new(child.stderr.take().unwrap()))] {
+        let sender = sender.clone();
+        thread::spawn(move || split_lines(stream, |line| drop(sender.send((is_stderr, line)))));
+    }
+    drop(sender);
+    let mut complaint = None;
+    for (is_stderr, line) in receiver {
+        progress(&line);
+        // A progress bar redraws one line hundreds of times: the log keeps the lines that say something
+        if percent(&line).is_none() {
+            log(line.clone());
+            if is_stderr {
+                complaint = Some(line);
+            }
         }
-    });
-    let name = title.to_string();
-    thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            sender.send(HostLine::Log(line)).ok();
+    }
+    let status = child.wait().map_err(|e| e.to_string())?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(complaint.unwrap_or_else(|| format!("{script} stopped with {status}")))
+}
+
+/// Calls `line` for each text that ends in a line feed or a carriage return: curl's progress bar
+/// redraws with carriage returns only. Empty texts are left out.
+fn split_lines(mut stream: impl Read, mut line: impl FnMut(String)) {
+    let (mut pending, mut buffer) = (Vec::new(), [0u8; 4096]);
+    while let Ok(n @ 1..) = stream.read(&mut buffer) {
+        for &byte in &buffer[..n] {
+            if byte == b'\n' || byte == b'\r' {
+                let text = String::from_utf8_lossy(&pending).trim().to_owned();
+                if !text.is_empty() {
+                    line(text);
+                }
+                pending.clear();
+            } else {
+                pending.push(byte);
+            }
         }
-        let ok = child.wait().is_ok_and(|s| s.success());
-        sender.send(HostLine::TaskDone { name, ok }).ok();
-    });
-    Ok(())
+    }
+    let text = String::from_utf8_lossy(&pending).trim().to_owned();
+    if !text.is_empty() {
+        line(text);
+    }
+}
+
+/// The percentage that curl's progress bar shows ("######   37.5%"), whole.
+pub fn percent(line: &str) -> Option<u32> {
+    let text = line.trim_end().strip_suffix('%')?;
+    let (bar, number) = text.rsplit_once(|c: char| c.is_whitespace() || c == '#').unwrap_or(("", text));
+    if !bar.chars().all(|c| matches!(c, '#' | ' ' | '=' | '-' | 'O' | '\t')) {
+        return None;
+    }
+    number.parse::<f32>().ok().map(|n| n as u32)
 }
 
 /// Headsets from ALVR's session.json, which the host updates when a headset announces itself.
@@ -644,20 +700,24 @@ mod tests {
         Settings { headset_app: HeadsetApp::Cranvr, ..Default::default() }
     }
 
+    fn alvr_settings() -> Settings {
+        Settings { headset_app: HeadsetApp::Alvr, ..Default::default() }
+    }
+
     #[test]
     fn the_alvr_client_gets_the_same_host_arguments_as_before() {
         assert_eq!(
-            host_options(&Settings::default(), false, None),
+            host_options(&alvr_settings(), false, None),
             ["--status", "--fps", "120", "--mbps", "100", "--config-dir", "/cfg", "--game-scale", "0.7", "--desktop", "--desktop-fps", "30"]
         );
-        let alvr = Settings { trusted: vec!["1234.client".into()], stream_protocol: StreamProtocol::Tcp, low_latency: true, ..Default::default() };
+        let alvr = Settings { trusted: vec!["1234.client".into()], stream_protocol: StreamProtocol::Tcp, low_latency: true, ..alvr_settings() };
         let args = host_options(&alvr, false, Some("482913"));
         assert!(!args.contains(&"--protocol".to_string()) && !args.contains(&"--pair".to_string()), "{args:?}");
         for wanted in ["--tcp", "--buffering-frames", "--trust", "1234.client"] {
             assert!(args.contains(&wanted.to_string()), "{wanted} in {args:?}");
         }
         // Auto mode streams over TCP once the window found that UDP data does not arrive
-        assert!(host_options(&Settings::default(), true, None).contains(&"--tcp".to_string()));
+        assert!(host_options(&alvr_settings(), true, None).contains(&"--tcp".to_string()));
     }
 
     #[test]
@@ -734,8 +794,33 @@ mod tests {
 
     #[test]
     fn settings_files_from_before_the_headset_app_choice_use_the_alvr_client() {
-        assert_eq!(serde_json::from_str::<Settings>(r#"{"fps": 90, "trusted": ["1234.client"]}"#).unwrap().headset_app, HeadsetApp::Alvr);
+        let old = serde_json::from_str::<Settings>(r#"{"fps": 90, "trusted": ["1234.client"]}"#).unwrap();
+        assert_eq!((old.headset_app, old.fps), (HeadsetApp::Alvr, 90));
+        assert_eq!(serde_json::from_str::<Settings>("{}").unwrap().headset_app, HeadsetApp::Alvr);
         assert_eq!(serde_json::from_str::<Settings>(r#"{"headset_app": "Cranvr"}"#).unwrap().headset_app, HeadsetApp::Cranvr);
+        assert_eq!(serde_json::from_str::<Settings>(r#"{"headset_app": "Alvr"}"#).unwrap().headset_app, HeadsetApp::Alvr);
+    }
+
+    // A fresh install has no settings file at all: it uses the cranvr headset app. Settings that the
+    // app saved keep their choice. The other fields keep their defaults when a key is missing.
+    #[test]
+    fn a_new_install_uses_the_cranvr_headset_app() {
+        assert_eq!(Settings::default().headset_app, HeadsetApp::Cranvr);
+        let saved = serde_json::to_string(&Settings { headset_app: HeadsetApp::Alvr, ..Default::default() }).unwrap();
+        assert_eq!(serde_json::from_str::<Settings>(&saved).unwrap().headset_app, HeadsetApp::Alvr);
+        assert_eq!(serde_json::from_str::<Settings>(&serde_json::to_string(&Settings::default()).unwrap()).unwrap(), Settings::default());
+        assert!(serde_json::from_str::<Settings>(r#"{"fps": 90}"#).unwrap().autostart);
+    }
+
+    #[test]
+    fn curl_s_progress_bar_is_not_a_log_line() {
+        assert_eq!(percent("######################                          37.5%"), Some(37));
+        assert_eq!(percent("100.0%"), Some(100));
+        assert_eq!(percent("Steam folder: 50%"), None);
+        assert_eq!(percent("Unpacking"), None);
+        let mut lines = vec![];
+        split_lines(&b"#   2.0%\r##  5.0%\rUnpacking\n\nlast"[..], |line| lines.push(line));
+        assert_eq!(lines, ["#   2.0%", "##  5.0%", "Unpacking", "last"]);
     }
 
     #[test]
