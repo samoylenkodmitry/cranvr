@@ -58,4 +58,4 @@ tar -xf "${archive}" -C "${unpacked}"
 "${scripts}/setup-wine.sh" "${unpacked}/cranvr-game-support"
 
 rm -rf "${work}"
-print "Game support is installed. Next: set up Steam in the cranvr app."
+print "Game support is installed."
