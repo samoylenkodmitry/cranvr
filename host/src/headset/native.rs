@@ -820,6 +820,9 @@ struct Stats {
     network: f64,
     network_frames: u32,
     decode: f64,
+    /// From the end of the decode to the take by the headset's frame loop, ms
+    decode_queue: f64,
+    /// From the take to the display time of the headset frame that shows the frame, ms
     vsync_wait: f64,
     sent_bytes: u64,
     sent_frames: u32,
@@ -956,7 +959,8 @@ impl Session {
         stats.frames += 1;
         stats.total += ms(t.display_time.saturating_sub(t.tracking_sample));
         stats.decode += ms(t.decode_end.saturating_sub(t.received));
-        stats.vsync_wait += ms(t.display_time.saturating_sub(t.decode_end));
+        stats.decode_queue += ms(t.picked.saturating_sub(t.decode_end));
+        stats.vsync_wait += ms(t.display_time.saturating_sub(t.picked));
         if let Some(sent) = sent_on_client {
             stats.pose_to_send += ms(sent.saturating_sub(t.tracking_sample));
             stats.network += ms(t.received.saturating_sub(sent));
@@ -1189,6 +1193,7 @@ impl Headset for Native {
             "pose_to_send_ms": stats.pose_to_send / stats.network_frames.max(1) as f64,
             "network_ms": stats.network / stats.network_frames.max(1) as f64,
             "decode_ms": stats.decode / n,
+            "decode_queue_ms": stats.decode_queue / n,
             "vsync_wait_ms": stats.vsync_wait / n,
             "rtt_ms": rtt_ms,
             "loss_pct": loss_pct,

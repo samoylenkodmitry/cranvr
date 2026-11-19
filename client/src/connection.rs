@@ -465,6 +465,9 @@ struct Averages {
     network_n: u32,
     pose_to_decode_ms: f64,
     pose_to_decode_n: u32,
+    /// The tracking sample to the display time of the headset frame that shows the frame, summed
+    /// over the same frames
+    pose_to_display_ms: f64,
     /// Of the frames with a target, those that came after the headset frame of their point
     with_target: u32,
     late: u32,
@@ -927,6 +930,7 @@ impl Decode<'_, '_> {
         {
             let mut averages = s.averages.lock().unwrap();
             averages.pose_to_decode_ms += decode_end.saturating_sub(unit.meta.tracking_sample) as f64 / 1e6;
+            averages.pose_to_display_ms += display_time.saturating_sub(unit.meta.tracking_sample) as f64 / 1e6;
             averages.pose_to_decode_n += 1;
         }
         let arrival = Arrival { frame: unit.meta.frame, tracking_sample: unit.meta.tracking_sample, received: unit.completed };
@@ -999,6 +1003,7 @@ impl Decode<'_, '_> {
             {
                 let mut averages = s.averages.lock().unwrap();
                 averages.pose_to_decode_ms += decode_end.saturating_sub(sent.tracking_sample) as f64 / 1e6;
+                averages.pose_to_display_ms += shown.display_time.saturating_sub(sent.tracking_sample) as f64 / 1e6;
                 averages.pose_to_decode_n += 1;
                 if sent.target_display != 0 {
                     averages.with_target += 1;
@@ -1033,7 +1038,7 @@ fn stats_loop(s: &Shared<'_>) {
     let (mut frames, mut decoded, mut bytes) = (0u64, 0u64, 0u64);
     // The decoder's own count of the pictures that it output. A new decoder starts from 0.
     let (mut decoder_seen, mut decoder_total) = (0u64, 0u64);
-    let (mut network_ms, mut sample_to_decode_ms) = (None, None);
+    let (mut network_ms, mut sample_to_decode_ms, mut sample_to_display_ms) = (None, None, None);
     // The streamed scene's counts at the last look. A new scene starts from 0.
     let mut scene = StreamCounts::default();
     let mut crypto = s.link.duplex.crypto_stats();
@@ -1069,6 +1074,7 @@ fn stats_loop(s: &Shared<'_>) {
             }
             if averages.pose_to_decode_n > 0 {
                 sample_to_decode_ms = Some((averages.pose_to_decode_ms / f64::from(averages.pose_to_decode_n)) as f32);
+                sample_to_display_ms = Some((averages.pose_to_display_ms / f64::from(averages.pose_to_decode_n)) as f32);
             }
             *averages = Averages::default();
             late_pct
@@ -1101,6 +1107,7 @@ fn stats_loop(s: &Shared<'_>) {
             rtt_ms: s.clock.lock().unwrap().estimate().map(|e| e.rtt_ns as f32 / 1e6),
             network_ms,
             sample_to_decode_ms,
+            sample_to_display_ms,
             haptic_pulses: c.haptics.load(Ordering::Relaxed),
             shown_fps,
             skipped_fps,
@@ -1135,7 +1142,7 @@ fn stats_loop(s: &Shared<'_>) {
             }
             log::info!(
                 "{:.1} fps received, {:.1} fps decoded, {:.1} fps shown, {:.1} skipped, {:.1} repeated of {:.1} headset frames (gap up to {:.1} ms), {:.0}% late at the take, {} dropped by the decoder, {:.1} Mbps, decode {:.2} ms mean, rtt {} ms, \
-                 network {} ms, pose to decode {} ms, tracking {} at {:?}, {} of {} packets lost, {} units recovered, {} units lost, \
+                 network {} ms, pose to decode {} ms, pose to display {} ms, tracking {} at {:?}, {} of {} packets lost, {} units recovered, {} units lost, \
                  {} pulses, opening {:.0} us a frame ({:.2} us a packet, {:.1}% of a core), {} packets refused",
                 stats.received_fps,
                 stats.decoded_fps,
@@ -1151,6 +1158,7 @@ fn stats_loop(s: &Shared<'_>) {
                 stats.rtt_ms.map_or("-".into(), |v| format!("{v:.2}")),
                 stats.network_ms.map_or("-".into(), |v| format!("{v:.2}")),
                 stats.sample_to_decode_ms.map_or("-".into(), |v| format!("{v:.1}")),
+                stats.sample_to_display_ms.map_or("-".into(), |v| format!("{v:.1}")),
                 if stats.tracking_live { "live" } else { "placeholder" },
                 stats.head_position.map(|p| p.map(|v| (v * 1000.0).round() / 1000.0)),
                 stats.packets_expected.saturating_sub(stats.packets_received),

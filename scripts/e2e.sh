@@ -379,11 +379,12 @@ case ${client} in
     quest)
         print "Starting ${package} on ${serial}"
         if (( cranvr_client )); then
-            # The Cranpose client takes the host's address and the start of the connection from
-            # the extras of its launch
+            # The Cranpose client takes the host's address, the start of the connection and the
+            # room from the extras of its launch. Room scene puts the host's picture on display:
+            # with the saved Passthrough the client shows no stream and reports no frame timing.
             "${adb_cmd[@]}" shell am force-stop "${package}"
             "${adb_cmd[@]}" shell am start -n "${package}/dev.cranpose.android.CranposeActivity" \
-                --es host "${mac_ip}:${native_port}" --ez connect true >/dev/null
+                --es host "${mac_ip}:${native_port}" --ez connect true --es room scene >/dev/null
         else
             "${adb_cmd[@]}" shell monkey -p "${package}" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
         fi
