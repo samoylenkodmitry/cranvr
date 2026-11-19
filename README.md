@@ -133,6 +133,21 @@ The host's stats line carries a `latency` block with the averages of the client'
 | `decode_queue_ms` | the end of the decode to the take |
 | `vsync_wait_ms` | the take to the display time |
 
+The headset samples its poses at the start of a headset frame, 17 ms before the display time that the poses are predicted for. A frame shows at a point of the display grid. So `total_ms` of a frame is 17 ms plus a whole number of periods: 42 ms for three periods, 50 ms for four. Most frames of the test scene show after three. A frame shows after four when its pose reached the host too late for the plan's start, and after more when the pose never came. The mean falls when more frames make the three, which needs the host's time from the start to the end of the decode (about 14 ms at the median and 20 to 26 ms at the 97.5th percentile) plus the lead (16.3 ms) to fit between the pose's arrival and the point. `decode_queue_ms` is the time that a frame that made its point waits for the headset's take. A frame that starts earlier at the arrival of its pose waits longer and shows at the same point. The wait therefore says little about the latency.
+
+The numbers below come from `scripts/e2e.sh --quest SERIAL --cranvr-client --native-port 9962 --seconds 30` on a Quest 3 over Wi-Fi at 120 Hz with the test scene. Each row is one run: the mean over its stats lines after the first. The load is the Mac's one-minute load average at the start and at the end of the run, with other programs running. `late` and `replaced` are the host's shares of frames that showed after their point and of frames that the headset replaced with a newer one. `shown` and `skipped` are the client's frames per second that the scene showed and skipped.
+
+| Run | `total_ms` | `decode_queue_ms` | late | replaced | shown | skipped | load |
+|---|---|---|---|---|---|---|---|
+| 1 | 43.07 | 9.43 | 2.43% | 0.17% | 116.4 | 2.8 | 7.9, 6.9 |
+| 2 | 43.44 | 9.72 | 1.90% | 0.24% | 117.6 | 2.0 | 7.4, 6.6 |
+| 3 | 42.25 | 9.04 | 1.94% | 0.07% | 118.0 | 1.9 | 5.7, 4.5 |
+| 4 | 43.84 | 9.90 | 2.14% | 0.14% | 118.2 | 1.9 | 12.0, 8.6 |
+| 5 | 42.37 | 9.19 | 2.41% | 0.00% | 117.1 | 2.7 | 6.2, 5.9 |
+| median | 43.07 | 9.43 | 2.14% | 0.14% | 117.6 | 2.0 | |
+
+The median run has `pose_to_send_ms` 10.1, `network_ms` 3.6, `decode_ms` 3.6 and `vsync_wait_ms` 16.3. The round trip was 3.6 to 3.8 ms. A run with a worse Wi-Fi (a round trip above 5 ms) or on a loaded Mac shows more frames after four periods and a mean of 50 ms and more. The display lock's share of misses rests at about 2.4%.
+
 The block also has the headset's frame rate, the video rate, the round trip, the loss, the parity share and the display lock's numbers. The client's stats panel shows the time from the tracking sample to the end of the decode and to the display. A headset that shows no stream (Room at Passthrough, no game) reports no timing, so the block is `null` then.
 
 ## Finding the Mac
