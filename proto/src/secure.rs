@@ -52,6 +52,10 @@ const HOST_LABEL: &[u8] = b"cranvr host signature v3";
 /// not stand for the other side.
 const CLIENT_LABEL: &[u8] = b"cranvr client signature v3";
 const TRANSCRIPT_LABEL: &[u8] = b"cranvr handshake transcript v3";
+/// What the host's commitment to its half of the approval code starts with
+const COMMIT_LABEL: &[u8] = b"cranvr approval commitment v5";
+/// What the approval code's hash starts with
+const APPROVAL_LABEL: &[u8] = b"cranvr approval code v5";
 
 /// One key for one direction of one path.
 pub struct Cipher(ChaCha20Poly1305);
@@ -317,6 +321,31 @@ pub fn verify_client(client_key: &[u8; KEY_LEN], transcript: &[u8; 32], signatur
     identity::verify_message(client_key, &signed_message(Role::Client, transcript, client_key), signature)
 }
 
+/// The host's commitment to its half of the approval code: a hash of its random number, the
+/// handshake's transcript and the client's key. The host sends it before the client sends its own
+/// number, and reveals the number afterwards. The client checks the commitment against the number.
+pub fn approval_commit(host_nonce: &[u8; KEY_LEN], transcript: &[u8; 32], client_key: &[u8; KEY_LEN]) -> [u8; 32] {
+    Sha256::new().chain_update(COMMIT_LABEL).chain_update(host_nonce).chain_update(transcript).chain_update(client_key).finalize().into()
+}
+
+/// The code that both screens show when a host asks its user to allow a new client, from 0 to
+/// 999999. It hashes the handshake's transcript (both fresh keys and the host's key), the client's
+/// key and both random numbers. A client in the middle of two connections has two transcripts, so
+/// it shows two different codes. It could try keys until the codes agree only if it knew the number
+/// of the other side before it fixed its own. The host's commitment hides its number until the
+/// client has sent its own, and the client picks its number before it knows the host's. So neither
+/// side can steer the code, and the middle one hits equal codes with a chance of one in a million.
+pub fn approval_code(transcript: &[u8; 32], client_key: &[u8; KEY_LEN], host_nonce: &[u8; KEY_LEN], client_nonce: &[u8; KEY_LEN]) -> u32 {
+    let hash = Sha256::new()
+        .chain_update(APPROVAL_LABEL)
+        .chain_update(transcript)
+        .chain_update(client_key)
+        .chain_update(host_nonce)
+        .chain_update(client_nonce)
+        .finalize();
+    u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]) % 10u32.pow(identity::CODE_DIGITS)
+}
+
 /// Splits the shared secret into the four keys of a session. `transcript` is the HKDF salt, so the
 /// keys depend on everything that the signatures cover.
 pub fn derive(role: Role, shared: &[u8; KEY_LEN], transcript: &[u8; 32]) -> Channels {
@@ -403,6 +432,31 @@ mod tests {
         buf.begin(KIND_DATAGRAM).extend_from_slice(text);
         tx.seal(&mut buf).unwrap();
         buf.datagram().to_vec()
+    }
+
+    #[test]
+    fn the_approval_code_depends_on_every_input() {
+        let (transcript, key, host, client) = ([1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]);
+        let code = approval_code(&transcript, &key, &host, &client);
+        assert!(code < 1_000_000);
+        assert_eq!(code, approval_code(&transcript, &key, &host, &client));
+        // A hit by chance is one in a million for each line, so these seeds do not fail by luck
+        assert_ne!(code, approval_code(&[9u8; 32], &key, &host, &client));
+        assert_ne!(code, approval_code(&transcript, &[9u8; 32], &host, &client));
+        assert_ne!(code, approval_code(&transcript, &key, &[9u8; 32], &client));
+        assert_ne!(code, approval_code(&transcript, &key, &host, &[9u8; 32]));
+        // The two numbers are not interchangeable
+        assert_ne!(code, approval_code(&transcript, &key, &client, &host));
+    }
+
+    #[test]
+    fn the_commitment_binds_the_number_to_the_session() {
+        let (transcript, key, nonce) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let commit = approval_commit(&nonce, &transcript, &key);
+        assert_eq!(commit, approval_commit(&nonce, &transcript, &key));
+        assert_ne!(commit, approval_commit(&[4u8; 32], &transcript, &key));
+        assert_ne!(commit, approval_commit(&nonce, &[9u8; 32], &key));
+        assert_ne!(commit, approval_commit(&nonce, &transcript, &[9u8; 32]));
     }
 
     #[test]

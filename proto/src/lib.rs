@@ -31,6 +31,7 @@
 //! from ping exchanges.
 
 pub mod clock;
+pub mod discovery;
 pub mod fec;
 pub mod identity;
 pub mod link;
@@ -56,10 +57,19 @@ pub use wire::{Error, Nanos};
 /// Version 4 seals the session. Both sides sign a key exchange. Every packet after it is encrypted
 /// and authenticated. The host also has a key. Versions 2 and 3 ran in clear text, so this crate
 /// speaks no older version. A peer of version 3 or lower is refused.
-pub const PROTOCOL_VERSION: u16 = 4;
+///
+/// Version 5 adds the approval of a new headset on the Mac. A host that does not know a client
+/// holds the connection and tells the client to wait ([`message::HostMsg::AwaitApproval`]). Both
+/// sides show a code that comes from the session (see [`secure::approval_code`]). The user compares
+/// the two codes and allows the headset on the Mac. A version 4 client cannot wait: the host refuses
+/// it at once, as before. A headset that is paired already connects with either version.
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// The oldest protocol version this crate still speaks.
 pub const MIN_PROTOCOL_VERSION: u16 = 4;
+
+/// The first protocol version with the approval of a new headset on the Mac.
+pub const APPROVAL_VERSION: u16 = 5;
 
 /// The largest datagram, in bytes, sealed: the counter and the tag are in it. A media packet and
 /// any datagram message fit in it. A typical path MTU of 1500 bytes minus the IP and UDP headers

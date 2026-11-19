@@ -29,11 +29,23 @@ fn identity() -> cranvr_proto::identity::Identity {
     cranvr_proto::identity::Identity::from_seed([5; 32])
 }
 
+/// A folder of its own for the host's files, empty at the start of the test
+fn config_dir(port: u16) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("cranvr-native-test-{port}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::remove_file(dir.join("paired-headsets.txt")).ok();
+    dir
+}
+
 fn config(port: u16) -> Config {
     Config {
         port,
         identity: cranvr_proto::identity::Identity::from_seed([7; 32]),
-        pairings: Arc::new(crate::pairing::Pairings::load(&std::env::temp_dir().join(format!("cranvr-native-test-{port}")), None)),
+        pairings: Arc::new(crate::pairing::Pairings::load(&config_dir(port), None)),
+        name: "Test Mac".into(),
+        discovery_port: None,
+        approval_wait: Duration::from_secs(30),
+        approve_loopback: false,
         trust_all: false,
         display_lock: true,
         desktop: Default::default(),
@@ -439,15 +451,280 @@ fn a_second_headset_gets_busy_and_the_host_takes_the_next_one() {
 }
 
 #[test]
-fn the_status_line_tells_the_app_who_may_connect_and_whether_pairing_is_open() {
-    let dir = std::env::temp_dir().join(format!("cranvr-native-status-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::remove_file(dir.join("paired-headsets.txt")).ok();
-    // No headset is paired and no code was given: only this Mac may connect
-    let closed = status_line(9950, true, &Pairings::load(&dir, None));
-    assert_eq!(closed, json!({"type": "native", "port": 9950, "local_only": true, "paired": [], "pairing_s": null}));
-    // A code opens the window for ten minutes
-    let open = status_line(9951, false, &Pairings::load(&dir, Some(123_456)));
-    assert_eq!((open["port"].as_u64(), open["local_only"].as_bool()), (Some(9951), Some(false)));
+fn the_status_line_tells_the_app_who_is_paired_and_who_waits() {
+    let dir = config_dir(1);
+    // Nobody is paired and nobody waits
+    let none = status_line(9950, &Pairings::load(&dir, None));
+    assert_eq!(none, json!({"type": "native", "port": 9950, "paired": [], "pairing_s": null, "pending": []}));
+    // A code opens the window of the older protocol for ten minutes
+    let open = status_line(9951, &Pairings::load(&dir, Some(123_456)));
+    assert_eq!(open["port"].as_u64(), Some(9951));
     assert!(open["pairing_s"].as_u64().is_some_and(|s| (590..=600).contains(&s)), "{open}");
+    // A headset that waits has its key, name, address and the code that both screens show
+    let pairings = Pairings::load(&dir, None);
+    let key = identity().public_key();
+    assert!(pairings.ask(key, "Meta Quest 3", [192, 168, 1, 30].into(), 4829));
+    let waiting = status_line(9950, &pairings);
+    assert_eq!(
+        waiting["pending"],
+        json!([{"key": cranvr_proto::identity::to_hex(&key), "name": "Meta Quest 3", "ip": "192.168.1.30", "code": "004 829"}])
+    );
+}
+
+#[test]
+fn the_user_answers_with_a_line_that_names_the_key() {
+    let key = identity().public_key();
+    let hex = cranvr_proto::identity::to_hex(&key);
+    assert_eq!(parse_answer(&format!("allow {hex}")), Some((true, key)));
+    assert_eq!(parse_answer(&format!("  deny   {hex}  ")), Some((false, key)));
+    assert_eq!(parse_answer(&format!("allow {}", &hex[..60])), None, "a short key");
+    assert_eq!(parse_answer(&format!("grant {hex}")), None);
+    assert_eq!(parse_answer(&format!("allow {hex} now")), None);
+    assert_eq!(parse_answer("allow"), None);
+    assert_eq!(parse_answer(""), None);
+}
+
+#[test]
+fn a_version_mismatch_tells_the_user_which_side_to_update() {
+    use cranvr_proto::wire::Error;
+    let old = Error::Version { ours: (4, 5), theirs: (4, 4) };
+    assert_eq!(version_notice(&old).unwrap(), "A headset tried to connect with a cranvr app of an older version. Update the cranvr app on the headset.");
+    let new = Error::Version { ours: (4, 5), theirs: (6, 7) };
+    assert_eq!(version_notice(&new).unwrap(), "A headset tried to connect with a cranvr app of a newer version. Update cranvr on the Mac.");
+    assert!(version_notice(&Error::Closed).is_none());
+}
+
+/// A host that asks the user about loopback clients too, with the files of its own folder
+fn asking_host(port: u16, wait: Duration) -> (Arc<Pairings>, Box<dyn EventSource>, Arc<dyn Headset>) {
+    let mut config = config(port);
+    config.approve_loopback = true;
+    config.approval_wait = wait;
+    let pairings = Arc::clone(&config.pairings);
+    let (headset, events) = start(config).unwrap();
+    (pairings, events, headset)
+}
+
+/// What the headset's panel shows while it waits
+struct Panel(mpsc::Sender<(u32, String)>, Arc<std::sync::atomic::AtomicBool>);
+
+impl cranvr_proto::link::ConnectObserver for Panel {
+    fn waiting(&mut self, code: u32, host_name: &str) {
+        self.0.send((code, host_name.to_owned())).unwrap();
+    }
+
+    fn cancelled(&self) -> bool {
+        self.1.load(Ordering::Relaxed)
+    }
+}
+
+fn panel() -> (Panel, mpsc::Receiver<(u32, String)>, Arc<std::sync::atomic::AtomicBool>) {
+    let (shown, seen) = mpsc::channel();
+    let give_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    (Panel(shown, Arc::clone(&give_up)), seen, give_up)
+}
+
+fn until(what: &str, mut done: impl FnMut() -> bool) {
+    for _ in 0..200 {
+        if done() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("{what} did not happen");
+}
+
+#[test]
+fn an_unknown_headset_waits_for_the_user_and_connects_when_the_user_allows_it() {
+    let port = free_port();
+    let (pairings, mut events, _headset) = asking_host(port, Duration::from_secs(30));
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let (mut observer, seen, _) = panel();
+    let client = thread::spawn(move || ClientLink::connect_with(addr, &caps("Meta Quest 3"), &identity(), None, Duration::from_secs(10), &mut observer));
+    // The headset shows the code and the host's name
+    let (code, host_name) = seen.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(host_name, "Test Mac");
+    // The host lists the headset with the same code and has not paired it
+    until("the request", || !pairings.waiting().is_empty());
+    let request = pairings.waiting().remove(0);
+    assert_eq!((request.name.as_str(), request.code), ("Meta Quest 3", code));
+    assert_eq!(request.key, identity().public_key());
+    assert!(!pairings.contains(&request.key));
+    let status = status_line(port, &pairings);
+    assert_eq!(status["pending"][0]["code"], cranvr_proto::identity::format_code(code));
+    assert!(!client.is_finished(), "the client waits while the user has not answered");
+    // The user presses Allow
+    assert!(pairings.answer(&request.key, true));
+    let client = client.join().unwrap().unwrap();
+    wait_for(&mut *events, |e| matches!(e, Event::Connected { .. }));
+    // The headset is paired for good, and the request is gone
+    assert!(pairings.contains(&identity().public_key()));
+    until("the end of the request", || pairings.waiting().is_empty());
+    assert_eq!(status_line(port, &pairings)["pending"], json!([]));
+    assert_eq!(status_line(port, &pairings)["paired"], json!(["Meta Quest 3"]));
+    let saved = std::fs::read_to_string(config_dir(port).join("paired-headsets.txt")).unwrap_or_default();
+    assert!(saved.is_empty() || saved.contains("Meta Quest 3"), "the file belongs to this run's folder");
+    client.duplex.close();
+    wait_for(&mut *events, |e| matches!(e, Event::Disconnected));
+    // The next connection needs no approval: the host knows the key
+    let again = ClientLink::connect(addr, &caps("Meta Quest 3"), &identity(), None, Duration::from_secs(10)).unwrap();
+    wait_for(&mut *events, |e| matches!(e, Event::Connected { .. }));
+    again.duplex.close();
+}
+
+#[test]
+fn a_denied_headset_hears_no_and_stays_unpaired() {
+    let port = free_port();
+    let (pairings, _events, _headset) = asking_host(port, Duration::from_secs(30));
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let (mut observer, seen, _) = panel();
+    let client = thread::spawn(move || ClientLink::connect_with(addr, &caps("Meta Quest 3"), &identity(), None, Duration::from_secs(10), &mut observer));
+    seen.recv_timeout(Duration::from_secs(10)).unwrap();
+    until("the request", || !pairings.waiting().is_empty());
+    assert!(pairings.answer(&identity().public_key(), false));
+    let result = client.join().unwrap();
+    assert!(matches!(result, Err(cranvr_proto::Error::Rejected(RejectReason::Denied))), "{:?}", result.err());
+    until("the end of the request", || pairings.waiting().is_empty());
+    assert!(!pairings.contains(&identity().public_key()));
+}
+
+#[test]
+fn a_headset_that_nobody_answers_is_told_so_after_the_wait() {
+    let port = free_port();
+    let (pairings, _events, _headset) = asking_host(port, Duration::from_millis(700));
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let (mut observer, _seen, _) = panel();
+    let result = ClientLink::connect_with(addr, &caps("Meta Quest 3"), &identity(), None, Duration::from_secs(10), &mut observer);
+    assert!(matches!(result, Err(cranvr_proto::Error::Rejected(RejectReason::NoAnswer))), "{:?}", result.err());
+    until("the end of the request", || pairings.waiting().is_empty());
+    assert!(!pairings.contains(&identity().public_key()));
+}
+
+#[test]
+fn a_request_ends_when_the_headset_leaves() {
+    let port = free_port();
+    let (pairings, _events, _headset) = asking_host(port, Duration::from_secs(30));
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let (mut observer, seen, give_up) = panel();
+    let client = thread::spawn(move || ClientLink::connect_with(addr, &caps("Meta Quest 3"), &identity(), None, Duration::from_secs(10), &mut observer));
+    seen.recv_timeout(Duration::from_secs(10)).unwrap();
+    until("the request", || !pairings.waiting().is_empty());
+    // The user of the headset presses Cancel
+    give_up.store(true, Ordering::Relaxed);
+    assert!(matches!(client.join().unwrap(), Err(cranvr_proto::Error::Closed)));
+    until("the end of the request", || pairings.waiting().is_empty());
+    assert!(!pairings.contains(&identity().public_key()));
+}
+
+#[test]
+fn a_second_unknown_headset_gets_busy_while_the_first_waits() {
+    let port = free_port();
+    let (pairings, _events, _headset) = asking_host(port, Duration::from_secs(30));
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let (mut first, seen, give_up) = panel();
+    let first_client = thread::spawn(move || ClientLink::connect_with(addr, &caps("First"), &identity(), None, Duration::from_secs(10), &mut first));
+    seen.recv_timeout(Duration::from_secs(10)).unwrap();
+    until("the request", || !pairings.waiting().is_empty());
+    let other = cranvr_proto::identity::Identity::from_seed([9; 32]);
+    let (mut second, _seen, _) = panel();
+    let result = ClientLink::connect_with(addr, &caps("Second"), &other, None, Duration::from_secs(10), &mut second);
+    assert!(matches!(result, Err(cranvr_proto::Error::Rejected(RejectReason::Busy))), "{:?}", result.err());
+    // The first request stays
+    assert_eq!(pairings.waiting()[0].name, "First");
+    give_up.store(true, Ordering::Relaxed);
+    first_client.join().unwrap().err();
+}
+
+#[test]
+fn a_headset_on_this_mac_needs_no_approval() {
+    let port = free_port();
+    let (headset, mut events) = start(config(port)).unwrap();
+    let _ = headset;
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    // `config` does not ask about loopback clients: a USB link and a flat window need no approval
+    let client = ClientLink::connect(addr, &caps("USB headset"), &identity(), None, Duration::from_secs(10)).unwrap();
+    wait_for(&mut *events, |e| matches!(e, Event::Connected { .. }));
+    client.duplex.close();
+}
+
+/// A client of protocol version 4, written by hand: the real client speaks 5. It sends its Hello and
+/// returns what the host answers.
+fn old_client(addr: SocketAddr, identity: &cranvr_proto::identity::Identity) -> HostMsg {
+    use cranvr_proto::{
+        message::{client_preamble, VersionRange, HOST_PREAMBLE_LEN},
+        secure::{derive, sign_as_client, transcript_hash, Ephemeral, HostHello, Role, HOST_HELLO_LEN},
+        wire::{decode, encode, read_tcp_packet, PacketBuf, KIND_CONTROL, KIND_HANDSHAKE},
+    };
+    use std::io::{Read, Write};
+    let mut tcp = std::net::TcpStream::connect(addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let client_pre = client_preamble(VersionRange { min: 4, max: 4 });
+    tcp.write_all(&client_pre).unwrap();
+    let mut host_pre = [0u8; HOST_PREAMBLE_LEN];
+    tcp.read_exact(&mut host_pre).unwrap();
+    let fresh = Ephemeral::new().unwrap();
+    tcp.write_all(&[&33u32.to_le_bytes()[..], &[KIND_HANDSHAKE], &fresh.public()].concat()).unwrap();
+    let mut buf = Vec::new();
+    read_tcp_packet(&mut tcp, &mut buf).unwrap();
+    assert_eq!(buf.len() - 1, HOST_HELLO_LEN);
+    let hello = HostHello::parse(&buf[1..]).unwrap();
+    let transcript = transcript_hash(&client_pre, &host_pre, &fresh.public(), &hello.ephemeral, &hello.key);
+    let mut channels = derive(Role::Client, &fresh.agree(&hello.ephemeral).unwrap(), &transcript);
+    let mut auth = PacketBuf::new();
+    let body = auth.begin(KIND_HANDSHAKE);
+    body.extend_from_slice(&identity.public_key());
+    body.extend_from_slice(&sign_as_client(identity, &transcript));
+    tcp.write_all(channels.tcp_tx.seal(&mut auth).unwrap()).unwrap();
+    let mut hello_packet = PacketBuf::new();
+    // Over TCP the host needs no UDP hello from this hand-written client
+    encode(&ClientMsg::Hello(ClientCaps { tcp_only: true, ..caps("Old headset") }), hello_packet.begin(KIND_CONTROL)).unwrap();
+    tcp.write_all(channels.tcp_tx.seal(&mut hello_packet).unwrap()).unwrap();
+    read_tcp_packet(&mut tcp, &mut buf).unwrap();
+    let content = channels.tcp_rx.open(&mut buf).unwrap();
+    decode(&content[1..]).unwrap()
+}
+
+#[test]
+fn a_headset_with_the_older_app_is_refused_with_a_note_to_update_it() {
+    let port = free_port();
+    let (pairings, _events, _headset) = asking_host(port, Duration::from_secs(30));
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    // The older app cannot wait: the host refuses it at once, as before
+    assert_eq!(old_client(addr, &identity()), HostMsg::Reject(RejectReason::NotPaired));
+    assert!(pairings.waiting().is_empty());
+    let note = status::latest("network").expect("a note for the user");
+    assert_eq!(note["problem"], "incompatible_client");
+    assert!(note["message"].as_str().unwrap().ends_with("Update the cranvr app on the headset."), "{note}");
+}
+
+#[test]
+fn a_headset_with_the_older_app_that_the_host_paired_still_connects() {
+    let port = free_port();
+    let (pairings, mut events, _headset) = asking_host(port, Duration::from_secs(30));
+    pairings.add(&identity().public_key(), "Old headset");
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    // The host speaks version 4 to it and starts the session: the first answer is the welcome
+    assert!(matches!(old_client(addr, &identity()), HostMsg::Welcome(w) if w.version == 4));
+    wait_for(&mut *events, |e| matches!(e, Event::Connected { .. }));
+}
+
+#[test]
+fn the_host_answers_a_search_with_its_name_its_port_and_its_key() {
+    let port = free_port();
+    let discovery = {
+        // A UDP port that nothing uses
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    };
+    let mut config = config(port);
+    config.discovery_port = Some(discovery);
+    let (_headset, _events) = start(config).unwrap();
+    let found = cranvr_proto::discovery::find(vec![([127, 0, 0, 1], discovery).into()], Duration::from_millis(800)).unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    let host = &found[0];
+    assert_eq!(host.answer.name, "Test Mac");
+    assert_eq!(host.answer.port, port);
+    assert_eq!(host.answer.fingerprint, cranvr_proto::identity::fingerprint(&cranvr_proto::identity::Identity::from_seed([7; 32]).public_key()));
+    assert_eq!(host.answer.versions, cranvr_proto::message::VersionRange::OURS);
+    // The address in the answer is one that a client can connect to
+    let client = ClientLink::connect(host.socket_addr(), &caps("Found it"), &identity(), None, Duration::from_secs(10));
+    assert!(client.is_ok(), "{:?}", client.err());
 }
