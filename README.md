@@ -97,6 +97,7 @@ The client's modules: `connection.rs` runs the link on its own threads. `hub.rs`
 - A recenter of the headset goes to the host as a `Recenter` message. The host then puts its desktop screen in front of the user again.
 - The floor goes to the host as a `Floor` message. It comes from the stage that the runtime gives. The poses are in the app's room (OpenXR's LOCAL space), whose origin lies where the head was when the app started. The host moves the room up by the height of the floor before it gives the poses to its test scene or to a game, so the floor lies at height 0 there.
 - The host's haptic pulses play on the controllers through Cranpose's `Haptics`.
+- Hands, body, face and eyes (`tracked.rs`): the Quest build asks Cranpose for the four kinds of tracking in `build.rs` (`Use::hand_tracking()` and its siblings). An OpenXR instance fixes its extensions before the app runs, so the declaration cannot wait for a game. It writes the permissions to the manifest, and Cranpose asks the user for them before the OpenXR instance exists. The headset offers a kind to the host (`ClientMsg::TrackingOffer`) only while its tracker runs, which is after the user allowed it. A Quest 3 has no eye cameras, so it never offers the eyes. Its face comes from the microphone: the data source is audio, and the runtime marks it so a game can tell. A face from Android XR's own extension has the 68 weights of Jetpack XR and is not offered. The client sends a feature only while the host wishes it (`HostMsg::TrackingWish`): one datagram per headset frame, from a buffer that it allocated once. Cranpose gives no velocities for joints, so the client estimates the velocity of each wrist and of the body's root from the poses of two frames, as it does for the head.
 
 ### The eye size and the decoder
 
@@ -423,7 +424,7 @@ Use pairing for real use. `--trust-all` accepts any client on the network and is
 
 ## Not tested yet
 
-- Hands, body, face and eyes from a worn headset. The tests run with the probe's script. No client sends the data yet: the client waits for the Cranpose tracking API.
+- Hands, body, face and eyes from a worn headset. The tests run with the probe's script and the client's own tests. A real hand in view, a real face and the permission prompts of a user who answers them have not been tried.
 - The cranvr client in a worn headset: the controllers in a game, the carry of the desktop panel by a ray, a recenter and the cable from a Quest.
 - Beat Saber during a song. The game's frame rate and latency were measured on its first screen with the headset on a desk.
 - A game that hides the desktop together with a recenter.
