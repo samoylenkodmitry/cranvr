@@ -560,7 +560,7 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
         Incoming::Datagram(
             data @ (ClientDatagram::Hands(_) | ClientDatagram::Body(_) | ClientDatagram::Face(_) | ClientDatagram::Eyes(_)),
         ) => {
-            let mut tracked = match data {
+            let tracked = match data {
                 ClientDatagram::Hands(h) => Tracked::Hands(h),
                 ClientDatagram::Body(b) => Tracked::Body(b),
                 ClientDatagram::Face(f) => Tracked::Face(f),
