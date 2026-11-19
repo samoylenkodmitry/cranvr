@@ -34,6 +34,9 @@ pub struct Options {
     pub game_audio: bool,
     /// Scaled displays get their panels' own pixels while a game runs (see display_modes.rs)
     pub unscale_displays: bool,
+    /// A tracked hand makes the controller of a game that has no hand code, while the headset
+    /// tracks no controller (see hand_controller.rs)
+    pub hand_controllers: bool,
 }
 
 /// What the host agreed on with the headset for the current connection.

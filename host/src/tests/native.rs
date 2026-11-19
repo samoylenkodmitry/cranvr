@@ -739,3 +739,83 @@ fn only_a_few_threads_hold_clients_for_the_user_at_once() {
     drop(places);
     assert!(asking.enter().is_some());
 }
+
+#[test]
+fn the_wish_for_tracking_stays_within_the_offer_and_the_version() {
+    let (hands, face, eyes) = (Features::HANDS, Features::FACE, Features::EYES);
+    // A client of the version before the tracking messages is never asked
+    assert_eq!(wish_to_send(5, hands, Features::ALL, None), None);
+    // Nothing to ask for at the start: no message
+    assert_eq!(wish_to_send(6, Features::NONE, Features::ALL, None), None);
+    // Only what the client offers
+    assert_eq!(wish_to_send(6, hands.union(face), hands.union(eyes), None), Some(hands));
+    // Before the offer came, a wish waits
+    assert_eq!(wish_to_send(6, hands, Features::NONE, None), None);
+    // The same answer again is not sent again. A change is, also the change to nothing.
+    assert_eq!(wish_to_send(6, hands, Features::ALL, Some(hands)), None);
+    assert_eq!(wish_to_send(6, face, Features::ALL, Some(hands)), Some(face));
+    assert_eq!(wish_to_send(6, Features::NONE, Features::ALL, Some(hands)), Some(Features::NONE));
+    // Bits that this version does not know are dropped
+    assert_eq!(wish_to_send(6, Features(0xe0 | 1), Features(0xff), None), Some(hands));
+}
+
+#[test]
+fn tracking_goes_from_the_headset_to_the_events_only_when_the_host_asked() {
+    use cranvr_proto::tracking::{Eyes, Hands};
+    let port = free_port();
+    let (headset, mut events) = start(config(port)).unwrap();
+    let client = Arc::new(ClientLink::connect(([127, 0, 0, 1], port).into(), &caps("Test headset"), &identity(), None, Duration::from_secs(10)).unwrap());
+    wait_for(&mut *events, |e| matches!(e, Event::Connected { .. }));
+    let (to_test, from_client) = channel();
+    for udp in [true, false] {
+        let (client, to_test) = (Arc::clone(&client), to_test.clone());
+        thread::spawn(move || {
+            let handler = |incoming: Incoming<'_, cranvr_proto::link::ClientSide>| {
+                if let Incoming::Control(HostMsg::TrackingWish(wish)) = incoming {
+                    to_test.send(wish).ok();
+                }
+            };
+            if udp {
+                client.duplex.read_udp(handler)
+            } else {
+                client.duplex.read_tcp(handler)
+            };
+        });
+    }
+    // The floor lies 0.3 m below the room's origin
+    client.duplex.send_control(&ClientMsg::Floor(-0.3)).unwrap();
+    // A game asks before the headset offers: nothing goes out yet
+    headset.set_tracking_wish(Features::HANDS.union(Features::EYES));
+    assert!(from_client.recv_timeout(Duration::from_millis(300)).is_err());
+    client.duplex.send_control(&ClientMsg::TrackingOffer(Features::HANDS.union(Features::FACE))).unwrap();
+    let Event::TrackingOffer(offer) = wait_for(&mut *events, |e| matches!(e, Event::TrackingOffer(_))) else { unreachable!() };
+    assert_eq!(offer, Features::HANDS.union(Features::FACE));
+    assert_eq!(from_client.recv_timeout(Duration::from_secs(10)).unwrap(), Features::HANDS);
+
+    // Eyes were not asked for and not offered: the datagram is dropped. Hands come through, with
+    // the floor of the headset moved to height 0.
+    let root = Motion { pose: ProtoPose { orientation: [0.0, 0.0, 0.0, 1.0], position: [0.1, 1.0, -0.4] }, ..Default::default() };
+    let hand = cranvr_proto::tracking::Hand::new(root, &[cranvr_proto::tracking::Joint::tracked(root.pose); cranvr_proto::tracking::HAND_JOINTS]);
+    let mut sample = 7_000_000_000u64;
+    let tracked = loop {
+        client.duplex.send_datagram(&ClientDatagram::Eyes(Eyes { sample_time: sample, display_time: sample, gaze: Some(ProtoPose::IDENTITY) })).unwrap();
+        client.duplex.send_datagram(&ClientDatagram::Hands(Hands { sample_time: sample, display_time: sample, left: Some(hand.clone()), right: None })).unwrap();
+        // UDP may lose a datagram: the client repeats it
+        if let Ok(Event::Tracked(tracked)) = events.next(Duration::from_millis(100)) {
+            break tracked;
+        }
+        sample += 1;
+    };
+    let cranvr_proto::tracking::Tracked::Hands(hands) = tracked else { panic!("the eyes came through, which nobody asked for") };
+    let left = hands.left.expect("the left hand");
+    assert!((left.root.pose.position[1] - 1.3).abs() < 1e-5, "{:?}", left.root.pose.position);
+    assert_eq!(left.root.pose.position[0], 0.1);
+    assert!(hands.right.is_none());
+
+    // The game wants something else: the client hears the new wish, within what it offers
+    headset.set_tracking_wish(Features::FACE.union(Features::EYES));
+    assert_eq!(from_client.recv_timeout(Duration::from_secs(10)).unwrap(), Features::FACE);
+    // The client leaves: the offer ends
+    client.duplex.send_control(&ClientMsg::Bye).unwrap();
+    wait_for(&mut *events, |e| matches!(e, Event::TrackingOffer(offer) if offer.is_empty()));
+}
