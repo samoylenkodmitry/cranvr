@@ -1178,6 +1178,13 @@ impl Headset for Native {
         Some(FramePlan { start_in: Duration::from_nanos(plan.start.saturating_sub(now)), target: plan.target, start: plan.start })
     }
 
+    fn start_early(&self, plan: &FramePlan) -> bool {
+        let Some(session) = self.shared.session() else { return false };
+        let Some(now) = session.client_time(now_ns()) else { return false };
+        let early = session.lock.lock().unwrap().starts_early(now, plan.start);
+        early
+    }
+
     fn frame_started(&self, target: u64, late: Duration) {
         if let Some(session) = self.shared.session() {
             session.lock.lock().unwrap().commit(target, late.as_nanos() as u64);

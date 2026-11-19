@@ -16,6 +16,11 @@
 //!   to the end of its decode (render, encode, send, network and decode);
 //! - the host renders for the pose that is valid at the target.
 //!
+//! A frame whose planned start lies less than a period ahead starts when the pose that it renders for
+//! arrives (`starts_early`). The pose that is newest at the planned start is the same one, so the
+//! frame shows the same picture and has more time before the take. The margin below then falls
+//! until the misses return to their share, and the plans move later.
+//!
 //! The planner reads no clock and sends nothing. Its times are on the headset's clock, in
 //! nanoseconds. The caller converts the host's clock with the clock sync.
 //!
@@ -45,10 +50,16 @@ const FIRST_MARGIN_MS: f64 = 1.5;
 const MIN_MARGIN_MS: f64 = 0.3;
 const MAX_MARGIN_PERIODS: f64 = 1.0;
 /// A missed frame raises the margin by this much, in ms. A frame that hit lowers it by the
-/// smaller step. The ratio sets the share of misses at which the margin rests: 0.01 / 0.41 is
-/// about 2.5 percent.
-const MISS_STEP_MS: f64 = 0.4;
-const HIT_STEP_MS: f64 = 0.01;
+/// smaller step. The ratio sets the share of misses at which the margin rests: 0.005 / 0.205 is
+/// about 2.4 percent. Small steps keep the margin near its rest: with a step of 0.4 ms each miss
+/// moved the plan by more than the spread of the need.
+const MISS_STEP_MS: f64 = 0.2;
+const HIT_STEP_MS: f64 = 0.005;
+/// A frame starts at the arrival of a pose when the next pose is not due before the planned start.
+/// The next pose is due one period after this one. Its arrival jitters by about this much, in ms,
+/// so a pose that arrives less than a period minus this guard before the start is the last one
+/// before the start.
+const EARLY_GUARD_MS: f64 = 0.5;
 /// A frame shown a point early lowers the margin by this much, in ms. The client reports a frame
 /// that the queue holds as on time, so this applies to a headset without a queue only.
 const EARLY_STEP_MS: f64 = 0.1;
@@ -269,6 +280,25 @@ impl DisplayLock {
         };
         let start = (target as f64 - need - lead).max(0.0) as Nanos;
         Some(Plan { start, target })
+    }
+
+    /// Whether a frame whose plan starts at `start` should start now, at `now`, the arrival of a
+    /// pose. The frame renders for the newest pose at its start. The pose that came now is the
+    /// newest one at the planned start when the next pose is not due before that start. Starting
+    /// now gives the same picture and the frame more time before the headset's take.
+    ///
+    /// The time that the frame gains is time that it waits in the headset's queue, which holds
+    /// three frames. A frame that waited there too long was replaced and counted as a miss, which
+    /// raised the margin and made the next frames wait longer. So the gain may not take the need
+    /// past the cap of `need`.
+    pub fn starts_early(&self, now: Nanos, start: Nanos) -> bool {
+        if !(start > now && ((start - now) as f64) < self.period - EARLY_GUARD_MS * 1e6) {
+            return false;
+        }
+        match percentile(&self.need, 0.1) {
+            Some(fast) => self.need() + (start - now) as f64 <= fast + NEED_CAP_PERIODS * self.period,
+            None => true,
+        }
     }
 
     /// The target for a frame that no plan started, such as a game's frame, which is ready for the

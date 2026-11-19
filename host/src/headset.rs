@@ -130,6 +130,12 @@ pub trait Headset: Send + Sync {
         None
     }
 
+    /// Whether the frame loop should start the planned frame now, at the arrival of a pose, and not
+    /// wait for the plan's start (see `DisplayLock::starts_early`).
+    fn start_early(&self, _plan: &FramePlan) -> bool {
+        false
+    }
+
     /// The frame loop takes the plan with this target and renders. `late` is how long after the
     /// planned start it began.
     fn frame_started(&self, _target: u64, _late: Duration) {}
