@@ -83,7 +83,7 @@ done
 runtime_dir=${prefix}/drive_c/basalt/runtime
 mkdir -p "${runtime_dir}"
 cp "${runtime_bin}/basalt_openxr.dll" "${runtime_bin}/basalt_openxr.json" "${runtime_bin}/loader_smoke.exe" "${runtime_dir}/"
-for extra in d3d11_runtime_smoke.exe steamwebhelper_compat.exe; do
+for extra in d3d11_runtime_smoke.exe tracking_smoke.exe steamwebhelper_compat.exe; do
     if [[ -e ${runtime_bin}/${extra} ]]; then
         cp "${runtime_bin}/${extra}" "${runtime_dir}/"
     fi

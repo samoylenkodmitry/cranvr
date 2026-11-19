@@ -14,7 +14,7 @@
 //! With `--use-tracking hands,body,full_body,face,eyes` it plays a game that uses these features, as
 //! the runtime of patch 0005 does: it writes the word `tracking` to `runtime-features.txt`, tells the
 //! host a second after the start which features it uses (`TRACKING_REQUEST`). With `--release-tracking`
-//! it takes them away again two seconds before the end. The host then sends their data. With `cranvr-probe --tracking` the data
+//! it takes them away again six seconds before the end, while the probe still runs. The host then sends their data. With `cranvr-probe --tracking` the data
 //! is the script of `tracked.rs`, and `--expect-tracking` makes the exit code depend on it.
 //! `--expect-hand-controllers` plays a game without hand code: with `cranvr-probe --tracking
 //! --no-controllers` the host must make the controllers of the probe's hands.
@@ -628,7 +628,7 @@ fn main() {
             .filter(|(name, _)| names.split(',').any(|f| f == *name))
             .fold(0, |bits, (_, bit)| bits | bit)
     };
-    // The game creates its trackers a second after the start. It may destroy them two seconds before the end.
+    // The game creates its trackers a second after the start. It may destroy them six seconds before the end.
     let (mut requested, mut released) = (false, false);
     while start.elapsed().as_secs_f64() < seconds {
         if !use_tracking.is_empty() {
@@ -637,7 +637,7 @@ fn main() {
                 requested = true;
                 println!("fake-game: tracking requested: {use_tracking} at unix {} ms", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis()));
                 stream.write_all(&message(TRACKING_REQUEST, &features_used(&use_tracking).to_le_bytes())).unwrap();
-            } else if release_tracking && requested && !released && at >= seconds - 2.0 {
+            } else if release_tracking && requested && !released && at >= seconds - 6.0 {
                 released = true;
                 stream.write_all(&message(TRACKING_REQUEST, &0u32.to_le_bytes())).unwrap();
             }

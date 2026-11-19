@@ -6,6 +6,7 @@
 # Usage: scripts/e2e.sh [--seconds N] [--fps HZ] [--game | --wine PROGRAM [--wine-arg ARG]...] [--desktop]
 #                       [--quest [SERIAL] | --native-tcp] [--native-drop PERCENT] [--native-port PORT]
 #                       [--host-arg ARG]... [--report FILE]
+#                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine]
 #
 #   --seconds N   how long the stream runs (default 20)
 #   --fps HZ      the stream's refresh rate (default 120, as the host). The probe also offers 144,
@@ -16,6 +17,19 @@
 #                 scripts/run-game.sh: a Windows path such as 'C:\basalt\runtime\d3d11_runtime_smoke.exe'.
 #                 The probe then counts every frame of the right size, since the program draws no
 #                 eye badges. --wine-arg passes one argument to the program.
+#   --tracking [FEATURES]  hands, body, face and eyes: the fake game uses these features (a comma
+#                 list of hands, body, full_body, face and eyes; default all), the probe offers
+#                 them and plays the script of probe/src/tracked.rs, and the fake game checks what
+#                 reaches it. The run also checks that the host asked the headset only after the
+#                 game created its trackers. Implies --game.
+#   --hand-controllers  a game without hand code: the probe tracks hands and no controller, and the
+#                 fake game checks that the host made controllers of the hands (a pinch is the
+#                 trigger, the aim pose points from the shoulder through the fingers). Implies --game.
+#   --tracking-wine  the same through the real runtime: C:\basalt\runtime\tracking_smoke.exe runs in
+#                 Wine, creates a hand tracker for each hand, a body tracker for each joint set, a
+#                 face tracker and an eye gaze action, and compares what it reads with the script.
+#                 Set CRANVR_HOME to a stack that scripts/setup-wine.sh built from the runtime to
+#                 test. The run lasts at least 40 seconds.
 #   --desktop     the host shows this Mac's screen. The probe asks for the desktop stream, plays a
 #                 pointer script (the host only logs its mouse events: CRANVR_POINTER_DRY_RUN) and
 #                 counts the Mac's sound. It counts every frame of the right size, since the
@@ -52,6 +66,7 @@ set -euo pipefail
 
 root=${0:A:h:h}
 seconds=20 fps=120 game=0 desktop=0 client=mac serial="" report=""
+tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0
 wine="" wine_args=()
 native_tcp=0 native_drop=0 native_port=9950
 more_host_args=()
@@ -60,6 +75,11 @@ while (( $# )); do
         --seconds) seconds=$2; shift 2 ;;
         --fps) fps=$2; shift 2 ;;
         --game) game=1; shift ;;
+        --tracking)
+            game=1 tracking=1; shift
+            if (( $# )) && [[ $1 != --* ]]; then tracking_features=$1; shift; fi ;;
+        --hand-controllers) game=1 hand_controllers=1; shift ;;
+        --tracking-wine) tracking_wine=1; shift ;;
         --desktop) desktop=1; shift ;;
         --wine) wine=$2; shift 2 ;;
         --wine-arg) wine_args+=("$2"); shift 2 ;;
@@ -75,6 +95,17 @@ while (( $# )); do
         *) print -u2 "unknown option $1"; exit 2 ;;
     esac
 done
+
+if [[ ${client} == quest ]] && (( tracking || hand_controllers || tracking_wine )); then
+    print -u2 "--tracking, --hand-controllers and --tracking-wine belong to the probe: they cannot combine with --quest."
+    exit 2
+fi
+if (( tracking_wine )); then
+    # The Windows program waits for the headset's features, starts a session and reads the data
+    wine='C:\basalt\runtime\tracking_smoke.exe'
+    wine_args=(--seconds 25)
+    (( seconds >= 40 )) || seconds=40
+fi
 
 if [[ ${client} == quest ]] && (( native_tcp || native_drop )); then
     print -u2 "--native-tcp and --native-drop belong to the probe: they cannot combine with --quest."
@@ -219,8 +250,11 @@ if (( game )); then
     # cranvr-fake-game) and ends a few seconds after the probe, so its exit code counts. A
     # headset on a desk sends no controller input.
     if [[ ${client} == mac ]]; then
+        game_args=(--expect-input)
+        (( tracking )) && game_args=(--use-tracking "${tracking_features}" --release-tracking --expect-tracking)
+        (( hand_controllers )) && game_args=(--expect-hand-controllers)
         "${bin}/cranvr-fake-game" --control "${work}/config/runtime-control.txt" --fps "${fps}" \
-            --seconds $(( seconds + 4 )) --expect-input > "${work}/game.log" 2>&1 &
+            --seconds $(( seconds + 4 )) "${game_args[@]}" > "${work}/game.log" 2>&1 &
     else
         "${bin}/cranvr-fake-game" --control "${work}/config/runtime-control.txt" --fps "${fps}" \
             --seconds $(( seconds + 60 )) > "${work}/game.log" 2>&1 &
@@ -245,6 +279,9 @@ if [[ -n ${wine} ]] || (( desktop )); then
 fi
 # The probe asks for the desktop stream, plays a pointer script and counts the Mac's sound
 (( desktop )) && probe_args+=(--desktop)
+# The probe offers hands, body, face and eyes and plays the script of tracked.rs for what the host asks
+(( tracking || tracking_wine )) && probe_args+=(--tracking)
+(( hand_controllers )) && probe_args+=(--tracking --no-controllers)
 client_exit=0
 case ${client} in
     mac)
@@ -276,9 +313,42 @@ case ${client} in
 esac
 (( client_exit == 0 )) || print -u2 "The client failed; see ${work}/probe.log"
 game_exit=0
+tracking_exit=0
+if (( tracking_wine )); then
+    # The probe's time is up. The Windows program ends on its own: wait for its verdict.
+    for i in {1..60}; do
+        grep -qE "tracking_smoke: (PASS|FAIL)" "${work}/game.log" && break
+        sleep 0.5
+    done
+    grep -h "tracking_smoke:" "${work}/game.log" || true
+    grep -q "tracking_smoke: PASS" "${work}/game.log" || { print -u2 "The tracking program did not pass; see ${work}/game.log"; tracking_exit=1; }
+fi
+if (( tracking || tracking_wine )); then
+    # The host asks the headset for tracking only after the game created its trackers
+    python3 -I - "${work}/probe.log" "${work}/game.log" <<'PYTHON' || tracking_exit=1
+import re, sys
+probe, game = (open(path, errors="replace").read() for path in sys.argv[1:3])
+asks = [(int(ms), what) for what, ms in re.findall(r"probe: the host asks for (.*?) at unix (\d+) ms", probe)]
+made = re.findall(r"(?:fake-game: tracking requested: .*?|tracking_smoke: creating the trackers) at unix (\d+) ms", game)
+if not made or not asks:
+    print("tracking: no asks (%d) or no trackers (%d)" % (len(asks), len(made)), file=sys.stderr)
+    sys.exit(1)
+created = int(made[0])
+first = next(ms for ms, what in asks if what != "no tracking")
+early = [ms for ms, what in asks if what != "no tracking" and ms < created - 20]
+print("tracking: the first ask came %d ms after the trackers were created, the last ask was %s" % (first - created, asks[-1][1]))
+if early:
+    print("tracking: the host asked %d ms before the game created a tracker" % (created - early[0]), file=sys.stderr)
+    sys.exit(1)
+if first - created > 3000 or asks[-1][1] != "no tracking":
+    print("tracking: the first ask is late or the last ask is not the end of tracking", file=sys.stderr)
+    sys.exit(1)
+PYTHON
+    grep -h "probe: tracking sent" "${work}/probe.log" || true
+fi
 if [[ ${client} == mac ]] && (( game )); then
     wait ${game_pid} || game_exit=$?
-    grep -h "fake-game: input" "${work}/game.log" || true
+    grep -hE "fake-game: (input|tracking|controllers made|hand controller)" "${work}/game.log" || true
     (( game_exit == 0 )) || print -u2 "The fake game failed or saw wrong input; see ${work}/game.log"
 fi
 # The host prints a stats line every 5 seconds: wait for the last one
@@ -309,6 +379,7 @@ result=0
 python3 -I "${root}/scripts/e2e-report.py" "${work}/host.out" "${fps}" "${report}" "${extra[@]}" || result=$?
 (( client_exit == 0 )) || result=1
 (( game_exit == 0 )) || result=1
+(( tracking_exit == 0 )) || result=1
 grep -hE "probe: (done|frame arrival|native|desktop|audio)" "${work}/probe.log" 2>/dev/null || true
 print "Report: ${report}"
 exit ${result}

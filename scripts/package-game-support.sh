@@ -70,7 +70,7 @@ cp "${fork}/x86_64-unix/winemetal.so" "${root}/engine/lib/wine/x86_64-unix/winem
 cp "${fork}/x86_64-unix/winemetal.so" "${root}/dxmt/x86_64-unix/winemetal.so"
 
 print "Copying the OpenXR runtime"
-for f in basalt_openxr.dll basalt_openxr.json loader_smoke.exe d3d11_runtime_smoke.exe steamwebhelper_compat.exe; do
+for f in basalt_openxr.dll basalt_openxr.json loader_smoke.exe d3d11_runtime_smoke.exe tracking_smoke.exe steamwebhelper_compat.exe; do
     cp "${runtime_bin}/${f}" "${root}/runtime/${f}"
 done
 
