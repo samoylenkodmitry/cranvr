@@ -7,7 +7,9 @@
 #   --mute       start without sound (Wine gets no audio driver)
 #
 # Environment: CRANVR_MAX_MSAA caps the MSAA samples a game may use (default: the app's setting, else
-# 2; 0 for no cap).
+# 2; 0 for no cap). The script applies no option of a particular game: set them yourself, as the
+# app's launch options do, for example BASALT_MAX_ARRAY_SIZE=1 for a game whose right eye stays
+# black, or WINEDLLOVERRIDES='winhttp=n,b' for a mod loader that ships winhttp.dll.
 #
 # Examples:
 #   scripts/run-game.sh 'C:\basalt\runtime\d3d11_runtime_smoke.exe' --render-frames 7200 --visual
@@ -96,11 +98,5 @@ if [[ ${dir} == */steamapps/common/* ]]; then
         print "Steam app ${app_id} (${installdir})"
     fi
 fi
-# Games that render both eyes in one pass into a two-slice swapchain show a black right eye:
-# DXMT leaves the second slice empty. The runtime then rejects such swapchains (cranvr's runtime
-# patch 0003) and Unity draws each eye apart. Keep this list in step with the app's steam.rs.
-case ${program:l} in
-    *\\superhot_vr.exe) export BASALT_MAX_ARRAY_SIZE=1 ;;
-esac
 export MVK_CONFIG_LOG_LEVEL=0
 exec "${wine_root}/bin/wine" "${program}" "$@"

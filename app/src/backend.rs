@@ -1,10 +1,11 @@
 //! Everything outside the window: the host child process, settings on disk, paired headsets
 //! from ALVR's session.json, and games under Wine.
 
+use crate::launch::{GameOptions, WineOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     env,
     ffi::OsString,
     fs,
@@ -69,6 +70,11 @@ pub struct Settings {
     pub game_msaa_limit: u32,
     /// While a game runs, a display in a scaled mode shows its panel's own pixels
     pub unscale_displays: bool,
+    /// The launch options of each Windows program, by its Windows path. A program with no entry
+    /// starts with the default options.
+    pub launch: BTreeMap<String, GameOptions>,
+    /// The options of every Windows program that cranvr starts
+    pub wine: WineOptions,
 }
 
 /// The app that runs on the headset.
@@ -112,6 +118,8 @@ impl Default for Settings {
             low_latency: false,
             game_msaa_limit: 2,
             unscale_displays: true,
+            launch: BTreeMap::new(),
+            wine: WineOptions::default(),
         }
     }
 }
