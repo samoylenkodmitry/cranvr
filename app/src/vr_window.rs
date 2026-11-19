@@ -35,6 +35,34 @@ pub fn move_into_vr(vr_display: u32) {
     });
 }
 
+/// The least time between two raises of the window. A device on the network that asks again and
+/// again must not keep the window on top.
+const RAISE_GAP: std::time::Duration = std::time::Duration::from_secs(20);
+static LAST_RAISE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// Brings the window to the front of every other app. A headset that asks to connect has a user who
+/// wears it and may not look at the Mac, so the request must be on top when they look.
+pub fn bring_to_front() {
+    {
+        let mut last = LAST_RAISE.lock().unwrap();
+        if last.is_some_and(|at| at.elapsed() < RAISE_GAP) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    DispatchQueue::main().exec_async(|| unsafe {
+        let Some(app_class) = AnyClass::get(c"NSApplication") else { return };
+        let app: *mut AnyObject = msg_send![app_class, sharedApplication];
+        let Some(app) = app.as_ref() else { return };
+        let nobody: *mut AnyObject = std::ptr::null_mut();
+        let _: () = msg_send![app, unhide: nobody];
+        let _: () = msg_send![app, activateIgnoringOtherApps: true];
+        if let Some(window) = app_window() {
+            let _: () = msg_send![window, orderFrontRegardless];
+        }
+    });
+}
+
 /// Moves the window back to where it was before it went into VR, or to the middle of the main
 /// display. Without a headset nobody sees the virtual display, so the window must not stay
 /// there: macOS also puts it back there at the next start when the app ended in VR.

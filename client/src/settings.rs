@@ -8,7 +8,7 @@
 use crate::console::{Room, Volume};
 use crate::hub::MediaChoice;
 use cranpose::{launch_args, preferences};
-use cranvr_proto::identity::{from_hex, random_bytes, to_hex, Identity};
+use cranvr_proto::identity::{fingerprint, from_hex, random_bytes, to_hex, Identity, FINGERPRINT_LEN};
 use std::sync::OnceLock;
 
 const HOST_KEY: &str = "host";
@@ -98,21 +98,43 @@ fn host_key_entry(name: &str) -> String {
     format!("host-key:{name}")
 }
 
+/// The preferences key under which the headset finds the key of a host again by its fingerprint,
+/// after the Mac's address changed.
+fn host_fingerprint_entry(fingerprint: &[u8; FINGERPRINT_LEN]) -> String {
+    format!("host-fingerprint:{}", to_hex(fingerprint))
+}
+
 /// The key of the host that this headset paired with at `name`, if it did.
 pub fn host_key(name: &str) -> Option<[u8; 32]> {
     preferences().get(&host_key_entry(name)).and_then(|text| from_hex(&text))
 }
 
-/// Remembers the key of a host. The headset refuses a host at this name that has another key.
+/// The key of the host that this headset paired with and that has this fingerprint, if it did.
+/// A key whose fingerprint differs is not returned, so a damaged entry pins nothing.
+pub fn host_key_by_fingerprint(fingerprint_of_host: &[u8; FINGERPRINT_LEN]) -> Option<[u8; 32]> {
+    let key = preferences().get(&host_fingerprint_entry(fingerprint_of_host)).and_then(|text| from_hex(&text))?;
+    (fingerprint(&key) == *fingerprint_of_host).then_some(key)
+}
+
+/// Remembers the key of a host under its address and under its fingerprint. The headset refuses a
+/// host at this address, or with this fingerprint, that has another key.
 pub fn remember_host_key(name: &str, key: &[u8; 32]) {
-    if let Err(e) = preferences().set(&host_key_entry(name), &to_hex(key)) {
+    let saved = preferences()
+        .set(&host_key_entry(name), &to_hex(key))
+        .and_then(|()| preferences().set(&host_fingerprint_entry(&fingerprint(key)), &to_hex(key)));
+    if let Err(e) = saved {
         log::warn!("the host's key was not saved, so the next connection trusts the host's key again: {e}");
     }
 }
 
-/// Forgets the key of the host at `name`. The next connection trusts the key that the host shows
-/// and remembers it.
+/// Forgets the key of the host at `name`, under its address and under its fingerprint. The next
+/// connection trusts the key that the host shows and remembers it.
 pub fn forget_host_key(name: &str) {
+    if let Some(key) = host_key(name) {
+        if let Err(e) = preferences().remove(&host_fingerprint_entry(&fingerprint(&key))) {
+            log::warn!("the host's fingerprint was not forgotten: {e}");
+        }
+    }
     if let Err(e) = preferences().remove(&host_key_entry(name)) {
         log::warn!("the host's key was not forgotten: {e}");
     }

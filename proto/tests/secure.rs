@@ -8,10 +8,12 @@ use common::{caps, host_identity, identity, meta, Rng};
 use cranvr_proto::{
     fec::ParityController,
     identity::{Identity, KEY_LEN},
-    link::{ClientLink, HostLink, HostListener, Incoming, MediaMode},
+    link::{ClientLink, ConnectObserver, HostLink, HostListener, Incoming, MediaMode},
     media::{FrameReceiver, DEFAULT_SHARD_LEN},
     message::*,
-    secure::{derive, sign_as_client, transcript_hash, Channels, Ephemeral, HostHello, Role, HOST_HELLO_LEN, OVERHEAD},
+    secure::{
+        approval_commit, derive, sign_as_client, sign_as_host, transcript_hash, Channels, Ephemeral, HostHello, Role, HOST_HELLO_LEN, OVERHEAD,
+    },
     wire::{encode, read_tcp_packet, Error, PacketBuf, KIND_CONTROL, KIND_DATAGRAM, KIND_HANDSHAKE},
 };
 use std::{
@@ -50,9 +52,14 @@ impl Raw {
     /// Runs the version exchange and the three flights. `claimed` is the key that flight 3 names.
     /// `signer` signs it. They differ in the tests of a forged identity.
     fn handshake(addr: std::net::SocketAddr, claimed: &Identity, signer: &Identity) -> std::io::Result<Raw> {
+        Self::handshake_with_versions(addr, claimed, signer, VersionRange::OURS)
+    }
+
+    /// The same, for a client that speaks only the versions in `range`.
+    fn handshake_with_versions(addr: std::net::SocketAddr, claimed: &Identity, signer: &Identity, range: VersionRange) -> std::io::Result<Raw> {
         let mut tcp = TcpStream::connect(addr)?;
         tcp.set_read_timeout(Some(WAIT))?;
-        let client_pre = client_preamble(VersionRange::OURS);
+        let client_pre = client_preamble(range);
         tcp.write_all(&client_pre)?;
         let mut host_pre = [0u8; HOST_PREAMBLE_LEN];
         tcp.read_exact(&mut host_pre)?;
@@ -598,4 +605,171 @@ fn seal_cost() {
         println!("  sealing alone {seal:.0}, {seal_min:.0}; opening {open:.0}, {open_min:.0}");
         println!("  per packet: seal {:.2}, open {:.2}; open throughput {:.2} GB/s", seal / packets as f64, open / packets as f64, wire_bytes as f64 / open / 1e3);
     }
+}
+
+/// What the codes of the two legs of a connection through a middle machine show. The middle machine
+/// ends the client's connection with a host of its own and opens a connection to the real host as a
+/// client. Each leg has its own keys.
+#[test]
+fn a_man_in_the_middle_that_ends_both_legs_shows_two_different_codes() {
+    struct Show(mpsc::Sender<(u32, String)>);
+    impl ConnectObserver for Show {
+        fn waiting(&mut self, code: u32, host_name: &str) {
+            self.0.send((code, host_name.to_owned())).unwrap();
+        }
+        fn cancelled(&self) -> bool {
+            // The test ends the waits by dropping the sockets
+            false
+        }
+    }
+    let real = HostListener::bind("127.0.0.1:0", host_identity()).unwrap();
+    let real_addr = real.local_addr().unwrap();
+    let middle = HostListener::bind("127.0.0.1:0", Identity::from_seed([66; KEY_LEN])).unwrap();
+    let middle_addr = middle.local_addr().unwrap();
+    // The real host asks its user and learns the code of its leg
+    let real_host = thread::spawn(move || {
+        let mut pending = real.accept().unwrap();
+        let code = pending.hold_for_approval("Real Mac").unwrap();
+        pending.reject(RejectReason::Denied);
+        code
+    });
+    // The middle machine takes the client's connection and opens its own to the real host
+    let middle_host = thread::spawn(move || {
+        let mut pending = middle.accept().unwrap();
+        let (to_test, from_leg_two) = mpsc::channel();
+        let leg_two = thread::spawn(move || {
+            ClientLink::connect_with(real_addr, &caps(), &Identity::from_seed([77; KEY_LEN]), None, WAIT, &mut Show(to_test)).err()
+        });
+        let (code_two, _) = from_leg_two.recv_timeout(WAIT).expect("the real host holds the middle machine");
+        let code_one = pending.hold_for_approval("Real Mac").unwrap();
+        pending.reject(RejectReason::Denied);
+        assert!(matches!(leg_two.join().unwrap(), Some(Error::Rejected(RejectReason::Denied))));
+        (code_one, code_two)
+    });
+    let (to_test, from_client) = mpsc::channel();
+    let client = ClientLink::connect_with(middle_addr, &caps(), &identity(), None, WAIT, &mut Show(to_test));
+    assert!(matches!(client, Err(Error::Rejected(RejectReason::Denied))));
+    let (client_code, host_name) = from_client.recv_timeout(WAIT).unwrap();
+    assert_eq!(host_name, "Real Mac");
+    let real_code = real_host.join().unwrap();
+    let (middle_code_one, middle_code_two) = middle_host.join().unwrap();
+    // Each leg agrees with itself
+    assert_eq!(client_code, middle_code_one);
+    assert_eq!(real_code, middle_code_two);
+    // The user compares the headset's code with the Mac's code: they differ. They agree with a
+    // chance of one in a million.
+    assert_ne!(client_code, real_code, "the two legs showed the same code");
+}
+
+#[test]
+fn a_client_of_version_4_gets_no_approval_and_the_host_says_why() {
+    let listener = HostListener::bind("127.0.0.1:0", host_identity()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let host = thread::spawn(move || {
+        let mut pending = listener.accept().unwrap();
+        let version = pending.version;
+        let held = pending.hold_for_approval("Mac");
+        (version, held.err())
+    });
+    let mut raw = Raw::handshake_with_versions(addr, &identity(), &identity(), VersionRange { min: 4, max: 4 }).unwrap();
+    raw.send_control(&ClientMsg::Hello(caps()));
+    let (version, held) = host.join().unwrap();
+    assert_eq!(version, 4);
+    assert!(matches!(held, Some(Error::Unexpected(_))), "{held:?}");
+}
+
+/// A host written by hand. It runs the handshake as `versions` say, reads the client's key and
+/// its Hello, and returns the sealed channel for the test to continue.
+struct FakeHost {
+    tcp: TcpStream,
+    channels: Channels,
+    transcript: [u8; 32],
+    client_key: [u8; 32],
+}
+
+impl FakeHost {
+    fn accept(listener: &TcpListener, versions: VersionRange) -> FakeHost {
+        let (mut tcp, _) = listener.accept().unwrap();
+        let mut client_pre = [0u8; CLIENT_PREAMBLE_LEN];
+        tcp.read_exact(&mut client_pre).unwrap();
+        let host_pre = host_preamble(Some(versions.max), versions);
+        tcp.write_all(&host_pre).unwrap();
+        let mut buf = Vec::new();
+        read_tcp_packet(&mut tcp, &mut buf).unwrap();
+        let client_fresh: [u8; 32] = buf[1..].try_into().unwrap();
+        let fresh = Ephemeral::new().unwrap();
+        let host = host_identity();
+        let transcript = transcript_hash(&client_pre, &host_pre, &client_fresh, &fresh.public(), &host.public_key());
+        let hello = HostHello { ephemeral: fresh.public(), key: host.public_key(), signature: sign_as_host(&host, &transcript) };
+        let body = hello.to_bytes();
+        tcp.write_all(&[&(1 + body.len() as u32).to_le_bytes()[..], &[KIND_HANDSHAKE], &body].concat()).unwrap();
+        let mut channels = derive(Role::Host, &fresh.agree(&client_fresh).unwrap(), &transcript);
+        // The client's key, then its Hello
+        read_tcp_packet(&mut tcp, &mut buf).unwrap();
+        let client_key: [u8; 32] = channels.tcp_rx.open(&mut buf).unwrap()[1..33].try_into().unwrap();
+        read_tcp_packet(&mut tcp, &mut buf).unwrap();
+        channels.tcp_rx.open(&mut buf).unwrap();
+        FakeHost { tcp, channels, transcript, client_key }
+    }
+
+    fn send(&mut self, msg: &HostMsg) {
+        let mut out = PacketBuf::new();
+        encode(msg, out.begin(KIND_CONTROL)).unwrap();
+        self.tcp.write_all(self.channels.tcp_tx.seal(&mut out).unwrap()).unwrap();
+    }
+
+    fn read(&mut self) -> ClientMsg {
+        let mut buf = Vec::new();
+        read_tcp_packet(&mut self.tcp, &mut buf).unwrap();
+        let content = self.channels.tcp_rx.open(&mut buf).unwrap();
+        cranvr_proto::wire::decode(&content[1..]).unwrap()
+    }
+}
+
+#[test]
+fn a_host_that_reveals_another_number_than_it_committed_to_is_caught() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let fake = thread::spawn(move || {
+        let mut host = FakeHost::accept(&listener, VersionRange::OURS);
+        // The commitment is to one number, and the reveal shows another
+        let commit = approval_commit(&[1; 32], &host.transcript, &host.client_key);
+        host.send(&HostMsg::AwaitApproval { host_name: "Mac".into(), commit });
+        assert!(matches!(host.read(), ClientMsg::PairNonce(_)));
+        host.send(&HostMsg::PairReveal([2; 32]));
+    });
+    struct Never;
+    impl ConnectObserver for Never {
+        fn waiting(&mut self, _code: u32, _host_name: &str) {
+            panic!("the client showed a code for a commitment that does not hold");
+        }
+    }
+    let result = ClientLink::connect_with(addr, &caps(), &identity(), None, WAIT, &mut Never);
+    assert!(matches!(result, Err(Error::Crypto(_))), "{:?}", result.err());
+    fake.join().unwrap();
+}
+
+#[test]
+fn a_host_of_version_4_that_does_not_know_the_client_is_the_side_to_update() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let old = thread::spawn(move || {
+        let mut host = FakeHost::accept(&listener, VersionRange { min: 4, max: 4 });
+        // What a version 4 host did for a key that it did not know
+        host.send(&HostMsg::Reject(RejectReason::NotPaired));
+    });
+    let result = ClientLink::connect(addr, &caps(), &identity(), None, WAIT);
+    let error = result.err().expect("the old host refuses");
+    assert!(matches!(error, Error::Version { ours: (4, 5), theirs: (4, 4) }), "{error:?}");
+    assert_eq!(error.peer_must_update(), Some(true));
+    old.join().unwrap();
+}
+
+#[test]
+fn the_older_side_is_the_one_to_update() {
+    let ours = VersionRange { min: 4, max: 5 };
+    assert!(ours.peer_is_older(VersionRange { min: 4, max: 4 }));
+    assert!(ours.peer_is_older(VersionRange { min: 3, max: 3 }));
+    assert!(!ours.peer_is_older(VersionRange { min: 6, max: 7 }));
+    assert!(!ours.peer_is_older(VersionRange { min: 4, max: 5 }));
 }

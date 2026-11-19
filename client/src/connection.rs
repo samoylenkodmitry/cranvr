@@ -25,11 +25,11 @@ use cranpose_xr::{Hand, StreamCounts, Vibration};
 use cranvr_proto::{
     clock::{now_ns, ClockSync},
     identity::format_code,
-    link::{ClientLink, ClientSide, Incoming},
+    link::{ClientLink, ClientSide, ConnectObserver, Incoming},
     media::{FrameReceiver, Received},
     message::{
         ClientCaps, ClientDatagram, ClientMsg, FrameTiming, HostDatagram, HostMsg, LossReport, Ping, Pong, RejectReason,
-        StreamParams, Views, DESKTOP_STREAM,
+        StreamParams, Views, DESKTOP_STREAM, UPDATE_HEADSET, UPDATE_MAC,
     },
     media::LostUnit,
     wire::{Codec, Error, Nanos},
@@ -179,14 +179,15 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Connects in the background. The hub gets the progress under `id`.
-    pub fn start(hub: &'static Hub, id: u64, host: String, media: MediaChoice) -> Self {
+    /// Connects in the background. The hub gets the progress under `id`. `fingerprint` is the start
+    /// of the host's key fingerprint when the host came from the search.
+    pub fn start(hub: &'static Hub, id: u64, host: String, fingerprint: Option<[u8; 8]>, media: MediaChoice) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let link = Arc::new(Mutex::new(None));
         let (thread_stop, thread_link) = (Arc::clone(&stop), Arc::clone(&link));
         let spawned = thread::Builder::new()
             .name("cranvr-link".into())
-            .spawn(move || run(hub, id, &host, media, &thread_stop, &thread_link));
+            .spawn(move || run(hub, id, &host, fingerprint, media, &thread_stop, &thread_link));
         if let Err(e) = spawned {
             hub.report(id, |snapshot| snapshot.state = LinkState::Failed(format!("no thread for the link: {e}")));
         }
@@ -211,15 +212,49 @@ impl Connection {
     }
 }
 
-/// Says in words why a connection ended.
-fn describe(error: &Error, host: SocketAddr) -> String {
+/// Says in words why a connection ended, and what the user does next.
+fn failure_text(error: &Error, host: SocketAddr) -> String {
     match error {
-        Error::Timeout => format!("{host} did not answer. Does cranvr-host run with --protocol native?"),
+        Error::Version { .. } => {
+            if error.peer_must_update() == Some(true) {
+                format!("The cranvr on {host} is older than this app. {UPDATE_MAC}")
+            } else {
+                format!("The cranvr on {host} is newer than this app. {UPDATE_HEADSET}")
+            }
+        }
+        Error::Rejected(RejectReason::Denied) => "The Mac denied this headset. Press the Mac to ask again.".into(),
+        Error::Rejected(RejectReason::NoAnswer) => "Nobody answered on the Mac. Press the Mac to ask again.".into(),
+        Error::Rejected(RejectReason::Busy) => "The Mac is busy with another headset.".into(),
+        Error::Rejected(RejectReason::NotPaired) => format!("{host} does not know this headset."),
+        Error::HostKeyChanged => format!(
+            "{host} does not have the key that this headset paired with. Someone may pose as the Mac. If you reinstalled cranvr on the Mac, press Forget host key and connect again."
+        ),
+        Error::Timeout => format!("{host} did not answer. Is cranvr open on the Mac?"),
         Error::Closed => format!("{host} closed the connection"),
         Error::Io(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-            format!("{host} refused the connection. Does cranvr-host run with --protocol native?")
+            // A Mac with an older cranvr that paired no headset listens on its own address only
+            format!("{host} refused the connection. Is cranvr open on the Mac? An older cranvr on the Mac may cause this: update cranvr on the Mac.")
         }
         other => other.to_string(),
+    }
+}
+
+/// Shows the approval code in the panel while the Mac's user decides.
+struct Waiting<'a> {
+    hub: &'static Hub,
+    id: u64,
+    stop: &'a AtomicBool,
+}
+
+impl ConnectObserver for Waiting<'_> {
+    fn waiting(&mut self, code: u32, host_name: &str) {
+        let (code, host) = (format_code(code), host_name.to_owned());
+        log::info!("the Mac {host:?} asks its user to allow this headset: the code is {code}");
+        self.hub.report(self.id, |snapshot| snapshot.state = LinkState::Waiting { code, host });
+    }
+
+    fn cancelled(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
     }
 }
 
@@ -252,7 +287,7 @@ pub fn host_name(text: &str) -> String {
 fn resolve(text: &str) -> Result<SocketAddr, String> {
     let text = text.trim();
     if text.is_empty() {
-        return Err("Enter the address of the Mac that runs cranvr-host".into());
+        return Err("Enter the address of the Mac".into());
     }
     with_port(text)
         .to_socket_addrs()
@@ -265,6 +300,7 @@ fn run(
     hub: &'static Hub,
     id: u64,
     text: &str,
+    fingerprint: Option<[u8; 8]>,
     media: MediaChoice,
     stop: &AtomicBool,
     slot: &Mutex<Option<Arc<ClientLink>>>,
@@ -314,20 +350,17 @@ fn run(
     // host) is reached through no network. Its key is not checked, as the host does not check the
     // pairing of a client on loopback. Any other host must be the one that this headset paired with.
     let name = host_name(text);
-    let pinned = if host.ip().is_loopback() { None } else { crate::settings::host_key(&name) };
-    let link = match ClientLink::connect(host, &caps, identity, pinned, CONNECT_TIMEOUT) {
+    // A Mac from the search may have a new address since the last pairing: the fingerprint finds its key.
+    // The fingerprint comes first: an address that moved to another paired Mac must not look like a fake
+    let pinned = if host.ip().is_loopback() {
+        None
+    } else {
+        fingerprint.and_then(|fp| crate::settings::host_key_by_fingerprint(&fp)).or_else(|| crate::settings::host_key(&name))
+    };
+    let link = match ClientLink::connect_with(host, &caps, identity, pinned, CONNECT_TIMEOUT, &mut Waiting { hub, id, stop }) {
         Ok(link) => Arc::new(link),
         Err(e) => {
-            let message = match &e {
-                Error::Rejected(RejectReason::NotPaired) => format!(
-                    "{host} does not know this headset. On the Mac, choose the cranvr client in the cranvr app and pair the code {}, or start cranvr-host with --pair and the code",
-                    format_code(identity.code()).replace(' ', "")
-                ),
-                Error::HostKeyChanged => format!(
-                    "{host} does not have the key that this headset paired with. Someone may pose as the host. If you reinstalled the host or lost its host-identity.txt, press Forget host key and connect again."
-                ),
-                other => describe(other, host),
-            };
+            let message = failure_text(&e, host);
             log::warn!("{message}");
             hub.report(id, |snapshot| snapshot.state = LinkState::Failed(message));
             return;
@@ -1105,5 +1138,126 @@ mod tests {
         // A pulse with no length is a click, a frequency of 0 leaves the choice to the controller,
         // and a strength beyond 1 is the strongest
         assert_eq!((hand, vibration.duration(), vibration.frequency(), vibration.amplitude()), (Hand::Left, MIN_PULSE, None, 1.0));
+    }
+
+    #[test]
+    fn a_failure_says_which_side_to_update() {
+        let host: SocketAddr = ([192, 168, 1, 20], 9950).into();
+        // An older Mac: its range ends below the client's
+        let old_mac = failure_text(&Error::Version { ours: (4, 5), theirs: (4, 4) }, host);
+        assert!(old_mac.ends_with("Update cranvr on the Mac."), "{old_mac}");
+        // A newer Mac
+        let new_mac = failure_text(&Error::Version { ours: (4, 5), theirs: (6, 6) }, host);
+        assert!(new_mac.ends_with("Update the cranvr app on the headset."), "{new_mac}");
+    }
+
+    #[test]
+    fn a_refusal_tells_the_user_what_to_press() {
+        let host: SocketAddr = ([192, 168, 1, 20], 9950).into();
+        assert_eq!(failure_text(&Error::Rejected(RejectReason::Denied), host), "The Mac denied this headset. Press the Mac to ask again.");
+        assert_eq!(failure_text(&Error::Rejected(RejectReason::NoAnswer), host), "Nobody answered on the Mac. Press the Mac to ask again.");
+        assert!(failure_text(&Error::Timeout, host).contains("Is cranvr open on the Mac?"));
+        assert!(failure_text(&Error::HostKeyChanged, host).contains("Forget host key"));
+    }
+
+    /// The whole way of a new headset to a Mac, against a real host process on this machine: the
+    /// search finds the host, a press connects, the headset waits with a code, the host's user
+    /// allows it and frames arrive. The window is not a headset, so nothing decodes, but the frames
+    /// reach the client whole. It needs a built host (`CRANVR_HOST_BIN`, else `target/debug`) and an
+    /// address of this Mac on a network, because the host asks about no client on loopback.
+    ///
+    /// `cargo test --manifest-path client/Cargo.toml -- --ignored finds_a_host`
+    #[test]
+    #[ignore = "starts a host process on port 9962"]
+    fn a_new_headset_finds_a_host_process_waits_for_the_user_and_gets_frames() {
+        use crate::hub::hub;
+        use cranvr_proto::discovery::{broadcast_targets, find, DEFAULT_PORT};
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+
+        const PORT: u16 = 9962;
+        cranpose::set_platform_preferences(Arc::new(cranpose::MemoryPreferences::default()));
+        let host_bin = std::env::var_os("CRANVR_HOST_BIN")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/debug/cranvr-host"));
+        let dir = std::env::temp_dir().join(format!("cranvr-find-mac-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut host = Command::new(&host_bin)
+            .args(["--protocol", "native", "--native-port", &PORT.to_string(), "--status", "--fps", "60", "--no-game-audio", "--config-dir"])
+            .arg(&dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("cannot start {}: {e}", host_bin.display()));
+        let (lines, status) = mpsc::channel();
+        let stdout = host.stdout.take().unwrap();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some(json) = line.strip_prefix("@cranvr ").and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok()) {
+                    lines.send(json).ok();
+                }
+            }
+        });
+        let cleanup_dir = dir.clone();
+        let finish = |host: &mut std::process::Child| {
+            hub().disconnect();
+            host.kill().ok();
+            host.wait().ok();
+            std::fs::remove_dir_all(&cleanup_dir).ok();
+        };
+
+        // The search: the Mac answers on its LAN address. A query to this machine would give loopback.
+        let found = (0..5)
+            .find_map(|_| {
+                find(broadcast_targets(DEFAULT_PORT), Duration::from_secs(1))
+                    .unwrap()
+                    .into_iter()
+                    .find(|host| host.answer.port == PORT && !host.address.is_loopback())
+            })
+            .expect("a host on port 9962 answers the search from a network address of this Mac");
+        assert!(!found.answer.name.is_empty());
+        assert_eq!(found.answer.versions, cranvr_proto::message::VersionRange::OURS);
+
+        // The press
+        hub().connect(found.socket_addr().to_string(), Some(found.answer.fingerprint), MediaChoice::Auto);
+        let wait_for = |what: &str, done: &mut dyn FnMut() -> bool| {
+            for _ in 0..400 {
+                if done() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            panic!("{what} did not happen: {:?}", hub().snapshot().state);
+        };
+        let mut shown = String::new();
+        wait_for("the wait for the Mac", &mut || match hub().snapshot().state {
+            LinkState::Waiting { code, .. } => {
+                shown = code;
+                true
+            }
+            _ => false,
+        });
+        // The host lists the same code with the headset's key
+        let request = loop {
+            let line = status.recv_timeout(Duration::from_secs(10)).expect("a status line");
+            if let Some(request) = line["pending"].as_array().and_then(|list| list.first()).cloned() {
+                break request;
+            }
+        };
+        assert_eq!(request["code"].as_str(), Some(shown.as_str()), "the host and the headset show one code");
+        assert_eq!(request["key"].as_str().map(str::len), Some(64));
+
+        // The user presses Allow
+        let key = request["key"].as_str().unwrap().to_owned();
+        writeln!(host.stdin.as_mut().unwrap(), "allow {key}").unwrap();
+        wait_for("the stream", &mut || hub().snapshot().state == LinkState::Streaming);
+        let mut best = 0.0f32;
+        wait_for("frames", &mut || {
+            best = best.max(hub().snapshot().stats.received_fps);
+            best > 10.0
+        });
+        println!("frames received: {best:.1} a second");
+        finish(&mut host);
     }
 }

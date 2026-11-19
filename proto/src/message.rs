@@ -6,7 +6,11 @@
 //! 2. The key exchange of [`crate::secure`]: three flights. They prove the keys of both sides and
 //!    give both the keys of the session. Everything below is sealed.
 //! 3. The client sends [`ClientMsg::Hello`] with its capabilities.
-//! 4. The host answers [`HostMsg::Welcome`] with its choices, or [`HostMsg::Reject`].
+//! 4. The host answers [`HostMsg::Welcome`] with its choices, or [`HostMsg::Reject`]. A host that
+//!    does not know the client (version 5) first sends [`HostMsg::AwaitApproval`]. The client
+//!    answers [`ClientMsg::PairNonce`], the host sends [`HostMsg::PairReveal`], and both show the
+//!    approval code. The host's user compares the codes and allows or denies the client. Then the
+//!    host sends the `Welcome` or `Reject(Denied)`.
 //! 5. With UDP media, the client repeats [`ClientDatagram::Hello`] until the host answers
 //!    [`HostMsg::MediaReady`] over TCP. The datagram tells the host the client's UDP address.
 //!    With TCP media the host sends `MediaReady` at once.
@@ -35,6 +39,12 @@ impl VersionRange {
     pub fn common(self, other: VersionRange) -> Option<u16> {
         let high = self.max.min(other.max);
         (high >= self.min.max(other.min)).then_some(high)
+    }
+
+    /// Whether the other side's newest version is older than this side's. When two sides cannot
+    /// talk, the older one must update.
+    pub fn peer_is_older(self, other: VersionRange) -> bool {
+        other.max < self.max
     }
 }
 
@@ -168,14 +178,28 @@ pub struct Welcome {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RejectReason {
-    /// The host does not know the client's key. The client shows its pairing code.
+    /// The host does not know the client's key. A client of version 4 shows its pairing code. A
+    /// client of version 5 never sees this: the host holds it and asks its user.
     NotPaired,
-    /// Another headset is connected
+    /// Another headset is connected, or another headset waits for the host's user
     Busy,
     NoCommonCodec,
     NoCommonRefreshRate,
     Other(String),
+    /// The host's user pressed Deny
+    Denied,
+    /// The host's user did not answer in time
+    NoAnswer,
 }
+
+/// How long a host holds a connection for its user's answer. A client waits a little longer.
+pub const APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// What a client tells its user when the host's cranvr is older than its own: the user updates the
+/// Mac. The words are the same in every place that says it.
+pub const UPDATE_MAC: &str = "Update cranvr on the Mac.";
+/// What a host tells its user when the headset's cranvr app is older.
+pub const UPDATE_HEADSET: &str = "Update the cranvr app on the headset.";
 
 /// Control messages from the client to the host.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -204,6 +228,10 @@ pub enum ClientMsg {
     /// "fps": 90}`). The host hands it to the cranvr app as a `vr_request` status line. A host
     /// that does not know the message skips it.
     Console(String),
+    /// The client's half of the approval code (see [`crate::secure::approval_code`]): a random
+    /// number that it sends after it saw the host's [`HostMsg::AwaitApproval`]. A host of version
+    /// 4 does not know the message.
+    PairNonce([u8; 32]),
 }
 
 /// A change of the origin of the poses that the client sends. Every pose with a display time at or
@@ -242,6 +270,16 @@ pub enum HostMsg {
     /// client connects and again when it changes, at most once a second. A client that does not
     /// know the message skips it.
     Menu(String),
+    /// The host does not know this client. It holds the connection until its user allows or denies
+    /// the client. `commit` is the hash of a random number that the host keeps secret until the
+    /// client answered with [`ClientMsg::PairNonce`]. The host then sends the number in
+    /// [`HostMsg::PairReveal`], and both sides compute the approval code from both numbers. A
+    /// client that is in the middle of two connections cannot make the two codes equal: it has
+    /// to fix its number on one connection before it sees the number of the other. The message
+    /// comes with protocol version 5.
+    AwaitApproval { host_name: String, commit: [u8; 32] },
+    /// The number that `commit` hides
+    PairReveal([u8; 32]),
 }
 
 /// Datagram messages from the client to the host.

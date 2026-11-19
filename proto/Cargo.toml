@@ -10,7 +10,7 @@ cranvr-common.workspace = true
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 reed-solomon-simd = "3"
-socket2 = "0.6"
+socket2 = { version = "0.6", features = ["all"] }
 # Both sides sign their half of the handshake with a key that they generated
 ed25519-dalek = "3"
 sha2 = "0.11"
