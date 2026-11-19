@@ -12,6 +12,17 @@
 
 `scripts/release-app.sh --skip-notarize` signs and packs without Apple's check. macOS then refuses the app on other Macs. The build on this Mac keeps its "Apple Development" signature from `scripts/bundle-app.sh`, because macOS keeps Screen Recording and Accessibility per signature: a switch of signatures asks for both again.
 
+## Game support
+
+The Mac app downloads Wine, DXMT and the OpenXR runtime as one archive from the public repository samoylenkodmitry/cranvr-game-support, in its newest release. A change of a runtime or DXMT patch needs a new release, or the apps of other people keep the old runtime.
+
+1. Set a new date in `scripts/game-support-version.txt` (`YYYY.MM.DD`, with `.2` after it for a second release on one day).
+2. Run `scripts/build-basaltvr.sh`, then `scripts/package-game-support.sh`. The archive and its `.sha256` land in `target/game-support`.
+3. Publish both files, with these names, as a release tagged `v` plus the version: `gh release create v2026.11.19 target/game-support/cranvr-game-support-macos.tar.xz target/game-support/cranvr-game-support-macos.tar.xz.sha256 --repo samoylenkodmitry/cranvr-game-support --title "Game support 2026-11-19" --notes-file NOTES.md`. The notes say in plain words what changed.
+4. Build the Mac app with the same version file. Its Play tab then offers "Update game support" to every Mac whose stamp in `wine/game-support-version.txt` is older.
+
+Do step 3 before the app with the new version file reaches anyone. An app that expects a version that no release carries offers the update again after each install.
+
 ## The headset app in the Meta Horizon Store
 
 The store needs the owner's Meta developer account. These steps are the owner's.
