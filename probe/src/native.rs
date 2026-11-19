@@ -1,10 +1,10 @@
-//! The probe as a client of cranvr's own protocol (`--protocol native`). It behaves like a
+//! The probe as a client of cranvr's protocol. It behaves like a
 //! headset app:
 //! - connects to the host, agrees on a stream and sends synthetic tracking once per refresh;
 //! - receives the media, restores lost packets with the parity and decodes with VideoToolbox;
 //! - reports to the host what a real headset reports: the decode end and the display time of each
 //!   frame. It also reports the loss that it saw;
-//! - checks the eye badges that the host draws, as the ALVR probe does.
+//! - checks the eye badges that the host draws, as by the eye badges of the host's scene.
 //!
 //! The display is simulated. It refreshes on a fixed grid of the stream's rate. A decoded frame
 //! gets the first refresh after its decode. The display times in the report lie on that grid. The
@@ -169,7 +169,7 @@ fn caps(tcp: bool) -> ClientCaps {
 /// Runs the probe and returns its exit code: 0 when at least half of the expected frames arrived
 /// and decoded with the right badges.
 pub fn run(o: Options) -> i32 {
-    println!("probe: waiting for the host at {} (run cranvr-host --protocol native)", o.connect);
+    println!("probe: waiting for the host at {} (run cranvr-host)", o.connect);
     let started = Instant::now();
     // The probe runs on this Mac or against a host that trusts every client, so its key needs no
     // pairing

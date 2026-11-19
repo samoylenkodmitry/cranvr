@@ -1,11 +1,11 @@
-//! The controllers that the probe's tracking script plays (`cranvr-probe --protocol native`, see
+//! The controllers that the probe's tracking script plays (`cranvr-probe`, see
 //! `native.rs`) and that `cranvr-fake-game` looks for at the game. Both files take the numbers from
 //! here, so the script and the check cannot drift apart.
 //!
 //! Each controller has a grip pose and an aim pose. The two hands differ in every number, so a swap
 //! of the hands or of grip and aim changes what the game sees. The poses are in the probe's room.
 
-use alvr_common::glam::{Quat, Vec3};
+use glam::{Quat, Vec3};
 use cranvr_proto::wire::{Motion, Pose};
 
 /// Where the left grip pose stays

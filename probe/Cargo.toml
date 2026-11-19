@@ -1,22 +1,12 @@
 [package]
 name = "cranvr-probe"
-description = "A headless ALVR client that connects to the host, decodes the stream and checks it"
+description = "A test client of cranvr's protocol on this Mac: it connects to the host, decodes the stream and checks it"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-alvr_common.workspace = true
-alvr_packets.workspace = true
-alvr_session.workspace = true
-alvr_client_core.workspace = true
 cranvr-common.workspace = true
-
-[target.'cfg(target_os = "macos")'.dependencies]
 cranvr-vt.workspace = true
 cranvr-proto.workspace = true
-
-[target.'cfg(target_os = "android")'.dependencies]
-alvr_graphics = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
-glow = "0.16"
-ndk = { version = "0.9", features = ["api-level-26"] }
+glam.workspace = true

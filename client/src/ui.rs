@@ -847,9 +847,10 @@ fn loss_text(stats: &Stats) -> String {
 fn latency_text(stats: &Stats) -> String {
     let ms = |value: Option<f32>| value.map_or("-".to_string(), |v| format!("{v:.1}"));
     format!(
-        "round trip {} ms, network {} ms, pose to decode {} ms",
+        "round trip {} ms, network {} ms, pose to decode {} ms, pose to display {} ms",
         ms(stats.rtt_ms),
         ms(stats.network_ms),
-        ms(stats.sample_to_decode_ms)
+        ms(stats.sample_to_decode_ms),
+        ms(stats.sample_to_display_ms)
     )
 }

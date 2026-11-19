@@ -137,8 +137,8 @@ fn input_changes_name_the_buttons_that_moved() {
     assert_eq!(changes.len(), 3);
     let id = |hand: usize, i: usize| hand_ids(hand).clicks[i].1;
     assert!(changes.iter().any(|b| b.path_id == id(1, 0) && !b.scalar && b.value == 1.0));
-    assert!(changes.iter().any(|b| b.path_id == *RIGHT_THUMBSTICK_CLICK_ID && b.value == 1.0));
-    assert!(changes.iter().any(|b| b.path_id == *RIGHT_TRIGGER_VALUE_ID && b.scalar && b.value == 0.75));
+    assert!(changes.iter().any(|b| b.path_id == RIGHT_THUMBSTICK_CLICK_ID && b.value == 1.0));
+    assert!(changes.iter().any(|b| b.path_id == RIGHT_TRIGGER_VALUE_ID && b.scalar && b.value == 0.75));
     input.hands[1].buttons = 0;
     let changes = state.changes(&input);
     assert_eq!(changes.len(), 2);
@@ -210,10 +210,10 @@ fn a_native_client_connects_and_the_host_serves_it() {
     let client = ClientLink::connect(([127, 0, 0, 1], port).into(), &caps("Test headset"), &identity(), None, Duration::from_secs(10)).unwrap();
     let client = Arc::new(client);
 
-    let Event::Connected { stream: Some(stream), ip } = wait_for(&mut *events, |e| matches!(e, Event::Connected { .. })) else { unreachable!() };
+    let Event::Connected { stream, ip } = wait_for(&mut *events, |e| matches!(e, Event::Connected { .. })) else { unreachable!() };
     assert_eq!((stream.eye_width, stream.eye_height, stream.fps), (2064, 2208, 120.0));
     assert!(stream.foveated && stream.codec == Codec::Hevc);
-    assert_eq!(ip, Some([127, 0, 0, 1].into()));
+    assert_eq!(ip, std::net::IpAddr::from([127, 0, 0, 1]));
     let Event::Views(views) = wait_for(&mut *events, |e| matches!(e, Event::Views(_))) else { unreachable!() };
     assert!((views.fov[0].left + 0.9).abs() < 1e-6);
 
@@ -309,8 +309,8 @@ fn a_native_client_connects_and_the_host_serves_it() {
             sample_ns: sample,
             idr: true,
             eye_poses: [
-                AlvrPose { orientation: Quat::from_rotation_y(0.5), position: Vec3::new(0.468, 1.6, -0.25) },
-                AlvrPose { orientation: Quat::from_rotation_y(0.5), position: Vec3::new(0.532, 1.6, -0.25) },
+                RoomPose { orientation: Quat::from_rotation_y(0.5), position: Vec3::new(0.468, 1.6, -0.25) },
+                RoomPose { orientation: Quat::from_rotation_y(0.5), position: Vec3::new(0.532, 1.6, -0.25) },
             ],
             slices: vec![FrameSlice { rect: [0, 0, 2432, 1152], data: data.clone() }],
         });
@@ -367,8 +367,8 @@ fn a_native_client_connects_and_the_host_serves_it() {
             idr: false,
             // The scene's eyes 2.0 m above the floor are 1.6 m above the room's origin
             eye_poses: [
-                AlvrPose { orientation: Quat::IDENTITY, position: Vec3::new(0.468, 2.0, -0.25) },
-                AlvrPose { orientation: Quat::IDENTITY, position: Vec3::new(0.532, 2.0, -0.25) },
+                RoomPose { orientation: Quat::IDENTITY, position: Vec3::new(0.468, 2.0, -0.25) },
+                RoomPose { orientation: Quat::IDENTITY, position: Vec3::new(0.532, 2.0, -0.25) },
             ],
             slices: vec![FrameSlice { rect: [0, 0, 2432, 1152], data: data.clone() }],
         });

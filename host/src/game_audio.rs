@@ -1,12 +1,11 @@
 //! The game sound in the headset. ScreenCaptureKit captures what this Mac plays, from every app
-//! but the host. The host converts it to ALVR's format, interleaved 16-bit stereo at 48 kHz, and
-//! the server core sends it as ALVR's game audio.
+//! but the host. The host converts it to interleaved 16-bit stereo at 48 kHz and hands it to the
+//! headset link (`headset/native/audio.rs`).
 //!
 //! The capture takes the sound before the Mac's volume, so the Mac can stay muted while the
 //! headset plays it. It needs Screen Recording, as the desktop view does.
 
 use crate::screen_capture::{self, SendBox};
-use alvr_server_core::{send_game_audio, GAME_AUDIO_SAMPLE_RATE};
 use dispatch2::DispatchQueue;
 use objc2::{define_class, msg_send, rc::Retained, runtime::ProtocolObject, AllocAnyThread};
 use objc2_core_media::{CMSampleBuffer, CMTime, CMTimeFlags};
@@ -14,22 +13,11 @@ use objc2_foundation::{NSArray, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{SCContentFilter, SCStream, SCStreamConfiguration, SCStreamOutput, SCStreamOutputType};
 use std::{
     ffi::c_void,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        OnceLock,
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 
-/// Where the sound goes instead of ALVR's server core: the native protocol's sender
-static SINK: OnceLock<fn(&[u8])> = OnceLock::new();
-
-/// Sends the captured sound to `sink` from now on, not to ALVR's server core. The native protocol
-/// takes it, because it runs no ALVR core.
-pub fn set_sink(sink: fn(&[u8])) {
-    SINK.set(sink).ok();
-}
-
 const CHANNELS: usize = 2;
+const SAMPLE_RATE: u32 = cranvr_proto::message::AudioFormat::HOST_CAPTURE.sample_rate;
 
 // Stereo frames captured since the last `take_counts`. Buffers that the host could not read.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
@@ -38,7 +26,7 @@ static UNREADABLE: AtomicU64 = AtomicU64::new(0);
 /// Seconds of sound captured and buffers in a format the host cannot read, since the last call.
 pub fn take_counts() -> (f64, u64) {
     let frames = FRAMES.swap(0, Ordering::Relaxed);
-    (frames as f64 / GAME_AUDIO_SAMPLE_RATE as f64, UNREADABLE.swap(0, Ordering::Relaxed))
+    (frames as f64 / SAMPLE_RATE as f64, UNREADABLE.swap(0, Ordering::Relaxed))
 }
 
 #[repr(C)]
@@ -112,10 +100,7 @@ define_class!(
                 match unsafe { convert(sample as *const CMSampleBuffer as *const c_void) } {
                     Some(samples) => {
                         FRAMES.fetch_add((samples.len() / CHANNELS / 2) as u64, Ordering::Relaxed);
-                        match SINK.get() {
-                            Some(sink) => sink(&samples),
-                            None => send_game_audio(samples),
-                        }
+                        crate::headset::native::audio::send(&samples);
                     }
                     None => {
                         UNREADABLE.fetch_add(1, Ordering::Relaxed);
@@ -235,7 +220,7 @@ impl Capture {
         let config = unsafe { SCStreamConfiguration::new() };
         unsafe {
             config.setCapturesAudio(true);
-            config.setSampleRate(GAME_AUDIO_SAMPLE_RATE as isize);
+            config.setSampleRate(SAMPLE_RATE as isize);
             config.setChannelCount(CHANNELS as isize);
             config.setExcludesCurrentProcessAudio(true);
             // The stream also captures the display. The smallest picture once per second costs

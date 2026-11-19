@@ -1,7 +1,6 @@
 //! The Mac's sound for the native client. `game_audio.rs` captures what this Mac plays with
-//! ScreenCaptureKit and converts it to interleaved 16-bit stereo at 48 kHz. In ALVR mode the server
-//! core sends it. In native mode `send` below cuts it into datagrams of `FRAMES_PER_DATAGRAM`
-//! stereo frames, 5 ms each. The client plays them (`client/src/audio.rs`).
+//! ScreenCaptureKit and converts it to interleaved 16-bit stereo at 48 kHz. `send` below cuts it into
+//! datagrams of `FRAMES_PER_DATAGRAM` stereo frames, 5 ms each. The client plays them (`client/src/audio.rs`).
 //!
 //! The sound goes out as plain PCM. Opus would cut 1.54 Mbps to about 0.1 Mbps. The stream's
 //! video takes 40 to 100 Mbps, so the PCM costs about 1.5% on top of it. PCM adds no encode or
@@ -12,7 +11,7 @@
 //! datagrams of one buffer therefore leave together. The client's jitter buffer absorbs it.
 
 use super::Session;
-use alvr_common::info;
+use log::info;
 use cranvr_proto::{
     clock::now_ns,
     message::{Audio, HostDatagram, MAX_AUDIO_BYTES},

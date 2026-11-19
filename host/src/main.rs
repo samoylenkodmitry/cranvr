@@ -1,8 +1,7 @@
-//! cranvr-host: streams to a Quest, through the stock ALVR client (v20.14.1) or through cranvr's
-//! own protocol (see headset.rs). It shows a game when the BasaltVR OpenXR runtime inside Wine
-//! connects (see runtime_link.rs). Without a game it shows a head-tracked test scene.
+//! cranvr-host: streams to a headset through cranvr's own protocol (see headset.rs). It shows a
+//! game when the BasaltVR OpenXR runtime inside Wine connects (see runtime_link.rs). Without a
+//! game it shows a head-tracked test scene.
 
-mod compat;
 mod desktop;
 mod desktop_layer;
 mod display_modes;
@@ -10,10 +9,11 @@ mod eye_check;
 mod game_audio;
 mod game_sizes;
 mod headset;
-mod latency;
+mod logger;
 mod network;
 mod pacer;
 mod pairing;
+mod pose;
 mod pose_gaps;
 mod render;
 mod runtime_link;
@@ -22,12 +22,15 @@ mod session;
 mod status;
 mod virtual_display;
 
-use alvr_common::{error, info, warn, RIGHT_THUMBSTICK_CLICK_ID, RIGHT_THUMBSTICK_Y_ID, RIGHT_TRIGGER_VALUE_ID};
-use alvr_filesystem::Layout;
-use cranvr_common::foveation::{Foveation, FoveationConfig};
+use cranvr_common::{
+    foveation::{Foveation, FoveationConfig},
+    inputs::{RIGHT_THUMBSTICK_CLICK_ID, RIGHT_THUMBSTICK_Y_ID, RIGHT_TRIGGER_VALUE_ID},
+};
 use cranvr_proto::{message::HostWishes, wire::Codec};
 use cranvr_vt::{EncodedFrame, Encoder, EncoderConfig, PixelBuffer};
-use headset::{Device, Event, FrameSlice, Headset, OutFrame, Protocol};
+use headset::{Device, Event, FrameSlice, Headset, OutFrame};
+use log::{error, info, warn};
+use pose::Pose;
 use render::{ComposeParams, Params, Renderer};
 use runtime_link::{GameEvent, GameFrame, RuntimeLink, Swapchains};
 use serde_json::json;
@@ -53,10 +56,8 @@ struct Shared {
     views: Mutex<Views>,
     force_idr: AtomicBool,
     inputs: Mutex<Inputs>,
-    /// The desktop as a layer in cranvr's Quest app (desktop_layer.rs)
+    /// What the frame loop and the headset's desktop panel share (desktop_layer.rs)
     layer: Arc<desktop_layer::LayerState>,
-    /// The display the desktop view captures; 0 before the capture starts
-    desktop_display: std::sync::atomic::AtomicU32,
 }
 
 /// Controller inputs the desktop uses.
@@ -84,7 +85,7 @@ struct DesktopOptions {
     /// The screen goes where the headset looks, tilt included: for tests with a headset that
     /// lies still
     screen_in_view: bool,
-    /// cranvr's Quest app may show the desktop as a compositor layer (desktop_layer.rs)
+    /// The headset shows the desktop as a panel of its own (headset/native/desktop.rs)
     layer: bool,
     /// The virtual display becomes the main display while a headset is connected
     vr_main: bool,
@@ -111,54 +112,44 @@ impl Default for Views {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: cranvr-host [--protocol native|alvr, default alvr] [--native-port PORT] [--fps 72|80|90|120, default 120] [--eye-width PIXELS] [--mbps N] [--trust HOSTNAME]... [--trust-all] [--pair CODE] [--discovery-port N] [--no-display-lock] [--client-ip IP]... [--tcp] [--no-foveation] [--buffering-frames N] [--game-scale F] [--decoder-low-latency] [--strict-rate-control] [--no-game-audio] [--desktop] [--desktop-fps N] [--virtual-display WxH] [--vr-main-display] [--pointer-pitch DEG] [--screen-in-view] [--no-desktop-layer] [--config-dir DIR] [--status]\n\
-         \n  --protocol P      how the headset's app talks to the host: alvr (the stock ALVR client,\
-         \n                    the default) or native (cranvr's own protocol and client). The\
-         \n                    native mode sends the Mac's sound as PCM and, with --desktop, the\
-         \n                    desktop as a second video stream for the client's desktop panel.\
-         \n  --native-port N   with --protocol native: the TCP port to listen on (default 9950)\
-         \n  --trust HOSTNAME  accept this ALVR client (the hostname shows in the client's lobby)\
-         \n  --trust-all       accept any client on the network, ALVR or native (for tests)\
-         \n  --pair CODE       with --protocol native: pair a headset with the older cranvr app, which\
-         \n                    shows a code of six digits when the host does not know it. A newer\
-         \n                    app waits instead: the cranvr app on this Mac shows Allow and Deny. With\
-         \n                    --status you may type `allow KEY` or `deny KEY` into the host's input\
-         \n                    (the status line gives the key). The host remembers the headset in\
+        "usage: cranvr-host [--protocol native] [--native-port PORT] [--fps 72|80|90|120, default 120] [--eye-width PIXELS] [--mbps N] [--trust-all] [--pair CODE] [--discovery-port N] [--no-display-lock] [--tcp] [--no-foveation] [--game-scale F] [--strict-rate-control] [--no-game-audio] [--desktop] [--desktop-fps N] [--virtual-display WxH] [--vr-main-display] [--pointer-pitch DEG] [--screen-in-view] [--no-desktop-layer] [--config-dir DIR] [--status]\n\
+         \n  --protocol native the headset protocol; cranvr's own is the only one. The option stays so\
+         \n                    that older command lines work.\
+         \n  --native-port N   the TCP port to listen on (default 9950)\
+         \n  --trust-all       accept any client on the network without a pairing (for tests)\
+         \n  --pair CODE       pair a headset of the older cranvr app, which shows a code of six\
+         \n                    digits when the host does not know it. A newer app waits instead: the\
+         \n                    cranvr app on this Mac shows Allow and Deny. With --status you may\
+         \n                    type `allow KEY` or `deny KEY` into the host's input (the status line\
+         \n                    gives the key). The host remembers the headset in\
          \n                    paired-headsets.txt. It has a key of its own in host-identity.txt:\
          \n                    keep it, or the paired headsets refuse the host.\
-         \n  --discovery-port N  with --protocol native: the UDP port that answers the headsets'\
-         \n                    search for this Mac (default 9950; 0 turns it off)\
-         \n  --no-display-lock with --protocol native: render at the arrival of each pose, not at a\
-         \n                    time that follows the headset's display (for comparison)\
-         \n  --client-ip IP    connect to a client at this address; 127.0.0.1 with `adb forward` of\
-         \n                    TCP 9943 and 9944 reaches a client on a phone (needs --tcp)\
-         \n  --tcp             stream over TCP instead of UDP (needed when the client runs on this Mac)\
+         \n  --discovery-port N  the UDP port that answers the headsets' search for this Mac\
+         \n                    (default 9950; 0 turns it off)\
+         \n  --no-display-lock render at the arrival of each pose, not at a time that follows the\
+         \n                    headset's display (for comparison)\
+         \n  --tcp             send the media over TCP to every headset instead of UDP\
          \n  --no-foveation    encode every pixel at full density (needs a smaller eye size)\
-         \n  --buffering-frames N  frames the headset may hold before it decodes (default 2; less\
-         \n                    is less latency and more stutter on a busy network)\
          \n  --game-scale F    a game renders each eye at this share of the stream's eye size\
          \n                    (0.3 to 1, default 0.7; foveated encoding sends about a third of\
          \n                    the pixels anyway)\
-         \n  --decoder-low-latency  ask the headset's decoder for its low-latency mode (Quest 3)\
          \n  --strict-rate-control  VideoToolbox's low-latency rate control: even frame sizes, one\
          \n                    frame at a time; slower per frame on an M5 (6.1 ms against 3.6 to 5.0)\
          \n  --no-game-audio   do not send this Mac's sound to the headset (it needs Screen Recording)\
          \n  --keep-display-modes  keep the Mac's displays in their modes while a game runs (by\
          \n                    default a scaled display gets its panel's own pixels: less GPU time)\
-         \n  --desktop         show the Mac's main display on a screen in VR while no game runs; the\
-         \n                    right controller moves the mouse, the trigger clicks, the thumbstick\
-         \n                    scrolls, a thumbstick click puts the screen in front of you again\
+         \n  --desktop         show the Mac's main display as a panel in the headset while no game\
+         \n                    runs; the right controller moves the mouse, the trigger clicks, the\
+         \n                    thumbstick scrolls\
          \n  --desktop-fps N   desktop captures per second (default 30; 60 costs more GPU time)\
          \n  --virtual-display WxH  with --desktop: a display of W x H points (HiDPI) for the headset\
-         \n                    alone, such as 1920x1080; the desktop view shows it\
+         \n                    alone, such as 1920x1080; the desktop panel shows it\
          \n  --vr-main-display with --virtual-display: it is the main display while a headset is\
          \n                    connected, so the menu bar, the Dock and new windows open in VR\
          \n  --pointer-pitch DEG  tilt of the pointing ray below the controller handle (default -40)\
-         \n  --screen-in-view  put the screen where the headset looks, tilt included: for tests with a\
-         \n                    headset that lies on a desk\
-         \n  --no-desktop-layer keep the desktop in the eye stream, also for cranvr's Quest app, which\
-         \n                    otherwise shows it as a sharper compositor layer. With --protocol native\
-         \n                    it stops the desktop panel.\
+         \n  --screen-in-view  put the eye stream's screen where the headset looks, tilt included: for\
+         \n                    tests with a headset that lies on a desk\
+         \n  --no-desktop-layer do not show the desktop as a panel in the headset\
          \n\nEnvironment: CRANVR_POINTER_DRY_RUN=1 logs the mouse events that a controller would make\
          \nand posts none (for tests with a controller on a desk).\
          \n  --status          print status lines (@cranvr JSON) on stdout, for the cranvr app\
@@ -170,24 +161,19 @@ fn usage() -> ! {
 
 fn parse_args() -> (Options, DesktopOptions, PathBuf) {
     let mut options = Options {
-        protocol: Protocol::Alvr,
         native_port: 9950,
         fps: 120.0,
         eye_width: 0,
         eye_width_unfoveated: 0,
         eye_width_given: false,
         mbps: 100,
-        trust: vec![],
         trust_all: false,
         pair_code: None,
         discovery_port: Some(cranvr_proto::discovery::DEFAULT_PORT),
         display_lock: true,
-        client_ips: vec![],
         tcp: false,
         foveation: true,
-        buffering_frames: 2.0,
         game_scale: 0.7,
-        decoder_low_latency: false,
         strict_rate: false,
         game_audio: true,
         unscale_displays: true,
@@ -212,17 +198,15 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
         let mut value = || args.next().unwrap_or_else(|| usage());
         match arg.as_str() {
             "--protocol" => {
-                options.protocol = match value().as_str() {
-                    "native" => Protocol::Native,
-                    "alvr" => Protocol::Alvr,
-                    _ => usage(),
+                if value() != "native" {
+                    eprintln!("--protocol takes native: cranvr's own protocol is the only one");
+                    usage()
                 }
             }
             "--native-port" => options.native_port = value().parse().unwrap_or_else(|_| usage()),
             "--fps" => options.fps = value().parse().unwrap_or_else(|_| usage()),
             "--eye-width" => options.eye_width = value().parse().unwrap_or_else(|_| usage()),
             "--mbps" => options.mbps = value().parse().unwrap_or_else(|_| usage()),
-            "--trust" => options.trust.push(value()),
             "--trust-all" => options.trust_all = true,
             "--discovery-port" => {
                 // 0 turns discovery off
@@ -235,14 +219,11 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
                 }))
             }
             "--no-display-lock" => options.display_lock = false,
-            "--client-ip" => options.client_ips.push(value().parse().unwrap_or_else(|_| usage())),
             "--tcp" => options.tcp = true,
             "--no-foveation" => options.foveation = false,
-            "--buffering-frames" => options.buffering_frames = value().parse().unwrap_or_else(|_| usage()),
             "--game-scale" => {
                 options.game_scale = value().parse::<f32>().ok().filter(|s| (0.3..=1.0).contains(s)).unwrap_or_else(|| usage())
             }
-            "--decoder-low-latency" => options.decoder_low_latency = true,
             "--strict-rate-control" => options.strict_rate = true,
             "--no-game-audio" => options.game_audio = false,
             "--keep-display-modes" => options.unscale_displays = false,
@@ -272,7 +253,7 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
 fn default_eye_width(foveation: bool, fps: u32) -> u32 {
     // With strict rate control an M5 encoded about a megapixel in 2 ms (3200x1696 in 10.5 ms,
     // 2496x1312 in 6.9 ms), and these sizes come from that; the overlapping encoder is faster
-    // (2432x1152 in 3.5 ms). With ALVR's default foveation a Quest 3 eye (2064 wide) encodes
+    // (2432x1152 in 3.5 ms). With the default foveation a Quest 3 eye (2064 wide) encodes
     // as about 1216x1152. A client without foveation that got an eye of 2064 wide saw frames of
     // 4128 by 2162 pixels. They took 10.5 ms each to encode. A Quest 3 showed green blocks in
     // part of the picture. Its decoder advertises HEVC level 6.2, so the cause is not known.
@@ -340,9 +321,6 @@ fn native_config(
     config_dir: &std::path::Path,
     desktop: headset::native::desktop::Options,
 ) -> headset::native::Config {
-    if !options.trust.is_empty() {
-        warn!("--trust does not count for the native protocol: the headset asks the user of this Mac to allow it");
-    }
     headset::native::Config {
         port: options.native_port,
         identity: pairing::host_identity(config_dir),
@@ -358,7 +336,7 @@ fn native_config(
         tcp_media: options.tcp,
         wishes: HostWishes {
             // A foveated eye takes the size that the headset asks for: its recommended size, within
-            // its decoder's limits. The ALVR protocol keeps the host's own choice.
+            // its decoder's limits.
             eye_width: if options.eye_width_given || !options.foveation { options.eye_width } else { 0 },
             eye_width_unfoveated: options.eye_width_unfoveated,
             refresh_hz: options.fps,
@@ -374,36 +352,18 @@ fn native_config(
 fn main() {
     raise_file_limit();
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some("--display-helper") {
-        virtual_display::helper_main(&args[2..]);
-    }
     if args.get(1).map(String::as_str) == Some("--unscale-displays") {
         display_modes::helper_main();
     }
     let (options, mut desktop, config_dir) = parse_args();
     std::fs::create_dir_all(&config_dir).expect("config dir");
     status::set_menu_file(config_dir.join("vr-menu.json"));
-    let layout = Layout::new(&config_dir);
-    let alvr = options.protocol == Protocol::Alvr;
-    if alvr {
-        session::prepare(&layout, &options);
-        alvr_server_core::initialize_environment(layout.clone());
-    }
-    // The logger comes from ALVR's server core. It opens no socket and reads no session file.
-    alvr_server_core::init_logging(None, Some(layout.crash_log()));
-    // The native protocol sends the sound itself (headset/native/audio.rs)
-    if !alvr {
-        game_audio::set_sink(headset::native::audio::send);
-    }
+    logger::init(&config_dir.join("crash_log.txt"));
     if options.game_audio {
         start_game_audio();
     }
-    // The native client shows the desktop as a panel (headset/native/desktop.rs), not as the old
-    // Quest app's layer
+    // The headset shows the desktop as a panel (headset/native/desktop.rs)
     let desktop_panel = desktop.enabled && desktop.layer;
-    if !alvr {
-        desktop.layer = false;
-    }
     let layer: Arc<desktop_layer::LayerState> = Arc::default();
     info!(
         "cranvr-host: {} Hz, {} px per eye, {} Mbps, config in {}",
@@ -432,28 +392,24 @@ fn main() {
         }
     }
 
-    let (headset, mut events) = match options.protocol {
-        Protocol::Alvr => headset::alvr::start(layout.session()),
-        Protocol::Native => {
-            let panel = headset::native::desktop::Options {
-                enabled: desktop_panel,
-                display_id: desktop.display_id,
-                layer: Arc::clone(&layer),
-                mbps: headset::native::desktop::MBPS,
-            };
-            let config = native_config(&options, &config_dir, panel);
-            // The cranvr app sends the user's answers to the headsets' requests on the host's input.
-            // A host without --status leaves its input alone: a background job that reads its
-            // terminal would stop.
-            if status::enabled() {
-                headset::native::read_answers(Arc::clone(&config.pairings));
-            }
-            headset::native::start(config)
+    let (headset, mut events) = {
+        let panel = headset::native::desktop::Options {
+            enabled: desktop_panel,
+            display_id: desktop.display_id,
+            layer: Arc::clone(&layer),
+            mbps: headset::native::desktop::MBPS,
+        };
+        let config = native_config(&options, &config_dir, panel);
+        // The cranvr app sends the user's answers to the headsets' requests on the host's input.
+        // A host without --status leaves its input alone: a background job that reads its
+        // terminal would stop.
+        if status::enabled() {
+            headset::native::read_answers(Arc::clone(&config.pairings));
         }
-        .unwrap_or_else(|e| {
+        headset::native::start(config).unwrap_or_else(|e| {
             error!("Native protocol: cannot listen on port {}: {e}", options.native_port);
             std::process::exit(1)
-        }),
+        })
     };
     let shared = Arc::new(Shared {
         stream: Mutex::new(None),
@@ -462,7 +418,6 @@ fn main() {
         force_idr: AtomicBool::new(true),
         inputs: Mutex::new(Inputs::default()),
         layer,
-        desktop_display: std::sync::atomic::AtomicU32::new(0),
     });
 
     let (link, game_events) = {
@@ -484,7 +439,6 @@ fn main() {
     }
 
     let mut watch = network::StreamWatch::default();
-    let mut layer_stop = Arc::new(AtomicBool::new(false));
     // The console in the headset gets the menu when it connects and when it changes
     let mut console = ConsoleMenu::default();
     loop {
@@ -498,38 +452,30 @@ fn main() {
             Event::Connected { stream: negotiated, ip: client_ip } => {
                 watch.connected();
                 console.connected();
-                layer_stop.store(true, Ordering::Relaxed);
-                layer_stop = Arc::new(AtomicBool::new(false));
-                let display = shared.desktop_display.load(Ordering::Relaxed);
-                if let (true, Some(ip), true) = (desktop.enabled && desktop.layer, client_ip, display != 0) {
-                    desktop_layer::start(ip, display, Arc::clone(&shared.layer), Arc::clone(&layer_stop));
-                }
-                info!("Headset address: {}", client_ip.map_or("unknown".into(), |ip| ip.to_string()));
-                if let Some(problem) = client_ip.and_then(network::check_route) {
+                info!("Headset address: {client_ip}");
+                if let Some(problem) = network::check_route(client_ip) {
                     warn!("{}", problem["message"].as_str().unwrap_or_default());
                     status::emit(problem);
                 }
-                match &negotiated {
-                    Some(n) if n.codec == Codec::Hevc => info!("Headset connected: {n:?}"),
-                    Some(n) => error!("Headset connected with codec {:?}, but this host only encodes HEVC", n.codec),
-                    None => error!("Headset connected, but session.json has no stream config"),
+                if negotiated.codec == Codec::Hevc {
+                    info!("Headset connected: {negotiated:?}");
+                } else {
+                    error!("Headset connected with codec {:?}, but this host only encodes HEVC", negotiated.codec);
                 }
-                if let Some(n) = &negotiated {
-                    // `ip` tells the app which way the stream travels: loopback is the USB cable
-                    status::emit(json!({"type": "headset", "connected": true, "eye": [n.eye_width, n.eye_height], "fps": n.fps, "foveated": n.foveated, "ip": client_ip.map(|ip| ip.to_string())}));
-                    // games that start from now on render at the stream's eye size
-                    let scaled = |v: u32| (v as f32 * options.game_scale).round() as u32;
-                    if let Err(e) = link.write_control_file((scaled(n.eye_width), scaled(n.eye_height)), n.fps.round() as u32) {
-                        warn!("Game runtime control file: {e}");
-                    }
+                let n = &negotiated;
+                // `ip` tells the app which way the stream travels: loopback is the USB cable
+                status::emit(json!({"type": "headset", "connected": true, "eye": [n.eye_width, n.eye_height], "fps": n.fps, "foveated": n.foveated, "ip": client_ip.to_string()}));
+                // games that start from now on render at the stream's eye size
+                let scaled = |v: u32| (v as f32 * options.game_scale).round() as u32;
+                if let Err(e) = link.write_control_file((scaled(n.eye_width), scaled(n.eye_height)), n.fps.round() as u32) {
+                    warn!("Game runtime control file: {e}");
                 }
-                *shared.stream.lock().unwrap() = negotiated.filter(|n| n.codec == Codec::Hevc);
+                *shared.stream.lock().unwrap() = Some(negotiated).filter(|n| n.codec == Codec::Hevc);
                 shared.force_idr.store(true, Ordering::Relaxed);
             }
             Event::Disconnected => {
                 info!("Headset disconnected");
                 console.disconnected();
-                layer_stop.store(true, Ordering::Relaxed);
                 if let Some(display) = virtual_display.as_mut().filter(|d| d.is_main()) {
                     match display.restore() {
                         Ok(()) => status::emit(json!({"type": "vr_display", "main": false, "display": display.id})),
@@ -603,11 +549,11 @@ fn main() {
                 let mut inputs = shared.inputs.lock().unwrap();
                 for button in buttons {
                     let value = button.value;
-                    if button.path_id == *RIGHT_TRIGGER_VALUE_ID {
+                    if button.path_id == RIGHT_TRIGGER_VALUE_ID {
                         inputs.right_trigger = value;
-                    } else if button.path_id == *RIGHT_THUMBSTICK_Y_ID {
+                    } else if button.path_id == RIGHT_THUMBSTICK_Y_ID {
                         inputs.right_stick_y = value;
-                    } else if button.path_id == *RIGHT_THUMBSTICK_CLICK_ID && value > 0.5 {
+                    } else if button.path_id == RIGHT_THUMBSTICK_CLICK_ID && value > 0.5 {
                         inputs.recenter = true;
                     }
                     link.button(button.path_id, button.scalar, value);
@@ -623,11 +569,6 @@ fn main() {
             // The headset's new origin makes the old screen place wrong: put the screen in front
             // of the user again, as a click of the right thumbstick does
             Event::Recenter => shared.inputs.lock().unwrap().recenter = true,
-            Event::Stop => {
-                info!("The headset link asked the host to stop");
-                break;
-            }
-            Event::Other => {}
         }
     }
 }
@@ -695,7 +636,7 @@ fn encode_loop(jobs: mpsc::Receiver<EncodeJob>) {
 /// What the headset needs to show a frame, besides the encoder's output.
 struct FrameNote {
     sample: u64,
-    eye_poses: [alvr_common::Pose; 2],
+    eye_poses: [Pose; 2],
     /// The encoded frame's size
     rect: [u32; 4],
     /// The plan that the frame followed
@@ -879,7 +820,6 @@ fn frame_loop(
         .and_then(|c| c.map_err(|e| error!("Desktop: {e}")).ok());
     match &capture {
         Some(c) => {
-            shared.desktop_display.store(c.display_id, Ordering::Relaxed);
             let is_virtual = desktop_options.display_id == Some(c.display_id);
             info!("Desktop: capturing display {} (aspect {:.2}, virtual: {is_virtual})", c.display_id, c.aspect);
             let message = if is_virtual { "the virtual display".to_string() } else { format!("display {}", c.display_id) };

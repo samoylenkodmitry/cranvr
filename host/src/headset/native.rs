@@ -26,18 +26,9 @@ use crate::{
     session::Negotiated,
     status,
 };
-use alvr_common::{
-    debug, error,
-    glam::{Quat, Vec3},
-    info, warn, DeviceMotion, Fov as AlvrFov, Pose as AlvrPose, LEFT_MENU_CLICK_ID, LEFT_SQUEEZE_CLICK_ID, LEFT_SQUEEZE_VALUE_ID,
-    LEFT_THUMBREST_TOUCH_ID, LEFT_THUMBSTICK_CLICK_ID, LEFT_THUMBSTICK_TOUCH_ID, LEFT_THUMBSTICK_X_ID, LEFT_THUMBSTICK_Y_ID,
-    LEFT_TRIGGER_CLICK_ID, LEFT_TRIGGER_TOUCH_ID, LEFT_TRIGGER_VALUE_ID, LEFT_X_CLICK_ID, LEFT_X_TOUCH_ID, LEFT_Y_CLICK_ID,
-    LEFT_Y_TOUCH_ID, RIGHT_A_CLICK_ID, RIGHT_A_TOUCH_ID, RIGHT_B_CLICK_ID, RIGHT_B_TOUCH_ID, RIGHT_MENU_CLICK_ID,
-    RIGHT_SQUEEZE_CLICK_ID, RIGHT_SQUEEZE_VALUE_ID, RIGHT_THUMBREST_TOUCH_ID, RIGHT_THUMBSTICK_CLICK_ID,
-    RIGHT_THUMBSTICK_TOUCH_ID, RIGHT_THUMBSTICK_X_ID, RIGHT_THUMBSTICK_Y_ID, RIGHT_TRIGGER_CLICK_ID, RIGHT_TRIGGER_TOUCH_ID,
-    RIGHT_TRIGGER_VALUE_ID,
-};
-use alvr_server_core::ViewsConfig;
+use crate::pose::{DeviceMotion, Fov as ViewFov, Pose as RoomPose, Quat, Vec3, ViewsConfig};
+use cranvr_common::inputs::*;
+use log::{debug, error, info, warn};
 use cranvr_common::foveation::FoveationConfig;
 use cranvr_proto::{
     clock::{now_ns, ClockSync},
@@ -489,7 +480,7 @@ fn run_session(shared: &Shared, session: &Arc<Session>, stream: cranvr_proto::me
         foveated: stream.foveation.is_some(),
         foveation: stream.foveation.map(FoveationConfig::from).unwrap_or_default(),
     };
-    shared.emit(Event::Connected { stream: Some(negotiated), ip: Some(peer.ip()) });
+    shared.emit(Event::Connected { stream: negotiated, ip: peer.ip() });
     shared.emit(Event::Views(views_config(&views)));
     if let Some(config) = shared.decoder_config.lock().unwrap().clone() {
         session.send_decoder_config(config);
@@ -604,8 +595,8 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
 }
 
 fn views_config(views: &ProtoViews) -> ViewsConfig {
-    let pose = |p: &ProtoPose| AlvrPose { orientation: Quat::from_array(p.orientation), position: Vec3::from_array(p.position) };
-    let fov = |f: &cranvr_proto::wire::Fov| AlvrFov { left: f.left, right: f.right, up: f.up, down: f.down };
+    let pose = |p: &ProtoPose| RoomPose { orientation: Quat::from_array(p.orientation), position: Vec3::from_array(p.position) };
+    let fov = |f: &cranvr_proto::wire::Fov| ViewFov { left: f.left, right: f.right, up: f.up, down: f.down };
     ViewsConfig {
         local_view_transforms: [pose(&views.eye_pose[0]), pose(&views.eye_pose[1])],
         fov: [fov(&views.fov[0]), fov(&views.fov[1])],
@@ -614,7 +605,7 @@ fn views_config(views: &ProtoViews) -> ViewsConfig {
 
 /// The pose in the headset's room: the host's scene put the room up by `floor` (see `device_motion`),
 /// so the pose goes down again.
-fn proto_pose(p: &AlvrPose, floor: f32) -> ProtoPose {
+fn proto_pose(p: &RoomPose, floor: f32) -> ProtoPose {
     let [x, y, z] = p.position.to_array();
     ProtoPose { orientation: p.orientation.to_array(), position: [x, y + floor, z] }
 }
@@ -658,7 +649,7 @@ fn device_of(t: &Tracking, device: Device, pose: HandPose) -> Option<Motion> {
 /// adds no offset to them.
 fn device_motion(motion: Motion, floor: f32) -> DeviceMotion {
     DeviceMotion {
-        pose: AlvrPose {
+        pose: RoomPose {
             orientation: Quat::from_array(motion.pose.orientation),
             position: Vec3::from_array(motion.pose.position) - Vec3::new(0.0, floor, 0.0),
         },
@@ -691,7 +682,7 @@ struct InputState {
     last: Option<Input>,
 }
 
-/// The ALVR path ids of one hand: binary inputs by bit, then the analog inputs.
+/// The path ids of one hand: binary inputs by bit, then the analog inputs.
 struct HandIds {
     /// For each click: its bit in `HandInput::buttons` and its id
     clicks: [(u32, u64); 6],
@@ -707,44 +698,44 @@ fn hand_ids(hand: usize) -> HandIds {
     if hand == 0 {
         HandIds {
             clicks: [
-                (PRIMARY, *LEFT_X_CLICK_ID),
-                (SECONDARY, *LEFT_Y_CLICK_ID),
-                (MENU, *LEFT_MENU_CLICK_ID),
-                (STICK_CLICK, *LEFT_THUMBSTICK_CLICK_ID),
-                (TRIGGER_CLICK, *LEFT_TRIGGER_CLICK_ID),
-                (GRIP_CLICK, *LEFT_SQUEEZE_CLICK_ID),
+                (PRIMARY, LEFT_X_CLICK_ID),
+                (SECONDARY, LEFT_Y_CLICK_ID),
+                (MENU, LEFT_MENU_CLICK_ID),
+                (STICK_CLICK, LEFT_THUMBSTICK_CLICK_ID),
+                (TRIGGER_CLICK, LEFT_TRIGGER_CLICK_ID),
+                (GRIP_CLICK, LEFT_SQUEEZE_CLICK_ID),
             ],
             touches: [
-                (PRIMARY, *LEFT_X_TOUCH_ID),
-                (SECONDARY, *LEFT_Y_TOUCH_ID),
-                (STICK_CLICK, *LEFT_THUMBSTICK_TOUCH_ID),
-                (TRIGGER_CLICK, *LEFT_TRIGGER_TOUCH_ID),
-                (THUMB_REST, *LEFT_THUMBREST_TOUCH_ID),
+                (PRIMARY, LEFT_X_TOUCH_ID),
+                (SECONDARY, LEFT_Y_TOUCH_ID),
+                (STICK_CLICK, LEFT_THUMBSTICK_TOUCH_ID),
+                (TRIGGER_CLICK, LEFT_TRIGGER_TOUCH_ID),
+                (THUMB_REST, LEFT_THUMBREST_TOUCH_ID),
             ],
-            trigger: *LEFT_TRIGGER_VALUE_ID,
-            grip: *LEFT_SQUEEZE_VALUE_ID,
-            stick: [*LEFT_THUMBSTICK_X_ID, *LEFT_THUMBSTICK_Y_ID],
+            trigger: LEFT_TRIGGER_VALUE_ID,
+            grip: LEFT_SQUEEZE_VALUE_ID,
+            stick: [LEFT_THUMBSTICK_X_ID, LEFT_THUMBSTICK_Y_ID],
         }
     } else {
         HandIds {
             clicks: [
-                (PRIMARY, *RIGHT_A_CLICK_ID),
-                (SECONDARY, *RIGHT_B_CLICK_ID),
-                (MENU, *RIGHT_MENU_CLICK_ID),
-                (STICK_CLICK, *RIGHT_THUMBSTICK_CLICK_ID),
-                (TRIGGER_CLICK, *RIGHT_TRIGGER_CLICK_ID),
-                (GRIP_CLICK, *RIGHT_SQUEEZE_CLICK_ID),
+                (PRIMARY, RIGHT_A_CLICK_ID),
+                (SECONDARY, RIGHT_B_CLICK_ID),
+                (MENU, RIGHT_MENU_CLICK_ID),
+                (STICK_CLICK, RIGHT_THUMBSTICK_CLICK_ID),
+                (TRIGGER_CLICK, RIGHT_TRIGGER_CLICK_ID),
+                (GRIP_CLICK, RIGHT_SQUEEZE_CLICK_ID),
             ],
             touches: [
-                (PRIMARY, *RIGHT_A_TOUCH_ID),
-                (SECONDARY, *RIGHT_B_TOUCH_ID),
-                (STICK_CLICK, *RIGHT_THUMBSTICK_TOUCH_ID),
-                (TRIGGER_CLICK, *RIGHT_TRIGGER_TOUCH_ID),
-                (THUMB_REST, *RIGHT_THUMBREST_TOUCH_ID),
+                (PRIMARY, RIGHT_A_TOUCH_ID),
+                (SECONDARY, RIGHT_B_TOUCH_ID),
+                (STICK_CLICK, RIGHT_THUMBSTICK_TOUCH_ID),
+                (TRIGGER_CLICK, RIGHT_TRIGGER_TOUCH_ID),
+                (THUMB_REST, RIGHT_THUMBREST_TOUCH_ID),
             ],
-            trigger: *RIGHT_TRIGGER_VALUE_ID,
-            grip: *RIGHT_SQUEEZE_VALUE_ID,
-            stick: [*RIGHT_THUMBSTICK_X_ID, *RIGHT_THUMBSTICK_Y_ID],
+            trigger: RIGHT_TRIGGER_VALUE_ID,
+            grip: RIGHT_SQUEEZE_VALUE_ID,
+            stick: [RIGHT_THUMBSTICK_X_ID, RIGHT_THUMBSTICK_Y_ID],
         }
     }
 }
@@ -820,6 +811,9 @@ struct Stats {
     network: f64,
     network_frames: u32,
     decode: f64,
+    /// From the end of the decode to the take by the headset's frame loop, ms
+    decode_queue: f64,
+    /// From the take to the display time of the headset frame that shows the frame, ms
     vsync_wait: f64,
     sent_bytes: u64,
     sent_frames: u32,
@@ -956,7 +950,8 @@ impl Session {
         stats.frames += 1;
         stats.total += ms(t.display_time.saturating_sub(t.tracking_sample));
         stats.decode += ms(t.decode_end.saturating_sub(t.received));
-        stats.vsync_wait += ms(t.display_time.saturating_sub(t.decode_end));
+        stats.decode_queue += ms(t.picked.saturating_sub(t.decode_end));
+        stats.vsync_wait += ms(t.display_time.saturating_sub(t.picked));
         if let Some(sent) = sent_on_client {
             stats.pose_to_send += ms(sent.saturating_sub(t.tracking_sample));
             stats.network += ms(t.received.saturating_sub(sent));
@@ -1189,6 +1184,7 @@ impl Headset for Native {
             "pose_to_send_ms": stats.pose_to_send / stats.network_frames.max(1) as f64,
             "network_ms": stats.network / stats.network_frames.max(1) as f64,
             "decode_ms": stats.decode / n,
+            "decode_queue_ms": stats.decode_queue / n,
             "vsync_wait_ms": stats.vsync_wait / n,
             "rtt_ms": rtt_ms,
             "loss_pct": loss_pct,

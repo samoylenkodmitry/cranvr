@@ -20,7 +20,7 @@
 //! key is refused afterwards. Keep the file. A host without it gets a new key. The paired headsets
 //! then refuse it until their user forgets the old one.
 
-use alvr_common::{info, warn};
+use log::{info, warn};
 use cranvr_proto::{
     discovery::clean_name,
     identity::{format_code, from_hex, pairing_code, to_hex, Identity, KEY_LEN},

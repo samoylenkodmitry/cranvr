@@ -9,7 +9,7 @@
 #              tablet, with no OpenXR. The screen shows the picture and the motion sensors are the
 #              head. It has the application id dev.cranvr.client2.phone, so it installs beside the
 #              headset's APK.
-#   --install  installs the APK with adb, beside the ALVR app
+#   --install  installs the APK with adb
 #
 # Environment:
 #   ANDROID_HOME      the Android SDK (default ~/Library/Android/sdk)

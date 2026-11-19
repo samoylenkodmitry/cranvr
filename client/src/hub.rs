@@ -103,6 +103,9 @@ pub struct Stats {
     pub network_ms: Option<f32>,
     /// The tracking sample to the end of the decode, averaged
     pub sample_to_decode_ms: Option<f32>,
+    /// The tracking sample to the display time of the headset frame that shows the frame,
+    /// averaged. The streamed scene gives the display time when it takes the frame.
+    pub sample_to_display_ms: Option<f32>,
     pub haptic_pulses: u64,
     /// What the streamed scene did with the decoded frames, per second: frames that it showed,
     /// frames that it never showed. The last is headset frames that showed the last picture again
@@ -157,6 +160,7 @@ impl Default for Stats {
             rtt_ms: None,
             network_ms: None,
             sample_to_decode_ms: None,
+            sample_to_display_ms: None,
             haptic_pulses: 0,
             shown_fps: 0.0,
             skipped_fps: 0.0,
@@ -781,7 +785,7 @@ impl StreamLayout {
 
 /// The views of a frame from the render poses that the host sent with it. The two eyes lie side by
 /// side in the picture. A foveated picture has the host's compressed layout. The right eye is
-/// mirrored, as ALVR stores it. `fov` is the field of view of the full view that the host rendered.
+/// mirrored, as the foveated layout stores it. `fov` is the field of view of the full view that the host rendered.
 /// The poses are in the headset's room. The target display time comes later (see `views_of`).
 pub fn streamed_views(eye_poses: &[Pose; 2], fov: &[Fov; 2], layout: &StreamLayout) -> StreamedViews {
     let [width, height] = layout.eye_picture();

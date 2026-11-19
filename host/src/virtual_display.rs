@@ -82,10 +82,6 @@ impl Drop for DisplayMode {
 }
 
 const CONFIGURE_FOR_APP_ONLY: u32 = 0;
-/// An arrangement that outlives the process. A helper's arrangement must: macOS undoes an
-/// arrangement for the app only when the app ends, and while it removes the helper's display it
-/// mirrored the main display onto it, at the virtual display's size.
-const CONFIGURE_FOR_SESSION: u32 = 1;
 
 /// The display's modes, in pixels. With HiDPI macOS also offers each one at half the size in
 /// points, so 3840 x 2160 can look like 1920 x 1080 with sharp text.
@@ -292,118 +288,5 @@ fn apply(origins: &[(u32, i32, i32)], unmirror: bool, modes: &[(u32, *const c_vo
             0 => Ok(()),
             e => Err(format!("macOS refused the display arrangement ({e})")),
         }
-    }
-}
-
-
-/// A virtual display in a helper process: `cranvr-host --display-helper W H SERIAL`.
-///
-/// A process sees the displays as they were when it first asked, and macOS does not update that
-/// view in the host, whose main thread runs no event loop. The host's second display then failed
-/// to arrange, and macOS mirrored the main display onto it at the virtual display's size. A new
-/// process sees the current displays, so each added display gets its own. The display lives as
-/// long as the helper: dropping this ends the helper, and macOS removes the display at once.
-pub struct DisplayProcess {
-    child: std::process::Child,
-    pub id: u32,
-}
-
-impl DisplayProcess {
-    pub fn start(width: u32, height: u32, serial: u32) -> Result<Self, String> {
-        use std::{
-            io::{BufRead, BufReader},
-            process::{Command, Stdio},
-        };
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let mut child = Command::new(exe)
-            .args(["--display-helper", &width.to_string(), &height.to_string(), &serial.to_string()])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("no display helper: {e}"))?;
-        let stdout = child.stdout.take().ok_or("the display helper has no output")?;
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut line = String::new();
-            BufReader::new(stdout).read_line(&mut line).ok();
-            sender.send(line).ok();
-        });
-        let line = receiver.recv_timeout(std::time::Duration::from_secs(10)).unwrap_or_default();
-        match line.trim().strip_prefix("display ").and_then(|id| id.parse().ok()) {
-            Some(id) => Ok(Self { child, id }),
-            None => {
-                child.kill().ok();
-                child.wait().ok();
-                Err(line.trim().strip_prefix("error ").unwrap_or("the display helper did not answer").to_string())
-            }
-        }
-    }
-
-    /// The display's size in points and in pixels, as macOS set it up.
-    pub fn describe(&self) -> String {
-        let bounds = unsafe { CGDisplayBounds(self.id) };
-        format!("{} x {} points at ({}, {})", bounds.size.x, bounds.size.y, bounds.origin.x, bounds.origin.y)
-    }
-}
-
-impl Drop for DisplayProcess {
-    fn drop(&mut self) {
-        self.child.kill().ok();
-        self.child.wait().ok();
-    }
-}
-
-/// The helper's side: makes the display, says its number on stdout and keeps it until stdin
-/// closes, as when the host ends.
-pub fn helper_main(args: &[String]) -> ! {
-    use std::io::{Read, Write};
-    let number = |i: usize| args.get(i).and_then(|a| a.parse::<u32>().ok());
-    let (Some(width), Some(height), Some(serial)) = (number(0), number(1), number(2)) else {
-        println!("error usage: --display-helper WIDTH HEIGHT SERIAL");
-        std::process::exit(2);
-    };
-    match VirtualDisplay::create_numbered(width, height, 60.0, serial, CONFIGURE_FOR_SESSION) {
-        Ok(display) => {
-            println!("display {}", display.id);
-            std::io::stdout().flush().ok();
-            let mut rest = Vec::new();
-            std::io::stdin().read_to_end(&mut rest).ok();
-            drop(display);
-            std::process::exit(0)
-        }
-        Err(e) => {
-            println!("error {e}");
-            std::process::exit(1)
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Adds a display to this Mac for a moment: run it by hand. The host asks for the bounds of a
-    /// display made by a helper after the host's own first look at the displays.
-    #[test]
-    #[ignore]
-    fn the_host_sees_a_display_made_by_a_helper() {
-        let before = active_displays();
-        // The test binary is not cranvr-host: the helper is the release build of the host
-        let host = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/release/cranvr-host");
-        let mut child = std::process::Command::new(host)
-            .args(["--display-helper", "1920", "1080", "402"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut line = String::new();
-        std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.take().unwrap()), &mut line).unwrap();
-        let id: u32 = line.trim().strip_prefix("display ").unwrap().parse().unwrap();
-        let bounds = unsafe { CGDisplayBounds(id) };
-        child.kill().ok();
-        child.wait().ok();
-        assert!(!before.contains(&id));
-        assert_eq!((bounds.size.x, bounds.size.y), (1920.0, 1080.0));
     }
 }

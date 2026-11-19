@@ -52,8 +52,6 @@ cat > "${app}/Contents/Info.plist" <<EOF
     <key>NSHighResolutionCapable</key><true/>
     <key>NSLocalNetworkUsageDescription</key>
     <string>cranvr finds your headset on the local network and streams to it.</string>
-    <key>NSBonjourServices</key>
-    <array><string>_alvr._tcp</string></array>
 </dict>
 </plist>
 EOF

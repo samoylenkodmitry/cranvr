@@ -71,9 +71,8 @@ def main():
     report["stats"] = lines
     steady = lines[1:] or lines
     report["steady_fps"] = round(statistics.median(line["fps"] for line in steady), 2) if steady else 0.0
-    # The client may drop frames that the host sent: its own rate counts too. ALVR's client fps
-    # comes from the gaps between shown frames and stays near the target while frames drop, so
-    # the probe's count of shown frames decides where it exists.
+    # The client may drop frames that the host sent: its own rate counts too. The probe's count
+    # of shown frames decides where it exists.
     client_fps = report["summary"].get("latency.client_fps", {}).get("median")
     if "received" in report and "shown" in report:
         received, shown = int(report["received"]), int(report["shown"])

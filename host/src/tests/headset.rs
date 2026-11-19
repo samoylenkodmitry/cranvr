@@ -1,8 +1,5 @@
 use super::eye_poses;
-use alvr_common::{
-    glam::{Quat, Vec3},
-    Pose,
-};
+use crate::pose::{Pose, Quat, Vec3};
 use std::f32::consts::FRAC_PI_2;
 
 fn close(a: Vec3, b: Vec3) -> bool {

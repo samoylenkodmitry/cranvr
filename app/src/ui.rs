@@ -1,5 +1,5 @@
 use crate::{
-    backend::{self, HeadsetApp, Model, Settings, StreamPath, StreamProtocol},
+    backend::{self, Model, Settings, StreamPath},
     black_eye,
     launch::{self, GameOptions},
     setup::{self, Progress, Setup},
@@ -122,7 +122,7 @@ fn change(settings: MutableState<Settings>, model: MutableState<Model>, edit: im
     let s = settings.with(Clone::clone);
     s.save();
     if backend::host_running() {
-        let result = backend::start_host(&s, model.with(|m| m.tcp_fallback), None);
+        let result = backend::start_host(&s, None);
         model.update(|m| m.message = result.err());
     }
 }
@@ -135,7 +135,7 @@ fn start_host(settings: MutableState<Settings>, model: MutableState<Model>, pair
         m.network.clear();
         m.audio = None;
     });
-    let result = backend::start_host(&settings.with(Clone::clone), model.with(|m| m.tcp_fallback), pair_code);
+    let result = backend::start_host(&settings.with(Clone::clone), pair_code);
     model.update(|m| {
         m.running = result.is_ok();
         m.message = result.err();
@@ -159,29 +159,12 @@ fn connection_of(settings: MutableState<Settings>) -> Connection {
 fn refresh(settings: MutableState<Settings>, model: MutableState<Model>, slow: bool) {
     let mut next = model.with(Clone::clone);
     backend::pump(&mut next);
-    // The cable counts for the cranvr client only: the ALVR client does not use it
     usb::set_choice(connection_of(settings));
     next.usb = usb::status();
     let requests = std::mem::take(&mut next.vr_requests);
     vr_requests(settings, &mut next, requests);
     let reports = std::mem::take(&mut next.black_eyes);
     black_eye_reports(settings, &mut next, reports);
-    // In Auto mode the stream moves to TCP once, when the host finds that UDP data does not
-    // arrive. A problem over TCP stays on screen: switching back would only repeat the first one.
-    // The cranvr client picks its media path itself.
-    if std::mem::take(&mut next.udp_blocked)
-        && !next.tcp_fallback
-        && settings.with(|s| s.headset_app == HeadsetApp::Alvr && s.stream_protocol == StreamProtocol::Auto)
-    {
-        next.tcp_fallback = true;
-        next.network.push(
-            "cranvr switched the stream to TCP. TCP gets through such a VPN; UDP has less delay on a clean network."
-                .into(),
-        );
-        if let Err(e) = backend::start_host(&settings.with(Clone::clone), true, None) {
-            next.message = Some(e);
-        }
-    }
     // A headset that asks to connect has a user who may not look at the Mac: the window comes up
     let waiting = |m: &Model| m.native.iter().flat_map(|n| n.pending.iter().map(|r| r.key.clone())).collect::<Vec<_>>();
     let known = model.with(|m| waiting(m));
@@ -191,7 +174,6 @@ fn refresh(settings: MutableState<Settings>, model: MutableState<Model>, slow: b
     // A finished setup changed what the Play tab shows: read the state now, not in 2 s
     let setup_ended = model.with(|m| m.setup.as_ref().is_some_and(Setup::running)) && !next.setup.as_ref().is_some_and(Setup::running);
     if slow || setup_ended {
-        next.clients = backend::read_clients();
         next.lan = system::lan_addresses();
         next.permissions = PERMISSIONS.map(Permission::granted);
         next.steam = steam::state();
@@ -281,18 +263,15 @@ fn vr_requests(settings: MutableState<Settings>, next: &mut Model, requests: Vec
                 if let Some(samples) = request["msaa"].as_u64() {
                     after.game_msaa_limit = samples as u32;
                 }
-                if let Some(on) = request["low_latency"].as_bool() {
-                    after.low_latency = on;
-                }
                 if after == before {
                     continue;
                 }
                 after.save();
                 settings.set(after.clone());
                 // The anti-aliasing limit applies at a game's start; the rest are the host's options
-                let host_options = |s: &Settings| (s.fps, s.game_scale.to_bits(), s.low_latency);
+                let host_options = |s: &Settings| (s.fps, s.game_scale.to_bits());
                 if host_options(&before) != host_options(&after) && backend::host_running() {
-                    if let Err(e) = backend::start_host(&after, next.tcp_fallback, None) {
+                    if let Err(e) = backend::start_host(&after, None) {
                         next.message = Some(e);
                     }
                 }
@@ -439,7 +418,6 @@ fn PairingCard(model: MutableState<Model>) {
 #[composable]
 fn HeadsetCard(settings: MutableState<Settings>, model: MutableState<Model>) {
     Card(move || {
-        let native = settings.with(|s| s.headset_app == HeadsetApp::Cranvr);
         match model.with(|m| m.headset.clone()) {
             Some(h) => {
                 Text(
@@ -477,11 +455,7 @@ fn HeadsetCard(settings: MutableState<Settings>, model: MutableState<Model>) {
             }
             None => {
                 Label("No headset connected".into());
-                if native {
-                    NativeConnect(settings, model);
-                } else {
-                    Hint("On the Quest, open the ALVR app (version 20.14, from the Meta store). Use the same Wi-Fi as this Mac, on 5 GHz.".into());
-                }
+                NativeConnect(settings, model);
             }
         }
         if let Some((false, why)) = model.with(|m| m.audio.clone()) {
@@ -489,29 +463,6 @@ fn HeadsetCard(settings: MutableState<Settings>, model: MutableState<Model>) {
         }
         for note in model.with(|m| m.network.clone()) {
             Text(note, Modifier::empty(), colored(230, 180, 90));
-        }
-        // The list comes from ALVR's session file: the cranvr client does not use it
-        let clients = if native { vec![] } else { model.with(|m| m.clients.clone()) };
-        for client in clients {
-            let paired = client.trusted || settings.with(|s| s.trusted.contains(&client.hostname));
-            let name = client.hostname.clone();
-            FlowRow(Modifier::empty(), flow(), move || {
-                Text(name.clone(), Modifier::empty().padding(8.0), TextStyle::default());
-                if paired {
-                    Text("paired".to_string(), Modifier::empty().padding(8.0), dim_style());
-                } else {
-                    let name = name.clone();
-                    Primary(format!("Pair with {name}"), move || {
-                        let name = name.clone();
-                        change(settings, model, move |s| {
-                            if !s.trusted.contains(&name) {
-                                s.trusted.push(name);
-                            }
-                        });
-                        ensure_host(settings, model);
-                    });
-                }
-            });
         }
     });
 }
@@ -998,31 +949,10 @@ fn DesktopTab(settings: MutableState<Settings>, model: MutableState<Model>) {
 fn SettingsTab(settings: MutableState<Settings>, model: MutableState<Model>) {
     let s = settings.with(Clone::clone);
     let s1 = s.clone();
-    let native = s.headset_app == HeadsetApp::Cranvr;
     // The way of the stream comes first: the cable is the choice that a user looks for
     ConnectionCard(settings, model);
     Card(move || {
         Heading("Stream".into());
-        let headset_app = s1.headset_app;
-        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-            Text("Headset app".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
-            for (label, choice) in [("cranvr client", HeadsetApp::Cranvr), ("ALVR client", HeadsetApp::Alvr)] {
-                Choice(label.into(), headset_app == choice, move || {
-                    model.update(|m| {
-                        m.tcp_fallback = false;
-                        m.network.clear();
-                        m.native = None;
-                    });
-                    change(settings, model, |s| s.headset_app = choice);
-                });
-            }
-        });
-        Hint(if native {
-            "The cranvr client is cranvr's own app on the headset. The host speaks cranvr's protocol. A new headset asks you to allow it once. The Network choice, Low latency and trusted names count for the ALVR client only, so they are hidden."
-        } else {
-            "The ALVR client is the ALVR app from the Meta store. Choose the cranvr client to use cranvr's own app on the headset."
-        }
-        .into());
         let current_fps = s1.fps;
         FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
             Text("Refresh rate".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
@@ -1037,22 +967,6 @@ fn SettingsTab(settings: MutableState<Settings>, model: MutableState<Model>) {
                 Choice(format!("{mbps} Mbps"), current_mbps == mbps, move || change(settings, model, |s| s.mbps = mbps));
             }
         });
-        if !native {
-            let protocol = s1.stream_protocol;
-            FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-                Text("Network".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
-                for (label, choice) in [("Auto", StreamProtocol::Auto), ("UDP", StreamProtocol::Udp), ("TCP", StreamProtocol::Tcp)] {
-                    Choice(label.into(), protocol == choice, move || {
-                        model.update(|m| {
-                            m.tcp_fallback = false;
-                            m.network.clear();
-                        });
-                        change(settings, model, |s| s.stream_protocol = choice);
-                    });
-                }
-            });
-            Hint("Auto streams over UDP and moves to TCP when UDP data does not reach this Mac, as with a VPN on the headset.".into());
-        }
         let (foveation, autostart) = (s1.foveation, s1.autostart);
         FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
             Choice("Foveated encoding".into(), foveation, move || change(settings, model, |s| s.foveation = !s.foveation));
@@ -1079,13 +993,6 @@ fn SettingsTab(settings: MutableState<Settings>, model: MutableState<Model>) {
             }
         });
         Hint("A game that makes fewer frames than the refresh rate adds 10 to 18 ms of latency. The Log tab then names the game's rate. A smaller size or lower anti-aliasing in the game helps.".into());
-        if !native {
-            let low_latency = s1.low_latency;
-            FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-                Choice("Low latency".into(), low_latency, move || change(settings, model, |s| s.low_latency = !s.low_latency));
-            });
-            Hint("The headset keeps one decoded frame instead of two. This saved about 4 ms in a test. A weak Wi-Fi may then stutter.".into());
-        }
         let msaa = s1.game_msaa_limit;
         FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
             Text("Game anti-aliasing".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
@@ -1117,40 +1024,20 @@ fn SettingsTab(settings: MutableState<Settings>, model: MutableState<Model>) {
         Hint("A game that stays below the refresh rate for a minute renders smaller at its next start, as a share of the size above. A game reads its size only when it starts.".into());
         Hint("Changes restart the host; the headset reconnects by itself.".into());
     });
-    if native {
-        let paired = model.with(|m| m.native.as_ref().map(|n| n.paired.clone()));
-        Card(move || {
-            Heading("Paired headsets".into());
-            match &paired {
-                None => Hint("The host tells which headsets are paired while it runs.".into()),
-                Some(names) if names.is_empty() => {
-                    Hint("None yet. Open the cranvr app on the headset. This window then asks you to allow it.".into())
-                }
-                Some(names) => {
-                    for name in names {
-                        Text(name.clone(), Modifier::empty().padding(8.0), TextStyle::default());
-                    }
-                    Hint(format!("Delete the line of a headset from paired-headsets.txt in {} and restart the host to forget it.", backend::config_dir().display()));
-                }
-            }
-        });
-        return;
-    }
-    let trusted = s.trusted.clone();
+    let paired = model.with(|m| m.native.as_ref().map(|n| n.paired.clone()));
     Card(move || {
         Heading("Paired headsets".into());
-        if trusted.is_empty() {
-            Hint("None yet. A headset that opens ALVR shows up at the top with a Pair button.".into());
-        }
-        for name in trusted.clone() {
-            FlowRow(Modifier::empty(), flow(), move || {
-                Text(name.clone(), Modifier::empty().padding(8.0), TextStyle::default());
-                let name = name.clone();
-                Action("Forget".into(), move || {
-                    let name = name.clone();
-                    change(settings, model, move |s| s.trusted.retain(|t| *t != name));
-                });
-            });
+        match &paired {
+            None => Hint("The host tells which headsets are paired while it runs.".into()),
+            Some(names) if names.is_empty() => {
+                Hint("None yet. Open the cranvr app on the headset. This window then asks you to allow it.".into())
+            }
+            Some(names) => {
+                for name in names {
+                    Text(name.clone(), Modifier::empty().padding(8.0), TextStyle::default());
+                }
+                Hint(format!("Delete the line of a headset from paired-headsets.txt in {} and restart the host to forget it.", backend::config_dir().display()));
+            }
         }
     });
 }

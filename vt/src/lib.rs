@@ -1,4 +1,4 @@
-//! HEVC encode and decode with VideoToolbox, in the form ALVR wants: Annex-B frames, with the
+//! HEVC encode and decode with VideoToolbox, in the form of the stream: Annex-B frames, with the
 //! VPS, SPS and PPS of each IDR frame returned apart from the frame data.
 
 pub mod ffi;
@@ -280,7 +280,7 @@ impl Encoder {
             encoder.set(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue).ok();
             encoder.set(kVTCompressionPropertyKey_MaximizePowerEfficiency, kCFBooleanFalse).ok();
             encoder.set_number(kVTCompressionPropertyKey_ExpectedFrameRate, config.fps as f64)?;
-            // ALVR asks for an IDR frame when it needs one; a long interval avoids bitrate spikes
+            // The host asks for an IDR frame when a client needs one; a long interval avoids bitrate spikes
             encoder.set_number(kVTCompressionPropertyKey_MaxKeyFrameInterval, (config.fps * 10.0) as f64)?;
             encoder.set_bitrate(config.bitrate_bps);
             VTCompressionSessionPrepareToEncodeFrames(session);
@@ -313,7 +313,7 @@ impl Encoder {
             CFRelease(n);
             // Without strict rate control the average alone did not hold: at an 8 Mbps target the
             // encoder sent 12 to 16 Mbps. A hard limit per window makes it follow the target,
-            // which ALVR lowers when the network falls behind.
+            // which the host can lower when the network falls behind.
             if !self.strict_rate {
                 let limits: Vec<CFNumberRef> = RATE_WINDOWS
                     .iter()

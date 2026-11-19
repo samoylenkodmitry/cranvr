@@ -7,8 +7,8 @@ CONNECTIVITY_DUMP is the output of `adb shell dumpsys connectivity`. The script 
 warning per line, or nothing:
 
 - a VPN on the device routes the Mac's address. The device's own UDP then goes through the
-  tunnel; with a Tailscale subnet route the subnet router changes its sender address, and ALVR
-  drops every stream packet;
+  tunnel; with a Tailscale subnet route the subnet router changes its sender address, and the
+  stream may not arrive;
 - the device uses 2.4 GHz Wi-Fi;
 - the Wi-Fi link is slow.
 """

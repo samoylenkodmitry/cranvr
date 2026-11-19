@@ -36,9 +36,14 @@ pub fn remember_host(host: &str) {
     }
 }
 
-/// What shows behind the panels while no game runs, as the console's Room setting saved it. A
-/// missing or unknown value gives the passthrough.
+/// What shows behind the panels while no game runs. The launch argument `room` (`scene` or
+/// `passthrough`) decides for one launch and saves nothing: a test that wants the host's picture on
+/// display uses it. Without it the console's Room setting counts, as it saved it. A missing or
+/// unknown value gives the passthrough.
 pub fn room() -> Room {
+    if let Some(room) = launch_args().string("room").and_then(Room::from_key) {
+        return room;
+    }
     preferences().get(ROOM_KEY).and_then(|text| Room::from_key(&text)).unwrap_or_default()
 }
 

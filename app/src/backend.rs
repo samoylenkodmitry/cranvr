@@ -1,5 +1,4 @@
-//! Everything outside the window: the host child process, settings on disk, paired headsets
-//! from ALVR's session.json, and games under Wine.
+//! Everything outside the window: the host child process, settings on disk and games under Wine.
 
 use crate::{
     launch::{GameOptions, WineOptions},
@@ -49,19 +48,10 @@ pub struct Settings {
     pub desktop: bool,
     /// Desktop captures per second
     pub desktop_fps: u32,
-    /// Headset hostnames the host accepts
-    pub trusted: Vec<String>,
     /// The last game started: a Windows path inside the Wine prefix, or a Mac path
     pub game: String,
     /// Start the host when the window opens
     pub autostart: bool,
-    /// The app on the headset, and with it the protocol that the host speaks. A new install uses
-    /// the cranvr app. A settings file from before this choice existed has no such key and
-    /// stays with the ALVR client that it was written for.
-    #[serde(default = "HeadsetApp::before_the_choice")]
-    pub headset_app: HeadsetApp,
-    /// Counts for the ALVR client only: the cranvr client picks its media path itself
-    pub stream_protocol: StreamProtocol,
     /// How the stream reaches the headset: by the USB cable when the headset is plugged into
     /// this Mac, or by Wi-Fi, or by the cable only (see usb.rs)
     pub connection: Connection,
@@ -77,10 +67,6 @@ pub struct Settings {
     pub window_in_vr: bool,
     /// A game renders each eye at this share of the stream's eye size
     pub game_scale: f32,
-    /// The headset holds one decoded frame instead of two: about 4 ms less latency, maybe
-    /// stutter on a weak Wi-Fi. Off by default until tested in a worn headset. The ALVR client
-    /// only: the host's buffering option reaches ALVR's session alone.
-    pub low_latency: bool,
     /// Games under Wine may use at most this many MSAA samples; 0 leaves it to the game
     pub game_msaa_limit: u32,
     /// While a game runs, a display in a scaled mode shows its panel's own pixels
@@ -92,34 +78,6 @@ pub struct Settings {
     pub wine: WineOptions,
 }
 
-/// The app that runs on the headset.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum HeadsetApp {
-    /// The ALVR client, version 20.14
-    Alvr,
-    /// cranvr's own client, `dev.cranvr.client2`: the host runs with `--protocol native`
-    #[default]
-    Cranvr,
-}
-
-impl HeadsetApp {
-    /// What a settings file without the `headset_app` key means: it predates the choice, so its
-    /// headset runs the ALVR client.
-    fn before_the_choice() -> Self {
-        Self::Alvr
-    }
-}
-
-/// How the stream travels between this Mac and the headset.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum StreamProtocol {
-    /// UDP, and TCP once the host reports that no UDP stream data arrives
-    #[default]
-    Auto,
-    Udp,
-    Tcp,
-}
-
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -128,18 +86,14 @@ impl Default for Settings {
             foveation: true,
             desktop: true,
             desktop_fps: 30,
-            trusted: vec![],
             game: String::new(),
             autostart: true,
-            headset_app: HeadsetApp::default(),
-            stream_protocol: StreamProtocol::Auto,
             connection: Connection::Automatic,
             game_audio: true,
             virtual_display: None,
             vr_main_display: false,
             window_in_vr: false,
             game_scale: 0.7,
-            low_latency: false,
             game_msaa_limit: 2,
             unscale_displays: true,
             launch: BTreeMap::new(),
@@ -223,13 +177,6 @@ pub struct PairRequest {
     pub code: String,
 }
 
-/// A headset that announced itself to the host.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Client {
-    pub hostname: String,
-    pub trusted: bool,
-}
-
 /// What the window shows.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Model {
@@ -246,7 +193,6 @@ pub struct Model {
     /// The virtual display is the main display now: a headset streams
     pub vr_main: bool,
     pub stats: Option<Stats>,
-    pub clients: Vec<Client>,
     /// The host's state in native mode, once it has said it
     pub native: Option<Native>,
     /// This Mac's addresses on the local network: the headset connects to one of them
@@ -271,10 +217,6 @@ pub struct Model {
     pub game_support_outdated: bool,
     /// Problems on the network path that the host found, newest last
     pub network: Vec<String>,
-    /// The host found that UDP stream data does not arrive: in Auto mode the stream uses TCP
-    pub tcp_fallback: bool,
-    /// The host reported that no UDP stream data arrives, and the window has not acted on it yet
-    pub udp_blocked: bool,
     /// Requests from the console in VR that the window has not run yet
     pub vr_requests: Vec<Value>,
     /// Reports of a black right eye that the window has not answered yet (see black_eye.rs)
@@ -347,9 +289,6 @@ impl Model {
                 let message = v["message"].as_str().unwrap_or("A network problem").to_string();
                 if !self.network.contains(&message) {
                     self.network.push(message);
-                }
-                if v["problem"] == "no_poses" && v["protocol"] == "udp" {
-                    self.udp_blocked = true;
                 }
             }
             Some("native") => {
@@ -431,36 +370,21 @@ pub fn answer_pairing(key: &str, allow: bool) {
     }
 }
 
-/// The command line of `cranvr-host`. `tcp_fallback` is the window's switch to TCP in Auto mode.
-/// `pair_code` opens the pairing window of the native protocol. The options that count for ALVR
-/// only stay off in native mode: `--tcp` would force TCP media on every native client. The host
-/// ignores `--buffering-frames` and `--trust` there.
-fn host_args(settings: &Settings, tcp_fallback: bool, pair_code: Option<&str>, config_dir: &Path, test: bool) -> Vec<OsString> {
-    let native = settings.headset_app == HeadsetApp::Cranvr;
+/// The command line of `cranvr-host`. `pair_code` opens the pairing window for a headset of the
+/// older cranvr app, which has no Allow button. `test` is for tests on one Mac: the probe needs no
+/// pairing and TCP media.
+fn host_args(settings: &Settings, pair_code: Option<&str>, config_dir: &Path, test: bool) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![];
     args.extend(["--status", "--fps", &settings.fps.to_string(), "--mbps", &settings.mbps.to_string()].map(OsString::from));
-    if native {
-        args.extend(["--protocol", "native"].map(OsString::from));
-        if native_port() != NATIVE_PORT {
-            args.extend(["--native-port".into(), native_port().to_string().into()]);
-        }
-        if let Some(code) = pair_code {
-            args.extend(["--pair", code].map(OsString::from));
-        }
+    if native_port() != NATIVE_PORT {
+        args.extend(["--native-port".into(), native_port().to_string().into()]);
     }
-    let tcp = !native
-        && match settings.stream_protocol {
-            StreamProtocol::Auto => tcp_fallback,
-            StreamProtocol::Udp => false,
-            StreamProtocol::Tcp => true,
-        };
+    if let Some(code) = pair_code {
+        args.extend(["--pair", code].map(OsString::from));
+    }
     args.extend(["--config-dir".into(), config_dir.as_os_str().to_owned()]);
-    // For tests on one Mac: the probe needs TCP and trusts nothing by hostname
     if test {
-        args.push("--trust-all".into());
-    }
-    if tcp || test {
-        args.push("--tcp".into());
+        args.extend(["--trust-all", "--tcp"].map(OsString::from));
     }
     if !settings.foveation {
         args.push("--no-foveation".into());
@@ -472,9 +396,6 @@ fn host_args(settings: &Settings, tcp_fallback: bool, pair_code: Option<&str>, c
     if !settings.unscale_displays {
         args.push("--keep-display-modes".into());
     }
-    if settings.low_latency && !native {
-        args.extend(["--buffering-frames", "1"].map(OsString::from));
-    }
     if settings.desktop {
         args.extend(["--desktop", "--desktop-fps", &settings.desktop_fps.to_string()].map(OsString::from));
         if let Some((width, height)) = settings.virtual_display {
@@ -484,20 +405,15 @@ fn host_args(settings: &Settings, tcp_fallback: bool, pair_code: Option<&str>, c
             }
         }
     }
-    if !native {
-        for name in &settings.trusted {
-            args.extend(["--trust", name.as_str()].map(OsString::from));
-        }
-    }
     args
 }
 
 /// Starts the host with these settings, after stopping a running one. See `host_args` for the
-/// other two arguments.
-pub fn start_host(settings: &Settings, tcp_fallback: bool, pair_code: Option<&str>) -> Result<(), String> {
+/// pairing code.
+pub fn start_host(settings: &Settings, pair_code: Option<&str>) -> Result<(), String> {
     stop_host();
     let mut command = Command::new(host_binary()?);
-    command.args(host_args(settings, tcp_fallback, pair_code, &config_dir(), env::var_os("CRANVR_TEST_TRUST_ALL").is_some()));
+    command.args(host_args(settings, pair_code, &config_dir(), env::var_os("CRANVR_TEST_TRUST_ALL").is_some()));
     let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
     *HOST_INPUT.lock().unwrap() = child.stdin.take();
     let sender = channel().0.clone();
@@ -577,7 +493,6 @@ fn vr_menu(settings: &Settings, games: &[crate::steam::Game], notice: Option<&st
         "fps": settings.fps,
         "game_scale": settings.game_scale,
         "msaa": settings.game_msaa_limit,
-        "low_latency": settings.low_latency,
     });
     if let Some(notice) = notice {
         menu["notice"] = notice.into();
@@ -588,7 +503,7 @@ fn vr_menu(settings: &Settings, games: &[crate::steam::Game], notice: Option<&st
 pub fn stop_host() {
     HOST_INPUT.lock().unwrap().take();
     if let Some(mut child) = HOST.lock().unwrap().take() {
-        // SIGTERM first, so ALVR can say goodbye to the headset
+        // SIGTERM first. The host has no handler, so it ends at once. A host that is still there after 1.5 s is killed.
         Command::new("kill").args(["-TERM", &child.id().to_string()]).status().ok();
         for _ in 0..30 {
             if child.try_wait().ok().flatten().is_some() {
@@ -715,22 +630,6 @@ pub fn percent(line: &str) -> Option<u32> {
     number.parse::<f32>().ok().map(|n| n as u32)
 }
 
-/// Headsets from ALVR's session.json, which the host updates when a headset announces itself.
-pub fn read_clients() -> Vec<Client> {
-    let Ok(bytes) = fs::read(config_dir().join("session.json")) else { return vec![] };
-    let Ok(v) = serde_json::from_slice::<Value>(&bytes) else { return vec![] };
-    let mut clients: Vec<Client> = v["client_connections"]
-        .as_object()
-        .map(|m| {
-            m.iter()
-                .map(|(name, c)| Client { hostname: name.clone(), trusted: c["trusted"].as_bool().unwrap_or(false) })
-                .collect()
-        })
-        .unwrap_or_default();
-    clients.sort_by(|a, b| a.hostname.cmp(&b.hostname));
-    clients
-}
-
 /// The Steam app ID of a game under `steamapps/common/<installdir>`, from Steam's
 /// `appmanifest_<id>.acf` files. A Steam game started by its .exe needs `SteamAppId`.
 pub fn steam_app_id(dir: &Path) -> Option<String> {
@@ -757,79 +656,40 @@ pub fn steam_app_id(dir: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
-    // The window switches to TCP only for missing UDP data, and shows each problem once.
     #[test]
-    fn a_udp_problem_asks_for_tcp_once() {
+    fn each_network_problem_shows_once() {
         let mut model = Model::default();
         let udp = serde_json::json!({"type": "network", "problem": "no_poses", "protocol": "udp", "message": "no UDP"});
         model.apply_status(&udp);
         model.apply_status(&udp);
-        assert!(model.udp_blocked);
-        assert_eq!(model.network, ["no UDP"]);
-
-        let mut model = Model::default();
-        model.apply_status(&serde_json::json!({"type": "network", "problem": "no_poses", "protocol": "tcp", "message": "no TCP"}));
         model.apply_status(&serde_json::json!({"type": "network", "problem": "vpn_route", "message": "tunnel"}));
-        assert!(!model.udp_blocked);
-        assert_eq!(model.network, ["no TCP", "tunnel"]);
+        assert_eq!(model.network, ["no UDP", "tunnel"]);
     }
 
-    fn host_options(settings: &Settings, tcp_fallback: bool, pair_code: Option<&str>) -> Vec<String> {
-        host_args(settings, tcp_fallback, pair_code, Path::new("/cfg"), false).into_iter().map(|a| a.to_string_lossy().into_owned()).collect()
-    }
-
-    fn native_settings() -> Settings {
-        Settings { headset_app: HeadsetApp::Cranvr, ..Default::default() }
-    }
-
-    fn alvr_settings() -> Settings {
-        Settings { headset_app: HeadsetApp::Alvr, ..Default::default() }
+    fn host_options(settings: &Settings, pair_code: Option<&str>) -> Vec<String> {
+        host_args(settings, pair_code, Path::new("/cfg"), false).into_iter().map(|a| a.to_string_lossy().into_owned()).collect()
     }
 
     #[test]
-    fn the_alvr_client_gets_the_same_host_arguments_as_before() {
-        assert_eq!(
-            host_options(&alvr_settings(), false, None),
-            ["--status", "--fps", "120", "--mbps", "100", "--config-dir", "/cfg", "--game-scale", "0.7", "--desktop", "--desktop-fps", "30"]
-        );
-        let alvr = Settings { trusted: vec!["1234.client".into()], stream_protocol: StreamProtocol::Tcp, low_latency: true, ..alvr_settings() };
-        let args = host_options(&alvr, false, Some("482913"));
-        assert!(!args.contains(&"--protocol".to_string()) && !args.contains(&"--pair".to_string()), "{args:?}");
-        for wanted in ["--tcp", "--buffering-frames", "--trust", "1234.client"] {
-            assert!(args.contains(&wanted.to_string()), "{wanted} in {args:?}");
-        }
-        // Auto mode streams over TCP once the window found that UDP data does not arrive
-        assert!(host_options(&alvr_settings(), true, None).contains(&"--tcp".to_string()));
-    }
-
-    #[test]
-    fn the_cranvr_client_gets_the_native_protocol_with_or_without_a_pairing_code() {
-        let without = host_options(&native_settings(), false, None);
+    fn the_host_gets_its_arguments_with_or_without_a_pairing_code() {
+        let without = host_options(&Settings::default(), None);
         assert_eq!(
             without,
-            ["--status", "--fps", "120", "--mbps", "100", "--protocol", "native", "--config-dir", "/cfg", "--game-scale", "0.7", "--desktop", "--desktop-fps", "30"]
+            ["--status", "--fps", "120", "--mbps", "100", "--config-dir", "/cfg", "--game-scale", "0.7", "--desktop", "--desktop-fps", "30"]
         );
-        let with = host_options(&native_settings(), false, Some("482913"));
-        assert_eq!(with[5..9], ["--protocol", "native", "--pair", "482913"]);
+        let with = host_options(&Settings::default(), Some("482913"));
+        assert_eq!(with[5..7], ["--pair", "482913"]);
         assert_eq!(with.len(), without.len() + 2);
+        // `--tcp` would force TCP media on every client: only a test asks for it
+        assert!(!without.contains(&"--tcp".to_string()));
+        let test = host_args(&Settings::default(), None, Path::new("/cfg"), true);
+        assert!(test.iter().any(|a| a == "--tcp") && test.iter().any(|a| a == "--trust-all"));
     }
 
     #[test]
-    fn settings_for_the_alvr_client_do_not_reach_a_native_host() {
-        let settings = Settings {
-            trusted: vec!["1234.client".into()],
-            stream_protocol: StreamProtocol::Tcp,
-            low_latency: true,
-            ..native_settings()
-        };
-        // `--tcp` would force TCP media on every native client
-        let args = host_options(&settings, true, None);
-        for unwanted in ["--tcp", "--buffering-frames", "--trust", "1234.client"] {
-            assert!(!args.contains(&unwanted.to_string()), "{unwanted} in {args:?}");
-        }
-        // Settings of both clients stay
-        let quiet = Settings { foveation: false, game_audio: false, virtual_display: Some((1920, 1080)), ..native_settings() };
-        let args = host_options(&quiet, false, None);
+    fn the_settings_reach_the_host() {
+        let quiet = Settings { foveation: false, game_audio: false, virtual_display: Some((1920, 1080)), ..Default::default() };
+        let args = host_options(&quiet, None);
         for wanted in ["--no-foveation", "--no-game-audio", "--virtual-display", "1920x1080"] {
             assert!(args.contains(&wanted.to_string()), "{wanted} in {args:?}");
         }
@@ -876,10 +736,9 @@ mod tests {
         assert_eq!(read(None)["fps"], Settings::default().fps);
     }
 
-    // The native host sends the same `headset` and `stats` lines as the ALVR host. Its latency
-    // report has the `total_ms` field that the window reads.
+    // The host's latency report has the `total_ms` field that the window reads.
     #[test]
-    fn a_native_hosts_headset_and_stats_lines_fill_the_model() {
+    fn the_hosts_headset_and_stats_lines_fill_the_model() {
         let mut model = Model::default();
         model.apply_status(&serde_json::json!({"type": "headset", "connected": true, "eye": [2064, 2208], "fps": 120.0, "foveated": true}));
         model.apply_status(&serde_json::json!({
@@ -918,22 +777,20 @@ mod tests {
         assert_eq!(serde_json::from_str::<Settings>(r#"{"connection": "Usb"}"#).unwrap().connection, Connection::Usb);
     }
 
+    // The settings of the retired choices of headset app, stream protocol, low latency and trusted
+    // names stay in an old app.json. The app reads the file as before and drops the keys when it
+    // saves.
     #[test]
-    fn settings_files_from_before_the_headset_app_choice_use_the_alvr_client() {
-        let old = serde_json::from_str::<Settings>(r#"{"fps": 90, "trusted": ["1234.client"]}"#).unwrap();
-        assert_eq!((old.headset_app, old.fps), (HeadsetApp::Alvr, 90));
-        assert_eq!(serde_json::from_str::<Settings>("{}").unwrap().headset_app, HeadsetApp::Alvr);
-        assert_eq!(serde_json::from_str::<Settings>(r#"{"headset_app": "Cranvr"}"#).unwrap().headset_app, HeadsetApp::Cranvr);
-        assert_eq!(serde_json::from_str::<Settings>(r#"{"headset_app": "Alvr"}"#).unwrap().headset_app, HeadsetApp::Alvr);
-    }
-
-    // A fresh install has no settings file at all: it uses the cranvr headset app. Settings that the
-    // app saved keep their choice. The other fields keep their defaults when a key is missing.
-    #[test]
-    fn a_new_install_uses_the_cranvr_headset_app() {
-        assert_eq!(Settings::default().headset_app, HeadsetApp::Cranvr);
-        let saved = serde_json::to_string(&Settings { headset_app: HeadsetApp::Alvr, ..Default::default() }).unwrap();
-        assert_eq!(serde_json::from_str::<Settings>(&saved).unwrap().headset_app, HeadsetApp::Alvr);
+    fn a_settings_file_with_the_retired_keys_loads() {
+        let old = serde_json::from_str::<Settings>(
+            r#"{"fps": 90, "headset_app": "Alvr", "stream_protocol": "Tcp", "low_latency": true, "trusted": ["1234.client"]}"#,
+        )
+        .unwrap();
+        assert_eq!(old.fps, 90);
+        let saved = serde_json::to_string(&old).unwrap();
+        for retired in ["headset_app", "stream_protocol", "low_latency", "trusted"] {
+            assert!(!saved.contains(retired), "{retired} in {saved}");
+        }
         assert_eq!(serde_json::from_str::<Settings>(&serde_json::to_string(&Settings::default()).unwrap()).unwrap(), Settings::default());
         assert!(serde_json::from_str::<Settings>(r#"{"fps": 90}"#).unwrap().autostart);
     }
@@ -978,13 +835,15 @@ mod tests {
         env::set_var("CRANVR_HOME", &home);
         env::set_var("CRANVR_HOST_BIN", release.join("cranvr-host"));
         env::set_var("CRANVR_TEST_TRUST_ALL", "1");
+        // The user's host keeps port 9950
+        env::set_var("CRANVR_NATIVE_PORT", "9962");
         let settings = Settings { fps: 72, desktop: false, ..Default::default() };
-        start_host(&settings, false, None).expect("host starts");
+        start_host(&settings, None).expect("host starts");
         std::thread::sleep(std::time::Duration::from_secs(2));
         let probe_home = home.join("probe");
         fs::create_dir_all(&probe_home).unwrap();
         let mut probe = Command::new(release.join("cranvr-probe"))
-            .args(["--seconds", "8"])
+            .args(["--seconds", "8", "--tcp", "--connect", "127.0.0.1:9962"])
             .env("HOME", &probe_home)
             .stdout(Stdio::null())
             .spawn()
@@ -1003,13 +862,11 @@ mod tests {
         };
         let (running, audio) = (model.running, model.audio.clone());
         stop_host();
-        let clients = read_clients();
         fs::remove_dir_all(&home).ok();
         assert!(probe_status.success(), "probe saw a good stream");
         assert!(running, "host ran");
         assert!(saw_headset, "a headset line");
         assert!(best_fps > 30.0, "stream fps {best_fps}");
-        assert!(!clients.is_empty(), "session.json lists the probe");
         // The capture of the Mac's sound needs Screen Recording for the app that runs the test
         assert!(matches!(audio, Some((true, _))), "the host captures the sound: {audio:?}");
     }

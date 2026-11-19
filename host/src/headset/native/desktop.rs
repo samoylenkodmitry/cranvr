@@ -9,11 +9,10 @@
 //!   the display changes, so a still desktop costs nothing. A key frame goes out at the start,
 //!   after a loss that the client reports and when the desktop becomes visible again.
 //! - The pictures are not mirrored: Cranpose's compositor layer already turns a decoder's surface
-//!   upright. The old Quest app's layer needed a mirror (`desktop_layer.rs`).
+//!   upright.
 //! - The cursor's position goes out as a datagram every 2 ms while the Mac's mouse moves.
 //! - `ClientDatagram::Pointer` carries where a controller points on the panel, with its trigger and
-//!   thumbstick. The host moves the Mac's mouse, clicks and scrolls as the compat mode does
-//!   (`desktop::Pointer`).
+//!   thumbstick. The host moves the Mac's mouse, clicks and scrolls (`desktop::Pointer`).
 //! - `LayerState` tells the frame loop that the client shows the desktop, so the eye stream leaves
 //!   its own copy of the screen out. It tells the loop that a game hides the desktop.
 
@@ -22,7 +21,7 @@ use crate::{
     desktop::{self, Capture, CaptureSpec},
     desktop_layer::LayerState,
 };
-use alvr_common::{info, warn};
+use log::{info, warn};
 use cranvr_proto::{
     clock::now_ns,
     media::FrameMeta,
@@ -60,8 +59,7 @@ impl Default for Options {
     }
 }
 
-/// The picture stream's average bitrate in Mbps. A still desktop needs far less. The old layer used
-/// the same.
+/// The picture stream's average bitrate in Mbps. A still desktop needs far less.
 pub const MBPS: u64 = 40;
 /// Pictures a second at most
 const MAX_FPS: i32 = 60;
@@ -203,8 +201,6 @@ impl Running {
                 cursor: cursor_in_video(),
                 yuv: true,
                 notify: Some(notify.clone()),
-                source: None,
-                size: None,
             },
         )?;
         let (width, height) = capture.size;

@@ -3,12 +3,12 @@
 //!
 //! A VPN on the headset can route the local network through another device. Tailscale does this
 //! for a device that accepts a subnet route of its own network: the headset's UDP then reaches
-//! the Mac from the subnet router's address, and ALVR drops every stream packet that does not
-//! come from the headset's own address. TCP still works, because the Mac opens those connections
-//! and Android answers them on the interface that they came in on.
+//! the Mac from the subnet router's address, and the stream may not arrive. TCP still works,
+//! because the headset opens that connection and the answers return on the interface that they
+//! came in on.
 
 use serde_json::{json, Value};
-use std::{fs, net::IpAddr, path::Path, process::Command};
+use std::{net::IpAddr, process::Command};
 
 /// Connections in a row that end without a pose before the host reports a problem. One such
 /// connection happens when the headset leaves for other reasons.
@@ -45,7 +45,7 @@ impl StreamWatch {
                 "The headset connected, but none of its stream data reached this Mac. A VPN on \
                  the headset can send its UDP packets through another device that changes their \
                  sender address: Tailscale does this when the headset uses a subnet route for its \
-                 own network. Exclude the headset's stream app (ALVR or cranvr) from the VPN on the headset, or stream over TCP."
+                 own network. Exclude the cranvr app from the VPN on the headset, or stream over TCP."
             };
             json!({
                 "type": "network",
@@ -55,16 +55,6 @@ impl StreamWatch {
             })
         })
     }
-}
-
-/// The address of the headset that is connected now, from ALVR's session file.
-pub fn client_ip(session: &Path) -> Option<IpAddr> {
-    let json: Value = serde_json::from_str(&fs::read_to_string(session).ok()?).ok()?;
-    json["client_connections"].as_object()?.values().find_map(|client| {
-        let state = client["connection_state"].as_str()?;
-        matches!(state, "Connecting" | "Connected" | "Streaming").then_some(())?;
-        client["current_ip"].as_str()?.parse().ok()
-    })
 }
 
 /// A status line when this Mac reaches `ip` through a tunnel interface, such as a VPN's.

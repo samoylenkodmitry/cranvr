@@ -14,7 +14,9 @@
 //! The runtime finds the host through a control file: "<port> <token> <eye width> <eye height>".
 //! The launcher passes the file's Windows path to the game in the `BASALT_CONTROL` variable.
 
-use alvr_common::{info, warn, DeviceMotion};
+use crate::pose::DeviceMotion;
+use log::{info, warn};
+use cranvr_common::inputs::QUEST_TOUCH_PROFILE_ID;
 use cranvr_vt::PixelBuffer;
 use std::{
     collections::HashMap,
@@ -39,8 +41,6 @@ const KEEPALIVE: Duration = Duration::from_secs(1);
 /// The runtime accepts per-eye sizes up to this (BASALT_CONTROL_MAX_VIEW_*; cranvr's runtime
 /// patch raises them to the Quest 3 panel size).
 pub const MAX_VIEW: (u32, u32) = (2064, 2208);
-/// ALVR's ID for "/interaction_profiles/oculus/touch_controller".
-const QUEST_TOUCH_PROFILE_ID: u64 = 0x0812_fd85_c843_84a6;
 
 mod msg {
     pub const HELLO: u16 = 1;
@@ -82,7 +82,7 @@ pub struct GameView {
 #[derive(Clone, Debug)]
 pub struct GameFrame {
     pub number: u64,
-    /// The ALVR tracking sample the game rendered for
+    /// The tracking sample the game rendered for
     pub tracking_ns: u64,
     pub views: [GameView; 2],
 }
@@ -426,7 +426,7 @@ impl RuntimeLink {
         self.send(msg::CONTROLLER_MASK, &p);
     }
 
-    /// An ALVR button: `scalar` false sends a binary value (0 or 1).
+    /// A button or an axis by its path id: `scalar` false sends a binary value (0 or 1).
     pub fn button(&self, path_id: u64, scalar: bool, value: f32) {
         self.counters.buttons.fetch_add(1, Ordering::Relaxed);
         let mut p = path_id.to_le_bytes().to_vec();
@@ -549,10 +549,7 @@ impl Swapchains {
 mod tests {
     use super::*;
 
-    use alvr_common::{
-        glam::{Quat, Vec3},
-        Pose,
-    };
+    use crate::pose::{Pose, Quat, Vec3};
 
     fn message(kind: u16, payload: &[u8]) -> Vec<u8> {
         let mut m = (2 + payload.len() as u32).to_le_bytes().to_vec();
