@@ -104,7 +104,7 @@ The Network choice and the Low latency switch in the Settings tab count for this
 - A pulled cable. `adb reconnect` stood in for it.
 - A headset that waits for the user to allow USB debugging, and a Mac that has no adb server running while the downloaded adb starts one. The parser covers the first. The window text was not seen.
 - The download from dl.google.com. The test used a local file.
-- A headset that has only used the cable and then falls back to Wi-Fi: the fallback stream ran on a Mac that already knew the headset's key (the host with `--trust-all`, and a pairing by file). A new headset meets the card on the Mac there.
+- A headset that has only used the cable and then falls back to Wi-Fi: the fallback stream ran on a Mac that already knew the headset's key (the host with `--trust-all`, and a pairing by file). The card of a new headset did not show in that run.
 - Beat Saber during a song and in a worn headset. The frame rates and latencies in the README come from the game's first screen, the health and safety warning, with the headset on a desk.
 - Sound with the Mac muted. A tone at a Mac volume of 15% reached the client at its full level.
 - The controller as a mouse on the virtual display in a real headset. The switch of the main display ran with a test client on the Mac only.
