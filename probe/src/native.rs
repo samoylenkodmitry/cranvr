@@ -56,6 +56,8 @@ pub struct Options {
     pub tracking: bool,
     /// With `tracking`: no controller is tracked
     pub no_controllers: bool,
+    /// With `tracking`: where the face comes from
+    pub face_source: tracked::FaceSource,
 }
 
 /// The probe's clock runs this far ahead of the process clock, as a headset's clock has its own
@@ -142,6 +144,7 @@ struct Shared {
     wish: AtomicU8,
     tracking: bool,
     no_controllers: bool,
+    face_source: tracked::FaceSource,
     sent_tracking: [AtomicU64; 4],
 }
 
@@ -230,12 +233,13 @@ pub fn run(o: Options) -> i32 {
         wish: AtomicU8::new(0),
         tracking: o.tracking,
         no_controllers: o.no_controllers,
+        face_source: o.face_source,
         sent_tracking: Default::default(),
     });
     if o.tracking {
-        // The probe offers every feature that the protocol has. Its head stands still for the
-        // script of tracked.rs.
-        shared.link.duplex.send_control(&ClientMsg::TrackingOffer(Features::ALL)).ok();
+        // The probe offers every feature that the protocol has, and names the face's source. Its head
+        // stands still for the script of tracked.rs.
+        shared.link.duplex.send_control(&ClientMsg::TrackingOffer(o.face_source.offer())).ok();
     }
 
     // The headset's floor lies below the room's origin. The host moves its scene up by that much
@@ -325,7 +329,14 @@ pub fn run(o: Options) -> i32 {
     print_summary(&shared, &r, o.seconds, expected);
     if o.tracking {
         let sent = |i: usize| shared.sent_tracking[i].load(Ordering::Relaxed);
-        println!("probe: tracking sent: {} hand, {} body, {} face and {} eye datagrams", sent(0), sent(1), sent(2), sent(3));
+        println!(
+            "probe: tracking sent: {} hand, {} body, {} face ({} source) and {} eye datagrams",
+            sent(0),
+            sent(1),
+            sent(2),
+            shared.face_source.word(),
+            sent(3)
+        );
     }
     let desktop_ok = shared.desktop.as_ref().is_none_or(|d| d.summary());
     i32::from(r.good * 2 < expected || !desktop_ok)
@@ -578,7 +589,7 @@ fn send_tracked(shared: &Shared, sample_time: u64, display_time: u64) {
         send(1, ClientDatagram::Body(tracked::body(sample_time, display_time, BodySet::Default)));
     }
     if wish.contains(Features::FACE) {
-        send(2, ClientDatagram::Face(tracked::face(sample_time, display_time)));
+        send(2, ClientDatagram::Face(tracked::face(sample_time, display_time, shared.face_source)));
     }
     if wish.contains(Features::EYES) {
         send(3, ClientDatagram::Eyes(tracked::eyes(sample_time, display_time)));

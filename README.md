@@ -97,7 +97,7 @@ The client's modules: `connection.rs` runs the link on its own threads. `hub.rs`
 - A recenter of the headset goes to the host as a `Recenter` message. The host then puts its desktop screen in front of the user again.
 - The floor goes to the host as a `Floor` message. It comes from the stage that the runtime gives. The poses are in the app's room (OpenXR's LOCAL space), whose origin lies where the head was when the app started. The host moves the room up by the height of the floor before it gives the poses to its test scene or to a game, so the floor lies at height 0 there.
 - The host's haptic pulses play on the controllers through Cranpose's `Haptics`.
-- Hands, body, face and eyes (`tracked.rs`): the Quest build asks Cranpose for the four kinds of tracking in `build.rs` (`Use::hand_tracking()` and its siblings). An OpenXR instance fixes its extensions before the app runs, so the declaration cannot wait for a game. It writes the permissions to the manifest, and Cranpose asks the user for them before the OpenXR instance exists. The headset offers a kind to the host (`ClientMsg::TrackingOffer`) only while its tracker runs, which is after the user allowed it. A Quest 3 has no eye cameras, so it never offers the eyes. Its face comes from the microphone: the data source is audio, and the runtime marks it so a game can tell. A face from Android XR's own extension has the 68 weights of Jetpack XR and is not offered. The client sends a feature only while the host wishes it (`HostMsg::TrackingWish`): one datagram per headset frame, from a buffer that it allocated once. Cranpose gives no velocities for joints, so the client estimates the velocity of each wrist and of the body's root from the poses of two frames, as it does for the head.
+- Hands, body, face and eyes (`tracked.rs`): the Quest build asks Cranpose for the four kinds of tracking in `build.rs` (`Use::hand_tracking()` and its siblings). An OpenXR instance fixes its extensions before the app runs, so the declaration cannot wait for a game. It writes the permissions to the manifest, and Cranpose asks the user for them before the OpenXR instance exists. The headset offers a kind to the host (`ClientMsg::TrackingOffer`) only while its tracker runs, which is after the user allowed it. A Quest 3 has no eye cameras, so it never offers the eyes. Its face comes from the microphone, which Cranpose calls the audio data source. The offer names the source of the face (`Features::FACE_AUDIO` or `FACE_VISUAL`), and each face sample carries its own. Cranpose names the source per frame, so the client offers a face of an unknown source until a valid sample names it. A face from Android XR's own extension has the 68 weights of Jetpack XR. The client maps them to Meta's 70 weights by `FaceBlendShapeType::expression()` and leaves the weights that Android XR lacks at zero. It offers that face as a visual one, because Android XR reads the face with the headset's cameras. The client sends a feature only while the host wishes it (`HostMsg::TrackingWish`): one datagram per headset frame, from a buffer that it allocated once. Cranpose gives no velocities for joints, so the client estimates the velocity of each wrist and of the body's root from the poses of two frames, as it does for the head.
 
 ### The eye size and the decoder
 
@@ -266,12 +266,22 @@ A Windows VR game under cranvr's Wine stack gets the user's hands, body, face an
 
 The way from the headset to the game:
 
-1. After its welcome, a client of protocol version 6 sends `ClientMsg::TrackingOffer` with the features that its headset has and its user allowed. The host writes them as words to `tracking-features.txt` next to the runtime's control file (`hands body full_body face eyes`) and removes the file when the headset leaves. A game lists its instance extensions before its session exists, so the runtime reads the file at that moment. A game that starts before the headset connects sees no tracking extension.
+1. After its welcome, a client of protocol version 6 sends `ClientMsg::TrackingOffer` with the features that its headset has and its user allowed. The host writes them as words to `tracking-features.txt` next to the runtime's control file (`hands body full_body face eyes`, with `face_visual` or `face_audio` after `face`) and removes the file when the headset leaves. A game lists its instance extensions before its session exists, so the runtime reads the file at that moment. A game that starts before the headset connects sees no tracking extension.
 2. The patched runtime (patch 0005) tells the host which features its game uses (`TRACKING_REQUEST`, message 19): a hand tracker, a body tracker or a face tracker, or an eye gaze action that the game attached. The host asks the headset for exactly these (`HostMsg::TrackingWish`) and asks again when the set changes. A feature that no game uses costs no traffic.
 3. For each headset frame the client sends one datagram for each wished feature (`Hands`, `Body`, `Face`, `Eyes`, in `proto/src/tracking.rs`). Each carries the sample time and display time of the frame's `Tracking` message. Joints travel as poses relative to a root pose with full precision and a velocity. The relative part is quantized: a position to 0.1 mm and an orientation to its three smaller components in 16 bits, so the error stays below 0.1 mm and 0.005 degrees. The largest datagram, the 84 joint body, takes 1197 of the 1400 bytes of a packet. A face weight takes one byte.
 4. The host lowers the poses by the headset's floor, as for the head and the controllers, and sends them to the runtime (messages 20 to 23, documented in `basalt_control_protocol.h`). The runtime sends the joints in the base space that the game names. A hand and a body move forward by their velocity for the time from the sample's arrival to the game's locate time, at most 50 ms. The runtime has no map from the headset's clock to the game's `XrTime`, so the arrival time stands in for the sample's time. The headset has already predicted the sample to its own display time.
 
 A runtime without patch 0005 closes the connection at a message that it does not know. The patched runtime therefore writes the word `tracking` to `runtime-features.txt`, and the host sends messages 20 to 23 only to a runtime that wrote it. Without the word the host still makes controllers from hands. An older host never writes `tracking-features.txt`, so a patched runtime then lists no tracking extension. A host or a client of protocol version 5 or older skips the new messages and takes no harm.
+
+### Where the face comes from
+
+`XR_FB_face_tracking2` lets a game choose the data source of its face: the cameras (visual) or the microphone (audio). A Quest 3 has no camera that sees the mouth, so its face is the audio one. The offer carries the source, and runtime patch 0006 reports it to the game by the rules of the extension:
+
+- `xrGetSystemProperties` sets `supportsVisualFaceTracking` and `supportsAudioFaceTracking` from the offer. A Quest 3 supports audio only. A face of an unknown source reports both. An older headset app offers such a face, and so does a headset that has not yet given a valid sample.
+- `xrCreateFaceTracker2FB` takes `requestedDataSources` by the extension's rules. An empty list accepts any source. A duplicate, a value that is no source and a missing list for a counted one get `XR_ERROR_VALIDATION_FAILURE`. While no headset offers a face, the runtime makes the tracker and reads no face, so that a game survives a reconnect of the headset.
+- `xrGetFaceExpressionWeights2FB` sets `dataSource` from the newest sample, which says its own source.
+
+The runtime is more lenient than the extension in one case. The extension calls the list the sources that the game accepts. It lets a runtime refuse a list that holds no source of the headset's face with `XR_ERROR_FEATURE_UNSUPPORTED`. This runtime makes the tracker instead and serves the headset's face. A game that lists the cameras only still gets the face of a Quest 3, and `dataSource` tells it that the face comes from the microphone. Every game that creates a face tracker therefore reads the headset's face.
 
 ### Controllers made of hands
 
@@ -291,14 +301,16 @@ A game without hand code binds the Oculus Touch controller profile and knows not
 
 ```bash
 # The fake game asks for the features. It checks every joint, weight and the gaze against the script.
+# --face-source visual|audio|unknown sets where the probe's face comes from (default audio, a Quest 3's).
 scripts/e2e.sh --native-port 9961 --tracking
 # A game without hand code: the probe tracks hands and no controller.
 scripts/e2e.sh --native-port 9961 --hand-controllers
 # The real runtime: tracking_smoke.exe reads everything through OpenXR in Wine.
 CRANVR_HOME=/path/to/a/test/stack scripts/e2e.sh --native-port 9961 --tracking-wine
+CRANVR_HOME=/path/to/a/test/stack scripts/e2e.sh --native-port 9961 --tracking-wine --face-source visual
 ```
 
-`--tracking-wine` needs a stack built from the runtime under test (`CRANVR_HOME=... scripts/setup-wine.sh third_party/basaltvr/src`). `tracking_smoke.exe` checks that the runtime lists the extensions, answers the system properties, refuses a joint set that it lacks, returns a skeleton, and gives the 26 hand joints of both hands, 70 and 84 body joints, 70 face weights and the gaze within 0.5 mm and 0.1 degrees of the script. It also checks the joints in the view space and the joints' velocities. The run checks that the host asked the headset for tracking only after the game created its trackers and that it asked for none after the game left.
+`--tracking-wine` needs a stack built from the runtime under test (`CRANVR_HOME=... scripts/setup-wine.sh third_party/basaltvr/src`). `tracking_smoke.exe` checks that the runtime lists the extensions, answers the system properties, refuses a joint set that it lacks, returns a skeleton, and gives the 26 hand joints of both hands, 70 and 84 body joints, 70 face weights and the gaze within 0.5 mm and 0.1 degrees of the script. It also checks the joints in the view space and the joints' velocities. For the face it checks the support structure against `--face-source`, the answer of the creation to each list of sources and the `dataSource` of each sample. `--live-face` accepts any weights, so that the program can read the face of a real headset. The run checks that the host asked the headset for tracking only after the game created its trackers and that it asked for none after the game left.
 
 ## Games
 
@@ -441,7 +453,7 @@ Use pairing for real use. `--trust-all` accepts any client on the network and is
 
 ## Not tested yet
 
-- Hands, body, face and eyes from a worn headset. The tests run with the probe's script and the client's own tests. A real hand in view, a real face and the permission prompts of a user who answers them have not been tried.
+- Hands, body, face and eyes from a worn headset. The tests run with the probe's script and the client's own tests. A real hand in view, a real face and the permission prompts of a user who answers them have not been tried. The face source of a worn Quest 3 and the face of a real Android XR headset have not been seen either.
 - The cranvr client in a worn headset: the controllers in a game, the carry of the desktop panel by a ray, a recenter and the cable from a Quest.
 - Beat Saber during a song. The game's frame rate and latency were measured on its first screen with the headset on a desk.
 - A game that hides the desktop together with a recenter.

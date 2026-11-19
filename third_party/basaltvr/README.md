@@ -77,6 +77,13 @@ applies these patches and builds both parts.
 - `tests/tracking_smoke.cpp` reads every feature through the loader and compares it with the script
   of cranvr-probe (`scripts/e2e.sh --tracking-wine`).
 
+`0006-face-data-sources.patch`
+
+- `tracking-features.txt` may name the headset's face source after `face`: `face_visual` for cameras, `face_audio` for the microphone. A Quest 3's face comes from the microphone. The runtime fills `XrSystemFaceTrackingProperties2FB` from the words. A face with no named source is of an unknown source, and the runtime then reports both sources.
+- `xrCreateFaceTracker2FB` takes `requestedDataSources` by the extension's rules. An empty list accepts any source. A duplicate, a value that is no source and a missing list for a counted one are `XR_ERROR_VALIDATION_FAILURE`. A list without a source of the headset's face may be refused with `XR_ERROR_FEATURE_UNSUPPORTED` by the extension. This runtime makes the tracker and serves the headset's face instead, so that a game which lists the cameras only still gets the face of a Quest 3. While the headset offers no face, the tracker is made and reads no face.
+- `xrGetFaceExpressionWeights2FB` reports the source of the newest sample as `dataSource`. The sample says it with flag 4 of `FACE_TRACKING`.
+- `tests/tracking_smoke.cpp` takes `--face-source visual|audio|unknown`. It checks the support structure, the answer of the creation to each list of sources, a tracker with no list, a tracker that lists only the other source and the `dataSource` of each sample. `--live-face` accepts any weights, for a face from a real headset.
+
 ## patches/dxmt
 
 `0005-public-atomic-for-new-metal-compiler.patch`: DXMT 0.80 calls a private Metal builtin

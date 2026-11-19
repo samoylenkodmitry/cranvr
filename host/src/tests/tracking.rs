@@ -365,6 +365,11 @@ fn body_face_and_eyes_reach_the_runtime_when_the_game_uses_them() {
     let (kind, payload) = rig.next();
     assert_eq!((kind, payload.len()), (msg::FACE_TRACKING, 8 + 4 + 8 + FACE_WEIGHTS * 4));
     assert_eq!(&payload[8..12], &u32::from(face::VALID).to_le_bytes());
+    // The source of each sample reaches the runtime as it came: the game reads it as `dataSource`
+    rig.hub.on_tracked(Tracked::Face(Face::new(31_000_000, 41_000_000, face::VALID | face::FROM_AUDIO, [0.5, 1.0], &weights)));
+    let (kind, payload) = rig.next();
+    assert_eq!(kind, msg::FACE_TRACKING);
+    assert_eq!(&payload[8..12], &u32::from(face::VALID | face::FROM_AUDIO).to_le_bytes());
     let values = floats(&payload[12..]);
     assert!((values[0] - 0.5).abs() < 0.003 && values[1] == 1.0);
     assert!((values[2 + 69] - 1.0).abs() < 1e-6 && (values[2 + 35] - 35.0 / 69.0).abs() < 0.003);
@@ -396,6 +401,11 @@ fn the_runtime_learns_which_features_the_headset_offers_through_a_file() {
     assert_eq!(fs::read_to_string(&file).unwrap(), "hands eyes\n");
     rig.hub.on_offer(Features::ALL);
     assert_eq!(fs::read_to_string(&file).unwrap(), "hands body full_body face eyes\n");
+    // A Quest 3's face comes from the microphone, which the runtime reports to the game
+    rig.hub.on_offer(Features::HANDS.union(Features::FACE).union(Features::FACE_AUDIO));
+    assert_eq!(fs::read_to_string(&file).unwrap(), "hands face face_audio\n");
+    rig.hub.on_offer(Features::FACE.union(Features::FACE_VISUAL).union(Features::FACE_AUDIO));
+    assert_eq!(fs::read_to_string(&file).unwrap(), "face face_visual face_audio\n");
     // The headset leaves: the file goes with it, and the wish ends
     rig.hub.on_offer(Features::NONE);
     assert!(!file.exists());

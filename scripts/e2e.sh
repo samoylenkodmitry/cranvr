@@ -7,6 +7,7 @@
 #                       [--quest [SERIAL] | --native-tcp] [--native-drop PERCENT] [--native-port PORT]
 #                       [--host-arg ARG]... [--report FILE]
 #                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine]
+#                       [--face-source visual|audio|unknown]
 #
 #   --seconds N   how long the stream runs (default 20)
 #   --fps HZ      the stream's refresh rate (default 120, as the host). The probe also offers 144,
@@ -30,6 +31,12 @@
 #                 face tracker and an eye gaze action, and compares what it reads with the script.
 #                 Set CRANVR_HOME to a stack that scripts/setup-wine.sh built from the runtime to
 #                 test. The run lasts at least 40 seconds.
+#   --face-source SOURCE  with --tracking and --tracking-wine: where the probe's face comes from.
+#                 audio (the default) is a Quest 3's microphone face, visual is a face from cameras,
+#                 and unknown is an offer that names no source, as an older headset app sends. The
+#                 offer, the host's file for the runtime and each sample carry the source. The
+#                 Windows program checks that the support structure says it, that a face tracker
+#                 which asks for the other source is refused, and each sample's dataSource.
 #   --desktop     the host shows this Mac's screen. The probe asks for the desktop stream, plays a
 #                 pointer script (the host only logs its mouse events: CRANVR_POINTER_DRY_RUN) and
 #                 counts the Mac's sound. It counts every frame of the right size, since the
@@ -66,7 +73,7 @@ set -euo pipefail
 
 root=${0:A:h:h}
 seconds=20 fps=120 game=0 desktop=0 client=mac serial="" report=""
-tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0
+tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 face_source=audio
 wine="" wine_args=()
 native_tcp=0 native_drop=0 native_port=9950
 more_host_args=()
@@ -80,6 +87,9 @@ while (( $# )); do
             if (( $# )) && [[ $1 != --* ]]; then tracking_features=$1; shift; fi ;;
         --hand-controllers) game=1 hand_controllers=1; shift ;;
         --tracking-wine) tracking_wine=1; shift ;;
+        --face-source)
+            face_source=$2; shift 2
+            [[ ${face_source} == (visual|audio|unknown) ]] || { print -u2 "--face-source takes visual, audio or unknown"; exit 2; } ;;
         --desktop) desktop=1; shift ;;
         --wine) wine=$2; shift 2 ;;
         --wine-arg) wine_args+=("$2"); shift 2 ;;
@@ -103,7 +113,7 @@ fi
 if (( tracking_wine )); then
     # The Windows program waits for the headset's features, starts a session and reads the data
     wine='C:\basalt\runtime\tracking_smoke.exe'
-    wine_args=(--seconds 25)
+    wine_args=(--seconds 25 --face-source "${face_source}")
     (( seconds >= 40 )) || seconds=40
 fi
 
@@ -251,7 +261,7 @@ if (( game )); then
     # headset on a desk sends no controller input.
     if [[ ${client} == mac ]]; then
         game_args=(--expect-input)
-        (( tracking )) && game_args=(--use-tracking "${tracking_features}" --release-tracking --expect-tracking)
+        (( tracking )) && game_args=(--use-tracking "${tracking_features}" --release-tracking --expect-tracking --face-source "${face_source}")
         (( hand_controllers )) && game_args=(--expect-hand-controllers)
         "${bin}/cranvr-fake-game" --control "${work}/config/runtime-control.txt" --fps "${fps}" \
             --seconds $(( seconds + 4 )) "${game_args[@]}" > "${work}/game.log" 2>&1 &
@@ -280,7 +290,7 @@ fi
 # The probe asks for the desktop stream, plays a pointer script and counts the Mac's sound
 (( desktop )) && probe_args+=(--desktop)
 # The probe offers hands, body, face and eyes and plays the script of tracked.rs for what the host asks
-(( tracking || tracking_wine )) && probe_args+=(--tracking)
+(( tracking || tracking_wine )) && probe_args+=(--tracking --face-source "${face_source}")
 (( hand_controllers )) && probe_args+=(--tracking --no-controllers)
 client_exit=0
 case ${client} in

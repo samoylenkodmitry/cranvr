@@ -1,0 +1,533 @@
+Subject: [PATCH] runtime: the face's data sources are the headset's own (cranvr)
+
+XR_FB_face_tracking2 lets a game choose where its face comes from: the cameras
+(visual) or the microphone (audio). A Quest 3 has no camera for the mouth and
+gives the audio one. The patched runtime of 0005 said that it supports the
+visual source only. It also dropped every sample from a source that the game
+had not listed. A game that asked for audio, or that read
+XrSystemFaceTrackingProperties2FB first, got no face from a Quest 3.
+
+tracking-features.txt may now name the headset's face source next to "face":
+face_visual for cameras, face_audio for the microphone, or both. The runtime
+reports them in XrSystemFaceTrackingProperties2FB. A face without a named
+source is of an unknown source. The runtime then reports both sources. An older
+cranvr-host offers such a face. A headset that has given no valid sample yet
+offers one too.
+
+xrCreateFaceTracker2FB follows the extension for requestedDataSources. An empty
+list takes any source. A duplicate, a value that is no source and a missing list
+for a counted one are XR_ERROR_VALIDATION_FAILURE. The runtime is more lenient
+than the extension's word "accepts" in one case. The extension lets a runtime
+refuse a list that holds no source of the headset's face with
+XR_ERROR_FEATURE_UNSUPPORTED. This runtime makes the tracker instead and serves
+the headset's face. A game that lists the cameras only still gets the face of a
+Quest 3. While the headset offers no face (it may reconnect), a tracker is made
+and reads none.
+
+xrGetFaceExpressionWeights2FB reports the source of the newest sample as
+dataSource. The daemon says it with flag 4 of FACE_TRACKING. Before a sample
+came, it reports the source that the headset offers when it offers one.
+
+tests/tracking_smoke.cpp takes --face-source visual|audio|unknown. It checks
+the support structure, the answer of the creation to each list of sources, a
+tracker with no list, a tracker that lists only the other source and the
+dataSource of each sample. --live-face accepts any weights, for a face that
+comes from a real headset instead of the probe's script.
+---
+diff --git a/runtime/pe/basalt_control_protocol.h b/runtime/pe/basalt_control_protocol.h
+index 95c4480..afd8b84 100644
+--- a/runtime/pe/basalt_control_protocol.h
++++ b/runtime/pe/basalt_control_protocol.h
+@@ -90,6 +90,12 @@
+  * (hands body full_body face eyes). The runtime reads it before a game lists its
+  * OpenXR extensions, and lists the extensions of those features only. A feature
+  * is a bit in TRACKING_REQUEST: 1 hands, 2 body, 4 full_body, 8 face, 16 eyes.
++ * With face the file may name where the face comes from: face_visual for cameras,
++ * face_audio for the microphone (a Quest 3 has no camera for the mouth). The
++ * runtime reports these in XrSystemFaceTrackingProperties2FB and accepts only the
++ * face trackers that ask for one of them. A face without a named source is of an
++ * unknown source, and the runtime then reports both. Each FACE_TRACKING sample
++ * says its own source with flag 4, which a game reads as the sample's dataSource.
+  * Poses are in the headset's tracking space, like HEAD_POSE's. A joint's flags
+  * byte holds 1 position valid, 2 orientation valid, 4 position tracked,
+  * 8 orientation tracked.
+@@ -154,13 +160,16 @@ enum {
+     BASALT_MSG_EYE_GAZE = 23,
+ };
+ 
+-/* Bits of TRACKING_REQUEST and of tracking-features.txt's words. */
++/* Bits of TRACKING_REQUEST and of tracking-features.txt's words. The last two are
++ * words of the file only: a TRACKING_REQUEST never carries them. */
+ enum {
+     BASALT_TRACKING_HANDS = 1,
+     BASALT_TRACKING_BODY = 2,
+     BASALT_TRACKING_FULL_BODY = 4,
+     BASALT_TRACKING_FACE = 8,
+     BASALT_TRACKING_EYES = 16,
++    BASALT_TRACKING_FACE_VISUAL = 32,
++    BASALT_TRACKING_FACE_AUDIO = 64,
+ };
+ 
+ enum {
+diff --git a/runtime/pe/control.cpp b/runtime/pe/control.cpp
+index 9444aca..e56e131 100644
+--- a/runtime/pe/control.cpp
++++ b/runtime/pe/control.cpp
+@@ -2095,8 +2095,12 @@ bool controlFaceState(XrSession session, ControlFaceState* state) {
+     if (connected) {
+         const FaceRecord& record = gFace;
+         state->active = trackedFresh(record.active, record.arrival, now);
+-        if (state->active) {
++        // The flags of a sample that went stale still name the headset's face source
++        state->received = record.arrival > 0;
++        if (state->received) {
+             state->flags = record.flags;
++        }
++        if (state->active) {
+             std::memcpy(state->confidences, record.confidences, sizeof(state->confidences));
+             std::memcpy(state->weights, record.weights, sizeof(state->weights));
+         }
+@@ -2224,6 +2228,10 @@ uint32_t controlTrackingOffered() {
+             offered |= BASALT_TRACKING_FACE;
+         } else if (std::strcmp(word, "eyes") == 0) {
+             offered |= BASALT_TRACKING_EYES;
++        } else if (std::strcmp(word, "face_visual") == 0) {
++            offered |= BASALT_TRACKING_FACE_VISUAL;
++        } else if (std::strcmp(word, "face_audio") == 0) {
++            offered |= BASALT_TRACKING_FACE_AUDIO;
+         }
+     }
+     return offered;
+diff --git a/runtime/pe/control.hpp b/runtime/pe/control.hpp
+index a18b708..ac41eab 100644
+--- a/runtime/pe/control.hpp
++++ b/runtime/pe/control.hpp
+@@ -201,7 +201,8 @@ constexpr uint32_t kTrackedFaceConfidences = 2;
+ // tracking-features.txt next to the control file, which cranvr-host writes
+ // while a headset is connected. Zero without a daemon, without the gate, and
+ // without the file, so the runtime then lists exactly the extensions that it
+-// listed before.
++// listed before. The bits of the face's sources (FACE_VISUAL and FACE_AUDIO)
++// are in the result too.
+ uint32_t controlTrackingOffered();
+ 
+ // Tells cranvr-host which features the game uses now (BASALT_TRACKING_* bits).
+@@ -232,6 +233,8 @@ struct ControlBodyState {
+ 
+ struct ControlFaceState {
+     bool active;
++    // A sample came in this session, fresh or not: flags then holds its flags
++    bool received;
+     // 1 valid, 2 eye-following weights valid, 4 from audio
+     uint32_t flags;
+     float confidences[kTrackedFaceConfidences];
+diff --git a/runtime/pe/tracking.cpp b/runtime/pe/tracking.cpp
+index 3210d42..2389f5a 100644
+--- a/runtime/pe/tracking.cpp
++++ b/runtime/pe/tracking.cpp
+@@ -64,8 +64,11 @@ struct TrackerRecord {
+     uint32_t hand = 0;
+     // kBody: 70 or 84
+     uint32_t jointCount = 0;
+-    // kFace: bit 0 visual, bit 1 audio
++    // kFace: the data sources that the game listed: bit 0 visual, bit 1 audio. An empty list is both.
++    // The runtime serves the headset's face whatever the list says, see getFaceExpressionWeights2.
+     uint32_t sources = 0;
++    // kFace: the sources that the headset offered when the tracker was created
++    uint32_t offeredSources = 0;
+ };
+ 
+ constexpr uintptr_t kFirstTrackerHandle = static_cast<uintptr_t>(0x70000);
+@@ -122,9 +125,30 @@ bool extensionEnabled(uint32_t bit) {
+     return enabled;
+ }
+ 
++// The data sources of XR_FB_face_tracking2 as bits of TrackerRecord::sources
++constexpr uint32_t kSourceVisual = 1;
++constexpr uint32_t kSourceAudio = 2;
++
++// The face sources that the headset offers, as the file tracking-features.txt names them. A face
++// without a named source is of an unknown source: the runtime then says that it can serve both,
++// and each sample names its own. Zero while the headset offers no face.
++uint32_t offeredFaceSources(uint32_t offered) {
++    if ((offered & BASALT_TRACKING_FACE) == 0) {
++        return 0;
++    }
++    uint32_t sources = 0;
++    if ((offered & BASALT_TRACKING_FACE_VISUAL) != 0) {
++        sources |= kSourceVisual;
++    }
++    if ((offered & BASALT_TRACKING_FACE_AUDIO) != 0) {
++        sources |= kSourceAudio;
++    }
++    return sources != 0 ? sources : (kSourceVisual | kSourceAudio);
++}
++
+ XrResult createTracker(
+     XrSession session, TrackerKind kind, uint32_t hand, uint32_t jointCount, uint32_t sources,
+-    uintptr_t* handle) {
++    uintptr_t* handle, uint32_t offeredSources = 0) {
+     AcquireSRWLockExclusive(&gTrackingLock);
+     TrackerRecord* available = nullptr;
+     for (TrackerRecord& record : gTrackers) {
+@@ -144,6 +168,7 @@ XrResult createTracker(
+     available->hand = hand;
+     available->jointCount = jointCount;
+     available->sources = sources;
++    available->offeredSources = offeredSources;
+     *handle = available->handle;
+     ReleaseSRWLockExclusive(&gTrackingLock);
+     announceRequest(session);
+@@ -410,9 +435,12 @@ void fillTrackingSystemProperties(void* next) {
+                 (offered & BASALT_TRACKING_FULL_BODY) != 0 ? XR_TRUE : XR_FALSE;
+             break;
+         case XR_TYPE_SYSTEM_FACE_TRACKING_PROPERTIES2_FB: {
++            // A Quest 3 has no camera for the mouth: its face is the audio one, and a game that
++            // asks for the visual source would get no face from it
++            const uint32_t sources = offeredFaceSources(offered);
+             auto* face = reinterpret_cast<XrSystemFaceTrackingProperties2FB*>(structure);
+-            face->supportsVisualFaceTracking = (offered & BASALT_TRACKING_FACE) != 0 ? XR_TRUE : XR_FALSE;
+-            face->supportsAudioFaceTracking = XR_FALSE;
++            face->supportsVisualFaceTracking = (sources & kSourceVisual) != 0 ? XR_TRUE : XR_FALSE;
++            face->supportsAudioFaceTracking = (sources & kSourceAudio) != 0 ? XR_TRUE : XR_FALSE;
+             break;
+         }
+         case XR_TYPE_SYSTEM_EYE_GAZE_INTERACTION_PROPERTIES_EXT:
+@@ -656,22 +684,38 @@ XrResult XRAPI_CALL createFaceTracker2(
+     *faceTracker = XR_NULL_HANDLE;
+     if (createInfo == nullptr || createInfo->type != XR_TYPE_FACE_TRACKER_CREATE_INFO2_FB ||
+         createInfo->faceExpressionSet != XR_FACE_EXPRESSION_SET2_DEFAULT_FB ||
+-        createInfo->requestedDataSourceCount == 0 || createInfo->requestedDataSources == nullptr) {
++        (createInfo->requestedDataSourceCount != 0 && createInfo->requestedDataSources == nullptr)) {
+         return XR_ERROR_VALIDATION_FAILURE;
+     }
++    // The sources that the game listed. A duplicate is a validation failure by the spec.
+     uint32_t sources = 0;
+     for (uint32_t index = 0; index < createInfo->requestedDataSourceCount; ++index) {
+         const XrFaceTrackingDataSource2FB source = createInfo->requestedDataSources[index];
++        uint32_t bit = 0;
+         if (source == XR_FACE_TRACKING_DATA_SOURCE2_VISUAL_FB) {
+-            sources |= 1;
++            bit = kSourceVisual;
+         } else if (source == XR_FACE_TRACKING_DATA_SOURCE2_AUDIO_FB) {
+-            sources |= 2;
++            bit = kSourceAudio;
+         } else {
+             return XR_ERROR_VALIDATION_FAILURE;
+         }
++        if ((sources & bit) != 0) {
++            return XR_ERROR_VALIDATION_FAILURE;
++        }
++        sources |= bit;
+     }
++    if (createInfo->requestedDataSourceCount == 0) {
++        // The game takes any source
++        sources = kSourceVisual | kSourceAudio;
++    }
++    // The extension lets a runtime refuse a list that holds no source of the headset's face
++    // (XR_ERROR_FEATURE_UNSUPPORTED). This runtime makes the tracker instead and serves the
++    // headset's face with its true dataSource: a game that lists only the cameras then still gets
++    // the face of a Quest 3, which comes from the microphone. While no headset offers a face (it
++    // may reconnect), the tracker is made and reads none.
++    const uint32_t supported = offeredFaceSources(controlTrackingOffered());
+     uintptr_t handle = 0;
+-    const XrResult result = createTracker(session, TrackerKind::kFace, 0, 0, sources, &handle);
++    const XrResult result = createTracker(session, TrackerKind::kFace, 0, 0, sources, &handle, supported);
+     if (XR_SUCCEEDED(result)) {
+         *faceTracker = reinterpret_cast<XrFaceTracker2FB>(handle);
+     }
+@@ -705,9 +749,13 @@ XrResult XRAPI_CALL getFaceExpressionWeights2(
+     }
+     ControlFaceState state{};
+     controlFaceState(tracker.session, &state);
+-    const bool fromAudio = (state.flags & 4) != 0;
+-    const bool wanted = (tracker.sources & (fromAudio ? 2u : 1u)) != 0;
+-    const bool valid = state.active && (state.flags & 1) != 0 && wanted;
++    // The source of the newest sample. Before any sample came, the source that the headset offers
++    // when it offers one: the one that a face will come from.
++    bool fromAudio = (state.flags & 4) != 0;
++    if (!state.received) {
++        fromAudio = tracker.offeredSources == kSourceAudio;
++    }
++    const bool valid = state.active && (state.flags & 1) != 0;
+     expressionWeights->weightCount = kTrackedFaceWeights;
+     expressionWeights->confidenceCount = kTrackedFaceConfidences;
+     for (uint32_t index = 0; index < kTrackedFaceWeights; ++index) {
+diff --git a/runtime/tests/tracking_smoke.cpp b/runtime/tests/tracking_smoke.cpp
+index aefd6c7..4cf9a1d 100644
+--- a/runtime/tests/tracking_smoke.cpp
++++ b/runtime/tests/tracking_smoke.cpp
+@@ -4,9 +4,16 @@
+ // game's LOCAL space is the probe's room lifted by the floor's height of 0.3 m.
+ //
+ // Usage: tracking_smoke.exe [--features hands,body,full_body,face,eyes] [--wait-seconds N]
+-//                           [--seconds N]
++//                           [--seconds N] [--face-source visual|audio|unknown] [--live-face]
+ //   --features      the features that the headset must offer and that this program uses
+ //                   (default: all)
++//   --face-source   where the probe's face comes from: cameras, the microphone, or a face of an
++//                   unknown source (the probe's samples then come from the microphone). The
++//                   program checks that XrSystemFaceTrackingProperties2FB says so, that a tracker
++//                   which lists only the other source reads the face as well, and that every
++//                   sample's dataSource is the true one.
++//   --live-face     the face comes from a real headset, not from the probe's script: the program
++//                   takes any weights and confidences and checks the source and the validity only
+ //   --wait-seconds  how long to wait for the headset's features to show in the runtime's list of
+ //                   extensions (default 30). A game that starts before the headset connects sees
+ //                   none, so the test waits.
+@@ -161,6 +168,14 @@ struct Feature {
+     uint32_t bit;
+ };
+ 
++// Where the headset's face comes from, as the test's option names it
++enum class FaceSource {
++    kAny,
++    kVisual,
++    kAudio,
++    kUnknown,
++};
++
+ constexpr uint32_t kHands = 1;
+ constexpr uint32_t kBody = 2;
+ constexpr uint32_t kFullBody = 4;
+@@ -218,6 +233,8 @@ int main(int argc, char** argv) {
+     uint32_t wanted = kHands | kBody | kFullBody | kFace | kEyes;
+     double waitSeconds = 30.0;
+     double seconds = 20.0;
++    FaceSource faceSource = FaceSource::kAny;
++    bool liveFace = false;
+     for (int index = 1; index < argc; ++index) {
+         if (std::strcmp(argv[index], "--features") == 0 && index + 1 < argc) {
+             wanted = 0;
+@@ -238,8 +255,23 @@ int main(int argc, char** argv) {
+             waitSeconds = std::atof(argv[++index]);
+         } else if (std::strcmp(argv[index], "--seconds") == 0 && index + 1 < argc) {
+             seconds = std::atof(argv[++index]);
++        } else if (std::strcmp(argv[index], "--live-face") == 0) {
++            liveFace = true;
++        } else if (std::strcmp(argv[index], "--face-source") == 0 && index + 1 < argc) {
++            const char* word = argv[++index];
++            if (std::strcmp(word, "visual") == 0) {
++                faceSource = FaceSource::kVisual;
++            } else if (std::strcmp(word, "audio") == 0) {
++                faceSource = FaceSource::kAudio;
++            } else if (std::strcmp(word, "unknown") == 0) {
++                faceSource = FaceSource::kUnknown;
++            } else {
++                std::fputs("tracking_smoke: --face-source takes visual, audio or unknown\n", stderr);
++                return 2;
++            }
+         } else {
+-            std::fputs("usage: tracking_smoke [--features LIST] [--wait-seconds N] [--seconds N]\n", stderr);
++            std::fputs("usage: tracking_smoke [--features LIST] [--wait-seconds N] [--seconds N] "
++                       "[--face-source visual|audio|unknown] [--live-face]\n", stderr);
+             return 2;
+         }
+     }
+@@ -329,7 +361,19 @@ int main(int argc, char** argv) {
+     if ((wanted & kHands) != 0) report(handSupport.supportsHandTracking == XR_TRUE, "the system supports hand tracking");
+     if ((wanted & (kBody | kFullBody)) != 0) report(bodySupport.supportsBodyTracking == XR_TRUE, "the system supports body tracking");
+     if ((wanted & kFullBody) != 0) report(fullSupport.supportsFullBodyTracking == XR_TRUE, "the system supports full body tracking");
+-    if ((wanted & kFace) != 0) report(faceSupport.supportsVisualFaceTracking == XR_TRUE, "the system supports visual face tracking");
++    const bool visualSupported = faceSupport.supportsVisualFaceTracking == XR_TRUE;
++    const bool audioSupported = faceSupport.supportsAudioFaceTracking == XR_TRUE;
++    if ((wanted & kFace) != 0) {
++        report(visualSupported || audioSupported, "the system supports face tracking from a source (visual %d, audio %d)",
++               visualSupported, audioSupported);
++        if (faceSource != FaceSource::kAny) {
++            // A face of an unknown source may come from either
++            const bool visualExpected = faceSource == FaceSource::kVisual || faceSource == FaceSource::kUnknown;
++            const bool audioExpected = faceSource == FaceSource::kAudio || faceSource == FaceSource::kUnknown;
++            report(visualSupported == visualExpected && audioSupported == audioExpected,
++                   "the system names the headset's face source (visual %d, audio %d)", visualSupported, audioSupported);
++        }
++    }
+     if ((wanted & kEyes) != 0) report(eyeSupport.supportsEyeGazeInteraction == XR_TRUE, "the system supports eye gaze interaction");
+ 
+     // The tracking functions answer only for enabled extensions
+@@ -420,14 +464,63 @@ int main(int argc, char** argv) {
+             CHECK_XR(createBody(session, &info, &bodies[1]));
+         }
+     }
++    // A game lists the sources that the system says it supports. A second tracker lists none, which
++    // lets the runtime pick. A third lists only the source that the headset's face does not come
++    // from, as a game does that never looked at the support structure: it gets the face as well,
++    // and each sample's dataSource says where the face came from.
+     XrFaceTracker2FB face = XR_NULL_HANDLE;
+-    if ((wanted & kFace) != 0) {
+-        XrFaceTrackingDataSource2FB sources[1] = {XR_FACE_TRACKING_DATA_SOURCE2_VISUAL_FB};
++    XrFaceTracker2FB faceAnySource = XR_NULL_HANDLE;
++    XrFaceTracker2FB faceOtherSource = XR_NULL_HANDLE;
++    const bool wantFace = (wanted & kFace) != 0;
++    if (wantFace) {
++        XrFaceTrackingDataSource2FB sources[2]{};
++        uint32_t count = 0;
++        if (visualSupported) sources[count++] = XR_FACE_TRACKING_DATA_SOURCE2_VISUAL_FB;
++        if (audioSupported) sources[count++] = XR_FACE_TRACKING_DATA_SOURCE2_AUDIO_FB;
+         XrFaceTrackerCreateInfo2FB info = make<XrFaceTrackerCreateInfo2FB>(XR_TYPE_FACE_TRACKER_CREATE_INFO2_FB);
+         info.faceExpressionSet = XR_FACE_EXPRESSION_SET2_DEFAULT_FB;
+-        info.requestedDataSourceCount = 1;
++        info.requestedDataSourceCount = count;
+         info.requestedDataSources = sources;
+         CHECK_XR(createFace(session, &info, &face));
++        info.requestedDataSourceCount = 0;
++        info.requestedDataSources = nullptr;
++        CHECK_XR(createFace(session, &info, &faceAnySource));
++        if (faceSource != FaceSource::kAny) {
++            XrFaceTrackingDataSource2FB other[1] = {
++                faceSource == FaceSource::kVisual ? XR_FACE_TRACKING_DATA_SOURCE2_AUDIO_FB : XR_FACE_TRACKING_DATA_SOURCE2_VISUAL_FB};
++            info.requestedDataSourceCount = 1;
++            info.requestedDataSources = other;
++            CHECK_XR(createFace(session, &info, &faceOtherSource));
++        }
++
++        // What the creation answers for each list of sources. The extension makes a duplicate and a
++        // value that is no source a validation failure, and an empty list takes any source. A list
++        // that holds no source of the headset's face may be refused; this runtime makes the tracker.
++        auto tryCreate = [&](const char* what, XrFaceTrackingDataSource2FB* list, uint32_t count, XrResult expected) {
++            XrFaceTrackerCreateInfo2FB probe = make<XrFaceTrackerCreateInfo2FB>(XR_TYPE_FACE_TRACKER_CREATE_INFO2_FB);
++            probe.faceExpressionSet = XR_FACE_EXPRESSION_SET2_DEFAULT_FB;
++            probe.requestedDataSourceCount = count;
++            probe.requestedDataSources = list;
++            XrFaceTracker2FB made = XR_NULL_HANDLE;
++            const XrResult result = createFace(session, &probe, &made);
++            report(result == expected, "a face tracker that asks for %s answers %d (expected %d)", what,
++                   static_cast<int>(result), static_cast<int>(expected));
++            if (made != XR_NULL_HANDLE) {
++                destroyFace(made);
++            }
++        };
++        XrFaceTrackingDataSource2FB visual = XR_FACE_TRACKING_DATA_SOURCE2_VISUAL_FB;
++        XrFaceTrackingDataSource2FB audio = XR_FACE_TRACKING_DATA_SOURCE2_AUDIO_FB;
++        XrFaceTrackingDataSource2FB both[2] = {visual, audio};
++        XrFaceTrackingDataSource2FB twice[2] = {visual, visual};
++        XrFaceTrackingDataSource2FB nonsense[1] = {static_cast<XrFaceTrackingDataSource2FB>(7)};
++        tryCreate("the visual source", &visual, 1, XR_SUCCESS);
++        tryCreate("the audio source", &audio, 1, XR_SUCCESS);
++        tryCreate("both sources", both, 2, XR_SUCCESS);
++        tryCreate("no source", nullptr, 0, XR_SUCCESS);
++        tryCreate("the visual source twice", twice, 2, XR_ERROR_VALIDATION_FAILURE);
++        tryCreate("a value that is no source", nonsense, 1, XR_ERROR_VALIDATION_FAILURE);
++        tryCreate("one source and gives no list", nullptr, 1, XR_ERROR_VALIDATION_FAILURE);
+     }
+ 
+     // The eyes: an action on /user/eyes_ext/input/gaze_ext/pose
+@@ -519,6 +612,8 @@ int main(int argc, char** argv) {
+     bool handsOk[2] = {false, false};
+     bool bodyOk[2] = {false, false};
+     bool faceOk = false;
++    bool faceAnyOk = false;
++    bool faceOtherOk = false;
+     bool eyesOk = false;
+     bool velocitiesOk = false;
+     const uint64_t dataStart = unixMilliseconds();
+@@ -664,7 +759,10 @@ int main(int argc, char** argv) {
+                    bodyJoints[set], worstPosition * 1000.0f, worstAngle * 57.29578f, flagsOk ? "valid" : "WRONG", result.confidence);
+         }
+ 
+-        if (face != XR_NULL_HANDLE && !faceOk) {
++        // The probe's samples come from the source that --face-source names. Without it any source
++        // is right when the system names one only.
++        auto readFace = [&](XrFaceTracker2FB tracker, float* worst, float* lower, float* upper, XrBool32* valid,
++                            XrFaceTrackingDataSource2FB* source) {
+             float weights[XR_FACE_EXPRESSION2_COUNT_FB]{};
+             float confidences[XR_FACE_CONFIDENCE2_COUNT_FB]{};
+             XrFaceExpressionWeights2FB result = make<XrFaceExpressionWeights2FB>(XR_TYPE_FACE_EXPRESSION_WEIGHTS2_FB);
+@@ -674,17 +772,57 @@ int main(int argc, char** argv) {
+             result.confidences = confidences;
+             XrFaceExpressionInfo2FB info = make<XrFaceExpressionInfo2FB>(XR_TYPE_FACE_EXPRESSION_INFO2_FB);
+             info.time = time;
+-            CHECK_XR(faceWeights(face, &info, &result));
+-            if (result.isValid == XR_TRUE) {
+-                float worst = 0.0f;
+-                for (int i = 0; i < XR_FACE_EXPRESSION2_COUNT_FB; ++i) {
+-                    worst = std::max(worst, std::fabs(weights[i] - faceWeight(i)));
+-                }
+-                faceOk = worst < 0.003f && std::fabs(confidences[0] - 0.25f) < 0.003f &&
+-                         std::fabs(confidences[1] - 0.75f) < 0.003f &&
+-                         result.dataSource == XR_FACE_TRACKING_DATA_SOURCE2_VISUAL_FB;
+-                report(faceOk, "face: 70 weights within %.4f of the script, confidences %.2f and %.2f, visual source", worst,
+-                       confidences[0], confidences[1]);
++            const XrResult read = faceWeights(tracker, &info, &result);
++            *worst = 0.0f;
++            for (int i = 0; i < XR_FACE_EXPRESSION2_COUNT_FB; ++i) {
++                *worst = std::max(*worst, std::fabs(weights[i] - faceWeight(i)));
++            }
++            *lower = confidences[0];
++            *upper = confidences[1];
++            *valid = result.isValid;
++            *source = result.dataSource;
++            return read;
++        };
++        const bool visualSource = faceSource == FaceSource::kVisual;
++        const bool audioSource = faceSource == FaceSource::kAudio || faceSource == FaceSource::kUnknown;
++        auto sourceIsRight = [&](XrFaceTrackingDataSource2FB source) {
++            if (!visualSource && !audioSource) {
++                return true;
++            }
++            return source == (visualSource ? XR_FACE_TRACKING_DATA_SOURCE2_VISUAL_FB : XR_FACE_TRACKING_DATA_SOURCE2_AUDIO_FB);
++        };
++        const char* sourceName = faceSource == FaceSource::kVisual ? "visual" : (faceSource == FaceSource::kAny ? "any" : "audio");
++        auto faceMatches = [&](float worst, float lower, float upper, XrFaceTrackingDataSource2FB source) {
++            const bool scripted = worst < 0.003f && std::fabs(lower - 0.25f) < 0.003f && std::fabs(upper - 0.75f) < 0.003f;
++            return (liveFace || scripted) && sourceIsRight(source);
++        };
++        for (XrFaceTracker2FB tracker : {face, faceAnySource}) {
++            bool& done = tracker == face ? faceOk : faceAnyOk;
++            if (tracker == XR_NULL_HANDLE || done) {
++                continue;
++            }
++            float worst, lower, upper;
++            XrBool32 valid;
++            XrFaceTrackingDataSource2FB source;
++            CHECK_XR(readFace(tracker, &worst, &lower, &upper, &valid, &source));
++            if (valid == XR_TRUE) {
++                done = faceMatches(worst, lower, upper, source);
++                report(done, "face (%s): 70 weights within %.4f of the script, confidences %.2f and %.2f, data source %s (%s)",
++                       tracker == face ? "the sources that the system names" : "no source asked", worst, lower, upper,
++                       source == XR_FACE_TRACKING_DATA_SOURCE2_AUDIO_FB ? "audio" : "visual", sourceName);
++            }
++        }
++        // A tracker that lists only the other source gets the face too, and the sample still says
++        // where it came from.
++        if (faceOtherSource != XR_NULL_HANDLE && !faceOtherOk) {
++            float worst, lower, upper;
++            XrBool32 valid;
++            XrFaceTrackingDataSource2FB source;
++            CHECK_XR(readFace(faceOtherSource, &worst, &lower, &upper, &valid, &source));
++            if (valid == XR_TRUE) {
++                faceOtherOk = faceMatches(worst, lower, upper, source);
++                report(faceOtherOk, "face (only the other source listed): 70 weights within %.4f of the script, data source %s (%s)",
++                       worst, source == XR_FACE_TRACKING_DATA_SOURCE2_AUDIO_FB ? "audio" : "visual", sourceName);
+             }
+         }
+ 
+@@ -720,13 +858,14 @@ int main(int argc, char** argv) {
+ 
+         const bool allDone = ((wanted & kHands) == 0 || (handsOk[0] && handsOk[1])) &&
+                              (!wantBody || ((bodyOk[0] || bodies[0] == XR_NULL_HANDLE) && (bodyOk[1] || bodies[1] == XR_NULL_HANDLE))) &&
+-                             ((wanted & kFace) == 0 || faceOk) && ((wanted & kEyes) == 0 || eyesOk);
++                             (!wantFace || (faceOk && faceAnyOk && (faceOtherSource == XR_NULL_HANDLE || faceOtherOk))) &&
++                             ((wanted & kEyes) == 0 || eyesOk);
+         if (allDone) {
+             break;
+         }
+         if ((unixMilliseconds() - dataStart) / 1000.0 > seconds) {
+-            report(false, "not every feature's data arrived in %.0f seconds (hands %d %d, body %d %d, face %d, eyes %d)", seconds,
+-                   handsOk[0], handsOk[1], bodyOk[0], bodyOk[1], faceOk, eyesOk);
++            report(false, "not every feature's data arrived in %.0f seconds (hands %d %d, body %d %d, face %d %d %d, eyes %d)", seconds,
++                   handsOk[0], handsOk[1], bodyOk[0], bodyOk[1], faceOk, faceAnyOk, faceOtherOk, eyesOk);
+             break;
+         }
+     }
+@@ -742,7 +881,9 @@ int main(int argc, char** argv) {
+     for (XrBodyTrackerFB body : bodies) {
+         if (body != XR_NULL_HANDLE) destroyBody(body);
+     }
+-    if (face != XR_NULL_HANDLE) destroyFace(face);
++    for (XrFaceTracker2FB tracker : {face, faceAnySource, faceOtherSource}) {
++        if (tracker != XR_NULL_HANDLE) destroyFace(tracker);
++    }
+     report(destroyHand != nullptr && (wanted & kHands) == 0 ? true : (wanted & kHands) == 0 || destroyHand(hands[0]) == XR_ERROR_HANDLE_INVALID,
+            "a destroyed tracker's handle is invalid");
+     Sleep(1500);

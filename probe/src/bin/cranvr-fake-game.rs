@@ -244,6 +244,9 @@ struct Tracked {
     face: Option<Vec<u8>>,
     eyes: Option<Vec<u8>>,
     counts: [u32; 4],
+    /// The words of the runtime's tracking-features.txt when the first face came: the host writes them
+    /// for the headset's offer, and removes the file when the headset leaves
+    offered_words: Option<String>,
 }
 
 fn floats_of(bytes: &[u8]) -> Vec<f32> {
@@ -283,7 +286,7 @@ fn same_turn_within(a: [f32; 4], b: [f32; 4], tolerance: f32) -> bool {
 
 impl Tracked {
     /// What the script of tracked.rs must have brought for the features that the game used
-    fn problems(&self, used: &str) -> Vec<String> {
+    fn problems(&self, used: &str, face_source: tracked::FaceSource) -> Vec<String> {
         let mut out = Vec::new();
         let uses = |name: &str| used.split(',').any(|f| f == name);
         if uses("hands") {
@@ -337,7 +340,7 @@ impl Tracked {
         if uses("face") {
             match &self.face {
                 None => out.push("no face message".into()),
-                Some(p) if p.len() == 8 + 4 + 8 + 280 && u32_at(p, 8) == 1 => {
+                Some(p) if p.len() == 8 + 4 + 8 + 280 && u32_at(p, 8) == u32::from(face_source.flags()) => {
                     let values = floats_of(&p[12..]);
                     for (k, want) in tracked::FACE_CONFIDENCES.iter().enumerate() {
                         if (values[k] - want).abs() > 0.003 {
@@ -351,7 +354,20 @@ impl Tracked {
                         }
                     }
                 }
-                Some(p) => out.push(format!("face: {} bytes, flags {}", p.len(), u32_at(p, 8))),
+                Some(p) => out.push(format!(
+                    "face: {} bytes, flags {}, expected flags {} for the {} source",
+                    p.len(),
+                    u32_at(p, 8),
+                    face_source.flags(),
+                    face_source.word()
+                )),
+            }
+            // The headset's offer names the face's source for the game's runtime
+            let words: Vec<&str> = self.offered_words.as_deref().unwrap_or("").split_whitespace().collect();
+            let want = face_source.words();
+            let all = ["face", "face_visual", "face_audio"];
+            if all.iter().any(|word| words.contains(word) != want.contains(word)) {
+                out.push(format!("face: tracking-features.txt held {words:?}, expected the words {want:?} for the {} source", face_source.word()));
             }
         }
         if uses("eyes") {
@@ -464,6 +480,7 @@ fn main() {
     let (mut control, mut fps, mut seconds, mut expect_input) = (None, 72.0f64, 10.0f64, false);
     let (mut use_tracking, mut expect_tracking, mut expect_hand_controllers, mut expect_no_controllers) = (String::new(), false, false, false);
     let mut release_tracking = false;
+    let mut face_source = tracked::FaceSource::default();
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -476,8 +493,9 @@ fn main() {
             "--expect-hand-controllers" => expect_hand_controllers = true,
             "--expect-no-controllers" => expect_no_controllers = true,
             "--release-tracking" => release_tracking = true,
+            "--face-source" => face_source = args.next().as_deref().and_then(tracked::FaceSource::parse).expect("--face-source visual|audio|unknown"),
             _ => {
-                eprintln!("usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input] [--use-tracking FEATURES] [--expect-tracking] [--expect-hand-controllers] [--expect-no-controllers] [--release-tracking]");
+                eprintln!("usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input] [--use-tracking FEATURES] [--expect-tracking] [--face-source visual|audio|unknown] [--expect-hand-controllers] [--expect-no-controllers] [--release-tracking]");
                 std::process::exit(2);
             }
         }
@@ -493,6 +511,8 @@ fn main() {
     // sends no aim poses, because a runtime without the patch drops the connection at the message.
     let features = std::path::Path::new(&control_path).with_file_name("runtime-features.txt");
     fs::write(&features, "aim tracking\n").expect("write runtime-features.txt");
+    // The host writes the headset's features here for the runtime (see runtime_link.rs)
+    let tracking_file = std::path::Path::new(&control_path).with_file_name("tracking-features.txt");
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the host");
     stream.set_nodelay(true).ok();
     let name = b"cranvr-fake-game";
@@ -512,6 +532,7 @@ fn main() {
     let (consumed, consumed_rx) = mpsc::channel::<u64>();
     {
         let (head_ns, fov, input, tracked_data) = (Arc::clone(&head_ns), Arc::clone(&fov), Arc::clone(&input), Arc::clone(&tracked_data));
+        let tracking_file = tracking_file.clone();
         let mut reader = stream.try_clone().unwrap();
         let mut haptic_stream = stream.try_clone().unwrap();
         thread::spawn(move || {
@@ -577,6 +598,9 @@ fn main() {
                         let mut t = tracked_data.lock().unwrap();
                         t.counts[2] += 1;
                         t.face = Some(p);
+                        if t.offered_words.is_none() {
+                            t.offered_words = fs::read_to_string(&tracking_file).ok();
+                        }
                     }
                     EYE_GAZE => {
                         let mut t = tracked_data.lock().unwrap();
@@ -720,7 +744,7 @@ fn main() {
         tracked_data.counts[0], tracked_data.counts[1], tracked_data.counts[2], tracked_data.counts[3]
     );
     if expect_tracking {
-        let problems = tracked_data.problems(&use_tracking);
+        let problems = tracked_data.problems(&use_tracking, face_source);
         for problem in &problems {
             println!("fake-game: tracking problem: {problem}");
         }

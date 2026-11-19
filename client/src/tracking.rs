@@ -22,7 +22,7 @@
 //! controllers' poses go as they are too: the grip pose and the aim pose, each with its own
 //! velocities and with no offset. The host hands both to a game, which picks the one that it needs.
 
-use crate::tracked::{self, TrackedFrame, TrackedReader};
+use crate::tracked::{TrackedFrame, TrackedReader};
 use cranpose_xr::{Controller, Pose as XrPose, Recenter as XrRecenter, RenderViewpoint, TrackedPose, XrFrame};
 use cranvr_proto::{
     clock::now_ns,
@@ -131,7 +131,7 @@ impl FrameReader {
     /// The call comes before `Feed::push` of that result, so the sender finds the tracked data when it
     /// wakes for the frame.
     pub fn push_tracked(&mut self, xr: &XrFrame, read: &Read, feed: &Feed) {
-        feed.set_offer(tracked::offer(&xr.tracking));
+        feed.set_offer(self.tracked.offer(xr));
         let Some(frame) = read.frame else { return };
         let wish = feed.wish();
         if wish.is_empty() {
@@ -1096,6 +1096,19 @@ mod tests {
         let face = sent.iter().find_map(|d| if let ClientDatagram::Face(f) = d { Some(f) } else { None }).expect("a face");
         assert_eq!(face.weights().unwrap()[3], 1.0);
         assert!(!sent.iter().any(|d| matches!(d, ClientDatagram::Hands(_) | ClientDatagram::Eyes(_))), "the hands and the eyes were not wished");
+        assert_eq!(face.flags, cranvr_proto::tracking::face::VALID, "no source was named");
+
+        // The headset learns that its face comes from the microphone, as a Quest 3's does. The offer
+        // goes again with the source, and each sample says it too.
+        xr.meta_face.data_source = Some(cranpose_xr::FaceDataSource::Audio);
+        let with_source = offered.union(Features::FACE_AUDIO);
+        push(&xr, 550, with_source);
+        let heard = heard_for_a_moment(&inbox);
+        let offers: Vec<Features> = heard.iter().filter_map(|h| if let Heard::Control(ClientMsg::TrackingOffer(f)) = h { Some(*f) } else { None }).collect();
+        assert_eq!(offers, [with_source]);
+        assert!(with_source.offers_face_audio() && !with_source.offers_face_visual());
+        let face = datagrams(&heard).into_iter().find_map(|d| if let ClientDatagram::Face(f) = d { Some(f.clone()) } else { None }).expect("a face");
+        assert_eq!(face.flags, cranvr_proto::tracking::face::VALID | cranvr_proto::tracking::face::FROM_AUDIO);
 
         // The host wishes the eyes only
         feed.set_wish(Features::EYES);
@@ -1108,6 +1121,36 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         sender.join().unwrap();
+    }
+
+    #[test]
+    fn a_face_of_android_xr_reaches_the_host_as_the_70_weights_of_meta() {
+        use cranpose_xr::{FaceBlendShapeType, FaceConfidenceRegion, FaceExpression, FaceState, FaceTrackingProvider};
+        let (link, inbox) = loopback();
+        let mut xr = frame();
+        xr.face = FaceState { tracking_state: cranpose_xr::TrackingState::Tracking, is_valid: true, ..FaceState::default() };
+        xr.face.blend_shapes[FaceBlendShapeType::JawDrop.index()] = 0.5;
+        xr.face.blend_shapes[FaceBlendShapeType::TongueOut.index()] = 1.0;
+        // Android XR has tongue shapes that Meta lacks: they reach no slot
+        xr.face.blend_shapes[FaceBlendShapeType::TongueLeft.index()] = 1.0;
+        xr.face.confidence_regions[FaceConfidenceRegion::Lower.index()] = 0.25;
+        xr.face.confidence_regions[FaceConfidenceRegion::LeftUpper.index()] = 0.5;
+        xr.face.confidence_regions[FaceConfidenceRegion::RightUpper.index()] = 1.0;
+        let mut reader = TrackedReader::default();
+        let tracked = reader.read_face_of(&xr, 10, 20, Features::FACE, Some(FaceTrackingProvider::Android)).clone();
+        assert!(send_tracked(&link, &tracked, Features::FACE, &mut Outgoing::default()));
+        let heard = heard_for_a_moment(&inbox);
+        let sent = datagrams(&heard);
+        let face = sent.iter().find_map(|d| if let ClientDatagram::Face(f) = d { Some(f) } else { None }).expect("a face datagram");
+        assert_eq!((face.sample_time, face.display_time), (10, 20));
+        assert_eq!(face.flags, cranvr_proto::tracking::face::VALID | cranvr_proto::tracking::face::EYES_FOLLOWING_VALID);
+        let weights = face.weights().unwrap();
+        // A weight crosses the wire as a byte: within half a step of 1/255
+        assert!((weights[FaceExpression::JawDrop.index()] - 0.5).abs() < 0.003);
+        assert_eq!(weights[FaceExpression::TongueOut.index()], 1.0);
+        assert_eq!(weights.iter().filter(|w| **w > 0.0).count(), 2, "nothing else is set");
+        let confidences = face.confidences();
+        assert!((confidences[0] - 0.25).abs() < 0.003 && (confidences[1] - 0.75).abs() < 0.003, "{confidences:?}");
     }
 
     #[test]

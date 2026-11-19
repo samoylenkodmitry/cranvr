@@ -16,11 +16,12 @@
 //!   for the left hand), and turns about x by 2 i degrees relative to the wrist.
 //! - the body's root lies at [`BODY_AT`] and turns about y by [`BODY_YAW`] degrees. Joint `i` lies at
 //!   (0.01 i, 0.02 i, 0.005 i) from the root in the root's frame and turns about z by i degrees.
-//! - face weight `i` is ((7 i) mod 71) / 70. The confidences are 0.25 and 0.75.
+//! - face weight `i` is ((7 i) mod 71) / 70. The confidences are 0.25 and 0.75. The source of the face
+//!   is [`FaceSource`]: the microphone, as a Quest 3's face, unless the run says otherwise.
 //! - the gaze lies at [`GAZE_AT`] and turns about y by 15 degrees, then about x by -5 degrees.
 
 use cranvr_proto::{
-    tracking::{Body, BodySet, Eyes, Face, Hand, Hands, Joint, FACE_WEIGHTS, HAND_JOINTS},
+    tracking::{face, Body, BodySet, Eyes, Face, Features, Hand, Hands, Joint, FACE_WEIGHTS, HAND_JOINTS},
     wire::{Motion, Pose},
 };
 use glam::{Quat, Vec3};
@@ -97,8 +98,68 @@ pub fn face_weights() -> [f32; FACE_WEIGHTS] {
 
 pub const FACE_CONFIDENCES: [f32; 2] = [0.25, 0.75];
 
-pub fn face(sample_time: u64, display_time: u64) -> Face {
-    Face::new(sample_time, display_time, cranvr_proto::tracking::face::VALID, FACE_CONFIDENCES, &face_weights())
+/// Where the probe's face comes from. It sets the source that the offer names and the source that
+/// each sample says. The test program tracking_smoke.exe takes the same word as `--face-source`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FaceSource {
+    /// Cameras, as a Quest Pro's face
+    Visual,
+    /// The microphone, as a Quest 3's face
+    #[default]
+    Audio,
+    /// The offer names no source, as an older headset app does. The samples come from the microphone.
+    Unknown,
+}
+
+impl FaceSource {
+    pub fn parse(word: &str) -> Option<FaceSource> {
+        match word {
+            "visual" => Some(FaceSource::Visual),
+            "audio" => Some(FaceSource::Audio),
+            "unknown" => Some(FaceSource::Unknown),
+            _ => None,
+        }
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            FaceSource::Visual => "visual",
+            FaceSource::Audio => "audio",
+            FaceSource::Unknown => "unknown",
+        }
+    }
+
+    /// Every feature that the protocol has, with the face's source as this run names it
+    pub fn offer(self) -> Features {
+        match self {
+            FaceSource::Visual => Features::ALL.union(Features::FACE_VISUAL),
+            FaceSource::Audio => Features::ALL.union(Features::FACE_AUDIO),
+            FaceSource::Unknown => Features::ALL,
+        }
+    }
+
+    /// The flags of each face sample
+    pub fn flags(self) -> u8 {
+        match self {
+            FaceSource::Visual => face::VALID,
+            FaceSource::Audio | FaceSource::Unknown => face::VALID | face::FROM_AUDIO,
+        }
+    }
+
+    /// The words that the host writes to the runtime's tracking-features.txt for the face. Only
+    /// cranvr-fake-game reads that file, so the probe's own build never calls this.
+    #[allow(dead_code)]
+    pub fn words(self) -> &'static [&'static str] {
+        match self {
+            FaceSource::Visual => &["face", "face_visual"],
+            FaceSource::Audio => &["face", "face_audio"],
+            FaceSource::Unknown => &["face"],
+        }
+    }
+}
+
+pub fn face(sample_time: u64, display_time: u64, source: FaceSource) -> Face {
+    Face::new(sample_time, display_time, source.flags(), FACE_CONFIDENCES, &face_weights())
 }
 
 pub fn gaze() -> Pose {
@@ -125,6 +186,17 @@ mod tests {
         let body = body(1, 2, BodySet::Full);
         assert_eq!(body.joints().unwrap().len(), cranvr_proto::tracking::FULL_BODY_JOINTS);
         assert!(face_weights().iter().all(|w| (0.0..=1.0).contains(w)));
+        // The offer names the face's source, and each sample says its own
+        let audio = FaceSource::Audio;
+        assert!(audio.offer().offers_face_audio() && !audio.offer().offers_face_visual());
+        assert!(FaceSource::Visual.offer().offers_face_visual() && !FaceSource::Visual.offer().offers_face_audio());
+        assert!(FaceSource::Unknown.offer().contains(Features::FACE) && !FaceSource::Unknown.offer().offers_face_audio());
+        assert_eq!(face(1, 2, audio).flags, face::VALID | face::FROM_AUDIO);
+        assert_eq!(face(1, 2, FaceSource::Visual).flags, face::VALID);
+        for source in [FaceSource::Visual, FaceSource::Audio, FaceSource::Unknown] {
+            assert_eq!(FaceSource::parse(source.word()), Some(source));
+            assert_eq!(Features::from_names(source.words().iter().copied()), source.offer().intersect(Features::FACE.union(Features::FACE_SOURCES)));
+        }
         // The joints of the two hands differ in every position
         assert_ne!(hand_joints(0).1[5].pose.position, hand_joints(1).1[5].pose.position);
     }
