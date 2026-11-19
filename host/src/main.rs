@@ -120,9 +120,9 @@ fn usage() -> ! {
          \n  --trust-all       accept any client on the network, ALVR or native (for tests)\
          \n  --pair CODE       with --protocol native: pair a headset with the older cranvr app, which\
          \n                    shows a code of six digits when the host does not know it. A newer\
-         \n                    app waits instead: the cranvr app on this Mac shows Allow and Deny, or\
-         \n                    type `allow KEY` or `deny KEY` into this host's input (the status\
-         \n                    line gives the key). The host remembers the headset in\
+         \n                    app waits instead: the cranvr app on this Mac shows Allow and Deny. With\
+         \n                    --status you may type `allow KEY` or `deny KEY` into the host's input\
+         \n                    (the status line gives the key). The host remembers the headset in\
          \n                    paired-headsets.txt. It has a key of its own in host-identity.txt:\
          \n                    keep it, or the paired headsets refuse the host.\
          \n  --discovery-port N  with --protocol native: the UDP port that answers the headsets'\
@@ -441,8 +441,12 @@ fn main() {
                 mbps: headset::native::desktop::MBPS,
             };
             let config = native_config(&options, &config_dir, panel);
-            // The cranvr app sends the user's answers to the headsets' requests on the host's input
-            headset::native::read_answers(Arc::clone(&config.pairings));
+            // The cranvr app sends the user's answers to the headsets' requests on the host's input.
+            // A host without --status leaves its input alone: a background job that reads its
+            // terminal would stop.
+            if status::enabled() {
+                headset::native::read_answers(Arc::clone(&config.pairings));
+            }
             headset::native::start(config)
         }
         .unwrap_or_else(|e| {

@@ -232,7 +232,8 @@ fn failure_text(error: &Error, host: SocketAddr) -> String {
         Error::Timeout => format!("{host} did not answer. Is cranvr open on the Mac?"),
         Error::Closed => format!("{host} closed the connection"),
         Error::Io(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-            format!("{host} refused the connection. Is cranvr open on the Mac?")
+            // A Mac with an older cranvr that paired no headset listens on its own address only
+            format!("{host} refused the connection. Is cranvr open on the Mac? An older cranvr on the Mac may cause this: update cranvr on the Mac.")
         }
         other => other.to_string(),
     }
@@ -349,11 +350,12 @@ fn run(
     // host) is reached through no network. Its key is not checked, as the host does not check the
     // pairing of a client on loopback. Any other host must be the one that this headset paired with.
     let name = host_name(text);
-    // A Mac from the search may have a new address since the last pairing: the fingerprint finds its key
+    // A Mac from the search may have a new address since the last pairing: the fingerprint finds its key.
+    // The fingerprint comes first: an address that moved to another paired Mac must not look like a fake
     let pinned = if host.ip().is_loopback() {
         None
     } else {
-        crate::settings::host_key(&name).or_else(|| fingerprint.and_then(|fp| crate::settings::host_key_by_fingerprint(&fp)))
+        fingerprint.and_then(|fp| crate::settings::host_key_by_fingerprint(&fp)).or_else(|| crate::settings::host_key(&name))
     };
     let link = match ClientLink::connect_with(host, &caps, identity, pinned, CONNECT_TIMEOUT, &mut Waiting { hub, id, stop }) {
         Ok(link) => Arc::new(link),

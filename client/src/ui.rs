@@ -75,6 +75,9 @@ pub fn ClientApp() {
     let console = rememberMutableStateOf(|| hub().console());
     let backdrop = rememberMutableStateOf(|| hub().backdrop());
     let panels_shown = rememberMutableStateOf(settings::panels_shown);
+    // The address and the connect at launch belong to the app, not to the connect panel: a user who
+    // hid the panels still connects at launch
+    let address = address_field();
     LaunchedEffect((), async move |_| {
         if settings::console_on_launch() {
             hub().pin_console();
@@ -92,9 +95,14 @@ pub fn ClientApp() {
     FollowingSubspace(FollowTarget::View(FollowMode::Snap), move || {
         HeadsetFrames();
         // A flat window shows the panels in this order, side by side. In a headset each panel has
-        // its own place.
+        // its own place. The ball hides the panels for the time of a stream. While no link runs the
+        // connect panel shows anyway, so a user always sees how to connect and sees the code that
+        // the Mac asks them to compare.
+        let streaming = snapshot.get().state == LinkState::Streaming;
+        if panels_shown.get() || !streaming {
+            ConnectPanel(snapshot, address);
+        }
         if panels_shown.get() {
-            ConnectPanel(snapshot);
             StatsPanel(snapshot);
         }
         crate::desktop::DesktopPanel();
@@ -350,11 +358,10 @@ fn address_field() -> TextFieldState {
     address
 }
 
-/// The host address, a keypad for it and the Connect button. A headset has no keyboard in the
-/// room, so the keypad edits the same text as the field does.
+/// The connect panel: the Macs that the search found, and the address with its keypad behind a
+/// button. The app owns the address field (`address_field`).
 #[composable]
-fn ConnectPanel(snapshot: MutableState<Snapshot>) {
-    let address = address_field();
+fn ConnectPanel(snapshot: MutableState<Snapshot>, address: TextFieldState) {
     // In a headset a focused field must not ask for a software keyboard
     let in_headset = local_spatial_capabilities().current().is_spatial_ui_enabled();
     let pose = remember(|| place::start_pose("connect", side_pose(-1.0))).with(|pose| *pose);
@@ -367,7 +374,8 @@ fn ConnectPanel(snapshot: MutableState<Snapshot>) {
 
 /// The content of the connect panel. `modifier` gives its size. While no link runs, it lists the
 /// Macs that answered the search. A press on one connects. The address field and the keypad stay
-/// behind the small button "Enter an address", for a headset on USB and for another network.
+/// behind the small button "Enter an address", for a headset on USB and for another network. They
+/// replace the list while they show.
 #[composable]
 fn ConnectBody(snapshot: MutableState<Snapshot>, address: TextFieldState, modifier: Modifier, entry: Entry) {
     let snap = snapshot.get();
@@ -381,12 +389,14 @@ fn ConnectBody(snapshot: MutableState<Snapshot>, address: TextFieldState, modifi
             Text("cranvr", Modifier::empty(), text_style(44.0, TEXT_COLOR, Some(FontWeight::BOLD)));
             match state.clone() {
                 LinkState::Idle | LinkState::Failed(_) => {
-                    HostList(found.clone(), address);
-                    StatusLine(state.clone(), address);
-                    AddressButtons(typing, address);
+                    // The address entry takes the place of the list: both together would not fit the panel
                     if typing.get() {
                         AddressEntry(address, state.clone(), entry);
+                    } else {
+                        HostList(found.clone(), address);
                     }
+                    StatusLine(state.clone(), address);
+                    AddressButtons(typing, address);
                 }
                 LinkState::Waiting { code, host } => {
                     WaitingBody(code, host);
@@ -478,7 +488,7 @@ fn AddressButtons(typing: MutableState<bool>, address: TextFieldState) {
                 ButtonSpec::default(),
                 move || typing.set(!shown),
                 move || {
-                    Text(if shown { "Hide the address" } else { "Enter an address" }, Modifier::empty(), text_style(22.0, MUTED_COLOR, None));
+                    Text(if shown { "Show the Macs" } else { "Enter an address" }, Modifier::empty(), text_style(22.0, MUTED_COLOR, None));
                 },
             );
             ForgetHostButton(address);

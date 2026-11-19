@@ -27,7 +27,7 @@ This list covers a first run with cranvr's Cranpose client on a Quest. The clien
 
 A Quest that is not on the Mac's network connects over USB. Run `adb reverse tcp:9950 tcp:9950`, press "Enter an address" in the panel and type `127.0.0.1:9950`. The same button serves a Mac on another network, which the search does not reach. A connection over USB needs no code. The client keeps the last address that you pressed or typed. A start with the extras `--es host ADDRESS --ez connect true` connects to a Mac without a press (`adb shell am start ...`).
 
-The Mac and the headset update apart. When the two apps speak different protocol versions, both say which one to update: "Update cranvr on the Mac." or "Update the cranvr app on the headset." A Mac with a cranvr older than the headset's does not appear in the list, because it does not answer the search. Press "Enter an address" and type its address to see the advice. A headset that has paired with the Mac keeps connecting while both apps speak a common version. A headset with the older app that the Mac does not know cannot ask: the Mac shows a note that tells you to update the cranvr app on the headset.
+The Mac and the headset update apart. When the two apps speak different protocol versions, both say which one to update: "Update cranvr on the Mac." or "Update the cranvr app on the headset." A Mac with a cranvr older than the headset's does not appear in the list, because it does not answer the search. Press "Enter an address" and type its address to see the advice. A Mac with an older cranvr that never paired a headset listens on its own address only. The headset then says that the Mac refused the connection, and the text names the update of cranvr on the Mac as a cause. A headset that has paired with the Mac keeps connecting while both apps speak a common version. A headset with the older app that the Mac does not know cannot ask: the Mac shows a note that tells you to update the cranvr app on the headset.
 
 ## Work from the headset
 
@@ -74,6 +74,7 @@ The Network choice and the Low latency switch in the Settings tab count for this
 - A real Direct3D 11 OpenXR program under Wine at 120 Hz to the Tab: 119.7 frames a second.
 - The game sound from the Mac to the client: 20.5 seconds of sound in a 20-second run, over USB with TCP and over Wi-Fi with UDP.
 - The notice for an ALVR app of another version: a discovery packet with another protocol ID produced it.
+- The way of a new headset to the Mac, with a real host process on port 9962 and the client's connection code in a flat window on the Mac (`cargo test --manifest-path client/Cargo.toml -- --ignored a_new_headset`): the search found the host by its network address, the panel showed the code 172 624 and the host's status line listed the same code, Allow on the host's input paired the headset, and the client received 55 to 64 frames a second at 60 to 72 Hz with no loss. A second start of the client connected without a question. Unit and integration tests cover the messages of the search, the code, a middle machine (two different codes), a host that lies about its commitment, a refusal, a timeout, a headset that leaves, a second headset, a headset with the older protocol and a version mismatch.
 
 ## What the tests did not cover
 
@@ -82,3 +83,6 @@ The Network choice and the Low latency switch in the Settings tab count for this
 - Sound with the Mac muted. A tone at a Mac volume of 15% reached the client at its full level.
 - The controller as a mouse on the virtual display in a real headset. The switch of the main display ran with a test client on the Mac only.
 - The automatic switch to TCP in the window, for the ALVR client.
+- The search and the connect panel on a Galaxy Tab or a Quest. The Tab was locked by its screen lock, which the test cannot open. The UDP broadcast from Android is not tested: a router that drops broadcasts leaves the list empty, and the address field is the way around it.
+- The cranvr app's card with Allow and Deny, and the raise of its window when a headset asks. The window ran only in unit tests of its status lines.
+- A headset of the old protocol against the new Mac, and the reverse, on a device. A hand-written client of version 4 and a hand-written host of version 4 covered both in tests.
