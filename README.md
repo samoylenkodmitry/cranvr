@@ -1,6 +1,6 @@
 # cranvr
 
-cranvr streams VR from an Apple Silicon Mac to a Meta Quest. The Mac side is Rust. It renders and composes with Metal, encodes HEVC with VideoToolbox and sends the frames with cranvr's own protocol (`proto/`, crate `cranvr-proto`). The headset side is a Cranpose app (`client/`, package `cranvr-client`, application id `dev.cranvr.client2`). It uses only Cranpose's public API and plain Rust crates. It has no ndk, JNI, GL, OpenXR or platform code of its own. The same crate also builds as a flat app for an Android phone or tablet.
+cranvr streams VR from an Apple Silicon Mac to a Meta Quest. The Mac side is Rust. It renders and composes with Metal, encodes HEVC with VideoToolbox and sends the frames with cranvr's own protocol (`proto/`, crate `cranvr-proto`). The headset side is a Cranpose app (`client/`, package `cranvr-client`, application id `dev.cranvr.client`). It uses only Cranpose's public API and plain Rust crates. It has no ndk, JNI, GL, OpenXR or platform code of its own. The same crate also builds as a flat app for an Android phone or tablet.
 
 The goal is to play Windows SteamVR games on a Quest from a Mac. Windows games run under Wine with the OpenXR runtime and the DXMT fork from [BasaltVR](https://github.com/Stooovie/BasaltVR) (MIT). The game's frames reach the host as shared IOSurfaces. No frame passes through the CPU.
 
@@ -75,7 +75,7 @@ A game replaces the scene while it runs. The headset's Room setting (in its cons
 - The stats panel shows the frame rate, the decode time, the loss, the FEC recoveries, the sound and the latency. It also shows what the scene did with the decoded frames: how many it showed a second, how many it skipped and how many headset frames showed the last picture again.
 - A `SpatialFrameEffect` runs once for each headset frame. It hands the head pose, the eye views, both controllers and the predicted display time to the thread that sends the tracking.
 
-The launch arguments are intent extras on Android (`adb shell am start -n dev.cranvr.client2/dev.cranpose.android.CranposeActivity --es host 192.168.1.20:9950 --ez connect true`) and `--name=value` on a desktop (`--host=192.168.1.20:9950 --connect`):
+The launch arguments are intent extras on Android (`adb shell am start -n dev.cranvr.client/dev.cranpose.android.CranposeActivity --es host 192.168.1.20:9950 --ez connect true`) and `--name=value` on a desktop (`--host=192.168.1.20:9950 --connect`):
 
 | Argument | Meaning |
 |---|---|
@@ -113,7 +113,7 @@ The console has two settings of the client itself, which never go to the host: R
 
 ### Phone mode
 
-`scripts/build-client.sh --phone [--install SERIAL]` builds `target/client/cranvr-phone.apk` from the same crate. Its application id is `dev.cranvr.client2.phone` and its label is "cranvr phone". The build differs from the headset's in four places: the Cargo feature `phone` replaces `android` (the entry is `cranpose::android_main!`), the build has no OpenXR loader and no `xr` service, the Gradle property `cranvrPhone=true` switches the module and the phone's manifest turns the activity to landscape with the sensor. `cargo run --manifest-path client/Cargo.toml -- --phone --host=127.0.0.1:9950 --connect` runs the phone's app in a desktop window.
+`scripts/build-client.sh --phone [--install SERIAL]` builds `target/client/cranvr-phone.apk` from the same crate. Its application id is `dev.cranvr.client.phone` and its label is "cranvr phone". The build differs from the headset's in four places: the Cargo feature `phone` replaces `android` (the entry is `cranpose::android_main!`), the build has no OpenXR loader and no `xr` service, the Gradle property `cranvrPhone=true` switches the module and the phone's manifest turns the activity to landscape with the sensor. `cargo run --manifest-path client/Cargo.toml -- --phone --host=127.0.0.1:9950 --connect` runs the phone's app in a desktop window.
 
 - The picture fills the screen. A tap opens the connect panel and the stats panel over it. The Hide panels button closes them. They open again when the stream ends. The Recenter button puts the host's front where the screen points.
 - The head comes from the device's motion sensors (`client/src/phone.rs`). The first look along the horizon becomes the host's front. The head stays at a height of 1.6 m.
@@ -180,7 +180,7 @@ The protocol is at version 6. The crate still speaks version 4, so a headset and
 
 ## The USB cable
 
-A headset on a USB cable at the Mac connects over the cable without a typed address. The cable gives the stream TCP and a steady link. The Mac looks for the adb tool (the PATH, Android Studio's SDK, Homebrew's android-platform-tools). A Mac with none shows "Add USB support" in the Settings tab, which downloads Google's platform-tools into cranvr's folder. The Mac counts a device only when `dev.cranvr.client2` or the phone build is installed on it. The app then sets up `adb reverse` for the host's port. The headset lists "This Mac by USB cable" first (`app/src/usb.rs`, `client/src/usb.rs`, `cranvr_proto::link::probe_host`). The Settings tab has a Connection choice: Automatic, Wi-Fi or USB cable. When the cable comes out, the headset connects to the same Mac over Wi-Fi by itself after about three seconds. A Wi-Fi link never moves to the cable while it runs.
+A headset on a USB cable at the Mac connects over the cable without a typed address. The cable gives the stream TCP and a steady link. The Mac looks for the adb tool (the PATH, Android Studio's SDK, Homebrew's android-platform-tools). A Mac with none shows "Add USB support" in the Settings tab, which downloads Google's platform-tools into cranvr's folder. The Mac counts a device only when `dev.cranvr.client` or the phone build is installed on it. The app then sets up `adb reverse` for the host's port. The headset lists "This Mac by USB cable" first (`app/src/usb.rs`, `client/src/usb.rs`, `cranvr_proto::link::probe_host`). The Settings tab has a Connection choice: Automatic, Wi-Fi or USB cable. When the cable comes out, the headset connects to the same Mac over Wi-Fi by itself after about three seconds. A Wi-Fi link never moves to the cable while it runs.
 
 ## The sealed session
 

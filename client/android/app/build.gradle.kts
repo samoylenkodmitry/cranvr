@@ -30,12 +30,12 @@ cranpose {
 }
 
 android {
-    namespace = "dev.cranvr.client2"
+    namespace = "dev.cranvr.client"
     compileSdk = 37
 
     defaultConfig {
         // The phone's APK has its own id, so it installs beside the Quest's.
-        applicationId = if (phone) "dev.cranvr.client2.phone" else "dev.cranvr.client2"
+        applicationId = if (phone) "dev.cranvr.client.phone" else "dev.cranvr.client"
         minSdk = 24
         targetSdk = 36
         // A store takes an upload only with a higher version code than the last one

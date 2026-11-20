@@ -7,7 +7,7 @@
 # Usage: scripts/build-client.sh [--phone] [--xr-store STORE] [--install [SERIAL]]
 #   --phone    builds cranvr-phone.apk instead: the same crate as a flat app for an Android phone or
 #              tablet, with no OpenXR. The screen shows the picture and the motion sensors are the
-#              head. It has the application id dev.cranvr.client2.phone, so it installs beside the
+#              head. It has the application id dev.cranvr.client.phone, so it installs beside the
 #              headset's APK.
 #   --xr-store STORE  the store whose features the manifest carries: meta (the default of the Cranpose
 #              plugin), android-xr or open. The APK is named cranvr-client-STORE.apk, so a build
@@ -18,7 +18,7 @@
 #   ANDROID_HOME      the Android SDK (default ~/Library/Android/sdk)
 #   ANDROID_NDK_HOME  the NDK (default: the newest 28.x in the SDK, else the newest)
 #
-# The APK carries the application id dev.cranvr.client2 (dev.cranvr.client2.phone with --phone).
+# The APK carries the application id dev.cranvr.client (dev.cranvr.client.phone with --phone).
 # The Android debug key signs it, so later builds install over it.
 
 set -euo pipefail
@@ -47,9 +47,9 @@ for need in "${sdk}" "${ndk}"; do
 done
 work=${root}/target/client
 if (( phone )); then
-    name=cranvr-phone gradle_args=(-PcranvrPhone=true) app_id=dev.cranvr.client2.phone
+    name=cranvr-phone gradle_args=(-PcranvrPhone=true) app_id=dev.cranvr.client.phone
 else
-    name=cranvr-client gradle_args=() app_id=dev.cranvr.client2
+    name=cranvr-client gradle_args=() app_id=dev.cranvr.client
 fi
 if [[ -n ${store} ]]; then
     gradle_args+=("-PcranposeXrStore=${store}")

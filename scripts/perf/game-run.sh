@@ -9,7 +9,7 @@
 # The cranvr app must run with "cranvr client" as its Headset app (Settings tab). The headset
 # must be paired with it already (see "Pairing" in the README). The script wakes the headset
 # without a wearer (proximity sensor and guardian off), starts the Cranpose client
-# (dev.cranvr.client2) and the game without sound, records the host's stats and the Mac's GPU
+# (dev.cranvr.client) and the game without sound, records the host's stats and the Mac's GPU
 # use, then stops the game and gives the headset its guardian back. The proximity sensor stays
 # closed, so the headset stays awake.
 #
@@ -56,8 +56,8 @@ adb shell setprop debug.oculus.guardian_pause 1
 # of its launch
 launch_extras=(--ez connect true)
 [[ -n $CRANVR_HOST ]] && launch_extras+=(--es host $CRANVR_HOST)
-adb shell am force-stop dev.cranvr.client2
-adb shell am start -n dev.cranvr.client2/dev.cranpose.android.CranposeActivity $launch_extras > /dev/null
+adb shell am force-stop dev.cranvr.client
+adb shell am start -n dev.cranvr.client/dev.cranpose.android.CranposeActivity $launch_extras > /dev/null
 for i in {1..120}; do tail -n +$skip "$log" | grep -q "Headset connected" && break; sleep 1; done
 tail -n +$skip "$log" | grep -q "Headset connected" || { echo "no headset"; exit 1; }
 sleep 3

@@ -1,1 +1,1 @@
--keep class dev.cranvr.client2.** { *; }
+-keep class dev.cranvr.client.** { *; }
