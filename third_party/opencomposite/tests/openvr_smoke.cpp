@@ -17,7 +17,11 @@
 // With --load-only --runtime DIR it only loads DIR\bin\vrclient_x64.dll and asks it for its core, as
 // scripts/setup-wine.sh does to check an install. The runtime is then not found by the path file.
 //
-// Usage: openvr_smoke.exe [--seconds N] [--expect-input] [--load-only --runtime DIR]
+// --format rgba|bgra|bgra-typeless picks the format of the eye textures: R8G8B8A8_UNORM (the default; the runtime
+// of cranvr offers B8G8R8A8 only, so OpenComposite converts it with a draw), B8G8R8A8_UNORM (copied as it is) and
+// B8G8R8A8_TYPELESS with a UNORM view, which is the texture that a game such as Serious Sam VR submits.
+//
+// Usage: openvr_smoke.exe [--seconds N] [--expect-input] [--format F] [--load-only --runtime DIR]
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -261,6 +265,7 @@ int main(int argc, char** argv)
 {
 	double seconds = 15;
 	bool expect_input = false, load_only = false;
+	DXGI_FORMAT texture_format = DXGI_FORMAT_R8G8B8A8_UNORM, view_format = DXGI_FORMAT_R8G8B8A8_UNORM;
 	for (int i = 1; i < argc; i++) {
 		if (!std::strcmp(argv[i], "--seconds") && i + 1 < argc) {
 			seconds = std::atof(argv[++i]);
@@ -268,11 +273,24 @@ int main(int argc, char** argv)
 			expect_input = true;
 		} else if (!std::strcmp(argv[i], "--load-only")) {
 			load_only = true;
+		} else if (!std::strcmp(argv[i], "--format") && i + 1 < argc) {
+			const char* name = argv[++i];
+			if (!std::strcmp(name, "rgba")) {
+				texture_format = view_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			} else if (!std::strcmp(name, "bgra")) {
+				texture_format = view_format = DXGI_FORMAT_B8G8R8A8_UNORM;
+			} else if (!std::strcmp(name, "bgra-typeless")) {
+				texture_format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
+				view_format = DXGI_FORMAT_B8G8R8A8_UNORM;
+			} else {
+				std::fprintf(stderr, "--format takes rgba, bgra or bgra-typeless\n");
+				return 2;
+			}
 		} else if (!std::strcmp(argv[i], "--runtime") && i + 1 < argc) {
 			g_runtime_path = argv[++i];
 			g_runtime_given = true;
 		} else {
-			std::fprintf(stderr, "usage: openvr_smoke.exe [--seconds N] [--expect-input] [--load-only --runtime DIR]\n");
+			std::fprintf(stderr, "usage: openvr_smoke.exe [--seconds N] [--expect-input] [--format F] [--load-only --runtime DIR]\n");
 			return 2;
 		}
 	}
@@ -313,7 +331,7 @@ int main(int argc, char** argv)
 
 	uint32_t width = 0, height = 0;
 	system->GetRecommendedRenderTargetSize(&width, &height);
-	say("recommended render target %ux%u", width, height);
+	say("recommended render target %ux%u, eye textures of DXGI format %d", width, height, static_cast<int>(texture_format));
 	if (width < 256 || height < 256 || width > 8192 || height > 8192) {
 		return fail("the recommended render target size is not sane");
 	}
@@ -373,11 +391,14 @@ int main(int argc, char** argv)
 		desc.Height = height;
 		desc.MipLevels = 1;
 		desc.ArraySize = 1;
-		desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		desc.Format = texture_format;
 		desc.SampleDesc.Count = 1;
 		desc.Usage = D3D11_USAGE_DEFAULT;
 		desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-		if (FAILED(device->CreateTexture2D(&desc, nullptr, &targets[i])) || FAILED(device->CreateRenderTargetView(targets[i], nullptr, &views[i]))) {
+		D3D11_RENDER_TARGET_VIEW_DESC view_desc{};
+		view_desc.Format = view_format;
+		view_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+		if (FAILED(device->CreateTexture2D(&desc, nullptr, &targets[i])) || FAILED(device->CreateRenderTargetView(targets[i], &view_desc, &views[i]))) {
 			return fail("the render target of an eye");
 		}
 	}
