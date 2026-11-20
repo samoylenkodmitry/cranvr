@@ -225,7 +225,7 @@ fn hand_input(c: &Controller) -> HandInput {
             (c.menu, bit::MENU),
             (c.thumbstick.pressed, bit::STICK_CLICK),
             (c.trigger.value > CLICK_AT, bit::TRIGGER_CLICK),
-            (c.squeeze > CLICK_AT, bit::GRIP_CLICK),
+            (c.squeeze.value > CLICK_AT, bit::GRIP_CLICK),
         ]),
         touches: set(&[
             (c.primary.touched, bit::PRIMARY),
@@ -235,7 +235,7 @@ fn hand_input(c: &Controller) -> HandInput {
             (c.thumbrest_touched, bit::THUMB_REST),
         ]),
         trigger: c.trigger.value,
-        grip: c.squeeze,
+        grip: c.squeeze.value,
         stick: [c.thumbstick.x, c.thumbstick.y],
     }
 }
@@ -733,7 +733,7 @@ pub fn send_loop(link: &ClientLink, feed: &Feed, tracked: bool, refresh_hz: f32,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cranpose_xr::{Button, FieldOfView, Thumbstick, Trigger};
+    use cranpose_xr::{Button, FieldOfView, Squeeze, Thumbstick, Trigger};
     /// The wrist's place among the hand's joints
     const HAND_WRIST: usize = cranpose_xr::HandJointType::Wrist.index();
     use cranvr_proto::{
@@ -861,8 +861,8 @@ mod tests {
         xr.right_controller = Controller {
             grip: Some(TrackedPose { pose: pose_at(0.2, 1.1, -0.3), linear_velocity: Some([1.0, 0.0, 0.0]), angular_velocity: None }),
             aim: Some(TrackedPose { pose: XrPose { orientation: [0.0, 0.382_683_43, 0.0, 0.923_879_5], position: [0.2, 1.05, -0.4] }, linear_velocity: Some([1.0, 0.1, 0.0]), angular_velocity: Some([0.0, 0.5, 0.0]) }),
-            trigger: Trigger { value: 0.75, touched: true },
-            squeeze: 0.25,
+            trigger: Trigger { value: 0.75, pressed: true, touched: true },
+            squeeze: Squeeze { value: 0.25, pressed: false },
             thumbstick: Thumbstick { x: 0.5, y: -1.0, pressed: true, touched: true },
             primary: Button { pressed: true, touched: true },
             secondary: Button { pressed: false, touched: true },
@@ -998,8 +998,8 @@ mod tests {
             profile: Some(profile),
             aim: Some(TrackedPose { pose: pose_at(0.2, 1.1, -0.4), linear_velocity: None, angular_velocity: None }),
             grip: Some(TrackedPose { pose: pose_at(0.2, 1.1, -0.3), linear_velocity: None, angular_velocity: None }),
-            trigger: Trigger { value: 0.9, touched: true },
-            squeeze: 0.8,
+            trigger: Trigger { value: 0.9, pressed: true, touched: true },
+            squeeze: Squeeze { value: 0.8, pressed: true },
             ..Controller::default()
         };
         // The left hand holds a Touch controller. The right hand is a hand that the cameras track, and its pinch
@@ -1121,7 +1121,7 @@ mod tests {
         let mut reader = FrameReader::default();
         // The right trigger is pulled and a panel holds the right hand
         let mut xr = frame();
-        xr.right_controller.trigger = Trigger { value: 0.9, touched: true };
+        xr.right_controller.trigger = Trigger { value: 0.9, pressed: true, touched: true };
         let mut read = reader.read(&xr, 100);
         read.frame.as_mut().unwrap().held = [false, true];
         feed.push(read);

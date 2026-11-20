@@ -16,16 +16,14 @@
 
 use crate::{
     displays::{displays, PointerNow},
-    hover,
-    hub::hub,
-    place,
+    hover, place,
 };
 use cranpose::{launch_args, prelude::*};
 use cranpose_xr::{
-    Pose, ResizeLimits, ResizePolicy, SpatialExternalSurface, SpatialFrameEffect, SpatialMoveEvent, SpatialMoveEventType, SpatialPanel, SpatialResizeEventType,
+    Controller, Pose, ResizeLimits, ResizePolicy, SpatialExternalSurface, SpatialFrameEffect, SpatialMoveEvent, SpatialMoveEventType, SpatialPanel, SpatialResizeEventType,
     StereoMode, SubspaceModifier, XrFrame, METERS_PER_DP,
 };
-use cranvr_common::controls::{mouse, Action as ControlAction, Control, Controls, Hand as ControlHand};
+use cranvr_common::controls::{mouse, Hand as ControlHand};
 use cranvr_proto::message::DESKTOP_STREAM;
 use std::time::Duration;
 
@@ -105,20 +103,10 @@ fn stick_lean(frame: &XrFrame, axis: usize) -> f32 {
         .unwrap_or(0.0)
 }
 
-/// How far the thumbsticks lean in the axes that the mapping gives to scrolling: across, then
-/// forward. A stick whose axis does something else, or nothing, does not scroll. The stronger
-/// of the two sticks counts in each axis.
-fn scroll_lean(frame: &XrFrame, controls: &Controls) -> [f32; 2] {
-    let lean = |axis: usize, control: Control| {
-        [(ControlHand::Left, &frame.left_controller), (ControlHand::Right, &frame.right_controller)]
-            .into_iter()
-            .filter(|(hand, _)| controls.action(*hand, control) == ControlAction::Scroll)
-            .map(|(_, controller)| [controller.thumbstick.x, controller.thumbstick.y][axis])
-            .filter(|lean| lean.abs() >= DEAD_ZONE)
-            .max_by(|a, b| a.abs().total_cmp(&b.abs()))
-            .unwrap_or(0.0)
-    };
-    [lean(0, Control::StickHorizontal), lean(1, Control::StickVertical)]
+/// How far a controller's thumbstick leans across and forward, each from -1 to 1, with the dead zone
+/// left out.
+fn lean_of(controller: &Controller) -> [f32; 2] {
+    [controller.thumbstick.x, controller.thumbstick.y].map(|lean| if lean.abs() >= DEAD_ZONE { lean } else { 0.0 })
 }
 
 /// The surface's width and height in dp (a millimeter each) for a panel `width` meters wide that
@@ -157,7 +145,7 @@ pub fn RoomDisplay(stream: u8) {
     let cursor = rememberMutableStateOf(|| None::<[f32; 2]>);
     SpatialFrameEffect(move |frame: &XrFrame| {
         if !displays().view(stream).visible {
-            displays().update_pointer(stream, |pointer| *pointer = PointerNow::default());
+            displays().reset_pointers(stream);
             // A surface that leaves during a carry sends no `End`
             if carrying.get_non_reactive() {
                 carrying.set(false);
@@ -173,11 +161,13 @@ pub fn RoomDisplay(stream: u8) {
             if after != before {
                 width.set(after);
             }
+            // The stick that carries a panel scrolls nothing
+            displays().update_pointers(stream, |pointers| ControlHand::BOTH.into_iter().for_each(|hand| pointers.lean(hand, [0.0; 2])));
         } else if pointer_test() {
-            displays().update_pointer(stream, |pointer| *pointer = synthetic_pointer(frame.predicted_display_time));
+            displays().set_pointer(stream, synthetic_pointer(frame.predicted_display_time));
         } else {
-            let lean = scroll_lean(frame, &hub().controls());
-            displays().update_pointer(stream, |pointer| pointer.scroll = if pointer.hit.is_some() { lean } else { [0.0; 2] });
+            let leans = [lean_of(&frame.left_controller), lean_of(&frame.right_controller)];
+            displays().update_pointers(stream, |pointers| ControlHand::BOTH.into_iter().for_each(|hand| pointers.lean(hand, leans[hand.index()])));
         }
         let at = displays().cursor(stream);
         if cursor.get_non_reactive() != at {
@@ -241,7 +231,7 @@ fn Surface(stream: u8, modifier: SubspaceModifier, width: MutableState<f32>) {
         // The decoder stops before the callback returns, as the surface's owner requires. A surface
         // that leaves sends no `Exit`: a press that was on would stay down.
         scope.on_surface_destroyed(move |_| {
-            displays().update_pointer(stream, |pointer| *pointer = PointerNow::default());
+            displays().reset_pointers(stream);
             hover::clear_panel(id);
             displays().set_surface(stream, None);
         });
@@ -263,14 +253,14 @@ pub fn HandDisplay(stream: u8, base: [f32; 3]) {
     let width = rememberMutableStateOf(|| place::saved_width("hand-display").map_or(HAND_START_WIDTH, |width| width.clamp(HAND_WIDTH[0], HAND_WIDTH[1])));
     SpatialFrameEffect(move |frame: &XrFrame| {
         if !displays().view(stream).visible {
-            displays().update_pointer(stream, |pointer| *pointer = PointerNow::default());
+            displays().reset_pointers(stream);
             return;
         }
         if pointer_test() {
-            displays().update_pointer(stream, |pointer| *pointer = synthetic_pointer(frame.predicted_display_time));
+            displays().set_pointer(stream, synthetic_pointer(frame.predicted_display_time));
         } else {
-            let lean = scroll_lean(frame, &hub().controls());
-            displays().update_pointer(stream, |pointer| pointer.scroll = if pointer.hit.is_some() { lean } else { [0.0; 2] });
+            let leans = [lean_of(&frame.left_controller), lean_of(&frame.right_controller)];
+            displays().update_pointers(stream, |pointers| ControlHand::BOTH.into_iter().for_each(|hand| pointers.lean(hand, leans[hand.index()])));
         }
     });
     let view = view.get();

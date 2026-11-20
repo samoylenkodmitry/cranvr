@@ -155,18 +155,21 @@ The inputs of a Touch controller are the trigger, the grip, the two face buttons
 
 | Action | What it does |
 | --- | --- |
-| Left click, Right click, Middle click | The mouse button on the panel that the controller points at. On the Mac's desktop panel the host posts a real mouse event at the pointed place. |
-| Scroll | A thumbstick axis scrolls the panel that the controller points at. On the Mac's desktop panel the host posts scroll events, up and down and to the sides. Only a thumbstick axis offers it. |
-| Grab a window | Holds the panel that the controller points at and carries it. |
+| Left click, Right click, Middle click | The mouse button on the Mac's desktop panel. The host posts a real mouse event at the pointed place. |
+| Scroll | A thumbstick axis scrolls the Mac's desktop panel. The host posts scroll events, up and down and to the sides. Only a thumbstick axis offers it. |
 | Show or hide panels | The connection panel and the stream numbers together, as the panels' buttons of the hand menu do one by one. |
 | Open the console | Shows or hides the console. |
 | Recenter | Brings the panels in front of the user. The panels' subspace snaps to the head again. The front of a game's room is the system's: the Meta button's hold recenters it, and the headset passes that on to the game. |
 | Keyboard | Opens or closes the address field of the connect panel with its keyboard, while no link runs. |
 | Nothing | |
 
-The standard mapping is the same on both controllers: the trigger is the left click, the grip grabs a window, A and X are the right click, B and Y show or hide the panels, the thumbstick scrolls in both axes and its press is the middle click, as the press of a mouse's wheel is. The left menu button opens the console. The trigger's left click and the console's menu button are what the controllers did before the mapping existed. The two controllers are the same so that either hand can point.
+The standard mapping is the same on both controllers: the trigger is the left click, A and X are the right click, B and Y show or hide the panels, the thumbstick scrolls in both axes and its press is the middle click, as the press of a mouse's wheel is. The grip does nothing. The left menu button opens the console. The trigger's left click and the console's menu button are what the controllers did before the mapping existed. The two controllers are the same so that either hand can point. The menu button offers no mouse button.
 
-A mouse action and Grab work where the controller points at a panel, so they do nothing while a game is the only thing in view. The four actions of the headset work wherever the controller points. While no game runs, a press does the action. While a game runs, the button must stay down for 0.8 seconds, so that a short press stays with the game, as the menu button's hold always did (`client/src/controls.rs`).
+The mouse actions work on the Mac's desktop panel. Cranpose's pointer turns each input into one of Compose's five pointer buttons (`PointerSettings::set_mapping`): the client gives each input a button of its own (`client/src/controls.rs`: trigger primary, A and X secondary, the stick's press middle, the grip back, B and Y forward). A press then arrives at the desktop panel with the id of its hand (1 left, 2 right) and with the button of its input, and the panel looks up the action of that input and that hand in the user's mapping. So each hand has its own mapping, also for the thumbstick's two axes. The headset's own panels are different: Cranpose has one mapping for both hands, and the trigger clicks their buttons and takes their handles whatever it is set to. The thumbstick scrolls Cranpose's own panels while any axis of the mapping scrolls. The Mac has one mouse, so one controller drives it: the one that holds a button keeps it, the one that presses next takes it, and else the first that points at the panel (`Pointers` in `client/src/desktop.rs`).
+
+The four actions of the headset work wherever the controller points. While no game runs, a press does the action. While a game runs, the button must stay down for 0.8 seconds, so that a short press stays with the game, as the menu button's hold always did (`client/src/controls.rs`).
+
+The beams of the controllers show only while one of the app's own panels shows (connect, stats, console, desktop). A game draws its own rays. With every panel hidden in a game, the beams hide (`PointerSettings::set_beams_visible`) and the ball is pressed without one. The hold of a button that shows the panels again needs no beam.
 
 `cranvr_common::controls` holds the mapping for the app, the host and the headset. The app keeps it in `app.json` under `controls` (a missing or unknown entry takes the standard action), writes it into `vr-menu.json` and the host sends it to the headset with the menu. A change in the console goes back as `{"action": "set", "controls": {...}}` in `ClientMsg::Console`. The app saves it and the next menu repeats it. The console shows the change at once and keeps it against a menu that was on its way, for up to 3 seconds. The headset keeps the last mapping that the Mac sent (Cranpose's preferences service), so the buttons keep working without a link. The console's page shows that mapping and changes nothing while no link runs.
 

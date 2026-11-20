@@ -10,76 +10,48 @@ fn pressed(mask: u32) -> HandInput {
     HandInput { buttons: mask, ..HandInput::default() }
 }
 
-fn trigger(value: f32) -> HandInput {
-    HandInput { trigger: value, ..HandInput::default() }
+#[test]
+fn each_input_that_can_click_has_a_pointer_button_of_its_own() {
+    // The desktop panel finds the input from the button, so no two inputs may share one
+    let inputs = [Control::Trigger, Control::Grip, Control::Primary, Control::Secondary, Control::StickClick];
+    let buttons: Vec<_> = inputs.iter().map(|control| button_of(*control).unwrap()).collect();
+    for (i, a) in buttons.iter().enumerate() {
+        for b in &buttons[i + 1..] {
+            assert_ne!(a, b);
+        }
+    }
+    for control in inputs {
+        assert_eq!(control_of(button_of(control).unwrap()), control);
+    }
+    // The trigger clicks the headset's own panels, so it keeps the primary button
+    assert_eq!(button_of(Control::Trigger), Some(PointerButton::Primary));
+    assert!([Control::Menu, Control::StickVertical, Control::StickHorizontal].iter().all(|control| button_of(*control).is_none()));
 }
 
 #[test]
-fn the_standard_mapping_turns_each_button_into_its_mouse_button() {
-    let controls = Controls::default();
-    let mut runner = Runner::default();
-    let at = |hand, runner: &Runner| runner.pointer(hand);
-    // The right trigger is the left mouse button, as it always was
-    runner.update(&controls, &input(HandInput::default(), trigger(0.9)), 0, false);
-    assert_eq!(at(Hand::Right, &runner).buttons, mouse::LEFT);
-    assert_eq!(at(Hand::Left, &runner), HandPointer::default());
-    // A and the thumbstick's press are the right and the middle button. The grip grabs.
-    let mut held = pressed(bit::PRIMARY | bit::STICK_CLICK);
-    held.grip = 0.9;
-    runner.update(&controls, &input(HandInput::default(), held), 10 * MS, false);
-    assert_eq!(at(Hand::Right, &runner), HandPointer { buttons: mouse::RIGHT | mouse::MIDDLE, grab: true, scroll: [0.0; 2] });
-    // Both hands at once, each with its own buttons
-    runner.update(&controls, &input(pressed(bit::PRIMARY), trigger(0.9)), 20 * MS, false);
-    assert_eq!(at(Hand::Left, &runner).buttons, mouse::RIGHT);
-    assert_eq!(at(Hand::Right, &runner).buttons, mouse::LEFT);
-}
-
-#[test]
-fn the_thumbstick_scrolls_in_the_axes_that_the_mapping_gives_it() {
+fn cranpose_gets_one_button_for_each_input_and_scrolls_while_an_axis_scrolls() {
     let mut controls = Controls::default();
-    let mut runner = Runner::default();
-    let lean = HandInput { stick: [0.4, -0.8], ..HandInput::default() };
-    runner.update(&controls, &input(HandInput::default(), lean), 0, false);
-    assert_eq!(runner.pointer(Hand::Right).scroll, [0.4, -0.8]);
-    // The left stick scrolls too, and its lean does not reach the right hand's pointer
-    assert_eq!(runner.pointer(Hand::Left).scroll, [0.0, 0.0]);
-    // The user turns the sideways scroll off
-    controls.set(Hand::Right, Control::StickHorizontal, Action::Nothing);
-    runner.update(&controls, &input(HandInput::default(), lean), 10 * MS, false);
-    assert_eq!(runner.pointer(Hand::Right).scroll, [0.0, -0.8]);
-    controls.set(Hand::Right, Control::StickVertical, Action::Nothing);
-    runner.update(&controls, &input(HandInput::default(), lean), 20 * MS, false);
-    assert_eq!(runner.pointer(Hand::Right).scroll, [0.0, 0.0]);
-    assert!(!runner.pointer(Hand::Right).active());
-}
-
-#[test]
-fn a_button_does_what_the_user_mapped_to_it() {
-    let mut controls = Controls::default();
-    controls.set(Hand::Right, Control::Trigger, Action::RightClick);
-    controls.set(Hand::Right, Control::Secondary, Action::MiddleClick);
-    controls.set(Hand::Right, Control::Grip, Action::Nothing);
-    let mut runner = Runner::default();
-    let mut held = pressed(bit::SECONDARY);
-    held.trigger = 1.0;
-    held.grip = 1.0;
-    runner.update(&controls, &input(HandInput::default(), held), 0, false);
-    assert_eq!(runner.pointer(Hand::Right), HandPointer { buttons: mouse::RIGHT | mouse::MIDDLE, grab: false, scroll: [0.0; 2] });
-}
-
-#[test]
-fn the_trigger_keeps_its_press_between_the_two_thresholds() {
-    let controls = Controls::default();
-    let mut runner = Runner::default();
-    let down = |runner: &mut Runner, value: f32, at: u64| {
-        runner.update(&controls, &input(HandInput::default(), trigger(value)), at * MS, false);
-        runner.pointer(Hand::Right).buttons == mouse::LEFT
-    };
-    assert!(!down(&mut runner, 0.5, 0), "a trigger that is half pulled does not press");
-    assert!(down(&mut runner, 0.7, 1));
-    assert!(down(&mut runner, 0.5, 2), "it stays down until it falls below 0.4");
-    assert!(!down(&mut runner, 0.3, 3));
-    assert!(!down(&mut runner, 0.5, 4), "and needs 0.6 to press again");
+    let mapping = pointer_mapping(&controls);
+    for (input, control) in [
+        (ControllerInput::Trigger, Control::Trigger),
+        (ControllerInput::Squeeze, Control::Grip),
+        (ControllerInput::Primary, Control::Primary),
+        (ControllerInput::Secondary, Control::Secondary),
+        (ControllerInput::ThumbstickClick, Control::StickClick),
+    ] {
+        assert_eq!(mapping.button(input), button_of(control), "{input:?}");
+    }
+    assert_eq!(mapping.button(ControllerInput::Menu), None);
+    assert_eq!(mapping.scroll_speed(), 800.0);
+    // One axis of one hand that scrolls keeps Cranpose's own scrolling on
+    for hand in Hand::BOTH {
+        for axis in [Control::StickVertical, Control::StickHorizontal] {
+            controls.set(hand, axis, Action::Nothing);
+        }
+    }
+    assert_eq!(pointer_mapping(&controls).scroll_speed(), 0.0);
+    controls.set(Hand::Left, Control::StickHorizontal, Action::Scroll);
+    assert_eq!(pointer_mapping(&controls).scroll_speed(), 800.0);
 }
 
 #[test]
@@ -130,13 +102,19 @@ fn the_right_controller_has_no_menu_button_to_map() {
     assert!(fires.is_empty());
 }
 
+
 #[test]
-fn a_mouse_button_and_a_headset_action_can_share_a_controller() {
-    let mut controls = Controls::default();
-    controls.set(Hand::Right, Control::Primary, Action::Keyboard);
-    let mut runner = Runner::default();
-    let both = HandInput { buttons: bit::PRIMARY | bit::TRIGGER_CLICK, trigger: 1.0, ..HandInput::default() };
-    let fires = runner.update(&controls, &input(HandInput::default(), both), 0, false);
-    assert_eq!(fires, vec![Fire { hand: Hand::Right, action: Action::Keyboard }]);
-    assert_eq!(runner.pointer(Hand::Right).buttons, mouse::LEFT);
+fn the_beams_show_only_while_one_of_the_apps_own_panels_shows() {
+    // No link: the connect panel shows, so the beams do
+    assert!(beams_wanted(true, true, false, false, false));
+    assert!(beams_wanted(true, false, false, false, false), "the connect panel shows while no link streams");
+    // A stream with the panels shown, and a stream with them hidden and nothing else up
+    assert!(beams_wanted(true, true, true, false, false));
+    assert!(!beams_wanted(true, false, true, false, false), "a game with every panel hidden has no beam");
+    // The console, the desktop panel or both bring the beams back
+    assert!(beams_wanted(true, false, true, true, false));
+    assert!(beams_wanted(true, false, true, false, true));
+    // The hands belong to a game: no panel stands, and only the console or the desktop can show
+    assert!(!beams_wanted(false, true, false, false, false));
+    assert!(beams_wanted(false, true, false, true, false));
 }

@@ -9,7 +9,7 @@ use crate::{
     audio,
     connection::Connection,
     console::{Action, Backdrop, Console, Menu, Room, View as ConsoleView, Volume},
-    controls::{Fire, HandPointer, Runner},
+    controls::{Fire, Runner},
     displays::displays,
     discovery::FoundHost,
     settings,
@@ -701,11 +701,6 @@ impl Hub {
     /// The headset actions that fired and that the UI has not taken yet
     pub fn take_fires(&self) -> Vec<Fire> {
         std::mem::take(&mut *self.fires.lock().unwrap())
-    }
-
-    /// What a controller does to the panel that it points at, as of the last frame
-    pub fn hand_pointer(&self, hand: Hand) -> HandPointer {
-        self.runner.lock().unwrap().pointer(hand)
     }
 
     /// What the buttons of the controllers do now
