@@ -124,9 +124,10 @@ if (( openvr_wine )); then
     wine='C:\opencomposite\openvr_smoke.exe'
     wine_args=(--seconds $(( seconds - 6 )) --expect-input)
     export CRANVR_OPENCOMPOSITE=1
-    # OpenComposite spends about a millisecond of each frame on the OpenVR calls (a trivial program at
-    # 120 Hz reaches 105 to 107 frames a second), so the run asks the host for 90 Hz unless --fps says otherwise
-    (( fps != 120 )) || fps=90
+    # The run tests the path of an OpenVR program, not the rate: a trivial program made 105 to 107 frames a
+    # second at 120 Hz on a quiet Mac and 77 to 86 on a busy one (the OpenXR smoke made 118 on the same
+    # Mac), so the run asks the host for 72 Hz unless --fps says otherwise
+    (( fps != 120 )) || fps=72
 fi
 if (( tracking_wine )); then
     # The Windows program waits for the headset's features, starts a session and reads the data
