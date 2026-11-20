@@ -25,6 +25,8 @@ mod discovery;
 mod focus;
 mod hands;
 mod hold;
+mod hover;
+mod menu_model;
 mod hub;
 mod panel_layout;
 mod panels_ball;
