@@ -1,0 +1,120 @@
+diff --git a/DrvOpenXR/DrvOpenXR.cpp b/DrvOpenXR/DrvOpenXR.cpp
+index 5e3b863..f8b0207 100644
+--- a/DrvOpenXR/DrvOpenXR.cpp
++++ b/DrvOpenXR/DrvOpenXR.cpp
+@@ -221,6 +221,10 @@ IBackend* DrvOpenXR::CreateOpenXRBackend(const char* startupInfo)
+ 	if (availableExtensions.count(XR_KHR_VISIBILITY_MASK_EXTENSION_NAME))
+ 		extensions.push_back(XR_KHR_VISIBILITY_MASK_EXTENSION_NAME);
+ 
++	// cranvr: the headset's refresh rate, for the display frequency that a game reads
++	if (availableExtensions.count(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME))
++		extensions.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
++
+ 	if (availableExtensions.count(XR_EXT_HAND_TRACKING_EXTENSION_NAME))
+ 		extensions.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
+ 
+diff --git a/DrvOpenXR/XrHMD.cpp b/DrvOpenXR/XrHMD.cpp
+index ffeab79..7317fd8 100644
+--- a/DrvOpenXR/XrHMD.cpp
++++ b/DrvOpenXR/XrHMD.cpp
+@@ -328,8 +328,16 @@ float XrHMD::GetFloatTrackedDeviceProperty(vr::ETrackedDeviceProperty prop, vr::
+ 	TRY_PROFILE_PROP(float);
+ 
+ 	switch (prop) {
+-	case vr::Prop_DisplayFrequency_Float:
+-		return 90.0; // TODO use the real value
++	case vr::Prop_DisplayFrequency_Float: {
++		// cranvr: the runtime's rate, when it tells it (XR_FB_display_refresh_rate), else 90 Hz as before
++		float rate = 0.0f;
++		if (xr_ext && xr_ext->xrGetDisplayRefreshRateFB_Available()) {
++			auto lock = xr_session.lock_shared();
++			if (xr_session.get() != XR_NULL_HANDLE && XR_SUCCEEDED(xr_ext->xrGetDisplayRefreshRateFB(xr_session.get(), &rate)) && rate >= 1.0f)
++				return rate;
++		}
++		return 90.0;
++	}
+ 	case vr::Prop_LensCenterLeftU_Float:
+ 	case vr::Prop_LensCenterLeftV_Float:
+ 	case vr::Prop_LensCenterRightU_Float:
+diff --git a/OpenOVR/Misc/xr_ext.h b/OpenOVR/Misc/xr_ext.h
+index fe27f69..7093fa7 100644
+--- a/OpenOVR/Misc/xr_ext.h
++++ b/OpenOVR/Misc/xr_ext.h
+@@ -37,6 +37,7 @@
+ 
+ #include "../logging.h"
+ 
++#include "../RuntimeExtensions/XR_FB_display_refresh_rate.h"
+ #include "../RuntimeExtensions/XR_MNDX_xdev_space.h"
+ #include <openxr/openxr_platform.h>
+ 
+@@ -67,6 +68,14 @@ public:
+ 
+ 	bool G2Controller_Available() { return supportsG2Controller; }
+ 	bool xrGetVisibilityMaskKHR_Available() { return pfnXrGetVisibilityMaskKHR != nullptr; }
++
++	// XR_FB_display_refresh_rate: the rate of the display in Hz
++	bool xrGetDisplayRefreshRateFB_Available() { return pfnXrGetDisplayRefreshRateFB != nullptr; }
++	XrResult xrGetDisplayRefreshRateFB(XrSession session, float* displayRefreshRate)
++	{
++		OOVR_FALSE_ABORT(pfnXrGetDisplayRefreshRateFB);
++		return pfnXrGetDisplayRefreshRateFB(session, displayRefreshRate);
++	}
+ 	bool xrMndxXdevSpace_Available() { return pfnxrCreateXDevSpaceMNDX != nullptr; }
+ 
+ 	XrResult xrGetVisibilityMaskKHR(
+@@ -209,6 +218,7 @@ public:
+ 
+ private:
+ 	PFN_xrGetVisibilityMaskKHR pfnXrGetVisibilityMaskKHR = nullptr;
++	PFN_xrGetDisplayRefreshRateFB pfnXrGetDisplayRefreshRateFB = nullptr;
+ 	PFN_xrCreateHandTrackerEXT pfnXrCreateHandTrackerExt = nullptr;
+ 	PFN_xrDestroyHandTrackerEXT pfnXrDestroyHandTrackerExt = nullptr;
+ 	PFN_xrLocateHandJointsEXT pfnXrLocateHandJointsExt = nullptr;
+diff --git a/OpenOVR/Misc/xrutil.cpp b/OpenOVR/Misc/xrutil.cpp
+index 902bcd6..f6d3088 100644
+--- a/OpenOVR/Misc/xrutil.cpp
++++ b/OpenOVR/Misc/xrutil.cpp
+@@ -28,11 +28,14 @@ XrExt::XrExt(XrGraphicsApiSupportedFlags apis, const std::vector<const char*>& e
+ {
+ 	// Check the extensions we have selected, and don't fetch functions if we're not allowed to use them
+ 	bool hasVisMask = false;
++	bool hasDisplayRefreshRate = false;
+ 	bool hasHandTracking = false;
+ 	bool xdevSpace = false;
+ 	for (const char* ext : extensions) {
+ 		if (strcmp(ext, XR_KHR_VISIBILITY_MASK_EXTENSION_NAME) == 0)
+ 			hasVisMask = true;
++		if (strcmp(ext, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME) == 0)
++			hasDisplayRefreshRate = true;
+ 		if (strcmp(ext, XR_EXT_HAND_TRACKING_EXTENSION_NAME) == 0)
+ 			hasHandTracking = true;
+ 		if (strcmp(ext, XR_EXT_HP_MIXED_REALITY_CONTROLLER_EXTENSION_NAME) == 0)
+@@ -47,6 +50,9 @@ XrExt::XrExt(XrGraphicsApiSupportedFlags apis, const std::vector<const char*>& e
+ 	if (hasVisMask)
+ 		XR_BIND_OPT(xrGetVisibilityMaskKHR, pfnXrGetVisibilityMaskKHR);
+ 
++	if (hasDisplayRefreshRate)
++		XR_BIND_OPT(xrGetDisplayRefreshRateFB, pfnXrGetDisplayRefreshRateFB);
++
+ 	if (hasHandTracking) {
+ 		XR_BIND(xrCreateHandTrackerEXT, pfnXrCreateHandTrackerExt);
+ 		XR_BIND(xrDestroyHandTrackerEXT, pfnXrDestroyHandTrackerExt);
+diff --git a/RuntimeExtensions/XR_FB_display_refresh_rate.h b/RuntimeExtensions/XR_FB_display_refresh_rate.h
+new file mode 100644
+index 0000000..99f16c6
+--- /dev/null
++++ b/RuntimeExtensions/XR_FB_display_refresh_rate.h
+@@ -0,0 +1,12 @@
++// cranvr: the one function of XR_FB_display_refresh_rate that OpenComposite uses. The OpenXR SDK that
++// OpenComposite bundles (1.0.12) predates the extension. The names and values are the ones of the
++// Khronos registry (the extension is version 1).
++#pragma once
++
++#include <openxr/openxr.h>
++
++#ifndef XR_FB_display_refresh_rate
++#define XR_FB_display_refresh_rate 1
++#define XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME "XR_FB_display_refresh_rate"
++typedef XrResult(XRAPI_PTR* PFN_xrGetDisplayRefreshRateFB)(XrSession session, float* displayRefreshRate);
++#endif

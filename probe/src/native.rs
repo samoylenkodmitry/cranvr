@@ -33,7 +33,7 @@ use std::{
     f32::consts::FRAC_PI_4,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
@@ -56,6 +56,9 @@ pub struct Options {
     pub tracking: bool,
     /// With `tracking`: no controller is tracked
     pub no_controllers: bool,
+    /// The head stands still, as it does with `tracking`, so that a game's room is the probe's room
+    /// and its controller poses can be compared with the script's numbers
+    pub still_head: bool,
     /// With `tracking`: where the face comes from
     pub face_source: tracked::FaceSource,
     /// Loses the input focus at this many seconds for this many seconds, as under the system's
@@ -103,6 +106,10 @@ struct Counters {
     malformed: AtomicU64,
     key_requests: AtomicU64,
     haptics: AtomicU64,
+    /// Pulses with no amplitude, and the strongest amplitude (as f32 bits) among the others: what a game's
+    /// pulses were worth
+    haptics_zero: AtomicU64,
+    haptics_max_bits: AtomicU32,
 }
 
 /// What the decode thread measured, in ms per frame.
@@ -147,6 +154,7 @@ struct Shared {
     /// The tracking that the host asked for last, as bits of `Features`, and what the probe sent
     wish: AtomicU8,
     tracking: bool,
+    still_head: bool,
     no_controllers: bool,
     face_source: tracked::FaceSource,
     sent_tracking: [AtomicU64; 4],
@@ -255,6 +263,7 @@ pub fn run(o: Options) -> i32 {
         desktop: o.desktop.then(DesktopProbe::new),
         wish: AtomicU8::new(0),
         tracking: o.tracking,
+        still_head: o.tracking || o.still_head,
         no_controllers: o.no_controllers,
         face_source: o.face_source,
         sent_tracking: Default::default(),
@@ -343,14 +352,16 @@ pub fn run(o: Options) -> i32 {
     let r = results.lock().unwrap();
     let expected = (o.seconds * fps) as u64;
     println!(
-        "probe: done: {} received, {} decoded ({} good, {} wrong) at {}x{}, expected about {expected}; {} haptic pulses",
+        "probe: done: {} received, {} decoded ({} good, {} wrong) at {}x{}, expected about {expected}; {} haptic pulses ({} of them with no amplitude, the strongest {:.2})",
         r.received,
         r.decoded,
         r.good,
         r.bad,
         r.size.0,
         r.size.1,
-        shared.counters.haptics.load(Ordering::Relaxed)
+        shared.counters.haptics.load(Ordering::Relaxed),
+        shared.counters.haptics_zero.load(Ordering::Relaxed),
+        f32::from_bits(shared.counters.haptics_max_bits.load(Ordering::Relaxed))
     );
     print_summary(&shared, &r, o.seconds, expected);
     if o.tracking {
@@ -433,9 +444,15 @@ fn read_loop(shared: &Arc<Shared>, units: &mpsc::Sender<Received>, udp: bool) {
         Incoming::Datagram(HostDatagram::Pong(p)) => {
             shared.clock.lock().unwrap().add(p.ping_sent, p.received, p.sent, now_ns());
         }
-        Incoming::Datagram(HostDatagram::Haptics(_)) => {
+        Incoming::Datagram(HostDatagram::Haptics(pulse)) => {
             if shared.counters.haptics.fetch_add(1, Ordering::Relaxed) == 0 {
                 println!("probe: first haptic pulse");
+            }
+            if pulse.amplitude <= 0.0 {
+                shared.counters.haptics_zero.fetch_add(1, Ordering::Relaxed);
+            } else {
+                // Amplitudes above zero order like their bits
+                shared.counters.haptics_max_bits.fetch_max(pulse.amplitude.to_bits(), Ordering::Relaxed);
             }
         }
         Incoming::Datagram(HostDatagram::Audio(audio)) => {
@@ -558,7 +575,7 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
         // sample. The head's pose is the one that is valid then, as a headset predicts it.
         let display_time = next_refresh(vsync_origin, period_ns, sample_time + 2 * period_ns);
         // A tracking script keeps the head still: the game's LOCAL space is then the room itself
-        let head = if shared.tracking { head_at(shared.pose_origin, shared.pose_origin) } else { head_at(shared.pose_origin, display_time) };
+        let head = if shared.still_head { head_at(shared.pose_origin, shared.pose_origin) } else { head_at(shared.pose_origin, display_time) };
         // The left hand stays where it is. The right hand swings 10 cm to each side of a point in
         // front of the head, with its velocity. Each hand has a grip pose and its own aim pose
         // (see hands.rs).

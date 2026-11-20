@@ -1,0 +1,126 @@
+diff --git a/runtime/pe/input.cpp b/runtime/pe/input.cpp
+index 2882035..69a777e 100644
+--- a/runtime/pe/input.cpp
++++ b/runtime/pe/input.cpp
+@@ -260,6 +260,9 @@ struct SyncedActionState {
+     XrTime lastChangeTime = 0;
+     uint32_t poseHand = UINT32_MAX;
+     BindingKind poseKind = BindingKind::kUnknown;
++    // cranvr: how often the log told that the action became active and changed (see logActionState)
++    bool loggedActive = false;
++    uint8_t loggedChanges = 0;
+ };
+ 
+ struct ActionRecord {
+@@ -646,6 +649,43 @@ void resolveBindingPrioritiesLocked() {
+     }
+ }
+ 
++// cranvr: the game's log (stderr, which the cranvr app keeps as the game's log) tells what reached the
++// game: the first time that each action of each hand is active and its first two changes. A game
++// that binds no action, or binds one that no controller input reaches, shows nothing here. The
++// lines of the first kind stop after 80, and so do the lines of the second kind.
++uint32_t gActiveLogLines = 0;
++uint32_t gChangeLogLines = 0;
++constexpr uint32_t kMaxActionLogLines = 80;
++
++void logActionState(const ActionRecord& action, const SyncedActionState& state, const char* what, uint32_t& lines) {
++    if (lines >= kMaxActionLogLines) {
++        return;
++    }
++    ++lines;
++    const char* hand = state.selectedHandMask == 1u   ? "left hand"
++                       : state.selectedHandMask == 2u ? "right hand"
++                       : state.selectedHandMask == 4u ? "eyes"
++                                                      : "both hands";
++    char value[64] = "";
++    switch (action.actionType) {
++    case XR_ACTION_TYPE_BOOLEAN_INPUT:
++        std::snprintf(value, sizeof(value), "%s", state.booleanValue ? "pressed" : "released");
++        break;
++    case XR_ACTION_TYPE_FLOAT_INPUT:
++        std::snprintf(value, sizeof(value), "%.2f", state.floatValue);
++        break;
++    case XR_ACTION_TYPE_VECTOR2F_INPUT:
++        std::snprintf(value, sizeof(value), "(%.2f, %.2f)", state.vectorValue.x, state.vectorValue.y);
++        break;
++    case XR_ACTION_TYPE_POSE_INPUT:
++        std::snprintf(value, sizeof(value), "pose of the %s is tracked", hand);
++        break;
++    default:
++        break;
++    }
++    std::fprintf(stderr, "Basalt OpenXR: action %s (%s) %s %s\n", action.name, hand, what, value);
++}
++
+ void syncOneState(
+     ActionRecord& action,
+     SyncedActionState& state,
+@@ -752,6 +792,11 @@ void syncOneState(
+         state.lastChangeTime = 0;
+         return;
+     }
++    // The state of both hands together repeats the state of one hand
++    if (!state.loggedActive && requestedHand >= 0) {
++        state.loggedActive = true;
++        logActionState(action, state, "is active:", gActiveLogLines);
++    }
+     if (!wasActive) {
+         state.lastChangeTime = physicalChangeTime;
+         return;
+@@ -773,6 +818,10 @@ void syncOneState(
+     if (state.changed) {
+         state.lastChangeTime = physicalChangeTime > 0
+             ? physicalChangeTime : inputTimeNow();
++        if (state.loggedChanges < 2 && requestedHand >= 0) {
++            ++state.loggedChanges;
++            logActionState(action, state, "changed to", gChangeLogLines);
++        }
+     }
+ }
+ 
+@@ -1188,6 +1237,27 @@ XrResult XRAPI_CALL attachSessionActionSets(
+         eyesBound = action != nullptr && findActionSetLocked(action->actionSet) != nullptr &&
+                     findActionSetLocked(action->actionSet)->attachedSession == session;
+     }
++    // cranvr: what the game bound, for the game's log
++    uint32_t attachedActions = 0;
++    uint32_t boundActions = 0;
++    for (const ActionRecord& action : gActions) {
++        const ActionSetRecord* set = action.handleAlive ? findActionSetLocked(action.actionSet) : nullptr;
++        if (set == nullptr || set->attachedSession != session) {
++            continue;
++        }
++        ++attachedActions;
++        for (size_t index = 0; index < gTouchBindingCount; ++index) {
++            if (gTouchBindings[index].action == action.handle) {
++                ++boundActions;
++                break;
++            }
++        }
++    }
++    std::fprintf(
++        stderr,
++        "Basalt OpenXR: %u action sets with %u actions are attached; %u of the actions have a "
++        "binding for the Touch controllers (%zu bindings)\n",
++        attachInfo->countActionSets, attachedActions, boundActions, gTouchBindingCount);
+     ReleaseSRWLockExclusive(&gInputLock);
+     if (eyesBound) {
+         trackingEyeGazeBound(session, true);
+@@ -1358,8 +1428,14 @@ XrResult XRAPI_CALL syncActions(
+                     controller.profileId == kQuestTouchProfileId
+                 ? gTouchProfilePath
+                 : XR_NULL_PATH;
+-        interactionProfileChanged = interactionProfileChanged ||
+-            gCurrentInteractionProfiles[handIndex] != nextProfile;
++        if (gCurrentInteractionProfiles[handIndex] != nextProfile) {
++            interactionProfileChanged = true;
++            // cranvr: the game's log tells when a controller joins or leaves
++            std::fprintf(
++                stderr, "Basalt OpenXR: the %s controller %s\n", handIndex == 0 ? "left" : "right",
++                nextProfile != XR_NULL_PATH ? "is tracked and uses the Touch controller profile"
++                                            : "is gone");
++        }
+         gCurrentInteractionProfiles[handIndex] = nextProfile;
+     }
+     // cranvr: the eyes' profile is current while the gaze is tracked

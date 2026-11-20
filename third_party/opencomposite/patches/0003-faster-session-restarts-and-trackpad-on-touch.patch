@@ -1,0 +1,77 @@
+diff --git a/DrvOpenXR/DrvOpenXR.cpp b/DrvOpenXR/DrvOpenXR.cpp
+index 61e5422..5e3b863 100644
+--- a/DrvOpenXR/DrvOpenXR.cpp
++++ b/DrvOpenXR/DrvOpenXR.cpp
+@@ -362,16 +362,21 @@ void DrvOpenXR::ShutdownSession()
+ 	if (currentBackend->sessionActive) {
+ 		// Hey it turns out that xrDestroySession can be called whenever - how convenient
+ 		OOVR_FAILED_XR_ABORT(xrRequestExitSession(xr_session.get()));
+-		int count = 0;
+-		while (currentBackend->GetSessionState() != XR_SESSION_STATE_EXITING && count++ < 10) {
+-			const int durationMs = 250;
+-			OOVR_LOGF("Session Exit state has not been reached yet, waiting %dms ...", durationMs);
++		// cranvr: poll the events every 2 ms for up to 2.5 s. The first poll comes before any sleep: a runtime
++		// that has the exit state ready (cranvr's has, at once) no longer costs the game a quarter of a
++		// second for each restart of the session (a game that asks for input restarts it twice).
++		currentBackend->PumpEvents();
++		int waitedMs = 0;
++		while (currentBackend->GetSessionState() != XR_SESSION_STATE_EXITING && waitedMs < 2500) {
++			if (waitedMs == 0)
++				OOVR_LOG("Session Exit state has not been reached yet, waiting ...");
+ #ifdef _WIN32
+-			Sleep(durationMs);
++			Sleep(2);
+ #else
+-			struct timespec ts = { 0, durationMs * 1000000 };
++			struct timespec ts = { 0, 2 * 1000000 };
+ 			nanosleep(&ts, &ts);
+ #endif
++			waitedMs += 2;
+ 			currentBackend->PumpEvents();
+ 		}
+ 	}
+diff --git a/DrvOpenXR/XrBackend.cpp b/DrvOpenXR/XrBackend.cpp
+index 6b0f7c6..93bf64c 100644
+--- a/DrvOpenXR/XrBackend.cpp
++++ b/DrvOpenXR/XrBackend.cpp
+@@ -852,15 +852,18 @@ void XrBackend::OnSessionCreated()
+ 
+ 	// Wait until we transition to the idle state.
+ 	// This sets the time, so OpenXR calls which use that will work correctly.
++	// cranvr: poll every 2 ms, not every 250 ms (see ShutdownSession)
++	bool logged = false;
+ 	while (sessionState == XR_SESSION_STATE_UNKNOWN) {
+-		const int durationMs = 250;
+-
+-		OOVR_LOGF("No session transition yet received, waiting %dms ...", durationMs);
++		if (!logged) {
++			OOVR_LOG("No session transition yet received, waiting ...");
++			logged = true;
++		}
+ 
+ #ifdef _WIN32
+-		Sleep(durationMs);
++		Sleep(2);
+ #else
+-		struct timespec ts = { 0, durationMs * 1000000 };
++		struct timespec ts = { 0, 2 * 1000000 };
+ 		nanosleep(&ts, &ts);
+ #endif
+ 
+diff --git a/OpenOVR/Misc/Input/OculusInteractionProfile.cpp b/OpenOVR/Misc/Input/OculusInteractionProfile.cpp
+index c362535..72b0817 100644
+--- a/OpenOVR/Misc/Input/OculusInteractionProfile.cpp
++++ b/OpenOVR/Misc/Input/OculusInteractionProfile.cpp
+@@ -63,7 +63,11 @@ OculusTouchInteractionProfile::OculusTouchInteractionProfile()
+ 		{ "grip/force", "squeeze/value" },
+ 		{ "grip/value", "squeeze/value" },
+ 		{ "trigger/click", "trigger/value" },
+-		{ "application_menu", "menu" }
++		{ "application_menu", "menu" },
++		// cranvr: a game that ships bindings for the Vive wand and none for Touch controllers binds the trackpad
++		// (its position, its click and its touch). The Touch controller's thumbstick takes its place, as it does
++		// in SteamVR.
++		{ "trackpad", "thumbstick" }
+ 	};
+ 	// TODO implement the poses through the interaction profile (the raw pose is hard-coded in BaseInput at the moment):
+ 	// pose/raw
