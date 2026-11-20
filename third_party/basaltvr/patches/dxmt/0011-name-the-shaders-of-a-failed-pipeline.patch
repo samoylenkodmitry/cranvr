@@ -1,0 +1,89 @@
+Subject: [PATCH] d3d11: name the shaders and the state of a pipeline that Metal refuses (cranvr)
+
+"Failed to create PSO" gave Metal's message and nothing else. It now names the vertex and pixel shader, the state of
+the rasterizer, the geometry and stream output stages, the render targets, the depth format, the topology and the
+sample count. DXMT_SHADER_DUMP_FOLDER=<folder> writes each shader's bytecode as <hash>.cso, so a hash in the log
+names a file that a disassembler reads.
+---
+diff --git i/src/d3d11/d3d11_pipeline.cpp w/src/d3d11/d3d11_pipeline.cpp
+index 8ea32be..b2a2d4a 100644
+--- i/src/d3d11/d3d11_pipeline.cpp
++++ w/src/d3d11/d3d11_pipeline.cpp
+@@ -18,7 +18,14 @@ public:
+         topology_class(pDesc->TopologyClass), device_(pDevice),
+         pBlendState(pDesc->BlendState),
+         RasterizationEnabled(pDesc->RasterizationEnabled),
+-        SampleCount(pDesc->SampleCount) {
++        SampleCount(pDesc->SampleCount),
++        vs_sha1(pDesc->VertexShader->sha1()),
++        has_ps(pDesc->PixelShader != nullptr),
++        has_gs(pDesc->GeometryShader != nullptr),
++        has_so(pDesc->SOLayout != nullptr),
++        gs_passthrough(pDesc->GSPassthrough) {
++    if (pDesc->PixelShader)
++      ps_sha1 = pDesc->PixelShader->sha1();
+     uint32_t unorm_output_reg_mask = 0;
+     for (unsigned i = 0; i < num_rtvs; i++) {
+       rtv_formats[i] = pDesc->ColorAttachmentFormats[i];
+@@ -99,7 +106,16 @@ public:
+     state_ = device_->GetMTLDevice().newRenderPipelineState(info, err);
+ 
+     if (state_ == nullptr) {
+-      ERR("Failed to create PSO: ", err.description().getUTF8String());
++      /*
++       * cranvr: say which draw failed. The hashes name the shaders (DXMT_SHADER_DUMP_FOLDER writes
++       * each shader's bytecode as <hash>.cso), the rest is the state that built the pipeline.
++       */
++      ERR("Failed to create PSO: ", err.description().getUTF8String(), " (vertex shader ", vs_sha1.string(),
++          has_ps ? ", pixel shader " + ps_sha1.string() : std::string(", no pixel shader"),
++          ", rasterization ", RasterizationEnabled ? "on" : "off", ", geometry shader ", has_gs ? "yes" : "no",
++          ", stream output ", has_so ? "yes" : "no", ", GS passthrough ", gs_passthrough, ", render targets ", num_rtvs,
++          ", depth format ", (unsigned)depth_stencil_format, ", topology ", (unsigned)topology_class, ", samples ",
++          (unsigned)SampleCount, ")");
+       return this;
+     }
+ 
+@@ -129,6 +145,12 @@ private:
+   WMT::Reference<WMT::RenderPipelineState> state_;
+   bool RasterizationEnabled;
+   UINT SampleCount;
++  Sha1Digest vs_sha1;
++  Sha1Digest ps_sha1 = {};
++  bool has_ps;
++  bool has_gs;
++  bool has_so;
++  uint32_t gs_passthrough;
+ };
+ 
+ std::unique_ptr<MTLCompiledGraphicsPipeline>
+diff --git i/src/d3d11/d3d11_pipeline_cache.cpp w/src/d3d11/d3d11_pipeline_cache.cpp
+index ec17d04..b1c959d 100644
+--- i/src/d3d11/d3d11_pipeline_cache.cpp
++++ w/src/d3d11/d3d11_pipeline_cache.cpp
+@@ -9,7 +9,9 @@
+ #include "sha1/sha1_util.hpp"
+ #include "../d3d10/d3d10_shader.hpp"
+ #include "../d3d10/d3d10_input_layout.hpp"
++#include "util_env.hpp"
+ #include <cstring>
++#include <fstream>
+ #include <shared_mutex>
+ 
+ namespace dxmt {
+@@ -236,6 +238,16 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+       return nullptr;
+     }
+     auto shader = std::make_unique<CachedSM50Shader>(this, sm50, sha1, reflection);
++    /*
++     * cranvr: DXMT_SHADER_DUMP_FOLDER=<folder> writes each shader's bytecode as <hash>.cso, so a
++     * shader that a log line names can be read.
++     */
++    static const std::string dump_folder = env::getEnvVar("DXMT_SHADER_DUMP_FOLDER");
++    if (!dump_folder.empty()) {
++      std::fstream out(dump_folder + "/" + sha1.string() + ".cso", std::ios::out | std::ios::binary);
++      if (out)
++        out.write((const char *)pBytecode, BytecodeLength);
++    }
+     {
+       std::unique_lock<std::shared_mutex> lock(mutex_shares);
+       auto result = shaders_.find(sha1);

@@ -130,3 +130,18 @@ and `GetExceptionMode` of the device. The Discard calls are hints that a driver 
 asks the device for discard support calls them every frame. A reader of the log took the line for the
 failure of a game with a black picture (#60). The patch names each call. The Discard calls log it once as a
 warning ("is ignored: it is only a hint"), not as an error.
+
+`0011-name-the-shaders-of-a-failed-pipeline.patch`: DXMT logged "Failed to create PSO" with Metal's message and nothing
+else, so a reader could not tell which draw failed. The line now names the vertex shader, the pixel shader, the state
+of the rasterizer, the geometry and stream output stages, the number of render targets, the depth format, the topology
+and the sample count. `DXMT_SHADER_DUMP_FOLDER=FOLDER` writes the bytecode of each shader that a game creates as
+`<hash>.cso` into the folder (the folder must exist), so a hash in the log names a file that a disassembler reads.
+
+`0012-vertex-shader-without-output-draws-nothing.patch`: a vertex shader that declares no output draws nothing in
+Direct3D 11: the rasterizer gets no position. DXMT still built the Metal pipeline with the rasterizer on whenever a
+pixel shader was bound. Metal refused it ("RasterizationEnabled is true but the vertex shader's return type is void")
+and DXMT set no pipeline for the draw, so the render encoder kept the one of the draw before it, or none. Unity 6000.0
+does this at the start: it draws with an empty vertex shader (two inputs, no output, no instruction) and a pixel
+shader that writes a constant. The pipeline now has the rasterizer off when the vertex shader declares no output and no geometry,
+hull or domain shader and no stream output takes its place. `DXMT_RASTERIZE_OUTPUTLESS_VERTEX_SHADERS=1` brings the
+former behavior back for a comparison. The log says once which vertex shader this was.

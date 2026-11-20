@@ -1,0 +1,45 @@
+Subject: [PATCH] d3d11: a vertex shader that declares no output draws nothing (cranvr)
+
+Direct3D 11 rasterizes nothing for a vertex shader without a position. DXMT built the Metal pipeline with the
+rasterizer on whenever a pixel shader was bound, and Metal refused it ("RasterizationEnabled is true but the vertex
+shader's return type is void"). DXMT then set no pipeline for the draw. The pipeline now has the rasterizer off for a
+vertex shader that declares no output, with no geometry, hull, domain or stream output stage.
+DXMT_RASTERIZE_OUTPUTLESS_VERTEX_SHADERS=1 brings the former behavior back for a comparison.
+---
+diff --git i/src/d3d11/d3d11_context_impl.cpp w/src/d3d11/d3d11_context_impl.cpp
+index 8b5eb14..26d6a4e 100644
+--- i/src/d3d11/d3d11_context_impl.cpp
++++ w/src/d3d11/d3d11_context_impl.cpp
+@@ -24,6 +24,7 @@ since it is for internal use only
+ #include "dxmt_staging.hpp"
+ #include "d3d11_resource.hpp"
+ #include "dxmt_texture.hpp"
++#include "util_env.hpp"
+ #include "util_flags.hpp"
+ #include "util_math.hpp"
+ #include "util_win32_compat.h"
+@@ -4609,6 +4610,24 @@ public:
+     // FIXME: corner case: DSV is not bound or missing planar
+     Desc.RasterizationEnabled =
+         (PS || ds_enabled) && (!Desc.SOLayout || Desc.SOLayout->RasterizedStream() != D3D11_SO_NO_RASTERIZED_STREAM);
++    /*
++     * cranvr: a vertex shader that declares no output leaves the rasterizer nothing to draw: D3D11 draws
++     * no pixel for it, and Metal refuses the pipeline ("RasterizationEnabled is true but the vertex
++     * shader's return type is void"). A draw that Metal refuses keeps the pipeline of the draw before
++     * it, which then runs with this draw's buffers. Such a draw turns rasterization off, as a draw
++     * with no pixel shader and no depth test does. The shaders with a geometry, hull or domain stage
++     * take their outputs from those stages. DXMT_RASTERIZE_OUTPUTLESS_VERTEX_SHADERS=1 brings the
++     * former behavior back, for a comparison.
++     */
++    static const bool rasterize_outputless = env::getEnvVar("DXMT_RASTERIZE_OUTPUTLESS_VERTEX_SHADERS") == "1";
++    if (Desc.RasterizationEnabled && !rasterize_outputless && !Desc.SOLayout && !Desc.HullShader &&
++        !Desc.GeometryShader && Desc.VertexShader && Desc.VertexShader->reflection().NumOutputElement == 0) {
++      static bool logged = false;
++      if (!std::exchange(logged, true))
++        WARN("cranvr: the first vertex shader that declares no output is ", Desc.VertexShader->sha1().string(),
++             ": rasterization is off for the draws that use such a shader");
++      Desc.RasterizationEnabled = false;
++    }
+     if (!Desc.RasterizationEnabled)
+       Desc.PixelShader = nullptr; // Even rasterization is disabled, Metal still checks if VS-PS signatures match.
+     Desc.SampleMask = state_.OutputMerger.SampleMask;
