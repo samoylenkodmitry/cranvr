@@ -46,8 +46,8 @@ pub enum Error {
     Malformed(&'static str),
     /// A packet or message above its size limit
     TooLarge(usize),
-    /// The peer speaks no protocol version that this side speaks
-    Version { ours: (u16, u16), theirs: (u16, u16) },
+    /// The peer speaks another protocol version than this side
+    Version { ours: u16, theirs: u16 },
     /// The host refused the client
     Rejected(crate::message::RejectReason),
     /// The peer sent something else than the handshake expects
@@ -70,11 +70,7 @@ impl fmt::Display for Error {
             Error::Codec(e) => write!(f, "message codec: {e}"),
             Error::Malformed(what) => write!(f, "malformed packet: {what}"),
             Error::TooLarge(n) => write!(f, "{n} bytes is more than a packet may hold"),
-            Error::Version { ours, theirs } => write!(
-                f,
-                "no common protocol version: this side speaks {}..={}, the peer {}..={}",
-                ours.0, ours.1, theirs.0, theirs.1
-            ),
+            Error::Version { ours, theirs } => write!(f, "another protocol version: this side speaks {ours}, the peer {theirs}"),
             Error::Rejected(reason) => write!(f, "the host refused the connection: {reason:?}"),
             Error::Unexpected(what) => write!(f, "unexpected message: {what}"),
             Error::Crypto(what) => write!(f, "authentication failed: {what}"),
@@ -90,7 +86,7 @@ impl Error {
     /// error.
     pub fn peer_must_update(&self) -> Option<bool> {
         match self {
-            Error::Version { ours, theirs } => Some(theirs.1 < ours.1),
+            Error::Version { ours, theirs } => Some(crate::message::peer_must_update(*ours, *theirs)),
             _ => None,
         }
     }

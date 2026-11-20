@@ -53,6 +53,16 @@ pub fn game_support_outdated() -> bool {
     wine_ready() && is_older(game_support_installed().as_deref(), game_support_expected())
 }
 
+/// An error that tells the user to update the game support, while the installed one is older than
+/// this app expects. Nothing starts with an older game support: its runtime and the host speak
+/// different versions of the control protocol.
+pub fn require_current_game_support() -> Result<(), String> {
+    if game_support_outdated() {
+        return Err("The game support is older than this app expects. Press Update game support in the Play tab.".into());
+    }
+    Ok(())
+}
+
 /// Whether `installed` is older than `expected`. Versions are dates, "2026.11.19", with an optional
 /// fourth number for a second release on one day. A missing or unreadable version is older.
 fn is_older(installed: Option<&str>, expected: &str) -> bool {
@@ -260,7 +270,6 @@ fn game_wine(program: &str) -> Command {
     let settings = backend::Settings::load();
     let options = settings.launch.get(program).cloned().unwrap_or_default();
     let on = launch::opencomposite(&settings.wine, &options);
-    // An older game support has no OpenComposite: the Play tab then offers its update, so a start says nothing
     if let Err(e) = openvr::apply(&prefix(), on) {
         backend::notify(format!("cranvr could not set the OpenVR runtime: {e}"));
     }
@@ -296,6 +305,7 @@ fn log_file(name: &str) -> Stdio {
 /// Starts Steam with the flags BasaltVR found to work under Wine on macOS: no update at start
 /// (an update would replace the web helper shim), no file check, no CEF sandbox.
 pub fn start() -> Result<(), String> {
+    require_current_game_support()?;
     match state() {
         SteamState::Ready => {}
         SteamState::NoWine => return Err("Set up game support first".into()),
@@ -318,6 +328,7 @@ pub fn start() -> Result<(), String> {
 /// Starts a game by its program while Steam runs. A game started by `steam.exe -applaunch`
 /// would get Steam's environment; this one gets the host's control file and its app ID.
 pub fn play(game: &Game) -> Result<(), String> {
+    require_current_game_support()?;
     let exe = game.exe.clone().ok_or(format!("No program found for {}", game.name))?;
     if !running() {
         start()?;
@@ -344,6 +355,7 @@ pub fn run_program(path: &Path) -> Result<(), String> {
     if !wine_ready() {
         return Err("Set up game support first".into());
     }
+    require_current_game_support()?;
     let mut command = game_wine(&mac_to_windows(path));
     if let Some(app_id) = backend::steam_app_id(path.parent().unwrap_or(path)) {
         command.env("SteamAppId", &app_id).env("SteamGameId", &app_id);

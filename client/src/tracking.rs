@@ -29,7 +29,7 @@ use cranvr_proto::{
     link::ClientLink,
     message::{buttons as bit, ClientDatagram, ClientMsg, Focus, HandInput, Input, Recenter, Tracking, Views},
     motion::velocities,
-    tracking::{Body, Eyes, Face, Features, Hand, Hands, Joint, TRACKING_VERSION},
+    tracking::{Body, Eyes, Face, Features, Hand, Hands, Joint},
     wire::{Fov, Motion, Nanos, Pose},
 };
 use std::{
@@ -624,10 +624,8 @@ pub fn send_loop(link: &ClientLink, feed: &Feed, tracked: bool, refresh_hz: f32,
     let mut deadline = Instant::now();
     let mut sent_views = hello_views;
     let mut sent_floor: Option<f32> = None;
-    // The features that the host heard that the headset offers. A host of an older protocol version
-    // knows no such message.
+    // The features that the host heard that the headset offers
     let mut sent_offer: Option<Features> = None;
-    let sends_tracking = link.welcome.version >= TRACKING_VERSION;
     let mut outgoing = Outgoing::default();
     let mut buffer = Box::new(TrackedFrame::new());
     // A host takes a client that never says anything as focused
@@ -688,7 +686,7 @@ pub fn send_loop(link: &ClientLink, feed: &Feed, tracked: bool, refresh_hz: f32,
             let offer = feed.offer();
             if sent_offer != Some(offer) {
                 log::info!("the headset offers {}", describe(offer));
-                if sends_tracking && !(sent_offer.is_none() && offer.is_empty()) {
+                if !(sent_offer.is_none() && offer.is_empty()) {
                     link.duplex.send_control(&ClientMsg::TrackingOffer(offer)).ok();
                 }
                 sent_offer = Some(offer);

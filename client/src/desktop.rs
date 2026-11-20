@@ -10,8 +10,7 @@
 //! reports it as pointer events in dp from the surface's top left corner (`on_pointer_event`). This
 //! file turns each event into a point on the picture (u and v from 0 to 1) and the mouse buttons
 //! that are down (left, right, middle). It sends them to the host as `ClientDatagram::Mouse`
-//! datagrams, or as the older `Pointer` to a host of protocol version 6. The host moves the Mac's
-//! mouse, clicks and scrolls. The pointer events carry no scroll, so the thumbstick's lean comes
+//! datagrams. The host moves the Mac's mouse, clicks and scrolls. The pointer events carry no scroll, so the thumbstick's lean comes
 //! from the headset's frame while the ray is on the surface, in the axes that the mapping of
 //! `controls.rs` gives to scrolling.
 //!
@@ -45,9 +44,8 @@ use cranvr_proto::{
     clock::now_ns,
     link::ClientLink,
     media::Received,
-    message::{ClientDatagram, ClientMsg, Cursor, DesktopParams, DesktopWish, HostMsg, Mouse, Pointer, DESKTOP_STREAM},
+    message::{ClientDatagram, ClientMsg, Cursor, DesktopParams, DesktopWish, HostMsg, Mouse, DESKTOP_STREAM},
     wire::Codec,
-    MOUSE_VERSION,
 };
 use std::{
     sync::{
@@ -830,21 +828,10 @@ pub fn uplink(link: &ClientLink, stop: &AtomicBool) {
         }
         if dirty || (pointer.busy() && last_send.elapsed() >= POINTER_KEEPALIVE) {
             last_send = Instant::now();
-            link.duplex.send_datagram(&pointer_datagram(link.welcome.version, seq, &pointer)).ok();
+            link.duplex.send_datagram(&ClientDatagram::Mouse(Mouse { seq, sent: now_ns(), hit: pointer.hit, buttons: pointer.buttons, scroll: pointer.scroll })).ok();
             seq = seq.wrapping_add(1);
             d.inner.lock().unwrap().counts.pointers_sent += 1;
         }
-    }
-}
-
-/// The datagram for a pointer, in the form of the host's protocol version. A host of version 6 has
-/// the trigger and one axis only: the left button is its trigger, and the forward lean its scroll.
-fn pointer_datagram(version: u16, seq: u32, pointer: &PointerNow) -> ClientDatagram {
-    if version >= MOUSE_VERSION {
-        ClientDatagram::Mouse(Mouse { seq, sent: now_ns(), hit: pointer.hit, buttons: pointer.buttons, scroll: pointer.scroll })
-    } else {
-        let left = pointer.buttons & mouse::LEFT != 0;
-        ClientDatagram::Pointer(Pointer { seq, sent: now_ns(), hit: pointer.hit, trigger: if left { 1.0 } else { 0.0 }, scroll: pointer.scroll[1] })
     }
 }
 
@@ -1198,25 +1185,6 @@ mod tests {
         assert!(a.differs(&PointerNow { hit: None, ..a }));
         assert!(a.differs(&PointerNow { buttons: mouse::RIGHT, ..a }));
         assert!(a.differs(&PointerNow { scroll: [0.5, 0.0], ..a }), "a lean across is worth sending");
-    }
-
-    #[test]
-    fn a_host_of_version_6_gets_the_older_datagram_with_the_left_button_as_its_trigger() {
-        let pointer = PointerNow { hit: Some([0.1, 0.2]), buttons: mouse::LEFT | mouse::RIGHT, scroll: [0.3, 0.6] };
-        match pointer_datagram(7, 4, &pointer) {
-            ClientDatagram::Mouse(m) => assert_eq!((m.seq, m.hit, m.buttons, m.scroll), (4, Some([0.1, 0.2]), mouse::LEFT | mouse::RIGHT, [0.3, 0.6])),
-            other => panic!("{other:?}"),
-        }
-        match pointer_datagram(6, 5, &pointer) {
-            ClientDatagram::Pointer(p) => assert_eq!((p.seq, p.hit, p.trigger, p.scroll), (5, Some([0.1, 0.2]), 1.0, 0.6)),
-            other => panic!("{other:?}"),
-        }
-        // A right button alone is no trigger for a host that knows only the trigger
-        let right = PointerNow { buttons: mouse::RIGHT, ..pointer };
-        match pointer_datagram(6, 6, &right) {
-            ClientDatagram::Pointer(p) => assert_eq!(p.trigger, 0.0),
-            other => panic!("{other:?}"),
-        }
     }
 
     #[test]

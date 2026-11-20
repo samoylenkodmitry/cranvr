@@ -4,16 +4,15 @@
 //! `cranvr-probe --game` can tell its frames from the host's test scene.
 //!
 //! It also reads the controller messages that the host sends and writes what arrived when it ends.
-//! Like the runtime with cranvr's patch 0004, it tells the host in `runtime-features.txt` that it
-//! takes aim poses, so each hand arrives with a grip pose and an aim pose. A pull of the left grip
+//! Each hand arrives with a grip pose and an aim pose. A pull of the left grip
 //! makes it answer with a haptic pulse on the left hand, as a game does. `--expect-input` makes the
 //! exit code depend on the input: the probe's scripted controllers (`cranvr-probe`) must have
 //! arrived on both hands with their own grip and aim poses, as `hands.rs` scripts them, and with
 //! the Touch buttons.
 //!
 //! With `--use-tracking hands,body,full_body,face,eyes` it plays a game that uses these features, as
-//! the runtime of patch 0005 does: it writes the word `tracking` to `runtime-features.txt`, tells the
-//! host a second after the start which features it uses (`TRACKING_REQUEST`). With `--release-tracking`
+//! the runtime of patch 0005 does: it tells the host a second after the start which features it uses
+//! (`TRACKING_REQUEST`). With `--release-tracking`
 //! it takes them away again six seconds before the end, while the probe still runs. The host then sends their data. With `cranvr-probe --tracking` the data
 //! is the script of `tracked.rs`, and `--expect-tracking` makes the exit code depend on it.
 //! `--expect-hand-controllers` plays a game without hand code: with `cranvr-probe --tracking
@@ -517,10 +516,6 @@ fn main() {
     let token = fields[1];
     let (w, h): (u32, u32) = (fields[2].parse().unwrap(), fields[3].parse().unwrap());
 
-    // The runtime of cranvr's patch 0004 writes this file before it connects. Without it the host
-    // sends no aim poses, because a runtime without the patch drops the connection at the message.
-    let features = std::path::Path::new(&control_path).with_file_name("runtime-features.txt");
-    fs::write(&features, "aim tracking\n").expect("write runtime-features.txt");
     // The host writes the headset's features here for the runtime (see runtime_link.rs)
     let tracking_file = std::path::Path::new(&control_path).with_file_name("tracking-features.txt");
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the host");

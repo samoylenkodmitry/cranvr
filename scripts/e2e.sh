@@ -37,7 +37,7 @@
 #                 runs in Wine. It finds the runtime through the prefix's OpenVR path file, which
 #                 scripts/run-game.sh writes when CRANVR_OPENCOMPOSITE is 1 (this option sets it). It
 #                 makes a Direct3D 11 device, submits both eyes in every frame and reads the head pose,
-#                 the legacy state of the scripted controllers (a pull of the left grip, the right
+#                 the controller state of IVRSystem for the scripted controllers (a pull of the left grip, the right
 #                 trigger at 0.75, the A button) and their poses in the array of WaitGetPoses (valid in
 #                 90 percent of the frames, the left one where the probe holds it, the right one swinging;
 #                 the probe's head stands still). It prints "openvr_smoke: PASS" or "FAIL ...". Set
@@ -48,7 +48,7 @@
 #                 when the program's haptic pulse does not reach the probe. Implies --openvr-wine.
 #   --face-source SOURCE  with --tracking and --tracking-wine: where the probe's face comes from.
 #                 audio (the default) is a Quest 3's microphone face, visual is a face from cameras,
-#                 and unknown is an offer that names no source, as an older headset app sends. The
+#                 and unknown is an offer that names no source, as a headset's offer before its face gives data. The
 #                 offer, the host's file for the runtime and each sample carry the source. The
 #                 Windows program checks that the support structure says it, that a face tracker
 #                 which asks for the other source is refused, and each sample's dataSource.

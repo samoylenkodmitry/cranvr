@@ -16,7 +16,7 @@ use cranvr_proto::{
     clock::ClockSync,
     link::ClientLink,
     media::Received,
-    message::{Audio, ClientDatagram, ClientMsg, Cursor, DesktopParams, DesktopWish, HostMsg, Mouse, Pointer, DESKTOP_STREAM},
+    message::{Audio, ClientDatagram, ClientMsg, Cursor, DesktopParams, DesktopWish, HostMsg, Mouse, DESKTOP_STREAM},
 };
 use cranvr_vt::{DecodedFrame, Decoder};
 use std::{
@@ -218,21 +218,15 @@ impl DesktopProbe {
     /// script of six seconds repeats. The left button goes down for 200 ms at the end of the first
     /// second, the right button at the end of the third and the middle button at the end of the
     /// fifth. The thumbstick leans forward for a second, then back for a second, and leans to the
-    /// right in the first three seconds of the six and to the left in the others. A probe of
-    /// protocol version 6 or older sends the older `Pointer`: a trigger for the left button and one
-    /// axis. `mouse` says that the host reads `Mouse`.
-    pub fn pointer_script(mouse: bool, send: impl Fn(ClientDatagram) + Send + 'static, stopped: impl Fn() -> bool + Send + 'static) {
+    /// right in the first three seconds of the six and to the left in the others.
+    pub fn pointer_script(send: impl Fn(ClientDatagram) + Send + 'static, stopped: impl Fn() -> bool + Send + 'static) {
         thread::Builder::new()
             .name("pointer-script".into())
             .spawn(move || {
                 let start = Instant::now();
                 let (mut seq, mut next) = (0u32, start);
                 let datagram = |seq: u32, hit: Option<[f32; 2]>, buttons: u8, scroll: [f32; 2]| {
-                    if mouse {
-                        ClientDatagram::Mouse(Mouse { seq, sent: now_ns(), hit, buttons, scroll })
-                    } else {
-                        ClientDatagram::Pointer(Pointer { seq, sent: now_ns(), hit, trigger: f32::from(buttons & controls::mouse::LEFT), scroll: scroll[1] })
-                    }
+                    ClientDatagram::Mouse(Mouse { seq, sent: now_ns(), hit, buttons, scroll })
                 };
                 while !stopped() {
                     let t = start.elapsed().as_secs_f32();

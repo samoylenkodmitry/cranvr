@@ -56,18 +56,18 @@ pub enum Applied {
     On,
     /// The file that named OpenComposite is gone, or there was none
     Off,
-    /// The choice is on but the game support has no OpenComposite (an older install): nothing changed
-    NotInstalled,
 }
 
-/// Makes the prefix's OpenVR path file follow the choice.
+/// Makes the prefix's OpenVR path file follow the choice. The game support of this app installs
+/// OpenComposite, so a prefix without it is an error that the user sees.
 pub fn apply(prefix: &Path, on: bool) -> io::Result<Applied> {
+    let missing = || io::Error::new(io::ErrorKind::NotFound, "the game support has no OpenComposite");
     let Some(file) = path_file(prefix) else {
-        return Ok(if on { Applied::NotInstalled } else { Applied::Off });
+        return if on { Err(missing()) } else { Ok(Applied::Off) };
     };
     if on {
         if !installed(prefix) {
-            return Ok(Applied::NotInstalled);
+            return Err(missing());
         }
         let text = file_text();
         if fs::read_to_string(&file).is_ok_and(|now| now == text) {
@@ -142,10 +142,12 @@ mod tests {
     }
 
     #[test]
-    fn without_the_install_on_changes_nothing() {
-        let prefix = prefix("older", "someone");
-        assert_eq!(apply(&prefix, true).unwrap(), Applied::NotInstalled);
+    fn without_the_install_on_is_an_error_and_changes_nothing() {
+        let prefix = prefix("missing", "someone");
+        assert!(apply(&prefix, true).is_err());
         assert!(!path_file(&prefix).unwrap().exists());
+        // Off needs no install
+        assert_eq!(apply(&prefix, false).unwrap(), Applied::Off);
         fs::remove_dir_all(&prefix).ok();
     }
 
@@ -155,7 +157,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(dir.join("drive_c/users/Public")).unwrap();
         assert_eq!(path_file(&dir), None);
-        assert_eq!(apply(&dir, true).unwrap(), Applied::NotInstalled);
+        assert!(apply(&dir, true).is_err());
         fs::remove_dir_all(&dir).ok();
     }
 }

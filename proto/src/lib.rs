@@ -44,50 +44,11 @@ pub mod wire;
 
 pub use wire::{Error, Nanos};
 
-/// The newest protocol version this crate speaks. A change of the wire format, or of a message
-/// that older code cannot read, raises it. New enum variants at the end of a message enum do not
-/// need a new version for receivers that ignore what they cannot decode.
-///
-/// Version 2 added the key and the challenge of pairing, the display time of a tracking sample
-/// and the moment at which the compositor took a frame.
-///
-/// Version 3 added the aim pose of each controller to [`message::Tracking`]. Postcard has no
-/// optional trailing fields, so a version 2 sample does not decode and the two versions cannot
-/// talk.
-///
-/// Version 4 seals the session. Both sides sign a key exchange. Every packet after it is encrypted
-/// and authenticated. The host also has a key. Versions 2 and 3 ran in clear text, so this crate
-/// speaks no older version. A peer of version 3 or lower is refused.
-///
-/// Version 5 adds the approval of a new headset on the Mac. A host that does not know a client
-/// holds the connection and tells the client to wait ([`message::HostMsg::AwaitApproval`]). Both
-/// sides show a code that comes from the session (see [`secure::approval_code`]). The user compares
-/// the two codes and allows the headset on the Mac. A version 4 client cannot wait: the host refuses
-/// it at once, as before. A headset that is paired already connects with either version.
-///
-/// Version 6 adds the tracking of hands, body, face and eyes (see [`tracking`]): the offer of the
-/// client, the wish of the host and one datagram for each feature. They are new variants at the end
-/// of the message enums, so a peer of version 4 or 5 skips them and the two still talk. The host
-/// sends a wish only to a client of version 6, and a client of version 6 offers features only to a
-/// host that answered with version 6.
-///
-/// Version 7 adds the datagram [`message::ClientDatagram::Mouse`]: the buttons of the Mac's mouse
-/// (left, right, middle) and a thumbstick's lean in two axes. The client sends it to a host of
-/// version 7 in place of the older `Pointer`, which carries a trigger and one axis. The host reads
-/// both.
-pub const PROTOCOL_VERSION: u16 = 7;
-
-/// The first protocol version with [`message::ClientDatagram::Mouse`].
-pub const MOUSE_VERSION: u16 = 7;
-
-/// The oldest protocol version this crate still speaks.
-pub const MIN_PROTOCOL_VERSION: u16 = 4;
-
-/// The first protocol version with the approval of a new headset on the Mac.
-pub const APPROVAL_VERSION: u16 = 5;
-
-/// The first protocol version with the tracking messages of [`tracking`].
-pub const TRACKING_VERSION: u16 = tracking::TRACKING_VERSION;
+/// The protocol version. The crate speaks this one and no other. A peer of another version is
+/// refused with a message that says which side to update (see [`message::peer_must_update`]). Any
+/// change of the wire format or of a message raises it. Both ends are one project and ship from one
+/// commit, so the version tells that they do.
+pub const PROTOCOL_VERSION: u16 = 8;
 
 /// The largest datagram, in bytes, sealed: the counter and the tag are in it. A media packet and
 /// any datagram message fit in it. A typical path MTU of 1500 bytes minus the IP and UDP headers

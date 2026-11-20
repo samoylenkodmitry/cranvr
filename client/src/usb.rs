@@ -18,7 +18,6 @@ use cranvr_proto::{
     discovery::DEFAULT_PORT,
     identity::{fingerprint, FINGERPRINT_LEN, KEY_LEN},
     link::probe_host,
-    message::VersionRange,
 };
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -51,9 +50,9 @@ pub fn address() -> SocketAddr {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UsbMac {
     pub address: SocketAddr,
-    /// The Mac's key. `None` when the host speaks no protocol version that this app speaks.
+    /// The Mac's key. `None` when the host speaks another protocol version than this app.
     pub key: Option<[u8; KEY_LEN]>,
-    pub versions: VersionRange,
+    pub version: u16,
 }
 
 impl UsbMac {
@@ -69,7 +68,7 @@ impl UsbMac {
             name: CABLE_NAME.into(),
             address: self.address,
             fingerprint: self.fingerprint().unwrap_or([0; FINGERPRINT_LEN]),
-            versions: self.versions,
+            version: self.version,
             paired: false,
         }
     }
@@ -85,7 +84,7 @@ pub fn probe() -> Option<UsbMac> {
 
 fn probe_at(address: SocketAddr) -> Option<UsbMac> {
     match probe_host(address, PROBE_TIMEOUT) {
-        Ok(probe) => Some(UsbMac { address, key: probe.key, versions: probe.versions }),
+        Ok(probe) => Some(UsbMac { address, key: probe.key, version: probe.version }),
         Err(e) => {
             log::debug!("nothing answers behind the cable at {address}: {e}");
             None
@@ -205,16 +204,17 @@ pub fn target(aim: &Aim, usb: Option<&UsbMac>, found: &[FoundHost]) -> Target {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cranvr_proto::PROTOCOL_VERSION;
 
     const B: [u8; FINGERPRINT_LEN] = [2; FINGERPRINT_LEN];
 
     fn wifi(name: &str, ip: [u8; 4], fingerprint: [u8; FINGERPRINT_LEN]) -> FoundHost {
-        FoundHost { name: name.into(), address: (ip, 9950).into(), fingerprint, versions: VersionRange::OURS, paired: false }
+        FoundHost { name: name.into(), address: (ip, 9950).into(), fingerprint, version: PROTOCOL_VERSION, paired: false }
     }
 
     /// A Mac behind the cable whose key has the fingerprint of the first byte's key
     fn cable(key_byte: u8) -> UsbMac {
-        UsbMac { address: address(), key: Some([key_byte; KEY_LEN]), versions: VersionRange::OURS }
+        UsbMac { address: address(), key: Some([key_byte; KEY_LEN]), version: PROTOCOL_VERSION }
     }
 
     fn aim(address: &str, fingerprint: Option<[u8; FINGERPRINT_LEN]>) -> Aim {
@@ -235,7 +235,7 @@ mod tests {
     #[test]
     fn a_cable_with_no_known_key_hides_no_wifi_entry() {
         // A host of another protocol version shows no key: it cannot be matched with a Wi-Fi entry
-        let unknown = UsbMac { key: None, versions: VersionRange { min: 9, max: 9 }, ..cable(1) };
+        let unknown = UsbMac { key: None, version: PROTOCOL_VERSION + 1, ..cable(1) };
         let host = wifi("Mac", [192, 168, 1, 20], [0; FINGERPRINT_LEN]);
         assert_eq!(entries(std::slice::from_ref(&host), Some(&unknown)), [Line::Cable(unknown), Line::WiFi(host)]);
     }

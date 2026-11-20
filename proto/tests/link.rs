@@ -11,7 +11,6 @@ use cranvr_proto::{
     media::{FrameReceiver, DEFAULT_SHARD_LEN},
     message::*,
     wire::{Codec, Error, Motion, Pose},
-    PROTOCOL_VERSION,
 };
 use std::{
     io::{Read, Write},
@@ -53,8 +52,6 @@ fn session(mode: MediaMode, client_caps: ClientCaps) -> (HostLink, ClientLink) {
 #[test]
 fn the_handshake_agrees_on_a_stream() {
     let (host, client) = session(MediaMode::Udp, caps());
-    assert_eq!(host.version, PROTOCOL_VERSION);
-    assert_eq!(client.welcome.version, PROTOCOL_VERSION);
     assert_eq!(client.welcome.session, host.session);
     let stream = &client.welcome.stream;
     assert_eq!(stream, &host.stream);
@@ -268,35 +265,54 @@ fn a_host_that_finds_no_common_codec_rejects() {
     host.join().unwrap();
 }
 
-#[test]
-fn a_peer_of_another_version_is_told_so() {
+/// A raw client that says it speaks `version`, against a host listener. Returns what the host
+/// answered and what `accept` gave back.
+fn raw_client_of_version(version: u16) -> (u16, Option<Error>) {
     let listener = HostListener::bind("127.0.0.1:0", host_identity()).unwrap();
     let addr = listener.local_addr().unwrap();
     let host = thread::spawn(move || listener.accept().err());
     let mut raw = TcpStream::connect(addr).unwrap();
-    raw.write_all(&client_preamble(VersionRange { min: cranvr_proto::PROTOCOL_VERSION + 1, max: cranvr_proto::PROTOCOL_VERSION + 3 })).unwrap();
+    raw.write_all(&client_preamble(version)).unwrap();
     let mut answer = [0u8; HOST_PREAMBLE_LEN];
     raw.read_exact(&mut answer).unwrap();
-    let (chosen, range) = parse_host_preamble(&answer).unwrap();
-    assert_eq!(chosen, None);
-    assert_eq!(range, VersionRange::OURS);
-    assert!(matches!(host.join().unwrap(), Some(Error::Version { .. })));
+    (parse_host_preamble(&answer).unwrap(), host.join().unwrap())
 }
 
 #[test]
-fn a_client_of_version_2_or_3_is_refused() {
-    // Version 3 changed the tracking sample. Version 4 seals the session. Neither older version
-    // can share a session with this crate: the older ones spoke in clear text.
-    for old in [2, 3] {
-        let listener = HostListener::bind("127.0.0.1:0", host_identity()).unwrap();
+fn a_client_of_another_version_is_refused_and_told_the_hosts_version() {
+    let ours = cranvr_proto::PROTOCOL_VERSION;
+    // A client of a higher and of a lower version: the host answers with its own version in both cases, and the
+    // error names the side that must update
+    for theirs in [ours + 1, ours - 1, 1] {
+        let (answered, error) = raw_client_of_version(theirs);
+        assert_eq!(answered, ours);
+        match error {
+            Some(error @ Error::Version { .. }) => {
+                assert!(matches!(error, Error::Version { ours: o, theirs: t } if o == ours && t == theirs), "{error:?}");
+                assert_eq!(error.peer_must_update(), Some(theirs < ours), "{error:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_host_of_another_version_is_refused_by_the_client_and_names_the_side_to_update() {
+    let ours = cranvr_proto::PROTOCOL_VERSION;
+    for theirs in [ours + 1, ours - 1] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let host = thread::spawn(move || listener.accept().err());
-        let mut raw = TcpStream::connect(addr).unwrap();
-        raw.write_all(&client_preamble(VersionRange { min: old, max: old })).unwrap();
-        let mut answer = [0u8; HOST_PREAMBLE_LEN];
-        raw.read_exact(&mut answer).unwrap();
-        assert_eq!(parse_host_preamble(&answer).unwrap().0, None);
-        assert!(matches!(host.join().unwrap(), Some(Error::Version { .. })));
+        let host = thread::spawn(move || {
+            let (mut tcp, _) = listener.accept().unwrap();
+            let mut hello = [0u8; CLIENT_PREAMBLE_LEN];
+            tcp.read_exact(&mut hello).unwrap();
+            assert_eq!(parse_client_preamble(&hello).unwrap(), cranvr_proto::PROTOCOL_VERSION);
+            tcp.write_all(&host_preamble(theirs)).unwrap();
+        });
+        let error = ClientLink::connect(addr, &caps(), &identity(), None, WAIT).err().expect("a host of another version refuses");
+        assert!(matches!(error, Error::Version { ours: o, theirs: t } if o == ours && t == theirs), "{error:?}");
+        assert_eq!(error.peer_must_update(), Some(theirs < ours));
+        host.join().unwrap();
     }
 }
 
@@ -308,15 +324,6 @@ fn a_stranger_on_the_port_is_refused() {
     let mut raw = TcpStream::connect(addr).unwrap();
     raw.write_all(b"GET / HT").unwrap();
     assert!(matches!(host.join().unwrap(), Some(Error::Malformed(_))));
-}
-
-#[test]
-fn the_version_ranges_pick_the_highest_common_version() {
-    let v = |min, max| VersionRange { min, max };
-    assert_eq!(v(1, 3).common(v(2, 5)), Some(3));
-    assert_eq!(v(1, 1).common(v(1, 4)), Some(1));
-    assert_eq!(v(1, 2).common(v(3, 4)), None);
-    assert_eq!(v(3, 4).common(v(1, 2)), None);
 }
 
 #[test]
@@ -473,26 +480,26 @@ fn a_probe_learns_the_hosts_key_and_the_host_serves_the_next_client() {
     });
     let probe = probe_host(addr, WAIT).unwrap();
     assert_eq!(probe.key, Some(key));
-    assert_eq!(probe.versions, VersionRange::OURS);
+    assert_eq!(probe.version, cranvr_proto::PROTOCOL_VERSION);
     let _client = thread::spawn(move || ClientLink::connect(addr, &caps(), &identity(), None, Duration::from_secs(1)));
     let (probe_error, name) = host.join().unwrap();
     assert!(matches!(probe_error, Some(Error::Closed)), "the host sees the probe leave: {probe_error:?}");
     assert_eq!(name, caps().name);
 }
 
-// A host of another protocol version ends the exchange after the versions. The probe returns them.
+// A host of another protocol version ends the exchange after the versions. The probe returns its version.
 #[test]
-fn a_probe_of_a_host_of_another_version_gets_its_versions_and_no_key() {
+fn a_probe_of_a_host_of_another_version_gets_its_version_and_no_key() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let host = thread::spawn(move || {
         let (mut tcp, _) = listener.accept().unwrap();
         let mut hello = [0u8; CLIENT_PREAMBLE_LEN];
         tcp.read_exact(&mut hello).unwrap();
-        tcp.write_all(&host_preamble(None, VersionRange { min: cranvr_proto::PROTOCOL_VERSION + 1, max: cranvr_proto::PROTOCOL_VERSION + 3 })).unwrap();
+        tcp.write_all(&host_preamble(cranvr_proto::PROTOCOL_VERSION + 1)).unwrap();
     });
     let probe = probe_host(addr, WAIT).unwrap();
-    assert_eq!((probe.versions, probe.key), (VersionRange { min: cranvr_proto::PROTOCOL_VERSION + 1, max: cranvr_proto::PROTOCOL_VERSION + 3 }, None));
+    assert_eq!((probe.version, probe.key), (cranvr_proto::PROTOCOL_VERSION + 1, None));
     host.join().unwrap();
 }
 

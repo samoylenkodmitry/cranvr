@@ -300,9 +300,7 @@ pub fn run(o: Options) -> i32 {
     if let Some(desktop) = &shared.desktop {
         desktop.ask(&shared.link);
         let (send, stop) = (Arc::clone(&shared), Arc::clone(&shared));
-        let mouse = shared.link.welcome.version >= cranvr_proto::MOUSE_VERSION;
         DesktopProbe::pointer_script(
-            mouse,
             move |datagram| drop(send.link.duplex.send_datagram(&datagram)),
             move || stop.stop.load(Ordering::Relaxed),
         );

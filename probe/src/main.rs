@@ -57,8 +57,7 @@ fn usage() -> ! {
          \n                     of the cycle is off then, so the pulls are the only presses. A game that shows one\
          \n                     pointer at a time, such as a menu, then has its left controller pressed for the\
          \n                     first time at AT.\
-         \n  --right-trigger AT:FOR  the same for the right trigger\
-         \n  --protocol native  accepted and ignored: cranvr's protocol is the only one"
+         \n  --right-trigger AT:FOR  the same for the right trigger"
     );
     std::process::exit(2);
 }
@@ -102,11 +101,6 @@ fn main() {
             "--seconds" => options.seconds = value().parse().unwrap_or_else(|_| usage()),
             "--game" => options.game = true,
             "--any-picture" => options.any_picture = true,
-            "--protocol" => {
-                if value() != "native" {
-                    usage()
-                }
-            }
             "--connect" => options.connect = value().to_socket_addrs().ok().and_then(|mut a| a.next()).unwrap_or_else(|| usage()),
             "--tcp" => options.tcp = true,
             "--desktop" => options.desktop = true,
