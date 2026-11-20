@@ -6,8 +6,10 @@
 //!
 //! [`Runner::update`] reads one frame's input and gives the headset actions that fired in this
 //! frame ([`Fire`]): show or hide the panels, open the console, recenter, the keyboard. While no
-//! game runs, the press fires the action. While a game runs, only a hold of [`HOLD_NS`] does, so a
-//! short press stays with the game, as the menu button's hold always did.
+//! link streams, the press fires the action. While the link streams, only a hold of [`HOLD_NS`]
+//! does, so a short press stays with the game, as the menu button's hold always did. The host's
+//! word that a game runs is not enough for the rule: a game that the host does not report would
+//! lose its buttons to a short press.
 //!
 //! The mouse actions belong to the desktop panel (`desktop.rs`). Cranpose's pointer turns each
 //! controller input into one of Compose's five pointer buttons, and `pointer_mapping` here fixes
@@ -23,8 +25,8 @@ use cranpose_xr::{ControllerInput, PointerMapping};
 use cranvr_common::controls::{Action, Control, Controls, Hand};
 use cranvr_proto::message::{buttons as bit, HandInput, Input};
 
-/// How long a button must stay down to fire a headset action while a game runs. A shorter press goes
-/// to the game only: games use the buttons for their own menus.
+/// How long a button must stay down to fire a headset action while the link streams. A shorter press
+/// goes to the game only: games use the buttons for their own menus.
 pub const HOLD_NS: u64 = 800_000_000;
 /// An analog input counts as down above `PRESS` and as up below `RELEASE`, as Cranpose's pointer
 /// counts the trigger, so a trigger held near one value does not flicker.
@@ -69,8 +71,10 @@ pub fn control_of(button: PointerButton) -> Control {
     }
 }
 
-/// The mapping that Cranpose's pointer gets: each input has its own button (`button_of`), and the
-/// thumbstick scrolls Cranpose's panels while any axis of the mapping scrolls. Cranpose has one
+/// The mapping that Cranpose's pointer gets: an input that some hand maps to a mouse button has a
+/// button of its own (`button_of`), and no other input presses a pointer button, so a grip or a
+/// face button that does something else reaches no panel as a click. The trigger always has the
+/// primary button. The thumbstick scrolls Cranpose's panels while any axis of the mapping scrolls. Cranpose has one
 /// mapping for both hands, and the user's mapping has one for each hand. The desktop panel applies
 /// the user's mapping to each hand's presses (`desktop.rs`).
 pub fn pointer_mapping(controls: &Controls) -> PointerMapping {
@@ -82,7 +86,10 @@ pub fn pointer_mapping(controls: &Controls) -> PointerMapping {
         (ControllerInput::ThumbstickClick, Control::StickClick),
         (ControllerInput::Menu, Control::Menu),
     ];
-    let mapping = pairs.into_iter().fold(PointerMapping::new(), |mapping, (input, control)| mapping.with_button(input, button_of(control)));
+    let clicks = |control: Control| control == Control::Trigger || Hand::BOTH.into_iter().any(|hand| controls.action(hand, control).is_click());
+    let mapping = pairs
+        .into_iter()
+        .fold(PointerMapping::new(), |mapping, (input, control)| mapping.with_button(input, button_of(control).filter(|_| clicks(control))));
     let scrolls = Hand::BOTH.into_iter().any(|hand| {
         [Control::StickVertical, Control::StickHorizontal].into_iter().any(|axis| controls.action(hand, axis) == Action::Scroll)
     });
@@ -135,9 +142,9 @@ pub struct Runner {
 }
 
 impl Runner {
-    /// Reads one frame of input. `now` is on the client's clock. `game_runs` says that a game runs
-    /// on the host. The returned actions fired in this frame.
-    pub fn update(&mut self, controls: &Controls, input: &Input, now: u64, game_runs: bool) -> Vec<Fire> {
+    /// Reads one frame of input. `now` is on the client's clock. `streams` says that the link
+    /// streams, so a game may run. The returned actions fired in this frame.
+    pub fn update(&mut self, controls: &Controls, input: &Input, now: u64, streams: bool) -> Vec<Fire> {
         let mut fires = Vec::new();
         for hand in Hand::BOTH {
             let (inputs, mapped) = (&input.hands[hand.index()], controls.hand(hand));
@@ -153,7 +160,7 @@ impl Runner {
                 } else if !down {
                     *slot = Slot::default();
                 }
-                if down && action.is_headset() && !slot.fired && (!game_runs || now.saturating_sub(slot.since) >= HOLD_NS) {
+                if down && action.is_headset() && !slot.fired && (!streams || now.saturating_sub(slot.since) >= HOLD_NS) {
                     slot.fired = true;
                     fires.push(Fire { hand, action });
                 }

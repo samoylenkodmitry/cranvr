@@ -30,7 +30,7 @@ use cranpose::prelude::*;
 use cranpose::text::{FontWeight, TextUnit};
 use cranpose::DecodedFrames;
 use cranpose_xr::{
-    local_haptics, local_headset_properties, local_pointer_settings, local_spatial_capabilities, local_spatial_environment, FollowMode, FollowTarget,
+    local_controller_models, local_haptics, local_headset_properties, local_pointer_settings, local_spatial_capabilities, local_spatial_environment, FollowMode, FollowTarget,
     FollowingSubspace, Hand as XrHand, InputSource, Pose, SpatialFrameEffect, SpatialPanel, StreamedScene, SubspaceModifier,
 };
 use cranvr_common::controls::Action as ControlAction;
@@ -107,6 +107,8 @@ pub fn ClientApp() {
     let address = address_field();
     // Cranpose's pointer: the buttons of the controllers and the beams. `None` outside a headset.
     let pointer_settings = local_pointer_settings().current();
+    // The models of the controllers. A game draws its own controllers, so they show with the beams.
+    let controller_models = local_controller_models().current();
     LaunchedEffect((), async move |_| {
         if settings::console_on_launch() {
             hub().pin_console();
@@ -149,6 +151,13 @@ pub fn ClientApp() {
                     pointer.set_mapping(want.0);
                     pointer.set_beams_visible(want.1);
                     given = Some(want);
+                }
+                // With the models off the headset draws no projection layer for them, so a game with
+                // every panel hidden costs what it cost before the models
+                if let Some(models) = &controller_models {
+                    if models.is_enabled() != beams {
+                        models.set_enabled(beams);
+                    }
                 }
             }
             delay(CONSOLE_POLL).await;

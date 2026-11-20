@@ -387,7 +387,8 @@ fi
 (( hold )) && probe_args+=(--hold-script)
 (( hand_hold )) && probe_args+=(--hold-hands)
 [[ -n ${pause} ]] && probe_args+=(--pause "${pause}")
-[[ -n ${left_trigger} ]] && probe_args+=(--left-trigger "${left_trigger}")
+# The pull test needs a head that stands still, so the hands stay in view
+[[ -n ${left_trigger} ]] && probe_args+=(--left-trigger "${left_trigger}" --still-head)
 # The probe offers hands, body, face and eyes and plays the script of tracked.rs for what the host asks
 (( tracking || tracking_wine )) && probe_args+=(--tracking --face-source "${face_source}")
 (( hand_controllers )) && probe_args+=(--tracking --no-controllers)

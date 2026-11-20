@@ -29,21 +29,30 @@ fn each_input_that_can_click_has_a_pointer_button_of_its_own() {
 }
 
 #[test]
-fn cranpose_gets_one_button_for_each_input_and_scrolls_while_an_axis_scrolls() {
+fn cranpose_presses_a_button_only_for_an_input_that_a_hand_maps_to_a_mouse_button() {
     let mut controls = Controls::default();
     let mapping = pointer_mapping(&controls);
-    for (input, control) in [
-        (ControllerInput::Trigger, Control::Trigger),
-        (ControllerInput::Squeeze, Control::Grip),
-        (ControllerInput::Primary, Control::Primary),
-        (ControllerInput::Secondary, Control::Secondary),
-        (ControllerInput::ThumbstickClick, Control::StickClick),
-    ] {
-        assert_eq!(mapping.button(input), button_of(control), "{input:?}");
+    // The standard mapping: the trigger, A and X and the press of the stick click. The grip and B and Y
+    // do other things, so they reach no panel as a click.
+    assert_eq!(mapping.button(ControllerInput::Trigger), Some(PointerButton::Primary));
+    assert_eq!(mapping.button(ControllerInput::Primary), Some(PointerButton::Secondary));
+    assert_eq!(mapping.button(ControllerInput::ThumbstickClick), Some(PointerButton::Middle));
+    for input in [ControllerInput::Squeeze, ControllerInput::Secondary, ControllerInput::Menu] {
+        assert_eq!(mapping.button(input), None, "{input:?}");
     }
-    assert_eq!(mapping.button(ControllerInput::Menu), None);
     assert_eq!(mapping.scroll_speed(), 800.0);
-    // One axis of one hand that scrolls keeps Cranpose's own scrolling on
+    // One hand maps its grip to a click: the grip gets its own button
+    controls.set(Hand::Left, Control::Grip, Action::RightClick);
+    assert_eq!(pointer_mapping(&controls).button(ControllerInput::Squeeze), button_of(Control::Grip));
+    // The trigger keeps the primary button, whatever it does
+    controls.set(Hand::Left, Control::Trigger, Action::Nothing);
+    controls.set(Hand::Right, Control::Trigger, Action::Panels);
+    assert_eq!(pointer_mapping(&controls).button(ControllerInput::Trigger), Some(PointerButton::Primary));
+    // A and X that do something else press nothing
+    controls.set(Hand::Left, Control::Primary, Action::Recenter);
+    controls.set(Hand::Right, Control::Primary, Action::Nothing);
+    assert_eq!(pointer_mapping(&controls).button(ControllerInput::Primary), None);
+    // Cranpose scrolls its own panels while any axis of any hand scrolls
     for hand in Hand::BOTH {
         for axis in [Control::StickVertical, Control::StickHorizontal] {
             controls.set(hand, axis, Action::Nothing);
@@ -55,7 +64,7 @@ fn cranpose_gets_one_button_for_each_input_and_scrolls_while_an_axis_scrolls() {
 }
 
 #[test]
-fn without_a_game_a_press_fires_the_headset_action_once() {
+fn without_a_stream_a_press_fires_the_headset_action_once() {
     let controls = Controls::default();
     let mut runner = Runner::default();
     // The left Y button shows or hides the panels in the standard mapping
@@ -73,7 +82,7 @@ fn without_a_game_a_press_fires_the_headset_action_once() {
 }
 
 #[test]
-fn while_a_game_runs_only_a_hold_fires_and_a_short_press_stays_with_the_game() {
+fn while_the_link_streams_only_a_hold_fires_and_a_short_press_stays_with_the_game() {
     let controls = Controls::default();
     let mut runner = Runner::default();
     let menu = input(pressed(bit::MENU), HandInput::default());
