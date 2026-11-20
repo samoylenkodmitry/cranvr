@@ -833,10 +833,7 @@ fn LaunchOptions(settings: MutableState<Settings>, program: String) {
             Hint("An OpenVR game needs OpenComposite to run, because SteamVR is not installed. Off leaves the game no OpenVR runtime, so a game with an OpenXR mode takes that. It applies when the game starts.".into());
             if shown {
                 OptionField("Wine DLL overrides", dll);
-                if !options.dll_overrides.is_empty() && !options.dll_overrides_reason.is_empty() {
-                    Hint(options.dll_overrides_reason.clone());
-                }
-                Hint("As WINEDLLOVERRIDES takes them, such as winhttp=n,b. The program then loads a winhttp.dll from its own folder before Wine's. A mod loader needs this.".into());
+                Hint("As WINEDLLOVERRIDES takes them, such as winhttp=n,b. The program then loads a winhttp.dll from its own folder before Wine's. Use it only for a mod loader that does not start without it: a loader that patched the game's files already starts twice with it.".into());
                 OptionField("Steam app ID", steam_id);
                 if !options.steam_app_id.is_empty() && !options.steam_app_id_reason.is_empty() {
                     Hint(options.steam_app_id_reason.clone());
@@ -851,14 +848,11 @@ fn LaunchOptions(settings: MutableState<Settings>, program: String) {
                     Primary("Save options".into(), move || {
                         edit_launch(settings, &key, |o| {
                             // A value that the user changed has no reason of cranvr's any more
-                            let (dll_text, steam_text) = (dll.text().trim().to_owned(), steam_id.text().trim().to_owned());
-                            if dll_text != o.dll_overrides {
-                                o.dll_overrides_reason.clear();
-                            }
+                            let steam_text = steam_id.text().trim().to_owned();
                             if steam_text != o.steam_app_id {
                                 o.steam_app_id_reason.clear();
                             }
-                            o.dll_overrides = dll_text;
+                            o.dll_overrides = dll.text().trim().to_owned();
                             o.steam_app_id = steam_text;
                             o.env = env.text().trim().to_owned();
                             o.args = args.text().trim().to_owned();

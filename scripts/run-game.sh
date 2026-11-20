@@ -15,7 +15,8 @@
 # Environment: CRANVR_MAX_MSAA caps the MSAA samples a game may use (default: the app's setting, else
 # 2; 0 for no cap). The script applies no option of a particular game: set them yourself, as the
 # app's launch options do, for example BASALT_MAX_ARRAY_SIZE=1 for a game whose right eye stays
-# black, or WINEDLLOVERRIDES='winhttp=n,b' for a mod loader that ships winhttp.dll.
+# black, or WINEDLLOVERRIDES='winhttp=n,b' for a mod loader that does not start without its winhttp.dll
+# (BSIPA, which patches the game's files, does start without it and starts twice with it).
 #
 # Examples:
 #   scripts/run-game.sh 'C:\basalt\runtime\d3d11_runtime_smoke.exe' --render-frames 7200 --visual

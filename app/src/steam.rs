@@ -447,8 +447,8 @@ pub fn mac_to_windows(path: &Path) -> String {
 }
 
 /// Adds the program at `program` (a Mac path) to the games that the user added from a folder, and fills in
-/// its launch options as far as its folder shows what it needs (see [`launch::detect`]): the override
-/// for a mod loader's DLL, and the Steam app ID of the game that it is a copy of. `steam` is the list of
+/// its launch options as far as its folder shows what it needs (see [`launch::detect`]): the Steam app ID
+/// of the game that it is a copy of. `steam` is the list of
 /// Steam games. A value that the program's options hold already stays. The list grows by one game, named
 /// after the program's folder, and the options keep the reasons for the user to read.
 pub fn add_game(settings: &mut backend::Settings, program: &Path, steam: &[Game]) -> Result<(), String> {
@@ -470,10 +470,6 @@ pub fn add_game(settings: &mut backend::Settings, program: &Path, steam: &[Game]
     let detected = launch::detect(program, original.map(|game| (game.name.as_str(), game.app_id.as_str())));
     if !detected.is_default() {
         let options = settings.launch.entry(mac_to_windows(program)).or_default();
-        if options.dll_overrides.trim().is_empty() {
-            options.dll_overrides = detected.dll_overrides;
-            options.dll_overrides_reason = detected.dll_overrides_reason;
-        }
         if options.steam_app_id.trim().is_empty() {
             options.steam_app_id = detected.steam_app_id;
             options.steam_app_id_reason = detected.steam_app_id_reason;
@@ -597,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn adding_a_copy_of_a_modded_game_fills_in_its_options_with_reasons() {
+    fn adding_a_copy_of_a_modded_game_fills_in_its_steam_app_id_and_no_override() {
         let original = folder("add-original", &["Some Game.exe", "Some Game_Data/", "UnityPlayer.dll", "MonoBleedingEdge/"]);
         let copy = folder("add-copy", &["Some Game.exe", "Some Game_Data/", "UnityPlayer.dll", "MonoBleedingEdge/", "winhttp.dll", "Plugins/"]);
         let steam = [Game { app_id: "620".into(), name: "Some Game".into(), exe: Some(original.join("Some Game.exe")) }];
@@ -610,12 +606,12 @@ mod tests {
         let options = &settings.launch[&mac_to_windows(&program)];
         assert_eq!(options.steam_app_id, "620");
         assert!(options.steam_app_id_reason.contains("Some Game"));
-        assert_eq!(options.dll_overrides, "winhttp=n,b");
-        assert!(options.dll_overrides_reason.contains("winhttp.dll"));
-        // The game's environment holds what its Steam check and its mod loader need
+        // The mod loader's DLL in the folder is no reason for an override: BSIPA-like loaders start twice with one
+        assert!(options.dll_overrides.is_empty());
+        // The game's environment holds what its Steam check needs
         let vars = launch::environment(&settings.wine, options);
         assert!(vars.contains(&("SteamAppId".to_owned(), "620".to_owned())));
-        assert!(vars.contains(&("WINEDLLOVERRIDES".to_owned(), "winhttp=n,b".to_owned())));
+        assert!(!vars.iter().any(|(name, _)| name == "WINEDLLOVERRIDES"));
         // The second add, the original's own program and a file that is no program are refused
         assert!(add_game(&mut settings, &program, &steam).is_err());
         assert!(add_game(&mut settings, &original.join("Some Game.exe"), &steam).is_err());
