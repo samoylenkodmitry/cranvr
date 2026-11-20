@@ -1,0 +1,35 @@
+diff --git a/DrvOpenXR/XrController.cpp b/DrvOpenXR/XrController.cpp
+index 8d52e92..01a9e91 100644
+--- a/DrvOpenXR/XrController.cpp
++++ b/DrvOpenXR/XrController.cpp
+@@ -122,6 +122,10 @@ uint32_t XrController::GetStringTrackedDeviceProperty(vr::ETrackedDeviceProperty
+ 	// Resonite determines controller type by using render model name, if it can't recognize - it will load generic controller
+ 	switch (type) {
+ 	case XCT_LEFT: {
++		// cranvr: each controller has a serial number of its own. A game that tells its controllers apart by their serial
++		// numbers (Serious Sam VR does, 14000 queries in 2 minutes) took both for one controller while both said
++		// "<unknown>": the first one worked and the second stayed where it had no pose, on the floor.
++		PROP(vr::Prop_SerialNumber_String, "oculus_touch_left");
+ 		std::optional<const char*> leftHandPath = GetInteractionProfile()->GetLeftHandRenderModelName();
+ 		if (leftHandPath.has_value()) {
+ 			PROP(vr::Prop_RenderModelName_String, leftHandPath.value());
+@@ -132,6 +136,7 @@ uint32_t XrController::GetStringTrackedDeviceProperty(vr::ETrackedDeviceProperty
+ 		break;
+ 	}
+ 	case XCT_RIGHT: {
++		PROP(vr::Prop_SerialNumber_String, "oculus_touch_right");
+ 		std::optional<const char*> rightHandPath = GetInteractionProfile()->GetRightHandRenderModelName();
+ 		if (rightHandPath.has_value()) {
+ 			PROP(vr::Prop_RenderModelName_String, rightHandPath.value());
+diff --git a/DrvOpenXR/XrHMD.cpp b/DrvOpenXR/XrHMD.cpp
+index 7317fd8..7e299bf 100644
+--- a/DrvOpenXR/XrHMD.cpp
++++ b/DrvOpenXR/XrHMD.cpp
+@@ -391,6 +391,7 @@ uint32_t XrHMD::GetStringTrackedDeviceProperty(vr::ETrackedDeviceProperty prop,
+ 		}                                                                                                  \
+ 	} while (0)
+ 
++	PROP(vr::Prop_SerialNumber_String, "oculus_hmd"); // cranvr: not the "<unknown>" of the controllers (see XrController.cpp)
+ 	PROP(vr::Prop_RegisteredDeviceType_String, "oculus/F00BAAF00F");
+ 	PROP(vr::Prop_RenderModelName_String, "oculusHmdRenderModel");
+ 

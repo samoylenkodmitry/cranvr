@@ -756,6 +756,11 @@ int main(int argc, char** argv)
 	float eye_distance = 0.0f;
 	Clock::time_point last_eye_read = begin;
 	bool left_connected = false, right_connected = false, left_grip_pressed = false, a_pressed = false;
+	// A game that tells its controllers apart by their serial numbers (Serious Sam VR does) takes two controllers with one
+	// number for a single controller: the second stays where it has no pose. The head and the two controllers must differ.
+	// They are read once, while both controllers are there.
+	char serials[3][64] = {};
+	bool serials_read = false;
 	// The poses of the two controllers in the array that WaitGetPoses fills, as a game with no action manifest reads
 	// them: how often each was valid, from which frame on, how often it was lost, and where it was
 	// (the verdict counts the frames up to the last valid head pose: a program that runs longer than the headset's
@@ -850,6 +855,13 @@ int main(int argc, char** argv)
 		const vr::TrackedDeviceIndex_t right = system->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
 		left_connected |= left != vr::k_unTrackedDeviceIndexInvalid && poses[left].bDeviceIsConnected && poses[left].bPoseIsValid;
 		right_connected |= right != vr::k_unTrackedDeviceIndexInvalid && poses[right].bDeviceIsConnected && poses[right].bPoseIsValid;
+		if (!serials_read && left_connected && right_connected && frames > 10) {
+			serials_read = true;
+			for (vr::TrackedDeviceIndex_t index = 0; index < 3; index++) {
+				vr::ETrackedPropertyError error = vr::TrackedProp_Success;
+				system->GetStringTrackedDeviceProperty(index, vr::Prop_SerialNumber_String, serials[index], sizeof(serials[index]), &error);
+			}
+		}
 		for (int i = 0; i < 2; i++) {
 			const vr::TrackedDeviceIndex_t index = i == 0 ? left : right;
 			const bool valid = index != vr::k_unTrackedDeviceIndexInvalid && poses[index].bDeviceIsConnected && poses[index].bPoseIsValid
@@ -984,6 +996,10 @@ int main(int argc, char** argv)
 		    static_cast<unsigned long long>(judged_valid[i]), static_cast<unsigned long long>(judged_frames[i]), legacy_x_min[i], legacy_x_max[i], legacy_y[i]);
 	}
 
+	say("serial numbers: head \"%s\", device 1 \"%s\", device 2 \"%s\"", serials[0], serials[1], serials[2]);
+	const bool serials_differ = serials_read && serials[1][0] != '\0' && std::strcmp(serials[1], serials[2]) != 0 && std::strcmp(serials[0], serials[1]) != 0
+	    && std::strcmp(serials[0], serials[2]) != 0;
+
 	say("the eyes are %.1f mm apart", eye_distance * 1000.0f);
 
 	for (int i = 0; i < 2; i++) {
@@ -1002,6 +1018,9 @@ int main(int argc, char** argv)
 	}
 	if (judged_head_valid < judged * 9 / 10) {
 		return fail("the head pose was not valid in 90 percent of the frames");
+	}
+	if (!serials_differ) {
+		return fail("the head and the two controllers do not have serial numbers of their own");
 	}
 	if (!(eye_distance > 0.03f && eye_distance < 0.09f)) {
 		return fail("the eyes are not 3 to 9 cm apart");
