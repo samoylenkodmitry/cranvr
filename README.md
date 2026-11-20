@@ -133,7 +133,7 @@ The same pinch must not press a panel behind the game's picture while it is the 
 
 ### Text entry
 
-A text field asks for the platform's software keyboard when it takes focus. In a Quest, Cranpose draws the keyboard as a panel of keys under the panel of the field. A press of a controller's ray or a pinch of a hand on a key types. On Android XR the system's keyboard shows instead. The address field of the connect panel is the app's only text field. It takes the typed address of a Mac. The phone build uses the system's keyboard.
+A text field asks for the platform's software keyboard when it takes focus. In a Quest, Cranpose draws the keyboard as a panel of keys under the panel of the field. A press of a controller's ray or a pinch of a hand on a key types. On Android XR the system's keyboard shows instead. The address field of the connect panel is the app's only text field. It takes the typed address of a Mac. A headset also keeps the keypad in that panel, which edits the same text. It stays until the drawn keyboard has run on a Quest 3, because Cranpose tested the keyboard in a window and in an emulator only. The phone build uses the system's keyboard.
 
 ### The Meta store check
 

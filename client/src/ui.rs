@@ -199,7 +199,7 @@ fn PhonePanels(snapshot: MutableState<Snapshot>, address: TextFieldState, panels
                 Modifier::empty().weight(1.0).fill_max_height().vertical_scroll(left, false).clickable(|_| {}),
                 ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(16.0)),
                 move || {
-                    ConnectBody(snapshot, address, Modifier::empty().fill_max_width());
+                    ConnectBody(snapshot, address, Modifier::empty().fill_max_width(), false);
                     PhoneButtons(panels);
                 },
             );
@@ -318,6 +318,14 @@ fn Stream(frames: MutableState<Option<DecodedFrames>>) {
     }
 }
 
+/// What the user presses on the keypad.
+#[derive(Clone, Copy, PartialEq)]
+enum KeyPress {
+    Text(&'static str),
+    Back,
+    Clear,
+}
+
 /// Starts or ends the connection, as the button of the panel says. A start connects to the typed
 /// address.
 fn toggle_connection(state: &LinkState, address: TextFieldState) {
@@ -361,24 +369,24 @@ fn address_field() -> TextFieldState {
     address
 }
 
-/// The connect panel: the Macs that the search found, and the address field behind a button. The
-/// app owns the address field (`address_field`).
+/// The connect panel: the Macs that the search found, and the address field with its keypad behind a
+/// button. The app owns the address field (`address_field`).
 #[composable]
 fn ConnectPanel(snapshot: MutableState<Snapshot>, address: TextFieldState) {
     let pose = remember(|| place::start_pose("connect", side_pose(-1.0))).with(|pose| *pose);
     let size = rememberMutableStateOf(|| place::start_size("connect", CONNECT_SIZE));
     SpatialPanel(
         place::movable("connect", place::resizable("connect", size, CONNECT_SIZE), pose, |_| {}),
-        move || ConnectBody(snapshot, address, Modifier::empty().fill_max_size()),
+        move || ConnectBody(snapshot, address, Modifier::empty().fill_max_size(), true),
     );
 }
 
 /// The content of the connect panel. `modifier` gives its size. While no link runs, it lists the
 /// Macs that answered the search. A press on one connects. The address field stays
 /// behind the small button "Enter an address", for a headset on USB and for another network. It
-/// replaces the list while it shows.
+/// replaces the list while it shows. `keypad` adds the keypad of a headset.
 #[composable]
-fn ConnectBody(snapshot: MutableState<Snapshot>, address: TextFieldState, modifier: Modifier) {
+fn ConnectBody(snapshot: MutableState<Snapshot>, address: TextFieldState, modifier: Modifier, keypad: bool) {
     let snap = snapshot.get();
     let state = snap.state.clone();
     let found = usb::entries(&snap.found, snap.usb.as_ref());
@@ -393,7 +401,7 @@ fn ConnectBody(snapshot: MutableState<Snapshot>, address: TextFieldState, modifi
                 LinkState::Idle | LinkState::Failed(_) => {
                     // The address entry takes the place of the list: both together would not fit the panel
                     if typing.get() {
-                        AddressEntry(address, state.clone());
+                        AddressEntry(address, state.clone(), keypad);
                     } else {
                         HostList(found.clone(), address);
                     }
@@ -533,8 +541,10 @@ fn AddressButtons(typing: MutableState<bool>, address: TextFieldState) {
 /// The address of a Mac that the search does not find: a headset on USB (`127.0.0.1`) or on another
 /// network. A press on the field opens the keyboard. In a Quest it is the keyboard that Cranpose
 /// draws under the panel, and a press on its keys types. On a phone it is the system's keyboard.
+/// A headset also gets a keypad in the panel, which edits the same text. It stays until the drawn
+/// keyboard has run on a Quest 3, because Cranpose tested it in a window and an emulator only.
 #[composable]
-fn AddressEntry(address: TextFieldState, state: LinkState) {
+fn AddressEntry(address: TextFieldState, state: LinkState, keypad: bool) {
     Text("Address of the Mac", Modifier::empty(), text_style(22.0, MUTED_COLOR, None));
     Box(
         Modifier::empty().fill_max_width().background(FIELD_COLOR).rounded_corners(14.0).padding(18.0),
@@ -553,7 +563,63 @@ fn AddressEntry(address: TextFieldState, state: LinkState) {
             );
         },
     );
+    if keypad {
+        Keypad(address);
+    }
     ConnectButton(state, address);
+}
+
+#[composable]
+fn Keypad(address: TextFieldState) {
+    let rows: [&[KeyPress]; 3] = [
+        &[KeyPress::Text("1"), KeyPress::Text("2"), KeyPress::Text("3"), KeyPress::Text("4"), KeyPress::Text("5")],
+        &[KeyPress::Text("6"), KeyPress::Text("7"), KeyPress::Text("8"), KeyPress::Text("9"), KeyPress::Text("0")],
+        &[KeyPress::Text("."), KeyPress::Text(":"), KeyPress::Back, KeyPress::Clear],
+    ];
+    Column(
+        Modifier::empty(),
+        ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(10.0)),
+        move || {
+            for row in rows {
+                Row(
+                    Modifier::empty(),
+                    RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(10.0)),
+                    move || {
+                        for press in row {
+                            Key(*press, address);
+                        }
+                    },
+                );
+            }
+        },
+    );
+}
+
+#[composable]
+fn Key(press: KeyPress, address: TextFieldState) {
+    let label = match press {
+        KeyPress::Text(text) => text,
+        KeyPress::Back => "<-",
+        KeyPress::Clear => "clear",
+    };
+    let wide = !matches!(press, KeyPress::Text(_));
+    Button(
+        Modifier::empty()
+            .background(KEY_COLOR)
+            .rounded_corners(12.0)
+            .padding_symmetric(if wide { 26.0 } else { 30.0 }, 14.0),
+        ButtonSpec::default(),
+        move || {
+            address.edit(|buffer| match press {
+                KeyPress::Text(text) => buffer.insert(text),
+                KeyPress::Back => buffer.delete_before_cursor(),
+                KeyPress::Clear => buffer.clear(),
+            });
+        },
+        move || {
+            Text(label, Modifier::empty(), text_style(30.0, TEXT_COLOR, Some(FontWeight::BOLD)));
+        },
+    );
 }
 
 /// Connects to the typed address.
