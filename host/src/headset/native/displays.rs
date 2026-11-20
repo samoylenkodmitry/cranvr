@@ -43,8 +43,11 @@ const ADDED_SIZE: [u32; 2] = [1920, 1080];
 const LOOK_EVERY: Duration = Duration::from_millis(50);
 /// How often it checks that the added displays still exist
 const ALIVE_EVERY: Duration = Duration::from_secs(1);
-/// How often it writes what the displays did into the log
-const LOG_EVERY: Duration = Duration::from_secs(5);
+/// How often it writes what the displays did into the log. `CRANVR_DISPLAYS_LOG_SECS` changes it, so a
+/// test can look at short windows.
+fn log_every() -> Duration {
+    std::env::var("CRANVR_DISPLAYS_LOG_SECS").ok().and_then(|v| v.parse::<f64>().ok()).filter(|s| *s >= 0.2).map_or(Duration::from_secs(5), Duration::from_secs_f64)
+}
 
 /// One display and what belongs to it.
 struct Slot {
@@ -310,6 +313,7 @@ fn manage(displays: &Displays, session: &Session) {
     let mut list_sent: Option<DisplayList> = None;
     let (mut alive_at, mut log_at) = (Instant::now(), Instant::now());
     let mut seen = DisplayCounts::default();
+    let log_every = log_every();
     let send = |message: &HostMsg| session.link.duplex.send_control(message).ok();
     while !displays.stop.load(Ordering::Relaxed) && !*session.stopped.lock().unwrap() {
         thread::sleep(LOOK_EVERY);
@@ -330,14 +334,14 @@ fn manage(displays: &Displays, session: &Session) {
             alive_at = Instant::now();
             displays.drop_gone();
         }
-        if log_at.elapsed() >= LOG_EVERY {
+        if log_at.elapsed() >= log_every {
             log_at = Instant::now();
             let (now, known, shown) = displays.totals();
             let d = |a: u64, b: u64| a.saturating_sub(b);
             info!(
-                "Native displays: {known} known, {shown} shown, {}; in the last {:.0} s: {} pictures captured, {} encoded, {} sent, {} cursor datagrams sent",
+                "Native displays: {known} known, {shown} shown, {}; in the last {:.1} s: {} pictures captured, {} encoded, {} sent, {} cursor datagrams sent",
                 if game { "a game runs" } else { "no game runs" },
-                LOG_EVERY.as_secs_f64(),
+                log_every.as_secs_f64(),
                 d(now.captured, seen.captured),
                 d(now.encoded, seen.encoded),
                 d(now.sent, seen.sent),

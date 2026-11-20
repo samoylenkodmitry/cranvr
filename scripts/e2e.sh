@@ -7,6 +7,7 @@
 #                       [--quest [SERIAL] | --native-tcp] [--native-drop PERCENT] [--native-port PORT]
 #                       [--host-arg ARG]... [--report FILE]
 #                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine | --openvr-wine | --openvr-actions MODE]
+#                       [--displays N] [--hold] [--displays-in-game]
 #                       [--pause AT:FOR]
 #                       [--face-source visual|audio|unknown]
 #
@@ -60,6 +61,18 @@
 #                 desktop scene draws no eye badges. The run fails when the probe gets the sound
 #                 for less than 80 percent of the stream time. --host-arg --virtual-display
 #                 --host-arg 1920x1080 shows a virtual display instead of the main one.
+#   --displays N  with --desktop's host: the probe shows N displays. It asks the host to add N-1 of them, wishes
+#                 the video of each, decodes each stream, plays the pointer script on each and removes the last one
+#                 three seconds before the end. Needs this Mac to make virtual displays (it takes the owner's
+#                 displays through a short rearrangement: do not run it while the owner plays). Implies --desktop.
+#   --hold        the probe's right hand points at a panel in every other window of its script. The host must
+#                 give the game rest values for those windows, and the fake game checks that none of the panel's
+#                 presses reaches it, also not in the 0.1 s after the hold ends. Implies --game.
+#   --displays-in-game  a game runs (the fake game). For 5 s the probe wishes no display, then it shows its
+#                 displays for 5 s, then it hides them. The run checks the host's log and the probe's counts: no
+#                 capture, no encoder and no picture sent or received while nothing is wished or after the
+#                 wish ended, and pictures while it lasted. Add --displays N for more than one display.
+#                 Implies --game.
 #   --quest       the client is cranvr's Cranpose client (dev.cranvr.client, see
 #                 scripts/build-client.sh) on a Quest attached by USB. The Quest and the Mac must
 #                 share a network. The host runs with --trust-all on --native-port. The app gets this
@@ -90,6 +103,7 @@ set -euo pipefail
 
 root=${0:A:h:h}
 seconds=20 fps=120 fps_given=0 game=0 desktop=0 client=mac serial="" report=""
+displays=1 hold=0 displays_in_game=0
 tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 openvr_wine=0 openvr_actions="" face_source=audio
 wine="" wine_args=()
 native_tcp=0 native_drop=0 native_port=9950 pause=""
@@ -112,6 +126,9 @@ while (( $# )); do
             face_source=$2; shift 2
             [[ ${face_source} == (visual|audio|unknown) ]] || { print -u2 "--face-source takes visual, audio or unknown"; exit 2; } ;;
         --desktop) desktop=1; shift ;;
+        --displays) displays=$2; shift 2 ;;
+        --hold) game=1 hold=1; shift ;;
+        --displays-in-game) game=1 displays_in_game=1; shift ;;
         --wine) wine=$2; shift 2 ;;
         --wine-arg) wine_args+=("$2"); shift 2 ;;
         --cranvr-client|--native) shift ;;
@@ -128,7 +145,16 @@ while (( $# )); do
     esac
 done
 
-if [[ ${client} == quest ]] && (( tracking || hand_controllers || tracking_wine || openvr_wine )); then
+if (( displays > 1 && ! displays_in_game )); then
+    # The probe adds the displays, shows them and removes the last one three seconds before the end
+    desktop=1
+    (( seconds >= 15 )) || seconds=15
+fi
+if (( displays_in_game )); then
+    # 5 s with no wish, 5 s shown, 1.5 s for the pictures on their way and 4 s with none
+    (( seconds >= 18 )) || seconds=18
+fi
+if [[ ${client} == quest ]] && (( hold || displays > 1 || displays_in_game || tracking || hand_controllers || tracking_wine || openvr_wine )); then
     print -u2 "--tracking, --hand-controllers, --tracking-wine and --openvr-wine belong to the probe: they cannot combine with --quest."
     exit 2
 fi
@@ -196,6 +222,11 @@ case ${client} in
         host_args+=(--trust-all)
         ;;
 esac
+if (( displays_in_game )); then
+    # The host runs the displays and logs what they did in windows of one second
+    host_args+=(--desktop)
+    export CRANVR_DISPLAYS_LOG_SECS=1 CRANVR_POINTER_DRY_RUN=1
+fi
 if (( desktop )); then
     host_args+=(--desktop)
     # The probe's pointer script then moves no real mouse
@@ -305,6 +336,7 @@ if (( game )); then
         game_args=(--expect-input)
         (( tracking )) && game_args=(--use-tracking "${tracking_features}" --release-tracking --expect-tracking --face-source "${face_source}")
         (( hand_controllers )) && game_args=(--expect-hand-controllers)
+        (( hold )) && game_args+=(--expect-held)
         "${bin}/cranvr-fake-game" --control "${work}/config/runtime-control.txt" --fps "${fps}" \
             --seconds $(( seconds + 4 )) "${game_args[@]}" > "${work}/game.log" 2>&1 &
     else
@@ -331,6 +363,9 @@ if [[ -n ${wine} ]] || (( desktop )); then
 fi
 # The probe asks for the desktop stream, plays a pointer script and counts the Mac's sound
 (( desktop )) && probe_args+=(--desktop)
+(( displays > 1 )) && probe_args+=(--displays "${displays}")
+(( displays_in_game )) && probe_args+=(--displays-in-game)
+(( hold )) && probe_args+=(--hold-script)
 [[ -n ${pause} ]] && probe_args+=(--pause "${pause}")
 # The probe offers hands, body, face and eyes and plays the script of tracked.rs for what the host asks
 (( tracking || tracking_wine )) && probe_args+=(--tracking --face-source "${face_source}")
@@ -431,6 +466,61 @@ if [[ ${client} == mac ]] && (( game )); then
     grep -hE "fake-game: (input|tracking|controllers made|hand controller)" "${work}/game.log" || true
     (( game_exit == 0 )) || print -u2 "The fake game failed or saw wrong input; see ${work}/game.log"
 fi
+displays_exit=0
+if (( displays > 1 && ! displays_in_game )); then
+    # Every display got its own stream and pictures: the probe's summary counts them, and the host says
+    # which displays it captured
+    grep -h "probe: displays:" "${work}/probe.log" || { print -u2 "The probe printed no summary of the displays; see ${work}/probe.log"; displays_exit=1; }
+    for (( n = 2; n <= displays; n++ )); do
+        grep -q "Native display ${n}: capturing display" "${work}/host.out" || { print -u2 "The host captured no display ${n}; see ${work}/host.out"; displays_exit=1; }
+        grep -hE "probe: desktop display ${n}:.*pictures" "${work}/probe.log" | head -1 || true
+    done
+fi
+if (( displays_in_game )); then
+    # A game with no display shown costs nothing: the host's windows with no wish and after the wish ended
+    # captured, encoded and sent nothing, and the probe received nothing. The windows in between did work.
+    python3 -I - "${work}/probe.log" "${work}/host.out" <<'PYTHON' || displays_exit=1
+import re, sys
+probe, host = (open(path, errors="replace").read() for path in sys.argv[1:3])
+def numbers(pattern, text):
+    found = re.search(pattern, text)
+    return [int(n) for n in found.groups()] if found else None
+idle = numbers(r"nothing wished for \d+ s: (\d+) units arrived, (\d+) pictures decoded", probe)
+shown = numbers(r"shown for \d+ s: (\d+) units arrived, (\d+) pictures decoded", probe)
+after = numbers(r"after the wish ended: (\d+) units arrived in the first 1\.5 s, (\d+) in the next 4 s", probe)
+windows = [
+    {"runs": m[2] == "a game runs", "shown": int(m[1]), "captured": int(m[3]), "encoded": int(m[4]), "sent": int(m[5]), "cursors": int(m[6])}
+    for m in re.findall(r"Native displays: (\d+) known, (\d+) shown, (a game runs|no game runs); in the last [0-9.]+ s: (\d+) pictures captured, (\d+) encoded, (\d+) sent, (\d+) cursor datagrams sent", host)
+]
+free = lambda w: w["captured"] == w["encoded"] == w["sent"] == w["cursors"] == 0 and w["shown"] == 0
+problems = []
+if idle is None or shown is None or after is None:
+    problems.append("the probe printed no counts of the in-game script")
+else:
+    print("displays in a game: nothing wished: %d units, %d pictures; shown: %d units, %d pictures; after the wish: %d units in 1.5 s, %d in the next 4 s" % (*idle, *shown, *after))
+    if idle != [0, 0]:
+        problems.append("units or pictures arrived while nothing was wished")
+    if shown[0] == 0 or shown[1] == 0:
+        problems.append("no pictures arrived while the displays were shown")
+    if after[1] != 0:
+        problems.append("pictures arrived after the wish ended")
+quiet = [w for w in windows if w["runs"] and free(w)]
+busy = [w for w in windows if w["runs"] and w["captured"] > 0 and w["encoded"] > 0 and w["sent"] > 0]
+print("displays in a game: the host's log has %d windows of a running game with no display shown and no capture, encode or send, and %d windows with all three" % (len(quiet), len(busy)))
+if len(quiet) < 4:
+    problems.append("fewer than 4 windows of the host's log show a game that costs nothing")
+if not busy:
+    problems.append("no window of the host's log shows a display at work")
+# After the last window with pictures the windows go quiet again (the first one may hold the end of the work)
+last_busy = max((i for i, w in enumerate(windows) if w["sent"] > 0), default=-1)
+tail = windows[last_busy + 1:]
+if len(tail) < 3 or not all(free(w) for w in tail[1:]):
+    problems.append("the host's windows after the wish ended are not all quiet (%d windows)" % len(tail))
+for problem in problems:
+    print("displays in a game: " + problem, file=sys.stderr)
+sys.exit(1 if problems else 0)
+PYTHON
+fi
 # The host prints a stats line every 5 seconds: wait for the last one
 sleep 5.5
 
@@ -464,6 +554,7 @@ python3 -I "${root}/scripts/e2e-report.py" "${work}/host.out" "${fps}" "${report
 (( game_exit == 0 )) || result=1
 (( tracking_exit == 0 )) || result=1
 (( openvr_exit == 0 )) || result=1
-grep -hE "probe: (done|frame arrival|native|desktop|audio|pause test|[0-9.]+ s: the focus)" "${work}/probe.log" 2>/dev/null || true
+(( displays_exit == 0 )) || result=1
+grep -hE "probe: (done|frame arrival|native|desktop|audio|pause test|displays|in-game displays|[0-9.]+ s: the focus)" "${work}/probe.log" 2>/dev/null || true
 print "Report: ${report}"
 exit ${result}

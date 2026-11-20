@@ -102,7 +102,16 @@ impl DesktopProbe {
         println!("probe: asked the host for {} at up to {MAX_WIDTH} pixels and {MAX_FPS} pictures a second", self.name());
     }
 
-    /// The words for this display in the output
+    /// The label of this display's lines in the output: `desktop` for the first one
+    fn label(&self) -> String {
+        if self.stream == DESKTOP_STREAM {
+            "desktop".to_string()
+        } else {
+            format!("desktop display {}", self.stream - DESKTOP_STREAM + 1)
+        }
+    }
+
+    /// The words for this display in a sentence
     pub fn name(&self) -> String {
         if self.stream == DESKTOP_STREAM {
             "the desktop".to_string()
@@ -287,8 +296,8 @@ impl DesktopProbe {
             format!("median {:.2}, p95 {:.2}, max {:.2}", at(0.5), at(0.95), sorted[sorted.len() - 1])
         };
         println!(
-            "probe: desktop {}: {} pictures ({} key) of {}x{} in {:.1} s: {:.1} a second, {:.1} Mbps, {} skipped, {} of the wrong size; decode (ms) {}; network (ms) {}",
-            self.name(),
+            "probe: {}: {} pictures ({} key) of {}x{} in {:.1} s: {:.1} a second, {:.1} Mbps, {} skipped, {} of the wrong size; decode (ms) {}; network (ms) {}",
+            self.label(),
             totals.pictures,
             totals.key_pictures,
             totals.size.0,
@@ -302,8 +311,8 @@ impl DesktopProbe {
             describe(&totals.network_ms),
         );
         println!(
-            "probe: desktop {}: {} cursor datagrams, the last at {:?}",
-            self.name(),
+            "probe: {}: {} cursor datagrams, the last at {:?}",
+            self.label(),
             totals.cursor_datagrams,
             totals.last_cursor.map(|c| (c.u, c.v, c.on))
         );
