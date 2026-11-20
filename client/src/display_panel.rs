@@ -185,7 +185,7 @@ fn RoomSurface(stream: u8, name: &'static str, pose: MutableState<Pose>, width: 
     let [smallest, largest] = WIDTH_RANGE.map(|width| surface_size(width, aspect));
     let limits = ResizeLimits::new().minimum_size(smallest[0], smallest[1]).maximum_size(largest[0], largest[1]).maintain_aspect_ratio(true);
     let resize = ResizePolicy::custom(move |event| {
-        hover::set(hover::HANDLE, event.event_type != SpatialResizeEventType::End);
+        hover::set_handle(event.event_type != SpatialResizeEventType::End);
         width.set((event.size[0] * METERS_PER_DP).clamp(WIDTH_RANGE[0], WIDTH_RANGE[1]));
         if event.event_type == SpatialResizeEventType::End {
             place::save_width(name, width.get_non_reactive());
@@ -218,14 +218,12 @@ fn Surface(stream: u8, modifier: SubspaceModifier, width: MutableState<f32>) {
         // that leaves sends no `Exit`: a press that was on would stay down.
         scope.on_surface_destroyed(move |_| {
             displays().update_pointer(stream, |pointer| *pointer = PointerNow::default());
-            hover::set(id, false);
+            hover::clear_panel(id);
             displays().set_surface(stream, None);
         });
         scope.on_pointer_event(move |event| {
-            match event.kind {
-                cranpose::PointerEventKind::Enter | cranpose::PointerEventKind::Move => hover::set(id, true),
-                cranpose::PointerEventKind::Exit => hover::set(id, false),
-                _ => {}
+            if let Some(hovered) = hover::hover_of(event.kind) {
+                hover::set(id, event.id.0, hovered);
             }
             displays().on_pointer_event(stream, &event, surface_size(width.get_non_reactive(), displays().view(stream).aspect));
         });
@@ -259,7 +257,7 @@ pub fn HandDisplay(stream: u8, base: [f32; 3]) {
     let [smallest, largest] = HAND_WIDTH.map(|width| surface_size(width, view.aspect));
     let limits = ResizeLimits::new().minimum_size(smallest[0], smallest[1]).maximum_size(largest[0], largest[1]).maintain_aspect_ratio(true);
     let resize = ResizePolicy::custom(move |event| {
-        hover::set(hover::HANDLE, event.event_type != SpatialResizeEventType::End);
+        hover::set_handle(event.event_type != SpatialResizeEventType::End);
         width.set((event.size[0] * METERS_PER_DP).clamp(HAND_WIDTH[0], HAND_WIDTH[1]));
         if event.event_type == SpatialResizeEventType::End {
             place::save_width("hand-display", width.get_non_reactive());

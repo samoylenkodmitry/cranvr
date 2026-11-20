@@ -398,8 +398,8 @@ fn held_hands(hold: &mut PanelHold, frame: &cranpose_xr::XrFrame, now: u64, menu
         hover::clear();
         return [false; 2];
     }
-    let hover = hover::any();
-    if hover {
+    let hover = hover::hands();
+    if hover[0] || hover[1] {
         hover::mark(now / 1_000_000);
     }
     let trigger = |hand: XrHand| match frame.pointer(hand) {
@@ -410,8 +410,8 @@ fn held_hands(hold: &mut PanelHold, frame: &cranpose_xr::XrFrame, now: u64, menu
     let held = hold.update(&HoldFrame {
         time: frame.predicted_display_time,
         hover,
+        handle: hover::handle_held(),
         trigger: [trigger(XrHand::Left), trigger(XrHand::Right)],
-        points: [frame.pointer(XrHand::Left).is_some(), frame.pointer(XrHand::Right).is_some()],
         menu_open,
     });
     // Each change goes to the log, so a run shows when a panel held a hand back
