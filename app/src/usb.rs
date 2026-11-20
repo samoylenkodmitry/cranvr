@@ -30,7 +30,7 @@ use std::{
 
 /// The application ids of cranvr's headset app and of its phone build. A device counts when one of
 /// them is installed, not by its model name.
-const HEADSET_APPS: [&str; 2] = ["dev.cranvr.client2", "dev.cranvr.client2.phone"];
+const HEADSET_APPS: [&str; 2] = ["dev.cranvr.client", "dev.cranvr.client.phone"];
 /// Where Google publishes the platform-tools for macOS, and their size at the time of writing
 const TOOLS_URL: &str = "https://dl.google.com/android/repository/platform-tools-latest-darwin.zip";
 pub const TOOLS_SIZE: &str = "about 16 MB";
@@ -152,7 +152,7 @@ pub fn parse_packages(text: &str) -> Vec<String> {
     text.lines().filter_map(|line| Some(line.trim().strip_prefix("package:")?.split_whitespace().next()?.to_string())).collect()
 }
 
-/// Whether the packages hold a cranvr headset app. `pm list packages dev.cranvr.client2` also lists
+/// Whether the packages hold a cranvr headset app. `pm list packages dev.cranvr.client` also lists
 /// a package that merely contains the text, so the names must match whole.
 pub fn has_headset_app(packages: &[String]) -> bool {
     packages.iter().any(|package| HEADSET_APPS.contains(&package.as_str()))
@@ -601,18 +601,18 @@ emulator-5554          device product:sdk_gphone64 model:sdk device:emu64 transp
         assert_eq!(devices[1].state, DeviceState::Other("recovery".into()));
     }
 
-    // The Tab's real answer holds the phone build and the retired client of an earlier time. A
-    // package that only contains the id's text does not count.
+    // The Tab's real answer holds the phone build and the headset build. A package that only
+    // contains the id's text does not count.
     #[test]
     fn a_headset_app_is_told_by_its_whole_package_name() {
-        let tab = parse_packages("package:dev.cranvr.client2.phone\npackage:dev.cranvr.client\n");
-        assert_eq!(tab, ["dev.cranvr.client2.phone", "dev.cranvr.client"]);
+        let tab = parse_packages("package:dev.cranvr.client.phone\npackage:dev.cranvr.client\n");
+        assert_eq!(tab, ["dev.cranvr.client.phone", "dev.cranvr.client"]);
         assert!(has_headset_app(&tab));
-        assert!(has_headset_app(&parse_packages("package:dev.cranvr.client2\n")));
-        assert!(!has_headset_app(&parse_packages("package:dev.cranvr.client\npackage:dev.cranvr.client22\n")));
+        assert!(has_headset_app(&parse_packages("package:dev.cranvr.client\n")));
+        assert!(!has_headset_app(&parse_packages("package:dev.cranvr.clients\npackage:dev.cranvr.client2\n")));
         assert!(!has_headset_app(&parse_packages("")));
         assert!(!has_headset_app(&parse_packages("package:com.oculus.vrshell installer=com.oculus\n")));
-        assert_eq!(parse_packages("package:dev.cranvr.client2 installer=x\n"), ["dev.cranvr.client2"]);
+        assert_eq!(parse_packages("package:dev.cranvr.client installer=x\n"), ["dev.cranvr.client"]);
     }
 
     #[test]

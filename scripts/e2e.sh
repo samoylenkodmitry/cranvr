@@ -43,7 +43,7 @@
 #                 desktop scene draws no eye badges. The run fails when the probe gets the sound
 #                 for less than 80 percent of the stream time. --host-arg --virtual-display
 #                 --host-arg 1920x1080 shows a virtual display instead of the main one.
-#   --quest       the client is cranvr's Cranpose client (dev.cranvr.client2, see
+#   --quest       the client is cranvr's Cranpose client (dev.cranvr.client, see
 #                 scripts/build-client.sh) on a Quest attached by USB. The Quest and the Mac must
 #                 share a network. The host runs with --trust-all on --native-port. The app gets this
 #                 Mac's address and the room `scene` as launch extras: with the Room setting at
@@ -215,7 +215,7 @@ if [[ ${client} == quest ]]; then
         print -u2 "No Quest in adb devices. Connect it by USB and allow USB debugging in the headset."
         exit 1
     fi
-    package=$("${adb_cmd[@]}" shell pm list packages dev.cranvr.client2 | tr -d '\r' | sed -n 's/^package:\(dev\.cranvr\.client2\)$/\1/p')
+    package=$("${adb_cmd[@]}" shell pm list packages dev.cranvr.client | tr -d '\r' | sed -n 's/^package:\(dev\.cranvr\.client\)$/\1/p')
     if [[ -z ${package} ]]; then
         print -u2 "cranvr's Cranpose client is not on the Quest. Build and install it:"
         print -u2 "  scripts/build-client.sh --install ${serial}"

@@ -27,7 +27,7 @@ Do step 3 before the app with the new version file reaches anyone. An app that e
 
 The store needs the owner's Meta developer account. These steps are the owner's.
 
-1. Pick the final application id. Today it is `dev.cranvr.client2` in `client/android/app/build.gradle.kts`. The store keeps the id of the first upload for good.
+1. Pick the final application id. Today it is `dev.cranvr.client` in `client/android/app/build.gradle.kts`. The store keeps the id of the first upload for good.
 2. Make an upload key once and keep it safe. A lost key blocks every later update:
    `keytool -genkeypair -v -keystore cranvr-upload.jks -alias cranvr -keyalg RSA -keysize 4096 -validity 10000`
 3. Build with the key and a version code above the last upload:
