@@ -30,8 +30,7 @@
 //! left hand would hold them. The extra `hand_menu` with the value `open` opens the menu at the start.
 
 use crate::{
-    display_wish::Place,
-    displays::{displays, DisplaysView},
+    displays::displays,
     hover,
     hub::hub,
     menu_model::{self, ButtonKind, MenuAction, MenuInput, MenuRow},
@@ -55,9 +54,6 @@ pub const CLEARANCE: f32 = 30.0;
 /// The menu's center, to the right of the hand and nearer to the face, in dp
 const MENU_X: f32 = 210.0;
 const MENU_Z: f32 = 70.0;
-/// The hand display's width at the start, and the widths that the user may give it, in dp
-pub const HAND_WIDTH: f32 = 420.0;
-pub const HAND_WIDTH_RANGE: [f32; 2] = [280.0, 700.0];
 /// The hand display's center to the right of the hand, in dp
 pub const HAND_DISPLAY_X: f32 = 90.0;
 /// The menu closes when no pointer was over a panel for this long: a user who forgot it open in a
@@ -218,9 +214,8 @@ fn Menu(state: HandState, console_open: bool, base: [f32; 3]) {
     });
     let layout = state.layout.get();
     let wishes = crate::displays::wishes_of(&layout);
-    let host_has_displays = displays().host_has_displays();
     let displays_view = view.get();
-    let input = MenuInput { layout: &layout, console_open, displays: &displays_view, wishes, host_has_displays };
+    let input = MenuInput { layout: &layout, console_open, displays: &displays_view, wishes };
     let rows = menu_model::rows(&input);
     let height = menu_model::height(&rows);
     let y = base[1] + LIFT + BALL / 2.0 + CLEARANCE + height / 2.0;
@@ -312,13 +307,3 @@ fn perform(action: MenuAction, state: HandState) {
     }
 }
 
-/// The place of a display for the wish: the hand's, or the room's.
-pub fn place_of(layout: &Layout, stream: u8) -> Place {
-    menu_model::place_of(layout, stream)
-}
-
-/// The views of the displays' list, for the layout to forget the displays that left.
-pub fn forget_missing(layout: &mut Layout, view: &DisplaysView) {
-    let streams: Vec<u8> = view.displays.iter().map(|d| d.info.stream).collect();
-    layout.forget_missing(&streams);
-}

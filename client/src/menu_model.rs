@@ -60,8 +60,6 @@ pub struct MenuInput<'a> {
     pub displays: &'a DisplaysView,
     /// What the client asks of each display that shows, by its index
     pub wishes: [Option<DesktopWish>; crate::displays::SLOTS],
-    /// Whether the host's protocol has displays: a host of an older version adds none
-    pub host_has_displays: bool,
 }
 
 /// The sizes of the menu's parts in dp. A dp is a millimeter in the room. The text is 22 dp tall or
@@ -153,7 +151,7 @@ mod tests {
     }
 
     fn input<'a>(layout: &'a Layout, displays: &'a DisplaysView) -> MenuInput<'a> {
-        MenuInput { layout, console_open: false, displays, wishes: Default::default(), host_has_displays: true }
+        MenuInput { layout, console_open: false, displays, wishes: Default::default() }
     }
 
     #[test]

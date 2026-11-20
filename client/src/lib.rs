@@ -18,7 +18,6 @@ mod audio;
 mod connection;
 mod console;
 mod console_panel;
-mod desktop;
 mod display_panel;
 mod display_wish;
 mod displays;
@@ -31,7 +30,6 @@ mod hover;
 mod menu_model;
 mod hub;
 mod panel_layout;
-mod panels_ball;
 mod phone;
 mod place;
 #[cfg(all(feature = "scripted-hand", target_os = "android"))]

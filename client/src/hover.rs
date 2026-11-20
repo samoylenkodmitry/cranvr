@@ -53,11 +53,6 @@ pub fn any() -> bool {
     HOVERED.load(Ordering::Relaxed) != 0
 }
 
-/// Whether a pointer is over the panel `id`.
-pub fn is_over(id: u32) -> bool {
-    HOVERED.load(Ordering::Relaxed) & (1u64 << id) != 0
-}
-
 /// Forgets every hover: the app lost the input focus, so no pointer points at anything.
 pub fn clear() {
     HOVERED.store(0, Ordering::Relaxed);
@@ -88,9 +83,9 @@ mod tests {
         assert!(!any());
         set(MENU, true);
         set(DISPLAY + 2, true);
-        assert!(any() && is_over(MENU) && is_over(DISPLAY + 2) && !is_over(STATS));
+        assert!(any());
         set(MENU, false);
-        assert!(any() && !is_over(MENU));
+        assert!(any());
         set(DISPLAY + 2, false);
         assert!(!any());
         set(STRIP, true);

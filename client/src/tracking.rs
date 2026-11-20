@@ -1126,9 +1126,8 @@ mod tests {
         read.frame.as_mut().unwrap().held = [false, true];
         feed.push(read);
         let held = loop {
-            match inbox.recv_timeout(Duration::from_secs(10)).expect("no input") {
-                Heard::Datagram(ClientDatagram::InputHold(hold)) => break hold,
-                _ => {}
+            if let Heard::Datagram(ClientDatagram::InputHold(hold)) = inbox.recv_timeout(Duration::from_secs(10)).expect("no input") {
+                break hold;
             }
         };
         // The input is the real one: the host does the holding back

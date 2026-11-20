@@ -18,8 +18,9 @@
 //!   never holds up the eye stream or another display;
 //! - the composition thread creates and ends the surface and takes its pointer events
 //!   (`display_panel.rs`).
-//! One uplink thread ([`uplink`]) sends the wishes, the requests for key frames and the requests to
-//! add or remove a display.
+//!
+//! One uplink thread ([`uplink`]) sends the wishes, the pointers, the requests for key frames and the
+//! requests to add or remove a display.
 //!
 //! A host of an older protocol version offers one display and no list: the first display then gets
 //! the entry "Mac display". It hides that display while a game runs, which is how this client learns
@@ -465,11 +466,6 @@ impl Displays {
         inner.params.filter(|_| inner.active).map(|p| !p.visible)
     }
 
-    /// Whether the host speaks the protocol of displays: it sends the list and takes wishes.
-    pub fn host_has_displays(&self) -> bool {
-        self.version.load(Ordering::Relaxed) >= DISPLAYS_VERSION
-    }
-
     /// The list for the menu. A host of an older version gets the one entry for its one display.
     pub fn menu_view(&self) -> DisplaysView {
         let state = self.state.lock().unwrap();
@@ -528,9 +524,20 @@ impl Displays {
         self.update_pointer(stream, |pointer| *pointer = pointer.after(event.kind, at));
     }
 
-    /// The pointer on a display as the app last set it.
-    pub fn pointer(&self, stream: u8) -> PointerNow {
-        slot_of(stream).map_or_else(PointerNow::default, |index| self.uplink.lock().unwrap().pointer[index])
+    /// Keeps the wishes for the displays that exist: the host's list when it sent one, else the first
+    /// display. A wish for a display that the host does not have has no answer.
+    pub fn existing(&self, mut wishes: [Option<DesktopWish>; SLOTS]) -> [Option<DesktopWish>; SLOTS] {
+        let state = self.state.lock().unwrap();
+        for (index, wish) in wishes.iter_mut().enumerate() {
+            let exists = match &state.list {
+                Some(list) => list.displays.iter().any(|d| d.stream == display_stream(index as u8)),
+                None => index == 0,
+            };
+            if !exists {
+                *wish = None;
+            }
+        }
+        wishes
     }
 
     /// The user asks the host to add a display.

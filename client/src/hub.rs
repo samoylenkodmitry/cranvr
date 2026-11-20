@@ -9,7 +9,7 @@ use crate::{
     audio,
     connection::Connection,
     console::{Action, Backdrop, Console, Menu, Room, View as ConsoleView, Volume},
-    desktop::desktop,
+    displays::displays,
     discovery::FoundHost,
     settings,
     tracking::{Display, Feed},
@@ -688,7 +688,7 @@ impl Hub {
 
     /// What decides the room behind the panels: the user's choice and whether a game runs.
     pub fn backdrop(&self) -> Backdrop {
-        self.console.lock().unwrap().backdrop(desktop().game_hides())
+        self.console.lock().unwrap().backdrop(displays().game_runs())
     }
 
     /// Takes the saved choices of the console's Room and Volume settings and applies them. The

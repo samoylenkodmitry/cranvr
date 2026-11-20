@@ -347,7 +347,7 @@ mod tests {
     #[test]
     fn the_pointer_test_circles_and_presses() {
         let seen: Vec<f32> = (0..60).map(|i| synthetic_pointer(Duration::from_secs_f32(i as f32 * 0.1)).trigger).collect();
-        assert!(seen.iter().any(|t| *t == 1.0) && seen.iter().any(|t| *t == 0.0));
+        assert!(seen.contains(&1.0) && seen.contains(&0.0));
         assert!(synthetic_pointer(Duration::from_secs_f32(4.5)).scroll > 0.0);
     }
 }
