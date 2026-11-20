@@ -53,6 +53,11 @@ fn usage() -> ! {
          \n                     the system's menu: the probe tells the host, sends no tracking and no input and\
          \n                     counts the frames that still arrive. The exit code says whether the stream paused\
          \n                     and went on.\
+         \n  --left-trigger AT:FOR  the left trigger goes to 1 at AT seconds and stays for FOR seconds, once. The script\
+         \n                     of the cycle is off then, so the pulls are the only presses. A game that shows one\
+         \n                     pointer at a time, such as a menu, then has its left controller pressed for the\
+         \n                     first time at AT.\
+         \n  --right-trigger AT:FOR  the same for the right trigger\
          \n  --protocol native  accepted and ignored: cranvr's protocol is the only one"
     );
     std::process::exit(2);
@@ -63,6 +68,13 @@ fn parse_pause(text: &str) -> Option<(f32, f32)> {
     let (at, length) = text.split_once(':')?;
     let (at, length) = (at.parse::<f32>().ok()?, length.parse::<f32>().ok()?);
     (at >= 2.0 && length > 0.0).then_some((at, length))
+}
+
+/// `AT:FOR` as two numbers of seconds, the start of a pull and its length
+fn parse_pull(text: &str) -> Option<(f32, f32)> {
+    let (at, length) = text.split_once(':')?;
+    let (at, length) = (at.parse::<f32>().ok()?, length.parse::<f32>().ok()?);
+    (at >= 0.0 && length > 0.0).then_some((at, length))
 }
 
 fn main() {
@@ -80,6 +92,8 @@ fn main() {
         hands_lift: 0.0,
         face_source: Default::default(),
         pause: None,
+        left_trigger: None,
+        right_trigger: None,
     };
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -101,6 +115,8 @@ fn main() {
             "--still-head" => options.still_head = true,
             "--hands-lift" => options.hands_lift = value().parse().unwrap_or_else(|_| usage()),
             "--face-source" => options.face_source = tracked::FaceSource::parse(&value()).unwrap_or_else(|| usage()),
+            "--left-trigger" => options.left_trigger = Some(parse_pull(&value()).unwrap_or_else(|| usage())),
+            "--right-trigger" => options.right_trigger = Some(parse_pull(&value()).unwrap_or_else(|| usage())),
             "--pause" => options.pause = Some(parse_pause(&value()).unwrap_or_else(|| usage())),
             "--drop-percent" => options.drop_percent = value().parse().unwrap_or_else(|_| usage()),
             _ => usage(),

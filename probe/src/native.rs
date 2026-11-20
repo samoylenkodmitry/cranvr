@@ -69,6 +69,12 @@ pub struct Options {
     /// menu: the probe tells the host, sends no tracking and no input, and counts the frames that
     /// still arrive
     pub pause: Option<(f32, f32)>,
+    /// Pulls the left trigger once: when it starts and how long it stays, in seconds. The script of
+    /// the cycle (the left grip, the right trigger, A and the right stick) is off then, so the pulls
+    /// are the only presses.
+    pub left_trigger: Option<(f32, f32)>,
+    /// Pulls the right trigger once, in the same way
+    pub right_trigger: Option<(f32, f32)>,
 }
 
 /// The probe's clock runs this far ahead of the process clock, as a headset's clock has its own
@@ -164,6 +170,8 @@ struct Shared {
     face_source: tracked::FaceSource,
     sent_tracking: [AtomicU64; 4],
     pause: Option<(f32, f32)>,
+    left_trigger: Option<(f32, f32)>,
+    right_trigger: Option<(f32, f32)>,
     /// Frames of the eye stream that arrived, for the pause test
     units_seen: AtomicU64,
     /// What the pause test measured: frames that arrived in the first 0.3 s of the pause, frames
@@ -274,6 +282,8 @@ pub fn run(o: Options) -> i32 {
         face_source: o.face_source,
         sent_tracking: Default::default(),
         pause: o.pause,
+        left_trigger: o.left_trigger,
+        right_trigger: o.right_trigger,
         units_seen: AtomicU64::new(0),
         pause_result: Mutex::new(None),
     });
@@ -290,8 +300,10 @@ pub fn run(o: Options) -> i32 {
     if let Some(desktop) = &shared.desktop {
         desktop.ask(&shared.link);
         let (send, stop) = (Arc::clone(&shared), Arc::clone(&shared));
+        let mouse = shared.link.welcome.version >= cranvr_proto::MOUSE_VERSION;
         DesktopProbe::pointer_script(
-            move |p| drop(send.link.duplex.send_datagram(&ClientDatagram::Pointer(p))),
+            mouse,
+            move |datagram| drop(send.link.duplex.send_datagram(&datagram)),
             move || stop.stop.load(Ordering::Relaxed),
         );
     }
@@ -633,17 +645,28 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
             // The input goes out with each sample, as the client's does. For half a second in every
             // 3 seconds the left grip squeezes, the right trigger goes to 0.75, A is down and the right
             // stick leans to 0.5, as a game test may ask. A game answers the squeeze with a haptic pulse.
-            let held = t % 3.0 > 2.5;
+            // A test that pulls a trigger once plays only the pulls: the cycle would press the other
+            // trigger at times of its own
+            let held = t % 3.0 > 2.5 && shared.left_trigger.is_none() && shared.right_trigger.is_none();
             let on = |v: f32| if held { v } else { 0.0 };
             let mut input = Input { sample_time, ..Default::default() };
             // A headset with no controller reports every input at rest
             if controllers {
-                input.hands[0] = HandInput { grip: on(1.0), buttons: buttons::GRIP_CLICK * u32::from(held), ..Default::default() };
+                // The left trigger's pull, once, for a game that waits for the first press of that hand
+                let pulled = shared.left_trigger.is_some_and(|(at, length)| (at..at + length).contains(&t));
+                input.hands[0] = HandInput {
+                    grip: on(1.0),
+                    trigger: if pulled { 1.0 } else { 0.0 },
+                    buttons: (buttons::GRIP_CLICK * u32::from(held)) | (buttons::TRIGGER_CLICK * u32::from(pulled)),
+                    touches: buttons::TRIGGER_CLICK * u32::from(pulled),
+                    ..Default::default()
+                };
+                let right_pulled = shared.right_trigger.is_some_and(|(at, length)| (at..at + length).contains(&t));
                 input.hands[1] = HandInput {
-                    trigger: on(0.75),
+                    trigger: if right_pulled { 1.0 } else { on(0.75) },
                     stick: [on(0.5), 0.0],
-                    buttons: (buttons::PRIMARY | buttons::TRIGGER_CLICK) * u32::from(held),
-                    touches: buttons::PRIMARY * u32::from(held),
+                    buttons: (buttons::PRIMARY * u32::from(held)) | (buttons::TRIGGER_CLICK * u32::from(held || right_pulled)),
+                    touches: (buttons::PRIMARY * u32::from(held)) | (buttons::TRIGGER_CLICK * u32::from(right_pulled)),
                     ..Default::default()
                 };
             }

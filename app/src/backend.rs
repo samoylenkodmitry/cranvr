@@ -4,6 +4,7 @@ use crate::{
     launch::{GameOptions, WineOptions},
     usb::Connection,
 };
+use cranvr_common::controls::Controls;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -74,6 +75,10 @@ pub struct Settings {
     /// A game without hand tracking gets controllers made of the headset's tracked hands, while the
     /// headset tracks no controller
     pub hand_controllers: bool,
+    /// What each button of each controller does in the headset's panels (see
+    /// `cranvr_common::controls`). The Controls page of the Settings tab and the headset's console
+    /// change it. The host sends it to the headset in `vr-menu.json`.
+    pub controls: Controls,
     /// The launch options of each Windows program, by its Windows path. A program with no entry
     /// starts with the default options.
     pub launch: BTreeMap<String, GameOptions>,
@@ -100,6 +105,7 @@ impl Default for Settings {
             game_msaa_limit: 2,
             unscale_displays: true,
             hand_controllers: true,
+            controls: Controls::default(),
             launch: BTreeMap::new(),
             wine: WineOptions::default(),
         }
@@ -500,11 +506,30 @@ fn vr_menu(settings: &Settings, games: &[crate::steam::Game], notice: Option<&st
         "fps": settings.fps,
         "game_scale": settings.game_scale,
         "msaa": settings.game_msaa_limit,
+        "controls": settings.controls,
     });
     if let Some(notice) = notice {
         menu["notice"] = notice.into();
     }
     menu.to_string()
+}
+
+/// The settings after a request of the console in VR with the action "set". A field that the
+/// request lacks keeps its value. A `controls` value that is no mapping changes nothing.
+pub fn apply_set_request(mut settings: Settings, request: &Value) -> Settings {
+    if let Some(fps) = request["fps"].as_u64() {
+        settings.fps = fps as u32;
+    }
+    if let Some(scale) = request["game_scale"].as_f64() {
+        settings.game_scale = scale as f32;
+    }
+    if let Some(samples) = request["msaa"].as_u64() {
+        settings.game_msaa_limit = samples as u32;
+    }
+    if let Some(controls) = request.get("controls").and_then(|controls| Controls::from_json(&controls.to_string())) {
+        settings.controls = controls;
+    }
+    settings
 }
 
 pub fn stop_host() {
@@ -706,6 +731,33 @@ mod tests {
     fn the_answer_to_a_request_names_the_headsets_key() {
         assert_eq!(answer_line("ab12", true), "allow ab12\n");
         assert_eq!(answer_line("ab12", false), "deny ab12\n");
+    }
+
+    #[test]
+    fn the_controls_travel_with_the_menu_and_come_back_with_a_request() {
+        use cranvr_common::controls::{Action, Control, Hand};
+        let mut settings = Settings::default();
+        // A file from before the Controls page has none: the standard mapping fills in
+        let old: Settings = serde_json::from_str(r#"{"fps": 90}"#).unwrap();
+        assert_eq!((old.fps, old.controls), (90, Controls::default()));
+        settings.controls.set(Hand::Right, Control::Secondary, Action::Keyboard);
+        let menu: Value = serde_json::from_str(&vr_menu(&settings, &[], None)).unwrap();
+        assert_eq!(menu["controls"]["right"]["secondary"], "keyboard");
+        assert_eq!(menu["controls"]["left"]["menu"], "console");
+        // The headset sends the whole mapping back as it changed it
+        let mut changed = settings.controls;
+        assert!(changed.set(Hand::Left, Control::Grip, Action::Recenter));
+        let request = serde_json::json!({"action": "set", "controls": changed});
+        let after = apply_set_request(settings.clone(), &request);
+        assert_eq!(after.controls.left.grip, Action::Recenter);
+        assert_eq!(after.controls.right.secondary, Action::Keyboard);
+        assert_eq!((after.fps, after.game_scale), (settings.fps, settings.game_scale));
+        // A value that is no mapping, and a request without one, change nothing
+        assert_eq!(apply_set_request(settings.clone(), &serde_json::json!({"controls": 5})), settings);
+        assert_eq!(apply_set_request(settings.clone(), &serde_json::json!({"action": "set"})), settings);
+        // The old fields still work in the same request
+        let both = apply_set_request(settings.clone(), &serde_json::json!({"fps": 72, "controls": changed}));
+        assert_eq!((both.fps, both.controls), (72, changed));
     }
 
     #[test]

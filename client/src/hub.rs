@@ -9,6 +9,7 @@ use crate::{
     audio,
     connection::Connection,
     console::{Action, Backdrop, Console, Menu, Room, View as ConsoleView, Volume},
+    controls::{Fire, Runner},
     desktop::desktop,
     discovery::FoundHost,
     settings,
@@ -19,10 +20,11 @@ use cranpose::{CropRect, DecodedFrames};
 use cranpose_xr::{
     FieldOfView, FoveatedEncoding, Haptics, HeadsetProperties, Pose as XrPose, StreamStats, StreamedView, StreamedViews,
 };
+use cranvr_common::controls::{Action as ControlAction, Control, Controls, Hand};
 use cranvr_common::foveation::{Foveation, FoveationConfig};
 use cranvr_proto::{
     clock::now_ns,
-    message::{FoveationParams, Focus},
+    message::{Focus, FoveationParams, Input},
     wire::{Fov, Nanos, Pose},
 };
 use std::{
@@ -370,6 +372,10 @@ pub struct Hub {
     /// The Mac that answers behind the USB cable
     usb: Mutex<Option<UsbMac>>,
     console: Mutex<Console>,
+    /// Follows the buttons of the controllers from frame to frame (see `controls.rs`)
+    runner: Mutex<Runner>,
+    /// The headset actions that fired and that the UI has not run yet
+    fires: Mutex<Vec<Fire>>,
     /// The saved settings of the console were loaded. A rebuilt composition must not load them
     /// again, because the choices in memory are newer when a save failed.
     settings_loaded: AtomicBool,
@@ -396,6 +402,8 @@ pub fn hub() -> &'static Hub {
         found: Mutex::new(Vec::new()),
         usb: Mutex::new(None),
         console: Mutex::new(Console::default()),
+        runner: Mutex::new(Runner::default()),
+        fires: Mutex::new(Vec::new()),
         settings_loaded: AtomicBool::new(false),
     })
 }
@@ -651,7 +659,13 @@ impl Hub {
             return;
         }
         match Menu::parse(text) {
-            Some(menu) => self.console.lock().unwrap().on_menu(menu),
+            Some(menu) => {
+                let changed = self.console.lock().unwrap().on_menu(menu);
+                // The headset keeps the mapping for the time without a link
+                if let Some(controls) = changed {
+                    settings::remember_controls(&controls);
+                }
+            }
             None => log::warn!("the host sent a menu that the console cannot read"),
         }
     }
@@ -660,10 +674,63 @@ impl Hub {
         self.console.lock().unwrap().view()
     }
 
-    /// One frame of the headset for the console: whether the left menu button is down. Returns
-    /// whether a hold of the button showed or hid the console.
-    pub fn console_frame(&self, menu_down: bool, now: Nanos) -> bool {
-        self.console.lock().unwrap().on_frame(menu_down, now)
+    /// One frame of the headset's input for the buttons of the controllers (see `controls.rs`).
+    /// Returns the headset actions that fired in this frame. The console opens or closes here. The
+    /// UI takes the other actions with `take_fires`.
+    pub fn controls_frame(&self, input: &Input, now: Nanos) -> Vec<Fire> {
+        // The host's word that a game runs can be late or missing, so a streaming link is enough to
+        // ask for the hold
+        let streams = self.snapshot.lock().unwrap().state == LinkState::Streaming;
+        let fires = {
+            let mut console = self.console.lock().unwrap();
+            let controls = console.controls();
+            let fires = self.runner.lock().unwrap().update(&controls, input, now, streams);
+            for fire in &fires {
+                if fire.action == ControlAction::Console {
+                    console.toggle_open();
+                }
+            }
+            fires
+        };
+        let mut queue = self.fires.lock().unwrap();
+        queue.extend(fires.iter().filter(|fire| fire.action != ControlAction::Console));
+        // The UI polls a few times a second. A queue that nobody drains must not grow.
+        let extra = queue.len().saturating_sub(16);
+        queue.drain(..extra);
+        fires
+    }
+
+    /// The headset actions that fired and that the UI has not taken yet
+    pub fn take_fires(&self) -> Vec<Fire> {
+        std::mem::take(&mut *self.fires.lock().unwrap())
+    }
+
+    /// What the buttons of the controllers do now
+    pub fn controls(&self) -> Controls {
+        self.console.lock().unwrap().controls()
+    }
+
+    /// The user picked the next or the previous action for one button in the console. The Mac keeps
+    /// the mapping, so the change goes to it. Without a link nothing changes.
+    pub fn step_control(&self, hand: Hand, control: Control, step: i32) {
+        let sent = self.console.lock().unwrap().step_control(hand, control, step, Instant::now());
+        self.send_controls(sent);
+    }
+
+    /// The user asked for the standard mapping.
+    pub fn reset_controls(&self) {
+        let sent = self.console.lock().unwrap().reset_controls(Instant::now());
+        self.send_controls(sent);
+    }
+
+    fn send_controls(&self, controls: Option<Controls>) {
+        let Some(controls) = controls else { return };
+        settings::remember_controls(&controls);
+        let request = serde_json::json!({"action": "set", "controls": controls}).to_string();
+        log::info!("the console sets the controls: {request}");
+        if let Some(connection) = self.connection.lock().unwrap().as_ref() {
+            connection.send_console(request);
+        }
     }
 
     pub fn close_console(&self) {
@@ -692,6 +759,9 @@ impl Hub {
             let mut console = self.console.lock().unwrap();
             console.set_room(room);
             console.set_volume(volume);
+            if let Some(controls) = settings::controls() {
+                console.set_controls(controls);
+            }
         }
         audio::set_gain(volume.gain());
     }

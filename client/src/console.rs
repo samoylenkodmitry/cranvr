@@ -11,7 +11,9 @@
 //! This file holds the data and the rules, with no Cranpose state. `console_panel.rs` draws them
 //! and places the panel.
 
+use cranvr_common::controls::{Action as ControlAction, Control, Controls, Hand};
 use serde_json::{json, Value};
+use std::time::{Duration, Instant};
 
 /// The refresh rates and the render sizes that the console offers. The app accepts any value.
 pub const RATES: [u32; 3] = [72, 90, 120];
@@ -52,6 +54,9 @@ pub struct Menu {
     /// One short line from the app about something that happens now, such as a game that restarts.
     /// The app writes it into vr-menu.json while it applies.
     pub notice: Option<String>,
+    /// What the buttons of the controllers do, as the cranvr app on the Mac keeps it. A menu from an
+    /// app that does not know the mapping has none.
+    pub controls: Option<Controls>,
 }
 
 impl Menu {
@@ -77,6 +82,7 @@ impl Menu {
                 game: s["game"].as_str().map(str::to_string),
             },
             notice: v["notice"].as_str().filter(|notice| !notice.is_empty()).map(str::to_string),
+            controls: v.get("controls").and_then(|controls| Controls::from_json(&controls.to_string())),
         })
     }
 
@@ -237,6 +243,15 @@ pub mod size {
     pub const HEADING: f32 = 34.0;
 }
 
+/// The height of the Controls page in dp: the title, the two tabs for the controllers, one row for
+/// each of the eight inputs, two lines of notes and the buttons at the bottom. A controller with no
+/// menu button leaves its row empty, so both pages have one height.
+pub fn controls_height() -> f32 {
+    use size::*;
+    let rows = |heights: &[f32]| heights.iter().map(|h| h + GAP).sum::<f32>();
+    2.0 * PADDING + rows(&[TITLE, BUTTON]) + Control::ALL.len() as f32 * (BUTTON + GAP) + rows(&[TEXT, TEXT, BUTTON])
+}
+
 /// The console's height in dp for a menu: the rows that `console_panel.rs` draws, with their gaps.
 pub fn height(menu: Option<&Menu>) -> f32 {
     use size::*;
@@ -253,9 +268,18 @@ pub fn height(menu: Option<&Menu>) -> f32 {
     2.0 * PADDING + notice + rows(&[TITLE, TEXT, HEADING]) + games * (BUTTON + GAP) + rows(&[HEADING, BUTTON, BUTTON, BUTTON, BUTTON, BUTTON, BUTTON, TEXT, BUTTON])
 }
 
-/// How long the left menu button must stay down to show or hide the console. A shorter press goes
-/// to the game only: games use the button for their own menu.
-pub const HOLD_NS: u64 = 800_000_000;
+/// How long the headset waits for the Mac to repeat a change of the controls that the user made in
+/// the console. A menu with other controls that comes later wins.
+const ECHO_WAIT: Duration = Duration::from_secs(3);
+
+/// The page of the console that shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Page {
+    #[default]
+    Main,
+    /// The buttons of one controller
+    Controls(Hand),
+}
 
 /// What the UI draws of the console.
 #[derive(Clone, Debug, PartialEq)]
@@ -264,6 +288,12 @@ pub struct View {
     pub menu: Option<Menu>,
     pub room: Room,
     pub volume: Volume,
+    /// What the buttons do. The mapping that the Mac last sent, or the headset's copy of it while
+    /// no link runs.
+    pub controls: Controls,
+    /// The Mac's app keeps the controls and the headset changes them through it, so a change needs a
+    /// link
+    pub controls_editable: bool,
 }
 
 /// The console's state: its menu and whether it shows.
@@ -271,12 +301,13 @@ pub struct View {
 pub struct Console {
     menu: Option<Menu>,
     open: bool,
-    /// When the menu button went down, while it is held
-    held_since: Option<u64>,
-    /// The hold already toggled the console
-    fired: bool,
     /// Whether a game ran at the last menu
     game_ran: Option<bool>,
+    /// What the buttons of the controllers do. The Mac owns the mapping (`app.json`): its menu
+    /// sets it, and the headset keeps the last one for the time without a link.
+    controls: Controls,
+    /// A change that the user made here and that the Mac has not repeated in a menu yet
+    pending_controls: Option<(Controls, Instant)>,
     /// The console stays open when the link ends. A launch option sets it, for a run without a
     /// controller that could open the console.
     keep_open: bool,
@@ -287,7 +318,55 @@ pub struct Console {
 
 impl Console {
     pub fn view(&self) -> View {
-        View { open: self.open, menu: self.menu.clone(), room: self.room, volume: self.volume }
+        View {
+            open: self.open,
+            menu: self.menu.clone(),
+            room: self.room,
+            volume: self.volume,
+            controls: self.controls,
+            controls_editable: self.menu.is_some(),
+        }
+    }
+
+    /// The mapping that the headset uses now.
+    pub fn controls(&self) -> Controls {
+        self.controls
+    }
+
+    /// Takes the mapping that the headset kept from an earlier link.
+    pub fn set_controls(&mut self, controls: Controls) {
+        self.controls = controls;
+    }
+
+    /// The user picks the next (`step` 1) or the previous (`step` -1) action for one button. The
+    /// choice shows at once. Returns the mapping to send to the Mac, or `None` when no link runs,
+    /// because the Mac keeps the mapping.
+    pub fn step_control(&mut self, hand: Hand, control: Control, step: i32, now: Instant) -> Option<Controls> {
+        self.menu.as_ref()?;
+        let offers = control.offers();
+        let at = offers.iter().position(|action| *action == self.controls.action(hand, control)).unwrap_or(0) as i32;
+        let next = offers[(at + step).rem_euclid(offers.len() as i32) as usize];
+        self.pick_control(hand, control, next, now)
+    }
+
+    /// The user picks `action` for one button. See `step_control`.
+    pub fn pick_control(&mut self, hand: Hand, control: Control, action: ControlAction, now: Instant) -> Option<Controls> {
+        self.menu.as_ref()?;
+        let mut next = self.controls;
+        next.set(hand, control, action).then_some(())?;
+        self.show_controls(next, now)
+    }
+
+    /// The user asks for the standard mapping. See `step_control`.
+    pub fn reset_controls(&mut self, now: Instant) -> Option<Controls> {
+        self.menu.as_ref()?;
+        self.show_controls(Controls::default(), now)
+    }
+
+    fn show_controls(&mut self, next: Controls, now: Instant) -> Option<Controls> {
+        self.controls = next;
+        self.pending_controls = Some((next, now));
+        Some(next)
     }
 
     pub fn set_room(&mut self, room: Room) {
@@ -321,14 +400,37 @@ impl Console {
 
     /// A new menu from the host. The console shows when the first menu comes and while no game
     /// runs, and it hides when a game starts. The user's own toggle holds until the game starts or
-    /// stops.
-    pub fn on_menu(&mut self, menu: Menu) {
+    /// stops. Returns the mapping that the headset must keep for the time without a link, when the
+    /// menu changed it.
+    pub fn on_menu(&mut self, menu: Menu) -> Option<Controls> {
+        self.on_menu_at(menu, Instant::now())
+    }
+
+    pub fn on_menu_at(&mut self, menu: Menu, now: Instant) -> Option<Controls> {
         let runs = menu.status.game.is_some();
         if self.game_ran != Some(runs) {
             self.game_ran = Some(runs);
             self.open = !runs;
         }
+        let mut changed = None;
+        if let Some(controls) = menu.controls {
+            // A change of the user's shows at once and the Mac repeats it a moment later. A menu that
+            // was on its way before the Mac saw the change must not undo it.
+            let waiting = match self.pending_controls {
+                Some((asked, since)) if controls == asked || now.saturating_duration_since(since) > ECHO_WAIT => {
+                    self.pending_controls = None;
+                    false
+                }
+                Some(_) => true,
+                None => false,
+            };
+            if !waiting && controls != self.controls {
+                self.controls = controls;
+                changed = Some(controls);
+            }
+        }
         self.menu = Some(menu);
+        changed
     }
 
     /// The link ended: the menu is gone.
@@ -336,23 +438,12 @@ impl Console {
         self.menu = None;
         self.game_ran = None;
         self.open = self.keep_open;
+        self.pending_controls = None;
     }
 
-    /// One frame of the headset: whether the left menu button is down. Returns whether a hold
-    /// toggled the console in this frame. `now` is on the client's clock.
-    pub fn on_frame(&mut self, menu_down: bool, now: u64) -> bool {
-        if !menu_down {
-            self.held_since = None;
-            self.fired = false;
-            return false;
-        }
-        let since = *self.held_since.get_or_insert(now);
-        if self.fired || now.saturating_sub(since) < HOLD_NS {
-            return false;
-        }
-        self.fired = true;
+    /// Shows the console, or hides it: the action of a button, such as the menu button.
+    pub fn toggle_open(&mut self) {
         self.toggle();
-        true
     }
 }
 

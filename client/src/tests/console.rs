@@ -87,24 +87,133 @@ fn the_first_menu_opens_the_console_and_a_game_closes_it() {
 }
 
 #[test]
-fn a_hold_of_the_menu_button_shows_or_hides_the_console() {
+fn the_action_of_a_button_shows_or_hides_the_console() {
     let mut console = Console::default();
-    let ms = 1_000_000;
-    // A short press does nothing: the game gets it
-    assert!(!console.on_frame(true, 1_000 * ms));
-    assert!(!console.on_frame(true, 1_000 * ms + HOLD_NS - 1));
-    assert!(!console.on_frame(false, 1_000 * ms + HOLD_NS + ms));
     assert!(!console.view().open);
-    // A hold toggles once
-    assert!(!console.on_frame(true, 2_000 * ms));
-    assert!(console.on_frame(true, 2_000 * ms + HOLD_NS));
-    assert!(!console.on_frame(true, 2_000 * ms + 2 * HOLD_NS), "one toggle for one hold");
+    console.toggle_open();
     assert!(console.view().open);
-    // Another hold hides it
-    assert!(!console.on_frame(false, 3_000 * ms));
-    assert!(!console.on_frame(true, 4_000 * ms));
-    assert!(console.on_frame(true, 4_000 * ms + HOLD_NS));
+    console.toggle_open();
     assert!(!console.view().open);
+}
+
+fn with_controls(controls: &Controls) -> Menu {
+    let mut menu = menu(None);
+    menu.controls = Some(*controls);
+    menu
+}
+
+#[test]
+fn the_menu_carries_the_controls_and_an_older_app_sends_none() {
+    let mut mapped = Controls::default();
+    mapped.set(Hand::Right, Control::Secondary, ControlAction::Keyboard);
+    let text = format!(r#"{{"games":[],"controls":{}}}"#, mapped.to_json());
+    assert_eq!(Menu::parse(&text).unwrap().controls, Some(mapped));
+    assert_eq!(Menu::parse(r#"{"games":[]}"#).unwrap().controls, None);
+    // A value that is no mapping counts as none
+    assert_eq!(Menu::parse(r#"{"games":[],"controls":5}"#).unwrap().controls, None);
+    assert!(!MENU.contains("controls"));
+}
+
+#[test]
+fn the_mac_sets_the_controls_and_the_headset_keeps_them_without_a_link() {
+    let mut console = Console::default();
+    assert_eq!(console.controls(), Controls::default());
+    let mut mapped = Controls::default();
+    mapped.set(Hand::Left, Control::Grip, ControlAction::Recenter);
+    let now = Instant::now();
+    // The menu changes the mapping, and says so once
+    assert_eq!(console.on_menu_at(with_controls(&mapped), now), Some(mapped));
+    assert_eq!(console.on_menu_at(with_controls(&mapped), now), None);
+    assert_eq!(console.view().controls, mapped);
+    // A menu from an older app leaves it alone
+    assert_eq!(console.on_menu_at(menu(None), now), None);
+    assert_eq!(console.controls(), mapped);
+    // The link ends: the mapping stays, and the page cannot change it
+    console.clear();
+    assert_eq!(console.controls(), mapped);
+    assert!(!console.view().controls_editable);
+    assert_eq!(console.step_control(Hand::Left, Control::Trigger, 1, now), None);
+    assert_eq!(console.reset_controls(now), None);
+    assert_eq!(console.controls(), mapped, "a refused change shows nothing");
+}
+
+#[test]
+fn a_change_of_the_user_shows_at_once_and_a_menu_that_was_on_its_way_does_not_undo_it() {
+    let mut console = Console::default();
+    let standard = Controls::default();
+    let start = Instant::now();
+    console.on_menu_at(with_controls(&standard), start);
+    assert!(console.view().controls_editable);
+    // The trigger's action steps from the left click to the right click and back
+    let sent = console.step_control(Hand::Right, Control::Trigger, 1, start).unwrap();
+    assert_eq!(sent.right.trigger, ControlAction::RightClick);
+    assert_eq!(console.controls(), sent);
+    let back = console.step_control(Hand::Right, Control::Trigger, -1, start).unwrap();
+    assert_eq!(back, standard);
+    let again = console.step_control(Hand::Right, Control::Trigger, 1, start).unwrap();
+    // The Mac still sends the mapping from before the change
+    let later = start + Duration::from_millis(500);
+    assert_eq!(console.on_menu_at(with_controls(&standard), later), None);
+    assert_eq!(console.controls(), again);
+    // The Mac repeats the change: the wait ends
+    assert_eq!(console.on_menu_at(with_controls(&again), later), None);
+    // A change at the Mac's window shows now
+    let mut at_the_mac = again;
+    at_the_mac.set(Hand::Left, Control::Primary, ControlAction::MiddleClick);
+    assert_eq!(console.on_menu_at(with_controls(&at_the_mac), later), Some(at_the_mac));
+}
+
+#[test]
+fn a_change_that_the_mac_never_repeats_gives_way_after_three_seconds() {
+    let mut console = Console::default();
+    let start = Instant::now();
+    console.on_menu_at(with_controls(&Controls::default()), start);
+    let asked = console.step_control(Hand::Left, Control::Menu, 1, start).unwrap();
+    assert_ne!(asked, Controls::default());
+    // No answer from the Mac: its own mapping returns once the wait is over
+    assert_eq!(console.on_menu_at(with_controls(&Controls::default()), start + Duration::from_secs(2)), None);
+    assert_eq!(console.controls(), asked);
+    assert_eq!(console.on_menu_at(with_controls(&Controls::default()), start + Duration::from_secs(4)), Some(Controls::default()));
+}
+
+#[test]
+fn stepping_through_the_actions_of_an_input_visits_each_one_it_offers_and_comes_round() {
+    let mut console = Console::default();
+    let now = Instant::now();
+    console.on_menu_at(with_controls(&Controls::default()), now);
+    for (control, hand) in [(Control::Primary, Hand::Left), (Control::StickVertical, Hand::Right), (Control::Menu, Hand::Left)] {
+        let offers = control.offers();
+        let mut seen = vec![console.controls().action(hand, control)];
+        for _ in 0..offers.len() {
+            let next = console.step_control(hand, control, 1, now).unwrap();
+            seen.push(next.action(hand, control));
+        }
+        assert_eq!(seen.first(), seen.last(), "{control:?} comes round after one turn");
+        let mut distinct = seen[..seen.len() - 1].to_vec();
+        distinct.sort_by_key(|action| action.key());
+        distinct.dedup();
+        assert_eq!(distinct.len(), offers.len(), "{control:?} offers {offers:?} and the steps saw {seen:?}");
+        // No step ever lands on an action that the input does not offer
+        assert!(seen.iter().all(|action| offers.contains(action)));
+    }
+}
+
+#[test]
+fn the_standard_button_gives_the_standard_mapping_back() {
+    let mut console = Console::default();
+    let now = Instant::now();
+    let mut odd = Controls::default();
+    odd.set(Hand::Left, Control::Trigger, ControlAction::Nothing);
+    console.on_menu_at(with_controls(&odd), now);
+    assert_eq!(console.reset_controls(now), Some(Controls::default()));
+    assert_eq!(console.controls(), Controls::default());
+}
+
+#[test]
+fn the_controls_page_fits_a_panel_that_a_person_can_reach() {
+    // Two lines, the title, two tabs, eight inputs and the buttons: about 740 dp, under a meter
+    let tall = controls_height();
+    assert!(tall > 600.0 && tall < 900.0, "{tall}");
 }
 
 #[test]
