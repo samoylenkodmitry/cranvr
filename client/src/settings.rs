@@ -8,7 +8,7 @@
 use crate::console::{Room, Volume};
 use crate::hub::MediaChoice;
 use cranpose::{launch_args, preferences};
-use cranvr_common::controls::Controls;
+use cranvr_common::controls::{Controls, Hand};
 use cranvr_proto::identity::{fingerprint, from_hex, random_bytes, to_hex, Identity, FINGERPRINT_LEN};
 use std::sync::OnceLock;
 
@@ -101,6 +101,17 @@ pub fn connect_on_launch() -> bool {
 /// `console`. A headset on a desk has no controller that could hold the menu button.
 pub fn console_on_launch() -> bool {
     launch_args().boolean("console").unwrap_or(false)
+}
+
+/// Whether the launch asks for the console to open on the Controls page, with `--controls_page=left`
+/// or `--controls_page=right` or the extra `controls_page`. A test on a desk has no controller that
+/// could press the console's Controls button, and a screen capture of the page needs it open.
+pub fn controls_page_on_launch() -> Option<Hand> {
+    match launch_args().string("controls_page") {
+        Some("left") => Some(Hand::Left),
+        Some("right") => Some(Hand::Right),
+        _ => None,
+    }
 }
 
 /// Whether the launch asks for the address field open at the start, with `--address_entry` or the

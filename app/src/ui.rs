@@ -273,11 +273,23 @@ fn vr_requests(settings: MutableState<Settings>, next: &mut Model, requests: Vec
     }
 }
 
+/// The tab that the window opens on: the Play tab, or the one that `CRANVR_TAB` names (`play`,
+/// `desktop`, `settings`, `controls` or `log`). A test that takes a screen capture of a page uses it,
+/// because it cannot press the tab's button.
+fn start_tab() -> Tab {
+    match std::env::var("CRANVR_TAB").as_deref() {
+        Ok("desktop") => Tab::Desktop,
+        Ok("settings" | "controls") => Tab::Settings,
+        Ok("log") => Tab::Log,
+        _ => Tab::Play,
+    }
+}
+
 #[composable]
 pub fn CranvrApp() {
     let settings = rememberMutableStateOf(Settings::load);
     let model = rememberMutableStateOf(Model::default);
-    let tab = rememberMutableStateOf(|| Tab::Play);
+    let tab = rememberMutableStateOf(|| start_tab());
 
     LaunchedEffect((), async move |_| {
         // The choice comes first: a Mac set to Wi-Fi must not get a link in the thread's first look
@@ -975,7 +987,13 @@ enum SettingsPage {
 
 #[composable]
 fn SettingsTab(settings: MutableState<Settings>, model: MutableState<Model>) {
-    let page = rememberMutableStateOf(|| SettingsPage::General);
+    let page = rememberMutableStateOf(|| {
+        if std::env::var("CRANVR_TAB").is_ok_and(|tab| tab == "controls") {
+            SettingsPage::Controls
+        } else {
+            SettingsPage::General
+        }
+    });
     let current = page.get();
     FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
         for (choice, name) in [(SettingsPage::General, "General"), (SettingsPage::Controls, "Controls")] {

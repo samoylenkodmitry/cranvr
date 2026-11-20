@@ -11,7 +11,7 @@
 use crate::{
     console::{self, size, Action, Game, Menu, Page, Press, Room, View, Volume, RATES, SCALES},
     hub::{hub, LinkState, Snapshot},
-    place,
+    place, settings,
     tracking::Read,
     ui::{text_style, ACCENT_COLOR, KEY_COLOR, MUTED_COLOR, PANEL_COLOR, STOP_COLOR, TEXT_COLOR, WARN_COLOR},
 };
@@ -64,7 +64,7 @@ pub fn ConsolePanel(view: MutableState<View>, snapshot: MutableState<Snapshot>) 
 
 #[composable]
 fn OpenConsole(view: View, state: LinkState) {
-    let page = rememberMutableStateOf(|| Page::Main);
+    let page = rememberMutableStateOf(|| settings::controls_page_on_launch().map_or(Page::Main, Page::Controls));
     let shown = page.get();
     let height = match shown {
         Page::Main => console::height(view.menu.as_ref()),
