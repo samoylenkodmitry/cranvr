@@ -44,6 +44,9 @@ fn usage() -> ! {
          \n                     each feature that the host asks for. The head stands still.\
          \n  --still-head       the head stands still (as with --tracking), so a game's room is the\
          \n                     probe's room and a game's controller poses match the script\
+         \n  --sweep-aim        the right controller's aim sweeps over the room in front of the head and its trigger\
+         \n                     goes down for half a second in every second, so that a game's panel (a warning\
+         \n                     with a Continue button) gets a click along the sweep\
          \n  --no-controllers   with --tracking: no controller is tracked, so a game without hand code\
          \n                     gets controllers made of the hands\
          \n  --face-source S    with --tracking: where the face comes from, visual (cameras), audio\
@@ -76,6 +79,7 @@ fn main() {
         tracking: false,
         no_controllers: false,
         still_head: false,
+        sweep_aim: false,
         face_source: Default::default(),
         pause: None,
     };
@@ -97,6 +101,7 @@ fn main() {
             "--tracking" => options.tracking = true,
             "--no-controllers" => options.no_controllers = true,
             "--still-head" => options.still_head = true,
+            "--sweep-aim" => options.sweep_aim = true,
             "--face-source" => options.face_source = tracked::FaceSource::parse(&value()).unwrap_or_else(|| usage()),
             "--pause" => options.pause = Some(parse_pause(&value()).unwrap_or_else(|| usage())),
             "--drop-percent" => options.drop_percent = value().parse().unwrap_or_else(|_| usage()),

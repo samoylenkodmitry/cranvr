@@ -59,6 +59,9 @@ pub struct Options {
     /// The head stands still, as it does with `tracking`, so that a game's room is the probe's room
     /// and its controller poses can be compared with the script's numbers
     pub still_head: bool,
+    /// The right controller's aim sweeps over the room in front of the head and its trigger goes down for
+    /// half a second in every second, so that a game's panel gets a click somewhere along the sweep
+    pub sweep_aim: bool,
     /// With `tracking`: where the face comes from
     pub face_source: tracked::FaceSource,
     /// Loses the input focus at this many seconds for this many seconds, as under the system's
@@ -155,6 +158,7 @@ struct Shared {
     wish: AtomicU8,
     tracking: bool,
     still_head: bool,
+    sweep_aim: bool,
     no_controllers: bool,
     face_source: tracked::FaceSource,
     sent_tracking: [AtomicU64; 4],
@@ -264,6 +268,7 @@ pub fn run(o: Options) -> i32 {
         wish: AtomicU8::new(0),
         tracking: o.tracking,
         still_head: o.tracking || o.still_head,
+        sweep_aim: o.sweep_aim,
         no_controllers: o.no_controllers,
         face_source: o.face_source,
         sent_tracking: Default::default(),
@@ -603,13 +608,16 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
                     left_grip: controllers.then_some(left),
                     right_grip: controllers.then_some(right),
                     left_aim: controllers.then(|| hands::aim_with(0, &left)),
-                    right_aim: controllers.then(|| hands::aim_with(1, &right)),
+                    right_aim: controllers.then(|| {
+                        let aim = hands::aim_with(1, &right);
+                        if shared.sweep_aim { hands::swept(aim, t) } else { aim }
+                    }),
                 })).ok();
             send_tracked(shared, sample_time, display_time);
             // The input goes out with each sample, as the client's does. For half a second in every
             // 3 seconds the left grip squeezes, the right trigger goes to 0.75, A is down and the right
             // stick leans to 0.5, as a game test may ask. A game answers the squeeze with a haptic pulse.
-            let held = t % 3.0 > 2.5;
+            let held = if shared.sweep_aim { t % 1.0 > 0.5 } else { t % 3.0 > 2.5 };
             let on = |v: f32| if held { v } else { 0.0 };
             let mut input = Input { sample_time, ..Default::default() };
             // A headset with no controller reports every input at rest

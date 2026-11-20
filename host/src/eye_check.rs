@@ -3,14 +3,18 @@
 //! eye stays empty. The host cannot tell this from the swapchain's description, because games that
 //! render both eyes into two slices work too. It looks at the pictures instead.
 //!
-//! About once a second the frame loop reads a grid of 16 x 16 pixels from each eye of the game's
+//! About once a second the frame loop reads a grid of 64 x 64 pixels from each eye of the game's
 //! newest frame. Three states decide: the right eye is black when none of its samples is lit, and
 //! the left eye has content when enough of its samples are lit. The symptom counts when the left
 //! eye has content and the right eye is black for several checks in a row. A dark screen in both
 //! eyes (a loading screen) and a flicker between states never count. The host reports the symptom
 //! once for each game run (see `status.rs`, the `black_eye` line).
 //!
-//! The cost is two read-only locks and 512 pixel reads once a second, with no allocation. A frame
+//! The grid has 4096 samples because a menu in a dark room lights few pixels. A game that showed the
+//! spectrum bars of its menu in the left eye and nothing in the right eye lit about 0.5 percent of the
+//! left eye's pixels, which a grid of 16 x 16 samples rarely hit.
+//!
+//! The cost is two read-only locks and 8192 pixel reads once a second, with no allocation. A frame
 //! between the checks costs one clock read.
 
 use log::{info, warn};
@@ -20,12 +24,12 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// Samples along each side of the grid
-pub const SIDE: usize = 16;
+pub const SIDE: usize = 64;
 pub const SAMPLES: usize = SIDE * SIDE;
 /// A sample is lit when its brightest color channel is above this value of 255. An empty slice
 /// reads 0. A dark scene stays below it only where it is nearly black.
 const LIT_LEVEL: u8 = 8;
-/// An eye has content when at least this many samples are lit (3 percent). A few bright pixels,
+/// An eye has content when at least this many samples are lit (0.2 percent). A few bright pixels,
 /// such as a cursor on a black screen, do not count.
 const CONTENT_SAMPLES: usize = 8;
 /// The checks in a row that must show the symptom. At one check a second the game has shown a
@@ -433,6 +437,22 @@ mod tests {
         let tiny = image(4, 4, 16, |_, _| [255, 255, 255, 255]);
         assert!(grid.fill(&tiny, 16, (4, 4), [0, 0, 4, 4]));
         assert_eq!(grid.lit(), SAMPLES);
+    }
+
+    #[test]
+    fn a_menu_that_lights_half_a_percent_of_a_dark_eye_has_content() {
+        // The spectrum bars of a menu in a dark room: a band of thin bars at the bottom, 0.4 percent of the pixels
+        let (width, height) = (1444, 1546);
+        let bars = image(width, height, width * 4, |x, y| {
+            if y >= height - 80 && (400..900).contains(&x) && x % 3 == 0 { [255, 255, 255, 255] } else { [0, 0, 0, 255] }
+        });
+        let mut grid = Grid::default();
+        assert!(grid.fill(&bars, width * 4, (width, height), [0, 0, width as i32, height as i32]));
+        assert!(grid.has_content(), "{} samples lit", grid.lit());
+        // The same eye beside a black one reports after four checks, as a lit eye does
+        let mut detector = Detector::default();
+        let checks = (0..CHECKS_IN_A_ROW as usize).map(|_| (Grid(grid.0), black())).collect::<Vec<_>>();
+        assert_eq!(reported_at(&mut detector, &checks), Some(4));
     }
 
     #[test]

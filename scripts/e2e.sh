@@ -49,6 +49,9 @@
 #                 offer, the host's file for the runtime and each sample carry the source. The
 #                 Windows program checks that the support structure says it, that a face tracker
 #                 which asks for the other source is refused, and each sample's dataSource.
+#   --sweep-aim   with the probe: the right controller's aim sweeps over the room in front of the head, and its
+#                 trigger goes down for half a second in every second. A game that waits for a click on a panel
+#                 (a warning with a Continue button) then gets one along the sweep.
 #   --pause AT:FOR  with the probe: the app loses the input focus at AT seconds (2 or more) for FOR
 #                 seconds, as under the headset's system menu. The probe tells the host, sends no tracking
 #                 and no input and counts the frames that still arrive. The run fails when a frame
@@ -92,7 +95,7 @@ root=${0:A:h:h}
 seconds=20 fps=120 fps_given=0 game=0 desktop=0 client=mac serial="" report=""
 tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 openvr_wine=0 openvr_actions="" face_source=audio
 wine="" wine_args=()
-native_tcp=0 native_drop=0 native_port=9950 pause=""
+native_tcp=0 native_drop=0 native_port=9950 pause="" sweep_aim=0
 more_host_args=()
 while (( $# )); do
     case $1 in
@@ -119,6 +122,7 @@ while (( $# )); do
         --native-drop) native_drop=$2; shift 2 ;;
         --native-port) native_port=$2; shift 2 ;;
         --pause) pause=$2; shift 2 ;;
+        --sweep-aim) sweep_aim=1; shift ;;
         --quest)
             client=quest; shift
             if (( $# )) && [[ $1 != --* ]]; then serial=$1; shift; fi ;;
@@ -324,6 +328,7 @@ fi
 
 probe_args=(--seconds "${seconds}" --connect "127.0.0.1:${native_port}" --drop-percent "${native_drop}")
 (( native_tcp )) && probe_args+=(--tcp)
+(( sweep_aim )) && probe_args+=(--sweep-aim)
 (( game )) && probe_args+=(--game)
 # A real program and the desktop scene draw no eye badges
 if [[ -n ${wine} ]] || (( desktop )); then
