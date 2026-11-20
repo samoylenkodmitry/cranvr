@@ -43,8 +43,13 @@
 // loading screen does. The runtime of cranvr takes no quad layer: the frames of the program must reach the host all
 // the same (scripts/e2e.sh --openvr-overlay checks the host's count of game frames).
 //
+// --gl draws with OpenGL instead of Direct3D 11, as Google Earth VR does: it asks for a context of OpenGL 3.2 with the
+// compatibility profile, draws the changing rows with a shader of GLSL 1.10 (attribute, varying, gl_FragColor) and
+// submits one texture that holds both eyes side by side, each eye with its half in the bounds. OpenComposite copies
+// OpenGL textures into the runtime's Direct3D 11 images. scripts/e2e.sh --openvr-gl runs it.
+//
 // Usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--trace-poses] [--actions MODE] [--expect-hz N] [--overlay] [--format F]
-//                         [--load-only --runtime DIR]
+//                         [--gl] [--load-only --runtime DIR]
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -54,6 +59,7 @@
 
 #include <d3d11.h>
 #include <dxgi.h>
+#include <GL/gl.h>
 
 #include <algorithm>
 #include <chrono>
@@ -559,12 +565,239 @@ struct ActionTest {
 	}
 };
 
+// === OpenGL, as Google Earth VR uses it ===
+//
+// A hidden window, a context of OpenGL 3.2 with the compatibility profile (the attributes that Earth VR passes), one
+// texture with both eyes side by side and a program of GLSL 1.10 that draws the changing rows. GL rows go up from the
+// bottom: the upper half of the picture is the rows from height / 2 up.
+
+typedef HGLRC(WINAPI* PFN_wglCreateContextAttribsARB)(HDC, HGLRC, const int*);
+typedef void(APIENTRY* PFN_glGenObjects)(GLsizei, GLuint*);
+typedef void(APIENTRY* PFN_glBindTarget)(GLenum, GLuint);
+typedef void(APIENTRY* PFN_glFramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
+typedef GLenum(APIENTRY* PFN_glCheckFramebufferStatus)(GLenum);
+typedef void(APIENTRY* PFN_glBindVertexArray)(GLuint);
+typedef void(APIENTRY* PFN_glBufferData)(GLenum, ptrdiff_t, const void*, GLenum);
+typedef void(APIENTRY* PFN_glVertexAttribPointer)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*);
+typedef void(APIENTRY* PFN_glEnableVertexAttribArray)(GLuint);
+typedef GLuint(APIENTRY* PFN_glCreateShader)(GLenum);
+typedef void(APIENTRY* PFN_glShaderSource)(GLuint, GLsizei, const char* const*, const GLint*);
+typedef void(APIENTRY* PFN_glCompileShader)(GLuint);
+typedef void(APIENTRY* PFN_glGetShaderiv)(GLuint, GLenum, GLint*);
+typedef void(APIENTRY* PFN_glGetShaderInfoLog)(GLuint, GLsizei, GLsizei*, char*);
+typedef GLuint(APIENTRY* PFN_glCreateProgram)();
+typedef void(APIENTRY* PFN_glAttachShader)(GLuint, GLuint);
+typedef void(APIENTRY* PFN_glBindAttribLocation)(GLuint, GLuint, const char*);
+typedef void(APIENTRY* PFN_glLinkProgram)(GLuint);
+typedef void(APIENTRY* PFN_glGetProgramiv)(GLuint, GLenum, GLint*);
+typedef void(APIENTRY* PFN_glUseProgram)(GLuint);
+typedef GLint(APIENTRY* PFN_glGetUniformLocation)(GLuint, const char*);
+typedef void(APIENTRY* PFN_glUniform4f)(GLint, GLfloat, GLfloat, GLfloat, GLfloat);
+
+struct GLGame {
+	HWND window = nullptr;
+	HDC dc = nullptr;
+	HGLRC context = nullptr;
+	GLuint texture = 0, framebuffer = 0, vao = 0, buffer = 0, program = 0;
+	GLint color = -1;
+	uint32_t width = 0, height = 0;
+
+	PFN_glGenObjects GenFramebuffers = nullptr, GenVertexArrays = nullptr, GenBuffers = nullptr;
+	PFN_glBindTarget BindFramebuffer = nullptr, BindBuffer = nullptr;
+	PFN_glFramebufferTexture2D FramebufferTexture2D = nullptr;
+	PFN_glCheckFramebufferStatus CheckFramebufferStatus = nullptr;
+	PFN_glBindVertexArray BindVertexArray = nullptr;
+	PFN_glBufferData BufferData = nullptr;
+	PFN_glVertexAttribPointer VertexAttribPointer = nullptr;
+	PFN_glEnableVertexAttribArray EnableVertexAttribArray = nullptr;
+	PFN_glCreateShader CreateShader = nullptr;
+	PFN_glShaderSource ShaderSource = nullptr;
+	PFN_glCompileShader CompileShader = nullptr;
+	PFN_glGetShaderiv GetShaderiv = nullptr;
+	PFN_glGetShaderInfoLog GetShaderInfoLog = nullptr;
+	PFN_glCreateProgram CreateProgram = nullptr;
+	PFN_glAttachShader AttachShader = nullptr;
+	PFN_glBindAttribLocation BindAttribLocation = nullptr;
+	PFN_glLinkProgram LinkProgram = nullptr;
+	PFN_glGetProgramiv GetProgramiv = nullptr;
+	PFN_glUseProgram UseProgram = nullptr;
+	PFN_glGetUniformLocation GetUniformLocation = nullptr;
+	PFN_glUniform4f Uniform4f = nullptr;
+
+	template <typename T>
+	bool load(T& function, const char* name)
+	{
+		function = reinterpret_cast<T>(wglGetProcAddress(name));
+		if (!function) {
+			say("no OpenGL function %s", name);
+		}
+		return function != nullptr;
+	}
+
+	GLuint shader(GLenum type, const char* source)
+	{
+		const GLuint id = CreateShader(type);
+		ShaderSource(id, 1, &source, nullptr);
+		CompileShader(id);
+		GLint ok = 0;
+		GetShaderiv(id, 0x8B81 /* GL_COMPILE_STATUS */, &ok);
+		if (!ok) {
+			char log[1024] = {};
+			GetShaderInfoLog(id, sizeof(log), nullptr, log);
+			say("a shader of GLSL 1.10 does not compile: %s", log);
+			return 0;
+		}
+		return id;
+	}
+
+	// The eye's picture: the upper half has the eye's color (blue for the left eye, orange for the right), the lower half
+	// is nearly black
+	const char* setup(uint32_t eye_width, uint32_t eye_height)
+	{
+		width = eye_width;
+		height = eye_height;
+		WNDCLASSA window_class{};
+		window_class.lpfnWndProc = DefWindowProcA;
+		window_class.hInstance = GetModuleHandleA(nullptr);
+		window_class.lpszClassName = "openvr_smoke_gl";
+		RegisterClassA(&window_class);
+		window = CreateWindowA("openvr_smoke_gl", "openvr_smoke", WS_OVERLAPPEDWINDOW, 0, 0, 64, 64, nullptr, nullptr, window_class.hInstance, nullptr);
+		dc = window ? GetDC(window) : nullptr;
+		if (!dc) {
+			return "a window for OpenGL";
+		}
+		PIXELFORMATDESCRIPTOR format{};
+		format.nSize = sizeof(format);
+		format.nVersion = 1;
+		format.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+		format.iPixelType = PFD_TYPE_RGBA;
+		format.cColorBits = 32;
+		format.cDepthBits = 24;
+		const int chosen = ChoosePixelFormat(dc, &format);
+		if (!chosen || !SetPixelFormat(dc, chosen, &format)) {
+			return "a pixel format for OpenGL";
+		}
+		HGLRC legacy = wglCreateContext(dc);
+		if (!legacy || !wglMakeCurrent(dc, legacy)) {
+			return "a first OpenGL context";
+		}
+		auto create = reinterpret_cast<PFN_wglCreateContextAttribsARB>(wglGetProcAddress("wglCreateContextAttribsARB"));
+		// WGL_CONTEXT_MAJOR_VERSION_ARB 3, WGL_CONTEXT_MINOR_VERSION_ARB 2, WGL_CONTEXT_FLAGS_ARB 0,
+		// WGL_CONTEXT_PROFILE_MASK_ARB WGL_CONTEXT_COMPATIBILITY_PROFILE_BIT_ARB
+		const int attributes[] = { 0x2091, 3, 0x2092, 2, 0x2094, 0, 0x9126, 2, 0 };
+		context = create ? create(dc, nullptr, attributes) : nullptr;
+		wglMakeCurrent(nullptr, nullptr);
+		wglDeleteContext(legacy);
+		if (!context || !wglMakeCurrent(dc, context)) {
+			return "an OpenGL 3.2 context with the compatibility profile";
+		}
+		say("OpenGL %s", reinterpret_cast<const char*>(glGetString(GL_VERSION)));
+		if (!load(GenFramebuffers, "glGenFramebuffers") || !load(GenVertexArrays, "glGenVertexArrays") || !load(GenBuffers, "glGenBuffers")
+		    || !load(BindFramebuffer, "glBindFramebuffer") || !load(BindBuffer, "glBindBuffer") || !load(FramebufferTexture2D, "glFramebufferTexture2D")
+		    || !load(CheckFramebufferStatus, "glCheckFramebufferStatus") || !load(BindVertexArray, "glBindVertexArray") || !load(BufferData, "glBufferData")
+		    || !load(VertexAttribPointer, "glVertexAttribPointer") || !load(EnableVertexAttribArray, "glEnableVertexAttribArray")
+		    || !load(CreateShader, "glCreateShader") || !load(ShaderSource, "glShaderSource") || !load(CompileShader, "glCompileShader")
+		    || !load(GetShaderiv, "glGetShaderiv") || !load(GetShaderInfoLog, "glGetShaderInfoLog") || !load(CreateProgram, "glCreateProgram")
+		    || !load(AttachShader, "glAttachShader") || !load(BindAttribLocation, "glBindAttribLocation") || !load(LinkProgram, "glLinkProgram")
+		    || !load(GetProgramiv, "glGetProgramiv") || !load(UseProgram, "glUseProgram") || !load(GetUniformLocation, "glGetUniformLocation")
+		    || !load(Uniform4f, "glUniform4f")) {
+			return "the OpenGL functions";
+		}
+
+		// Both eyes side by side in one texture, as Earth VR submits them
+		std::vector<uint8_t> picture(static_cast<size_t>(width) * 2 * height * 4);
+		for (uint32_t y = 0; y < height; y++) {
+			for (uint32_t x = 0; x < width * 2; x++) {
+				uint8_t* out = &picture[(static_cast<size_t>(y) * width * 2 + x) * 4];
+				const bool upper = y >= height / 2, left = x < width;
+				out[0] = upper ? (left ? 26 : 230) : 15;
+				out[1] = upper ? 128 : 15;
+				out[2] = upper ? (left ? 230 : 26) : 15;
+				out[3] = 255;
+			}
+		}
+		glGenTextures(1, &texture);
+		glBindTexture(GL_TEXTURE_2D, texture);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexImage2D(GL_TEXTURE_2D, 0, 0x8058 /* GL_RGBA8 */, width * 2, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, picture.data());
+		GenFramebuffers(1, &framebuffer);
+		BindFramebuffer(0x8D40 /* GL_FRAMEBUFFER */, framebuffer);
+		FramebufferTexture2D(0x8D40, 0x8CE0 /* GL_COLOR_ATTACHMENT0 */, GL_TEXTURE_2D, texture, 0);
+		if (CheckFramebufferStatus(0x8D40) != 0x8CD5 /* GL_FRAMEBUFFER_COMPLETE */) {
+			return "a framebuffer for the eye texture";
+		}
+
+		const GLuint vertex = shader(0x8B31 /* GL_VERTEX_SHADER */,
+		    "#version 110\n"
+		    "attribute vec2 aPosition;\n"
+		    "varying vec2 vPosition;\n"
+		    "void main() { vPosition = aPosition; gl_Position = vec4(aPosition, 0.0, 1.0); }\n");
+		const GLuint fragment = shader(0x8B30 /* GL_FRAGMENT_SHADER */,
+		    "#version 110\n"
+		    "uniform vec4 uColor;\n"
+		    "varying vec2 vPosition;\n"
+		    "void main() { gl_FragColor = uColor; }\n");
+		if (!vertex || !fragment) {
+			return "the shaders of GLSL 1.10";
+		}
+		program = CreateProgram();
+		AttachShader(program, vertex);
+		AttachShader(program, fragment);
+		BindAttribLocation(program, 0, "aPosition");
+		LinkProgram(program);
+		GLint linked = 0;
+		GetProgramiv(program, 0x8B82 /* GL_LINK_STATUS */, &linked);
+		if (!linked) {
+			return "the program of GLSL 1.10";
+		}
+		color = GetUniformLocation(program, "uColor");
+		const float quad[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+		GenVertexArrays(1, &vao);
+		BindVertexArray(vao);
+		GenBuffers(1, &buffer);
+		BindBuffer(0x8892 /* GL_ARRAY_BUFFER */, buffer);
+		BufferData(0x8892, sizeof(quad), quad, 0x88E4 /* GL_STATIC_DRAW */);
+		VertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
+		EnableVertexAttribArray(0);
+		BindFramebuffer(0x8D40, 0);
+		return glGetError() == GL_NO_ERROR ? nullptr : "an OpenGL error while setting up";
+	}
+
+	// The upper rows of each eye change in each frame, drawn by the program of GLSL 1.10
+	void draw(float shade, uint32_t rows)
+	{
+		BindFramebuffer(0x8D40, framebuffer);
+		BindVertexArray(vao);
+		UseProgram(program);
+		for (int eye = 0; eye < 2; eye++) {
+			glViewport(eye * width, height - rows, width, rows);
+			Uniform4f(color, eye == 0 ? 0.1f : 0.9f, 0.2f + 0.6f * shade, eye == 0 ? 0.9f : 0.1f, 1.0f);
+			glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		}
+		UseProgram(0);
+		BindVertexArray(0);
+		BindFramebuffer(0x8D40, 0);
+	}
+
+	void close()
+	{
+		wglMakeCurrent(nullptr, nullptr);
+		if (context) {
+			wglDeleteContext(context);
+		}
+		if (window) {
+			ReleaseDC(window, dc);
+			DestroyWindow(window);
+		}
+	}
+};
+
 } // namespace
 
 int main(int argc, char** argv)
 {
 	double seconds = 15;
-	bool expect_input = false, load_only = false, no_input = false, trace_poses = false, with_overlay = false;
+	bool expect_input = false, load_only = false, no_input = false, trace_poses = false, with_overlay = false, with_gl = false;
 	std::string actions_mode;
 	float expect_hz = 0.0f;
 	DXGI_FORMAT texture_format = DXGI_FORMAT_R8G8B8A8_UNORM, view_format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -587,6 +820,8 @@ int main(int argc, char** argv)
 			trace_poses = true;
 		} else if (!std::strcmp(argv[i], "--overlay")) {
 			with_overlay = true;
+		} else if (!std::strcmp(argv[i], "--gl")) {
+			with_gl = true;
 		} else if (!std::strcmp(argv[i], "--load-only")) {
 			load_only = true;
 		} else if (!std::strcmp(argv[i], "--format") && i + 1 < argc) {
@@ -606,7 +841,7 @@ int main(int argc, char** argv)
 			g_runtime_path = argv[++i];
 			g_runtime_given = true;
 		} else {
-			std::fprintf(stderr, "usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--actions MODE] [--expect-hz N] [--overlay] [--format F] [--load-only --runtime DIR]\n");
+			std::fprintf(stderr, "usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--actions MODE] [--expect-hz N] [--overlay] [--format F] [--gl] [--load-only --runtime DIR]\n");
 			return 2;
 		}
 	}
@@ -753,6 +988,14 @@ int main(int argc, char** argv)
 		}
 	}
 
+	GLGame gl;
+	if (with_gl) {
+		if (const char* problem = gl.setup(width, height)) {
+			return fail(problem);
+		}
+		say("the eyes are drawn with OpenGL into one texture of %ux%u", width * 2, height);
+	}
+
 	// The overlay's picture: a 512x256 texture, orange above and nearly black below
 	vr::VROverlayHandle_t overlay_handle = vr::k_ulOverlayHandleInvalid;
 	ID3D11Texture2D* overlay_texture = nullptr;
@@ -857,7 +1100,10 @@ int main(int argc, char** argv)
 		// The two eyes differ, and each frame differs from the one before, so a frame that the
 		// host shows is a frame of this program
 		const float shade = static_cast<float>(frames % 120) / 120.0f;
-		for (int i = 0; i < 2; i++) {
+		if (with_gl) {
+			gl.draw(shade, band_rows);
+		}
+		for (int i = 0; i < 2 && !with_gl; i++) {
 			std::vector<uint8_t> band(static_cast<size_t>(width) * band_rows * 4);
 			for (size_t p = 0; p < band.size(); p += 4) {
 				pixel(&band[p], i == 0 ? 0.1f : 0.9f, 0.2f + 0.6f * shade, i == 0 ? 0.9f : 0.1f);
@@ -870,7 +1116,12 @@ int main(int argc, char** argv)
 
 		for (int i = 0; i < 2; i++) {
 			vr::Texture_t texture{ targets[i], vr::TextureType_DirectX, vr::ColorSpace_Gamma };
-			const vr::EVRCompositorError submit = compositor->Submit(i == 0 ? vr::Eye_Left : vr::Eye_Right, &texture);
+			// Earth VR submits its one texture for both eyes, each with its half in the bounds
+			const vr::VRTextureBounds_t half{ i == 0 ? 0.0f : 0.5f, 0.0f, i == 0 ? 0.5f : 1.0f, 1.0f };
+			if (with_gl) {
+				texture = { reinterpret_cast<void*>(static_cast<uintptr_t>(gl.texture)), vr::TextureType_OpenGL, vr::ColorSpace_Gamma };
+			}
+			const vr::EVRCompositorError submit = compositor->Submit(i == 0 ? vr::Eye_Left : vr::Eye_Right, &texture, with_gl ? &half : nullptr);
 			if (submit != vr::VRCompositorError_None) {
 				submit_errors++;
 				if (first_error == vr::VRCompositorError_None) {
@@ -1053,6 +1304,9 @@ int main(int argc, char** argv)
 	release(overlay_texture);
 	release(device);
 	vr::VR_Shutdown();
+	if (with_gl) {
+		gl.close();
+	}
 
 	if (frames < 30) {
 		return fail("fewer than 30 frames");

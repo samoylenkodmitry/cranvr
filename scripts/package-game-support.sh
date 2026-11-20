@@ -1,15 +1,16 @@
 #!/bin/zsh
 # Packs cranvr's game support into one archive that another Mac can install without building:
-# Wine 11.10 with cranvr's DXMT fork and cranvr's wined3d.dll (the HLSL compiler of Wine), BasaltVR's OpenXR
-# runtime with cranvr's patches and OpenComposite, which runs OpenVR games on that runtime.
+# Wine 11.10 with cranvr's DXMT fork and cranvr's patched Wine files (wined3d.dll, wininet.dll, winemac.so and
+# opengl32.so), BasaltVR's OpenXR runtime with cranvr's patches and OpenComposite, which runs OpenVR games on that
+# runtime.
 #
 # Usage: scripts/package-game-support.sh [OUT_DIR]
 #
 # It takes the files from a built tree (scripts/build-basaltvr.sh), from the OpenComposite build
-# (scripts/build-opencomposite.sh) and from the Wine build (scripts/build-wine-d3d.sh) and writes
+# (scripts/build-opencomposite.sh) and from the Wine build (scripts/build-wine.sh) and writes
 # cranvr-game-support-macos.tar.xz, its .sha256, cranvr-opencomposite-source.tar.xz and
 # cranvr-wine-source.tar.xz into OUT_DIR (default target/game-support). The last two are the sources of
-# the OpenComposite and of the patched wined3d.dll in the archive, which the GPL 3 and the LGPL 2.1 ask
+# the OpenComposite and of the patched Wine files in the archive, which the GPL 3 and the LGPL 2.1 ask
 # for: publish them as release files too.
 # scripts/install-game-support.sh installs such an archive. The built tree is
 # third_party/basaltvr/src, or $CRANVR_BASALTVR_DIR when the build lives in another checkout.
@@ -21,14 +22,15 @@
 # DXMT patch needs a new date in that file, a new archive and a release tagged v<version>.
 #
 # The archive holds:
-#   engine/      Wine 11.10 (Gcenx's macOS build), with DXMT's DLLs in place
+#   engine/      Wine 11.10 (Gcenx's macOS build), with DXMT's DLLs and the patched Wine files in place
 #   dxmt/        DXMT's DLLs again, for the Wine prefix's system32
 #   runtime/     the OpenXR runtime, its manifest, its checks and the Steam web helper shim
 #   opencomposite/  OpenComposite's vrclient_x64.dll, its empty version.txt and openvr_smoke.exe, cranvr's
 #                OpenVR test program
-#   wine-d3d/    Wine's wined3d.dll with cranvr's patches, hlsl_compile.exe (cranvr's test program for the
-#                HLSL compiler) and the shader that it compiles
-#   SOURCE/      opencomposite-source.tar.xz and wine-source.tar.xz: the sources of those DLLs (see below)
+#   wine-patched/  Wine's wined3d.dll, wininet.dll, winemac.so and opengl32.so with cranvr's patches,
+#                hlsl_compile.exe (cranvr's test program for the HLSL compiler) with the shader that it compiles, and
+#                gl_compat_check.exe (cranvr's test program for an OpenGL program like Google Earth VR)
+#   SOURCE/      opencomposite-source.tar.xz and wine-source.tar.xz: the sources of those files (see below)
 #   LICENSES/    the licenses of Wine, DXMT, BasaltVR, the OpenXR SDK and OpenComposite with its parts
 #   SOURCES.md   where each part comes from and which patches it carries
 #   VERSION      the version of this game support
@@ -83,22 +85,25 @@ if [[ ${oc_support}/tests/openvr_smoke.cpp -nt ${oc_build}/bin/openvr_smoke.exe 
     exit 1
 fi
 
-for f in "${wine_build}/bin/wined3d.dll" "${wine_build}/bin/hlsl_compile.exe" "${wine_build}/bin/isnan.hlsl" "${wine_src}/.git"; do
+wine_files=(wined3d.dll wininet.dll winemac.so opengl32.so hlsl_compile.exe isnan.hlsl gl_compat_check.exe)
+for f in "${wine_files[@]/#/${wine_build}/bin/}" "${wine_src}/.git"; do
     if [[ ! -e ${f} ]]; then
-        print -u2 "Missing ${f}. Run scripts/build-wine-d3d.sh first."
+        print -u2 "Missing ${f}. Run scripts/build-wine.sh first."
         exit 1
     fi
 done
-# A DLL older than the patches or the test program was built before the last change
-for source in "${wine_support}"/patches/*.patch "${cranvr}/scripts/build-wine-d3d.sh"; do
-    if [[ ${source} -nt ${wine_build}/bin/wined3d.dll ]]; then
-        print -u2 "${source:t} is newer than wined3d.dll. Run scripts/build-wine-d3d.sh first."
-        exit 1
-    fi
+# A file older than the patches, the build or its test program was built before the last change
+for file in wined3d.dll wininet.dll winemac.so opengl32.so; do
+    for source in "${wine_support}"/patches/*.patch "${cranvr}/scripts/build-wine.sh"; do
+        if [[ ${source} -nt ${wine_build}/bin/${file} ]]; then
+            print -u2 "${source:t} is newer than ${file}. Run scripts/build-wine.sh first."
+            exit 1
+        fi
+    done
 done
-for source in "${wine_support}/tests/hlsl_compile.cpp" "${wine_support}/tests/isnan.hlsl"; do
-    if [[ ${source} -nt ${wine_build}/bin/hlsl_compile.exe ]]; then
-        print -u2 "${source:t} is newer than hlsl_compile.exe. Run scripts/build-wine-d3d.sh first."
+for pair in hlsl_compile.cpp:hlsl_compile.exe isnan.hlsl:hlsl_compile.exe gl_compat_check.cpp:gl_compat_check.exe; do
+    if [[ ${wine_support}/tests/${pair%%:*} -nt ${wine_build}/bin/${pair##*:} ]]; then
+        print -u2 "${pair%%:*} is newer than ${pair##*:}. Run scripts/build-wine.sh first."
         exit 1
     fi
 done
@@ -112,7 +117,7 @@ fi
 stage=$(mktemp -d)
 trap 'rm -rf "${stage}"' EXIT
 root=${stage}/cranvr-game-support
-mkdir -p "${root}/dxmt/x86_64-windows" "${root}/dxmt/x86_64-unix" "${root}/runtime" "${root}/opencomposite" "${root}/wine-d3d" "${root}/SOURCE" "${root}/LICENSES"
+mkdir -p "${root}/dxmt/x86_64-windows" "${root}/dxmt/x86_64-unix" "${root}/runtime" "${root}/opencomposite" "${root}/wine-patched" "${root}/SOURCE" "${root}/LICENSES"
 
 print "Copying Wine 11.10"
 cp -cR "${wine_app}" "${root}/engine"
@@ -128,32 +133,40 @@ for f in basalt_openxr.dll basalt_openxr.json loader_smoke.exe d3d11_runtime_smo
     cp "${runtime_bin}/${f}" "${root}/runtime/${f}"
 done
 
-print "Copying Wine's patched wined3d.dll and packing its source"
-cp "${wine_build}/bin/wined3d.dll" "${wine_build}/bin/hlsl_compile.exe" "${wine_build}/bin/isnan.hlsl" "${root}/wine-d3d/"
-# The engine's own copy: the prefix takes its copy from wine-d3d/ at setup
-cp "${wine_build}/bin/wined3d.dll" "${root}/engine/lib/wine/x86_64-windows/wined3d.dll"
-# Wine's wined3d.dll holds vkd3d-shader (LGPL 2.1 or later). Its source goes with the DLL: the pinned tag's
-# tree as it is on winehq.org, cranvr's patches and the steps of the build.
+print "Copying Wine's patched files and packing their source"
+cp "${wine_files[@]/#/${wine_build}/bin/}" "${root}/wine-patched/"
+# The engine's own copies: the prefix takes its copies of the Windows DLLs from wine-patched/ at setup
+cp "${wine_build}/bin/wined3d.dll" "${wine_build}/bin/wininet.dll" "${root}/engine/lib/wine/x86_64-windows/"
+cp "${wine_build}/bin/winemac.so" "${wine_build}/bin/opengl32.so" "${root}/engine/lib/wine/x86_64-unix/"
+# The patched files are Wine's (LGPL 2.1 or later; wined3d.dll holds vkd3d-shader). Their source goes with them:
+# the pinned tag's tree as it is on winehq.org, cranvr's patches and the steps of the build.
 wine_commit=$(git -C "${wine_src}" rev-parse HEAD)
 wine_name=wine-${wine_commit[1,12]}-source
 wine_tree=${stage}/${wine_name}
 mkdir -p "${out}" "${wine_tree}/Wine" "${wine_tree}/cranvr/tests" "${wine_tree}/cranvr/scripts"
 git -C "${wine_src}" archive --format=tar HEAD | tar -x -C "${wine_tree}/Wine"
 cp -R "${wine_support}/patches" "${wine_tree}/cranvr/"
-cp "${wine_support}/tests/hlsl_compile.cpp" "${wine_support}/tests/isnan.hlsl" "${wine_tree}/cranvr/tests/"
-cp "${cranvr}/scripts/build-wine-d3d.sh" "${wine_tree}/cranvr/scripts/"
+cp "${wine_support}/tests/hlsl_compile.cpp" "${wine_support}/tests/isnan.hlsl" "${wine_support}/tests/gl_compat_check.cpp" "${wine_tree}/cranvr/tests/"
+cp "${cranvr}/scripts/build-wine.sh" "${wine_tree}/cranvr/scripts/"
 {
-    print "Source of wined3d.dll in cranvr's game support (Wine 11.10, LGPL 2.1 or later, see Wine/COPYING.LIB and Wine/libs/vkd3d/COPYING)"
+    print "Source of wined3d.dll, wininet.dll, winemac.so and opengl32.so in cranvr's game support"
+    print "(Wine 11.10, LGPL 2.1 or later, see Wine/COPYING.LIB and Wine/libs/vkd3d/COPYING)"
     print
     print "Wine/            https://gitlab.winehq.org/wine/wine at the tag wine-11.10, commit ${wine_commit}, as it is"
     print "cranvr/patches   cranvr's changes to it, to apply in this order with git apply from Wine/:"
-    print "                 0001 adds the HLSL intrinsic isnan() to vkd3d-shader (libs/vkd3d/libs/vkd3d-shader/hlsl.y)."
-    print "cranvr/tests     hlsl_compile.cpp, the test program that is next to the DLL (it is not part of the DLL)."
-    print "                 isnan.hlsl is the shader that it compiles."
-    print "cranvr/scripts/build-wine-d3d.sh  the build: git apply, configure for 64-bit Windows with MinGW-w64"
-    print "                 (under Rosetta 2 on an Apple Silicon Mac), then make dlls/wined3d/all. The DLL appears at"
-    print "                 dlls/wined3d/x86_64-windows/wined3d.dll in the build folder. It needs flex, bison 3 or later and"
-    print "                 mingw-w64 (Homebrew)."
+    print "                 0001 adds the HLSL intrinsic isnan() to vkd3d-shader (libs/vkd3d/libs/vkd3d-shader/hlsl.y),"
+    print "                 0002 makes winemac create a core context for a request of the compatibility profile of OpenGL"
+    print "                 3.2 to 4.1, or of such a context without the forward-compatible flag, which it refused,"
+    print "                 0003 makes opengl32 compile GLSL 1.10, 1.20 and ES 1.00 in a core context as GLSL 1.50 and"
+    print "                 GLSL ES 3.00 as GLSL 3.30, and log a shader that does not compile or a program that does not link,"
+    print "                 0004 changes the list of a wininet handle's children under the lock: a program that closed"
+    print "                 handles on several threads crashed in invalidate_handle."
+    print "cranvr/tests     hlsl_compile.cpp and gl_compat_check.cpp, the test programs that are next to the files (they"
+    print "                 are not part of Wine). isnan.hlsl is the shader that hlsl_compile.exe compiles."
+    print "cranvr/scripts/build-wine.sh  the build: git apply, configure (under Rosetta 2 on an Apple Silicon Mac, with"
+    print "                 MinGW-w64 for the Windows files and macOS 10.15 as the oldest system), then make for the four"
+    print "                 files. They appear under dlls/ in the build folder. It needs flex, bison 3 or later and mingw-w64"
+    print "                 (Homebrew), and Xcode's command line tools."
 } > "${wine_tree}/README.txt"
 tar -C "${stage}" -cf - "${wine_name}" | xz -T0 -9 > "${root}/SOURCE/wine-source.tar.xz"
 cp "${root}/SOURCE/wine-source.tar.xz" "${out}/cranvr-wine-source.tar.xz"
@@ -199,7 +212,10 @@ cp "${cranvr}/scripts/build-opencomposite.sh" "${oc_tree}/cranvr/scripts/"
     print "                 0007 gives the headset and each controller a serial number of its own: every device said <unknown>,"
     print "                 and a game that tells its controllers apart by serial number took two controllers for one,"
     print "                 0008 leaves overlays and the keyboard out of the frame (the runtime takes no quad layer, so the frame"
-    print "                 failed and the headset got none while a game kept an overlay up, as a loading screen does)."
+    print "                 failed and the headset got none while a game kept an overlay up, as a loading screen does),"
+    print "                 0009 runs an OpenGL game: the session stays on a Direct3D 11 device of OpenComposite's own, and each"
+    print "                 OpenGL texture of the game is copied through the CPU into the runtime's Direct3D 11 image; it also"
+    print "                 answers GetFrameTimeRemaining, which Google Earth VR calls (it stopped the game)."
     print "cranvr/shim      atlbase.h: the part of ATL that OpenComposite uses, for MinGW-w64."
     print "cranvr/mingw-x86_64.cmake  the CMake toolchain file of the build."
     print "cranvr/tests/openvr_smoke.cpp  the test program that is next to the DLL (it is not part of the DLL)."
@@ -234,12 +250,12 @@ dxmt_commit=$(git -C "${runtime}/build/dxmt/src" rev-parse HEAD)
 {
     print "# Sources of cranvr's game support"
     print
-    print -r -- "- Wine 11.10: Gcenx's macOS build, https://github.com/Gcenx/macOS_Wine_builds/releases/tag/11.10 (LGPL 2.1 or later; source at https://gitlab.winehq.org/wine/wine/-/tags/wine-11.10). Unchanged, apart from DXMT's DLLs and wined3d.dll (next line)."
-    print -r -- "- wined3d.dll of Wine 11.10 (LGPL 2.1 or later), built from https://gitlab.winehq.org/wine/wine at the tag wine-11.10, commit ${wine_commit}, with cranvr's patch 0001 (the HLSL intrinsic isnan in vkd3d-shader). It replaces the file in the engine and in the Wine prefix. Its source, the patch and the build are in SOURCE/wine-source.tar.xz of this archive and in the file cranvr-wine-source.tar.xz of the release. wine-d3d/hlsl_compile.exe is cranvr's own test program (MIT)."
+    print -r -- "- Wine 11.10: Gcenx's macOS build, https://github.com/Gcenx/macOS_Wine_builds/releases/tag/11.10 (LGPL 2.1 or later; source at https://gitlab.winehq.org/wine/wine/-/tags/wine-11.10). Unchanged, apart from DXMT's DLLs and the patched Wine files (next line)."
+    print -r -- "- wined3d.dll, wininet.dll, winemac.so and opengl32.so of Wine 11.10 (LGPL 2.1 or later), built from https://gitlab.winehq.org/wine/wine at the tag wine-11.10, commit ${wine_commit}, with cranvr's patches 0001 (the HLSL intrinsic isnan in vkd3d-shader), 0002 (a core OpenGL context for a request of the compatibility profile), 0003 (legacy GLSL in a core context) and 0004 (wininet's handles closed on several threads). They replace the files in the engine, and the DLLs also in the Wine prefix. Their source, the patches and the build are in SOURCE/wine-source.tar.xz of this archive and in the file cranvr-wine-source.tar.xz of the release. wine-patched/hlsl_compile.exe and wine-patched/gl_compat_check.exe are cranvr's own test programs (MIT)."
     print -r -- "- DXMT v0.80 (MIT), https://github.com/3Shain/dxmt, with BasaltVR's patches 0001 to 0004 and cranvr's patches 0005 to 0012. Tree commit ${dxmt_commit}."
     print -r -- "- BasaltVR (MIT), https://github.com/Stooovie/BasaltVR at ${basalt_commit}, with cranvr's runtime patches."
     print -r -- "- The OpenXR SDK loader in the runtime's checks (Apache 2.0)."
-    print -r -- "- OpenComposite (GPL 3), https://gitlab.com/znixian/OpenOVR at ${oc_commit}, with cranvr's patches 0001 to 0008. Its source, the patches and the build are in SOURCE/opencomposite-source.tar.xz of this archive and in the file cranvr-opencomposite-source.tar.xz of the release. It is a separate program: games load it as an OpenVR runtime (opencomposite/vrclient_x64.dll) and it calls the OpenXR runtime above. It contains the OpenXR SDK loader (Apache 2.0), jsoncpp (MIT), glm (MIT), inih (BSD), Valve's OpenVR headers (BSD 3-Clause) and hand models of Oculus (CC BY 4.0): their licenses are in LICENSES/."
+    print -r -- "- OpenComposite (GPL 3), https://gitlab.com/znixian/OpenOVR at ${oc_commit}, with cranvr's patches 0001 to 0009. Its source, the patches and the build are in SOURCE/opencomposite-source.tar.xz of this archive and in the file cranvr-opencomposite-source.tar.xz of the release. It is a separate program: games load it as an OpenVR runtime (opencomposite/vrclient_x64.dll) and it calls the OpenXR runtime above. It contains the OpenXR SDK loader (Apache 2.0), jsoncpp (MIT), glm (MIT), inih (BSD), Valve's OpenVR headers (BSD 3-Clause) and hand models of Oculus (CC BY 4.0): their licenses are in LICENSES/."
     print
     print "cranvr's DXMT patches add a limit on MSAA samples, an MSAA resolve without a sample store, an"
     print "optional skip of the Mac window's present, a silent Discard hint (patch 0009) and an optional report of render-target"

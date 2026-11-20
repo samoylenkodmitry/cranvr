@@ -1,0 +1,29 @@
+diff --git a/dlls/winemac.drv/opengl.c b/dlls/winemac.drv/opengl.c
+index 0af1d3f..7f140cd 100644
+--- a/dlls/winemac.drv/opengl.c
++++ b/dlls/winemac.drv/opengl.c
+@@ -2163,18 +2163,14 @@ static BOOL macdrv_context_create(int format, void *shared, const int *attrib_li
+     if ((major == 3 && (minor == 2 || minor == 3)) ||
+         (major == 4 && (minor == 0 || minor == 1)))
+     {
++        /* macOS offers 3.2 and newer as a forward-compatible core profile only. A request for the compatibility
++         * profile, or one without the forward-compatible flag, gets that context too: the program runs as long as
++         * it makes no call that the core profile removed, and opengl32 compiles its legacy GLSL as GLSL 1.50.
++         * Refusing the request ended programs that ask for no other context. */
+         if (!(flags & WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB))
+-        {
+-            WARN("OS X only supports forward-compatible 3.2+ contexts\n");
+-            RtlSetLastWin32Error(ERROR_INVALID_VERSION_ARB);
+-            return FALSE;
+-        }
++            WARN("OS X only supports forward-compatible 3.2+ contexts; making one for %u.%u\n", major, minor);
+         if (profile != WGL_CONTEXT_CORE_PROFILE_BIT_ARB)
+-        {
+-            WARN("Compatibility profiles for GL version >= 3.2 not supported\n");
+-            RtlSetLastWin32Error(ERROR_INVALID_PROFILE_ARB);
+-            return FALSE;
+-        }
++            WARN("Compatibility profiles for GL version >= 3.2 not supported; making a core profile context for %u.%u\n", major, minor);
+         if (major > gl_info.max_major ||
+             (major == gl_info.max_major && minor > gl_info.max_minor))
+         {
