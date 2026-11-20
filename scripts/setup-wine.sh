@@ -17,7 +17,7 @@
 # The OpenComposite build (scripts/build-opencomposite.sh) is optional for BASALTVR_DIR: without it the
 # stack has no OpenVR support. $CRANVR_OPENCOMPOSITE_DIR names another build folder than
 # third_party/opencomposite/build. The Wine build (scripts/build-wine-d3d.sh) is optional the same way:
-# without it Wine's HLSL compiler lacks isnan(), and a game whose shader calls it shows a black picture.
+# without it Wine's HLSL compiler lacks isnan(). A game whose shader calls it shows a black picture.
 # $CRANVR_WINE_D3D_DIR names another build folder than third_party/wine/build.
 #
 # Usage: scripts/setup-wine.sh BASALTVR_DIR
@@ -96,7 +96,7 @@ for dll in d3d10core.dll d3d11.dll dxgi.dll winemetal.dll; do
 done
 
 # Wine's HLSL compiler with cranvr's patch: wined3d.dll holds vkd3d-shader. The prefix keeps its own
-# copy in system32, and the loader takes that one.
+# copy in system32. The loader takes that one.
 if [[ -f ${wine_d3d_bin}/wined3d.dll ]]; then
     cp "${wine_d3d_bin}/wined3d.dll" "${wine_root}/lib/wine/x86_64-windows/wined3d.dll"
     cp "${wine_d3d_bin}/wined3d.dll" "${prefix}/drive_c/windows/system32/wined3d.dll"

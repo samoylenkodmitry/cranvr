@@ -6,10 +6,10 @@ index d53be63..4c546c1 100644
      more like a hint of optimization, and Metal manages resources on its own)
      FIXME: for render targets we can use this information: LoadActionDontCare
      FIXME: A Map with D3D11_MAP_WRITE type could become D3D11_MAP_WRITE_DISCARD?
-+    The D3D11 documentation lets a driver ignore the hint, and a game that asks
++    The D3D11 documentation lets a driver ignore the hint. A game that asks
 +    the device for discard support (D3D11 options, DiscardAPIsSeenByDriver)
 +    calls it every frame. The message "Not implemented" that this call printed
-+    was no failure, and gave no name: a reader of the log looked for the cause
++    was no failure. It gave no name: a reader of the log looked for the cause
 +    of a black picture there. The log now names the call, once, as a warning.
      */
 -    ERR_ONCE("Not implemented");

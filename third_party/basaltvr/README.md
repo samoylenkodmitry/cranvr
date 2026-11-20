@@ -110,7 +110,7 @@ store back.
 
 `0009-name-the-discard-and-exception-mode-messages.patch`: DXMT logged "Not implemented" with no name
 once for `DiscardResource` and `DiscardView1` of `ID3D11DeviceContext1` and each time for `SetExceptionMode`
-and `GetExceptionMode` of the device. The Discard calls are hints that a driver may ignore, and a game that
+and `GetExceptionMode` of the device. The Discard calls are hints that a driver may ignore. A game that
 asks the device for discard support calls them every frame. A reader of the log took the line for the
 failure of a game with a black picture (#60). The patch names each call. The Discard calls log it once as a
 warning ("is ignored: it is only a hint"), not as an error.
