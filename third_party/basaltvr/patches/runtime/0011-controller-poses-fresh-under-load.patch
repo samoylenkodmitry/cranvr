@@ -1,0 +1,220 @@
+diff --git a/runtime/pe/control.cpp b/runtime/pe/control.cpp
+index e56e131..6d0e7d7 100644
+--- a/runtime/pe/control.cpp
++++ b/runtime/pe/control.cpp
+@@ -9,6 +9,7 @@
+ #include <d3d11_4.h>
+ 
+ #include <cmath>
++#include <cstdarg>
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -53,8 +54,12 @@ constexpr size_t kControllerMotionPayloadLength = 8 + 4 + 4 + 13 * sizeof(float)
+ constexpr size_t kControllerMotionAimPayloadLength = 8 + 4 + 4 + 26 * sizeof(float);
+ constexpr size_t kButtonStatePayloadLength = 8 + 4 + sizeof(float);
+ constexpr size_t kInteractionProfilePayloadLength = 4 + 8;
+-constexpr XrDuration kHeadPoseFreshness = 500'000'000;
+-constexpr XrDuration kControllerPoseFreshness = 500'000'000;
++// cranvr: the host sends an INPUT_RESET when it sent nothing for a second, and a CONTROLLER_MASK when a controller is
++// gone. A pose that is older than these times is therefore a receiver that the Mac's load starves, not a controller
++// that left: poses came 200 to 350 ms late at a load average of 30, and a pose that a half second old made a game draw
++// its controller at the origin, on the floor.
++constexpr XrDuration kHeadPoseFreshness = 1'500'000'000;
++constexpr XrDuration kControllerPoseFreshness = 1'500'000'000;
+ constexpr XrDuration kSystemButtonRecenterHold = 600'000'000;
+ 
+ // Serialized FrameReady payload: header (8 + 8 + 8 + 4) plus per view
+@@ -218,8 +223,17 @@ void resetSystemButtonLocked() {
+     gSystemButtonRecentered = false;
+ }
+ 
++// cranvr: whether data that arrived at `arrival` is no older than `limit` at `now`. A reader reads the clock
++// before it waits for the lock, and the receiver sets `arrival` under that lock. A message that the receiver
++// handled while the reader waited has an arrival after the reader's `now`: that is the newest data, not
++// stale data. Counting it as stale made a hand's pose flicker between valid and invalid under load, mostly the
++// hand of the last pose message of a sample (the right one).
++bool arrivedWithin(XrTime arrival, XrTime now, XrDuration limit) {
++    return arrival > 0 && (now < arrival || now - arrival <= limit);
++}
++
+ bool trackedFresh(bool active, XrTime arrival, XrTime now) {
+-    return active && arrival > 0 && now >= arrival && now - arrival <= kTrackedPoseFreshness;
++    return active && arrivedWithin(arrival, now, kTrackedPoseFreshness);
+ }
+ 
+ void resetTrackedLocked() {
+@@ -545,6 +559,21 @@ bool parseControllerMotion(const uint8_t* payload, size_t payloadLength, bool wi
+     if (timestamp < record.questTimestamp ||
+         timestamp < record.presenceTimestamp ||
+         (timestamp == record.presenceTimestamp && !record.presenceActive)) {
++        // cranvr (diagnosis): a pose that the timestamps refuse keeps the controller's pose stale
++        static uint32_t refusedLines = 0;
++        static uint32_t refused[2] = {0, 0};
++        ++refused[hand];
++        if (refused[hand] == 1 && refusedLines < 40) {
++            ++refusedLines;
++            std::fprintf(
++                stderr,
++                "Basalt OpenXR: a pose of the %s controller is older than what the runtime has: sample %llu, newest pose %llu, "
++                "presence %llu (%s)\n",
++                hand == 0 ? "left" : "right", static_cast<unsigned long long>(timestamp),
++                static_cast<unsigned long long>(record.questTimestamp),
++                static_cast<unsigned long long>(record.presenceTimestamp),
++                record.presenceActive ? "present" : "absent");
++        }
+         return true;
+     }
+     if (!gLocalOriginValid) {
+@@ -562,7 +591,18 @@ bool parseControllerMotion(const uint8_t* payload, size_t payloadLength, bool wi
+         record.rawAimAngularVelocity = {values[23], values[24], values[25]};
+     }
+     record.questTimestamp = timestamp;
+-    record.poseArrival = monotonicTime();
++    {
++        // cranvr (diagnosis): how long the runtime heard no pose of this hand before this one
++        const XrTime arrival = monotonicTime();
++        static uint32_t gapLines = 0;
++        if (record.poseArrival > 0 && arrival - record.poseArrival > 200'000'000 && gapLines < 40) {
++            ++gapLines;
++            std::fprintf(
++                stderr, "Basalt OpenXR: the %s controller's pose came after a gap of %lld ms\n", hand == 0 ? "left" : "right",
++                static_cast<long long>((arrival - record.poseArrival) / 1'000'000));
++        }
++        record.poseArrival = arrival;
++    }
+     record.poseValid = true;
+     return true;
+ }
+@@ -1380,6 +1420,44 @@ void adapterDescription(ID3D11Device* device, char* buffer, size_t capacity) {
+ 
+ namespace basalt {
+ 
++// cranvr: see control.hpp. The file opens once for each process. It keeps the lines of earlier games, up to 256 KB.
++void note(const char* format, ...) {
++    char line[512];
++    va_list arguments;
++    va_start(arguments, format);
++    std::vsnprintf(line, sizeof(line), format, arguments);
++    va_end(arguments);
++    std::fputs(line, stderr);
++
++    static SRWLOCK lock = SRWLOCK_INIT;
++    static FILE* file = nullptr;
++    static bool opened = false;
++    AcquireSRWLockExclusive(&lock);
++    if (!opened) {
++        opened = true;
++        char path[MAX_PATH]{};
++        const DWORD length = GetEnvironmentVariableA("BASALT_CONTROL", path, sizeof(path) - 20);
++        char* separator = length == 0 ? nullptr : std::strrchr(path, '\\');
++        if (separator != nullptr) {
++            std::strcpy(separator + 1, "game-input.log");
++            WIN32_FILE_ATTRIBUTE_DATA attributes{};
++            const bool large = GetFileAttributesExA(path, GetFileExInfoStandard, &attributes) && attributes.nFileSizeHigh == 0 &&
++                               attributes.nFileSizeLow > 256 * 1024;
++            file = std::fopen(path, large ? "w" : "a");
++            if (file != nullptr) {
++                char program[MAX_PATH]{};
++                GetModuleFileNameA(nullptr, program, sizeof(program));
++                std::fprintf(file, "---- %s (process %lu)\n", program, static_cast<unsigned long>(GetCurrentProcessId()));
++            }
++        }
++    }
++    if (file != nullptr) {
++        std::fputs(line, file);
++        std::fflush(file);
++    }
++    ReleaseSRWLockExclusive(&lock);
++}
++
+ bool controlConfiguredViewSize(uint32_t* width, uint32_t* height) {
+     if (width == nullptr || height == nullptr) {
+         return false;
+@@ -1621,9 +1699,7 @@ bool controlHeadPose(
+     AcquireSRWLockShared(&gControlLock);
+     const bool fresh = session != XR_NULL_HANDLE && gControlSession == session &&
+                        gSocket != INVALID_SOCKET && !gReceiverFailed &&
+-                       gHeadPoseValid && gHeadPoseArrival > 0 &&
+-                       now >= gHeadPoseArrival &&
+-                       now - gHeadPoseArrival <= kHeadPoseFreshness;
++                       gHeadPoseValid && arrivedWithin(gHeadPoseArrival, now, kHeadPoseFreshness);
+     if (fresh) {
+         if (questTimestampNanoseconds != nullptr) {
+             *questTimestampNanoseconds = gHeadPoseQuestTimestamp;
+@@ -1656,9 +1732,7 @@ bool controlInputSnapshot(
+             ControlControllerState& destination = snapshot->controllers[hand];
+             destination.profileActive = source.profileActive;
+             destination.profileId = source.profileId;
+-            destination.poseActive = source.poseValid && source.poseArrival > 0 &&
+-                                     now >= source.poseArrival &&
+-                                     now - source.poseArrival <= kControllerPoseFreshness;
++            destination.poseActive = source.poseValid && arrivedWithin(source.poseArrival, now, kControllerPoseFreshness);
+             destination.questTimestampNanoseconds = source.questTimestamp;
+             destination.poseInLocal = poseCompose(localFromQuest, source.rawPose);
+             destination.linearVelocity = quaternionRotate(
+diff --git a/runtime/pe/control.hpp b/runtime/pe/control.hpp
+index ac41eab..1179eaf 100644
+--- a/runtime/pe/control.hpp
++++ b/runtime/pe/control.hpp
+@@ -17,6 +17,11 @@
+ 
+ namespace basalt {
+ 
++// cranvr: a note on what a game's input does. It goes to stderr, which the cranvr app keeps as the log of a game that it
++// starts, and to game-input.log beside the control file (BASALT_CONTROL). Steam keeps no stderr of a game that it
++// starts: only the file shows what the controllers did in such a game.
++void note(const char* format, ...);
++
+ // Queries the Basalt DXMT fork's IOSurfaceID for a texture; 0 when absent.
+ uint32_t queryTextureIOSurfaceId(ID3D11Texture2D* texture);
+ 
+diff --git a/runtime/pe/input.cpp b/runtime/pe/input.cpp
+index 8fc5e7e..20f363e 100644
+--- a/runtime/pe/input.cpp
++++ b/runtime/pe/input.cpp
+@@ -683,7 +683,7 @@ void logActionState(const ActionRecord& action, const SyncedActionState& state,
+     default:
+         break;
+     }
+-    std::fprintf(stderr, "Basalt OpenXR: action %s (%s) %s %s\n", action.name, hand, what, value);
++    basalt::note("Basalt OpenXR: action %s (%s) %s %s\n", action.name, hand, what, value);
+ }
+ 
+ void syncOneState(
+@@ -1259,8 +1259,7 @@ XrResult XRAPI_CALL attachSessionActionSets(
+             }
+         }
+     }
+-    std::fprintf(
+-        stderr,
++    basalt::note(
+         "Basalt OpenXR: %u action sets with %u actions are attached; %u of the actions have a "
+         "binding for the Touch controllers (%zu bindings)\n",
+         attachInfo->countActionSets, attachedActions, boundActions, gTouchBindingCount);
+@@ -1437,12 +1436,23 @@ XrResult XRAPI_CALL syncActions(
+         if (gCurrentInteractionProfiles[handIndex] != nextProfile) {
+             interactionProfileChanged = true;
+             // cranvr: the game's log tells when a controller joins or leaves
+-            std::fprintf(
+-                stderr, "Basalt OpenXR: the %s controller %s\n", handIndex == 0 ? "left" : "right",
++            basalt::note(
++                "Basalt OpenXR: the %s controller %s\n", handIndex == 0 ? "left" : "right",
+                 nextProfile != XR_NULL_PATH ? "is tracked and uses the Touch controller profile"
+                                             : "is gone");
+         }
+         gCurrentInteractionProfiles[handIndex] = nextProfile;
++        // cranvr: the game's log tells when a controller's pose stops arriving or comes back. A pose that is
++        // not fresh makes the pose actions inactive, and a game then has no place for the controller.
++        static bool poseWasActive[2] = {false, false};
++        static uint32_t poseLogLines = 0;
++        if (controller.poseActive != poseWasActive[handIndex] && poseLogLines < kMaxActionLogLines) {
++            ++poseLogLines;
++            basalt::note(
++                "Basalt OpenXR: the %s controller's pose %s\n", handIndex == 0 ? "left" : "right",
++                controller.poseActive ? "arrives" : "stopped arriving");
++        }
++        poseWasActive[handIndex] = controller.poseActive;
+     }
+     // cranvr: the eyes' profile is current while the gaze is tracked
+     const XrPath nextEyeProfile = gEyeProfilePath != XR_NULL_PATH && gEyeBindingCount > 0 &&

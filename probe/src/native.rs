@@ -364,6 +364,21 @@ pub fn run(o: Options) -> i32 {
         f32::from_bits(shared.counters.haptics_max_bits.load(Ordering::Relaxed))
     );
     print_summary(&shared, &r, o.seconds, expected);
+    // The frames of the host's own scene, in runs: a game's stall must not show one (see `--game-stall` of scripts/e2e.sh)
+    if !r.bad_at.is_empty() {
+        let mut runs: Vec<(u128, u128, u32)> = Vec::new();
+        for &at in &r.bad_at {
+            match runs.last_mut() {
+                Some(run) if at - run.1 < 250 => {
+                    run.1 = at;
+                    run.2 += 1;
+                }
+                _ => runs.push((at, at, 1)),
+            }
+        }
+        let text: Vec<String> = runs.iter().map(|(from, to, n)| format!("{from}..{to} ms ({n})")).collect();
+        println!("probe: frames with the wrong badges, at unix ms: {}", text.join(", "));
+    }
     if o.tracking {
         let sent = |i: usize| shared.sent_tracking[i].load(Ordering::Relaxed);
         println!(
@@ -406,6 +421,8 @@ struct DecodeResults {
     decoded: u64,
     good: u64,
     bad: u64,
+    /// The wall-clock time in milliseconds of each frame with the wrong badges, up to a cap
+    bad_at: Vec<u128>,
     size: (usize, usize),
     /// What the model of the headset's queue did with the frames (see `compositor.rs`)
     queue: compositor::Counts,
@@ -833,6 +850,9 @@ fn decode_loop(
             r.good += 1;
         } else {
             r.bad += 1;
+            if r.bad_at.len() < 100_000 {
+                r.bad_at.push(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis()));
+            }
             if r.bad <= 3 {
                 eprintln!("probe: wrong badge colors: left {left:?} right {right:?}");
             }
