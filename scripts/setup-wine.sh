@@ -3,11 +3,18 @@
 #   - Wine 11.10 (Gcenx build), cloned from a BasaltVR checkout
 #   - the BasaltVR DXMT fork, which shares each game image with the host as an IOSurface
 #   - the BasaltVR OpenXR runtime (C:\basalt\runtime), registered as the active runtime
+#   - OpenComposite (C:\opencomposite), which turns a game's OpenVR calls into OpenXR calls to that
+#     runtime. A game finds it through the prefix's OpenVR path file when cranvr's choice is on (see
+#     scripts/run-game.sh); this script writes no such file.
 #
 # The BasaltVR checkout must have run, in this order:
 #   runtime/scripts/test-dxmt.zsh          (downloads Wine 11.10 and stock DXMT)
 #   runtime/scripts/build-dxmt-fork.zsh    (builds the fork)
 #   cmake -S runtime --preset mingw-release && cmake --build runtime/build
+#
+# The OpenComposite build (scripts/build-opencomposite.sh) is optional for BASALTVR_DIR: without it the
+# stack has no OpenVR support. $CRANVR_OPENCOMPOSITE_DIR names another build folder than
+# third_party/opencomposite/build.
 #
 # Usage: scripts/setup-wine.sh BASALTVR_DIR
 #        scripts/setup-wine.sh GAME_SUPPORT_DIR   (an unpacked archive from package-game-support.sh)
@@ -33,12 +40,14 @@ if [[ -x ${1:A}/engine/bin/wine && -f ${1:A}/runtime/basalt_openxr.dll ]]; then
     source_wine=${1:A}/engine
     fork=${1:A}/dxmt
     runtime_bin=${1:A}/runtime
+    opencomposite_bin=${1:A}/opencomposite
     version_file=${1:A}/VERSION
 else
     basalt=${1:A}/runtime
     source_wine="${basalt}/build/dxmt/toolchain/wine-11.10/Wine Devel.app/Contents/Resources/wine"
     fork=${basalt}/build/dxmt/fork-install
     runtime_bin=${basalt}/build/bin
+    opencomposite_bin=${CRANVR_OPENCOMPOSITE_DIR:-${0:A:h:h}/third_party/opencomposite/build}/bin
     version_file=${0:A:h}/game-support-version.txt
 fi
 
@@ -91,12 +100,27 @@ done
 "${wine_root}/bin/wine" reg.exe add 'HKLM\Software\Khronos\OpenXR\1' \
     /v ActiveRuntime /t REG_SZ /d 'C:\basalt\runtime\basalt_openxr.json' /f >/dev/null
 
+# OpenComposite: vrclient_x64.dll in bin, where an OpenVR loader looks for it, and its test next to it.
+# bin/version.txt keeps Steam from rewriting the OpenVR path file of a runtime that has none.
+oc_dir=${prefix}/drive_c/opencomposite
+if [[ -f ${opencomposite_bin}/vrclient_x64.dll ]]; then
+    mkdir -p "${oc_dir}/bin"
+    cp "${opencomposite_bin}/vrclient_x64.dll" "${opencomposite_bin}/version.txt" "${oc_dir}/bin/"
+    cp "${opencomposite_bin}/openvr_smoke.exe" "${oc_dir}/"
+else
+    print "No OpenComposite in ${opencomposite_bin}: this stack runs OpenXR games only."
+fi
+
 # A crash should end the program, not wait in Wine's debugger
 "${wine_root}/bin/wine" reg.exe add 'HKLM\Software\Microsoft\Windows NT\CurrentVersion\AeDebug' \
     /v Debugger /t REG_SZ /d '' /f >/dev/null
 
 print "Checking the OpenXR runtime through the Khronos loader"
 (cd "${runtime_dir}" && DXMT_BASALT_IOSURFACE=1 BASALT_EXPECT_D3D11_EXTENSION=1 "${wine_root}/bin/wine" ./loader_smoke.exe >/dev/null 2>&1) || { print -u2 "FAIL: loader_smoke.exe (run it by hand for details)"; exit 1; }
+if [[ -f ${oc_dir}/bin/vrclient_x64.dll ]]; then
+    print "Checking that OpenComposite loads"
+    (cd "${oc_dir}" && DXMT_BASALT_IOSURFACE=1 "${wine_root}/bin/wine" ./openvr_smoke.exe --load-only --runtime 'C:\opencomposite' >/dev/null 2>&1) || { print -u2 "FAIL: openvr_smoke.exe --load-only (run it by hand for details)"; exit 1; }
+fi
 # The stamp comes last: a stack that failed a step above has none
 if [[ -f ${version_file} ]]; then
     tr -d '[:space:]' < "${version_file}" > "${stack}/game-support-version.txt"

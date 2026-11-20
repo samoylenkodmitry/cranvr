@@ -1,0 +1,115 @@
+diff --git a/runtime/pe/space.cpp b/runtime/pe/space.cpp
+--- a/runtime/pe/space.cpp
++++ b/runtime/pe/space.cpp
+@@ -20,9 +20,14 @@
+ constexpr uintptr_t kFirstSpaceHandle = static_cast<uintptr_t>(0x40000);
+ constexpr uintptr_t kSpaceHandleStride = static_cast<uintptr_t>(0x10);
+ constexpr size_t kMaxSpaces = 64;
+-constexpr std::array<XrReferenceSpaceType, 2> kSupportedReferenceSpaces = {
++// cranvr: STAGE is offered too. The poses that cranvr-host sends are in a room whose floor lies at
++// height 0 (the host raises the headset's room by the height of its floor), so LOCAL is already
++// the floor-level space that OpenXR calls STAGE. A game that asks for STAGE, as OpenComposite does for
++// the standing space of OpenVR, gets the same space.
++constexpr std::array<XrReferenceSpaceType, 3> kSupportedReferenceSpaces = {
+     XR_REFERENCE_SPACE_TYPE_VIEW,
+     XR_REFERENCE_SPACE_TYPE_LOCAL,
++    XR_REFERENCE_SPACE_TYPE_STAGE,
+ };
+ 
+ // The headset supplies LOCAL-from-HEAD. These eye values are conservative
+@@ -204,7 +209,8 @@
+         return XR_ERROR_VALIDATION_FAILURE;
+     }
+     if (createInfo->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_VIEW &&
+-        createInfo->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_LOCAL) {
++        createInfo->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_LOCAL &&
++        createInfo->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_STAGE) {
+         return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
+     }
+     if (!poseValid(createInfo->poseInReferenceSpace)) {
+@@ -228,7 +234,11 @@
+     gNextSpaceHandle += kSpaceHandleStride;
+     available->session = session;
+     available->kind = SpaceKind::kReference;
+-    available->referenceSpaceType = createInfo->referenceSpaceType;
++    // A STAGE space is a LOCAL space (see kSupportedReferenceSpaces): the runtime keeps one kind
++    available->referenceSpaceType =
++        createInfo->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_STAGE
++            ? XR_REFERENCE_SPACE_TYPE_LOCAL
++            : createInfo->referenceSpaceType;
+     available->action = XR_NULL_HANDLE;
+     available->subactionPath = XR_NULL_PATH;
+     available->pose = createInfo->poseInReferenceSpace;
+@@ -632,7 +642,8 @@
+         return XR_ERROR_VALIDATION_FAILURE;
+     }
+     if (referenceSpaceType != XR_REFERENCE_SPACE_TYPE_VIEW &&
+-        referenceSpaceType != XR_REFERENCE_SPACE_TYPE_LOCAL) {
++        referenceSpaceType != XR_REFERENCE_SPACE_TYPE_LOCAL &&
++        referenceSpaceType != XR_REFERENCE_SPACE_TYPE_STAGE) {
+         return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
+     }
+ 
+diff --git a/runtime/tests/d3d11_runtime_smoke.cpp b/runtime/tests/d3d11_runtime_smoke.cpp
+--- a/runtime/tests/d3d11_runtime_smoke.cpp
++++ b/runtime/tests/d3d11_runtime_smoke.cpp
+@@ -611,7 +611,7 @@
+     if (XR_SUCCEEDED(result)) {
+         result = xrEnumerateReferenceSpaces(
+             session, 1, &referenceSpaceCount, insufficientSpaces);
+-        if (result != XR_ERROR_SIZE_INSUFFICIENT || referenceSpaceCount != 2) {
++        if (result != XR_ERROR_SIZE_INSUFFICIENT || referenceSpaceCount != 3) {
+             xrDestroySession(session);
+             release(context);
+             release(device);
+@@ -627,14 +627,17 @@
+         referenceSpaces.data());
+     bool foundViewSpace = false;
+     bool foundLocalSpace = false;
++    bool foundStageSpace = false;
+     for (XrReferenceSpaceType referenceSpace : referenceSpaces) {
++        foundStageSpace =
++            foundStageSpace || referenceSpace == XR_REFERENCE_SPACE_TYPE_STAGE;
+         foundViewSpace =
+             foundViewSpace || referenceSpace == XR_REFERENCE_SPACE_TYPE_VIEW;
+         foundLocalSpace =
+             foundLocalSpace || referenceSpace == XR_REFERENCE_SPACE_TYPE_LOCAL;
+     }
+-    if (XR_FAILED(result) || referenceSpaceCount != 2 ||
+-        !foundViewSpace || !foundLocalSpace) {
++    if (XR_FAILED(result) || referenceSpaceCount != 3 ||
++        !foundViewSpace || !foundLocalSpace || !foundStageSpace) {
+         xrDestroySession(session);
+         release(context);
+         release(device);
+@@ -644,7 +647,9 @@
+ 
+     XrReferenceSpaceCreateInfo referenceSpaceInfo{};
+     referenceSpaceInfo.type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO;
+-    referenceSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
++    // cranvr: STAGE is the floor-level room that LOCAL already is. A space type that the runtime does
++    // not know is still refused.
++    referenceSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR_EXT;
+     referenceSpaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
+     XrSpace rejectedSpace = XR_NULL_HANDLE;
+     result = xrCreateReferenceSpace(session, &referenceSpaceInfo, &rejectedSpace);
+@@ -654,8 +659,19 @@
+         release(context);
+         release(device);
+         xrDestroyInstance(instance);
++        return fail("xrCreateReferenceSpace(unknown type)", result);
++    }
++    referenceSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
++    XrSpace stageSpace = XR_NULL_HANDLE;
++    result = xrCreateReferenceSpace(session, &referenceSpaceInfo, &stageSpace);
++    if (XR_FAILED(result) || stageSpace == XR_NULL_HANDLE) {
++        xrDestroySession(session);
++        release(context);
++        release(device);
++        xrDestroyInstance(instance);
+         return fail("xrCreateReferenceSpace(STAGE)", result);
+     }
++    xrDestroySpace(stageSpace);
+ 
+     referenceSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+     referenceSpaceInfo.poseInReferenceSpace.orientation.w = 0.0f;

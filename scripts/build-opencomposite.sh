@@ -59,5 +59,10 @@ cmake -S "${dir}" -B "${build}" -G Ninja \
     -DCMAKE_SHARED_LINKER_FLAGS="-static -static-libgcc -static-libstdc++" >/dev/null
 cmake --build "${build}" --parallel
 
-print "Done: ${build}/bin/vrclient_x64.dll"
+# The OpenVR test program of cranvr: it needs only OpenComposite's copy of Valve's OpenVR headers
+print "Building openvr_smoke.exe"
+x86_64-w64-mingw32-g++ -std=c++20 -O2 -Wall -s -static -static-libgcc -static-libstdc++ \
+    -I"${dir}/OpenVRHeaders" -o "${build}/bin/openvr_smoke.exe" "${support}/tests/openvr_smoke.cpp" -ld3d11 -ldxgi
+
+print "Done: ${build}/bin/vrclient_x64.dll and openvr_smoke.exe"
 print "Next: scripts/package-game-support.sh"

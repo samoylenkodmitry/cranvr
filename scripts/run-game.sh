@@ -6,6 +6,12 @@
 #   PROGRAM.exe  a Windows path (C:\...) or a Mac path
 #   --mute       start without sound (Wine gets no audio driver)
 #
+# Environment: CRANVR_OPENCOMPOSITE=1 or 0 turns OpenComposite on or off for this start (default: the
+# app's setting "OpenVR games" in app.json, which is on until the user turns it off). On, an OpenVR game
+# finds OpenComposite, which sends its calls to the OpenXR runtime of cranvr: the script writes the
+# prefix's OpenVR path file (%LOCALAPPDATA%\\openvr\\openvrpaths.vrpath). Off, the script removes that
+# file when it points at OpenComposite. No file of a game changes. An OpenXR game ignores the file.
+#
 # Environment: CRANVR_MAX_MSAA caps the MSAA samples a game may use (default: the app's setting, else
 # 2; 0 for no cap). The script applies no option of a particular game: set them yourself, as the
 # app's launch options do, for example BASALT_MAX_ARRAY_SIZE=1 for a game whose right eye stays
@@ -99,4 +105,24 @@ if [[ ${dir} == */steamapps/common/* ]]; then
     fi
 fi
 export MVK_CONFIG_LOG_LEVEL=0
+
+# OpenVR runtime: the same choice as the app makes (app/src/openvr.rs)
+oc=${CRANVR_OPENCOMPOSITE:-}
+if [[ -z ${oc} && -f ${home}/app.json ]]; then
+    oc=$(python3 -I -c 'import json, sys; v = json.load(open(sys.argv[1])).get("wine", {}).get("opencomposite", True); print(1 if v else 0)' "${home}/app.json" 2>/dev/null || true)
+fi
+prefix=${home}/wine/prefix
+user_dir=${prefix}/drive_c/users/$(id -un)
+[[ -d ${user_dir} ]] || user_dir=$(print -rl -- "${prefix}"/drive_c/users/*(/N) | grep -v '/Public$' | head -1)
+if [[ -n ${user_dir} ]]; then
+    vrpath=${user_dir}/AppData/Local/openvr/openvrpaths.vrpath
+    if [[ ${oc:-1} == 1 && -f ${prefix}/drive_c/opencomposite/bin/vrclient_x64.dll ]]; then
+        mkdir -p "${vrpath:h}"
+        print -r -- '{"jsonid": "vrpathreg", "runtime": ["C:\\opencomposite"], "version": 1}' > "${vrpath}"
+        print "OpenVR games use OpenComposite (${vrpath})"
+    elif [[ ${oc:-1} == 0 && -f ${vrpath} ]] && grep -q 'C:\\\\opencomposite' "${vrpath}"; then
+        rm -f "${vrpath}"
+        print "OpenVR games find no runtime (OpenComposite is off)"
+    fi
+fi
 exec "${wine_root}/bin/wine" "${program}" "$@"

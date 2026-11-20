@@ -6,7 +6,7 @@
 # Usage: scripts/e2e.sh [--seconds N] [--fps HZ] [--game | --wine PROGRAM [--wine-arg ARG]...] [--desktop]
 #                       [--quest [SERIAL] | --native-tcp] [--native-drop PERCENT] [--native-port PORT]
 #                       [--host-arg ARG]... [--report FILE]
-#                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine]
+#                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine | --openvr-wine]
 #                       [--face-source visual|audio|unknown]
 #
 #   --seconds N   how long the stream runs (default 20)
@@ -31,6 +31,13 @@
 #                 face tracker and an eye gaze action, and compares what it reads with the script.
 #                 Set CRANVR_HOME to a stack that scripts/setup-wine.sh built from the runtime to
 #                 test. The run lasts at least 40 seconds.
+#   --openvr-wine  an OpenVR program through OpenComposite and the real runtime: C:\opencomposite\openvr_smoke.exe
+#                 runs in Wine. It finds the runtime through the prefix's OpenVR path file, which
+#                 scripts/run-game.sh writes when CRANVR_OPENCOMPOSITE is 1 (this option sets it). It
+#                 makes a Direct3D 11 device, submits both eyes in every frame and reads the head pose
+#                 and the legacy state of the scripted controllers (a pull of the left grip, the right
+#                 trigger at 0.75, the A button). It prints "openvr_smoke: PASS" or "FAIL ...". Set
+#                 CRANVR_HOME to a stack that scripts/setup-wine.sh built with OpenComposite.
 #   --face-source SOURCE  with --tracking and --tracking-wine: where the probe's face comes from.
 #                 audio (the default) is a Quest 3's microphone face, visual is a face from cameras,
 #                 and unknown is an offer that names no source, as an older headset app sends. The
@@ -73,7 +80,7 @@ set -euo pipefail
 
 root=${0:A:h:h}
 seconds=20 fps=120 game=0 desktop=0 client=mac serial="" report=""
-tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 face_source=audio
+tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 openvr_wine=0 face_source=audio
 wine="" wine_args=()
 native_tcp=0 native_drop=0 native_port=9950
 more_host_args=()
@@ -87,6 +94,7 @@ while (( $# )); do
             if (( $# )) && [[ $1 != --* ]]; then tracking_features=$1; shift; fi ;;
         --hand-controllers) game=1 hand_controllers=1; shift ;;
         --tracking-wine) tracking_wine=1; shift ;;
+        --openvr-wine) openvr_wine=1; shift ;;
         --face-source)
             face_source=$2; shift 2
             [[ ${face_source} == (visual|audio|unknown) ]] || { print -u2 "--face-source takes visual, audio or unknown"; exit 2; } ;;
@@ -106,9 +114,19 @@ while (( $# )); do
     esac
 done
 
-if [[ ${client} == quest ]] && (( tracking || hand_controllers || tracking_wine )); then
-    print -u2 "--tracking, --hand-controllers and --tracking-wine belong to the probe: they cannot combine with --quest."
+if [[ ${client} == quest ]] && (( tracking || hand_controllers || tracking_wine || openvr_wine )); then
+    print -u2 "--tracking, --hand-controllers, --tracking-wine and --openvr-wine belong to the probe: they cannot combine with --quest."
     exit 2
+fi
+if (( openvr_wine )); then
+    # The program ends a few seconds before the probe, so its verdict is in the log when the probe is done
+    (( seconds >= 20 )) || seconds=20
+    wine='C:\opencomposite\openvr_smoke.exe'
+    wine_args=(--seconds $(( seconds - 6 )) --expect-input)
+    export CRANVR_OPENCOMPOSITE=1
+    # OpenComposite spends about a millisecond of each frame on the OpenVR calls (a trivial program at
+    # 120 Hz reaches 105 to 107 frames a second), so the run asks the host for 90 Hz unless --fps says otherwise
+    (( fps != 120 )) || fps=90
 fi
 if (( tracking_wine )); then
     # The Windows program waits for the headset's features, starts a session and reads the data
@@ -324,6 +342,21 @@ esac
 (( client_exit == 0 )) || print -u2 "The client failed; see ${work}/probe.log"
 game_exit=0
 tracking_exit=0
+openvr_exit=0
+if (( openvr_wine )); then
+    for i in {1..60}; do
+        grep -qE "openvr_smoke: (PASS|FAIL)" "${work}/game.log" && break
+        sleep 0.5
+    done
+    grep -h "openvr_smoke:" "${work}/game.log" || true
+    grep -q "openvr_smoke: PASS" "${work}/game.log" || { print -u2 "The OpenVR program did not pass; see ${work}/game.log"; openvr_exit=1; }
+    # OpenComposite's own log, for a failure
+    opencomposite_log=$(print -rl -- "${CRANVR_HOME:-$HOME/Library/Application Support/cranvr}"/wine/prefix/drive_c/users/*/AppData/Local/OpenComposite/logs/opencomposite.log(N) | head -1)
+    if [[ -n ${opencomposite_log} ]]; then
+        cp "${opencomposite_log}" "${work}/opencomposite.log"
+        (( openvr_exit == 0 )) || tail -30 "${work}/opencomposite.log" >&2
+    fi
+fi
 if (( tracking_wine )); then
     # The probe's time is up. The Windows program ends on its own: wait for its verdict.
     for i in {1..60}; do
@@ -390,6 +423,7 @@ python3 -I "${root}/scripts/e2e-report.py" "${work}/host.out" "${fps}" "${report
 (( client_exit == 0 )) || result=1
 (( game_exit == 0 )) || result=1
 (( tracking_exit == 0 )) || result=1
+(( openvr_exit == 0 )) || result=1
 grep -hE "probe: (done|frame arrival|native|desktop|audio)" "${work}/probe.log" 2>/dev/null || true
 print "Report: ${report}"
 exit ${result}

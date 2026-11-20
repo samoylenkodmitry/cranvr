@@ -50,10 +50,215 @@ index 3e246d9..6b0f7c6 100644
  		}
  		case vr::TextureType_OpenGL: {
 diff --git i/OpenOVR/Compositor/dx11compositor.cpp w/OpenOVR/Compositor/dx11compositor.cpp
-index 2ed44d2..0df2384 100644
+index 2ed44d2..697b9d7 100644
 --- i/OpenOVR/Compositor/dx11compositor.cpp
 +++ w/OpenOVR/Compositor/dx11compositor.cpp
-@@ -309,7 +309,7 @@ void DX11Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
+@@ -143,10 +143,150 @@ DX11Compositor::~DX11Compositor()
+ 
+ 	resolvedMSAATextures.clear();
+ 
++	ReleaseConvertTexture();
++
+ 	context->Release();
+ 	device->Release();
+ }
+ 
++void DX11Compositor::ReleaseConvertTexture()
++{
++	if (convertView) {
++		convertView->Release();
++		convertView = nullptr;
++	}
++	if (convertTexture) {
++		convertTexture->Release();
++		convertTexture = nullptr;
++	}
++}
++
++bool DX11Compositor::RuntimeOffersFormat(DXGI_FORMAT format)
++{
++	uint32_t count = 0;
++	if (XR_FAILED(xrEnumerateSwapchainFormats(xr_session.get(), 0, &count, nullptr)))
++		return true; // Cannot tell: leave the choice to the runtime's answer to xrCreateSwapchain
++	std::vector<int64_t> formats(count);
++	if (XR_FAILED(xrEnumerateSwapchainFormats(xr_session.get(), count, &count, formats.data())))
++		return true;
++	for (int64_t offered : formats) {
++		if (offered == static_cast<int64_t>(format))
++			return true;
++	}
++	return false;
++}
++
++DXGI_FORMAT DX11Compositor::SwapChannelOrder(DXGI_FORMAT format)
++{
++	switch (format) {
++	case DXGI_FORMAT_R8G8B8A8_UNORM:
++		return DXGI_FORMAT_B8G8R8A8_UNORM;
++	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
++		return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
++	case DXGI_FORMAT_B8G8R8A8_UNORM:
++	case DXGI_FORMAT_B8G8R8X8_UNORM:
++		return DXGI_FORMAT_R8G8B8A8_UNORM;
++	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
++	case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
++		return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
++	default:
++		return DXGI_FORMAT_UNKNOWN;
++	}
++}
++
++// Draws the whole of `view` into `target` with the quad of the inverting copy. The game goes on drawing
++// after Submit, so the state that the game had bound comes back.
++void DX11Compositor::DrawQuad(ID3D11ShaderResourceView* view, ID3D11RenderTargetView* target, uint32_t width, uint32_t height)
++{
++	ID3D11RenderTargetView* oldTargets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
++	ID3D11DepthStencilView* oldDepthView = nullptr;
++	context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, oldTargets, &oldDepthView);
++	ID3D11BlendState* oldBlend = nullptr;
++	FLOAT oldBlendFactor[4] = {};
++	UINT oldSampleMask = 0;
++	context->OMGetBlendState(&oldBlend, oldBlendFactor, &oldSampleMask);
++	ID3D11DepthStencilState* oldDepthState = nullptr;
++	UINT oldStencilRef = 0;
++	context->OMGetDepthStencilState(&oldDepthState, &oldStencilRef);
++	ID3D11RasterizerState* oldRaster = nullptr;
++	context->RSGetState(&oldRaster);
++	D3D11_VIEWPORT oldViewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
++	UINT oldViewportCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
++	context->RSGetViewports(&oldViewportCount, oldViewports);
++	D3D11_RECT oldScissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
++	UINT oldScissorCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
++	context->RSGetScissorRects(&oldScissorCount, oldScissors);
++	ID3D11VertexShader* oldVertexShader = nullptr;
++	ID3D11HullShader* oldHullShader = nullptr;
++	ID3D11DomainShader* oldDomainShader = nullptr;
++	ID3D11GeometryShader* oldGeometryShader = nullptr;
++	ID3D11PixelShader* oldPixelShader = nullptr;
++	context->VSGetShader(&oldVertexShader, nullptr, nullptr);
++	context->HSGetShader(&oldHullShader, nullptr, nullptr);
++	context->DSGetShader(&oldDomainShader, nullptr, nullptr);
++	context->GSGetShader(&oldGeometryShader, nullptr, nullptr);
++	context->PSGetShader(&oldPixelShader, nullptr, nullptr);
++	ID3D11ShaderResourceView* oldView = nullptr;
++	context->PSGetShaderResources(0, 1, &oldView);
++	ID3D11SamplerState* oldSampler = nullptr;
++	context->PSGetSamplers(0, 1, &oldSampler);
++	ID3D11InputLayout* oldLayout = nullptr;
++	context->IAGetInputLayout(&oldLayout);
++	D3D11_PRIMITIVE_TOPOLOGY oldTopology;
++	context->IAGetPrimitiveTopology(&oldTopology);
++
++	D3D11_VIEWPORT viewport = {};
++	viewport.Width = static_cast<FLOAT>(width);
++	viewport.Height = static_cast<FLOAT>(height);
++	viewport.MaxDepth = 1.0f;
++	D3D11_RECT scissor = { 0, 0, static_cast<LONG>(width), static_cast<LONG>(height) };
++	context->OMSetRenderTargets(1, &target, nullptr);
++	context->OMSetBlendState(nullptr, nullptr, 0xffffffff);
++	context->OMSetDepthStencilState(nullptr, 0);
++	context->RSSetState(nullptr);
++	context->RSSetViewports(1, &viewport);
++	context->RSSetScissorRects(1, &scissor);
++	context->VSSetShader(fs_vshader, nullptr, 0);
++	context->HSSetShader(nullptr, nullptr, 0);
++	context->DSSetShader(nullptr, nullptr, 0);
++	context->GSSetShader(nullptr, nullptr, 0);
++	context->PSSetShader(fs_pshader, nullptr, 0);
++	context->PSSetShaderResources(0, 1, &view);
++	context->PSSetSamplers(0, 1, &quad_sampleState);
++	context->IASetInputLayout(nullptr);
++	context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
++	context->Draw(4, 0);
++
++	context->IASetPrimitiveTopology(oldTopology);
++	context->IASetInputLayout(oldLayout);
++	context->PSSetSamplers(0, 1, &oldSampler);
++	context->PSSetShaderResources(0, 1, &oldView);
++	context->PSSetShader(oldPixelShader, nullptr, 0);
++	context->GSSetShader(oldGeometryShader, nullptr, 0);
++	context->DSSetShader(oldDomainShader, nullptr, 0);
++	context->HSSetShader(oldHullShader, nullptr, 0);
++	context->VSSetShader(oldVertexShader, nullptr, 0);
++	if (oldScissorCount)
++		context->RSSetScissorRects(oldScissorCount, oldScissors);
++	if (oldViewportCount)
++		context->RSSetViewports(oldViewportCount, oldViewports);
++	context->RSSetState(oldRaster);
++	context->OMSetDepthStencilState(oldDepthState, oldStencilRef);
++	context->OMSetBlendState(oldBlend, oldBlendFactor, oldSampleMask);
++	context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, oldTargets, oldDepthView);
++
++	for (ID3D11RenderTargetView* old : oldTargets) {
++		if (old)
++			old->Release();
++	}
++	for (IUnknown* old : { (IUnknown*)oldDepthView, (IUnknown*)oldBlend, (IUnknown*)oldDepthState, (IUnknown*)oldRaster,
++	         (IUnknown*)oldVertexShader, (IUnknown*)oldHullShader, (IUnknown*)oldDomainShader, (IUnknown*)oldGeometryShader,
++	         (IUnknown*)oldPixelShader, (IUnknown*)oldView, (IUnknown*)oldSampler, (IUnknown*)oldLayout }) {
++		if (old)
++			old->Release();
++	}
++}
++
+ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr::VRTextureBounds_t* bounds, bool cube)
+ {
+ 	XrSwapchainCreateInfo& desc = createInfo;
+@@ -199,6 +339,8 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
+ 
+ 		resolvedMSAATextures.clear();
+ 
++		ReleaseConvertTexture();
++
+ 		// Figure out what format we need to use
+ 		DxgiFormatInfo info = {};
+ 		if (!GetFormatInfo(srcDesc.Format, info)) {
+@@ -225,6 +367,23 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
+ 			OOVR_ABORTF("Invalid DXGI target format found: useLinear=%d type=DXGI_FORMAT_UNKNOWN fmt=%d", useLinearFormat, srcDesc.Format);
+ 		}
+ 
++		// cranvr: a format that the runtime does not offer gets the same channels in the order that it does
++		// offer, and the copy draws instead (see convertCopy). The picture keeps its bytes: a game's
++		// sRGB texture goes to an sRGB image, any other to a plain one.
++		convertCopy = false;
++		if (!cube && !RuntimeOffersFormat(type)) {
++			const bool srcIsSrgb = srcDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || srcDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
++			    || srcDesc.Format == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
++			const DXGI_FORMAT bytes = srcIsSrgb ? info.srgb : info.linear;
++			const DXGI_FORMAT swapped = SwapChannelOrder(bytes);
++			if (swapped != DXGI_FORMAT_UNKNOWN && RuntimeOffersFormat(swapped)) {
++				OOVR_LOGF("The runtime offers no swapchain format %d: using %d and a draw", type, swapped);
++				type = swapped;
++				convertFormat = bytes;
++				convertCopy = true;
++			}
++		}
++
+ 		// Set aside the old format for checking later
+ 		createInfoFormat = srcDesc.Format;
+ 
+@@ -261,6 +420,20 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
+ 			swapchain_rtvs[i] = d3d_make_rtv(device, (XrBaseInStructure&)imagesHandles[i], type);
+ 		}
+ 
++		if (convertCopy) {
++			D3D11_TEXTURE2D_DESC convertDesc = {};
++			convertDesc.Width = desc.width;
++			convertDesc.Height = desc.height;
++			convertDesc.MipLevels = 1;
++			convertDesc.ArraySize = 1;
++			convertDesc.Format = convertFormat;
++			convertDesc.SampleDesc.Count = 1;
++			convertDesc.Usage = D3D11_USAGE_DEFAULT;
++			convertDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++			OOVR_FAILED_DX_ABORT(device->CreateTexture2D(&convertDesc, nullptr, &convertTexture));
++			OOVR_FAILED_DX_ABORT(device->CreateShaderResourceView(convertTexture, nullptr, &convertView));
++		}
++
+ 		if (srcDesc.SampleDesc.Count > 1) {
+ 			OOVR_LOGF("Creating resolver textures for MSAA source with sample count x%d", srcDesc.SampleDesc.Count);
+ 			D3D11_TEXTURE2D_DESC resDesc = srcDesc;
+@@ -309,7 +482,7 @@ void DX11Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
  	OOVR_FAILED_XR_ABORT(res = xrWaitSwapchainImage(chain, &waitInfo));
  
  	if (res == XR_TIMEOUT_EXPIRED)
@@ -62,7 +267,7 @@ index 2ed44d2..0df2384 100644
  
  	// Copy the source to the destination image
  	D3D11_BOX sourceRegion;
-@@ -350,7 +350,29 @@ void DX11Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
+@@ -350,7 +523,29 @@ void DX11Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
  		context->RSGetState(&pRSState);
  		context->RSSetState(nullptr);
  
@@ -93,6 +298,47 @@ index 2ed44d2..0df2384 100644
  		context->RSSetViewports(1, &viewport);
  		D3D11_RECT rects[1];
  		rects[0].top = 0;
+@@ -384,6 +579,15 @@ void DX11Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
+ 			context->RSSetScissorRects(numScissors, scissors.data());
+ 
+ 		context->RSSetState(pRSState);
++	} else if (convertCopy) {
++		const int arrayIndex = (srcDesc.ArraySize > 1 && eye.has_value()) ? static_cast<int>(*eye) : 0;
++		if (srcDesc.SampleDesc.Count > 1) {
++			context->ResolveSubresource(resolvedMSAATextures[currentIndex], 0, src, arrayIndex, convertFormat);
++			context->CopySubresourceRegion(convertTexture, 0, 0, 0, 0, resolvedMSAATextures[currentIndex], arrayIndex, &sourceRegion);
++		} else {
++			context->CopySubresourceRegion(convertTexture, 0, 0, 0, 0, src, arrayIndex, &sourceRegion);
++		}
++		DrawQuad(convertView, swapchain_rtvs[currentIndex], createInfo.width, createInfo.height);
+ 	} else {
+ 		// Apparently SteamVR supports apps just sending array textures without specifying what's what.
+ 		const int arrayIndex = (srcDesc.ArraySize > 1 && eye.has_value()) ? static_cast<int>(*eye) : 0;
+diff --git i/OpenOVR/Compositor/dx11compositor.h w/OpenOVR/Compositor/dx11compositor.h
+index 1f8fa64..5b4d1c0 100644
+--- i/OpenOVR/Compositor/dx11compositor.h
++++ w/OpenOVR/Compositor/dx11compositor.h
+@@ -23,6 +23,20 @@ protected:
+ 
+ 	bool CheckChainCompatible(D3D11_TEXTURE2D_DESC& inputDesc, vr::EColorSpace colourSpace);
+ 
++	// cranvr: the OpenXR runtime of cranvr offers swapchain images in the channel order B8G8R8A8 only, and a
++	// game's textures are often R8G8B8A8. A copy cannot change the channel order, so then the game's
++	// image is copied into convertTexture (a typed texture of the game's own format) and a quad
++	// draws it into the swapchain image.
++	bool RuntimeOffersFormat(DXGI_FORMAT format);
++	static DXGI_FORMAT SwapChannelOrder(DXGI_FORMAT format);
++	void DrawQuad(ID3D11ShaderResourceView* view, ID3D11RenderTargetView* target, uint32_t width, uint32_t height);
++	void ReleaseConvertTexture();
++
++	bool convertCopy = false;
++	DXGI_FORMAT convertFormat = DXGI_FORMAT_UNKNOWN;
++	ID3D11Texture2D* convertTexture = nullptr;
++	ID3D11ShaderResourceView* convertView = nullptr;
++
+ 	ID3D11Device* device = nullptr;
+ 	ID3D11DeviceContext* context = nullptr;
+ 
 diff --git i/OpenOVR/Compositor/dx12compositor.cpp w/OpenOVR/Compositor/dx12compositor.cpp
 index ff2fedd..c8d9f35 100644
 --- i/OpenOVR/Compositor/dx12compositor.cpp
@@ -150,7 +396,7 @@ index 1091a21..288e794 100644
  		std::stringstream contents;
  		contents << in.rdbuf();
 diff --git i/OpenOVR/logging.cpp w/OpenOVR/logging.cpp
-index 11b88c5..b731858 100644
+index 11b88c5..c56bd60 100644
 --- i/OpenOVR/logging.cpp
 +++ w/OpenOVR/logging.cpp
 @@ -8,6 +8,9 @@
@@ -163,7 +409,43 @@ index 11b88c5..b731858 100644
  #include <fstream>
  #include <iostream>
  #include <sstream>
-@@ -240,7 +243,11 @@ void oovr_flush_safe()
+@@ -135,7 +138,13 @@ std::string GetEnv(const std::string& var)
+ #ifdef ANDROID
+ #include <android/log.h>
+ #else
+-static std::ofstream stream;
++// A function's static, not a global: the constructor of the global configuration logs, and with MinGW's
++// order of static initialisation it runs before this file's globals, so a global stream was still empty.
++static std::ofstream& log_stream()
++{
++	static std::ofstream stream;
++	return stream;
++}
+ 
+ #ifdef __GLIBCXX__
+ #include <ext/stdio_filebuf.h>
+@@ -164,7 +173,7 @@ static FILE* cfile(std::ofstream& ofs)
+ 
+ static void init_stream()
+ {
+-	if (!stream.is_open()) {
++	if (!log_stream().is_open()) {
+ 		string outputFilePath = "opencomposite.log";
+ 
+ 		// Try and write to standard location
+@@ -188,9 +197,9 @@ static void init_stream()
+ 			outputFilePath = outputFolder + "/" + outputFilePath;
+ #endif
+ 
+-		stream.open(outputFilePath.c_str());
++		log_stream().open(outputFilePath.c_str());
+ #ifdef __GLIBCXX__
+-		stream_fd.store(fileno(cfile(stream)), std::memory_order::seq_cst);
++		stream_fd.store(fileno(cfile(log_stream())), std::memory_order::seq_cst);
+ #endif
+ 	}
+ }
+@@ -240,7 +249,11 @@ void oovr_flush_safe()
  
  	int r;
  	do {
@@ -175,3 +457,114 @@ index 11b88c5..b731858 100644
  	} while (r < 0 && errno == EINTR);
  #endif
  }
+@@ -253,7 +266,7 @@ void oovr_log_raw(const char* file, long line, const char* func, const char* msg
+ 	__android_log_print(ANDROID_LOG_INFO, "OpenComposite", "%s:%d \t %s", func, line, msg);
+ #else
+ 	init_stream();
+-	stream << "[" << format_time() << "] " << func << ":" << line << "\t- " << (msg ? msg : "NULL") << std::endl;
++	log_stream() << "[" << format_time() << "] " << func << ":" << line << "\t- " << (msg ? msg : "NULL") << std::endl;
+ 
+ 	// Write it to stdout
+ 	// TODO on Windows, write it into the debug log
+@@ -305,7 +318,7 @@ OC_NORETURN void oovr_abort_raw_va(const char* file, long line, const char* func
+ #ifdef ANDROID
+ 	__android_log_print(ANDROID_LOG_ERROR, "OpenComposite", "ERROR: %s:%d \t %s", func, line, buff);
+ #else
+-	stream << std::flush;
++	log_stream() << std::flush;
+ #endif
+ 
+ 	OOVR_MESSAGE(buff, title);
+diff --git i/scripts/split_headers.py w/scripts/split_headers.py
+index 3fc98b3..b2980c7 100644
+--- i/scripts/split_headers.py
++++ w/scripts/split_headers.py
+@@ -132,6 +132,23 @@ def patch(text, patchfile):
+     return "\n".join(lines)
+ 
+ 
++# cranvr: structs that a virtual method of an OpenVR interface returns by value, and that do not fit in a
++# register. MSVC passes `this` first and the address of the returned struct second, and a game is built by
++# MSVC. GCC builds MinGW's code the other way round, so such a method would write its result over the
++# object. The methods take the address as a parameter and return it instead, which is the same code on
++# both sides. stubs/codegen.py gives a game the same methods and the FnTable the original ones.
++STRUCT_RETURNS = ("HmdMatrix34_t", "HmdMatrix44_t", "HiddenAreaMesh_t", "HmdColor_t", "DistortionCoordinates_t")
++_struct_return = re.compile(r"(virtual\s+)(" + "|".join(STRUCT_RETURNS) + r")(\s+)(\w+)\(\s*(\)?)")
++
++
++def struct_returns_by_pointer(text):
++    def replace(match):
++        virtual, struct, space, name, close = match.groups()
++        return f"{virtual}{struct} *{name}( {struct} *pRet_{')' if close else ', '}"
++
++    return _struct_return.sub(replace, text)
++
++
+ def write_interface(target: str, result: str, usingiface: bool, interface_checker: Callable, out_dir: Path):
+     """
+     Writes an interface out to a file.
+@@ -209,6 +226,9 @@ def write_interface(target: str, result: str, usingiface: bool, interface_checke
+     if target in patches:
+         result = patch(result, input_dir / f"patches/{target}.ipatch")
+ 
++    if usingiface:
++        result = struct_returns_by_pointer(result)
++
+     # if nooverwrite and os.path.isfile(outfile):
+     #   # Check the hashes of the files, in case the headers have been modified, a new
+     #   #  header has been added, or anything like that.
+diff --git i/scripts/stubs/codegen.py w/scripts/stubs/codegen.py
+index 39cebd4..dd43544 100644
+--- i/scripts/stubs/codegen.py
++++ w/scripts/stubs/codegen.py
+@@ -88,9 +88,14 @@ std::shared_ptr<{cls}> GetCreate{getter_name}() {{
+             if f.user_implemented:
+                 continue
+ 
++            # cranvr: a struct that the base class returns by value goes out through the pointer that
++            # split_headers.py added as the first argument (see STRUCT_RETURNS there)
++            by_pointer = bool(f.args) and f.args[0].name == "pRet_"
++            call_args = f.args[1:] if by_pointer else f.args
++
+             # Generate an argument string with casts as appropriate
+             nargs = []
+-            for a in f.args:
++            for a in call_args:
+                 if namespace in a.type:
+                     casttype = a.type.replace(namespace + "::", "OOVR_")
+                     nargs.append("(%s) %s" % (casttype, a.name))
+@@ -104,10 +109,15 @@ std::shared_ptr<{cls}> GetCreate{getter_name}() {{
+             if namespace in f.return_type:
+                 return_str += f" ({f.return_type})"
+ 
++            if by_pointer:
++                call = f"*pRet_ = base->{f.name}({nargs});\n\treturn pRet_;"
++            else:
++                call = f"{return_str} base->{f.name}({nargs});"
++
+             fi.write(f"{f.return_type} {cname}::{f.name}({f.args_str()}) {{\n"
+                      "\tif (oovr_global_configuration.LogAllOpenVRCalls())\n"
+                      f"\t\tOOVR_LOG(\"Entered function (from interface {ver.namespace()})\");\n"
+-                     f"\t{return_str} base->{f.name}({nargs});\n}}\n")
++                     f"\t{call}\n}}\n")
+ 
+         # Generate the fntable
+         _build_fntable(fi, ver)
+@@ -128,6 +138,17 @@ def _build_fntable(fi, ver: InterfaceDef):
+ 
+     # Generate the stub functions
+     for func in ver.functions:
++        if func.args and func.args[0].name == "pRet_":
++            # A FnTable function returns the struct by value: the pointer of the method is a local here
++            struct = func.return_type.rstrip("* ")
++            rest = func.args[1:]
++            rest_str = ", ".join(a.type + " " + a.name for a in rest)
++            call_args = "".join(", " + a.name for a in rest)
++            fi.write(
++                f"static {struct} OPENVR_FNTABLE_CALLTYPE {func_name_template % func.name}({rest_str}) "
++                f"{{ {struct} result; {inst_name}->{func.name}(&result{call_args}); return result; }}\n")
++            continue
++
+         call_stmt = f"return {inst_name}->{func.name}({func.args_names()});"
+ 
+         fi.write(
