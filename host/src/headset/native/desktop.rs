@@ -11,8 +11,10 @@
 //! - The pictures are not mirrored: Cranpose's compositor layer already turns a decoder's surface
 //!   upright.
 //! - The cursor's position goes out as a datagram every 2 ms while the Mac's mouse moves.
-//! - `ClientDatagram::Pointer` carries where a controller points on the panel, with its trigger and
-//!   thumbstick. The host moves the Mac's mouse, clicks and scrolls (`desktop::Pointer`).
+//! - `ClientDatagram::Mouse` carries where the controller that owns the mouse points on the panel,
+//!   the mouse buttons that it holds (left, right, middle) and its thumbstick's lean in two axes.
+//!   `ClientDatagram::Pointer` is the older form with a trigger and one axis, from a client of
+//!   protocol version 6. The host moves the Mac's mouse, clicks and scrolls (`desktop::Pointer`).
 //! - `LayerState` tells the frame loop that the client shows the desktop, so the eye stream leaves
 //!   its own copy of the screen out. It tells the loop that a game hides the desktop.
 
@@ -25,7 +27,7 @@ use log::{info, warn};
 use cranvr_proto::{
     clock::now_ns,
     media::FrameMeta,
-    message::{Cursor, DesktopParams, DesktopWish, HostDatagram, HostMsg, Pointer, DESKTOP_STREAM},
+    message::{Cursor, DesktopParams, DesktopWish, HostDatagram, HostMsg, Mouse, Pointer, DESKTOP_STREAM},
     wire::{Codec, Pose, Rect},
 };
 use cranvr_vt::{EncodedFrame, Encoder, EncoderConfig, Flipper};
@@ -94,7 +96,7 @@ struct Inner {
     key: AtomicBool,
     /// The display of the running capture, for the pointer. 0 while none runs.
     display: AtomicU32,
-    pointer: Sender<Pointer>,
+    pointer: Sender<PointerIn>,
     stop: AtomicBool,
     counters: Counters,
 }
@@ -156,7 +158,47 @@ impl Desktop {
 
     pub(super) fn on_pointer(&self, pointer: Pointer) {
         self.inner.counters.pointer_datagrams.fetch_add(1, Ordering::Relaxed);
-        self.inner.pointer.send(pointer).ok();
+        self.inner.pointer.send(PointerIn::Trigger(pointer)).ok();
+    }
+
+    pub(super) fn on_mouse(&self, mouse: Mouse) {
+        self.inner.counters.pointer_datagrams.fetch_add(1, Ordering::Relaxed);
+        self.inner.pointer.send(PointerIn::Mouse(mouse)).ok();
+    }
+}
+
+/// What the client says about the pointer, in the form of its protocol version.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PointerIn {
+    /// Version 6: one controller with a trigger and one axis
+    Trigger(Pointer),
+    /// Version 7: the mouse buttons and two axes
+    Mouse(Mouse),
+}
+
+impl PointerIn {
+    fn seq(&self) -> u32 {
+        match self {
+            PointerIn::Trigger(p) => p.seq,
+            PointerIn::Mouse(m) => m.seq,
+        }
+    }
+
+    /// Whether the host has more to do for it than to wait: the controller points at the panel or
+    /// holds a button
+    fn busy(&self) -> bool {
+        match self {
+            PointerIn::Trigger(p) => p.hit.is_some() || p.trigger > 0.4,
+            PointerIn::Mouse(m) => m.hit.is_some() || m.buttons != 0,
+        }
+    }
+
+    /// Moves the Mac's mouse as the datagram says. `scroll_scale` is as in `desktop::Pointer`.
+    fn apply(&self, pointer: &mut desktop::Pointer, scroll_scale: f32) {
+        match self {
+            PointerIn::Trigger(p) => pointer.update_scaled(p.hit, p.trigger, p.scroll, scroll_scale),
+            PointerIn::Mouse(m) => pointer.update_mouse(m.hit, m.buttons, m.scroll, scroll_scale),
+        }
     }
 }
 
@@ -403,7 +445,7 @@ impl LogState {
         let n = frames.max(1) as f64;
         let mouse = desktop::injected_counts();
         info!(
-            "Native desktop: {:.1} pictures a second, {:.1} Mbps, {:.1} KB a picture, {} key, encode {:.2} ms, send {:.2} ms; the client sent {} pointer datagrams, {} cursor datagrams; mouse events: {} moves, {} downs, {} ups, {} px scrolled",
+            "Native desktop: {:.1} pictures a second, {:.1} Mbps, {:.1} KB a picture, {} key, encode {:.2} ms, send {:.2} ms; the client sent {} pointer datagrams, {} cursor datagrams; mouse events: {} moves, {} downs ({} right, {} middle), {} ups, {} px scrolled, {} px scrolled across",
             frames as f64 / seconds,
             d(now.1, self.seen.1) as f64 * 8.0 / seconds / 1e6,
             d(now.1, self.seen.1) as f64 / n / 1000.0,
@@ -414,8 +456,11 @@ impl LogState {
             d(now.6, self.seen.6),
             mouse.moves - self.mouse.moves,
             mouse.downs - self.mouse.downs,
+            mouse.right_downs - self.mouse.right_downs,
+            mouse.middle_downs - self.mouse.middle_downs,
             mouse.ups - self.mouse.ups,
             mouse.scroll_pixels - self.mouse.scroll_pixels,
+            mouse.scroll_across_pixels - self.mouse.scroll_across_pixels,
         );
         (self.at, self.seen, self.mouse) = (Instant::now(), now, mouse);
     }
@@ -423,7 +468,7 @@ impl LogState {
 
 /// Moves the Mac's mouse to where the client says a controller points on the panel, clicks and
 /// scrolls. A client that falls silent with its trigger down gets its button lifted.
-fn pointer_loop(inner: &Inner, receiver: &Receiver<Pointer>) {
+fn pointer_loop(inner: &Inner, receiver: &Receiver<PointerIn>) {
     let mut pointer: Option<desktop::Pointer> = None;
     let mut last_seq: Option<u32> = None;
     let mut last_update = Instant::now();
@@ -451,19 +496,20 @@ fn pointer_loop(inner: &Inner, receiver: &Receiver<Pointer>) {
             Some(p) => {
                 // UDP may swap datagrams: an older one would move the mouse back. A far older
                 // number means a new client session that counts from 0 again.
-                if last_seq.is_some_and(|last| last.wrapping_sub(p.seq) < 1000) {
+                if last_seq.is_some_and(|last| last.wrapping_sub(p.seq()) < 1000) {
                     continue;
                 }
-                last_seq = Some(p.seq);
+                last_seq = Some(p.seq());
                 // The scroll of one update is 20 pixels at 72 updates a second: scale it to the
                 // time since the last update, so the speed does not depend on the client's rate
                 let dt = now.duration_since(last_update).as_secs_f32().min(0.05);
-                pointer.update_scaled(p.hit, p.trigger, p.scroll, dt * 72.0);
-                active = p.hit.is_some() || p.trigger > 0.4;
+                p.apply(pointer, dt * 72.0);
+                active = p.busy();
                 last_update = now;
             }
+            // Every button that is down goes up
             None if active && now.duration_since(last_update) > POINTER_STALE => {
-                pointer.update(None, 0.0, 0.0);
+                pointer.update_mouse(None, 0, [0.0; 2], 1.0);
                 active = false;
                 last_update = now;
             }

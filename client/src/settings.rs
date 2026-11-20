@@ -8,6 +8,7 @@
 use crate::console::{Room, Volume};
 use crate::hub::MediaChoice;
 use cranpose::{launch_args, preferences};
+use cranvr_common::controls::Controls;
 use cranvr_proto::identity::{fingerprint, from_hex, random_bytes, to_hex, Identity, FINGERPRINT_LEN};
 use std::sync::OnceLock;
 
@@ -16,6 +17,7 @@ const IDENTITY_KEY: &str = "identity";
 const ROOM_KEY: &str = "room";
 const VOLUME_KEY: &str = "volume";
 const PANELS_KEY: &str = "panels";
+const CONTROLS_KEY: &str = "controls";
 /// The address that works over USB with `adb reverse tcp:9950 tcp:9950`, and on the same Mac
 const DEFAULT_HOST: &str = "127.0.0.1:9950";
 
@@ -74,6 +76,19 @@ pub fn panels_shown() -> bool {
 pub fn remember_panels_shown(shown: bool) {
     if let Err(e) = preferences().set(PANELS_KEY, if shown { "shown" } else { "hidden" }) {
         log::warn!("the panels setting was not saved: {e}");
+    }
+}
+
+/// What the buttons of the controllers did when a Mac last sent the mapping. The Mac's app keeps the
+/// mapping (`app.json`). The headset keeps this copy for the time without a link. `None` before any
+/// link: the standard mapping then holds.
+pub fn controls() -> Option<Controls> {
+    preferences().get(CONTROLS_KEY).and_then(|text| Controls::from_json(&text))
+}
+
+pub fn remember_controls(controls: &Controls) {
+    if let Err(e) = preferences().set(CONTROLS_KEY, &controls.to_json()) {
+        log::warn!("the controls were not saved: {e}");
     }
 }
 

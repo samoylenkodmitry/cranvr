@@ -8,10 +8,12 @@
 //!
 //! The controllers work as the mouse. Cranpose finds where a controller's ray meets the surface and
 //! reports it as pointer events in dp from the surface's top left corner (`on_pointer_event`). This
-//! file turns each event into a point on the picture (u and v from 0 to 1), a trigger and a scroll.
-//! It sends them to the host as `ClientDatagram::Pointer` datagrams. The host moves the Mac's
+//! file turns each event into a point on the picture (u and v from 0 to 1) and the mouse buttons
+//! that are down (left, right, middle). It sends them to the host as `ClientDatagram::Mouse`
+//! datagrams, or as the older `Pointer` to a host of protocol version 6. The host moves the Mac's
 //! mouse, clicks and scrolls. The pointer events carry no scroll, so the thumbstick's lean comes
-//! from the headset's frame while the ray is on the surface.
+//! from the headset's frame while the ray is on the surface, in the axes that the mapping of
+//! `controls.rs` gives to scrolling.
 //!
 //! Cranpose carries the panel. Its move events give the pose that `place.rs` keeps for the next
 //! start. They also give the cursor ring its place. The user resizes the panel with the sphere at
@@ -28,21 +30,23 @@
 //! The decoder lives in a mutex because the composition thread must drop it before the surface's
 //! end callback returns, while the decode thread feeds it.
 
-use crate::place;
+use crate::{hub::hub, place};
 use cranpose::{
-    launch_args, prelude::*, AccessUnit, DecodedFrames, DecoderConfig, DecoderError, DecoderOutput, ExternalSurface, PointerEvent,
-    PointerEventKind, VideoCodec, VideoDecoder,
+    launch_args, prelude::*, AccessUnit, DecodedFrames, DecoderConfig, DecoderError, DecoderOutput, ExternalSurface, PointerButton,
+    PointerEvent, PointerEventKind, VideoCodec, VideoDecoder,
 };
 use cranpose_xr::{
     Pose, ResizeLimits, ResizePolicy, SpatialExternalSurface, SpatialFrameEffect, SpatialMoveEvent, SpatialMoveEventType, SpatialPanel,
     SpatialResizeEventType, StereoMode, SubspaceModifier, XrFrame, METERS_PER_DP,
 };
+use cranvr_common::controls::{mouse, Action as ControlAction, Control, Controls, Hand};
 use cranvr_proto::{
     clock::now_ns,
     link::ClientLink,
     media::Received,
-    message::{ClientDatagram, ClientMsg, Cursor, DesktopParams, DesktopWish, HostMsg, Pointer, DESKTOP_STREAM},
+    message::{ClientDatagram, ClientMsg, Cursor, DesktopParams, DesktopWish, HostMsg, Mouse, Pointer, DESKTOP_STREAM},
     wire::Codec,
+    MOUSE_VERSION,
 };
 use std::{
     sync::{
@@ -97,18 +101,27 @@ pub struct View {
 pub struct PointerNow {
     /// Where the controller points on the picture as u and v from its top left corner
     pub hit: Option<[f32; 2]>,
-    /// 1 while the trigger is down and 0 while it is up. The host presses the button past 0.6 and
-    /// lets it go below 0.4.
-    pub trigger: f32,
-    /// How far the thumbstick leans forward, from -1 to 1
-    pub scroll: f32,
+    /// The mouse buttons that are down, as the bits of `cranvr_common::controls::mouse`
+    pub buttons: u8,
+    /// How far the thumbstick leans across (to the right) and forward, each from -1 to 1
+    pub scroll: [f32; 2],
+}
+
+/// The bit of a Compose pointer button, or 0 for a button that a mouse of the Mac has no use for here
+fn mouse_bit(button: PointerButton) -> u8 {
+    match button {
+        PointerButton::Primary => mouse::LEFT,
+        PointerButton::Secondary => mouse::RIGHT,
+        PointerButton::Middle => mouse::MIDDLE,
+        PointerButton::Back | PointerButton::Forward => 0,
+    }
 }
 
 impl PointerNow {
     /// Whether the host has something to do with it: a controller points at the panel or holds a
-    /// press.
+    /// button.
     pub fn busy(&self) -> bool {
-        self.hit.is_some() || self.trigger > 0.4
+        self.hit.is_some() || self.buttons != 0
     }
 
     /// Whether `other` differs enough to send. A move of a fifth of a pixel of a 4K picture does not
@@ -119,17 +132,19 @@ impl PointerNow {
             (None, None) => false,
             _ => true,
         };
-        moved || (self.trigger - other.trigger).abs() > 0.02 || (self.scroll - other.scroll).abs() > 0.02
+        moved || self.buttons != other.buttons || (0..2).any(|axis| (self.scroll[axis] - other.scroll[axis]).abs() > 0.02)
     }
 
     /// The pointer after a pointer event of the surface. `at` is the event's place as u and v.
     /// The surface sends `Up` before `Exit` when the ray left the surface during a press, so an
-    /// `Exit` always ends with the button up.
+    /// `Exit` always ends with the buttons up.
     fn after(mut self, kind: PointerEventKind, at: [f32; 2]) -> Self {
         match kind {
             PointerEventKind::Enter | PointerEventKind::Move => self.hit = Some(at),
-            PointerEventKind::Down => (self.hit, self.trigger) = (Some(at), 1.0),
-            PointerEventKind::Up => (self.hit, self.trigger) = (Some(at), 0.0),
+            PointerEventKind::Down => (self.hit, self.buttons) = (Some(at), self.buttons | mouse::LEFT),
+            PointerEventKind::Up => (self.hit, self.buttons) = (Some(at), self.buttons & !mouse::LEFT),
+            PointerEventKind::ButtonDown(button) => (self.hit, self.buttons) = (Some(at), self.buttons | mouse_bit(button)),
+            PointerEventKind::ButtonUp(button) => (self.hit, self.buttons) = (Some(at), self.buttons & !mouse_bit(button)),
             PointerEventKind::Exit => self = Self::default(),
             _ => {}
         }
@@ -700,11 +715,21 @@ pub fn uplink(link: &ClientLink, stop: &AtomicBool) {
         }
         if dirty || (pointer.busy() && last_send.elapsed() >= POINTER_KEEPALIVE) {
             last_send = Instant::now();
-            let datagram = Pointer { seq, sent: now_ns(), hit: pointer.hit, trigger: pointer.trigger, scroll: pointer.scroll };
+            link.duplex.send_datagram(&pointer_datagram(link.welcome.version, seq, &pointer)).ok();
             seq = seq.wrapping_add(1);
-            link.duplex.send_datagram(&ClientDatagram::Pointer(datagram)).ok();
             d.inner.lock().unwrap().counts.pointers_sent += 1;
         }
+    }
+}
+
+/// The datagram for a pointer, in the form of the host's protocol version. A host of version 6 has
+/// the trigger and one axis only: the left button is its trigger, and the forward lean its scroll.
+fn pointer_datagram(version: u16, seq: u32, pointer: &PointerNow) -> ClientDatagram {
+    if version >= MOUSE_VERSION {
+        ClientDatagram::Mouse(Mouse { seq, sent: now_ns(), hit: pointer.hit, buttons: pointer.buttons, scroll: pointer.scroll })
+    } else {
+        let left = pointer.buttons & mouse::LEFT != 0;
+        ClientDatagram::Pointer(Pointer { seq, sent: now_ns(), hit: pointer.hit, trigger: if left { 1.0 } else { 0.0 }, scroll: pointer.scroll[1] })
     }
 }
 
@@ -730,8 +755,13 @@ fn synthetic_pointer(time: Duration) -> PointerNow {
     let angle = t * std::f32::consts::TAU / 4.0;
     PointerNow {
         hit: Some([0.5 + 0.3 * angle.cos(), 0.5 + 0.3 * angle.sin()]),
-        trigger: if t % 3.0 < 0.3 { 1.0 } else { 0.0 },
-        scroll: if t % 6.0 > 4.0 { 0.6 } else { 0.0 },
+        // The left button every 3 s, the right one in the second 1.0 to 1.3 of each 3 s and the
+        // middle one in the second 2.0 to 2.3
+        buttons: [(0.0, mouse::LEFT), (1.0, mouse::RIGHT), (2.0, mouse::MIDDLE)]
+            .into_iter()
+            .filter(|(from, _)| (t % 3.0 - from).abs() < 0.3 && t % 3.0 >= *from)
+            .fold(0, |bits, (_, bit)| bits | bit),
+        scroll: if t % 6.0 > 4.0 { [0.6, 0.6] } else { [0.0, 0.0] },
     }
 }
 
@@ -745,6 +775,22 @@ fn stick_lean(frame: &XrFrame, axis: usize) -> f32 {
         .filter(|lean| lean.abs() >= DEAD_ZONE)
         .max_by(|a, b| a.abs().total_cmp(&b.abs()))
         .unwrap_or(0.0)
+}
+
+/// How far the thumbsticks lean in the axes that the mapping gives to scrolling: across, then
+/// forward. A stick whose axis does something else, or nothing, does not scroll. The stronger
+/// of the two sticks counts in each axis.
+fn scroll_lean(frame: &XrFrame, controls: &Controls) -> [f32; 2] {
+    let lean = |axis: usize, control: Control| {
+        [(Hand::Left, &frame.left_controller), (Hand::Right, &frame.right_controller)]
+            .into_iter()
+            .filter(|(hand, _)| controls.action(*hand, control) == ControlAction::Scroll)
+            .map(|(_, controller)| [controller.thumbstick.x, controller.thumbstick.y][axis])
+            .filter(|lean| lean.abs() >= DEAD_ZONE)
+            .max_by(|a, b| a.abs().total_cmp(&b.abs()))
+            .unwrap_or(0.0)
+    };
+    [lean(0, Control::StickHorizontal), lean(1, Control::StickVertical)]
 }
 
 /// The desktop panel and the cursor over it. It composes nothing while the host has no desktop for
@@ -788,8 +834,8 @@ pub fn DesktopPanel() {
         } else if pointer_test() {
             desktop().update_pointer(|pointer| *pointer = synthetic_pointer(frame.predicted_display_time));
         } else {
-            let lean = stick_lean(frame, 1);
-            desktop().update_pointer(|pointer| pointer.scroll = if pointer.hit.is_some() { lean } else { 0.0 });
+            let lean = scroll_lean(frame, &hub().controls());
+            desktop().update_pointer(|pointer| pointer.scroll = if pointer.hit.is_some() { lean } else { [0.0; 2] });
         }
         let at = desktop().cursor();
         if cursor.get_non_reactive() != at {
@@ -917,28 +963,74 @@ mod tests {
         let at = [0.25, 0.75];
         let idle = PointerNow::default();
         let hover = idle.after(PointerEventKind::Enter, at);
-        assert_eq!(hover, PointerNow { hit: Some(at), trigger: 0.0, scroll: 0.0 });
+        assert_eq!(hover, PointerNow { hit: Some(at), buttons: 0, scroll: [0.0; 2] });
         let moved = hover.after(PointerEventKind::Move, [0.3, 0.7]);
         assert_eq!(moved.hit, Some([0.3, 0.7]));
         let down = moved.after(PointerEventKind::Down, [0.3, 0.7]);
-        assert_eq!(down.trigger, 1.0);
+        assert_eq!(down.buttons, mouse::LEFT);
         // The thumbstick's lean survives the events of the same ray
-        let leaning = PointerNow { scroll: 0.5, ..down };
-        assert_eq!(leaning.after(PointerEventKind::Move, [0.31, 0.7]).scroll, 0.5);
+        let leaning = PointerNow { scroll: [0.25, 0.5], ..down };
+        assert_eq!(leaning.after(PointerEventKind::Move, [0.31, 0.7]).scroll, [0.25, 0.5]);
         let up = down.after(PointerEventKind::Up, [0.3, 0.7]);
-        assert_eq!((up.trigger, up.hit), (0.0, Some([0.3, 0.7])));
+        assert_eq!((up.buttons, up.hit), (0, Some([0.3, 0.7])));
         // The ray leaves: nothing points, nothing presses and nothing scrolls
         assert_eq!(leaning.after(PointerEventKind::Exit, [0.3, 0.7]), PointerNow::default());
         assert!(!PointerNow::default().busy() && hover.busy() && down.busy());
     }
 
     #[test]
+    fn the_buttons_of_a_pointer_come_from_the_events_of_the_surface() {
+        let at = [0.5, 0.5];
+        let pointer = PointerNow::default().after(PointerEventKind::Enter, at);
+        let right = pointer.after(PointerEventKind::ButtonDown(PointerButton::Secondary), at);
+        assert_eq!(right.buttons, mouse::RIGHT);
+        // Another button joins the first, and each lets go on its own
+        let all = right.after(PointerEventKind::Down, at).after(PointerEventKind::ButtonDown(PointerButton::Middle), at);
+        assert_eq!(all.buttons, mouse::LEFT | mouse::RIGHT | mouse::MIDDLE);
+        let less = all.after(PointerEventKind::ButtonUp(PointerButton::Secondary), at).after(PointerEventKind::Up, at);
+        assert_eq!(less.buttons, mouse::MIDDLE);
+        // The side buttons of a mouse mean nothing on the Mac's desktop here
+        assert_eq!(pointer.after(PointerEventKind::ButtonDown(PointerButton::Back), at).buttons, 0);
+        // The ray leaves with buttons down: they all go up
+        assert_eq!(all.after(PointerEventKind::Exit, at), PointerNow::default());
+    }
+
+    #[test]
     fn a_pointer_that_barely_moved_is_not_worth_sending() {
-        let a = PointerNow { hit: Some([0.5, 0.5]), trigger: 0.0, scroll: 0.0 };
+        let a = PointerNow { hit: Some([0.5, 0.5]), buttons: 0, scroll: [0.0; 2] };
         assert!(!a.differs(&PointerNow { hit: Some([0.500_02, 0.5]), ..a }));
         assert!(a.differs(&PointerNow { hit: Some([0.501, 0.5]), ..a }));
         assert!(a.differs(&PointerNow { hit: None, ..a }));
-        assert!(a.differs(&PointerNow { trigger: 1.0, ..a }));
+        assert!(a.differs(&PointerNow { buttons: mouse::RIGHT, ..a }));
+        assert!(a.differs(&PointerNow { scroll: [0.5, 0.0], ..a }), "a lean across is worth sending");
+    }
+
+    #[test]
+    fn a_host_of_version_6_gets_the_older_datagram_with_the_left_button_as_its_trigger() {
+        let pointer = PointerNow { hit: Some([0.1, 0.2]), buttons: mouse::LEFT | mouse::RIGHT, scroll: [0.3, 0.6] };
+        match pointer_datagram(7, 4, &pointer) {
+            ClientDatagram::Mouse(m) => assert_eq!((m.seq, m.hit, m.buttons, m.scroll), (4, Some([0.1, 0.2]), mouse::LEFT | mouse::RIGHT, [0.3, 0.6])),
+            other => panic!("{other:?}"),
+        }
+        match pointer_datagram(6, 5, &pointer) {
+            ClientDatagram::Pointer(p) => assert_eq!((p.seq, p.hit, p.trigger, p.scroll), (5, Some([0.1, 0.2]), 1.0, 0.6)),
+            other => panic!("{other:?}"),
+        }
+        // A right button alone is no trigger for a host that knows only the trigger
+        let right = PointerNow { buttons: mouse::RIGHT, ..pointer };
+        match pointer_datagram(6, 6, &right) {
+            ClientDatagram::Pointer(p) => assert_eq!(p.trigger, 0.0),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_pointer_test_presses_each_button_in_its_turn() {
+        let seen: Vec<u8> = (0..60).map(|i| synthetic_pointer(Duration::from_secs_f32(i as f32 * 0.1)).buttons).collect();
+        for bit in [mouse::LEFT, mouse::RIGHT, mouse::MIDDLE] {
+            assert!(seen.iter().any(|buttons| *buttons == bit), "{bit}: {seen:?}");
+        }
+        assert!(synthetic_pointer(Duration::from_secs_f32(4.5)).scroll[0] > 0.0);
     }
 
     #[test]

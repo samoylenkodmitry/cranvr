@@ -9,7 +9,7 @@
 //! head.
 
 use crate::{
-    console::{self, size, Action, Game, Menu, Press, Room, View, Volume, RATES, SCALES},
+    console::{self, size, Action, Game, Menu, Page, Press, Room, View, Volume, RATES, SCALES},
     hub::{hub, LinkState, Snapshot},
     place,
     tracking::Read,
@@ -18,11 +18,15 @@ use crate::{
 use cranpose::prelude::*;
 use cranpose::text::FontWeight;
 use cranpose_xr::{FollowMode, FollowTarget, FollowingSubspace, Hand, Pose, SpatialPanel, SubspaceModifier, Vibration};
-use cranvr_proto::{message::buttons, wire::Nanos};
+use cranvr_common::controls::{Control, Controls, Hand as ControlHand};
+use cranvr_proto::wire::Nanos;
 use std::time::Duration;
 
 /// The width of a setting's name, in dp
 const LABEL: f32 = 150.0;
+/// The width of an input's name on the Controls page, and of the buttons that step through its actions
+const CONTROL_LABEL: f32 = 210.0;
+const STEP: f32 = 48.0;
 
 /// Where the console starts, relative to the origin of its subspace, which lies 1 m ahead of the
 /// head: 0.6 m ahead of the head and 0.4 m below it, tilted up toward it by 34 degrees. The offset
@@ -30,14 +34,18 @@ const LABEL: f32 = 150.0;
 const START_OFFSET: [f32; 3] = [0.0, -400.0, 400.0];
 const START_TILT_DEGREES: f32 = 34.0;
 
-/// Gives the console one frame of the headset: the left menu button, whose hold shows or hides it.
-/// The frame loop calls it.
+/// Gives the buttons of the controllers one frame of the headset (see `controls.rs`). A hold of the
+/// menu button opens the console, as the standard mapping says. The frame loop calls it. A headset
+/// action that fires gives the hand that fired it a click, so the user knows that the press took.
 pub fn on_frame(read: &Read, now: Nanos) {
-    let menu_down = read.frame.as_ref().is_some_and(|frame| frame.input.hands[0].buttons & buttons::MENU != 0);
-    if hub().console_frame(menu_down, now) {
-        // A click on the left hand tells the user that the hold took
+    let input = read.frame.as_ref().map_or_else(Default::default, |frame| frame.input);
+    for fire in hub().controls_frame(&input, now) {
         if let Some(haptics) = hub().headset().and_then(|headset| headset.haptics) {
-            haptics.vibrate(Hand::Left, Vibration::new(0.4, Duration::from_millis(40)));
+            let hand = match fire.hand {
+                ControlHand::Left => Hand::Left,
+                ControlHand::Right => Hand::Right,
+            };
+            haptics.vibrate(hand, Vibration::new(0.4, Duration::from_millis(40)));
         }
     }
 }
@@ -56,7 +64,12 @@ pub fn ConsolePanel(view: MutableState<View>, snapshot: MutableState<Snapshot>) 
 
 #[composable]
 fn OpenConsole(view: View, state: LinkState) {
-    let height = console::height(view.menu.as_ref());
+    let page = rememberMutableStateOf(|| Page::Main);
+    let shown = page.get();
+    let height = match shown {
+        Page::Main => console::height(view.menu.as_ref()),
+        Page::Controls(_) => console::controls_height(),
+    };
     let start = remember(|| {
         let default = SubspaceModifier::new().offset(START_OFFSET[0], START_OFFSET[1], START_OFFSET[2]).rotate(-START_TILT_DEGREES, 0.0, 0.0).pose();
         place::start_pose("console", default)
@@ -65,13 +78,15 @@ fn OpenConsole(view: View, state: LinkState) {
     SpatialPanel(place::movable("console", SubspaceModifier::new().size(size::WIDTH, height), start, |_| {}), move || {
         let menu = view.menu.clone();
         let (room, volume) = (view.room, view.volume);
+        let (controls, editable) = (view.controls, view.controls_editable);
         let state = state.clone();
         Column(
             Modifier::empty().fill_max_size().background(PANEL_COLOR).rounded_corners(24.0).padding(size::PADDING),
             ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(size::GAP)),
-            move || match &menu {
-                Some(menu) => MenuRows(menu.clone(), room, volume),
-                None => NoMenu(state.clone(), room, volume),
+            move || match (shown, &menu) {
+                (Page::Controls(hand), _) => ControlsPage(page, hand, controls, editable),
+                (Page::Main, Some(menu)) => MenuRows(menu.clone(), room, volume, page),
+                (Page::Main, None) => NoMenu(state.clone(), room, volume, page),
             },
         );
     });
@@ -83,7 +98,7 @@ fn bold(size: f32) -> TextStyle {
 
 /// What the console says while the host sends no menu: its app is not running, or no link exists.
 #[composable]
-fn NoMenu(state: LinkState, room: Room, volume: Volume) {
+fn NoMenu(state: LinkState, room: Room, volume: Volume, page: MutableState<Page>) {
     Text("cranvr", Modifier::empty().height(size::TITLE), bold(34.0));
     let (text, color) = match state {
         LinkState::Streaming => ("The host offers no menu. Start the cranvr app on the Mac.", WARN_COLOR),
@@ -93,11 +108,11 @@ fn NoMenu(state: LinkState, room: Room, volume: Volume) {
     // The settings of the client need no host
     Heading("Settings");
     ClientSettings(room, volume);
-    CloseButtons(false);
+    CloseButtons(false, page);
 }
 
 #[composable]
-fn MenuRows(menu: Menu, room: Room, volume: Volume) {
+fn MenuRows(menu: Menu, room: Room, volume: Volume, page: MutableState<Page>) {
     let status = menu.status.clone();
     let stream = if status.refresh > 0.0 {
         let latency = status.latency_ms.map_or(String::new(), |ms| format!(", {ms:.0} ms"));
@@ -142,7 +157,7 @@ fn MenuRows(menu: Menu, room: Room, volume: Volume) {
         Modifier::empty().height(size::TEXT),
         text_style(20.0, MUTED_COLOR, None),
     );
-    CloseButtons(true);
+    CloseButtons(true, page);
 }
 
 /// The two settings that the client keeps for itself: what shows behind the panels while no game
@@ -212,10 +227,11 @@ fn run(press: &Press) {
     }
 }
 
-/// The buttons at the bottom. Close hides the console. Disconnect ends the link while it runs. Exit
-/// closes the app. The host's menu has no Exit item, so the client adds its own.
+/// The buttons at the bottom. Close hides the console. Controls opens the page for the buttons of
+/// the controllers. Disconnect ends the link while it runs. Exit closes the app. The host's menu has
+/// no Exit item, so the client adds its own.
 #[composable]
-fn CloseButtons(link: bool) {
+fn CloseButtons(link: bool, page: MutableState<Page>) {
     Row(
         Modifier::empty().fill_max_width(),
         RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(size::GAP)),
@@ -226,6 +242,14 @@ fn CloseButtons(link: bool) {
                 || hub().close_console(),
                 || {
                     Text("Close", Modifier::empty(), bold(22.0));
+                },
+            );
+            Button(
+                Modifier::empty().height(size::BUTTON).background(KEY_COLOR).rounded_corners(12.0).weight(1.0),
+                ButtonSpec::default(),
+                move || page.set(Page::Controls(ControlHand::Right)),
+                || {
+                    Text("Controls", Modifier::empty(), bold(22.0));
                 },
             );
             if link {
@@ -246,6 +270,103 @@ fn CloseButtons(link: bool) {
                     Text("Exit", Modifier::empty(), bold(22.0));
                 },
             );
+        },
+    );
+}
+
+/// The page for the buttons of the controllers: the two controllers as tabs, and for each input of
+/// the shown controller the action that it does, with a button on each side that picks the previous
+/// or the next action. The Mac's app keeps the mapping, so a change goes to it. Without a link the
+/// page shows the mapping that the headset kept and changes nothing.
+#[composable]
+fn ControlsPage(page: MutableState<Page>, hand: ControlHand, controls: Controls, editable: bool) {
+    Text("Controls", Modifier::empty().height(size::TITLE), bold(34.0));
+    Row(
+        Modifier::empty().fill_max_width(),
+        RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(size::GAP)),
+        move || {
+            for tab in ControlHand::BOTH {
+                Button(
+                    Modifier::empty().height(size::BUTTON).background(if tab == hand { ACCENT_COLOR } else { KEY_COLOR }).rounded_corners(12.0).weight(1.0),
+                    ButtonSpec::default(),
+                    move || page.set(Page::Controls(tab)),
+                    move || {
+                        Text(tab.label(), Modifier::empty(), bold(22.0));
+                    },
+                );
+            }
+        },
+    );
+    for control in Control::ALL {
+        ControlRow(hand, control, controls, editable);
+    }
+    let (first, second) = if editable {
+        ("A game still gets every button.", "A mouse action works where the controller points.")
+    } else {
+        ("Connect to the Mac to change the buttons.", "A game still gets every button.")
+    };
+    Text(first, Modifier::empty().height(size::TEXT), text_style(20.0, MUTED_COLOR, None));
+    Text(second, Modifier::empty().height(size::TEXT), text_style(20.0, MUTED_COLOR, None));
+    Row(
+        Modifier::empty().fill_max_width(),
+        RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(size::GAP)),
+        move || {
+            if editable {
+                Button(
+                    Modifier::empty().height(size::BUTTON).background(KEY_COLOR).rounded_corners(12.0).weight(1.0),
+                    ButtonSpec::default(),
+                    || hub().reset_controls(),
+                    || {
+                        Text("Standard", Modifier::empty(), bold(22.0));
+                    },
+                );
+            }
+            Button(
+                Modifier::empty().height(size::BUTTON).background(KEY_COLOR).rounded_corners(12.0).weight(1.0),
+                ButtonSpec::default(),
+                move || page.set(Page::Main),
+                || {
+                    Text("Back", Modifier::empty(), bold(22.0));
+                },
+            );
+        },
+    );
+}
+
+/// One input of a controller with the action that it does. The right controller has no menu button:
+/// its row says so and keeps the row's height, so the page does not change its size with the tab.
+#[composable]
+fn ControlRow(hand: ControlHand, control: Control, controls: Controls, editable: bool) {
+    let action = controls.action(hand, control);
+    let exists = control.exists(hand);
+    Row(
+        Modifier::empty().fill_max_width().height(size::BUTTON),
+        RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(size::GAP)),
+        move || {
+            Text(control.label(hand), Modifier::empty().width(CONTROL_LABEL).padding_symmetric(0.0, 8.0), text_style(20.0, TEXT_COLOR, None));
+            if !exists {
+                Text("This controller has none", Modifier::empty().weight(1.0).padding_symmetric(0.0, 8.0), text_style(20.0, MUTED_COLOR, None));
+            } else if editable {
+                Button(
+                    Modifier::empty().width(STEP).height(size::BUTTON).background(KEY_COLOR).rounded_corners(12.0),
+                    ButtonSpec::default(),
+                    move || hub().step_control(hand, control, -1),
+                    || {
+                        Text("<", Modifier::empty(), bold(22.0));
+                    },
+                );
+                Text(action.label(), Modifier::empty().weight(1.0).padding_symmetric(0.0, 8.0), bold(20.0));
+                Button(
+                    Modifier::empty().width(STEP).height(size::BUTTON).background(KEY_COLOR).rounded_corners(12.0),
+                    ButtonSpec::default(),
+                    move || hub().step_control(hand, control, 1),
+                    || {
+                        Text(">", Modifier::empty(), bold(22.0));
+                    },
+                );
+            } else {
+                Text(action.label(), Modifier::empty().weight(1.0).padding_symmetric(0.0, 8.0), bold(20.0));
+            }
         },
     );
 }

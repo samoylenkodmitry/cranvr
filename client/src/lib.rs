@@ -18,6 +18,7 @@ mod audio;
 mod connection;
 mod console;
 mod console_panel;
+mod controls;
 mod desktop;
 mod discovery;
 mod focus;

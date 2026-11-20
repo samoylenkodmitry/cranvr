@@ -607,6 +607,11 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
                 desktop.on_pointer(pointer);
             }
         }
+        Incoming::Datagram(ClientDatagram::Mouse(mouse)) => {
+            if let Some(desktop) = session.desktop.get() {
+                desktop.on_mouse(mouse);
+            }
+        }
         Incoming::Control(ClientMsg::Views(v)) => shared.emit(Event::Views(views_config(&v))),
         Incoming::Control(ClientMsg::Bye) => session.stop(),
         Incoming::Control(ClientMsg::Floor(height)) if height.is_finite() => {

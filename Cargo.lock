@@ -1244,6 +1244,7 @@ version = "0.1.0"
 dependencies = [
  "cranpose",
  "cranpose-core",
+ "cranvr-common",
  "dispatch2",
  "local-ip-address",
  "objc2 0.6.5",
@@ -1256,6 +1257,10 @@ dependencies = [
 [[package]]
 name = "cranvr-common"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "cranvr-host"

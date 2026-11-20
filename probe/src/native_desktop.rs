@@ -11,11 +11,12 @@
 //!   the sound is on arrival.
 
 use crate::native::now_ns;
+use cranvr_common::controls;
 use cranvr_proto::{
     clock::ClockSync,
     link::ClientLink,
     media::Received,
-    message::{Audio, ClientMsg, Cursor, DesktopParams, DesktopWish, HostMsg, Pointer, DESKTOP_STREAM},
+    message::{Audio, ClientDatagram, ClientMsg, Cursor, DesktopParams, DesktopWish, HostMsg, Mouse, Pointer, DESKTOP_STREAM},
 };
 use cranvr_vt::{DecodedFrame, Decoder};
 use std::{
@@ -213,28 +214,45 @@ impl DesktopProbe {
         }
     }
 
-    /// Plays the pointer script until `stop`: the controller circles over the panel at 120 Hz. Once
-    /// a second the trigger goes down for 200 ms. The thumbstick leans forward for a second, then
-    /// back for a second.
-    pub fn pointer_script(send: impl Fn(Pointer) + Send + 'static, stopped: impl Fn() -> bool + Send + 'static) {
+    /// Plays the pointer script until `stop`: the controller circles over the panel at 120 Hz. A
+    /// script of six seconds repeats. The left button goes down for 200 ms at the end of the first
+    /// second, the right button at the end of the third and the middle button at the end of the
+    /// fifth. The thumbstick leans forward for a second, then back for a second, and leans to the
+    /// right in the first three seconds of the six and to the left in the others. A probe of
+    /// protocol version 6 or older sends the older `Pointer`: a trigger for the left button and one
+    /// axis. `mouse` says that the host reads `Mouse`.
+    pub fn pointer_script(mouse: bool, send: impl Fn(ClientDatagram) + Send + 'static, stopped: impl Fn() -> bool + Send + 'static) {
         thread::Builder::new()
             .name("pointer-script".into())
             .spawn(move || {
                 let start = Instant::now();
                 let (mut seq, mut next) = (0u32, start);
+                let datagram = |seq: u32, hit: Option<[f32; 2]>, buttons: u8, scroll: [f32; 2]| {
+                    if mouse {
+                        ClientDatagram::Mouse(Mouse { seq, sent: now_ns(), hit, buttons, scroll })
+                    } else {
+                        ClientDatagram::Pointer(Pointer { seq, sent: now_ns(), hit, trigger: f32::from(buttons & controls::mouse::LEFT), scroll: scroll[1] })
+                    }
+                };
                 while !stopped() {
                     let t = start.elapsed().as_secs_f32();
                     let angle = t * std::f32::consts::TAU / 4.0;
                     let hit = Some([0.5 + 0.3 * angle.cos(), 0.5 + 0.3 * angle.sin()]);
-                    let trigger = if t % 1.0 > 0.8 { 1.0 } else { 0.0 };
-                    let scroll = if t % 2.0 < 1.0 { 0.5 } else { -0.5 };
-                    send(Pointer { seq, sent: now_ns(), hit, trigger, scroll });
+                    let in_turn = t % 6.0;
+                    let pressed = |from: f32| (from..from + 0.2).contains(&in_turn);
+                    let buttons = [(0.8, controls::mouse::LEFT), (2.8, controls::mouse::RIGHT), (4.8, controls::mouse::MIDDLE)]
+                        .into_iter()
+                        .filter(|(from, _)| pressed(*from))
+                        .fold(0, |bits, (_, bit)| bits | bit);
+                    let forward = if t % 2.0 < 1.0 { 0.5 } else { -0.5 };
+                    let across = if in_turn < 3.0 { 0.5 } else { -0.5 };
+                    send(datagram(seq, hit, buttons, [across, forward]));
                     seq = seq.wrapping_add(1);
                     next += Duration::from_secs_f32(1.0 / POINTER_HZ);
                     thread::sleep(next.saturating_duration_since(Instant::now()));
                 }
-                // A pointer that leaves the panel lets the button go
-                send(Pointer { seq, sent: now_ns(), hit: None, trigger: 0.0, scroll: 0.0 });
+                // A pointer that leaves the panel lets the buttons go
+                send(datagram(seq, None, 0, [0.0; 2]));
             })
             .ok();
     }

@@ -65,6 +65,8 @@ pub struct Options {
     /// menu: the probe tells the host, sends no tracking and no input, and counts the frames that
     /// still arrive
     pub pause: Option<(f32, f32)>,
+    /// Pulls the left trigger once: when it starts and how long it stays, in seconds
+    pub left_trigger: Option<(f32, f32)>,
 }
 
 /// The probe's clock runs this far ahead of the process clock, as a headset's clock has its own
@@ -159,6 +161,7 @@ struct Shared {
     face_source: tracked::FaceSource,
     sent_tracking: [AtomicU64; 4],
     pause: Option<(f32, f32)>,
+    left_trigger: Option<(f32, f32)>,
     /// Frames of the eye stream that arrived, for the pause test
     units_seen: AtomicU64,
     /// What the pause test measured: frames that arrived in the first 0.3 s of the pause, frames
@@ -268,6 +271,7 @@ pub fn run(o: Options) -> i32 {
         face_source: o.face_source,
         sent_tracking: Default::default(),
         pause: o.pause,
+        left_trigger: o.left_trigger,
         units_seen: AtomicU64::new(0),
         pause_result: Mutex::new(None),
     });
@@ -284,8 +288,10 @@ pub fn run(o: Options) -> i32 {
     if let Some(desktop) = &shared.desktop {
         desktop.ask(&shared.link);
         let (send, stop) = (Arc::clone(&shared), Arc::clone(&shared));
+        let mouse = shared.link.welcome.version >= cranvr_proto::MOUSE_VERSION;
         DesktopProbe::pointer_script(
-            move |p| drop(send.link.duplex.send_datagram(&ClientDatagram::Pointer(p))),
+            mouse,
+            move |datagram| drop(send.link.duplex.send_datagram(&datagram)),
             move || stop.stop.load(Ordering::Relaxed),
         );
     }
@@ -614,7 +620,15 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
             let mut input = Input { sample_time, ..Default::default() };
             // A headset with no controller reports every input at rest
             if controllers {
-                input.hands[0] = HandInput { grip: on(1.0), buttons: buttons::GRIP_CLICK * u32::from(held), ..Default::default() };
+                // The left trigger's pull, once, for a game that waits for the first press of that hand
+                let pulled = shared.left_trigger.is_some_and(|(at, length)| (at..at + length).contains(&t));
+                input.hands[0] = HandInput {
+                    grip: on(1.0),
+                    trigger: if pulled { 1.0 } else { 0.0 },
+                    buttons: (buttons::GRIP_CLICK * u32::from(held)) | (buttons::TRIGGER_CLICK * u32::from(pulled)),
+                    touches: buttons::TRIGGER_CLICK * u32::from(pulled),
+                    ..Default::default()
+                };
                 input.hands[1] = HandInput {
                     trigger: on(0.75),
                     stick: [on(0.5), 0.0],

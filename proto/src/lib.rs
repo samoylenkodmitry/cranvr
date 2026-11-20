@@ -70,7 +70,15 @@ pub use wire::{Error, Nanos};
 /// of the message enums, so a peer of version 4 or 5 skips them and the two still talk. The host
 /// sends a wish only to a client of version 6, and a client of version 6 offers features only to a
 /// host that answered with version 6.
-pub const PROTOCOL_VERSION: u16 = 6;
+///
+/// Version 7 adds the datagram [`message::ClientDatagram::Mouse`]: the buttons of the Mac's mouse
+/// (left, right, middle) and a thumbstick's lean in two axes. The client sends it to a host of
+/// version 7 in place of the older `Pointer`, which carries a trigger and one axis. The host reads
+/// both.
+pub const PROTOCOL_VERSION: u16 = 7;
+
+/// The first protocol version with [`message::ClientDatagram::Mouse`].
+pub const MOUSE_VERSION: u16 = 7;
 
 /// The oldest protocol version this crate still speaks.
 pub const MIN_PROTOCOL_VERSION: u16 = 4;

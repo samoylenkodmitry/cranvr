@@ -274,7 +274,7 @@ fn a_peer_of_another_version_is_told_so() {
     let addr = listener.local_addr().unwrap();
     let host = thread::spawn(move || listener.accept().err());
     let mut raw = TcpStream::connect(addr).unwrap();
-    raw.write_all(&client_preamble(VersionRange { min: 7, max: 9 })).unwrap();
+    raw.write_all(&client_preamble(VersionRange { min: cranvr_proto::PROTOCOL_VERSION + 1, max: cranvr_proto::PROTOCOL_VERSION + 3 })).unwrap();
     let mut answer = [0u8; HOST_PREAMBLE_LEN];
     raw.read_exact(&mut answer).unwrap();
     let (chosen, range) = parse_host_preamble(&answer).unwrap();
@@ -489,10 +489,10 @@ fn a_probe_of_a_host_of_another_version_gets_its_versions_and_no_key() {
         let (mut tcp, _) = listener.accept().unwrap();
         let mut hello = [0u8; CLIENT_PREAMBLE_LEN];
         tcp.read_exact(&mut hello).unwrap();
-        tcp.write_all(&host_preamble(None, VersionRange { min: 7, max: 9 })).unwrap();
+        tcp.write_all(&host_preamble(None, VersionRange { min: cranvr_proto::PROTOCOL_VERSION + 1, max: cranvr_proto::PROTOCOL_VERSION + 3 })).unwrap();
     });
     let probe = probe_host(addr, WAIT).unwrap();
-    assert_eq!((probe.versions, probe.key), (VersionRange { min: 7, max: 9 }, None));
+    assert_eq!((probe.versions, probe.key), (VersionRange { min: cranvr_proto::PROTOCOL_VERSION + 1, max: cranvr_proto::PROTOCOL_VERSION + 3 }, None));
     host.join().unwrap();
 }
 

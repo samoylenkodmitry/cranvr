@@ -27,6 +27,7 @@ use cranpose_xr::{
     local_haptics, local_headset_properties, local_spatial_capabilities, local_spatial_environment, FollowMode, FollowTarget, FollowingSubspace, Pose,
     SpatialFrameEffect, SpatialPanel, StreamedScene, SubspaceModifier,
 };
+use cranvr_common::controls::Action as ControlAction;
 use cranvr_proto::clock::now_ns;
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
@@ -79,6 +80,11 @@ pub fn ClientApp() {
     let console = rememberMutableStateOf(|| hub().console());
     let backdrop = rememberMutableStateOf(|| hub().backdrop());
     let panels_shown = rememberMutableStateOf(settings::panels_shown);
+    // The address field of the connect panel is open. The Keyboard action of a button opens and
+    // closes it too, so the state belongs to the app and not to the panel.
+    let typing = rememberMutableStateOf(settings::address_entry_on_launch);
+    // Counts the Recenter actions. Each count makes the panels' subspace snap in front of the head again.
+    let recenters = rememberMutableStateOf(|| 0u32);
     // The hands belong to the game while the host asks for them (see `hands.rs`): then no panel
     // stands where a pinch could press it
     let hands_in_game = rememberMutableStateOf(|| false);
@@ -93,6 +99,9 @@ pub fn ClientApp() {
             console.set(hub().console());
             backdrop.set(hub().backdrop());
             hands_in_game.set(hands::belong_to_game(hub().feed.wish(), hub().feed.hand_points()));
+            for fire in hub().take_fires() {
+                run_fire(fire.action, panels_shown, typing, recenters);
+            }
             delay(CONSOLE_POLL).await;
         }
     });
@@ -108,18 +117,44 @@ pub fn ClientApp() {
         // the Mac asks them to compare.
         let streaming = snapshot.get().state == LinkState::Streaming;
         let room_for_panels = !hands_in_game.get();
-        if room_for_panels && (panels_shown.get() || !streaming) {
-            ConnectPanel(snapshot, address);
-        }
-        if room_for_panels && panels_shown.get() {
-            StatsPanel(snapshot);
-        }
-        crate::desktop::DesktopPanel();
+        // The panels stand in a subspace of their own, which leaves the composition at a recenter
+        // and snaps in front of the head again when it comes back. The game's picture and the
+        // frame effect stay in the outer one, so a recenter does not touch the stream.
+        key(recenters.get(), move || {
+            FollowingSubspace(FollowTarget::View(FollowMode::Snap), move || {
+                if room_for_panels && (panels_shown.get() || !streaming) {
+                    ConnectPanel(snapshot, address, typing);
+                }
+                if room_for_panels && panels_shown.get() {
+                    StatsPanel(snapshot);
+                }
+                crate::desktop::DesktopPanel();
+            });
+        });
         ConsolePanel(console, snapshot);
         Behind(backdrop, frames);
     });
     if !hands_in_game.get() {
         PanelsBall(panels_shown);
+    }
+}
+
+/// Does a headset action that a button fired (see `controls.rs`). The console opens in the frame
+/// loop, so it is not here.
+fn run_fire(action: ControlAction, panels_shown: MutableState<bool>, typing: MutableState<bool>, recenters: MutableState<u32>) {
+    match action {
+        ControlAction::Panels => {
+            let shown = !panels_shown.get();
+            panels_shown.set(shown);
+            settings::remember_panels_shown(shown);
+        }
+        ControlAction::Keyboard => {
+            // The panels show for the keyboard, for this run only
+            panels_shown.set(true);
+            typing.set(!typing.get());
+        }
+        ControlAction::Recenter => recenters.set(recenters.get().wrapping_add(1)),
+        _ => {}
     }
 }
 
@@ -187,6 +222,7 @@ fn PhonePicture(frames: MutableState<Option<DecodedFrames>>) {
 /// phone's screen is lower than a panel.
 #[composable]
 fn PhonePanels(snapshot: MutableState<Snapshot>, address: TextFieldState, panels: MutableState<bool>) {
+    let typing = rememberMutableStateOf(settings::address_entry_on_launch);
     let left = remember(|| ScrollState::new(0.0)).with(|state| *state);
     let right = remember(|| ScrollState::new(0.0)).with(|state| *state);
     Row(
@@ -199,7 +235,7 @@ fn PhonePanels(snapshot: MutableState<Snapshot>, address: TextFieldState, panels
                 Modifier::empty().weight(1.0).fill_max_height().vertical_scroll(left, false).clickable(|_| {}),
                 ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(16.0)),
                 move || {
-                    ConnectBody(snapshot, address, Modifier::empty().fill_max_width(), false);
+                    ConnectBody(snapshot, address, Modifier::empty().fill_max_width(), false, typing);
                     PhoneButtons(panels);
                 },
             );
@@ -372,12 +408,12 @@ fn address_field() -> TextFieldState {
 /// The connect panel: the Macs that the search found, and the address field with its keypad behind a
 /// button. The app owns the address field (`address_field`).
 #[composable]
-fn ConnectPanel(snapshot: MutableState<Snapshot>, address: TextFieldState) {
+fn ConnectPanel(snapshot: MutableState<Snapshot>, address: TextFieldState, typing: MutableState<bool>) {
     let pose = remember(|| place::start_pose("connect", side_pose(-1.0))).with(|pose| *pose);
     let size = rememberMutableStateOf(|| place::start_size("connect", CONNECT_SIZE));
     SpatialPanel(
         place::movable("connect", place::resizable("connect", size, CONNECT_SIZE), pose, |_| {}),
-        move || ConnectBody(snapshot, address, Modifier::empty().fill_max_size(), true),
+        move || ConnectBody(snapshot, address, Modifier::empty().fill_max_size(), true, typing),
     );
 }
 
@@ -386,12 +422,11 @@ fn ConnectPanel(snapshot: MutableState<Snapshot>, address: TextFieldState) {
 /// behind the small button "Enter an address", for a headset on USB and for another network. It
 /// replaces the list while it shows. `keypad` adds the keypad of a headset.
 #[composable]
-fn ConnectBody(snapshot: MutableState<Snapshot>, address: TextFieldState, modifier: Modifier, keypad: bool) {
+fn ConnectBody(snapshot: MutableState<Snapshot>, address: TextFieldState, modifier: Modifier, keypad: bool, typing: MutableState<bool>) {
     let snap = snapshot.get();
     let state = snap.state.clone();
     let found = usb::entries(&snap.found, snap.usb.as_ref());
     let path = snap.path;
-    let typing = rememberMutableStateOf(settings::address_entry_on_launch);
     Column(
         modifier.background(PANEL_COLOR).rounded_corners(24.0).padding(36.0),
         ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(20.0)),

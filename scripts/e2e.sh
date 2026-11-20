@@ -56,9 +56,12 @@
 #                 With --game the fake game keeps running through the pause.
 #   --desktop     the host shows this Mac's screen. The probe asks for the desktop stream, plays a
 #                 pointer script (the host only logs its mouse events: CRANVR_POINTER_DRY_RUN) and
-#                 counts the Mac's sound. It counts every frame of the right size, since the
-#                 desktop scene draws no eye badges. The run fails when the probe gets the sound
-#                 for less than 80 percent of the stream time. --host-arg --virtual-display
+#                 counts the Mac's sound. The script presses the left, right and middle buttons and
+#                 leans the thumbstick in both axes. A run of 14 seconds or more fails when the host's
+#                 log shows no press of one button, no scroll in one axis or a press without its
+#                 release. It counts every frame of the right size, since the desktop scene draws no
+#                 eye badges. The run fails when the probe gets the sound for less than 80 percent of
+#                 the stream time. --host-arg --virtual-display
 #                 --host-arg 1920x1080 shows a virtual display instead of the main one.
 #   --quest       the client is cranvr's Cranpose client (dev.cranvr.client, see
 #                 scripts/build-client.sh) on a Quest attached by USB. The Quest and the Mac must
@@ -455,12 +458,35 @@ if [[ ${client} == quest ]]; then
     model=$("${adb_cmd[@]}" shell getprop ro.product.model | tr -d '\r')
     extra+=(serial=${serial} "model=${model}" device_celsius_before=${celsius_before} device_celsius_after=$(celsius))
 fi
+# The probe's pointer script presses the left, right and middle buttons and leans the thumbstick in
+# both axes. The host logs what it would have injected (a dry run). Each kind must show, once the run
+# lasts for two turns of the script.
+mouse_exit=0
+if (( desktop )) && [[ ${client} == mac ]]; then
+    python3 -I - "${work}/host.out" "${seconds}" <<'PYTHON' || mouse_exit=1
+import re, sys
+text = open(sys.argv[1], errors="replace").read()
+totals = [0] * 7
+for m in re.finditer(r"mouse events: (\d+) moves, (\d+) downs \((\d+) right, (\d+) middle\), (\d+) ups, (\d+) px scrolled, (\d+) px scrolled across", text):
+    totals = [a + int(b) for a, b in zip(totals, m.groups())]
+moves, downs, right, middle, ups, forward, across = totals
+print(f"host: mouse events (dry run): {moves} moves, {downs} downs ({right} right, {middle} middle), {ups} ups, {forward} px scrolled, {across} px scrolled across")
+if int(sys.argv[2]) >= 14:
+    missing = [name for name, n in [("left", downs - right - middle), ("right", right), ("middle", middle), ("up and down scroll", forward), ("sideways scroll", across)] if n <= 0]
+    # The last press may go down in the window of the last log line and up after it
+    unpaired = abs(ups - downs) > 1
+    if missing or unpaired:
+        print("the host injected no " + " and no ".join(missing) + (" and its ups differ from its downs" if unpaired else ""), file=sys.stderr)
+        sys.exit(1)
+PYTHON
+fi
 result=0
 python3 -I "${root}/scripts/e2e-report.py" "${work}/host.out" "${fps}" "${report}" "${extra[@]}" || result=$?
 # A pause empties some of the host's 5-second windows, so the report's frame rate says nothing then: the
 # probe's verdict on the pause counts, and it is part of the probe's exit code
 [[ -z ${pause} ]] || result=0
 (( client_exit == 0 )) || result=1
+(( mouse_exit == 0 )) || result=1
 (( game_exit == 0 )) || result=1
 (( tracking_exit == 0 )) || result=1
 (( openvr_exit == 0 )) || result=1
