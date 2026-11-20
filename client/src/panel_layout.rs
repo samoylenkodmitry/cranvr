@@ -92,10 +92,11 @@ impl Layout {
         self.pinned.map_or(String::new(), |stream| stream.to_string())
     }
 
-    /// Reads the saved layout from the preferences.
-    pub fn load(old_panels_shown: Option<bool>) -> Self {
+    /// Reads the saved layout from the preferences. The ball of the earlier versions saved its choice
+    /// under `panels`.
+    pub fn load() -> Self {
         let get = |key: &str| preferences().get(key);
-        Self::from_saved(get(ROOM_KEY).as_deref(), get(PINNED_KEY).as_deref(), old_panels_shown)
+        Self::from_saved(get(ROOM_KEY).as_deref(), get(PINNED_KEY).as_deref(), get("panels").map(|text| text != "hidden"))
     }
 
     /// Keeps the room's choice and the pinned display for the next start.

@@ -21,6 +21,8 @@ pub const STRIP: u32 = 4;
 pub const DISPLAY: u32 = 8;
 
 static HOVERED: AtomicU64 = AtomicU64::new(0);
+/// When a pointer was last over a panel, in milliseconds on the headset's clock, or 0
+static LAST_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Marks the panel `id` as hovered or not.
 pub fn set(id: u32, hovered: bool) {
@@ -29,6 +31,20 @@ pub fn set(id: u32, hovered: bool) {
         HOVERED.fetch_or(bit, Ordering::Relaxed);
     } else {
         HOVERED.fetch_and(!bit, Ordering::Relaxed);
+    }
+}
+
+/// Notes that a pointer is over a panel at `now_ms`. The frame loop calls it for each frame in which
+/// a panel is hovered.
+pub fn mark(now_ms: u64) {
+    LAST_MS.store(now_ms.max(1), Ordering::Relaxed);
+}
+
+/// How long no pointer has been over a panel, or `None` before the first time.
+pub fn idle_for(now_ms: u64) -> Option<std::time::Duration> {
+    match LAST_MS.load(Ordering::Relaxed) {
+        0 => None,
+        last => Some(std::time::Duration::from_millis(now_ms.saturating_sub(last))),
     }
 }
 
@@ -80,5 +96,8 @@ mod tests {
         set(STRIP, true);
         clear();
         assert!(!any());
+        assert_eq!(idle_for(5000), None);
+        mark(1000);
+        assert_eq!(idle_for(5000), Some(std::time::Duration::from_secs(4)));
     }
 }

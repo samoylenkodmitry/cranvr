@@ -62,13 +62,11 @@ pub struct PanelHold {
     pressing: [bool; 2],
     /// When each hand's ray was last on a panel
     hovered_at: [Option<Duration>; 2],
-    /// When any hand's ray was last on a panel
-    any_hover_at: Option<Duration>,
 }
 
 impl Default for PanelHold {
     fn default() -> Self {
-        Self { driver: 1, down: [false; 2], pressing: [false; 2], hovered_at: [None; 2], any_hover_at: None }
+        Self { driver: 1, down: [false; 2], pressing: [false; 2], hovered_at: [None; 2] }
     }
 }
 
@@ -91,7 +89,6 @@ impl PanelHold {
         }
         if frame.hover {
             self.hovered_at[self.driver] = Some(frame.time);
-            self.any_hover_at = Some(frame.time);
         }
         let hover_within = |hand: usize, within: Duration| self.hovered_at[hand].is_some_and(|at| frame.time.saturating_sub(at) <= within);
         for hand in 0..2 {
@@ -108,11 +105,6 @@ impl PanelHold {
             held[hand] = self.pressing[hand] || hover_within(hand, delay);
         }
         held
-    }
-
-    /// How long no hand's ray has been on a panel, or `None` before the first time.
-    pub fn idle(&self, now: Duration) -> Option<Duration> {
-        self.any_hover_at.map(|at| now.saturating_sub(at))
     }
 
     /// Forgets everything: the app lost the input focus, or the link ended.
@@ -220,15 +212,5 @@ mod tests {
         let mut hold = PanelHold::default();
         hold.update(&frame(0, true, [0.0, 0.0]));
         assert_eq!(hold.update(&frame(1000, false, [0.0, 0.0])), [false, false]);
-    }
-
-    #[test]
-    fn the_idle_time_counts_from_the_last_hover() {
-        let mut hold = PanelHold::default();
-        assert_eq!(hold.idle(Duration::from_secs(5)), None);
-        hold.update(&frame(1000, true, [0.0, 0.0]));
-        assert_eq!(hold.idle(Duration::from_millis(4000)), Some(Duration::from_secs(3)));
-        hold.reset();
-        assert_eq!(hold.idle(Duration::from_secs(9)), None);
     }
 }
