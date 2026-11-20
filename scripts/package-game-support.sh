@@ -181,7 +181,8 @@ dxmt_commit=$(git -C "${runtime}/build/dxmt/src" rev-parse HEAD)
     print "reference space, which is the LOCAL space that cranvr-host already puts the floor at height 0 in."
     print "Patch 0008 lets an action set attach to a session after the session that held it was destroyed: an OpenVR"
     print "game with an action manifest (IVRInput) reaches OpenComposite, which does exactly that at the game's first frame."
-    print "Patch 0009 offers XR_FB_display_refresh_rate with the headset's rate as the only rate."
+    print "Patch 0009 offers XR_FB_display_refresh_rate with the headset's rate as the only rate. Patch 0010 logs the"
+    print "bound actions of a game and the first input that reaches each of them."
 } > "${root}/SOURCES.md"
 
 print -r -- "${version}" > "${root}/VERSION"

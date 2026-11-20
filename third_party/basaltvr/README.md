@@ -96,6 +96,10 @@ applies these patches and builds both parts.
 
 - The runtime offers `XR_FB_display_refresh_rate`. The headset's rate (the control file's refresh rate) is the only rate: `xrEnumerateDisplayRefreshRatesFB` lists it, `xrGetDisplayRefreshRateFB` returns it, and `xrRequestDisplayRefreshRateFB` accepts it and 0 (the default). A request for another rate returns `XR_ERROR_DISPLAY_REFRESH_RATE_UNSUPPORTED_FB`, which the extension allows for a rate that is not on the list. A Unity game that uses the extension asked for it and got `extension not enabled`. OpenComposite reads the rate from it.
 
+`0010-log-what-reaches-the-game.patch`
+
+- The runtime writes to stderr, which the cranvr app keeps as the game's log (`game.err.log`), what a game's input does. At the first `xrAttachSessionActionSets` of a session it tells how many action sets and actions are attached and how many actions have a binding for the Touch controllers. It tells when a controller joins or leaves (`xrSyncActions` sees its profile). For each action of each hand it tells the first time that the action is active and its first two changes, with the value (pressed, a float, a vector or a tracked pose). Each kind stops after 80 lines. A game that binds nothing, or whose bindings no controller input reaches, shows no such line.
+
 ## patches/dxmt
 
 `0005-public-atomic-for-new-metal-compiler.patch`: DXMT 0.80 calls a private Metal builtin
