@@ -10,7 +10,7 @@ use crate::{
     connection::Connection,
     console::{Action, Backdrop, Console, Menu, Room, View as ConsoleView, Volume},
     controls::{Fire, Runner},
-    desktop::desktop,
+    displays::displays,
     discovery::FoundHost,
     settings,
     tracking::{Display, Feed},
@@ -737,6 +737,18 @@ impl Hub {
         self.console.lock().unwrap().close();
     }
 
+    /// Opens the console, as the hand menu asks. A game's start closes it again.
+    pub fn open_console(&self) {
+        self.console.lock().unwrap().open();
+    }
+
+    /// Opens the console on its page of the controls, or turns an open console to it.
+    pub fn open_controls(&self) {
+        log::info!("the hand menu asks for the page of the controls");
+        crate::console::request_controls_page();
+        self.console.lock().unwrap().open();
+    }
+
     /// Opens the console and keeps it open when the link ends (see `settings::console_on_launch`).
     pub fn pin_console(&self) {
         self.console.lock().unwrap().pin();
@@ -744,7 +756,7 @@ impl Hub {
 
     /// What decides the room behind the panels: the user's choice and whether a game runs.
     pub fn backdrop(&self) -> Backdrop {
-        self.console.lock().unwrap().backdrop(desktop().game_hides())
+        self.console.lock().unwrap().backdrop(displays().game_runs())
     }
 
     /// Takes the saved choices of the console's Room and Volume settings and applies them. The

@@ -29,8 +29,8 @@ use cranvr_proto::{
     link::{ClientLink, ClientSide, ConnectObserver, Incoming},
     media::{FrameReceiver, Received},
     message::{
-        ClientCaps, ClientDatagram, ClientMsg, FrameTiming, HostDatagram, HostMsg, LossReport, Ping, Pong, RejectReason,
-        StreamParams, Views, DESKTOP_STREAM, UPDATE_HEADSET, UPDATE_MAC,
+        display_index, display_stream, ClientCaps, ClientDatagram, ClientMsg, FrameTiming, HostDatagram, HostMsg, LossReport, Ping, Pong, RejectReason,
+        StreamParams, Views, UPDATE_HEADSET, UPDATE_MAC,
     },
     media::LostUnit,
     wire::{Codec, Error, Nanos},
@@ -588,9 +588,9 @@ fn session(hub: &'static Hub, id: u64, link: &ClientLink, device: Device, hello_
     shared.set_stream(&stream);
     let shared = &shared;
     let (units_tx, units_rx) = mpsc::channel::<Received>();
-    // The desktop panel and the sound have their own state (desktop.rs, audio.rs)
-    // Only a headset shows the desktop panel
-    let desktop_units = crate::desktop::desktop().session_start(device == Device::Headset);
+    // The displays and the sound have their own state (displays.rs, audio.rs)
+    // Only a headset shows the displays
+    let display_units = crate::displays::displays().session_start(device == Device::Headset);
     // Only a headset or a phone plays the sound. A flat window on the Mac that runs the host would
     // play what the host captures. The host would capture it again: an echo that grows.
     if let (Some(format), true) = (stream.audio, device.is_live()) {
@@ -612,16 +612,21 @@ fn session(hub: &'static Hub, id: u64, link: &ClientLink, device: Device, hello_
             .expect("the tracking thread");
         named("cranvr-decode").spawn_scoped(scope, move || decode_loop(shared, &units_rx)).expect("the decoder thread");
         named("cranvr-stats").spawn_scoped(scope, move || stats_loop(shared)).expect("the stats thread");
-        named("cranvr-desktop-decode")
-            .spawn_scoped(scope, move || crate::desktop::decode_loop(&desktop_units, stop))
-            .expect("the desktop decoder thread");
-        named("cranvr-desktop-uplink").spawn_scoped(scope, move || crate::desktop::uplink(link, stop)).expect("the desktop uplink thread");
+        // Each display has a decode thread of its own: a decoder that waits for an input buffer holds up
+        // no other display and not the eye stream. A display that is not shown gets no picture, so its
+        // thread only waits.
+        for (index, units) in display_units.into_iter().enumerate() {
+            named(&format!("cranvr-display-{}", index + 1))
+                .spawn_scoped(scope, move || crate::displays::decode_loop(display_stream(index as u8), &units, stop))
+                .expect("a display's decoder thread");
+        }
+        named("cranvr-displays-uplink").spawn_scoped(scope, move || crate::displays::uplink(link, stop)).expect("the displays' uplink thread");
         let reason = read_loop(shared, units_tx, false);
         shared.stop.store(true, Ordering::Relaxed);
         link.duplex.close();
         reason
     });
-    crate::desktop::desktop().session_end();
+    crate::displays::displays().session_end();
     crate::audio::close();
     hub.feed.set_wish(cranvr_proto::tracking::Features::NONE);
     reason
@@ -654,9 +659,14 @@ fn read_loop(s: &Shared<'_>, units: mpsc::Sender<Received>, udp: bool) -> Error 
             let age = s.clock.lock().unwrap().to_local(audio.host_time).map(|at| Duration::from_nanos(now_ns().saturating_sub(at)));
             crate::audio::on_datagram(&audio, age);
         }
-        Incoming::Datagram(HostDatagram::Cursor(cursor)) => crate::desktop::desktop().on_cursor(cursor),
-        Incoming::Control(message @ (HostMsg::Desktop(_) | HostMsg::DecoderConfig { stream: DESKTOP_STREAM, .. })) => {
-            crate::desktop::desktop().on_message(&message);
+        Incoming::Datagram(HostDatagram::DisplayCursor { stream, cursor }) => crate::displays::displays().on_cursor(stream, cursor),
+        Incoming::Control(
+            message @ (HostMsg::DisplayStream { .. }
+            | HostMsg::Displays(_)
+            | HostMsg::GameRuns(_)
+            | HostMsg::DecoderConfig { stream: 1..=4, .. }),
+        ) => {
+            crate::displays::displays().on_message(&message);
         }
         Incoming::Control(HostMsg::DecoderConfig { config, .. }) => {
             *s.config.lock().unwrap() = config;
@@ -690,8 +700,8 @@ fn on_media(s: &Shared<'_>, packet: &[u8], units: &mpsc::Sender<Received>) {
     match receiver.push(packet, now_ns()) {
         Ok(Some(unit)) => {
             drop(receiver);
-            if unit.meta.stream == DESKTOP_STREAM {
-                crate::desktop::desktop().push_unit(unit);
+            if display_index(unit.meta.stream).is_some() {
+                crate::displays::displays().push_unit(unit);
             } else {
                 units.send(unit).ok();
             }
@@ -707,15 +717,15 @@ fn on_media(s: &Shared<'_>, packet: &[u8], units: &mpsc::Sender<Received>) {
     }
 }
 
-/// Asks for a key frame of each stream that lost a unit: the eye stream and the desktop stream
-/// each have their own.
+/// Asks for a key frame of each stream that lost a unit: the eye stream and each display's stream
+/// have their own.
 fn on_lost(s: &Shared<'_>, lost: &[LostUnit]) {
     if let Some(first) = lost.iter().find(|unit| unit.stream == 0) {
         s.waiting_key.store(true, Ordering::Relaxed);
         s.request_key_frame(first.frame);
     }
-    if let Some(first) = lost.iter().find(|unit| unit.stream == DESKTOP_STREAM) {
-        crate::desktop::desktop().on_lost(first.frame);
+    for unit in lost.iter().filter(|unit| display_index(unit.stream).is_some()) {
+        crate::displays::displays().on_lost(unit.stream, unit.frame);
     }
 }
 

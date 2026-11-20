@@ -18,15 +18,18 @@
 //! `--expect-hand-controllers` plays a game without hand code: with `cranvr-probe --tracking
 //! --no-controllers` the host must make the controllers of the probe's hands.
 //!
+//! `--expect-held` checks the host's mask: with the probe's `--hold-script`, the right hand's presses
+//! that belong to a panel must never reach the game, and the ones that belong to the game must.
+//!
 //! `--stall AT:FOR` plays a game that loads a level or compiles shaders: it sends no frame for FOR
 //! seconds from AT seconds after its start, and logs the stall's wall-clock times, so that a test can
 //! look at what the headset showed in the meantime (the host must keep the game's last picture).
 //!
-//! Usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input]
+//! Usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input] [--expect-held]
 //!        [--use-tracking FEATURES] [--release-tracking] [--expect-tracking] [--expect-hand-controllers]
 //!        [--expect-no-controllers] [--stall AT:FOR]
 
-use cranvr_common::inputs::{LEFT_SQUEEZE_VALUE_ID, LEFT_TRIGGER_VALUE_ID, RIGHT_A_CLICK_ID, RIGHT_SQUEEZE_VALUE_ID, RIGHT_THUMBSTICK_X_ID, RIGHT_TRIGGER_VALUE_ID};
+use cranvr_common::inputs::{LEFT_SQUEEZE_VALUE_ID, LEFT_TRIGGER_VALUE_ID, RIGHT_A_CLICK_ID, RIGHT_B_CLICK_ID, RIGHT_SQUEEZE_VALUE_ID, RIGHT_THUMBSTICK_X_ID, RIGHT_TRIGGER_VALUE_ID};
 use cranvr_proto::wire::Motion;
 use cranvr_vt::PixelBuffer;
 use std::{
@@ -113,6 +116,8 @@ struct Input {
     profiles: [bool; 2],
     /// The last value of each button path and how often it changed
     buttons: BTreeMap<u64, (f32, u32)>,
+    /// Every value that each button path took, as f32 bits
+    values: BTreeMap<u64, Vec<u32>>,
     resets: u32,
 }
 
@@ -149,11 +154,37 @@ impl Input {
     }
 
     fn button(&mut self, path: u64, value: f32) {
+        let seen = self.values.entry(path).or_default();
+        if !seen.contains(&value.to_bits()) {
+            seen.push(value.to_bits());
+        }
         let entry = self.buttons.entry(path).or_insert((value, 0));
         if entry.0 != value {
             entry.1 += 1;
         }
         entry.0 = value;
+    }
+
+    /// Whether the path ever took `value`
+    fn took(&self, id: u64, value: f32) -> bool {
+        self.values.get(&id).is_some_and(|seen| seen.contains(&value.to_bits()))
+    }
+
+    /// What the host's masking must have done to the probe's `--hold-script`: the right hand's
+    /// panel presses (trigger 0.35 and B) never reach the game, and its game presses (trigger 0.75
+    /// and A) do. The left hand is never held.
+    fn held_problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.took(RIGHT_TRIGGER_VALUE_ID, 0.35) {
+            out.push("the right trigger reached the game at 0.35, a press that belongs to a panel".into());
+        }
+        if self.buttons.get(&RIGHT_B_CLICK_ID).is_some_and(|b| b.0 != 0.0 || self.took(RIGHT_B_CLICK_ID, 1.0)) {
+            out.push("the right B button went down in the game, a press that belongs to a panel".into());
+        }
+        if !self.took(RIGHT_TRIGGER_VALUE_ID, 0.75) || !self.took(RIGHT_A_CLICK_ID, 1.0) {
+            out.push("the right hand's presses that belong to the game did not arrive".into());
+        }
+        out
     }
 
     fn last(&self, id: u64) -> Option<f32> {
@@ -399,7 +430,7 @@ fn u32_at(b: &[u8], at: usize) -> u32 {
 impl Input {
     /// What a game without hand code must have got from the probe's hands: a controller for each
     /// hand, at the palm, with the trigger of a half-open pinch and the aim pose through the fingers
-    fn hand_controller_problems(&self) -> Vec<String> {
+    fn hand_controller_problems(&self, held: bool) -> Vec<String> {
         let mut out = Vec::new();
         if self.mask != Some(3) {
             out.push(format!("controller mask {:?}, expected both hands", self.mask));
@@ -418,7 +449,8 @@ impl Input {
             // The thumb tip and the index tip: 0.0418 m apart in the script. The trigger runs from 1
             // at 18 mm to 0 at 60 mm.
             let distance = |a: usize, b: usize| (0..3).map(|k| (joints[a].pose.position[k] - joints[b].pose.position[k]).powi(2)).sum::<f32>().sqrt();
-            let wanted = ((0.060 - distance(5, 10)) / (0.060 - 0.018)).clamp(0.0, 1.0);
+            // A hand that a panel holds back from the game makes a controller with rest values
+            let wanted = if held { 0.0 } else { ((0.060 - distance(5, 10)) / (0.060 - 0.018)).clamp(0.0, 1.0) };
             match self.last(trigger_id) {
                 Some(v) if (v - wanted).abs() < 0.01 => {}
                 other => out.push(format!("hand {side}: trigger {other:?}, expected {wanted:.3}")),
@@ -480,8 +512,9 @@ fn paint(image: &mut PixelBuffer, eye: usize) {
 }
 
 fn main() {
-    let (mut control, mut fps, mut seconds, mut expect_input) = (None, 72.0f64, 10.0f64, false);
+    let (mut control, mut fps, mut seconds, mut expect_input, mut expect_held) = (None, 72.0f64, 10.0f64, false, false);
     let (mut use_tracking, mut expect_tracking, mut expect_hand_controllers, mut expect_no_controllers) = (String::new(), false, false, false);
+    let mut expect_hand_held = false;
     let mut release_tracking = false;
     let mut stall: Option<(f64, f64)> = None;
     let mut face_source = tracked::FaceSource::default();
@@ -492,9 +525,11 @@ fn main() {
             "--fps" => fps = args.next().and_then(|v| v.parse().ok()).expect("--fps N"),
             "--seconds" => seconds = args.next().and_then(|v| v.parse().ok()).expect("--seconds N"),
             "--expect-input" => expect_input = true,
+            "--expect-held" => expect_held = true,
             "--use-tracking" => use_tracking = args.next().expect("--use-tracking FEATURES"),
             "--expect-tracking" => expect_tracking = true,
             "--expect-hand-controllers" => expect_hand_controllers = true,
+            "--expect-hand-held" => expect_hand_held = true,
             "--expect-no-controllers" => expect_no_controllers = true,
             "--release-tracking" => release_tracking = true,
             "--stall" => {
@@ -504,7 +539,7 @@ fn main() {
             }
             "--face-source" => face_source = args.next().as_deref().and_then(tracked::FaceSource::parse).expect("--face-source visual|audio|unknown"),
             _ => {
-                eprintln!("usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input] [--use-tracking FEATURES] [--expect-tracking] [--face-source visual|audio|unknown] [--expect-hand-controllers] [--expect-no-controllers] [--release-tracking] [--stall AT:FOR]");
+                eprintln!("usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input] [--expect-held] [--use-tracking FEATURES] [--expect-tracking] [--face-source visual|audio|unknown] [--expect-hand-controllers] [--expect-hand-held] [--expect-no-controllers] [--release-tracking] [--stall AT:FOR]");
                 std::process::exit(2);
             }
         }
@@ -756,7 +791,11 @@ fn main() {
         );
     }
     println!("fake-game: input: {} button paths, buttons that changed: {:?}", input.buttons.len(), input.buttons.iter().filter(|(_, b)| b.1 > 0).map(|(id, b)| (id, b.0, b.1)).collect::<Vec<_>>());
-    let problems = if expect_input { input.problems() } else { Vec::new() };
+    let mut problems = if expect_input { input.problems() } else { Vec::new() };
+    if expect_held {
+        problems.extend(input.held_problems());
+        println!("fake-game: input: the right trigger took the values {:?}", input.values.get(&RIGHT_TRIGGER_VALUE_ID).map(|v| v.iter().map(|b| f32::from_bits(*b)).collect::<Vec<_>>()));
+    }
     for problem in &problems {
         println!("fake-game: input problem: {problem}");
     }
@@ -782,7 +821,7 @@ fn main() {
         }
     }
     if expect_hand_controllers {
-        let problems = input.hand_controller_problems();
+        let problems = input.hand_controller_problems(expect_hand_held);
         for problem in &problems {
             println!("fake-game: hand controller problem: {problem}");
         }

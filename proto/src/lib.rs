@@ -13,13 +13,13 @@
 //!   (see [`media`] and [`fec`]). Over a USB link the same packets go through the TCP connection
 //!   with no parity.
 //! - **Datagrams** are small messages that may get lost. Tracking, input, frame timing, loss
-//!   reports, clock pings, haptics, the pointer on the desktop panel, the Mac's cursor and the
+//!   reports, clock pings, haptics, the mouse on the panel of a display, the Mac's cursors and the
 //!   Mac's sound use them. They share the UDP socket with the media, or the TCP connection when
 //!   UDP is off.
 //!
-//! The eye stream has the stream id 0. The Mac's desktop is a second video stream with the id
-//! [`message::DESKTOP_STREAM`]. Its units share the media path with the eye stream and have their own
-//! frame numbers, key frames and decoder configuration.
+//! The eye stream has the stream id 0. Each display of the Mac is a further video stream, from the id
+//! [`message::DESKTOP_STREAM`] on (see [`message::display_stream`]). Their units share the media path
+//! with the eye stream and have their own frame numbers, key frames and decoder configuration.
 //!
 //! Every packet on either path is sealed after the handshake: ChaCha20-Poly1305 encrypts it and
 //! authenticates it with a key that only the two sides hold. Its content starts with a kind byte
@@ -48,7 +48,15 @@ pub use wire::{Error, Nanos};
 /// refused with a message that says which side to update (see [`message::peer_must_update`]). Any
 /// change of the wire format or of a message raises it. Both ends are one project and ship from one
 /// commit, so the version tells that they do.
-pub const PROTOCOL_VERSION: u16 = 8;
+///
+/// Version 9 has the displays of the Mac: the client adds and removes displays and asks for the
+/// video of each (`ClientMsg::Display`, `ClientMsg::DisplayWish`), the host lists them and sends
+/// each one's stream parameters (`HostMsg::Displays`, `HostMsg::DisplayStream`) and the cursor of
+/// each (`HostDatagram::DisplayCursor`), the client sends the mouse of each display
+/// (`ClientDatagram::DisplayMouse`), the host says whether a game runs (`HostMsg::GameRuns`), and the
+/// client sends the controllers' input together with the hands that it holds back from the game
+/// (`ClientDatagram::InputHold`). The first display has no messages of its own.
+pub const PROTOCOL_VERSION: u16 = 9;
 
 /// The largest datagram, in bytes, sealed: the counter and the tag are in it. A media packet and
 /// any datagram message fit in it. A typical path MTU of 1500 bytes minus the IP and UDP headers

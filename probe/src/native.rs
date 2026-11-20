@@ -13,15 +13,21 @@
 //! `--drop-percent` drops that share of the media packets before the receiver sees them, so a
 //! run on loopback can show the parity at work.
 
-use crate::{badge_points, compositor, hands, native_desktop::DesktopProbe, tracked};
+use crate::{
+    badge_points, compositor,
+    displays::{DisplayPlan, DisplaySet},
+    hands,
+    native_desktop::DesktopProbe,
+    tracked,
+};
 use cranvr_common::foveation::{Foveation, FoveationConfig};
 use cranvr_proto::{
     clock::{now_ns as process_now_ns, ClockSync},
     link::{ClientLink, ClientSide, Incoming},
     media::{FrameReceiver, Received},
     message::{
-        buttons, ClientCaps, ClientDatagram, ClientMsg, FrameTiming, Focus, HandInput, HostDatagram, HostMsg, Input, LossReport, Ping, Pong,
-        Tracking, Views,
+        buttons, display_index, ClientCaps, ClientDatagram, ClientMsg, FrameTiming, Focus, HandInput, HostDatagram, HostMsg, Input, InputHold, LossReport, Ping,
+        Pong, Tracking, Views, DESKTOP_STREAM,
     },
     tracking::{BodySet, Features},
     wire::{Codec, Fov, Motion, Pose},
@@ -52,6 +58,19 @@ pub struct Options {
     pub drop_percent: f32,
     /// Ask for the desktop stream, play a pointer script and count the sound
     pub desktop: bool,
+    /// How many displays the probe shows: the first one and the ones that it asks the host to add.
+    /// It removes the last one near the end of the run. 0 and 1 mean the first display only.
+    pub displays: u8,
+    /// Against a game that runs: wish no display for the first seconds, show the displays for a
+    /// while, then hide them (see `displays.rs`)
+    pub displays_in_game: bool,
+    /// The right hand points at a panel in every other window of its script: its input is the
+    /// panel's press, which the host must hold back from the game. The fake game checks that none
+    /// of it arrives (`--expect-held`).
+    pub hold_script: bool,
+    /// Both hands point at a panel all the time: the host must make the game's controllers of the
+    /// tracked hands with rest values (`--expect-hand-held` of the fake game)
+    pub hold_hands: bool,
     /// Offer hands, body, face and eyes and send them when the host asks (see `tracked.rs`)
     pub tracking: bool,
     /// With `tracking`: no controller is tracked
@@ -161,6 +180,12 @@ struct Shared {
     stop: AtomicBool,
     /// The desktop stream and the sound, with `--desktop`
     desktop: Option<Arc<DesktopProbe>>,
+    /// The displays after the first (see `displays.rs`)
+    displays: Arc<DisplaySet>,
+    hold_script: bool,
+    hold_hands: bool,
+    /// Whether the host has said that a game runs
+    game_runs: AtomicBool,
     /// The tracking that the host asked for last, as bits of `Features`, and what the probe sent
     wish: AtomicU8,
     tracking: bool,
@@ -273,7 +298,11 @@ pub fn run(o: Options) -> i32 {
         drop_percent: o.drop_percent,
         rng: Mutex::new(Rng(0x9E37_79B9_7F4A_7C15)),
         stop: AtomicBool::new(false),
-        desktop: o.desktop.then(DesktopProbe::new),
+        desktop: (o.desktop || o.displays > 1 || o.displays_in_game).then(|| DesktopProbe::new(DESKTOP_STREAM)),
+        displays: DisplaySet::new(DisplayPlan { wanted: o.displays.max(1), in_game: o.displays_in_game }),
+        hold_script: o.hold_script,
+        hold_hands: o.hold_hands,
+        game_runs: AtomicBool::new(false),
         wish: AtomicU8::new(0),
         tracking: o.tracking,
         still_head: o.tracking || o.still_head,
@@ -298,12 +327,32 @@ pub fn run(o: Options) -> i32 {
     shared.link.duplex.send_control(&ClientMsg::Floor(PROBE_FLOOR)).ok();
 
     if let Some(desktop) = &shared.desktop {
-        desktop.ask(&shared.link);
+        // A script in a game wishes the displays itself, later
+        if !o.displays_in_game {
+            let (width, fps) = shared.displays.wish_size();
+            desktop.wish(&shared.link, true, (width, fps));
+            println!("probe: asked the host for the desktop at up to {width} pixels and {fps} pictures a second");
+        }
         let (send, stop) = (Arc::clone(&shared), Arc::clone(&shared));
         DesktopProbe::pointer_script(
+            DESKTOP_STREAM,
             move |datagram| drop(send.link.duplex.send_datagram(&datagram)),
             move || stop.stop.load(Ordering::Relaxed),
         );
+    }
+    if o.displays_in_game {
+        play_in_game(&shared, Duration::from_secs(5), Duration::from_secs(5));
+    }
+    if o.displays > 1 && !o.displays_in_game {
+        // The last display that the probe added goes again three seconds before the end
+        let (shared, at) = (Arc::clone(&shared), (o.seconds - 3.0).max(1.0));
+        thread::Builder::new()
+            .name("display-removal".into())
+            .spawn(move || {
+                thread::sleep(Duration::from_secs_f32(at));
+                shared.displays.remove_last(&shared.link);
+            })
+            .ok();
     }
     let (units, unit_receiver) = mpsc::channel::<Received>();
     // The simulated display's refresh times: this origin plus whole periods
@@ -406,7 +455,7 @@ pub fn run(o: Options) -> i32 {
             sent(3)
         );
     }
-    let desktop_ok = shared.desktop.as_ref().is_none_or(|d| d.summary());
+    let desktop_ok = shared.desktop.as_ref().is_none_or(|d| d.summary() || o.displays_in_game) && shared.displays.summary();
     let pause_ok = match (shared.pause, *shared.pause_result.lock().unwrap()) {
         (None, _) => true,
         (Some(_), None) => {
@@ -493,19 +542,44 @@ fn read_loop(shared: &Arc<Shared>, units: &mpsc::Sender<Received>, udp: bool) {
                 desktop.on_audio(&audio, &shared.clock);
             }
         }
-        Incoming::Datagram(HostDatagram::Cursor(cursor)) => {
-            if let Some(desktop) = &shared.desktop {
-                desktop.on_cursor(cursor);
+        Incoming::Datagram(HostDatagram::DisplayCursor { stream, cursor }) => match display_index(stream) {
+            Some(0) => {
+                if let Some(desktop) = &shared.desktop {
+                    desktop.on_cursor(cursor);
+                }
             }
-        }
-        Incoming::Control(HostMsg::DecoderConfig { stream, config, codec }) => {
-            if stream == cranvr_proto::message::DESKTOP_STREAM {
+            Some(_) => {
+                if let Some(display) = shared.displays.extra(stream) {
+                    display.on_cursor(cursor);
+                }
+            }
+            None => {}
+        },
+        Incoming::Control(HostMsg::DecoderConfig { stream, config, codec }) => match display_index(stream) {
+            Some(0) => {
                 if let Some(desktop) = &shared.desktop {
                     desktop.on_message(&HostMsg::DecoderConfig { stream, config, codec });
                 }
-            } else {
+            }
+            Some(_) => {
+                if let Some(display) = shared.displays.extra(stream) {
+                    display.on_message(&HostMsg::DecoderConfig { stream, config, codec });
+                }
+            }
+            None => {
                 let mut c = shared.config.lock().unwrap();
                 *c = (c.0 + 1, config);
+            }
+        },
+        Incoming::Control(HostMsg::Displays(list)) => on_display_list(shared, list),
+        Incoming::Control(message @ HostMsg::DisplayStream { stream, .. }) => {
+            if let Some(display) = shared.displays.extra(stream) {
+                display.on_message(&message);
+            }
+        }
+        Incoming::Control(HostMsg::GameRuns(runs)) => {
+            if shared.game_runs.swap(runs, Ordering::Relaxed) != runs {
+                println!("probe: the host says that a game {}", if runs { "runs" } else { "does not run" });
             }
         }
         Incoming::Control(HostMsg::Bye) => shared.stop.store(true, Ordering::Relaxed),
@@ -528,6 +602,57 @@ fn read_loop(shared: &Arc<Shared>, units: &mpsc::Sender<Received>, udp: bool) {
     if !shared.stop.load(Ordering::Relaxed) {
         println!("probe: the link ended: {reason}");
     }
+}
+
+/// The host's list of displays came: the probe's set reacts (see `displays.rs`).
+fn on_display_list(shared: &Arc<Shared>, list: cranvr_proto::message::DisplayList) {
+    let script = |stream: u8| {
+        let (send, stop) = (Arc::clone(shared), Arc::clone(shared));
+        DesktopProbe::pointer_script(stream, move |datagram| drop(send.link.duplex.send_datagram(&datagram)), move || stop.stop.load(Ordering::Relaxed));
+    };
+    shared.displays.on_list(list, &shared.link, &script);
+}
+
+/// The script of `--displays-in-game`: for `show_after` the probe wishes no display, then it shows
+/// its displays for `shown_for`, then it hides them. The counts of units that arrive in each part
+/// go to the output, for the e2e's verdict.
+fn play_in_game(shared: &Arc<Shared>, show_after: Duration, shown_for: Duration) {
+    let shared = Arc::clone(shared);
+    thread::Builder::new()
+        .name("displays-in-game".into())
+        .spawn(move || {
+            let sleep = |d: Duration| {
+                let until = Instant::now() + d;
+                while Instant::now() < until && !shared.stop.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(50));
+                }
+            };
+            let first = shared.desktop.as_ref();
+            sleep(show_after);
+            let before = shared.displays.counts(first);
+            println!("probe: in-game displays: nothing wished for {:.0} s: {} units arrived, {} pictures decoded", show_after.as_secs_f32(), before.0, before.1);
+            shared.displays.set_wished(&shared.link, first, true);
+            sleep(shown_for);
+            let shown = shared.displays.counts(first);
+            println!(
+                "probe: in-game displays: shown for {:.0} s: {} units arrived, {} pictures decoded",
+                shown_for.as_secs_f32(),
+                shown.0 - before.0,
+                shown.1 - before.1,
+            );
+            shared.displays.set_wished(&shared.link, first, false);
+            // Units that were on their way when the wish ended may still arrive
+            sleep(Duration::from_millis(1500));
+            let settled = shared.displays.counts(first);
+            sleep(Duration::from_secs(4));
+            let after = shared.displays.counts(first);
+            println!(
+                "probe: in-game displays: after the wish ended: {} units arrived in the first 1.5 s, {} in the next 4 s",
+                settled.0 - shown.0,
+                after.0 - settled.0
+            );
+        })
+        .ok();
 }
 
 fn on_media(shared: &Shared, packet: &[u8], units: &mpsc::Sender<Received>) {
@@ -559,8 +684,20 @@ fn on_lost(shared: &Shared, lost: &[cranvr_proto::media::LostUnit]) {
         shared.waiting_key.store(true, Ordering::Relaxed);
         shared.request_key_frame(first.frame);
     }
-    if let (Some(first), Some(desktop)) = (lost.iter().find(|l| l.stream != 0), &shared.desktop) {
-        desktop.on_lost(&shared.link, first.frame);
+    for unit in lost.iter().filter(|l| l.stream != 0) {
+        match display_index(unit.stream) {
+            Some(0) => {
+                if let Some(desktop) = &shared.desktop {
+                    desktop.on_lost(&shared.link, unit.frame);
+                }
+            }
+            Some(_) => {
+                if let Some(display) = shared.displays.extra(unit.stream) {
+                    display.on_lost(&shared.link, unit.frame);
+                }
+            }
+            None => {}
+        }
     }
 }
 
@@ -648,6 +785,14 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
             let held = t % 3.0 > 2.5 && shared.left_trigger.is_none() && shared.right_trigger.is_none();
             let on = |v: f32| if held { v } else { 0.0 };
             let mut input = Input { sample_time, ..Default::default() };
+            // With --hold-script the right hand points at a panel in every other window of the
+            // script: a press that is the panel's (the trigger at 0.35 and B) while the app holds
+            // the hand back, and for 0.1 s after the hold ends, as when the ray leaves the panel
+            // with the trigger still down. The game must see none of it: it never sees 0.35 or B.
+            let window = (t / 3.0) as u32;
+            let in_window = shared.hold_script && window % 2 == 1 && t % 3.0 > 2.5;
+            let in_tail = shared.hold_script && window.is_multiple_of(2) && window > 0 && t % 3.0 < 0.1;
+            let panel_press = in_window || in_tail;
             // A headset with no controller reports every input at rest
             if controllers {
                 // The left trigger's pull, once, for a game that waits for the first press of that hand
@@ -660,15 +805,26 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
                     ..Default::default()
                 };
                 let right_pulled = shared.right_trigger.is_some_and(|(at, length)| (at..at + length).contains(&t));
-                input.hands[1] = HandInput {
-                    trigger: if right_pulled { 1.0 } else { on(0.75) },
-                    stick: [on(0.5), 0.0],
-                    buttons: (buttons::PRIMARY * u32::from(held)) | (buttons::TRIGGER_CLICK * u32::from(held || right_pulled)),
-                    touches: (buttons::PRIMARY * u32::from(held)) | (buttons::TRIGGER_CLICK * u32::from(right_pulled)),
-                    ..Default::default()
+                input.hands[1] = if panel_press {
+                    HandInput {
+                        trigger: 0.35,
+                        buttons: buttons::SECONDARY | buttons::TRIGGER_CLICK,
+                        touches: buttons::SECONDARY,
+                        ..Default::default()
+                    }
+                } else {
+                    HandInput {
+                        trigger: if right_pulled { 1.0 } else { on(0.75) },
+                        stick: [on(0.5), 0.0],
+                        buttons: (buttons::PRIMARY * u32::from(held)) | (buttons::TRIGGER_CLICK * u32::from(held || right_pulled)),
+                        touches: (buttons::PRIMARY * u32::from(held)) | (buttons::TRIGGER_CLICK * u32::from(right_pulled)),
+                        ..Default::default()
+                    }
                 };
             }
-            shared.link.duplex.send_datagram(&ClientDatagram::Input(input)).ok();
+            // The input goes with the hands that the app holds back
+            let held_hands = if shared.hold_hands { [true, true] } else { [false, in_window] };
+            shared.link.duplex.send_datagram(&ClientDatagram::InputHold(InputHold { input, held: held_hands })).ok();
         }
         if last_ping.elapsed() >= PING_EVERY {
             last_ping = Instant::now();
@@ -764,10 +920,20 @@ fn decode_loop(
     let mut compositor = compositor::Compositor::new(vsync_origin, period, 2 * period, now_ns());
     let ms = |ns: u64| ns as f64 / 1e6;
     for unit in units {
-        // The desktop stream has its own decoder
+        // Each display's stream has its own decoder
         if unit.meta.stream != 0 {
-            if let Some(desktop) = &shared.desktop {
-                desktop.on_unit(&unit, &shared.link, &shared.clock);
+            match display_index(unit.meta.stream) {
+                Some(0) => {
+                    if let Some(desktop) = &shared.desktop {
+                        desktop.on_unit(&unit, &shared.link, &shared.clock);
+                    }
+                }
+                Some(_) => {
+                    if let Some(display) = shared.displays.extra(unit.meta.stream) {
+                        display.on_unit(&unit, &shared.link, &shared.clock);
+                    }
+                }
+                None => {}
             }
             continue;
         }

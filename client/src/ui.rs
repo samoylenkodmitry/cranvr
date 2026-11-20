@@ -11,11 +11,16 @@
 use crate::{
     console::Backdrop,
     controls::{beams_wanted, pointer_mapping},
-    hands,
     console_panel::{self, ConsolePanel},
     discovery::FoundHost,
-    panels_ball::PanelsBall,
+    display_panel::RoomDisplay,
+    displays::displays,
+    hand_menu::{self, HandPanels, HandState},
+    hands,
+    hold::{HoldFrame, PanelHold},
+    hover,
     hub::{hub, DecoderView, Device, LinkState, Snapshot, Stats},
+    panel_layout::{layers, Layout, PanelId},
     phone::{self, PhoneFrames},
     place, settings,
     usb::{self, Line, Path, UsbMac, CABLE_NAME},
@@ -26,7 +31,7 @@ use cranpose::text::{FontWeight, TextUnit};
 use cranpose::DecodedFrames;
 use cranpose_xr::{
     local_controller_models, local_haptics, local_headset_properties, local_pointer_settings, local_spatial_capabilities, local_spatial_environment, FollowMode, FollowTarget,
-    FollowingSubspace, Pose, SpatialFrameEffect, SpatialPanel, StreamedScene, SubspaceModifier,
+    FollowingSubspace, Hand as XrHand, InputSource, Pose, SpatialFrameEffect, SpatialPanel, StreamedScene, SubspaceModifier,
 };
 use cranvr_common::controls::Action as ControlAction;
 use cranvr_proto::clock::now_ns;
@@ -42,6 +47,8 @@ const POLL: Duration = Duration::from_millis(250);
 const STREAM_POLL: Duration = Duration::from_millis(16);
 /// How often the UI looks at the console's state. A hold of the menu button should show it soon.
 const CONSOLE_POLL: Duration = Duration::from_millis(50);
+/// How often the UI tells the displays what it wishes
+const WISH_POLL: Duration = Duration::from_millis(100);
 
 pub(crate) const PANEL_COLOR: Color = Color(0.09, 0.1, 0.13, 0.96);
 pub(crate) const FIELD_COLOR: Color = Color(0.16, 0.18, 0.23, 1.0);
@@ -66,8 +73,10 @@ pub(crate) fn side_pose(side: f32) -> Pose {
 }
 
 /// The app. In a headset it shows the game's picture around the viewer while a game runs, and the
-/// room otherwise. The connect panel stands to the left and the stats panel to the right. The ball
-/// above the left controller hides them or shows them again.
+/// room otherwise. The connect panel stands to the left and the stats panel to the right, and the
+/// displays of the Mac stand around the middle. The ball above the left controller opens the hand
+/// menu, which shows and hides each panel (see `hand_menu.rs`). While a game runs no panel shows
+/// until the user picks one.
 #[composable]
 pub fn ClientApp() {
     // The connection reads what the headset is from the hub. The values do not change in a
@@ -80,12 +89,16 @@ pub fn ClientApp() {
     let Link { snapshot, frames } = link();
     let console = rememberMutableStateOf(|| hub().console());
     let backdrop = rememberMutableStateOf(|| hub().backdrop());
-    let panels_shown = rememberMutableStateOf(settings::panels_shown);
+    // Which panels show: the room's choice, saved, or the game's, which ends with the game
+    let layout = rememberMutableStateOf(Layout::load);
+    let menu_open = rememberMutableStateOf(hand_menu::open_on_launch);
     // The address field of the connect panel is open. The Keyboard action of a button opens and
     // closes it too, so the state belongs to the app and not to the panel.
     let typing = rememberMutableStateOf(settings::address_entry_on_launch);
-    // Counts the Recenter actions. Each count makes the panels' subspace snap in front of the head again.
+    // Counts the Recenter actions, from a button or from the hand menu. Each count makes the panels'
+    // subspace snap in front of the head again.
     let recenters = rememberMutableStateOf(|| 0u32);
+    let hand = HandState { layout, menu_open, recenter: recenters };
     // The hands belong to the game while the host asks for them (see `hands.rs`): then no panel
     // stands where a pinch could press it
     let hands_in_game = rememberMutableStateOf(|| false);
@@ -97,6 +110,10 @@ pub fn ClientApp() {
     // The models of the controllers. A game draws its own controllers, so they show with the beams.
     let controller_models = local_controller_models().current();
     LaunchedEffect((), async move |_| {
+        for address in settings::host_keys_to_forget_on_launch() {
+            log::info!("the launch forgets the host key of {address}");
+            settings::forget_host_key(&crate::connection::host_name(&address));
+        }
         if settings::console_on_launch() {
             hub().pin_console();
         }
@@ -105,19 +122,32 @@ pub fn ClientApp() {
         let mut given = None;
         loop {
             console.set(hub().console());
-            backdrop.set(hub().backdrop());
+            let now = hub().backdrop();
+            backdrop.set(now);
             hands_in_game.set(hands::belong_to_game(hub().feed.wish(), hub().feed.hand_points()));
+            // A game starts with no panel shown, and the room's choice comes back when it ends
+            let current = layout.get_non_reactive();
+            if current.in_game() != now.game_runs {
+                let mut next = current;
+                next.set_in_game(now.game_runs);
+                log::info!("{}: {} displays shown", if now.game_runs { "a game runs" } else { "no game runs" }, next.displays_shown().len());
+                layout.set(next);
+            }
             for fire in hub().take_fires() {
-                run_fire(fire.action, panels_shown, typing, recenters);
+                run_fire(fire.action, layout, typing, recenters);
             }
             if let Some(pointer) = &pointer_settings {
                 let streaming = snapshot.get_non_reactive().state == LinkState::Streaming;
+                let shown = layout.get_non_reactive();
+                // A panel that the hand menu opens, a display in the room and the display on the hand are panels
+                // too: the beams show while any of them does
+                let any_display = shown.displays_shown().iter().any(|stream| displays().view(*stream).visible);
                 let beams = beams_wanted(
                     !hands_in_game.get_non_reactive(),
-                    panels_shown.get_non_reactive(),
+                    shown.shown(PanelId::Connection) || shown.shown(PanelId::Stats),
                     streaming,
-                    console.get_non_reactive().open,
-                    crate::desktop::desktop().view().visible,
+                    console.get_non_reactive().open || menu_open.get_non_reactive(),
+                    any_display,
                 );
                 let want = (pointer_mapping(&hub().controls()), beams);
                 if given != Some(want) {
@@ -137,52 +167,111 @@ pub fn ClientApp() {
             delay(CONSOLE_POLL).await;
         }
     });
+    // The client asks the host for the displays that show and for no other: a display that is not shown
+    // costs the Mac and the headset nothing. The list of displays also shows a display that the user
+    // adds at once, and forgets a display that left.
+    LaunchedEffect((), async move |_| {
+        let mut known: Option<Vec<u8>> = None;
+        loop {
+            let mut current = layout.get_non_reactive();
+            let mut changed = false;
+            if let Some(listed) = displays().listed_streams() {
+                if known.as_ref() != Some(&listed) {
+                    if let Some(before) = &known {
+                        for stream in listed.iter().filter(|stream| !before.contains(stream)) {
+                            current.set_shown(PanelId::Display(*stream), true);
+                        }
+                    }
+                    current.forget_missing(&listed);
+                    known = Some(listed);
+                    changed = true;
+                }
+            }
+            if changed {
+                if !current.in_game() {
+                    current.save();
+                }
+                layout.set(current.clone());
+            }
+            let focused = crate::focus::current().is_focused();
+            let streaming = hub().snapshot().state == LinkState::Streaming;
+            displays().set_wanted(if focused && streaming { displays().existing(crate::displays::wishes_of(&current)) } else { Default::default() });
+            delay(WISH_POLL).await;
+        }
+    });
+    // What the app composes, in the log: a game with nothing shown carries the ball only
+    let shown_layers = {
+        let layout = layout.get();
+        let streaming = snapshot.get().state == LinkState::Streaming;
+        let with_video: Vec<u8> = displays().menu_view().displays.iter().filter(|d| d.streaming).map(|d| d.info.stream).collect();
+        layers(&layout, streaming, console.get().open, menu_open.get(), !hands_in_game.get(), &with_video)
+    };
+    LaunchedEffect(shown_layers, async move |_| {
+        log::info!("layers composed by the app: {} panels and {} display surfaces", shown_layers.panels, shown_layers.surfaces);
+    });
     // The origin of the panels' frame stands a meter ahead of the head when the first frame tracks it.
     // It moves there again after each recenter. A panel that the user never carried starts at its
     // default pose in that frame, so the first start opens in front of the user. A saved pose is in
     // the same frame (see `place.rs`).
     FollowingSubspace(FollowTarget::View(FollowMode::Snap), move || {
-        HeadsetFrames();
+        HeadsetFrames(menu_open);
         // A flat window shows the panels in this order, side by side. In a headset each panel has
-        // its own place. The ball hides the panels for the time of a stream. While no link runs the
-        // connect panel shows anyway, so a user always sees how to connect and sees the code that
-        // the Mac asks them to compare.
+        // its own place. The hand menu shows and hides them. While no link runs the connect panel
+        // shows anyway, so a user always sees how to connect and sees the code that the Mac asks
+        // them to compare.
         let streaming = snapshot.get().state == LinkState::Streaming;
         let room_for_panels = !hands_in_game.get();
+        let layout = layout.get();
         // The panels stand in a subspace of their own, which leaves the composition at a recenter
         // and snaps in front of the head again when it comes back. The game's picture and the
         // frame effect stay in the outer one, so a recenter does not touch the stream.
         key(recenters.get(), move || {
             FollowingSubspace(FollowTarget::View(FollowMode::Snap), move || {
-                if room_for_panels && (panels_shown.get() || !streaming) {
+                if room_for_panels && (layout.shown(PanelId::Connection) || !streaming) {
                     ConnectPanel(snapshot, address, typing);
                 }
-                if room_for_panels && panels_shown.get() {
+                if room_for_panels && layout.shown(PanelId::Stats) {
                     StatsPanel(snapshot);
                 }
-                crate::desktop::DesktopPanel();
+                // Each shown display stands in the room, unless it rides on the left hand. Each has its
+                // own slot of the composition: hiding one must not hand its place, its pose and its
+                // surface to another.
+                for stream in layout.displays_shown().into_iter().filter(|stream| layout.pinned() != Some(*stream)) {
+                    key(stream, move || RoomDisplay(stream));
+                }
             });
         });
         ConsolePanel(console, snapshot);
+        if hand_menu::flat_menu() {
+            hand_menu::Menu(hand, console.get().open, [0.0; 3]);
+        }
         Behind(backdrop, frames);
     });
     if !hands_in_game.get() {
-        PanelsBall(panels_shown);
+        HandPanels(hand, console.get().open);
     }
 }
 
 /// Does a headset action that a button fired (see `controls.rs`). The console opens in the frame
 /// loop, so it is not here.
-fn run_fire(action: ControlAction, panels_shown: MutableState<bool>, typing: MutableState<bool>, recenters: MutableState<u32>) {
+fn run_fire(action: ControlAction, layout: MutableState<Layout>, typing: MutableState<bool>, recenters: MutableState<u32>) {
     match action {
         ControlAction::Panels => {
-            let shown = !panels_shown.get();
-            panels_shown.set(shown);
-            settings::remember_panels_shown(shown);
+            // The connection panel and the stream numbers hide together, or show together
+            let mut next = layout.get_non_reactive();
+            let shown = !(next.shown(PanelId::Connection) || next.shown(PanelId::Stats));
+            next.set_shown(PanelId::Connection, shown);
+            next.set_shown(PanelId::Stats, shown);
+            if !next.in_game() {
+                next.save();
+            }
+            layout.set(next);
         }
         ControlAction::Keyboard => {
-            // The panels show for the keyboard, for this run only
-            panels_shown.set(true);
+            // The connection panel shows for the keyboard, for this run only
+            let mut next = layout.get_non_reactive();
+            next.set_shown(PanelId::Connection, true);
+            layout.set(next);
             typing.set(!typing.get());
         }
         ControlAction::Recenter => recenters.set(recenters.get().wrapping_add(1)),
@@ -364,16 +453,59 @@ pub(crate) fn text_style(size: f32, color: Color, weight: Option<FontWeight>) ->
 /// Hands each frame of the headset to the sender of the tracking. The callback runs on the frame
 /// loop once for each headset frame. It does no network call: the sender thread wakes and sends.
 #[composable]
-fn HeadsetFrames() {
+fn HeadsetFrames(menu_open: MutableState<bool>) {
     let reader = remember(|| Rc::new(RefCell::new(FrameReader::default()))).with(Clone::clone);
+    let hold = remember(|| Rc::new(RefCell::new(PanelHold::default()))).with(Clone::clone);
     SpatialFrameEffect(move |frame| {
         let now = now_ns();
-        let read = reader.borrow_mut().read(frame, now);
+        let mut read = reader.borrow_mut().read(frame, now);
+        // The hands that a panel holds back from the game: the host gives the game rest values for them
+        if let Some(sent) = read.frame.as_mut() {
+            sent.held = held_hands(&mut hold.borrow_mut(), frame, now, menu_open.get_non_reactive());
+        }
         // The hands, body, face and eyes go in before the frame, so the sender finds them when it wakes
         reader.borrow_mut().push_tracked(frame, &read, &hub().feed);
         console_panel::on_frame(&read, now);
         hub().feed.push(read);
     });
+}
+
+/// The hands that the app holds back from the game in this frame (see `hold.rs`). An app without the
+/// input focus has no pointer, so nothing is held then.
+fn held_hands(hold: &mut PanelHold, frame: &cranpose_xr::XrFrame, now: u64, menu_open: bool) -> [bool; 2] {
+    if !frame.focused {
+        hold.reset();
+        hover::clear();
+        return [false; 2];
+    }
+    let hover = hover::hands();
+    if hover[0] || hover[1] {
+        hover::mark(now / 1_000_000);
+    }
+    let trigger = |hand: XrHand| match frame.pointer(hand) {
+        // A tracked hand presses with the pinch of its index finger
+        Some(InputSource::Hands) => frame.hand(hand).aim.map_or(0.0, |aim| aim.index.strength),
+        _ => frame.controller(hand).trigger.value,
+    };
+    let held = hold.update(&HoldFrame {
+        time: frame.predicted_display_time,
+        hover,
+        handle: hover::handle_held(),
+        trigger: [trigger(XrHand::Left), trigger(XrHand::Right)],
+        menu_open,
+    });
+    // Each change goes to the log, so a run shows when a panel held a hand back
+    static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    let bits = u8::from(held[0]) | u8::from(held[1]) << 1;
+    if LAST.swap(bits, std::sync::atomic::Ordering::Relaxed) != bits {
+        log::info!("a panel holds back {} from the game", match held {
+            [false, false] => "no hand",
+            [true, false] => "the left hand",
+            [false, true] => "the right hand",
+            [true, true] => "both hands",
+        });
+    }
+    held
 }
 
 /// The game's picture. The decoder outputs frames. The headset's compositor shows each one from
@@ -443,10 +575,11 @@ fn address_field() -> TextFieldState {
 fn ConnectPanel(snapshot: MutableState<Snapshot>, address: TextFieldState, typing: MutableState<bool>) {
     let pose = remember(|| place::start_pose("connect", side_pose(-1.0))).with(|pose| *pose);
     let size = rememberMutableStateOf(|| place::start_size("connect", CONNECT_SIZE));
-    SpatialPanel(
-        place::movable("connect", place::resizable("connect", size, CONNECT_SIZE), pose, |_| {}),
-        move || ConnectBody(snapshot, address, Modifier::empty().fill_max_size(), true, typing),
-    );
+    SpatialPanel(place::movable("connect", place::resizable("connect", size, CONNECT_SIZE), pose, |_| {}), move || {
+        // The pointer over the panel holds the pointing hand back from the game (see `hold.rs`)
+        let hovered = hover::hover_modifier(hover::CONNECTION);
+        ConnectBody(snapshot, address, Modifier::empty().fill_max_size().then(hovered), true, typing);
+    });
 }
 
 /// The content of the connect panel. `modifier` gives its size. While no link runs, it lists the
@@ -763,10 +896,10 @@ fn state_text(state: &LinkState, address: &str, path: Option<Path>) -> (String, 
 fn StatsPanel(snapshot: MutableState<Snapshot>) {
     let pose = remember(|| place::start_pose("stats", side_pose(1.0))).with(|pose| *pose);
     let size = rememberMutableStateOf(|| place::start_size("stats", STATS_SIZE));
-    SpatialPanel(
-        place::movable("stats", place::resizable("stats", size, STATS_SIZE), pose, |_| {}),
-        move || StatsBody(snapshot, Modifier::empty().fill_max_size()),
-    );
+    SpatialPanel(place::movable("stats", place::resizable("stats", size, STATS_SIZE), pose, |_| {}), move || {
+        let hovered = hover::hover_modifier(hover::STATS);
+        StatsBody(snapshot, Modifier::empty().fill_max_size().then(hovered));
+    });
 }
 
 /// The content of the stats panel. `modifier` gives its size.
@@ -845,7 +978,7 @@ fn stat_lines(snap: &Snapshot) -> Vec<(&'static str, String, Color)> {
         ));
     }
     lines.push(("Haptics", format!("{} pulses received", stats.haptic_pulses), TEXT_COLOR));
-    for (label, value) in crate::desktop::stat_lines().into_iter().chain(crate::audio::stat_lines()) {
+    for (label, value) in displays().stat_lines().into_iter().chain(crate::audio::stat_lines()) {
         lines.push((label, value, TEXT_COLOR));
     }
     lines

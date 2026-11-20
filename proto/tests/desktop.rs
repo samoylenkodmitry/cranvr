@@ -1,5 +1,5 @@
-//! The desktop stream and its messages: a second video stream beside the eye stream, the pointer
-//! that goes to the host and the cursor that comes back.
+//! The video stream of a display and its messages: a second video stream beside the eye stream, the
+//! mouse that goes to the host and the cursor that comes back.
 
 mod common;
 
@@ -26,19 +26,21 @@ fn params() -> DesktopParams {
         bitrate_bps: 40_000_000,
         full_range: true,
         flipped: false,
-        visible: true,
         cursor_in_video: true,
     }
 }
 
 #[test]
-fn the_desktop_messages_round_trip() {
-    round_trip(ClientMsg::Desktop(DesktopWish { enabled: true, max_width: 3840, max_fps: 60 }));
-    round_trip(HostMsg::Desktop(Some(params())));
-    round_trip(HostMsg::Desktop(None));
-    round_trip(ClientDatagram::Mouse(Mouse { seq: 4, sent: 99, hit: Some([0.1, 0.9]), buttons: 0b101, scroll: [-0.25, 1.0] }));
-    round_trip(ClientDatagram::Mouse(Mouse { seq: 5, sent: 0, hit: None, buttons: 0, scroll: [0.0, 0.0] }));
-    round_trip(HostDatagram::Cursor(Cursor { seq: 3, u: 0.5, v: 0.125, on: true }));
+fn the_display_video_messages_round_trip() {
+    round_trip(ClientMsg::DisplayWish { stream: DESKTOP_STREAM, wish: DesktopWish { enabled: true, max_width: 3840, max_fps: 60 } });
+    round_trip(HostMsg::DisplayStream { stream: DESKTOP_STREAM, params: Some(params()) });
+    round_trip(HostMsg::DisplayStream { stream: DESKTOP_STREAM, params: None });
+    round_trip(ClientDatagram::DisplayMouse {
+        stream: DESKTOP_STREAM,
+        mouse: Mouse { seq: 4, sent: 99, hit: Some([0.1, 0.9]), buttons: 0b101, scroll: [-0.25, 1.0] },
+    });
+    round_trip(ClientDatagram::DisplayMouse { stream: DESKTOP_STREAM + 1, mouse: Mouse { seq: 5, sent: 0, hit: None, buttons: 0, scroll: [0.0, 0.0] } });
+    round_trip(HostDatagram::DisplayCursor { stream: DESKTOP_STREAM, cursor: Cursor { seq: 3, u: 0.5, v: 0.125, on: true } });
 }
 
 /// A desktop picture and an eye frame with the same frame number are two units. Neither hides the

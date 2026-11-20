@@ -13,7 +13,29 @@
 
 use cranvr_common::controls::{Action as ControlAction, Control, Controls, Hand};
 use serde_json::{json, Value};
-use std::time::{Duration, Instant};
+use std::{
+    sync::atomic::{AtomicU8, Ordering},
+    time::{Duration, Instant},
+};
+
+/// The hand menu asks for the console on its page of the controls (see `hand_menu.rs`). The console
+/// takes the request when it opens, or while it is open: 0 is none, 1 the left controller's tab and 2
+/// the right controller's.
+static CONTROLS_REQUEST: AtomicU8 = AtomicU8::new(0);
+
+/// Asks for the console on its page of the controls, on the tab of the right controller.
+pub fn request_controls_page() {
+    CONTROLS_REQUEST.store(2, Ordering::Relaxed);
+}
+
+/// The tab that the hand menu asked for, once.
+pub fn take_controls_request() -> Option<Hand> {
+    match CONTROLS_REQUEST.swap(0, Ordering::Relaxed) {
+        1 => Some(Hand::Left),
+        2 => Some(Hand::Right),
+        _ => None,
+    }
+}
 
 /// The refresh rates and the render sizes that the console offers. The app accepts any value.
 pub const RATES: [u32; 3] = [72, 90, 120];
@@ -390,6 +412,10 @@ impl Console {
 
     pub fn close(&mut self) {
         self.open = false;
+    }
+
+    pub fn open(&mut self) {
+        self.open = true;
     }
 
     /// Opens the console and keeps it open when the link ends.

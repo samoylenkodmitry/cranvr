@@ -29,14 +29,13 @@ use std::{
 };
 
 const KEY_REQUEST_GAP: Duration = Duration::from_millis(250);
-/// The wish that the probe sends: a Quest 3 takes pictures of this width
-const MAX_WIDTH: u32 = 3840;
-const MAX_FPS: u8 = 60;
 /// The pointer script's rate, as a headset's frame rate
 const POINTER_HZ: f32 = 120.0;
 
 #[derive(Default)]
 struct Totals {
+    /// Units of the stream that arrived whole, decoded or not
+    received: u64,
     pictures: u64,
     key_pictures: u64,
     bytes: u64,
@@ -65,6 +64,8 @@ struct Totals {
 }
 
 pub struct DesktopProbe {
+    /// The stream of this display: `DESKTOP_STREAM` for the first one
+    pub stream: u8,
     totals: Mutex<Totals>,
     params: Mutex<Option<DesktopParams>>,
     config: Mutex<Option<Vec<u8>>>,
@@ -77,9 +78,10 @@ pub struct DesktopProbe {
 }
 
 impl DesktopProbe {
-    pub fn new() -> Arc<Self> {
+    pub fn new(stream: u8) -> Arc<Self> {
         let (decoded_sender, decoded) = mpsc::channel();
         Arc::new(Self {
+            stream,
             totals: Mutex::new(Totals::default()),
             params: Mutex::new(None),
             config: Mutex::new(None),
@@ -92,27 +94,55 @@ impl DesktopProbe {
         })
     }
 
-    /// Asks the host for the desktop.
-    pub fn ask(&self, link: &ClientLink) {
-        let wish = DesktopWish { enabled: true, max_width: MAX_WIDTH, max_fps: MAX_FPS };
-        link.duplex.send_control(&ClientMsg::Desktop(wish)).ok();
-        println!("probe: asked the host for the desktop at up to {MAX_WIDTH} pixels and {MAX_FPS} pictures a second");
+    /// The label of this display's lines in the output: `desktop` for the first one
+    fn label(&self) -> String {
+        if self.stream == DESKTOP_STREAM {
+            "desktop".to_string()
+        } else {
+            format!("desktop display {}", self.stream - DESKTOP_STREAM + 1)
+        }
+    }
+
+    /// The words for this display in a sentence
+    pub fn name(&self) -> String {
+        if self.stream == DESKTOP_STREAM {
+            "the desktop".to_string()
+        } else {
+            format!("display {}", self.stream - DESKTOP_STREAM + 1)
+        }
+    }
+
+    /// Wishes the video of this display at up to `(width, fps)`, or ends the wish: the host then runs no
+    /// capture for it.
+    pub fn wish(&self, link: &ClientLink, enabled: bool, (width, fps): (u32, u8)) {
+        let wish = if enabled { DesktopWish { enabled, max_width: width, max_fps: fps } } else { DesktopWish { enabled, max_width: 0, max_fps: 0 } };
+        link.duplex.send_control(&ClientMsg::DisplayWish { stream: self.stream, wish }).ok();
+        if !enabled {
+            // The decoder and the picture that it holds go with the wish
+            self.waiting_key.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Units that arrived, and pictures that the decoder gave.
+    pub fn counts(&self) -> (u64, u64) {
+        let totals = self.totals.lock().unwrap();
+        (totals.received, totals.pictures)
     }
 
     pub fn on_message(&self, message: &HostMsg) {
         match message {
-            HostMsg::Desktop(params) => {
+            HostMsg::DisplayStream { params, .. } => {
                 match params {
                     Some(p) => println!(
-                        "probe: the host runs the desktop stream: {}x{} pixels, {}x{} points, up to {} a second, {} Mbps, visible {}, mirrored {}, cursor in the pictures {}",
-                        p.size[0], p.size[1], p.points[0], p.points[1], p.max_fps, p.bitrate_bps / 1_000_000, p.visible, p.flipped, p.cursor_in_video
+                        "probe: the host runs the stream of {}: {}x{} pixels, {}x{} points, up to {} a second, {} Mbps, mirrored {}, cursor in the pictures {}",
+                        self.name(), p.size[0], p.size[1], p.points[0], p.points[1], p.max_fps, p.bitrate_bps / 1_000_000, p.flipped, p.cursor_in_video
                     ),
-                    None => println!("probe: the host has no desktop for this client"),
+                    None => println!("probe: the host runs no stream of {} for this client", self.name()),
                 }
                 *self.params.lock().unwrap() = *params;
                 self.waiting_key.store(true, Ordering::Relaxed);
             }
-            HostMsg::DecoderConfig { stream, config, .. } if *stream == DESKTOP_STREAM => {
+            HostMsg::DecoderConfig { stream, config, .. } if *stream == self.stream => {
                 *self.config.lock().unwrap() = Some(config.clone());
                 match Decoder::new(config, vec![(0.5, 0.5), (0.1, 0.1)], self.decoded_sender.clone()) {
                     Ok(decoder) => {
@@ -129,6 +159,7 @@ impl DesktopProbe {
 
     /// A picture of the desktop stream arrived whole.
     pub fn on_unit(&self, unit: &Received, link: &ClientLink, clock: &Mutex<ClockSync>) {
+        self.totals.lock().unwrap().received += 1;
         let mut last_frame = self.last_frame.lock().unwrap();
         let in_order = last_frame.is_none_or(|last| unit.meta.frame == last.wrapping_add(1));
         *last_frame = Some(unit.meta.frame);
@@ -187,7 +218,7 @@ impl DesktopProbe {
             return;
         }
         *last = Instant::now();
-        link.duplex.send_control(&ClientMsg::RequestKeyFrame { stream: DESKTOP_STREAM, frame }).ok();
+        link.duplex.send_control(&ClientMsg::RequestKeyFrame { stream: self.stream, frame }).ok();
     }
 
     pub fn on_cursor(&self, cursor: Cursor) {
@@ -219,14 +250,14 @@ impl DesktopProbe {
     /// second, the right button at the end of the third and the middle button at the end of the
     /// fifth. The thumbstick leans forward for a second, then back for a second, and leans to the
     /// right in the first three seconds of the six and to the left in the others.
-    pub fn pointer_script(send: impl Fn(ClientDatagram) + Send + 'static, stopped: impl Fn() -> bool + Send + 'static) {
+    pub fn pointer_script(stream: u8, send: impl Fn(ClientDatagram) + Send + 'static, stopped: impl Fn() -> bool + Send + 'static) {
         thread::Builder::new()
             .name("pointer-script".into())
             .spawn(move || {
                 let start = Instant::now();
                 let (mut seq, mut next) = (0u32, start);
                 let datagram = |seq: u32, hit: Option<[f32; 2]>, buttons: u8, scroll: [f32; 2]| {
-                    ClientDatagram::Mouse(Mouse { seq, sent: now_ns(), hit, buttons, scroll })
+                    ClientDatagram::DisplayMouse { stream, mouse: Mouse { seq, sent: now_ns(), hit, buttons, scroll } }
                 };
                 while !stopped() {
                     let t = start.elapsed().as_secs_f32();
@@ -268,7 +299,8 @@ impl DesktopProbe {
             format!("median {:.2}, p95 {:.2}, max {:.2}", at(0.5), at(0.95), sorted[sorted.len() - 1])
         };
         println!(
-            "probe: desktop: {} pictures ({} key) of {}x{} in {:.1} s: {:.1} a second, {:.1} Mbps, {} skipped, {} of the wrong size; decode (ms) {}; network (ms) {}",
+            "probe: {}: {} pictures ({} key) of {}x{} in {:.1} s: {:.1} a second, {:.1} Mbps, {} skipped, {} of the wrong size; decode (ms) {}; network (ms) {}",
+            self.label(),
             totals.pictures,
             totals.key_pictures,
             totals.size.0,
@@ -282,7 +314,8 @@ impl DesktopProbe {
             describe(&totals.network_ms),
         );
         println!(
-            "probe: desktop: {} cursor datagrams, the last at {:?}",
+            "probe: {}: {} cursor datagrams, the last at {:?}",
+            self.label(),
             totals.cursor_datagrams,
             totals.last_cursor.map(|c| (c.u, c.v, c.on))
         );

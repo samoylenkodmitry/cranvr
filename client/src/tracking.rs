@@ -27,7 +27,7 @@ use cranpose_xr::{Controller, Hand as XrHand, InputSource, InteractionProfile, P
 use cranvr_proto::{
     clock::now_ns,
     link::ClientLink,
-    message::{buttons as bit, ClientDatagram, ClientMsg, Focus, HandInput, Input, Recenter, Tracking, Views},
+    message::{buttons as bit, ClientDatagram, ClientMsg, Focus, HandInput, Input, InputHold, Recenter, Tracking, Views},
     motion::velocities,
     tracking::{Body, Eyes, Face, Features, Hand, Hands, Joint},
     wire::{Fov, Motion, Nanos, Pose},
@@ -56,6 +56,9 @@ pub struct HeadsetFrame {
     pub left_aim: Option<Motion>,
     pub right_aim: Option<Motion>,
     pub input: Input,
+    /// The hands that the app holds back from the game in this frame, left then right: a hand that
+    /// points at a panel of the app presses the panel, not the game (see `hold.rs`)
+    pub held: [bool; 2],
 }
 
 /// The display clock of the headset: when the frame that is in work reaches the display. It also
@@ -126,6 +129,7 @@ impl FrameReader {
             left_aim: left.and_then(|c| c.aim.as_ref()).map(motion),
             right_aim: right.and_then(|c| c.aim.as_ref()).map(motion),
             input: Input { sample_time: now, hands: [left.map_or_else(HandInput::default, hand_input), right.map_or_else(HandInput::default, hand_input)] },
+            held: [false; 2],
         });
         if frame.is_none() {
             self.last_head = None;
@@ -511,6 +515,7 @@ fn placeholder_frame(at: Nanos, display_time: Nanos) -> HeadsetFrame {
         left_aim: None,
         right_aim: None,
         input: Input::default(),
+        held: [false; 2],
     }
 }
 
@@ -706,7 +711,9 @@ pub fn send_loop(link: &ClientLink, feed: &Feed, tracked: bool, refresh_hz: f32,
         }
         // The input goes out with every sample. A datagram may get lost, and the host takes the
         // changes from the values that it sees, so a lost one leaves a button wrong for one frame.
-        link.duplex.send_datagram(&ClientDatagram::Input(frame.input)).ok();
+        // The hands that the app holds back from the game go in the same datagram, so no press of such a
+        // hand reaches the game before the hold does
+        link.duplex.send_datagram(&ClientDatagram::InputHold(InputHold { input: frame.input, held: frame.held })).ok();
         // The hands, the body, the face and the eyes that the host wished, of the same sample
         let wish = feed.wish();
         if from_headset && !wish.is_empty() && feed.take_tracked(&mut buffer) && buffer.sample_time == frame.sample_time && !send_tracked(link, &buffer, wish, &mut outgoing) {
@@ -890,7 +897,7 @@ mod tests {
         xr.right_controller.primary = Button { pressed: true, touched: true };
         feed.push(reader.read(&xr, 100));
         assert!(matches!(next("tracking"), Heard::Datagram(ClientDatagram::Tracking(t)) if t.sample_time == 100));
-        assert!(matches!(next("input"), Heard::Datagram(ClientDatagram::Input(_))));
+        assert!(matches!(next("input"), Heard::Datagram(ClientDatagram::InputHold(_))));
 
         // The system's menu takes the focus: the host hears it once, and the frames after it go nowhere
         focus.store(1, Ordering::Relaxed);
@@ -1093,6 +1100,37 @@ mod tests {
     }
 
     #[test]
+    fn a_hand_that_the_app_holds_back_travels_in_the_datagram_of_its_input() {
+        let (link, inbox) = loopback();
+        let link = std::sync::Arc::new(link);
+        let feed = std::sync::Arc::new(Feed::default());
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let sender = {
+            let (link, feed, stop) = (link.clone(), feed.clone(), stop.clone());
+            let hello = FrameReader::default().read(&frame(), 1).views.unwrap();
+            thread::spawn(move || send_loop(&link, &feed, true, 120.0, hello, &|| Focus::Focused, &stop))
+        };
+        let mut reader = FrameReader::default();
+        // The right trigger is pulled and a panel holds the right hand
+        let mut xr = frame();
+        xr.right_controller.trigger = Trigger { value: 0.9, pressed: true, touched: true };
+        let mut read = reader.read(&xr, 100);
+        read.frame.as_mut().unwrap().held = [false, true];
+        feed.push(read);
+        let held = loop {
+            if let Heard::Datagram(ClientDatagram::InputHold(hold)) = inbox.recv_timeout(Duration::from_secs(10)).expect("no input") {
+                break hold;
+            }
+        };
+        // The input is the real one: the host does the holding back
+        assert_eq!(held.held, [false, true]);
+        assert!(held.input.hands[1].trigger > 0.8);
+        stop.store(true, Ordering::Relaxed);
+        feed.wake();
+        sender.join().unwrap();
+    }
+
+    #[test]
     fn the_sender_sends_each_frame_the_input_when_it_changes_and_every_recenter() {
         let (link, inbox) = loopback();
         let link = std::sync::Arc::new(link);
@@ -1112,8 +1150,10 @@ mod tests {
         feed.push(reader.read(&xr, 100));
         let Heard::Datagram(ClientDatagram::Tracking(tracking)) = next("tracking") else { panic!("not tracking") };
         assert_eq!((tracking.sample_time, tracking.head.pose.position), (100, [0.0, 1.6, 0.0]));
-        let Heard::Datagram(ClientDatagram::Input(input)) = next("input") else { panic!("not input") };
+        let Heard::Datagram(ClientDatagram::InputHold(InputHold { input, held })) = next("input") else { panic!("not input") };
         assert_eq!(input.hands[1].buttons, bit::PRIMARY);
+        // No panel holds a hand back in this frame
+        assert_eq!(held, [false, false]);
 
         // The same input again sends tracking only: the next message is the next sample
         feed.push(reader.read(&xr, 200));
@@ -1268,7 +1308,7 @@ mod tests {
         let heard = heard_for_a_moment(&inbox);
         let offers: Vec<Features> = heard.iter().filter_map(|h| if let Heard::Control(ClientMsg::TrackingOffer(f)) = h { Some(*f) } else { None }).collect();
         assert_eq!(offers, [offered]);
-        assert!(datagrams(&heard).iter().all(|d| matches!(d, ClientDatagram::Tracking(_) | ClientDatagram::Input(_))), "nothing was wished");
+        assert!(datagrams(&heard).iter().all(|d| matches!(d, ClientDatagram::Tracking(_) | ClientDatagram::InputHold(_))), "nothing was wished");
 
         // The same offer again goes no more. The host wishes the hands: the right one arrives with its joints.
         feed.set_wish(Features::HANDS);

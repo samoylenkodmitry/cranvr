@@ -174,7 +174,7 @@ fn an_app_without_the_focus_lets_go_of_its_buttons_and_the_host_hears_of_each_ch
     let mut held = Input::default();
     held.hands[1].trigger = 1.0;
     loop {
-        client.duplex.send_datagram(&ClientDatagram::Input(held)).unwrap();
+        client.duplex.send_datagram(&ClientDatagram::InputHold(InputHold { input: held, held: [false; 2] })).unwrap();
         if let Ok(Event::Buttons(buttons)) = events.next(Duration::from_millis(100)) {
             assert!(buttons.iter().any(|b| b.path_id == RIGHT_TRIGGER_VALUE_ID && b.value == 1.0));
             break;
@@ -196,7 +196,7 @@ fn an_app_without_the_focus_lets_go_of_its_buttons_and_the_host_hears_of_each_ch
     assert_eq!(focus, Focus::Focused);
     // The input after the return reports what changed since the release: the trigger goes down again
     loop {
-        client.duplex.send_datagram(&ClientDatagram::Input(held)).unwrap();
+        client.duplex.send_datagram(&ClientDatagram::InputHold(InputHold { input: held, held: [false; 2] })).unwrap();
         if let Ok(Event::Buttons(buttons)) = events.next(Duration::from_millis(100)) {
             assert!(buttons.iter().any(|b| b.path_id == RIGHT_TRIGGER_VALUE_ID && b.value == 1.0));
             break;
@@ -899,4 +899,130 @@ fn a_value_that_the_runtime_would_refuse_never_reaches_it() {
     assert!(eyes.gaze.is_none());
     let Some(Tracked::Eyes(eyes)) = sanitized(Tracked::Eyes(Eyes { sample_time: 1, display_time: 2, gaze: Some(good.pose) })) else { panic!("eyes stay") };
     assert_eq!(eyes.gaze, Some(good.pose));
+}
+
+/// A host with the desktop on, for the tests of the displays. An added display shows the main display
+/// again, so the test needs no Screen Recording and moves none of this Mac's displays.
+fn display_host() -> (u16, Box<dyn EventSource>, Arc<ClientLink>, Receiver<HostMsg>) {
+    std::env::set_var("CRANVR_DISPLAY_TEST", "main");
+    let port = free_port();
+    let mut config = config(port);
+    config.desktop.enabled = true;
+    let (headset, events) = start(config).unwrap();
+    // The host serves while the handle lives, and the test ends with the process
+    std::mem::forget(headset);
+    let client = Arc::new(ClientLink::connect(([127, 0, 0, 1], port).into(), &caps("Test headset"), &identity(), None, Duration::from_secs(10)).unwrap());
+    let (to_test, control) = channel();
+    let reader = Arc::clone(&client);
+    thread::spawn(move || {
+        reader.duplex.read_tcp(|incoming| {
+            if let Incoming::Control(message) = incoming {
+                to_test.send(message).ok();
+            }
+        })
+    });
+    (port, events, client, control)
+}
+
+/// The next list of displays that the host sends, within a few seconds
+fn next_list(control: &Receiver<HostMsg>) -> cranvr_proto::message::DisplayList {
+    loop {
+        if let HostMsg::Displays(list) = control.recv_timeout(Duration::from_secs(5)).expect("the host sent no list of displays") {
+            return list;
+        }
+    }
+}
+
+#[test]
+fn the_client_adds_a_display_and_removes_it_again() {
+    use cranvr_proto::message::{display_stream, DisplayRequest};
+    let (_port, _events, client, control) = display_host();
+    // The host lists the Mac's own display first, and says that no game runs
+    let first = next_list(&control);
+    assert_eq!(first.displays.len(), 1);
+    assert_eq!((first.displays[0].stream, first.displays[0].removable), (display_stream(0), false));
+    assert!(first.can_add);
+
+    client.duplex.send_control(&ClientMsg::Display(DisplayRequest::Add)).unwrap();
+    let two = loop {
+        let list = next_list(&control);
+        if list.displays.len() == 2 {
+            break list;
+        }
+    };
+    assert_eq!(two.displays[1].stream, display_stream(1));
+    assert!(two.displays[1].removable, "the client may remove a display that it added");
+
+    // A request to remove the first display does nothing: the host keeps it
+    client.duplex.send_control(&ClientMsg::Display(DisplayRequest::Remove { stream: display_stream(0) })).unwrap();
+    client.duplex.send_control(&ClientMsg::Display(DisplayRequest::Remove { stream: display_stream(1) })).unwrap();
+    let back = loop {
+        let list = next_list(&control);
+        if list.displays.len() == 1 {
+            break list;
+        }
+    };
+    assert_eq!(back.displays[0].stream, display_stream(0));
+    // The host never sent a list that dropped the first display
+}
+
+#[test]
+fn a_display_that_the_client_does_not_wish_sends_no_picture_and_the_host_says_that_no_game_runs() {
+    let (_port, _events, client, control) = display_host();
+    let mut game = None;
+    let mut seen_units = 0;
+    // The client reads the media too: no unit of a display's stream may come while no wish was made
+    let (units, from_media) = channel();
+    let media = Arc::clone(&client);
+    thread::spawn(move || {
+        let mut receiver = FrameReceiver::new();
+        media.duplex.read_udp(|incoming| {
+            if let Incoming::Media(packet) = incoming {
+                if let Ok(Some(unit)) = receiver.push(packet, 1) {
+                    units.send(unit.meta.stream).ok();
+                }
+            }
+        })
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if let Ok(HostMsg::GameRuns(runs)) = control.recv_timeout(Duration::from_millis(50)) {
+            game = Some(runs);
+        }
+        while let Ok(stream) = from_media.try_recv() {
+            if stream != 0 {
+                seen_units += 1;
+            }
+        }
+    }
+    assert_eq!(game, Some(false), "the host says whether a game runs");
+    assert_eq!(seen_units, 0, "no display was wished, so none sent a picture");
+}
+
+#[test]
+fn the_hands_that_the_app_holds_back_reach_the_frame_loop_and_the_game_sees_rest_values() {
+    use cranvr_proto::message::{buttons, HandInput, Input, InputHold};
+    let (_port, mut events, client, _control) = display_host();
+    let pressed = HandInput { trigger: 0.9, buttons: buttons::TRIGGER_CLICK, ..Default::default() };
+    // The right hand presses a panel: the frame loop hears of the hold, and the game hears of no button
+    let hold = InputHold { input: Input { sample_time: 1, hands: [HandInput::default(), pressed] }, held: [false, true] };
+    client.duplex.send_datagram(&ClientDatagram::InputHold(hold)).unwrap();
+    let mut held = None;
+    let mut right_trigger = None;
+    for _ in 0..40 {
+        match events.next(Duration::from_millis(100)) {
+            Ok(Event::Held(h)) => held = Some(h),
+            Ok(Event::Buttons(buttons)) => {
+                right_trigger = buttons.iter().find(|b| b.path_id == cranvr_common::inputs::RIGHT_TRIGGER_VALUE_ID).map(|b| b.value);
+            }
+            _ => {}
+        }
+        if held.is_some() && right_trigger.is_some() {
+            break;
+        }
+        // UDP may lose the datagram on a busy machine: the client sends it again
+        client.duplex.send_datagram(&ClientDatagram::InputHold(hold)).unwrap();
+    }
+    assert_eq!(held, Some([false, true]));
+    assert_eq!(right_trigger, Some(0.0), "the game sees a trigger at rest while a panel holds the hand");
 }

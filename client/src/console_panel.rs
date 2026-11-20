@@ -64,7 +64,14 @@ pub fn ConsolePanel(view: MutableState<View>, snapshot: MutableState<Snapshot>) 
 
 #[composable]
 fn OpenConsole(view: View, state: LinkState) {
-    let page = rememberMutableStateOf(|| settings::controls_page_on_launch().map_or(Page::Main, Page::Controls));
+    let page = rememberMutableStateOf(|| console::take_controls_request().or_else(settings::controls_page_on_launch).map_or(Page::Main, Page::Controls));
+    // A press on Controls in the hand menu while the console is open turns the page
+    LaunchedEffect((), async move |_| loop {
+        if let Some(hand) = console::take_controls_request() {
+            page.set(Page::Controls(hand));
+        }
+        delay(Duration::from_millis(100)).await;
+    });
     let shown = page.get();
     let height = match shown {
         Page::Main => console::height(view.menu.as_ref()),
@@ -76,12 +83,14 @@ fn OpenConsole(view: View, state: LinkState) {
     })
     .with(|pose: &Pose| *pose);
     SpatialPanel(place::movable("console", SubspaceModifier::new().size(size::WIDTH, height), start, |_| {}), move || {
+        // The pointer over the console holds the pointing hand back from the game (see `hold.rs`)
+        let hovered = crate::hover::hover_modifier(crate::hover::CONSOLE);
         let menu = view.menu.clone();
         let (room, volume) = (view.room, view.volume);
         let (controls, editable) = (view.controls, view.controls_editable);
         let state = state.clone();
         Column(
-            Modifier::empty().fill_max_size().background(PANEL_COLOR).rounded_corners(24.0).padding(size::PADDING),
+            Modifier::empty().fill_max_size().then(hovered).background(PANEL_COLOR).rounded_corners(24.0).padding(size::PADDING),
             ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(size::GAP)),
             move || match (shown, &menu) {
                 (Page::Controls(hand), _) => ControlsPage(page, hand, controls, editable),

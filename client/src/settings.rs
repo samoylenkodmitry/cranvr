@@ -16,7 +16,6 @@ const HOST_KEY: &str = "host";
 const IDENTITY_KEY: &str = "identity";
 const ROOM_KEY: &str = "room";
 const VOLUME_KEY: &str = "volume";
-const PANELS_KEY: &str = "panels";
 const CONTROLS_KEY: &str = "controls";
 /// The address that works over USB with `adb reverse tcp:9950 tcp:9950`, and on the same Mac
 const DEFAULT_HOST: &str = "127.0.0.1:9950";
@@ -67,18 +66,6 @@ pub fn remember_volume(volume: Volume) {
     }
 }
 
-/// Whether the connect and stats panels show, as the ball above the left controller left them. A
-/// missing or unknown value shows them.
-pub fn panels_shown() -> bool {
-    !panels_hidden_on_launch() && preferences().get(PANELS_KEY).is_none_or(|text| text != "hidden")
-}
-
-pub fn remember_panels_shown(shown: bool) {
-    if let Err(e) = preferences().set(PANELS_KEY, if shown { "shown" } else { "hidden" }) {
-        log::warn!("the panels setting was not saved: {e}");
-    }
-}
-
 /// What the buttons of the controllers did when a Mac last sent the mapping. The Mac's app keeps the
 /// mapping (`app.json`). The headset keeps this copy for the time without a link. `None` before any
 /// link: the standard mapping then holds.
@@ -97,6 +84,18 @@ pub fn remember_controls(controls: &Controls) {
 /// the ball, and a test of the beams and the models needs the panels hidden. It saves nothing.
 pub fn panels_hidden_on_launch() -> bool {
     launch_args().string("panels") == Some("hidden")
+}
+
+/// The addresses whose host keys the launch asks to forget, with `--forget_host_key=ADDRESS,ADDRESS` or
+/// the extra `forget_host_key`. A test that connected this headset to a test host on a network address
+/// leaves the key of that host behind: the headset then refuses the next test host on that address.
+/// Each address is as the connect panel shows it, with its port.
+pub fn host_keys_to_forget_on_launch() -> Vec<String> {
+    launch_args().string("forget_host_key").map(split_addresses).unwrap_or_default()
+}
+
+fn split_addresses(text: &str) -> Vec<String> {
+    text.split(',').map(str::trim).filter(|address| !address.is_empty()).map(str::to_owned).collect()
 }
 
 /// Whether the launch asks to connect at once, with `--connect` or the extra `connect`.
@@ -213,4 +212,15 @@ pub fn identity() -> &'static Identity {
 
 fn now_nanos() -> u128 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_launch_names_the_addresses_to_forget_in_a_comma_list() {
+        assert_eq!(split_addresses("192.168.1.20:9961, 192.168.1.20:9962,,"), vec!["192.168.1.20:9961", "192.168.1.20:9962"]);
+        assert!(split_addresses("  ").is_empty());
+    }
 }

@@ -195,10 +195,6 @@ pub enum ClientMsg {
     /// app started. The client sends it again when it changes. The host puts its scenes' floor
     /// there.
     Floor(f32),
-    /// The client shows the Mac's desktop as a panel and asks the host for its video, or stops the
-    /// stream. The host answers with [`HostMsg::Desktop`]. The video is the stream
-    /// [`DESKTOP_STREAM`].
-    Desktop(DesktopWish),
     /// A press on a button of the console, as a JSON object (`{"action": "play", "game": "Beat
     /// Saber"}`, `{"action": "stop"}`, `{"action": "set", "fps": 90}`). The host hands it to the
     /// cranvr app as a `vr_request` status line.
@@ -214,6 +210,13 @@ pub enum ClientMsg {
     /// changes, and once after the welcome when the app starts without the input focus. A client
     /// that never sends it is focused.
     Focus(Focus),
+    /// The client adds a display to the Mac or removes one it added (see [`DisplayRequest`]). The
+    /// host answers with [`HostMsg::Displays`].
+    Display(DisplayRequest),
+    /// What the client asks of the video of one display: the stream of its panel, how wide a picture
+    /// and how many a second. A display that the client does not wish costs the Mac and the headset
+    /// nothing: the host runs no capture and no encoder and sends nothing for it.
+    DisplayWish { stream: u8, wish: DesktopWish },
 }
 
 /// How much of the headset the app has. The values follow the states of an OpenXR session and
@@ -266,11 +269,6 @@ pub enum HostMsg {
     /// The host changed the stream, for example the foveation or the eye size
     StreamUpdate(StreamParams),
     Bye,
-    /// The state of the desktop stream: its parameters, or `None` when the host has no desktop for
-    /// this client. The host sends it after a [`ClientMsg::Desktop`] and again when the picture's
-    /// size or the visibility changes. The decoder's parameter sets follow in a
-    /// [`HostMsg::DecoderConfig`] of the stream [`DESKTOP_STREAM`].
-    Desktop(Option<DesktopParams>),
     /// The console's menu as a JSON object: the games and the settings that the cranvr app
     /// offers (its `vr-menu.json`) and the stream's state as `status`. The host sends it when the
     /// client connects and again when it changes, at most once a second.
@@ -288,6 +286,17 @@ pub enum HostMsg {
     /// and no others. The set is empty when no game asks. The host sends it when the headset
     /// connects and when it changes.
     TrackingWish(Features),
+    /// The displays that the client can show, and whether it can add one. The host sends the list
+    /// when the client connects and after each change.
+    Displays(DisplayList),
+    /// The state of the video of a display: its parameters, or `None` while the host runs none for
+    /// this client. The host sends it after a wish and again when the picture's size changes. The
+    /// decoder's parameter sets follow in a [`HostMsg::DecoderConfig`] of the same stream.
+    DisplayStream { stream: u8, params: Option<DesktopParams> },
+    /// Whether a game runs on the host: it sends frames or it loads. The host sends it when the
+    /// client connects and when it changes. The host hides no display for a game: a display that
+    /// the client wishes goes on.
+    GameRuns(bool),
 }
 
 /// Datagram messages from the client to the host.
@@ -299,14 +308,10 @@ pub enum ClientDatagram {
     /// The first datagram on the UDP path
     Hello { session: u64 },
     Tracking(Tracking),
-    Input(Input),
     FrameTiming(FrameTiming),
     Loss(LossReport),
     Ping(Ping),
     Pong(Pong),
-    /// Where the controller that owns the Mac's mouse points on the desktop panel, with the mouse
-    /// buttons that it holds and its thumbstick's lean
-    Mouse(Mouse),
     /// The hands' joints, for every headset frame while the host wishes [`Features::HANDS`]
     Hands(Hands),
     /// The body's joints, while the host wishes [`Features::BODY`] or [`Features::FULL_BODY`]
@@ -315,6 +320,12 @@ pub enum ClientDatagram {
     Face(Face),
     /// The gaze, while the host wishes [`Features::EYES`]
     Eyes(Eyes),
+    /// The mouse on the panel of a display: where the controller that owns the Mac's mouse points,
+    /// with the mouse buttons that it holds and its thumbstick's lean. The stream names the display.
+    DisplayMouse { stream: u8, mouse: Mouse },
+    /// The controllers' input with the hands that the app holds back from the game (see
+    /// [`InputHold`]). The client sends it for every headset frame that has input.
+    InputHold(InputHold),
 }
 
 /// Datagram messages from the host to the client.
@@ -324,8 +335,8 @@ pub enum HostDatagram {
     Audio(Audio),
     Ping(Ping),
     Pong(Pong),
-    /// Where the Mac's cursor is on the desktop
-    Cursor(Cursor),
+    /// Where the Mac's cursor is on a display. The stream names it.
+    DisplayCursor { stream: u8, cursor: Cursor },
 }
 
 /// The head and the controllers at one moment.
@@ -481,7 +492,7 @@ pub struct Audio {
     pub pcm: Vec<u8>,
 }
 
-/// The id of the stream that carries the Mac's desktop. The eye stream is 0.
+/// The id of the stream that carries the first display of the Mac. The eye stream is 0.
 pub const DESKTOP_STREAM: u8 = 1;
 
 /// What the client asks of the desktop stream.
@@ -496,10 +507,10 @@ pub struct DesktopWish {
     pub max_fps: u8,
 }
 
-/// The desktop stream as the host runs it.
+/// The video of a display as the host runs it.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DesktopParams {
-    /// [`DESKTOP_STREAM`]
+    /// The display's stream (see [`display_stream`])
     pub stream: u8,
     pub codec: Codec,
     /// The size of the pictures in pixels: the display's full pixel size, or the client's
@@ -515,13 +526,74 @@ pub struct DesktopParams {
     /// decoder's surface bottom row first. Cranpose's compositor does not: the host sends the
     /// pictures upright and this is `false`.
     pub flipped: bool,
-    /// `false` while the host hides the desktop, as while a game runs. The host sends no pictures
-    /// then.
-    pub visible: bool,
     /// The Mac's cursor is part of the pictures. The client then draws none of its own. A client's
     /// panel cannot show a cursor over a surface panel today: the compositor draws surfaces over
     /// panels.
     pub cursor_in_video: bool,
+}
+
+/// The most displays that a client shows at once: the first display, which the host captures from
+/// the start, and the ones that the client adds.
+pub const MAX_DISPLAYS: u8 = 4;
+
+/// The stream of the display with this index. Index 0 is the first display, [`DESKTOP_STREAM`].
+pub const fn display_stream(index: u8) -> u8 {
+    DESKTOP_STREAM + index
+}
+
+/// The index of the display that a stream carries, or `None` for a stream that is no display's.
+pub const fn display_index(stream: u8) -> Option<u8> {
+    if stream >= DESKTOP_STREAM && stream < DESKTOP_STREAM + MAX_DISPLAYS {
+        Some(stream - DESKTOP_STREAM)
+    } else {
+        None
+    }
+}
+
+/// What the client asks of the Mac's displays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisplayRequest {
+    /// The Mac makes one more display, which only the headset shows. The first one that the host
+    /// captures from the start stays.
+    Add,
+    /// The Mac removes the display that carries this stream, if the client added it.
+    Remove { stream: u8 },
+}
+
+/// A display that the client can show as a panel.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DisplayInfo {
+    /// The stream that carries its video. It names the display in every message.
+    pub stream: u8,
+    /// The words for the headset's menu, such as "Mac display" or "Added display 2"
+    pub name: String,
+    /// The display's size in points
+    pub points: [u32; 2],
+    /// The client can remove it with [`DisplayRequest::Remove`]: the host made it for the client.
+    pub removable: bool,
+}
+
+/// The displays of the host, in the order of their streams.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DisplayList {
+    pub displays: Vec<DisplayInfo>,
+    /// The host can add one more display now
+    pub can_add: bool,
+    /// One line of plain words about a request that failed, such as an add that macOS refused. It
+    /// stays until the next list.
+    pub notice: Option<String>,
+}
+
+/// The controllers' input and the hands that the app holds back from the game. A hand points at a
+/// panel of the app, or holds a press that began on one: its buttons belong to the panel, so the
+/// game must not see them. The input and the mask travel in one datagram, so no input of a held
+/// hand reaches the game before the mask does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct InputHold {
+    pub input: Input,
+    /// Left, then right. The host gives the game rest values in place of the held hand's buttons,
+    /// touches, trigger, grip and thumbstick. The hand's poses stay.
+    pub held: [bool; 2],
 }
 
 /// Where the controller that owns the Mac's mouse points on the desktop panel. The Mac has one

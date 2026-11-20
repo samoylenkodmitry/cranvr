@@ -9,6 +9,7 @@ mod eye_check;
 mod game_audio;
 mod game_sizes;
 mod hand_controller;
+mod hand_mask;
 mod headset;
 mod logger;
 mod network;
@@ -344,6 +345,9 @@ fn native_config(
 fn main() {
     raise_file_limit();
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--display-helper") {
+        virtual_display::helper_main(&args[2..]);
+    }
     if args.get(1).map(String::as_str) == Some("--unscale-displays") {
         display_modes::helper_main();
     }
@@ -390,6 +394,7 @@ fn main() {
             display_id: desktop.display_id,
             layer: Arc::clone(&layer),
             mbps: headset::native::desktop::MBPS,
+            ..Default::default()
         };
         let config = native_config(&options, &config_dir, panel);
         // The cranvr app sends the user's answers to the headsets' requests on the host's input.
@@ -590,6 +595,7 @@ fn main() {
                     shared.force_idr.store(true, Ordering::Relaxed);
                 }
             }
+            Event::Held(held) => tracking.set_held(held),
             Event::TrackingOffer(offered) => tracking.on_offer(offered),
             Event::Tracked(data) => tracking.on_tracked(data),
             Event::RequestIdr => shared.force_idr.store(true, Ordering::Relaxed),
