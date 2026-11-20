@@ -51,19 +51,21 @@ pub struct Measured {
     pub decode_ms: f32,
 }
 
-/// The line under a display in the menu: what the display costs now.
-pub fn cost_line(shown: bool, measured: &Measured, wish: Option<&DesktopWish>) -> String {
+/// The lines under a display in the menu: what the display costs now. Each line is short enough for the
+/// menu's width. A hidden display costs nothing. A shown display costs the Mac's encoder and the
+/// headset's decoder, which the second line names with the numbers.
+pub fn cost_lines(shown: bool, measured: &Measured, wish: Option<&DesktopWish>) -> Vec<String> {
     if !shown {
-        return "Hidden: it costs nothing".to_string();
+        return vec!["Hidden: it costs nothing".to_string()];
     }
     let Some([width, height]) = measured.size else {
-        return "Starting: the Mac sends the first picture".to_string();
+        return vec!["Starting: the Mac sends the first picture".to_string()];
     };
-    let limit = wish.filter(|w| w.max_fps < 60).map_or(String::new(), |w| format!(" (at most {} a second)", w.max_fps));
-    format!(
-        "{width} x {height}, {:.0} a second{limit}, {:.1} Mbps, decode {:.1} ms; the Mac encodes each picture",
-        measured.decoded_fps, measured.mbps, measured.decode_ms
-    )
+    let limit = wish.filter(|w| w.max_fps < 60).map_or(String::new(), |w| format!(", at most {}", w.max_fps));
+    vec![
+        format!("{width} x {height} at {:.0} a second{limit}", measured.decoded_fps),
+        format!("{:.1} Mbps, decode {:.1} ms; the Mac encodes it", measured.mbps, measured.decode_ms),
+    ]
 }
 
 #[cfg(test)]
@@ -107,13 +109,15 @@ mod tests {
     }
 
     #[test]
-    fn the_cost_line_says_what_a_shown_display_costs_and_that_a_hidden_one_costs_nothing() {
-        assert_eq!(cost_line(false, &Measured::default(), None), "Hidden: it costs nothing");
-        assert!(cost_line(true, &Measured::default(), None).starts_with("Starting"));
+    fn the_cost_lines_say_what_a_shown_display_costs_and_that_a_hidden_one_costs_nothing() {
+        assert_eq!(cost_lines(false, &Measured::default(), None), vec!["Hidden: it costs nothing"]);
+        assert!(cost_lines(true, &Measured::default(), None)[0].starts_with("Starting"));
         let measured = Measured { size: Some([3840, 2160]), received_fps: 31.0, decoded_fps: 30.0, mbps: 6.2, decode_ms: 2.04 };
-        let line = cost_line(true, &measured, Some(&DesktopWish { enabled: true, max_width: 2560, max_fps: 30 }));
-        assert_eq!(line, "3840 x 2160, 30 a second (at most 30 a second), 6.2 Mbps, decode 2.0 ms; the Mac encodes each picture");
-        let line = cost_line(true, &measured, Some(&DesktopWish { enabled: true, max_width: 3840, max_fps: 60 }));
-        assert!(!line.contains("at most"));
+        let lines = cost_lines(true, &measured, Some(&DesktopWish { enabled: true, max_width: 2560, max_fps: 30 }));
+        assert_eq!(lines, vec!["3840 x 2160 at 30 a second, at most 30", "6.2 Mbps, decode 2.0 ms; the Mac encodes it"]);
+        let lines = cost_lines(true, &measured, Some(&DesktopWish { enabled: true, max_width: 3840, max_fps: 60 }));
+        assert!(!lines[0].contains("at most"));
+        // Each line fits the menu: it holds about 40 characters at 20 mm
+        assert!(lines.iter().chain(cost_lines(true, &Measured::default(), None).iter()).all(|line| line.len() <= 44), "{lines:?}");
     }
 }

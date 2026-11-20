@@ -79,6 +79,12 @@ pub fn open_on_launch() -> bool {
     launch_args().string("hand_menu") == Some("open")
 }
 
+/// Whether a flat window shows the menu: a test asks for it with the extra `hand_menu`. The menu then
+/// stands among the panels of the room, so a screenshot of the window shows its rows and words.
+pub fn flat_menu() -> bool {
+    !local_spatial_capabilities().current().is_spatial_ui_enabled() && launch_args().string("hand_menu").is_some()
+}
+
 /// A click in the right hand tells the user that a press took.
 fn click() {
     if let Some(haptics) = hub().headset().and_then(|headset| headset.haptics) {
@@ -98,6 +104,8 @@ pub struct HandState {
 /// The ball with the menu and the hand's display. In a headset only.
 #[composable]
 pub fn HandPanels(state: HandState, console_open: bool) {
+    // A flat window shows no ball. A test that asks for the menu gets it beside the panels instead
+    // (see `flat_menu`).
     if !local_spatial_capabilities().current().is_spatial_ui_enabled() {
         return;
     }
@@ -203,7 +211,7 @@ fn commit(state: HandState, layout: Layout) {
 
 /// The menu panel.
 #[composable]
-fn Menu(state: HandState, console_open: bool, base: [f32; 3]) {
+pub fn Menu(state: HandState, console_open: bool, base: [f32; 3]) {
     let view = rememberMutableStateOf(|| displays().menu_view());
     LaunchedEffect((), async move |_| loop {
         let now = displays().menu_view();
@@ -267,7 +275,7 @@ fn RowView(row: MenuRow, state: HandState) {
                 }
             },
         );
-        if let Some(detail) = row.detail.clone() {
+        for detail in row.details.clone() {
             Text(detail, Modifier::empty().height(DETAIL), text_style(20.0, MUTED_COLOR, None));
         }
     });

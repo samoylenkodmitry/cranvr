@@ -187,6 +187,9 @@ pub fn ClientApp() {
                 RoomDisplay(stream);
             }
             ConsolePanel(console, snapshot);
+            if hand_menu::flat_menu() {
+                hand_menu::Menu(hand, console.get().open, [0.0; 3]);
+            }
             Behind(backdrop, frames);
         });
     });

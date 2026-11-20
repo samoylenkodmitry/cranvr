@@ -8,7 +8,7 @@
 //! display, puts the panels in front of the user again and opens the page of the controls.
 
 use crate::{
-    display_wish::{cost_line, Place},
+    display_wish::{cost_lines, Place},
     displays::DisplaysView,
     panel_layout::{Layout, PanelId},
 };
@@ -48,8 +48,8 @@ pub struct MenuButton {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MenuRow {
     pub title: String,
-    /// A line of muted text under the row
-    pub detail: Option<String>,
+    /// Lines of muted text under the row
+    pub details: Vec<String>,
     pub buttons: Vec<MenuButton>,
 }
 
@@ -83,7 +83,7 @@ fn toggle(shown: bool, id: PanelId) -> MenuButton {
 /// The rows of the menu.
 pub fn rows(input: &MenuInput<'_>) -> Vec<MenuRow> {
     let layout = input.layout;
-    let panel = |title: &str, id: PanelId, shown: bool| MenuRow { title: title.into(), detail: None, buttons: vec![toggle(shown, id)] };
+    let panel = |title: &str, id: PanelId, shown: bool| MenuRow { title: title.into(), details: Vec::new(), buttons: vec![toggle(shown, id)] };
     let mut rows = vec![
         panel("Console", PanelId::Console, input.console_open),
         panel("Connection", PanelId::Connection, layout.shown(PanelId::Connection)),
@@ -104,8 +104,13 @@ pub fn rows(input: &MenuInput<'_>) -> Vec<MenuRow> {
             buttons.push(MenuButton { label: "Remove".into(), action: MenuAction::RemoveDisplay(stream), kind: ButtonKind::Danger });
         }
         let place = if on_hand { "On the left hand" } else { "In the room" };
-        let cost = cost_line(shown, &display.measured, wish.as_ref());
-        rows.push(MenuRow { title: display.info.name.clone(), detail: Some(format!("{place}. {cost}")), buttons });
+        let mut details = cost_lines(shown, &display.measured, wish.as_ref());
+        // The place goes in front of the first line when it fits, else in a line of its own
+        match details.first_mut() {
+            Some(first) if first.len() + place.len() + 2 <= 40 => *first = format!("{place}. {first}"),
+            _ => details.insert(0, place.to_string()),
+        }
+        rows.push(MenuRow { title: display.info.name.clone(), details, buttons });
     }
     let mut actions = Vec::new();
     if input.displays.can_add {
@@ -113,7 +118,7 @@ pub fn rows(input: &MenuInput<'_>) -> Vec<MenuRow> {
     }
     actions.push(MenuButton { label: "Recenter".into(), action: MenuAction::Recenter, kind: ButtonKind::Normal });
     actions.push(MenuButton { label: "Controls".into(), action: MenuAction::OpenControls, kind: ButtonKind::Normal });
-    rows.push(MenuRow { title: String::new(), detail: input.displays.notice.clone(), buttons: actions });
+    rows.push(MenuRow { title: String::new(), details: input.displays.notice.iter().cloned().collect(), buttons: actions });
     rows
 }
 
@@ -129,7 +134,7 @@ pub fn place_of(layout: &Layout, stream: u8) -> Place {
 /// The menu's height in dp for these rows: the title, then each row with its detail and its gaps.
 pub fn height(rows: &[MenuRow]) -> f32 {
     use size::*;
-    let body: f32 = rows.iter().map(|row| ROW + GAP + if row.detail.is_some() { DETAIL } else { 0.0 }).sum();
+    let body: f32 = rows.iter().map(|row| ROW + GAP + row.details.len() as f32 * DETAIL).sum();
     2.0 * PADDING + TITLE + GAP + body
 }
 
@@ -199,10 +204,14 @@ mod tests {
         let mut displays = view(vec![info(1, "Mac display", false), info(2, "Display 2", true)], true);
         displays.displays[0].measured = Measured { size: Some([3840, 2160]), received_fps: 58.0, decoded_fps: 58.0, mbps: 1.2, decode_ms: 2.0 };
         let rows = rows(&input(&layout, &displays));
-        assert_eq!(rows[4].detail.as_deref(), Some("In the room. Hidden: it costs nothing"));
-        assert!(rows[3].detail.as_deref().unwrap().starts_with("In the room. 3840 x 2160, 58 a second, 1.2 Mbps"));
+        assert_eq!(rows[4].details, vec!["In the room. Hidden: it costs nothing"]);
+        assert_eq!(rows[3].details[0], "In the room. 3840 x 2160 at 58 a second");
+        assert!(rows[3].details[1].starts_with("1.2 Mbps, decode 2.0 ms"));
         layout.toggle_pinned(1);
-        assert!(self::rows(&input(&layout, &displays))[3].detail.as_deref().unwrap().starts_with("On the left hand."));
+        // The longer place no longer fits in front of the size: it has a line of its own
+        let on_hand = self::rows(&input(&layout, &displays));
+        assert_eq!(on_hand[3].details[0], "On the left hand");
+        assert_eq!(on_hand[3].details[1], "3840 x 2160 at 58 a second");
     }
 
     #[test]
@@ -221,7 +230,7 @@ mod tests {
         let mut displays = view(vec![info(1, "Mac display", false)], true);
         displays.notice = Some("The Mac made no display".into());
         let rows = rows(&input(&layout, &displays));
-        assert_eq!(rows.last().unwrap().detail.as_deref(), Some("The Mac made no display"));
+        assert_eq!(rows.last().unwrap().details, vec!["The Mac made no display"]);
     }
 
     #[test]
