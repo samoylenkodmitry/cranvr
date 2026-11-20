@@ -474,7 +474,10 @@ fn pointer_loop(inner: &Inner, receiver: &Receiver<PointerIn>) {
     let mut last_update = Instant::now();
     let mut active = false;
     while !inner.stop.load(Ordering::Relaxed) {
-        let message = match receiver.recv_timeout(Duration::from_millis(50)) {
+        // While nothing points and nothing is held, the thread has nothing to time: it wakes for a
+        // datagram or twice a second to look at `stop`
+        let wait = if active { Duration::from_millis(50) } else { Duration::from_millis(500) };
+        let message = match receiver.recv_timeout(wait) {
             Ok(mut message) => {
                 // Only the newest of a burst counts
                 while let Ok(newer) = receiver.try_recv() {

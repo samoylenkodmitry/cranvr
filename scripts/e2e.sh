@@ -7,7 +7,7 @@
 #                       [--quest [SERIAL] | --native-tcp] [--native-drop PERCENT] [--native-port PORT]
 #                       [--host-arg ARG]... [--report FILE]
 #                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine | --openvr-wine | --openvr-actions MODE]
-#                       [--pause AT:FOR]
+#                       [--pause AT:FOR] [--left-trigger AT:FOR]
 #                       [--face-source visual|audio|unknown]
 #
 #   --seconds N   how long the stream runs (default 20)
@@ -54,6 +54,11 @@
 #                 and no input and counts the frames that still arrive. The run fails when a frame
 #                 arrives after the first 0.3 s of the pause, or when the stream does not go on after it.
 #                 With --game the fake game keeps running through the pause.
+#   --left-trigger AT:FOR  with the probe: the left trigger goes to 1 at AT seconds and stays for FOR
+#                 seconds, once. The right trigger pulls to 0.75 for half a second in every 3 seconds.
+#                 A game that shows one pointer at a time then has its left controller pressed for the
+#                 first time at AT. A host started with CRANVR_EYE_DUMP=FOLDER writes what the game
+#                 drew into FOLDER once a second, so the run shows which pointer was up before and after.
 #   --desktop     the host shows this Mac's screen. The probe asks for the desktop stream, plays a
 #                 pointer script (the host only logs its mouse events: CRANVR_POINTER_DRY_RUN) and
 #                 counts the Mac's sound. The script presses the left, right and middle buttons and
@@ -95,7 +100,7 @@ root=${0:A:h:h}
 seconds=20 fps=120 fps_given=0 game=0 desktop=0 client=mac serial="" report=""
 tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 openvr_wine=0 openvr_actions="" face_source=audio
 wine="" wine_args=()
-native_tcp=0 native_drop=0 native_port=9950 pause=""
+native_tcp=0 native_drop=0 native_port=9950 pause="" left_trigger=""
 more_host_args=()
 while (( $# )); do
     case $1 in
@@ -122,6 +127,7 @@ while (( $# )); do
         --native-drop) native_drop=$2; shift 2 ;;
         --native-port) native_port=$2; shift 2 ;;
         --pause) pause=$2; shift 2 ;;
+        --left-trigger) left_trigger=$2; shift 2 ;;
         --quest)
             client=quest; shift
             if (( $# )) && [[ $1 != --* ]]; then serial=$1; shift; fi ;;
@@ -335,6 +341,7 @@ fi
 # The probe asks for the desktop stream, plays a pointer script and counts the Mac's sound
 (( desktop )) && probe_args+=(--desktop)
 [[ -n ${pause} ]] && probe_args+=(--pause "${pause}")
+[[ -n ${left_trigger} ]] && probe_args+=(--left-trigger "${left_trigger}")
 # The probe offers hands, body, face and eyes and plays the script of tracked.rs for what the host asks
 (( tracking || tracking_wine )) && probe_args+=(--tracking --face-source "${face_source}")
 (( hand_controllers )) && probe_args+=(--tracking --no-controllers)
