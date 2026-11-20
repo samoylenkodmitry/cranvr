@@ -594,12 +594,12 @@ fn main() {
                 if paused {
                     // The first frame after the return must render for a pose of that moment, not for
                     // the last one before the pause
-                    shared.latest_sample_ns.store(0, Ordering::Relaxed);
+                    let last_sample = shared.latest_sample_ns.swap(0, Ordering::Relaxed);
                     // Meta's rule: an app without the input focus shows no controllers and takes no
                     // input. The link let go of the buttons already. The game sees no controller
                     // until the next sample, and a hand that made one lets go of it.
                     if link.is_connected() {
-                        link.controller_mask(shared.latest_sample_ns.load(Ordering::Relaxed), 0);
+                        link.controller_mask(last_sample, 0);
                     }
                     tracking.pause();
                 } else {
