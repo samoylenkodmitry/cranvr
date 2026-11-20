@@ -80,7 +80,7 @@ pub fn resizable(name: &'static str, size: MutableState<[f32; 2]>, smallest: [f3
     SubspaceModifier::new().size(width, height).resizable_with(
         limits,
         ResizePolicy::custom(move |event| {
-            crate::hover::set(crate::hover::HANDLE, event.event_type != SpatialResizeEventType::End);
+            crate::hover::set_handle(event.event_type != SpatialResizeEventType::End);
             size.set(event.size);
             if event.event_type == SpatialResizeEventType::End {
                 save_size(name, event.size);
@@ -99,7 +99,7 @@ pub fn start_pose(name: &str, default: Pose) -> Pose {
 pub fn movable(name: &'static str, modifier: SubspaceModifier, pose: Pose, on_move: impl Fn(&SpatialMoveEvent) + 'static) -> SubspaceModifier {
     modifier.with_pose(pose).movable_with(MovePolicy::system(move |event| {
         // A carry holds the carrying hand back from the game until it ends
-        crate::hover::set(crate::hover::HANDLE, event.event_type != SpatialMoveEventType::End);
+        crate::hover::set_handle(event.event_type != SpatialMoveEventType::End);
         on_move(&event);
         if event.event_type == SpatialMoveEventType::End {
             save_pose(name, &event.pose);

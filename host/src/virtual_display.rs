@@ -298,7 +298,10 @@ fn apply(origins: &[(u32, i32, i32)], unmirror: bool, modes: &[(u32, *const c_vo
 
 /// Whether this macOS has the classes of virtual displays.
 pub fn is_supported() -> bool {
-    [c"CGVirtualDisplayDescriptor", c"CGVirtualDisplay", c"CGVirtualDisplaySettings", c"CGVirtualDisplayMode"].iter().all(|name| AnyClass::get(name).is_some())
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        [c"CGVirtualDisplayDescriptor", c"CGVirtualDisplay", c"CGVirtualDisplaySettings", c"CGVirtualDisplayMode"].iter().all(|name| AnyClass::get(name).is_some())
+    })
 }
 
 /// A virtual display in a helper process: `cranvr-host --display-helper W H SERIAL`.
