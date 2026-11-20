@@ -84,6 +84,22 @@ applies these patches and builds both parts.
 - `xrGetFaceExpressionWeights2FB` reports the source of the newest sample as `dataSource`. The sample says it with flag 4 of `FACE_TRACKING`.
 - `tests/tracking_smoke.cpp` takes `--face-source visual|audio|unknown`. It checks the support structure, the answer of the creation to each list of sources, a tracker with no list, a tracker that lists only the other source and the `dataSource` of each sample. `--live-face` accepts any weights, for a face from a real headset.
 
+`0007-stage-reference-space.patch`
+
+- `xrCreateReferenceSpace` accepts `XR_REFERENCE_SPACE_TYPE_STAGE` and gives the LOCAL space. The host puts the floor at height 0 of that space (see `host/src/headset/native.rs`). OpenComposite asks for a STAGE space for the standing universe of an OpenVR game and stops without it.
+
+`0008-action-sets-attach-to-a-later-session.patch`
+
+- `xrAttachSessionActionSets` accepts an action set that was attached to a session which no longer exists. The runtime kept the set's `attached` mark for the life of the set and refused the second attach with `XR_ERROR_ACTIONSETS_ALREADY_ATTACHED`. An OpenVR game that sets an action manifest (IVRInput) at its start reaches that call twice. OpenComposite creates the action sets and attaches them to its first session. When the game submits its first frame, OpenComposite destroys that session, makes a new one on the game's own graphics device and attaches the same sets again. It stopped there with the error, so no game with an action manifest could show a picture. The set stays attached, so its actions and the suggested bindings stay frozen. A set that a live session holds, a second attach to the same session, an action created after the attach and a suggestion after the attach keep returning the error.
+
+`0009-display-refresh-rate-extension.patch`
+
+- The runtime offers `XR_FB_display_refresh_rate`. The headset's rate (the control file's refresh rate) is the only rate: `xrEnumerateDisplayRefreshRatesFB` lists it, `xrGetDisplayRefreshRateFB` returns it, and `xrRequestDisplayRefreshRateFB` accepts it and 0 (the default). A request for another rate returns `XR_ERROR_DISPLAY_REFRESH_RATE_UNSUPPORTED_FB`, which the extension allows for a rate that is not on the list. A Unity game that uses the extension asked for it and got `extension not enabled`. OpenComposite reads the rate from it.
+
+`0010-log-what-reaches-the-game.patch`
+
+- The runtime writes to stderr, which the cranvr app keeps as the game's log (`game.err.log`; a Unity game keeps it in its `Player.log`), what a game's input does. At the first `xrAttachSessionActionSets` of a session it tells how many action sets and actions are attached and how many actions have a binding for the Touch controllers. It tells when a controller joins or leaves (`xrSyncActions` sees its profile). For each action of each hand it tells the first time that the action is active and its first two changes, with the value (pressed, a float, a vector or a tracked pose). Each kind stops after 80 lines. A game that binds nothing, or whose bindings no controller input reaches, shows no such line.
+
 ## patches/dxmt
 
 `0005-public-atomic-for-new-metal-compiler.patch`: DXMT 0.80 calls a private Metal builtin
