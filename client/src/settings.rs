@@ -70,7 +70,7 @@ pub fn remember_volume(volume: Volume) {
 /// Whether the connect and stats panels show, as the ball above the left controller left them. A
 /// missing or unknown value shows them.
 pub fn panels_shown() -> bool {
-    preferences().get(PANELS_KEY).is_none_or(|text| text != "hidden")
+    !panels_hidden_on_launch() && preferences().get(PANELS_KEY).is_none_or(|text| text != "hidden")
 }
 
 pub fn remember_panels_shown(shown: bool) {
@@ -90,6 +90,13 @@ pub fn remember_controls(controls: &Controls) {
     if let Err(e) = preferences().set(CONTROLS_KEY, &controls.to_json()) {
         log::warn!("the controls were not saved: {e}");
     }
+}
+
+/// Whether the launch asks for the connect and stats panels hidden for this launch, with
+/// `--panels=hidden` or the extra `panels`. A headset on a desk has no controller that could press
+/// the ball, and a test of the beams and the models needs the panels hidden. It saves nothing.
+pub fn panels_hidden_on_launch() -> bool {
+    launch_args().string("panels") == Some("hidden")
 }
 
 /// Whether the launch asks to connect at once, with `--connect` or the extra `connect`.
