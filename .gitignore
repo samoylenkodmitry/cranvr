@@ -3,3 +3,5 @@ third_party/basaltvr/src/
 third_party/opencomposite/src/
 third_party/opencomposite/build/
 __pycache__/
+third_party/wine/src/
+third_party/wine/build/

@@ -6,6 +6,8 @@
 #   - OpenComposite (C:\opencomposite), which turns a game's OpenVR calls into OpenXR calls to that
 #     runtime. A game finds it through the prefix's OpenVR path file when cranvr's choice is on (see
 #     scripts/run-game.sh); this script writes no such file.
+#   - wined3d.dll with cranvr's patch for Wine's HLSL compiler (vkd3d-shader), which a game that compiles
+#     its shaders at run time uses through d3dcompiler_47.dll (scripts/build-wine-d3d.sh)
 #
 # The BasaltVR checkout must have run, in this order:
 #   runtime/scripts/test-dxmt.zsh          (downloads Wine 11.10 and stock DXMT)
@@ -14,7 +16,9 @@
 #
 # The OpenComposite build (scripts/build-opencomposite.sh) is optional for BASALTVR_DIR: without it the
 # stack has no OpenVR support. $CRANVR_OPENCOMPOSITE_DIR names another build folder than
-# third_party/opencomposite/build.
+# third_party/opencomposite/build. The Wine build (scripts/build-wine-d3d.sh) is optional the same way:
+# without it Wine's HLSL compiler lacks isnan(). A game whose shader calls it shows a black picture.
+# $CRANVR_WINE_D3D_DIR names another build folder than third_party/wine/build.
 #
 # Usage: scripts/setup-wine.sh BASALTVR_DIR
 #        scripts/setup-wine.sh GAME_SUPPORT_DIR   (an unpacked archive from package-game-support.sh)
@@ -41,6 +45,7 @@ if [[ -x ${1:A}/engine/bin/wine && -f ${1:A}/runtime/basalt_openxr.dll ]]; then
     fork=${1:A}/dxmt
     runtime_bin=${1:A}/runtime
     opencomposite_bin=${1:A}/opencomposite
+    wine_d3d_bin=${1:A}/wine-d3d
     version_file=${1:A}/VERSION
 else
     basalt=${1:A}/runtime
@@ -48,6 +53,7 @@ else
     fork=${basalt}/build/dxmt/fork-install
     runtime_bin=${basalt}/build/bin
     opencomposite_bin=${CRANVR_OPENCOMPOSITE_DIR:-${0:A:h:h}/third_party/opencomposite/build}/bin
+    wine_d3d_bin=${CRANVR_WINE_D3D_DIR:-${0:A:h:h}/third_party/wine/build}/bin
     version_file=${0:A:h}/game-support-version.txt
 fi
 
@@ -89,6 +95,17 @@ for dll in d3d10core.dll d3d11.dll dxgi.dll winemetal.dll; do
     cp "${fork}/x86_64-windows/${dll}" "${prefix}/drive_c/windows/system32/${dll}"
 done
 
+# Wine's HLSL compiler with cranvr's patch: wined3d.dll holds vkd3d-shader. The prefix keeps its own
+# copy in system32. The loader takes that one.
+if [[ -f ${wine_d3d_bin}/wined3d.dll ]]; then
+    cp "${wine_d3d_bin}/wined3d.dll" "${wine_root}/lib/wine/x86_64-windows/wined3d.dll"
+    cp "${wine_d3d_bin}/wined3d.dll" "${prefix}/drive_c/windows/system32/wined3d.dll"
+    mkdir -p "${prefix}/drive_c/wine-d3d"
+    cp "${wine_d3d_bin}/hlsl_compile.exe" "${wine_d3d_bin}/isnan.hlsl" "${prefix}/drive_c/wine-d3d/"
+else
+    print "No wined3d.dll in ${wine_d3d_bin}: Wine's HLSL compiler stays as it is (no isnan)."
+fi
+
 runtime_dir=${prefix}/drive_c/basalt/runtime
 mkdir -p "${runtime_dir}"
 cp "${runtime_bin}/basalt_openxr.dll" "${runtime_bin}/basalt_openxr.json" "${runtime_bin}/loader_smoke.exe" "${runtime_dir}/"
@@ -120,6 +137,15 @@ print "Checking the OpenXR runtime through the Khronos loader"
 if [[ -f ${oc_dir}/bin/vrclient_x64.dll ]]; then
     print "Checking that OpenComposite loads"
     (cd "${oc_dir}" && DXMT_BASALT_IOSURFACE=1 "${wine_root}/bin/wine" ./openvr_smoke.exe --load-only --runtime 'C:\opencomposite' >/dev/null 2>&1) || { print -u2 "FAIL: openvr_smoke.exe --load-only (run it by hand for details)"; exit 1; }
+fi
+if [[ -f ${prefix}/drive_c/wine-d3d/hlsl_compile.exe ]]; then
+    print "Checking that Wine's HLSL compiler knows isnan"
+    hlsl_out=$(cd "${prefix}/drive_c/wine-d3d" && "${wine_root}/bin/wine" ./hlsl_compile.exe isnan.hlsl 2>&1 || true)
+    if [[ ${hlsl_out} != *"hlsl_compile: PASS"* ]]; then
+        print -u2 "FAIL: hlsl_compile.exe isnan.hlsl (run it by hand for details):"
+        print -u2 -r -- "${hlsl_out}"
+        exit 1
+    fi
 fi
 # The stamp comes last: a stack that failed a step above has none
 if [[ -f ${version_file} ]]; then
