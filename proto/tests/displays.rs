@@ -65,7 +65,7 @@ fn the_display_messages_round_trip() {
     round_trip(HostMsg::DisplayStream { stream: 3, params: Some(params(3)) });
     round_trip(HostMsg::DisplayStream { stream: 3, params: None });
     round_trip(HostMsg::GameRuns(true));
-    round_trip(ClientDatagram::DisplayPointer { stream: 2, pointer: Pointer { seq: 1, sent: 5, hit: Some([0.5, 0.5]), trigger: 1.0, scroll: 0.0 } });
+    round_trip(ClientDatagram::DisplayMouse { stream: 2, mouse: Mouse { seq: 1, sent: 5, hit: Some([0.5, 0.5]), buttons: 3, scroll: [0.0, 0.5] } });
     round_trip(HostDatagram::DisplayCursor { stream: 2, cursor: Cursor { seq: 8, u: 0.25, v: 0.75, on: true } });
     let input = Input { sample_time: 77, hands: [HandInput { trigger: 0.5, ..Default::default() }, HandInput { buttons: buttons::PRIMARY, ..Default::default() }] };
     round_trip(ClientDatagram::InputHold(InputHold { input, held: [false, true] }));
@@ -85,9 +85,10 @@ fn the_new_variants_stand_after_the_old_ones() {
     assert_eq!(tag(&HostMsg::GameRuns(false)), 13);
     // A datagram of version 6 and the version 8 ones that follow it
     let eyes = tag(&ClientDatagram::Eyes(cranvr_proto::tracking::Eyes::default()));
-    let display_pointer = tag(&ClientDatagram::DisplayPointer { stream: 1, pointer: Pointer { seq: 0, sent: 0, hit: None, trigger: 0.0, scroll: 0.0 } });
+    let mouse = tag(&ClientDatagram::Mouse(Mouse { seq: 0, sent: 0, hit: None, buttons: 0, scroll: [0.0; 2] }));
+    let display_mouse = tag(&ClientDatagram::DisplayMouse { stream: 1, mouse: Mouse { seq: 0, sent: 0, hit: None, buttons: 0, scroll: [0.0; 2] } });
     let held = tag(&ClientDatagram::InputHold(InputHold::default()));
-    assert!(eyes < display_pointer && display_pointer < held);
+    assert!(eyes < mouse && mouse < display_mouse && display_mouse < held);
     assert_eq!(tag(&HostDatagram::Cursor(Cursor { seq: 0, u: 0.0, v: 0.0, on: false })), 4);
     assert_eq!(tag(&HostDatagram::DisplayCursor { stream: 1, cursor: Cursor { seq: 0, u: 0.0, v: 0.0, on: false } }), 5);
 }

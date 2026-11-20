@@ -8,7 +8,7 @@
 #                       [--host-arg ARG]... [--report FILE]
 #                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine | --openvr-wine | --openvr-actions MODE]
 #                       [--displays N] [--hold] [--hand-hold] [--displays-in-game]
-#                       [--pause AT:FOR]
+#                       [--pause AT:FOR] [--left-trigger AT:FOR]
 #                       [--face-source visual|audio|unknown]
 #
 #   --seconds N   how long the stream runs (default 20)
@@ -55,11 +55,19 @@
 #                 and no input and counts the frames that still arrive. The run fails when a frame
 #                 arrives after the first 0.3 s of the pause, or when the stream does not go on after it.
 #                 With --game the fake game keeps running through the pause.
+#   --left-trigger AT:FOR  with the probe: the left trigger goes to 1 at AT seconds and stays for FOR
+#                 seconds, once. The right trigger pulls to 0.75 for half a second in every 3 seconds.
+#                 A game that shows one pointer at a time then has its left controller pressed for the
+#                 first time at AT. A host started with CRANVR_EYE_DUMP=FOLDER writes what the game
+#                 drew into FOLDER once a second, so the run shows which pointer was up before and after.
 #   --desktop     the host shows this Mac's screen. The probe asks for the desktop stream, plays a
 #                 pointer script (the host only logs its mouse events: CRANVR_POINTER_DRY_RUN) and
-#                 counts the Mac's sound. It counts every frame of the right size, since the
-#                 desktop scene draws no eye badges. The run fails when the probe gets the sound
-#                 for less than 80 percent of the stream time. --host-arg --virtual-display
+#                 counts the Mac's sound. The script presses the left, right and middle buttons and
+#                 leans the thumbstick in both axes. A run of 14 seconds or more fails when the host's
+#                 log shows no press of one button, no scroll in one axis or a press without its
+#                 release. It counts every frame of the right size, since the desktop scene draws no
+#                 eye badges. The run fails when the probe gets the sound for less than 80 percent of
+#                 the stream time. --host-arg --virtual-display
 #                 --host-arg 1920x1080 shows a virtual display instead of the main one.
 #   --displays N  with --desktop's host: the probe shows N displays. It asks the host to add N-1 of them, wishes
 #                 the video of each, decodes each stream, plays the pointer script on each and removes the last one
@@ -112,7 +120,7 @@ seconds=20 fps=120 fps_given=0 game=0 desktop=0 client=mac serial="" report=""
 displays=1 hold=0 hand_hold=0 displays_in_game=0 display_test=0
 tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 openvr_wine=0 openvr_actions="" face_source=audio
 wine="" wine_args=()
-native_tcp=0 native_drop=0 native_port=9950 pause=""
+native_tcp=0 native_drop=0 native_port=9950 pause="" left_trigger=""
 more_host_args=()
 while (( $# )); do
     case $1 in
@@ -144,6 +152,7 @@ while (( $# )); do
         --native-drop) native_drop=$2; shift 2 ;;
         --native-port) native_port=$2; shift 2 ;;
         --pause) pause=$2; shift 2 ;;
+        --left-trigger) left_trigger=$2; shift 2 ;;
         --quest)
             client=quest; shift
             if (( $# )) && [[ $1 != --* ]]; then serial=$1; shift; fi ;;
@@ -378,6 +387,7 @@ fi
 (( hold )) && probe_args+=(--hold-script)
 (( hand_hold )) && probe_args+=(--hold-hands)
 [[ -n ${pause} ]] && probe_args+=(--pause "${pause}")
+[[ -n ${left_trigger} ]] && probe_args+=(--left-trigger "${left_trigger}")
 # The probe offers hands, body, face and eyes and plays the script of tracked.rs for what the host asks
 (( tracking || tracking_wine )) && probe_args+=(--tracking --face-source "${face_source}")
 (( hand_controllers )) && probe_args+=(--tracking --no-controllers)
@@ -556,12 +566,35 @@ if [[ ${client} == quest ]]; then
     model=$("${adb_cmd[@]}" shell getprop ro.product.model | tr -d '\r')
     extra+=(serial=${serial} "model=${model}" device_celsius_before=${celsius_before} device_celsius_after=$(celsius))
 fi
+# The probe's pointer script presses the left, right and middle buttons and leans the thumbstick in
+# both axes. The host logs what it would have injected (a dry run). Each kind must show, once the run
+# lasts for two turns of the script.
+mouse_exit=0
+if (( desktop )) && [[ ${client} == mac ]]; then
+    python3 -I - "${work}/host.out" "${seconds}" <<'PYTHON' || mouse_exit=1
+import re, sys
+text = open(sys.argv[1], errors="replace").read()
+totals = [0] * 7
+for m in re.finditer(r"mouse events: (\d+) moves, (\d+) downs \((\d+) right, (\d+) middle\), (\d+) ups, (\d+) px scrolled, (\d+) px scrolled across", text):
+    totals = [a + int(b) for a, b in zip(totals, m.groups())]
+moves, downs, right, middle, ups, forward, across = totals
+print(f"host: mouse events (dry run): {moves} moves, {downs} downs ({right} right, {middle} middle), {ups} ups, {forward} px scrolled, {across} px scrolled across")
+if int(sys.argv[2]) >= 14:
+    missing = [name for name, n in [("left", downs - right - middle), ("right", right), ("middle", middle), ("up and down scroll", forward), ("sideways scroll", across)] if n <= 0]
+    # The last press may go down in the window of the last log line and up after it
+    unpaired = abs(ups - downs) > 1
+    if missing or unpaired:
+        print("the host injected no " + " and no ".join(missing) + (" and its ups differ from its downs" if unpaired else ""), file=sys.stderr)
+        sys.exit(1)
+PYTHON
+fi
 result=0
 python3 -I "${root}/scripts/e2e-report.py" "${work}/host.out" "${fps}" "${report}" "${extra[@]}" || result=$?
 # A pause empties some of the host's 5-second windows, so the report's frame rate says nothing then: the
 # probe's verdict on the pause counts, and it is part of the probe's exit code
 [[ -z ${pause} ]] || result=0
 (( client_exit == 0 )) || result=1
+(( mouse_exit == 0 )) || result=1
 (( game_exit == 0 )) || result=1
 (( tracking_exit == 0 )) || result=1
 (( openvr_exit == 0 )) || result=1

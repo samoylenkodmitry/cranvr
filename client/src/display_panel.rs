@@ -16,13 +16,16 @@
 
 use crate::{
     displays::{displays, PointerNow},
-    hover, place,
+    hover,
+    hub::hub,
+    place,
 };
 use cranpose::{launch_args, prelude::*};
 use cranpose_xr::{
     Pose, ResizeLimits, ResizePolicy, SpatialExternalSurface, SpatialFrameEffect, SpatialMoveEvent, SpatialMoveEventType, SpatialPanel, SpatialResizeEventType,
     StereoMode, SubspaceModifier, XrFrame, METERS_PER_DP,
 };
+use cranvr_common::controls::{mouse, Action as ControlAction, Control, Controls, Hand as ControlHand};
 use cranvr_proto::message::DESKTOP_STREAM;
 use std::time::Duration;
 
@@ -80,8 +83,13 @@ fn synthetic_pointer(time: Duration) -> PointerNow {
     let angle = t * std::f32::consts::TAU / 4.0;
     PointerNow {
         hit: Some([0.5 + 0.3 * angle.cos(), 0.5 + 0.3 * angle.sin()]),
-        trigger: if t % 3.0 < 0.3 { 1.0 } else { 0.0 },
-        scroll: if t % 6.0 > 4.0 { 0.6 } else { 0.0 },
+        // The left button every 3 s, the right one in the second 1.0 to 1.3 of each 3 s and the
+        // middle one in the second 2.0 to 2.3
+        buttons: [(0.0, mouse::LEFT), (1.0, mouse::RIGHT), (2.0, mouse::MIDDLE)]
+            .into_iter()
+            .filter(|(from, _)| (t % 3.0 - from).abs() < 0.3 && t % 3.0 >= *from)
+            .fold(0, |bits, (_, bit)| bits | bit),
+        scroll: if t % 6.0 > 4.0 { [0.6, 0.6] } else { [0.0, 0.0] },
     }
 }
 
@@ -95,6 +103,22 @@ fn stick_lean(frame: &XrFrame, axis: usize) -> f32 {
         .filter(|lean| lean.abs() >= DEAD_ZONE)
         .max_by(|a, b| a.abs().total_cmp(&b.abs()))
         .unwrap_or(0.0)
+}
+
+/// How far the thumbsticks lean in the axes that the mapping gives to scrolling: across, then
+/// forward. A stick whose axis does something else, or nothing, does not scroll. The stronger
+/// of the two sticks counts in each axis.
+fn scroll_lean(frame: &XrFrame, controls: &Controls) -> [f32; 2] {
+    let lean = |axis: usize, control: Control| {
+        [(ControlHand::Left, &frame.left_controller), (ControlHand::Right, &frame.right_controller)]
+            .into_iter()
+            .filter(|(hand, _)| controls.action(*hand, control) == ControlAction::Scroll)
+            .map(|(_, controller)| [controller.thumbstick.x, controller.thumbstick.y][axis])
+            .filter(|lean| lean.abs() >= DEAD_ZONE)
+            .max_by(|a, b| a.abs().total_cmp(&b.abs()))
+            .unwrap_or(0.0)
+    };
+    [lean(0, Control::StickHorizontal), lean(1, Control::StickVertical)]
 }
 
 /// The surface's width and height in dp (a millimeter each) for a panel `width` meters wide that
@@ -152,8 +176,8 @@ pub fn RoomDisplay(stream: u8) {
         } else if pointer_test() {
             displays().update_pointer(stream, |pointer| *pointer = synthetic_pointer(frame.predicted_display_time));
         } else {
-            let lean = stick_lean(frame, 1);
-            displays().update_pointer(stream, |pointer| pointer.scroll = if pointer.hit.is_some() { lean } else { 0.0 });
+            let lean = scroll_lean(frame, &hub().controls());
+            displays().update_pointer(stream, |pointer| pointer.scroll = if pointer.hit.is_some() { lean } else { [0.0; 2] });
         }
         let at = displays().cursor(stream);
         if cursor.get_non_reactive() != at {
@@ -247,8 +271,8 @@ pub fn HandDisplay(stream: u8, base: [f32; 3]) {
         if pointer_test() {
             displays().update_pointer(stream, |pointer| *pointer = synthetic_pointer(frame.predicted_display_time));
         } else {
-            let lean = stick_lean(frame, 1);
-            displays().update_pointer(stream, |pointer| pointer.scroll = if pointer.hit.is_some() { lean } else { 0.0 });
+            let lean = scroll_lean(frame, &hub().controls());
+            displays().update_pointer(stream, |pointer| pointer.scroll = if pointer.hit.is_some() { lean } else { [0.0; 2] });
         }
     });
     let view = view.get();
@@ -347,9 +371,11 @@ mod tests {
     }
 
     #[test]
-    fn the_pointer_test_circles_and_presses() {
-        let seen: Vec<f32> = (0..60).map(|i| synthetic_pointer(Duration::from_secs_f32(i as f32 * 0.1)).trigger).collect();
-        assert!(seen.contains(&1.0) && seen.contains(&0.0));
-        assert!(synthetic_pointer(Duration::from_secs_f32(4.5)).scroll > 0.0);
+    fn the_pointer_test_presses_each_button_in_its_turn() {
+        let seen: Vec<u8> = (0..60).map(|i| synthetic_pointer(Duration::from_secs_f32(i as f32 * 0.1)).buttons).collect();
+        for bit in [mouse::LEFT, mouse::RIGHT, mouse::MIDDLE] {
+            assert!(seen.contains(&bit), "{bit}: {seen:?}");
+        }
+        assert!(synthetic_pointer(Duration::from_secs_f32(4.5)).scroll[0] > 0.0);
     }
 }

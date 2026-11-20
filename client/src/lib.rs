@@ -18,6 +18,7 @@ mod audio;
 mod connection;
 mod console;
 mod console_panel;
+mod controls;
 mod display_panel;
 mod display_wish;
 mod displays;

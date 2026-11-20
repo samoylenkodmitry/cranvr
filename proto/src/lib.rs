@@ -71,15 +71,24 @@ pub use wire::{Error, Nanos};
 /// sends a wish only to a client of version 6, and a client of version 6 offers features only to a
 /// host that answered with version 6.
 ///
+/// Version 7 adds the datagram [`message::ClientDatagram::Mouse`]: the buttons of the Mac's mouse
+/// (left, right, middle) and a thumbstick's lean in two axes. The client sends it to a host of
+/// version 7 in place of the older `Pointer`, which carries a trigger and one axis. The host reads
+/// both.
+///
 /// Version 8 adds displays: the client adds and removes displays of the Mac and asks for the video
 /// of each one (`ClientMsg::Display`, `ClientMsg::DisplayWish`, `HostMsg::Displays`,
 /// `HostMsg::DisplayStream`), the host says whether a game runs (`HostMsg::GameRuns`), and the
 /// client sends the controllers' input together with the hands that it holds back from the game
-/// (`ClientDatagram::InputHold`). All of them are new variants at the end of the enums, so a peer
+/// (`ClientDatagram::InputHold`). The mouse of a display other than the first goes in
+/// `ClientDatagram::DisplayMouse`. All of them are new variants at the end of the enums, so a peer
 /// of an older version skips them. A host of version 8 keeps the video of a display that the
 /// client wishes while a game runs. It hides the first display for a game only from a client of
 /// an older version, which has no other way to learn that a game runs.
 pub const PROTOCOL_VERSION: u16 = 8;
+
+/// The first protocol version with [`message::ClientDatagram::Mouse`].
+pub const MOUSE_VERSION: u16 = 7;
 
 /// The first protocol version with displays, the game's state and held hands.
 pub const DISPLAYS_VERSION: u16 = 8;

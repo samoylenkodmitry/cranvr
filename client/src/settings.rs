@@ -8,6 +8,7 @@
 use crate::console::{Room, Volume};
 use crate::hub::MediaChoice;
 use cranpose::{launch_args, preferences};
+use cranvr_common::controls::{Controls, Hand};
 use cranvr_proto::identity::{fingerprint, from_hex, random_bytes, to_hex, Identity, FINGERPRINT_LEN};
 use std::sync::OnceLock;
 
@@ -15,6 +16,7 @@ const HOST_KEY: &str = "host";
 const IDENTITY_KEY: &str = "identity";
 const ROOM_KEY: &str = "room";
 const VOLUME_KEY: &str = "volume";
+const CONTROLS_KEY: &str = "controls";
 /// The address that works over USB with `adb reverse tcp:9950 tcp:9950`, and on the same Mac
 const DEFAULT_HOST: &str = "127.0.0.1:9950";
 
@@ -64,6 +66,19 @@ pub fn remember_volume(volume: Volume) {
     }
 }
 
+/// What the buttons of the controllers did when a Mac last sent the mapping. The Mac's app keeps the
+/// mapping (`app.json`). The headset keeps this copy for the time without a link. `None` before any
+/// link: the standard mapping then holds.
+pub fn controls() -> Option<Controls> {
+    preferences().get(CONTROLS_KEY).and_then(|text| Controls::from_json(&text))
+}
+
+pub fn remember_controls(controls: &Controls) {
+    if let Err(e) = preferences().set(CONTROLS_KEY, &controls.to_json()) {
+        log::warn!("the controls were not saved: {e}");
+    }
+}
+
 /// Whether the launch asks to connect at once, with `--connect` or the extra `connect`.
 pub fn connect_on_launch() -> bool {
     launch_args().boolean("connect").unwrap_or(false)
@@ -73,6 +88,17 @@ pub fn connect_on_launch() -> bool {
 /// `console`. A headset on a desk has no controller that could hold the menu button.
 pub fn console_on_launch() -> bool {
     launch_args().boolean("console").unwrap_or(false)
+}
+
+/// Whether the launch asks for the console to open on the Controls page, with `--controls_page=left`
+/// or `--controls_page=right` or the extra `controls_page`. A test on a desk has no controller that
+/// could press the console's Controls button, and a screen capture of the page needs it open.
+pub fn controls_page_on_launch() -> Option<Hand> {
+    match launch_args().string("controls_page") {
+        Some("left") => Some(Hand::Left),
+        Some("right") => Some(Hand::Right),
+        _ => None,
+    }
 }
 
 /// Whether the launch asks for the address field open at the start, with `--address_entry` or the

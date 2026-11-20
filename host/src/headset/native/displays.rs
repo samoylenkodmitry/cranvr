@@ -24,7 +24,7 @@ use crate::{
     virtual_display::{self, DisplayProcess},
 };
 use cranvr_proto::{
-    message::{display_stream, DesktopWish, DisplayInfo, DisplayList, DisplayRequest, HostMsg, Pointer, DESKTOP_STREAM, MAX_DISPLAYS},
+    message::{display_stream, DesktopWish, DisplayInfo, DisplayList, DisplayRequest, HostMsg, Mouse, Pointer, DESKTOP_STREAM, MAX_DISPLAYS},
     DISPLAYS_VERSION,
 };
 use log::{info, warn};
@@ -129,6 +129,12 @@ impl Displays {
     pub(super) fn on_pointer(&self, stream: u8, pointer: Pointer) {
         if let Some(slot) = self.slots.lock().unwrap().iter().find(|slot| slot.desktop.stream() == stream) {
             slot.desktop.on_pointer(pointer);
+        }
+    }
+
+    pub(super) fn on_mouse(&self, stream: u8, mouse: Mouse) {
+        if let Some(slot) = self.slots.lock().unwrap().iter().find(|slot| slot.desktop.stream() == stream) {
+            slot.desktop.on_mouse(mouse);
         }
     }
 

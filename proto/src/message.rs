@@ -368,9 +368,13 @@ pub enum ClientDatagram {
     Face(Face),
     /// The gaze, while the host wishes [`Features::EYES`]
     Eyes(Eyes),
-    /// Where a controller points on the panel of a display other than the first, as
-    /// [`ClientDatagram::Pointer`] says it for the first one. Protocol version 8 added this datagram.
-    DisplayPointer { stream: u8, pointer: Pointer },
+    /// Where the controller that owns the Mac's mouse points on the desktop panel, with the mouse
+    /// buttons that it holds and its thumbstick's lean. Protocol version 7 added this datagram. A
+    /// client of that version sends it to a host of that version in place of [`ClientDatagram::Pointer`].
+    Mouse(Mouse),
+    /// The mouse on the panel of a display other than the first, as [`ClientDatagram::Mouse`] says it
+    /// for the first one. Protocol version 8 added this datagram.
+    DisplayMouse { stream: u8, mouse: Mouse },
     /// The controllers' input with the hands that the app holds back from the game (see
     /// [`InputHold`]). The client sends it in place of [`ClientDatagram::Input`] to a host of
     /// protocol version 8. Protocol version 8 added this datagram.
@@ -668,6 +672,30 @@ pub struct Pointer {
     pub trigger: f32,
     /// How far the pointing controller's thumbstick leans forward, from -1 to 1. The host scrolls.
     pub scroll: f32,
+}
+
+/// Where the controller that owns the Mac's mouse points on the desktop panel. The Mac has one
+/// mouse, so the client names one controller at a time: the one that holds a button, else the one
+/// that pressed last. The client sends the datagram for every headset frame while it changes and
+/// every 50 ms otherwise, so a lost datagram heals.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Mouse {
+    /// Counts up by one per datagram. The host drops a datagram that is older than the newest.
+    pub seq: u32,
+    /// When the client sampled the controller, on the client's clock
+    pub sent: Nanos,
+    /// The point on the panel as u and v from its top left corner (0, 0) to its bottom right corner
+    /// (1, 1), or `None` while no controller points at the panel
+    pub hit: Option<[f32; 2]>,
+    /// The mouse buttons that are down, as the bits of `cranvr_common::controls::mouse`: 1 for the
+    /// left, 2 for the right and 4 for the middle button. The client maps the controller's buttons
+    /// to them (see `cranvr_common::controls`), so the host needs no map. A bit stays set for as
+    /// long as the button is down: the host presses on the first datagram with the bit and lets go
+    /// on the first datagram without it.
+    pub buttons: u8,
+    /// How far the thumbstick leans, each axis from -1 to 1: across to the right, then forward. The
+    /// host scrolls at a speed that follows the lean. An axis that the user mapped to nothing is 0.
+    pub scroll: [f32; 2],
 }
 
 /// Where the Mac's cursor lies on the desktop. The newest datagram wins.

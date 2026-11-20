@@ -84,6 +84,8 @@ pub struct Options {
     /// menu: the probe tells the host, sends no tracking and no input, and counts the frames that
     /// still arrive
     pub pause: Option<(f32, f32)>,
+    /// Pulls the left trigger once: when it starts and how long it stays, in seconds
+    pub left_trigger: Option<(f32, f32)>,
 }
 
 /// The probe's clock runs this far ahead of the process clock, as a headset's clock has its own
@@ -184,6 +186,7 @@ struct Shared {
     face_source: tracked::FaceSource,
     sent_tracking: [AtomicU64; 4],
     pause: Option<(f32, f32)>,
+    left_trigger: Option<(f32, f32)>,
     /// Frames of the eye stream that arrived, for the pause test
     units_seen: AtomicU64,
     /// What the pause test measured: frames that arrived in the first 0.3 s of the pause, frames
@@ -297,6 +300,7 @@ pub fn run(o: Options) -> i32 {
         face_source: o.face_source,
         sent_tracking: Default::default(),
         pause: o.pause,
+        left_trigger: o.left_trigger,
         units_seen: AtomicU64::new(0),
         pause_result: Mutex::new(None),
     });
@@ -318,8 +322,10 @@ pub fn run(o: Options) -> i32 {
             println!("probe: asked the host for the desktop at up to {width} pixels and {fps} pictures a second");
         }
         let (send, stop) = (Arc::clone(&shared), Arc::clone(&shared));
+        let mouse = shared.link.welcome.version >= cranvr_proto::MOUSE_VERSION;
         DesktopProbe::pointer_script(
-            move |p| drop(send.link.duplex.send_datagram(&ClientDatagram::Pointer(p))),
+            mouse,
+            move |datagram| drop(send.link.duplex.send_datagram(&datagram)),
             move || stop.stop.load(Ordering::Relaxed),
         );
     }
@@ -571,8 +577,14 @@ fn read_loop(shared: &Arc<Shared>, units: &mpsc::Sender<Received>, udp: bool) {
 fn on_display_list(shared: &Arc<Shared>, list: cranvr_proto::message::DisplayList) {
     let script = |stream: u8| {
         let (send, stop) = (Arc::clone(shared), Arc::clone(shared));
+        // The probe speaks version 8, so the script sends `Mouse`: the display's own form of it carries the stream
         DesktopProbe::pointer_script(
-            move |pointer| drop(send.link.duplex.send_datagram(&ClientDatagram::DisplayPointer { stream, pointer })),
+            true,
+            move |datagram| {
+                if let ClientDatagram::Mouse(mouse) = datagram {
+                    send.link.duplex.send_datagram(&ClientDatagram::DisplayMouse { stream, mouse }).ok();
+                }
+            },
             move || stop.stop.load(Ordering::Relaxed),
         );
     };
@@ -758,7 +770,15 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
             let panel_press = in_window || in_tail;
             // A headset with no controller reports every input at rest
             if controllers {
-                input.hands[0] = HandInput { grip: on(1.0), buttons: buttons::GRIP_CLICK * u32::from(held), ..Default::default() };
+                // The left trigger's pull, once, for a game that waits for the first press of that hand
+                let pulled = shared.left_trigger.is_some_and(|(at, length)| (at..at + length).contains(&t));
+                input.hands[0] = HandInput {
+                    grip: on(1.0),
+                    trigger: if pulled { 1.0 } else { 0.0 },
+                    buttons: (buttons::GRIP_CLICK * u32::from(held)) | (buttons::TRIGGER_CLICK * u32::from(pulled)),
+                    touches: buttons::TRIGGER_CLICK * u32::from(pulled),
+                    ..Default::default()
+                };
                 input.hands[1] = if panel_press {
                     HandInput {
                         trigger: 0.35,

@@ -623,9 +623,14 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
                 displays.on_pointer(DESKTOP_STREAM, pointer);
             }
         }
-        Incoming::Datagram(ClientDatagram::DisplayPointer { stream, pointer }) => {
+        Incoming::Datagram(ClientDatagram::Mouse(mouse)) => {
             if let Some(displays) = session.displays.get() {
-                displays.on_pointer(stream, pointer);
+                displays.on_mouse(DESKTOP_STREAM, mouse);
+            }
+        }
+        Incoming::Datagram(ClientDatagram::DisplayMouse { stream, mouse }) => {
+            if let Some(displays) = session.displays.get() {
+                displays.on_mouse(stream, mouse);
             }
         }
         Incoming::Control(ClientMsg::Views(v)) => shared.emit(Event::Views(views_config(&v))),

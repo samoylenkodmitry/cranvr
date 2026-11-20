@@ -32,6 +32,7 @@ use cranpose_xr::{
     local_haptics, local_headset_properties, local_spatial_capabilities, local_spatial_environment, FollowMode, FollowTarget, FollowingSubspace,
     Hand as XrHand, InputSource, Pose, SpatialFrameEffect, SpatialPanel, StreamedScene, SubspaceModifier,
 };
+use cranvr_common::controls::Action as ControlAction;
 use cranvr_proto::clock::now_ns;
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
@@ -90,8 +91,13 @@ pub fn ClientApp() {
     // Which panels show: the room's choice, saved, or the game's, which ends with the game
     let layout = rememberMutableStateOf(Layout::load);
     let menu_open = rememberMutableStateOf(hand_menu::open_on_launch);
-    let recenter = rememberMutableStateOf(|| 0u32);
-    let hand = HandState { layout, menu_open, recenter };
+    // The address field of the connect panel is open. The Keyboard action of a button opens and
+    // closes it too, so the state belongs to the app and not to the panel.
+    let typing = rememberMutableStateOf(settings::address_entry_on_launch);
+    // Counts the Recenter actions, from a button or from the hand menu. Each count makes the panels'
+    // subspace snap in front of the head again.
+    let recenters = rememberMutableStateOf(|| 0u32);
+    let hand = HandState { layout, menu_open, recenter: recenters };
     // The hands belong to the game while the host asks for them (see `hands.rs`): then no panel
     // stands where a pinch could press it
     let hands_in_game = rememberMutableStateOf(|| false);
@@ -114,6 +120,9 @@ pub fn ClientApp() {
                 next.set_in_game(now.game_runs);
                 log::info!("{}: {} displays shown", if now.game_runs { "a game runs" } else { "no game runs" }, next.displays_shown().len());
                 layout.set(next);
+            }
+            for fire in hub().take_fires() {
+                run_fire(fire.action, layout, typing, recenters);
             }
             delay(CONSOLE_POLL).await;
         }
@@ -150,10 +159,6 @@ pub fn ClientApp() {
             delay(WISH_POLL).await;
         }
     });
-    // The origin of the panels' frame stands a meter ahead of the head when the first frame tracks it.
-    // It moves there again after each recenter. A panel that the user never carried starts at its
-    // default pose in that frame, so the first start opens in front of the user. A saved pose is in
-    // the same frame (see `place.rs`).
     // What the app composes, in the log: a game with nothing shown carries the ball only
     let shown_layers = {
         let layout = layout.get();
@@ -164,39 +169,73 @@ pub fn ClientApp() {
     LaunchedEffect(shown_layers, async move |_| {
         log::info!("layers composed by the app: {} panels and {} display surfaces", shown_layers.panels, shown_layers.surfaces);
     });
-    // A press on Recenter makes the subspace compose again, a meter ahead of the head as it is now. The
-    // panels keep their places relative to it.
-    key(recenter.get(), move || {
-        FollowingSubspace(FollowTarget::View(FollowMode::Snap), move || {
-            HeadsetFrames(menu_open);
-            // A flat window shows the panels in this order, side by side. In a headset each panel has
-            // its own place. The hand menu shows and hides them. While no link runs the connect panel
-            // shows anyway, so a user always sees how to connect and sees the code that the Mac asks
-            // them to compare.
-            let streaming = snapshot.get().state == LinkState::Streaming;
-            let room_for_panels = !hands_in_game.get();
-            let layout = layout.get();
-            if room_for_panels && (layout.shown(PanelId::Connection) || !streaming) {
-                ConnectPanel(snapshot, address);
-            }
-            if room_for_panels && layout.shown(PanelId::Stats) {
-                StatsPanel(snapshot);
-            }
-            // Each shown display stands in the room, unless it rides on the left hand
-            // Each display has its own slot of the composition: hiding one must not hand its place, its
-            // pose and its surface to another
-            for stream in layout.displays_shown().into_iter().filter(|stream| layout.pinned() != Some(*stream)) {
-                key(stream, move || RoomDisplay(stream));
-            }
-            ConsolePanel(console, snapshot);
-            if hand_menu::flat_menu() {
-                hand_menu::Menu(hand, console.get().open, [0.0; 3]);
-            }
-            Behind(backdrop, frames);
+    // The origin of the panels' frame stands a meter ahead of the head when the first frame tracks it.
+    // It moves there again after each recenter. A panel that the user never carried starts at its
+    // default pose in that frame, so the first start opens in front of the user. A saved pose is in
+    // the same frame (see `place.rs`).
+    FollowingSubspace(FollowTarget::View(FollowMode::Snap), move || {
+        HeadsetFrames(menu_open);
+        // A flat window shows the panels in this order, side by side. In a headset each panel has
+        // its own place. The hand menu shows and hides them. While no link runs the connect panel
+        // shows anyway, so a user always sees how to connect and sees the code that the Mac asks
+        // them to compare.
+        let streaming = snapshot.get().state == LinkState::Streaming;
+        let room_for_panels = !hands_in_game.get();
+        let layout = layout.get();
+        // The panels stand in a subspace of their own, which leaves the composition at a recenter
+        // and snaps in front of the head again when it comes back. The game's picture and the
+        // frame effect stay in the outer one, so a recenter does not touch the stream.
+        key(recenters.get(), move || {
+            FollowingSubspace(FollowTarget::View(FollowMode::Snap), move || {
+                if room_for_panels && (layout.shown(PanelId::Connection) || !streaming) {
+                    ConnectPanel(snapshot, address, typing);
+                }
+                if room_for_panels && layout.shown(PanelId::Stats) {
+                    StatsPanel(snapshot);
+                }
+                // Each shown display stands in the room, unless it rides on the left hand. Each has its
+                // own slot of the composition: hiding one must not hand its place, its pose and its
+                // surface to another.
+                for stream in layout.displays_shown().into_iter().filter(|stream| layout.pinned() != Some(*stream)) {
+                    key(stream, move || RoomDisplay(stream));
+                }
+            });
         });
+        ConsolePanel(console, snapshot);
+        if hand_menu::flat_menu() {
+            hand_menu::Menu(hand, console.get().open, [0.0; 3]);
+        }
+        Behind(backdrop, frames);
     });
     if !hands_in_game.get() {
         HandPanels(hand, console.get().open);
+    }
+}
+
+/// Does a headset action that a button fired (see `controls.rs`). The console opens in the frame
+/// loop, so it is not here.
+fn run_fire(action: ControlAction, layout: MutableState<Layout>, typing: MutableState<bool>, recenters: MutableState<u32>) {
+    match action {
+        ControlAction::Panels => {
+            // The connection panel and the stream numbers hide together, or show together
+            let mut next = layout.get_non_reactive();
+            let shown = !(next.shown(PanelId::Connection) || next.shown(PanelId::Stats));
+            next.set_shown(PanelId::Connection, shown);
+            next.set_shown(PanelId::Stats, shown);
+            if !next.in_game() {
+                next.save();
+            }
+            layout.set(next);
+        }
+        ControlAction::Keyboard => {
+            // The connection panel shows for the keyboard, for this run only
+            let mut next = layout.get_non_reactive();
+            next.set_shown(PanelId::Connection, true);
+            layout.set(next);
+            typing.set(!typing.get());
+        }
+        ControlAction::Recenter => recenters.set(recenters.get().wrapping_add(1)),
+        _ => {}
     }
 }
 
@@ -264,6 +303,7 @@ fn PhonePicture(frames: MutableState<Option<DecodedFrames>>) {
 /// phone's screen is lower than a panel.
 #[composable]
 fn PhonePanels(snapshot: MutableState<Snapshot>, address: TextFieldState, panels: MutableState<bool>) {
+    let typing = rememberMutableStateOf(settings::address_entry_on_launch);
     let left = remember(|| ScrollState::new(0.0)).with(|state| *state);
     let right = remember(|| ScrollState::new(0.0)).with(|state| *state);
     Row(
@@ -276,7 +316,7 @@ fn PhonePanels(snapshot: MutableState<Snapshot>, address: TextFieldState, panels
                 Modifier::empty().weight(1.0).fill_max_height().vertical_scroll(left, false).clickable(|_| {}),
                 ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(16.0)),
                 move || {
-                    ConnectBody(snapshot, address, Modifier::empty().fill_max_width(), false);
+                    ConnectBody(snapshot, address, Modifier::empty().fill_max_width(), false, typing);
                     PhoneButtons(panels);
                 },
             );
@@ -492,13 +532,13 @@ fn address_field() -> TextFieldState {
 /// The connect panel: the Macs that the search found, and the address field with its keypad behind a
 /// button. The app owns the address field (`address_field`).
 #[composable]
-fn ConnectPanel(snapshot: MutableState<Snapshot>, address: TextFieldState) {
+fn ConnectPanel(snapshot: MutableState<Snapshot>, address: TextFieldState, typing: MutableState<bool>) {
     let pose = remember(|| place::start_pose("connect", side_pose(-1.0))).with(|pose| *pose);
     let size = rememberMutableStateOf(|| place::start_size("connect", CONNECT_SIZE));
     SpatialPanel(place::movable("connect", place::resizable("connect", size, CONNECT_SIZE), pose, |_| {}), move || {
         // The pointer over the panel holds the pointing hand back from the game (see `hold.rs`)
         let hovered = hover::hover_modifier(hover::CONNECTION);
-        ConnectBody(snapshot, address, Modifier::empty().fill_max_size().then(hovered), true);
+        ConnectBody(snapshot, address, Modifier::empty().fill_max_size().then(hovered), true, typing);
     });
 }
 
@@ -507,12 +547,11 @@ fn ConnectPanel(snapshot: MutableState<Snapshot>, address: TextFieldState) {
 /// behind the small button "Enter an address", for a headset on USB and for another network. It
 /// replaces the list while it shows. `keypad` adds the keypad of a headset.
 #[composable]
-fn ConnectBody(snapshot: MutableState<Snapshot>, address: TextFieldState, modifier: Modifier, keypad: bool) {
+fn ConnectBody(snapshot: MutableState<Snapshot>, address: TextFieldState, modifier: Modifier, keypad: bool, typing: MutableState<bool>) {
     let snap = snapshot.get();
     let state = snap.state.clone();
     let found = usb::entries(&snap.found, snap.usb.as_ref());
     let path = snap.path;
-    let typing = rememberMutableStateOf(settings::address_entry_on_launch);
     Column(
         modifier.background(PANEL_COLOR).rounded_corners(24.0).padding(36.0),
         ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(20.0)),

@@ -41,6 +41,44 @@ fn the_desktop_messages_round_trip() {
     round_trip(HostDatagram::Cursor(Cursor { seq: 3, u: 0.5, v: 0.125, on: true }));
 }
 
+/// Protocol version 7 added the mouse datagram after the last variant of version 6. A host of an
+/// older version reads every message as before and skips this one.
+#[test]
+fn the_mouse_datagram_stands_after_the_variants_of_version_6() {
+    round_trip(ClientDatagram::Mouse(Mouse { seq: 4, sent: 99, hit: Some([0.1, 0.9]), buttons: 0b101, scroll: [-0.25, 1.0] }));
+    round_trip(ClientDatagram::Mouse(Mouse { seq: 5, sent: 0, hit: None, buttons: 0, scroll: [0.0, 0.0] }));
+    let mut bytes = Vec::new();
+    encode(&ClientDatagram::Mouse(Mouse { seq: 0, sent: 0, hit: None, buttons: 0, scroll: [0.0; 2] }), &mut bytes).unwrap();
+    assert_eq!(bytes[0], 12, "Mouse is the thirteenth datagram variant, after Eyes");
+    // The datagram of the older version
+    bytes.clear();
+    encode(&ClientDatagram::Eyes(cranvr_proto::tracking::Eyes::default()), &mut bytes).unwrap();
+    assert_eq!(bytes[0], 11);
+    // A host of version 6 has no such variant: its read loop skips the datagram
+    #[derive(Debug, serde::Deserialize)]
+    #[allow(dead_code, clippy::large_enum_variant)]
+    enum V6Datagram {
+        Hello { session: u64 },
+        Tracking(Tracking),
+        Input(Input),
+        FrameTiming(FrameTiming),
+        Loss(LossReport),
+        Ping(Ping),
+        Pong(Pong),
+        Pointer(Pointer),
+        Hands(cranvr_proto::tracking::Hands),
+        Body(cranvr_proto::tracking::Body),
+        Face(cranvr_proto::tracking::Face),
+        Eyes(cranvr_proto::tracking::Eyes),
+    }
+    bytes.clear();
+    encode(&ClientDatagram::Mouse(Mouse { seq: 1, sent: 2, hit: None, buttons: 1, scroll: [0.0; 2] }), &mut bytes).unwrap();
+    assert!(decode::<V6Datagram>(&bytes).is_err());
+    bytes.clear();
+    encode(&ClientDatagram::Pointer(Pointer { seq: 1, sent: 2, hit: None, trigger: 1.0, scroll: 0.0 }), &mut bytes).unwrap();
+    assert!(matches!(decode::<V6Datagram>(&bytes).unwrap(), V6Datagram::Pointer(_)));
+}
+
 /// The new variants stand after the old ones, so a host and a client that do not know them read
 /// every old message as before: an old message keeps its tag. A message that a side does not
 /// know fails to decode, which the read loops skip.
