@@ -68,6 +68,9 @@ pub struct Options {
     /// panel's press, which the host must hold back from the game. The fake game checks that none
     /// of it arrives (`--expect-held`).
     pub hold_script: bool,
+    /// Both hands point at a panel all the time: the host must make the game's controllers of the
+    /// tracked hands with rest values (`--expect-hand-held` of the fake game)
+    pub hold_hands: bool,
     /// Offer hands, body, face and eyes and send them when the host asks (see `tracked.rs`)
     pub tracking: bool,
     /// With `tracking`: no controller is tracked
@@ -170,6 +173,7 @@ struct Shared {
     /// The displays after the first (see `displays.rs`)
     displays: Arc<DisplaySet>,
     hold_script: bool,
+    hold_hands: bool,
     /// Whether the host has said that a game runs
     game_runs: AtomicBool,
     /// The tracking that the host asked for last, as bits of `Features`, and what the probe sent
@@ -284,6 +288,7 @@ pub fn run(o: Options) -> i32 {
         desktop: (o.desktop || o.displays > 1 || o.displays_in_game).then(|| DesktopProbe::new(DESKTOP_STREAM)),
         displays: DisplaySet::new(DisplayPlan { wanted: o.displays.max(1), in_game: o.displays_in_game }),
         hold_script: o.hold_script,
+        hold_hands: o.hold_hands,
         game_runs: AtomicBool::new(false),
         wish: AtomicU8::new(0),
         tracking: o.tracking,
@@ -773,7 +778,7 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
             }
             // A host of version 8 gets the input with the hands that the app holds back
             if shared.link.welcome.version >= cranvr_proto::DISPLAYS_VERSION {
-                let held_hands = [false, in_window];
+                let held_hands = if shared.hold_hands { [true, true] } else { [false, in_window] };
                 shared.link.duplex.send_datagram(&ClientDatagram::InputHold(InputHold { input, held: held_hands })).ok();
             } else {
                 shared.link.duplex.send_datagram(&ClientDatagram::Input(input)).ok();

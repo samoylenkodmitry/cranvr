@@ -47,6 +47,9 @@ fn usage() -> ! {
          \n                     and count the pictures in each part. Implies --desktop's streams, not its wish.\
          \n  --hold-script      the right hand points at a panel in every other window of its script: the input of\
          \n                     those windows must not reach the game (cranvr-fake-game --expect-held)\
+         \n  --hold-hands       both hands point at a panel all the time: a game without hand code must get the\
+         \n                     controllers that the host makes of the tracked hands with rest values\
+         \n                     (cranvr-fake-game --expect-hand-held)\
          \n  --tracking         offer hands, body, face and eyes, and send the script of tracked.rs for\
          \n                     each feature that the host asks for. The head stands still.\
          \n  --still-head       the head stands still (as with --tracking), so a game's room is the\
@@ -83,6 +86,7 @@ fn main() {
         displays: 1,
         displays_in_game: false,
         hold_script: false,
+        hold_hands: false,
         tracking: false,
         no_controllers: false,
         still_head: false,
@@ -107,6 +111,7 @@ fn main() {
             "--displays" => options.displays = value().parse().ok().filter(|n| (1..=cranvr_proto::message::MAX_DISPLAYS).contains(n)).unwrap_or_else(|| usage()),
             "--displays-in-game" => options.displays_in_game = true,
             "--hold-script" => options.hold_script = true,
+            "--hold-hands" => options.hold_hands = true,
             "--tracking" => options.tracking = true,
             "--no-controllers" => options.no_controllers = true,
             "--still-head" => options.still_head = true,

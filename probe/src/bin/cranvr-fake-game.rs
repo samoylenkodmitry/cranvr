@@ -427,7 +427,7 @@ fn u32_at(b: &[u8], at: usize) -> u32 {
 impl Input {
     /// What a game without hand code must have got from the probe's hands: a controller for each
     /// hand, at the palm, with the trigger of a half-open pinch and the aim pose through the fingers
-    fn hand_controller_problems(&self) -> Vec<String> {
+    fn hand_controller_problems(&self, held: bool) -> Vec<String> {
         let mut out = Vec::new();
         if self.mask != Some(3) {
             out.push(format!("controller mask {:?}, expected both hands", self.mask));
@@ -446,7 +446,8 @@ impl Input {
             // The thumb tip and the index tip: 0.0418 m apart in the script. The trigger runs from 1
             // at 18 mm to 0 at 60 mm.
             let distance = |a: usize, b: usize| (0..3).map(|k| (joints[a].pose.position[k] - joints[b].pose.position[k]).powi(2)).sum::<f32>().sqrt();
-            let wanted = ((0.060 - distance(5, 10)) / (0.060 - 0.018)).clamp(0.0, 1.0);
+            // A hand that a panel holds back from the game makes a controller with rest values
+            let wanted = if held { 0.0 } else { ((0.060 - distance(5, 10)) / (0.060 - 0.018)).clamp(0.0, 1.0) };
             match self.last(trigger_id) {
                 Some(v) if (v - wanted).abs() < 0.01 => {}
                 other => out.push(format!("hand {side}: trigger {other:?}, expected {wanted:.3}")),
@@ -510,6 +511,7 @@ fn paint(image: &mut PixelBuffer, eye: usize) {
 fn main() {
     let (mut control, mut fps, mut seconds, mut expect_input, mut expect_held) = (None, 72.0f64, 10.0f64, false, false);
     let (mut use_tracking, mut expect_tracking, mut expect_hand_controllers, mut expect_no_controllers) = (String::new(), false, false, false);
+    let mut expect_hand_held = false;
     let mut release_tracking = false;
     let mut face_source = tracked::FaceSource::default();
     let mut args = env::args().skip(1);
@@ -523,11 +525,12 @@ fn main() {
             "--use-tracking" => use_tracking = args.next().expect("--use-tracking FEATURES"),
             "--expect-tracking" => expect_tracking = true,
             "--expect-hand-controllers" => expect_hand_controllers = true,
+            "--expect-hand-held" => expect_hand_held = true,
             "--expect-no-controllers" => expect_no_controllers = true,
             "--release-tracking" => release_tracking = true,
             "--face-source" => face_source = args.next().as_deref().and_then(tracked::FaceSource::parse).expect("--face-source visual|audio|unknown"),
             _ => {
-                eprintln!("usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input] [--expect-held] [--use-tracking FEATURES] [--expect-tracking] [--face-source visual|audio|unknown] [--expect-hand-controllers] [--expect-no-controllers] [--release-tracking]");
+                eprintln!("usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input] [--expect-held] [--use-tracking FEATURES] [--expect-tracking] [--face-source visual|audio|unknown] [--expect-hand-controllers] [--expect-hand-held] [--expect-no-controllers] [--release-tracking]");
                 std::process::exit(2);
             }
         }
@@ -795,7 +798,7 @@ fn main() {
         }
     }
     if expect_hand_controllers {
-        let problems = input.hand_controller_problems();
+        let problems = input.hand_controller_problems(expect_hand_held);
         for problem in &problems {
             println!("fake-game: hand controller problem: {problem}");
         }

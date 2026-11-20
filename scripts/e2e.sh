@@ -7,7 +7,7 @@
 #                       [--quest [SERIAL] | --native-tcp] [--native-drop PERCENT] [--native-port PORT]
 #                       [--host-arg ARG]... [--report FILE]
 #                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine | --openvr-wine | --openvr-actions MODE]
-#                       [--displays N] [--hold] [--displays-in-game]
+#                       [--displays N] [--hold] [--hand-hold] [--displays-in-game]
 #                       [--pause AT:FOR]
 #                       [--face-source visual|audio|unknown]
 #
@@ -71,6 +71,9 @@
 #   --hold        the probe's right hand points at a panel in every other window of its script. The host must
 #                 give the game rest values for those windows, and the fake game checks that none of the panel's
 #                 presses reaches it, also not in the 0.1 s after the hold ends. Implies --game.
+#   --hand-hold   like --hand-controllers, with the app holding both hands back from the game: the controllers
+#                 that the host makes of the tracked hands must have rest values (a pinch at a panel is no
+#                 trigger of the game). Implies --hand-controllers.
 #   --displays-in-game  a game runs (the fake game). For 5 s the probe wishes no display, then it shows its
 #                 displays for 5 s, then it hides them. The run checks the host's log and the probe's counts: no
 #                 capture, no encoder and no picture sent or received while nothing is wished or after the
@@ -106,7 +109,7 @@ set -euo pipefail
 
 root=${0:A:h:h}
 seconds=20 fps=120 fps_given=0 game=0 desktop=0 client=mac serial="" report=""
-displays=1 hold=0 displays_in_game=0 display_test=0
+displays=1 hold=0 hand_hold=0 displays_in_game=0 display_test=0
 tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 openvr_wine=0 openvr_actions="" face_source=audio
 wine="" wine_args=()
 native_tcp=0 native_drop=0 native_port=9950 pause=""
@@ -132,6 +135,7 @@ while (( $# )); do
         --displays) displays=$2; shift 2 ;;
         --display-test) display_test=1; shift ;;
         --hold) game=1 hold=1; shift ;;
+        --hand-hold) game=1 hand_controllers=1 hand_hold=1; shift ;;
         --displays-in-game) game=1 displays_in_game=1; shift ;;
         --wine) wine=$2; shift 2 ;;
         --wine-arg) wine_args+=("$2"); shift 2 ;;
@@ -341,6 +345,7 @@ if (( game )); then
         game_args=(--expect-input)
         (( tracking )) && game_args=(--use-tracking "${tracking_features}" --release-tracking --expect-tracking --face-source "${face_source}")
         (( hand_controllers )) && game_args=(--expect-hand-controllers)
+        (( hand_hold )) && game_args+=(--expect-hand-held)
         (( hold )) && game_args+=(--expect-held)
         "${bin}/cranvr-fake-game" --control "${work}/config/runtime-control.txt" --fps "${fps}" \
             --seconds $(( seconds + 4 )) "${game_args[@]}" > "${work}/game.log" 2>&1 &
@@ -371,6 +376,7 @@ fi
 (( displays > 1 )) && probe_args+=(--displays "${displays}")
 (( displays_in_game )) && probe_args+=(--displays-in-game)
 (( hold )) && probe_args+=(--hold-script)
+(( hand_hold )) && probe_args+=(--hold-hands)
 [[ -n ${pause} ]] && probe_args+=(--pause "${pause}")
 # The probe offers hands, body, face and eyes and plays the script of tracked.rs for what the host asks
 (( tracking || tracking_wine )) && probe_args+=(--tracking --face-source "${face_source}")
