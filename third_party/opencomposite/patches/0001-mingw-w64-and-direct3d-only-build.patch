@@ -1,0 +1,78 @@
+diff --git i/CMakeLists.txt w/CMakeLists.txt
+index 17fd03e..ec49740 100644
+--- i/CMakeLists.txt
++++ w/CMakeLists.txt
+@@ -21,13 +21,18 @@ option(USE_SYSTEM_OPENXR "Try using system installation of OpenXR if available"
+ option(USE_SYSTEM_GLM "Try using system installation of glm if available" OFF)
+ option(OC_BACKTRACE "Print the backtrace on crash" OFF)
+ option(ERROR_ON_WARNING "Set all warnings to be errors" OFF)
++# cranvr: a Windows build for Wine with no Vulkan and no OpenGL. The OpenXR runtime of cranvr offers
++# Direct3D 11 only, and the Vulkan SDK is a Windows download that a MinGW build does not use.
++option(OC_D3D_ONLY "Windows only: build the Direct3D compositors alone" OFF)
+ 
+ # Directory for generated files, those being split headers and stubs
+ set(GENERATED_DIR ${CMAKE_BINARY_DIR}/generated)
+ 
+ # Platform-dependent flags
+ # Support Vulkan on Linux instead of DirectX
+-if (WIN32)
++if (WIN32 AND OC_D3D_ONLY)
++	set(GRAPHICS_API_SUPPORT_FLAGS -DSUPPORT_DX -DSUPPORT_DX11 -DSUPPORT_DX12)
++elseif (WIN32)
+ 	set(GRAPHICS_API_SUPPORT_FLAGS -DSUPPORT_DX -DSUPPORT_DX11 -DSUPPORT_DX12 -DSUPPORT_VK -DSUPPORT_GL)
+ elseif (ANDROID)
+ 	set(GRAPHICS_API_SUPPORT_FLAGS -DSUPPORT_VK -DSUPPORT_GLES)
+@@ -64,7 +69,7 @@ else ()
+ 	# In general using private symbols is a great idea, and it's something we'd want to do anyway.
+ 	# There is also -Bsymbolic set when linking the final shared library, see the bottom of this file
+ 	# FIXME the Vulkan functions still get exported, hopefully they won't fight with the application's ones.
+-    add_definitions(-fvisibility=hidden)
++    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-fvisibility=hidden>)
+ 	add_compile_options(-Wall -Wextra -Wpedantic -pedantic-errors -Wno-unused-parameter -Wno-missing-field-initializers -Wno-format-security)
+ 	set(ERROR_ON_WARNING_FLAG -Werror)
+ endif ()
+@@ -86,7 +91,9 @@ target_include_directories(OpenVR INTERFACE OpenVRHeaders) # TODO make this priv
+ # === Vulkan ===
+ add_library(Vulkan INTERFACE)
+ 
+-if (WIN32)
++if (WIN32 AND OC_D3D_ONLY)
++	# No Vulkan: the interface library stays empty
++elseif (WIN32)
+ 	# On Windows, use the bundled copy
+ 	target_include_directories(Vulkan INTERFACE libs/vulkan/Include) # TODO make this private and put the public headers elsewhere
+ 	if ("${CMAKE_SIZEOF_VOID_P}" EQUAL "8")
+@@ -115,7 +122,9 @@ else ()
+ endif ()
+ 
+ # === OpenXR ===
+-add_compile_definitions(XR_USE_GRAPHICS_API_OPENGL XR_USE_GRAPHICS_API_VULKAN)
++if (NOT (WIN32 AND OC_D3D_ONLY))
++	add_compile_definitions(XR_USE_GRAPHICS_API_OPENGL XR_USE_GRAPHICS_API_VULKAN)
++endif ()
+ # Platform-dependent flags
+ if (WIN32)
+ 	add_compile_definitions(XR_OS_WINDOWS XR_USE_PLATFORM_WIN32
+@@ -183,7 +192,9 @@ if (NOT OpenXR_FOUND OR NOT jsoncpp_FOUND)
+ 	target_include_directories(OpenXR PRIVATE ${XrDirCommon} ${XrDir}/src)
+ 	target_include_directories(OpenXR PUBLIC ${XrDir}/include)
+ 	# Platform-dependent flags
+-	if (WIN32)
++	if (WIN32 AND OC_D3D_ONLY)
++		target_link_libraries(OpenXR PUBLIC advapi32 pathcch)
++	elseif (WIN32)
+ 		target_link_libraries(OpenXR PUBLIC advapi32 pathcch OpenGL32)
+ 	else()
+ 		target_link_libraries(OpenXR PUBLIC -ldl)
+@@ -516,6 +527,11 @@ endif ()
+ if (NOT WIN32)
+ 	target_link_libraries(OCOVR PRIVATE -Wl,--no-undefined)
+ 	target_link_libraries(OCOVR PUBLIC -Wl,--start-group OCCore DrvOpenXR -Wl,--end-group)
++elseif (MINGW)
++	# GNU ld wants a static library after the one that needs it. MSVC takes its libraries from the
++	# #pragma comment(lib) lines of the sources, which GCC ignores.
++	target_link_libraries(OCOVR PRIVATE -Wl,--start-group OCCore DrvOpenXR -Wl,--end-group
++		d3d11 d3d12 dxgi d3dcompiler shlwapi dbghelp ole32 uuid)
+ else ()
+ 	# On Windows this isn't a problem since the linker knows how to figure this stuff out
+ 	target_link_libraries(OCOVR OCCore DrvOpenXR)
