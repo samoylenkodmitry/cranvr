@@ -31,7 +31,8 @@ required-features = ["desktop"]
 default = ["renderer-wgpu", "desktop"]
 renderer-wgpu = ["cranpose/renderer-wgpu"]
 desktop = ["cranpose/desktop", "dep:env_logger"]
-android = ["renderer-wgpu", "cranpose/android", "cranpose-xr/openxr"]
+# `gltf` loads the controller models that the Quest's runtime hands out (XR_FB_render_model)
+android = ["renderer-wgpu", "cranpose/android", "cranpose-xr/openxr", "cranpose-xr/gltf"]
 phone = ["renderer-wgpu", "cranpose/android"]
 # A test build for a headset on a desk: a scripted hand types into the address field (src/scripted.rs)
 scripted-hand = ["cranpose-xr/scripted-hand"]
@@ -41,16 +42,16 @@ cranvr-proto = { path = "../proto" }
 # The foveated layout that the host encodes: the client derives the same sizes
 cranvr-common = { path = "../common" }
 # One Cranpose revision for every Cranpose crate: the main branch of the Cranpose repository
-cranpose = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "f83f8686eb81ed403c587a8a822ddab47beecca9", features = ["embedded-default-font"] }
-cranpose-xr = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "f83f8686eb81ed403c587a8a822ddab47beecca9" }
+cranpose = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "247b334eae5f06ad3ff229673b1f0067dcec0400", features = ["embedded-default-font"] }
+cranpose-xr = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "247b334eae5f06ad3ff229673b1f0067dcec0400" }
 # The output device and the queue for the host's sound (see src/audio.rs)
-cranpose-audio = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "f83f8686eb81ed403c587a8a822ddab47beecca9" }
+cranpose-audio = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "247b334eae5f06ad3ff229673b1f0067dcec0400" }
 log = "0.4"
 serde_json = "1"
 env_logger = { version = "0.11", optional = true }
 
 [build-dependencies]
-cranpose-capabilities = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "f83f8686eb81ed403c587a8a822ddab47beecca9" }
+cranpose-capabilities = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "247b334eae5f06ad3ff229673b1f0067dcec0400" }
 
 # The Reed-Solomon code of the protocol is about ten times slower without optimization.
 [profile.dev.package.reed-solomon-simd]
