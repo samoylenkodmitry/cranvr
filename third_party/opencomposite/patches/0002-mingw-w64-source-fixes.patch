@@ -1,0 +1,177 @@
+diff --git i/DrvOpenXR/DrvOpenXR.cpp w/DrvOpenXR/DrvOpenXR.cpp
+index 8e3bd9c..61e5422 100644
+--- i/DrvOpenXR/DrvOpenXR.cpp
++++ w/DrvOpenXR/DrvOpenXR.cpp
+@@ -24,6 +24,7 @@ static XrBackend* currentBackend;
+ static bool initialised = false;
+ 
+ #ifdef _WIN32
++#include <shlwapi.h>
+ std::string GetExeName()
+ {
+ 	char exePath[MAX_PATH + 1] = { 0 };
+diff --git i/DrvOpenXR/XrBackend.cpp w/DrvOpenXR/XrBackend.cpp
+index 3e246d9..6b0f7c6 100644
+--- i/DrvOpenXR/XrBackend.cpp
++++ w/DrvOpenXR/XrBackend.cpp
+@@ -154,6 +154,7 @@ void XrBackend::GetDeviceToAbsoluteTrackingPose(
+ 	}
+ }
+ 
++#ifdef SUPPORT_VK
+ static void find_queue_family_and_queue_idx(VkDevice dev, VkPhysicalDevice pdev, VkQueue desired_queue, uint32_t& out_queueFamilyIndex, uint32_t& out_queueIndex)
+ {
+ 	uint32_t queue_family_count;
+@@ -180,6 +181,8 @@ static void find_queue_family_and_queue_idx(VkDevice dev, VkPhysicalDevice pdev,
+ 	           "This is really odd and really shouldn't ever happen");
+ }
+ 
++#endif // SUPPORT_VK
++
+ /* Submitting Frames */
+ void XrBackend::CheckOrInitCompositors(const vr::Texture_t* tex)
+ {
+@@ -260,6 +263,9 @@ void XrBackend::CheckOrInitCompositors(const vr::Texture_t* tex)
+ 			break;
+ 		}
+ 		case vr::TextureType_Vulkan: {
++#ifndef SUPPORT_VK
++			OOVR_ABORT("Application is trying to submit a Vulkan texture, which OpenComposite supports but is disabled in this build");
++#else
+ 			const vr::VRVulkanTextureData_t* vktex = (vr::VRVulkanTextureData_t*)tex->handle;
+ 
+ 			VkPhysicalDevice xr_desire;
+@@ -289,6 +295,7 @@ void XrBackend::CheckOrInitCompositors(const vr::Texture_t* tex)
+ 
+ 			graphicsBinding = std::make_unique<BindingWrapper<XrGraphicsBindingVulkanKHR>>(binding);
+ 			DrvOpenXR::SetupSession();
++#endif
+ 			break;
+ 		}
+ 		case vr::TextureType_OpenGL: {
+diff --git i/OpenOVR/Compositor/dx11compositor.cpp w/OpenOVR/Compositor/dx11compositor.cpp
+index 2ed44d2..0df2384 100644
+--- i/OpenOVR/Compositor/dx11compositor.cpp
++++ w/OpenOVR/Compositor/dx11compositor.cpp
+@@ -309,7 +309,7 @@ void DX11Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
+ 	OOVR_FAILED_XR_ABORT(res = xrWaitSwapchainImage(chain, &waitInfo));
+ 
+ 	if (res == XR_TIMEOUT_EXPIRED)
+-		OOVR_ABORTF("xrWaitSwapchainImage timeout");
++		OOVR_ABORT("xrWaitSwapchainImage timeout");
+ 
+ 	// Copy the source to the destination image
+ 	D3D11_BOX sourceRegion;
+@@ -350,7 +350,29 @@ void DX11Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
+ 		context->RSGetState(&pRSState);
+ 		context->RSSetState(nullptr);
+ 
+-		D3D11_VIEWPORT viewport = CD3D11_VIEWPORT(src, swapchain_rtvs[currentIndex]);
++		D3D11_VIEWPORT viewport = {};
++		{
++			// The whole first mip of the target's texture, as Microsoft's CD3D11_VIEWPORT(resource, view) says
++			D3D11_RENDER_TARGET_VIEW_DESC rtvDesc;
++			swapchain_rtvs[currentIndex]->GetDesc(&rtvDesc);
++			ID3D11Resource* rtvResource = nullptr;
++			swapchain_rtvs[currentIndex]->GetResource(&rtvResource);
++			D3D11_TEXTURE2D_DESC texDesc{};
++			ComPtr<ID3D11Texture2D> rtvTexture;
++			if (rtvResource && SUCCEEDED(rtvResource->QueryInterface(IID_PPV_ARGS(&rtvTexture)))) {
++				rtvTexture->GetDesc(&texDesc);
++			}
++			if (rtvResource) {
++				rtvResource->Release();
++			}
++			UINT mip = rtvDesc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D ? rtvDesc.Texture2D.MipSlice : 0;
++			viewport.TopLeftX = 0;
++			viewport.TopLeftY = 0;
++			viewport.Width = static_cast<FLOAT>(std::max(1u, texDesc.Width >> mip));
++			viewport.Height = static_cast<FLOAT>(std::max(1u, texDesc.Height >> mip));
++			viewport.MinDepth = 0.0f;
++			viewport.MaxDepth = 1.0f;
++		}
+ 		context->RSSetViewports(1, &viewport);
+ 		D3D11_RECT rects[1];
+ 		rects[0].top = 0;
+diff --git i/OpenOVR/Compositor/dx12compositor.cpp w/OpenOVR/Compositor/dx12compositor.cpp
+index ff2fedd..c8d9f35 100644
+--- i/OpenOVR/Compositor/dx12compositor.cpp
++++ w/OpenOVR/Compositor/dx12compositor.cpp
+@@ -213,7 +213,7 @@ void DX12Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
+ 	OOVR_FAILED_XR_ABORT(res = xrWaitSwapchainImage(chain, &waitInfo));
+ 
+ 	if (res == XR_TIMEOUT_EXPIRED)
+-		OOVR_ABORTF("xrWaitSwapchainImage timeout");
++		OOVR_ABORT("xrWaitSwapchainImage timeout");
+ 
+ 	// Copy the source to the destination image
+ 	D3D12_BOX sourceRegion;
+diff --git i/OpenOVR/Reimpl/BaseClientCore.cpp w/OpenOVR/Reimpl/BaseClientCore.cpp
+index 5f06605..3edb4f9 100644
+--- i/OpenOVR/Reimpl/BaseClientCore.cpp
++++ w/OpenOVR/Reimpl/BaseClientCore.cpp
+@@ -4,6 +4,7 @@
+ #include "steamvr_abi.h"
+ 
+ #include <codecvt>
++#include <filesystem>
+ #include <fstream>
+ #include <locale>
+ 
+@@ -25,7 +26,7 @@ static std::wstring_convert<std::codecvt_utf8<wchar_t>> CHAR_CONV;
+ 
+ static bool ReadJson(wstring path, Json::Value& result)
+ {
+-	std::ifstream in(APISTR(path), std::ios::binary);
++	std::ifstream in(std::filesystem::path(APISTR(path)), std::ios::binary);
+ 	if (in) {
+ 		std::stringstream contents;
+ 		contents << in.rdbuf();
+@@ -39,7 +40,7 @@ static bool ReadJson(wstring path, Json::Value& result)
+ 
+ static void WriteJson(wstring path, const Json::Value& value)
+ {
+-	std::ofstream out(APISTR(path), std::ios::binary);
++	std::ofstream out(std::filesystem::path(APISTR(path)), std::ios::binary);
+ 	if (!out) {
+ 		OOVR_ABORTF("Failed to write applist json: %s", strerror(errno));
+ 	}
+diff --git i/OpenOVR/Reimpl/BaseInput.cpp w/OpenOVR/Reimpl/BaseInput.cpp
+index 1091a21..288e794 100644
+--- i/OpenOVR/Reimpl/BaseInput.cpp
++++ w/OpenOVR/Reimpl/BaseInput.cpp
+@@ -78,7 +78,7 @@ static bool ReadJson(const std::wstring& path, Json::Value& result)
+ #endif
+ 
+ #ifndef ANDROID
+-	std::ifstream in(real_path, std::ios::binary);
++	std::ifstream in(std::filesystem::path(real_path), std::ios::binary);
+ 	if (in) {
+ 		std::stringstream contents;
+ 		contents << in.rdbuf();
+diff --git i/OpenOVR/logging.cpp w/OpenOVR/logging.cpp
+index 11b88c5..b731858 100644
+--- i/OpenOVR/logging.cpp
++++ w/OpenOVR/logging.cpp
+@@ -8,6 +8,9 @@
+ #include <cstdio>
+ #include <ctime>
+ #include <errno.h> // errno, ENOENT, EEXIST
++#ifdef _WIN32
++#include <io.h> // _commit
++#endif
+ #include <fstream>
+ #include <iostream>
+ #include <sstream>
+@@ -240,7 +243,11 @@ void oovr_flush_safe()
+ 
+ 	int r;
+ 	do {
++#ifdef _WIN32
++		r = _commit(fd);
++#else
+ 		r = fsync(fd);
++#endif
+ 	} while (r < 0 && errno == EINTR);
+ #endif
+ }

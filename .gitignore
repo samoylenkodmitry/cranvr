@@ -1,3 +1,5 @@
 target/
 third_party/basaltvr/src/
+third_party/opencomposite/src/
+third_party/opencomposite/build/
 __pycache__/
