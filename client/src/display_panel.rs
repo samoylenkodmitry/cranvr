@@ -185,6 +185,7 @@ fn RoomSurface(stream: u8, name: &'static str, pose: MutableState<Pose>, width: 
     let [smallest, largest] = WIDTH_RANGE.map(|width| surface_size(width, aspect));
     let limits = ResizeLimits::new().minimum_size(smallest[0], smallest[1]).maximum_size(largest[0], largest[1]).maintain_aspect_ratio(true);
     let resize = ResizePolicy::custom(move |event| {
+        hover::set(hover::HANDLE, event.event_type != SpatialResizeEventType::End);
         width.set((event.size[0] * METERS_PER_DP).clamp(WIDTH_RANGE[0], WIDTH_RANGE[1]));
         if event.event_type == SpatialResizeEventType::End {
             place::save_width(name, width.get_non_reactive());
@@ -258,6 +259,7 @@ pub fn HandDisplay(stream: u8, base: [f32; 3]) {
     let [smallest, largest] = HAND_WIDTH.map(|width| surface_size(width, view.aspect));
     let limits = ResizeLimits::new().minimum_size(smallest[0], smallest[1]).maximum_size(largest[0], largest[1]).maintain_aspect_ratio(true);
     let resize = ResizePolicy::custom(move |event| {
+        hover::set(hover::HANDLE, event.event_type != SpatialResizeEventType::End);
         width.set((event.size[0] * METERS_PER_DP).clamp(HAND_WIDTH[0], HAND_WIDTH[1]));
         if event.event_type == SpatialResizeEventType::End {
             place::save_width("hand-display", width.get_non_reactive());

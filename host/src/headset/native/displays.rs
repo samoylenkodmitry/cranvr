@@ -287,8 +287,11 @@ impl Displays {
     }
 
     /// Copies what the host's frame loop shares with the displays: it tells them whether a game
-    /// runs, and it hears whether any display shows and how many pictures went out.
-    fn mirror(&self, game: bool) {
+    /// runs, and it hears whether any display shows and how many pictures went out. `owns_panels` is
+    /// true for a client of version 8: it owns the panels of the Mac's displays, so the frame loop
+    /// draws no screen of its own into the eye stream and moves no mouse with a controller, also while
+    /// the client shows no display.
+    fn mirror(&self, game: bool, owns_panels: bool) {
         let slots = self.slots.lock().unwrap();
         let mut active = false;
         let mut frames = 0;
@@ -297,7 +300,7 @@ impl Displays {
             active |= slot.layer.active.load(Ordering::Relaxed);
             frames += slot.layer.frames.swap(0, Ordering::Relaxed);
         }
-        self.base.layer.active.store(active, Ordering::Relaxed);
+        self.base.layer.active.store(active || owns_panels, Ordering::Relaxed);
         self.base.layer.frames.fetch_add(frames, Ordering::Relaxed);
     }
 }
@@ -337,7 +340,7 @@ fn manage(displays: &Displays, session: &Session) {
     while !displays.stop.load(Ordering::Relaxed) && !*session.stopped.lock().unwrap() {
         thread::sleep(LOOK_EVERY);
         let game = displays.base.layer.game.load(Ordering::Relaxed);
-        displays.mirror(game);
+        displays.mirror(game, session.version >= DISPLAYS_VERSION && displays.base.enabled);
         if session.version >= DISPLAYS_VERSION {
             if game_sent != Some(game) {
                 game_sent = Some(game);

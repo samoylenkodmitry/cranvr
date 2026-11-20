@@ -69,7 +69,7 @@ fn OpenConsole(view: View, state: LinkState) {
         let (room, volume) = (view.room, view.volume);
         let state = state.clone();
         Column(
-            Modifier::empty().fill_max_size().background(PANEL_COLOR).rounded_corners(24.0).padding(size::PADDING).then(hovered),
+            Modifier::empty().fill_max_size().then(hovered).background(PANEL_COLOR).rounded_corners(24.0).padding(size::PADDING),
             ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(size::GAP)),
             move || match &menu {
                 Some(menu) => MenuRows(menu.clone(), room, volume),

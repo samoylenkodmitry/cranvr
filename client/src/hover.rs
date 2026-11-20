@@ -6,6 +6,11 @@
 //! [`hover_modifier`]: Cranpose's `hoverable` reports the pointer's entry and exit. A surface (a
 //! display) reports the same from its pointer events through [`set`].
 //!
+//! A grab of a panel's handle (the sphere under it, the sphere at its corner) is not a hover: Cranpose
+//! reports the grab's start and end only. The panels note them with [`set`] on [`HANDLE`]. The pull
+//! that starts a grab still leaks to the game: the trigger rises before the grab's start. That is a gap
+//! of Cranpose's API (see `hold.rs`).
+//!
 //! The registry is a bit set in an atomic, so the headset's frame loop reads it without a lock.
 
 use cranpose::prelude::*;
@@ -17,6 +22,9 @@ pub const CONNECTION: u32 = 1;
 pub const STATS: u32 = 2;
 pub const MENU: u32 = 3;
 pub const STRIP: u32 = 4;
+/// A controller holds a panel by its handle, to carry it or to resize it. The ray is on the handle,
+/// which gives the app no hover, so the grab itself stands for it from its start to its end.
+pub const HANDLE: u32 = 5;
 /// The first bit of the displays: the display of stream `s` has bit `DISPLAY + s`
 pub const DISPLAY: u32 = 8;
 

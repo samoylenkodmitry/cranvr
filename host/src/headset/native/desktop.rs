@@ -1,4 +1,7 @@
-//! The Mac's desktop for the native client's desktop panel.
+//! One display of the Mac for the native client's panel. `displays.rs` owns one `Desktop` for each
+//! display that the client can show: the first display, and the ones that the client added. Each has
+//! its own stream, wish, capture, encoder and pointer. A display that the client does not wish has no
+//! capture and no encoder, sends nothing and follows no cursor.
 //!
 //! The client shows the desktop as a movable panel, a surface that a hardware decoder writes
 //! into. The compositor then samples the picture once, at the display's own resolution, so text
@@ -14,7 +17,9 @@
 //! - `ClientDatagram::Pointer` carries where a controller points on the panel, with its trigger and
 //!   thumbstick. The host moves the Mac's mouse, clicks and scrolls (`desktop::Pointer`).
 //! - `LayerState` tells the frame loop that the client shows the desktop, so the eye stream leaves
-//!   its own copy of the screen out. It tells the loop that a game hides the desktop.
+//!   its own copy of the screen out. It tells the display that a game runs: a client of an older
+//!   protocol version then gets the display hidden. A client of version 8 hears of the game in a
+//!   message of its own and decides itself which displays to show.
 
 use super::Session;
 use crate::{

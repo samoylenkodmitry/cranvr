@@ -115,10 +115,14 @@ pub fn HandPanels(state: HandState, console_open: bool) {
     let open = state.menu_open.get();
     // The menu closes itself after a while without a pointer over a panel
     LaunchedEffect(open, async move |_| {
+        // The time counts from the last pointer over a panel, or from the opening
+        let opened_ms = cranvr_proto::clock::now_ns() / 1_000_000;
         while open {
             delay(Duration::from_secs(1)).await;
             let now_ms = cranvr_proto::clock::now_ns() / 1_000_000;
-            if hover::idle_for(now_ms).is_none_or(|idle| idle > MENU_IDLE) && state.menu_open.get_non_reactive() {
+            let since_opened = Duration::from_millis(now_ms.saturating_sub(opened_ms));
+            let idle = hover::idle_for(now_ms).map_or(since_opened, |idle| idle.min(since_opened));
+            if idle > MENU_IDLE && state.menu_open.get_non_reactive() {
                 log::info!("the hand menu closes: no pointer was over a panel for {} s", MENU_IDLE.as_secs());
                 state.menu_open.set(false);
             }
@@ -130,7 +134,7 @@ pub fn HandPanels(state: HandState, console_open: bool) {
             Menu(state, console_open, base);
         }
         if let Some(stream) = pinned_shown {
-            crate::display_panel::HandDisplay(stream, base);
+            key(stream, move || crate::display_panel::HandDisplay(stream, base));
         }
     });
 }
@@ -231,7 +235,7 @@ pub fn Menu(state: HandState, console_open: bool, base: [f32; 3]) {
         let hovered = hover::hover_modifier(hover::MENU);
         let rows = rows.clone();
         Column(
-            Modifier::empty().fill_max_size().background(PANEL_COLOR).rounded_corners(24.0).padding(menu_model::size::PADDING).then(hovered),
+            Modifier::empty().fill_max_size().then(hovered).background(PANEL_COLOR).rounded_corners(24.0).padding(menu_model::size::PADDING),
             ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(menu_model::size::GAP)),
             move || {
                 Text("cranvr", Modifier::empty().height(menu_model::size::TITLE), text_style(32.0, TEXT_COLOR, Some(FontWeight::BOLD)));

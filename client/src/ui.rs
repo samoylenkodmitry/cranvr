@@ -183,8 +183,10 @@ pub fn ClientApp() {
                 StatsPanel(snapshot);
             }
             // Each shown display stands in the room, unless it rides on the left hand
+            // Each display has its own slot of the composition: hiding one must not hand its place, its
+            // pose and its surface to another
             for stream in layout.displays_shown().into_iter().filter(|stream| layout.pinned() != Some(*stream)) {
-                RoomDisplay(stream);
+                key(stream, move || RoomDisplay(stream));
             }
             ConsolePanel(console, snapshot);
             if hand_menu::flat_menu() {
