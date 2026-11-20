@@ -657,6 +657,7 @@ fn read_loop(s: &Shared<'_>, units: mpsc::Sender<Received>, udp: bool) -> Error 
             crate::audio::on_datagram(&audio, age);
         }
         Incoming::Datagram(HostDatagram::Cursor(cursor)) => crate::desktop::desktop().on_cursor(cursor),
+        Incoming::Datagram(HostDatagram::DisplayCursor { .. }) => {}
         Incoming::Control(message @ (HostMsg::Desktop(_) | HostMsg::DecoderConfig { stream: DESKTOP_STREAM, .. })) => {
             crate::desktop::desktop().on_message(&message);
         }
