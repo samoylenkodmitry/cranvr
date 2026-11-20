@@ -20,6 +20,7 @@ mod console;
 mod console_panel;
 mod desktop;
 mod display_wish;
+mod displays;
 mod discovery;
 mod focus;
 mod hands;
