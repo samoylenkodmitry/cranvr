@@ -1,0 +1,41 @@
+Subject: [PATCH] d3d11: an optional report of render-target array indexing from any shader (cranvr)
+
+DXMT_RT_ARRAY_INDEX_FROM_ANY_SHADER=1 reports VPAndRTArrayIndexFromAnyShaderFeedingRasterizer, as upstream DXMT
+does. BasaltVR's patch 0004 turns it off so that Unity's OpenXR provider draws each eye in a pass of its own. Unity's
+OpenVR provider owns its two-slice texture, which no runtime rejects: with the report off, its instanced draws reach
+slice 0 only and the right eye stays black. A launch option sets the variable for such a game.
+---
+diff --git a/src/d3d11/d3d11_inspection.cpp b/src/d3d11/d3d11_inspection.cpp
+index dfd47f1..0193af8 100644
+--- a/src/d3d11/d3d11_inspection.cpp
++++ b/src/d3d11/d3d11_inspection.cpp
+@@ -1,5 +1,6 @@
+ #include "d3d11_inspection.hpp"
+ #include "log/log.hpp"
++#include "util_env.hpp"
+ 
+ namespace dxmt {
+ 
+@@ -137,8 +138,20 @@ HRESULT MTLD3D11Inspection::GetFeatureData(D3D11_FEATURE Feature,
+     //     &m_d3d9Options1);
+   case D3D11_FEATURE_D3D11_OPTIONS2:
+     return GetTypedFeatureData(FeatureDataSize, pFeatureData, &m_d3d11Options2);
+-  case D3D11_FEATURE_D3D11_OPTIONS3:
+-    return GetTypedFeatureData(FeatureDataSize, pFeatureData, &m_d3d11Options3);
++  case D3D11_FEATURE_D3D11_OPTIONS3: {
++    /*
++     * cranvr: DXMT_RT_ARRAY_INDEX_FROM_ANY_SHADER=1 reports the capability that
++     * BasaltVR's patch (force-unity-openxr-multipass) turned off. Unity's OpenVR
++     * provider draws both eyes into one texture array that the game owns, and
++     * no runtime rejects it. With the capability off, that game's instanced
++     * draws reach slice 0 only and the right eye stays black. With it on, the
++     * vertex shader writes the slice and DXMT's layered rendering delivers it.
++     */
++    D3D11_FEATURE_DATA_D3D11_OPTIONS3 options3 = m_d3d11Options3;
++    if (env::getEnvVar("DXMT_RT_ARRAY_INDEX_FROM_ANY_SHADER") == "1")
++      options3.VPAndRTArrayIndexFromAnyShaderFeedingRasterizer = TRUE;
++    return GetTypedFeatureData(FeatureDataSize, pFeatureData, &options3);
++  }
+     //   case D3D11_FEATURE_D3D11_OPTIONS4:
+     //     return GetTypedFeatureData(FeatureDataSize, pFeatureData,
+     //     &m_d3d11Options4);

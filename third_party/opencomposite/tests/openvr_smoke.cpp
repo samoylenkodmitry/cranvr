@@ -697,9 +697,32 @@ int main(int argc, char** argv)
 		return fail("D3D11CreateDevice");
 	}
 
+	// An eye's picture has an upper half and a lower half that differ, so that the host's copy of the picture shows
+	// whether the runtime turned it over: the upper half has the eye's color (blue for the left eye, orange for the
+	// right), the lower half is nearly black. Each frame the upper 16 rows change, so that each frame differs.
+	const bool blue_first = texture_format == DXGI_FORMAT_B8G8R8A8_UNORM || texture_format == DXGI_FORMAT_B8G8R8A8_TYPELESS;
+	const auto pixel = [blue_first](uint8_t* out, float r, float g, float b) {
+		const auto byte = [](float v) { return static_cast<uint8_t>(std::lround(255.0f * std::min(1.0f, std::max(0.0f, v)))); };
+		out[blue_first ? 2 : 0] = byte(r);
+		out[1] = byte(g);
+		out[blue_first ? 0 : 2] = byte(b);
+		out[3] = 255;
+	};
+	constexpr uint32_t band_rows = 16;
 	ID3D11Texture2D* targets[2] = {};
 	ID3D11RenderTargetView* views[2] = {};
 	for (int i = 0; i < 2; i++) {
+		std::vector<uint8_t> picture(static_cast<size_t>(width) * height * 4);
+		for (uint32_t y = 0; y < height; y++) {
+			for (uint32_t x = 0; x < width; x++) {
+				if (y < height / 2) {
+					pixel(&picture[(static_cast<size_t>(y) * width + x) * 4], i == 0 ? 0.1f : 0.9f, 0.5f, i == 0 ? 0.9f : 0.1f);
+				} else {
+					pixel(&picture[(static_cast<size_t>(y) * width + x) * 4], 0.06f, 0.06f, 0.06f);
+				}
+			}
+		}
+		D3D11_SUBRESOURCE_DATA initial{ picture.data(), width * 4, 0 };
 		D3D11_TEXTURE2D_DESC desc{};
 		desc.Width = width;
 		desc.Height = height;
@@ -712,7 +735,7 @@ int main(int argc, char** argv)
 		D3D11_RENDER_TARGET_VIEW_DESC view_desc{};
 		view_desc.Format = view_format;
 		view_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-		if (FAILED(device->CreateTexture2D(&desc, nullptr, &targets[i])) || FAILED(device->CreateRenderTargetView(targets[i], &view_desc, &views[i]))) {
+		if (FAILED(device->CreateTexture2D(&desc, &initial, &targets[i])) || FAILED(device->CreateRenderTargetView(targets[i], &view_desc, &views[i]))) {
 			return fail("the render target of an eye");
 		}
 	}
@@ -776,10 +799,14 @@ int main(int argc, char** argv)
 		// The two eyes differ, and each frame differs from the one before, so a frame that the
 		// host shows is a frame of this program
 		const float shade = static_cast<float>(frames % 120) / 120.0f;
-		const float left_color[4] = { 0.1f, 0.2f + 0.6f * shade, 0.9f, 1.0f };
-		const float right_color[4] = { 0.9f, 0.2f + 0.6f * shade, 0.1f, 1.0f };
-		context->ClearRenderTargetView(views[0], left_color);
-		context->ClearRenderTargetView(views[1], right_color);
+		for (int i = 0; i < 2; i++) {
+			std::vector<uint8_t> band(static_cast<size_t>(width) * band_rows * 4);
+			for (size_t p = 0; p < band.size(); p += 4) {
+				pixel(&band[p], i == 0 ? 0.1f : 0.9f, 0.2f + 0.6f * shade, i == 0 ? 0.9f : 0.1f);
+			}
+			const D3D11_BOX rows{ 0, 0, 0, width, band_rows, 1 };
+			context->UpdateSubresource(targets[i], 0, &rows, band.data(), width * 4, 0);
+		}
 		context->Flush();
 		draw_time += since(mark);
 

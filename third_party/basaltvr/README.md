@@ -124,6 +124,15 @@ memory still holds the samples. In Beat Saber a pass took 0.31 ms instead of 0.3
 M5, and the picture on the Quest looked the same. `DXMT_RESOLVE_STORE_SAMPLES=1` brings the
 store back.
 
+`0010-optional-render-target-array-index-capability.patch`: `DXMT_RT_ARRAY_INDEX_FROM_ANY_SHADER=1` makes
+`CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS3)` report `VPAndRTArrayIndexFromAnyShaderFeedingRasterizer`, as upstream DXMT
+does. BasaltVR's patch 0004 turns the report off, so that Unity's OpenXR provider draws each eye in a pass of its own
+(runtime patch 0003 refuses its two-slice swapchain). Unity's OpenVR provider owns its two-slice texture, which no runtime
+refuses. With the report off, its instanced draws reach slice 0 only: the left eye shows the picture and the right eye
+stays black, and "Each eye in its own pass" cannot help. With the report on, the vertex shader writes the slice and DXMT's
+layered rendering delivers it: both eyes show the picture at the full frame rate. The launch option "Both eyes in one pass"
+sets the variable. The patch sits in a second place of the same file as patch 0004 and applies on its own.
+
 `0009-name-the-discard-and-exception-mode-messages.patch`: DXMT logged "Not implemented" with no name
 once for `DiscardResource` and `DiscardView1` of `ID3D11DeviceContext1` and each time for `SetExceptionMode`
 and `GetExceptionMode` of the device. The Discard calls are hints that a driver may ignore. A game that
