@@ -87,6 +87,9 @@ The launch arguments are intent extras on Android (`adb shell am start -n dev.cr
 | `room` | `scene` or `passthrough`, for this launch. |
 | `console` | Open the console and keep it open, for a headset on a desk. |
 | `address_entry` | Open the address field of the connect panel at the start. |
+| `controls_page` | `left` or `right`: open the console on the Controls page of that controller, for a screen capture. |
+| `panels` | `hidden`: start with the connect and stats panels hidden, for this launch. A test of the beams and the models needs it. |
+| `scripted_pointer`, `scripted_pitch` | Only in a build from `scripts/build-client.sh --scripted-hand`: with `scripted_pointer=desktop` both controllers play over the Mac's desktop panel for 12 seconds in turn, with right clicks, middle clicks, left clicks, a drag and scroll in both axes. The left controller points at the picture's 25% and 45% point, the right one at its 75% and 55% point. A host in a dry run (`CRANVR_POINTER_DRY_RUN=1`) logs the mouse events at those points. `scripted_pitch` tilts the head that the panel follows, in degrees, for a headset that looks down. |
 | `scripted_text`, `scripted_hand` | Only in a build from `scripts/build-client.sh --scripted-hand`: a scripted hand (`left` or `right`) presses the address field and then the keys of the text. It shows that the keyboard opens and types on a headset on a desk. The build installs over the plain app, so install the plain build after the test. |
 | `usb_port` | The port that the headset asks on the USB cable, for a test host on another port. |
 | `desktop`, `desktop_width`, `cursor`, `desktop_pointer_test` | The desktop panel: `desktop false` asks for none, `desktop_width` is the widest picture to ask for. |
