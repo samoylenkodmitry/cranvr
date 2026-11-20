@@ -4,6 +4,7 @@
 mod backend;
 mod black_eye;
 mod launch;
+mod openvr;
 mod setup;
 mod steam;
 mod system;

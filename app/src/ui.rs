@@ -770,6 +770,20 @@ fn LaunchOptions(settings: MutableState<Settings>, program: String) {
                 Hint(options.eye_per_pass_reason.clone());
             }
             Hint("For a game whose right eye stays black. The runtime then refuses two-eye images, so the game draws each eye apart. This costs frames.".into());
+            let (own, default_on) = (options.opencomposite, wine.opencomposite);
+            let key = program.clone();
+            FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+                Text("OpenVR".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
+                for (label, choice) in [
+                    (format!("As in Settings ({})", if default_on { "OpenComposite" } else { "off" }), None),
+                    ("OpenComposite".to_owned(), Some(true)),
+                    ("Off".to_owned(), Some(false)),
+                ] {
+                    let key = key.clone();
+                    Choice(label, own == choice, move || edit_launch(settings, &key, |o| o.opencomposite = choice));
+                }
+            });
+            Hint("An OpenVR game needs OpenComposite to run, because SteamVR is not installed. Off leaves the game no OpenVR runtime, so a game with an OpenXR mode takes that. It applies when the game starts.".into());
             if shown {
                 OptionField("Wine DLL overrides", dll);
                 Hint("As WINEDLLOVERRIDES takes them, such as winhttp=n,b to load a winhttp.dll from the game's folder before Wine's own. Beat Saber's mod loader BSIPA ran without it in cranvr's Wine.".into());
@@ -825,6 +839,20 @@ fn edit_launch(settings: MutableState<Settings>, program: &str, edit: impl FnOnc
     settings.with(Settings::save);
 }
 
+/// The choice for every program: OpenVR games run through OpenComposite (see openvr.rs). A program can
+/// set its own in its options. The Wine card and the Settings tab both show it.
+#[composable]
+fn OpenVrSetting(settings: MutableState<Settings>) {
+    let on = settings.with(|s| s.wine.opencomposite);
+    FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+        Choice("OpenVR games through OpenComposite".into(), on, move || {
+            settings.update(|s| s.wine.opencomposite = !s.wine.opencomposite);
+            settings.with(Settings::save);
+        });
+    });
+    Hint("OpenComposite turns the OpenVR calls of a game into OpenXR calls to cranvr's runtime, so a SteamVR game runs without SteamVR. It changes no file of the game. An OpenXR game ignores it. It applies when a game starts. Each game can choose otherwise in its options.".into());
+}
+
 /// The Wine that runs the games and the options of every program that cranvr starts. The raw
 /// fields sit behind "Advanced", which starts open when they hold values.
 #[composable]
@@ -848,6 +876,7 @@ fn WineCard(settings: MutableState<Settings>) {
             Choice("Advanced".into(), shown, move || advanced.set(!shown));
         });
         Hint("Off: a game's own window on the Mac stays empty and costs no GPU time. The headset shows the game either way.".into());
+        OpenVrSetting(settings);
         if shown {
             OptionField("DLL overrides", dll);
             OptionField("Environment", env);
@@ -1015,6 +1044,7 @@ fn SettingsTab(settings: MutableState<Settings>, model: MutableState<Model>) {
             });
         });
         Hint("A game that has no hand tracking gets controllers made of your hands, while the headset tracks no controller. A pinch of thumb and index finger pulls the trigger. A fist presses the grip button. A game that tracks hands itself gets your hands and no controllers.".into());
+        OpenVrSetting(settings);
         let _ = model.with(|m| m.sizes_version);
         let learned = backend::learned_game_sizes();
         if !learned.is_empty() {

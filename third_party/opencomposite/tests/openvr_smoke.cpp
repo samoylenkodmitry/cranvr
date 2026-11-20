@@ -386,6 +386,10 @@ int main(int argc, char** argv)
 	const auto begin = Clock::now();
 	uint64_t frames = 0, valid_poses = 0, submit_errors = 0, wait_errors = 0;
 	float max_right_trigger = 0.0f, max_left_grip_pulled = 0.0f, a_seen = 0.0f;
+	// Once the frames flow the views come from the headset: the eyes sit apart. Read while the host's
+	// client is still there, once a second, and keep the last answer that is not the zero of "no views yet".
+	float eye_distance = 0.0f;
+	Clock::time_point last_eye_read = begin;
 	bool left_connected = false, right_connected = false, left_grip_pressed = false, a_pressed = false;
 	vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
 	vr::EVRCompositorError first_error = vr::VRCompositorError_None;
@@ -454,6 +458,16 @@ int main(int argc, char** argv)
 			a_seen = std::max(a_seen, a_pressed ? 1.0f : 0.0f);
 		}
 
+		if (std::chrono::duration<double>(Clock::now() - last_eye_read).count() >= 1.0) {
+			last_eye_read = Clock::now();
+			vr::HmdMatrix34_t left_eye{}, right_eye{};
+			msvc_call(system, 4, &left_eye, vr::Eye_Left);
+			msvc_call(system, 4, &right_eye, vr::Eye_Right);
+			if (right_eye.m[0][3] - left_eye.m[0][3] != 0.0f) {
+				eye_distance = right_eye.m[0][3] - left_eye.m[0][3];
+			}
+		}
+
 		vr::VREvent_t event;
 		while (system->PollNextEvent(&event, sizeof(event))) {
 			if (event.eventType == vr::VREvent_Quit) {
@@ -474,11 +488,6 @@ int main(int argc, char** argv)
 	    right_connected ? "tracked" : "missing", max_right_trigger, left_grip_pressed ? "pressed" : "not pressed", max_left_grip_pulled,
 	    a_pressed ? "pressed" : "not pressed");
 
-	// After the first frames the views come from the headset: the eyes sit apart
-	vr::HmdMatrix34_t left_eye{}, right_eye{};
-	msvc_call(system, 4, &left_eye, vr::Eye_Left);
-	msvc_call(system, 4, &right_eye, vr::Eye_Right);
-	const float eye_distance = right_eye.m[0][3] - left_eye.m[0][3];
 	say("the eyes are %.1f mm apart", eye_distance * 1000.0f);
 
 	for (int i = 0; i < 2; i++) {

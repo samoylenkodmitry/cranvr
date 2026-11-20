@@ -2,13 +2,14 @@
 
 cranvr streams VR from an Apple Silicon Mac to a Meta Quest. The Mac side is Rust. It renders and composes with Metal, encodes HEVC with VideoToolbox and sends the frames with cranvr's own protocol (`proto/`, crate `cranvr-proto`). The headset side is a Cranpose app (`client/`, package `cranvr-client`, application id `dev.cranvr.client`). It uses only Cranpose's public API and plain Rust crates. It has no ndk, JNI, GL, OpenXR or platform code of its own. The same crate also builds as a flat app for an Android phone or tablet.
 
-The goal is to play Windows SteamVR games on a Quest from a Mac. Windows games run under Wine with the OpenXR runtime and the DXMT fork from [BasaltVR](https://github.com/Stooovie/BasaltVR) (MIT). The game's frames reach the host as shared IOSurfaces. No frame passes through the CPU.
+The goal is to play Windows SteamVR games on a Quest from a Mac. Windows games run under Wine with the OpenXR runtime and the DXMT fork from [BasaltVR](https://github.com/Stooovie/BasaltVR) (MIT). A game that speaks OpenVR runs through [OpenComposite](https://gitlab.com/znixian/OpenOVR) (GPL 3), which turns its OpenVR calls into OpenXR calls to that runtime. The game's frames reach the host as shared IOSurfaces. No frame passes through the CPU.
 
 ## What works
 
 - A head-tracked test scene for a headset on a desk.
 - Foveated encoding. The host encodes about a third of the pixels of an eye. The client unwarps them. It makes the full Quest 3 eye size fit at 120 Hz.
 - Windows OpenXR games under Wine. Head pose, controller poses, buttons and haptics pass both ways.
+- Windows OpenVR games under Wine, through OpenComposite. The app has a choice for it in the Settings tab, in the Wine card and in each game's options.
 - The Mac desktop as a panel in the headset, with the controller as the mouse. The Mac's sound plays in the headset.
 - A display lock. The host starts each frame of its test scene so that it reaches the headset's display on its grid.
 - Discovery of the Mac by the headset, a pairing that the user allows on the Mac, an encrypted and authenticated session and a USB cable link.
@@ -322,7 +323,7 @@ Games need Wine with cranvr's DXMT fork and BasaltVR's OpenXR runtime. The app's
 
 A failed step keeps its message on screen with a Retry button, which runs the steps that are not done. Games on another disk need no setting in cranvr: in the Steam window, Settings, Storage adds a folder on that disk. The Play tab lists the games of every Steam library folder.
 
-The game support has a version, a date such as `2026.11.19`, in `scripts/game-support-version.txt`. `package-game-support.sh` puts it into the archive as `VERSION`. `setup-wine.sh` stamps it into `wine/game-support-version.txt` in the config folder after a good install. When the stamp is older than the app's version, or missing, the Play tab shows "Update game support". After a change of a runtime or DXMT patch: set a new date in the version file, run `build-basaltvr.sh` and `package-game-support.sh`. Publish the archive and its `.sha256` as a release of the public repository, tagged `v` plus the date.
+The game support has a version, a date such as `2026.11.19`, in `scripts/game-support-version.txt`. `package-game-support.sh` puts it into the archive as `VERSION`. `setup-wine.sh` stamps it into `wine/game-support-version.txt` in the config folder after a good install. When the stamp is older than the app's version, or missing, the Play tab shows "Update game support". After a change of a runtime, DXMT or OpenComposite patch: set a new date in the version file, run `build-basaltvr.sh`, `build-opencomposite.sh` and `package-game-support.sh`. Publish the archive, its `.sha256` and `cranvr-opencomposite-source.tar.xz` as a release of the public repository, tagged `v` plus the date.
 
 To build game support from source instead (about an hour, mostly LLVM):
 
@@ -331,10 +332,11 @@ xcodebuild -downloadComponent MetalToolchain
 softwareupdate --install-rosetta
 brew install cmake meson ninja mingw-w64
 scripts/build-basaltvr.sh
+scripts/build-opencomposite.sh
 scripts/setup-wine.sh third_party/basaltvr/src
 ```
 
-`build-basaltvr.sh` clones BasaltVR at a pinned commit into `third_party/basaltvr/src`, applies cranvr's patches and builds the OpenXR runtime and the DXMT fork. `setup-wine.sh` puts Wine 11.10 with the DXMT fork in `~/Library/Application Support/cranvr/wine`, registers the runtime in the Wine prefix and checks it through the OpenXR loader. `scripts/package-game-support.sh` packs a built tree into the archive and its `.sha256` in `target/game-support`.
+`build-basaltvr.sh` clones BasaltVR at a pinned commit into `third_party/basaltvr/src`, applies cranvr's patches and builds the OpenXR runtime and the DXMT fork. `build-opencomposite.sh` clones OpenComposite at a pinned commit into `third_party/opencomposite/src`, applies cranvr's patches and builds `vrclient_x64.dll` with the same MinGW-w64 toolchain (a minute). `setup-wine.sh` puts Wine 11.10 with the DXMT fork in `~/Library/Application Support/cranvr/wine`, registers the runtime in the Wine prefix, installs OpenComposite as `C:\opencomposite` and checks both. `scripts/package-game-support.sh` packs the built trees into the archive, its `.sha256` and the source of OpenComposite in `target/game-support`.
 
 Start the host first: it writes `runtime-control.txt` into its config dir. Then start a game from the window or with the script:
 
@@ -354,9 +356,28 @@ Steam runs in the prefix with BasaltVR's web helper shim (`scripts/setup-steam.s
 
 A rebuild of BasaltVR gives the web helper shim new bytes. The app then reports that Steam needs its setup step. "Set up games" then runs `setup-steam.sh` again. Do not use `steam.exe -applaunch`: a game that Steam starts gets Steam's environment, not the one with the runtime's control file. For a game under `steamapps\common` the script and the window find the Steam app ID in Steam's `appmanifest` files and set `SteamAppId`, which the game's Steam check needs.
 
-The runtime speaks OpenXR with D3D11. Games that use OpenVR only need OpenComposite (see BasaltVR's `docs/BOTTLES.md`). The app looks for a game's program three folders deep, preferring a 64-bit folder.
+The runtime speaks OpenXR with D3D11. A game that uses OpenVR runs through OpenComposite (see "OpenVR games"). The app looks for a game's program three folders deep, preferring a 64-bit folder.
 
 A game that the app or `scripts/run-game.sh` starts draws nothing into its Mac window: `DXMT_SKIP_PRESENT=1` (cranvr's DXMT patch 0008) sends each frame's GPU work without the present but tells the game that the present worked. `CRANVR_MAC_MIRROR=1` for the script draws the window again.
+
+### OpenVR games
+
+Most SteamVR games speak OpenVR. SteamVR stays uninstalled, so such a game finds no OpenVR runtime in the prefix. The game support installs [OpenComposite](https://gitlab.com/znixian/OpenOVR) as `C:\opencomposite` (GPL 3, built from source by `scripts/build-opencomposite.sh`). It is an OpenVR runtime that makes OpenXR calls, here to BasaltVR's runtime, which is the active OpenXR runtime of the prefix.
+
+A game finds OpenComposite through the prefix's OpenVR path file, `%LOCALAPPDATA%\openvr\openvrpaths.vrpath`. Valve's `openvr_api.dll`, which every OpenVR game carries, reads it and loads `bin\vrclient_x64.dll` from the runtime that it names. No file of a game changes. An OpenXR game ignores the file. The app writes the file when it starts a program and removes it when the choice is off, but only a file that names OpenComposite (`app/src/openvr.rs`). `scripts/run-game.sh` does the same: `CRANVR_OPENCOMPOSITE=1` or `0` chooses for one start, else the setting `wine.opencomposite` of `app.json` (on by default). Steam does not rewrite the file, and `bin/version.txt` in OpenComposite's folder is empty for the case that it would.
+
+The choice is on by default and visible in three places: "OpenVR games through OpenComposite" in the Settings tab and in the Wine card, and a row "OpenVR" in each game's options with "As in Settings", "OpenComposite" and "Off". A game's own choice is `opencomposite` in its entry of `launch`, absent when it follows the setting.
+
+What the port to Wine needed, in `third_party/opencomposite/patches` (see its README):
+
+- OpenComposite builds for Windows with MSVC. The build here uses MinGW-w64 and Direct3D 11 only (no Vulkan, no OpenGL: the runtime offers Direct3D 11).
+- MSVC and GCC pass the address of a returned struct and `this` in the other order. A virtual method such as `GetProjectionMatrix`, which an MSVC game calls, would write its result over the interface object. The generated interface classes pass the address as a parameter.
+- The runtime offers images of the order B8G8R8A8 only, and many games draw R8G8B8A8. OpenComposite copies such a game's image into the runtime's image with a draw.
+- The runtime offers the STAGE space, which is the LOCAL space with the floor at height 0 (runtime patch 0007). OpenComposite needs it for the standing space of OpenVR.
+
+OpenComposite takes the hidden area mesh from `XR_KHR_visibility_mask`, which the runtime lacks, so it returns an empty one, as OpenVR allows. It supports games with 64-bit Direct3D 11 programs and 8-bit images. A 32-bit game, a Direct3D 12, Vulkan or OpenGL game and a game with 10-bit or float images are not supported.
+
+A game folder with OpenComposite's own `openvr_api.dll` or an `opencomposite.ini` from another setup bypasses the choice: the game loads that DLL, not the runtime in the prefix. Put Valve's file back. OpenComposite stops a game with a message box for an option that it does not know, such as a section header in the `.ini`.
 
 ### What the host and the app do for a game
 
@@ -416,6 +437,8 @@ scripts/e2e.sh --seconds 30 --wine 'C:\basalt\runtime\d3d11_runtime_smoke.exe' \
     --wine-arg --render-frames --wine-arg 14400 --wine-arg --visual
 ```
 
+`--openvr-wine` runs `C:\opencomposite\openvr_smoke.exe`, a Direct3D 11 OpenVR program (source: `third_party/opencomposite/tests/openvr_smoke.cpp`), against the real runtime and the probe. It finds OpenComposite through the prefix's OpenVR path file, as a game does, and fails without it. It starts as an application of type Scene, reads the recommended size and the eye transforms (through the vtable in the order of MSVC's callers and through the FnTable), draws a different color in each eye and submits both eyes in every frame, reads the head pose and reads the legacy controller state that the probe scripts (left grip, right trigger at 0.75, button A). It also checks the eye distance. It asks the host for 90 Hz unless `--fps` says otherwise, because OpenComposite's calls take about a millisecond of each frame. Set `CRANVR_HOME` to a stack that `setup-wine.sh` built with OpenComposite.
+
 `--wine` runs a Windows OpenXR program in cranvr's Wine stack without sound. The probe then counts every frame of the right size, since a real program draws no eye badges. `--desktop` starts the host with its desktop panel. The probe then asks for the desktop stream, plays a pointer script (the host only logs its mouse events, as `CRANVR_POINTER_DRY_RUN=1` does) and counts the Mac's sound. It plays no sound: it measures what arrives. The run fails when the probe gets the Mac's sound for less than 80 percent of the stream time.
 
 `--quest` starts cranvr's client on a Quest attached by USB (install it with `scripts/build-client.sh --install SERIAL`). adb keeps its display on without a face in the headset. The script pauses the guardian for the run. The Quest and the Mac must share a network. The host runs with `--trust-all` on `--native-port` (default 9950). A headset keeps one host key for each address and port. Pick a port that the headset has not used with another host at this Mac's address, such as 9961. The app gets this Mac's address and the room `scene` through its launch extras. The run keeps the host's key in `target/e2e/host-identity.txt`, because a headset refuses a known address with a new key. Before a Quest run, the harness reads the device's network over adb. It warns when a VPN on the device routes this Mac's address, when the device uses 2.4 GHz Wi-Fi and when its Wi-Fi link runs below 400 Mbps. Two runs with the same setting differ by up to 5 ms in total, so compare two settings with several pairs and keep every report. Check `uptime` before a run: other programs on the Mac lower the rates.
@@ -468,3 +491,5 @@ Use pairing for real use. `--trust-all` accepts any client on the network and is
 ## License
 
 MIT. The foveation math follows ALVR v20.14.1 (MIT, `third_party/licenses/ALVR-MIT.txt`). BasaltVR is MIT.
+
+Game support also ships [OpenComposite](https://gitlab.com/znixian/OpenOVR) (GPL 3, copyright of its authors) as a separate program: the DLL `opencomposite/vrclient_x64.dll`, which games load as an OpenVR runtime and which calls the OpenXR runtime over the OpenXR interface. The GPL applies to it and to cranvr's patches of it in `third_party/opencomposite/` (the patches, `shim/` and `mingw-x86_64.cmake`). The rest of cranvr stays MIT. The archive carries OpenComposite's license and the licenses of its parts in `LICENSES/` and its source in `SOURCE/opencomposite-source.tar.xz`. The same file, `cranvr-opencomposite-source.tar.xz`, sits in each release of https://github.com/samoylenkodmitry/cranvr-game-support. It holds the pinned commit of OpenComposite (`cff07db75c4823afe93ed7027b03d5f7bc86f164` at https://gitlab.com/znixian/OpenOVR) with its two libraries, the patches and the build script, which rebuilds the DLL.

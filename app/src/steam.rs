@@ -2,7 +2,7 @@
 
 use crate::{
     backend::{self, config_dir},
-    launch,
+    launch, openvr,
 };
 use std::{
     fs,
@@ -244,10 +244,16 @@ pub fn wine(program: &str) -> Command {
 }
 
 /// A game's Wine command: `wine` with the options for every program and the program's own, which
-/// the Play tab shows. Steam does not get them.
+/// the Play tab shows. Steam does not get them. The OpenVR choice goes into the prefix's OpenVR path
+/// file now, because the game reads that file when it starts.
 fn game_wine(program: &str) -> Command {
     let settings = backend::Settings::load();
     let options = settings.launch.get(program).cloned().unwrap_or_default();
+    let on = launch::opencomposite(&settings.wine, &options);
+    // An older game support has no OpenComposite: the Play tab then offers its update, so a start says nothing
+    if let Err(e) = openvr::apply(&prefix(), on) {
+        backend::notify(format!("cranvr could not set the OpenVR runtime: {e}"));
+    }
     let mut command = wine_with(program, settings.game_msaa_limit);
     command.envs(launch::environment(&settings.wine, &options)).args(launch::arguments(&options));
     command
