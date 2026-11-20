@@ -476,6 +476,9 @@ Use pairing for real use. `--trust-all` accepts any client on the network and is
 
 ## Not tested yet
 
+- An OpenVR game that draws a picture in the headset. The Direct3D 11 test program `openvr_smoke.exe` ran through the real runtime in a Quest 3 on a desk, with the picture of each eye checked by `adb exec-out screencap -p` (R8G8B8A8 and typeless B8G8R8A8 textures). Serious Sam VR (Steam app 465240) loaded OpenComposite through the path file, created its swapchains and sent frames at 94 to 107 a second, but its picture stayed black: Wine's `d3dcompiler_47` rejects the game's `FinalPassPS` shader (`isnan` is not defined), and the game's own `D3DCompiler_47.dll` makes DXMT stop with "Not implemented". Google Earth VR loads OpenComposite and quits a second later without a message. No OpenVR game has shown its own picture in the headset yet. A worn headset with controllers, the seated universe of OpenVR and a game with IVRInput actions (OpenComposite then needs the game's action manifest) are untested.
+- OpenComposite uses `XR_EXT_hand_tracking` when the runtime offers it, so the host logs "the game uses hands" for an OpenVR game and makes no controllers of the user's hands for it.
+- The STAGE space (runtime patch 0007) is offered to every OpenXR game now. Beat Saber's height with it has not been compared with its height before.
 - Hands, body, face and eyes from a worn headset. The tests run with the probe's script and the client's own tests. A real hand in view, a real face and the permission prompts of a user who answers them have not been tried. The face source of a worn Quest 3 and the face of a real Android XR headset have not been seen either.
 - The cranvr client in a worn headset: the controllers in a game, the carry of the desktop panel by a ray, a recenter and the cable from a Quest.
 - Beat Saber during a song. The game's frame rate and latency were measured on its first screen with the headset on a desk.
