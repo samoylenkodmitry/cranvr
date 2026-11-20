@@ -105,6 +105,15 @@ impl Hub {
         }
     }
 
+    /// The headset's app lost the input focus: no hand makes a controller, and the buttons that a
+    /// hand made go back to 0 (Meta's rule: an app without the focus shows no controllers).
+    pub fn pause(&mut self) {
+        self.seen = [None, None];
+        for hand in 0..2 {
+            self.release(hand);
+        }
+    }
+
     /// The headset says which features it offers. An empty set means that it is gone.
     pub fn on_offer(&mut self, offered: Features) {
         self.offered = offered;

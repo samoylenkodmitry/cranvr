@@ -268,6 +268,7 @@ impl PhoneReader {
             views,
             recenter: None,
             floor: None,
+            hand_pointer: false,
         }
     }
 

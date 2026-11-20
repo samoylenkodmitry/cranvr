@@ -289,6 +289,11 @@ fn an_older_peer_skips_the_new_messages_and_still_reads_the_old_ones() {
     let mut wish = Vec::new();
     encode(&HostMsg::TrackingWish(Features::HANDS), &mut wish).unwrap();
     assert!(decode::<OldHostMsg>(&wish).is_err());
+    // The focus of the app is a message that a host of version 6 from before it skips
+    let mut focus = Vec::new();
+    encode(&ClientMsg::Focus(Focus::Visible), &mut focus).unwrap();
+    assert!(decode::<OldClientMsg>(&focus).is_err());
+    assert!(matches!(decode::<ClientMsg>(&focus).unwrap(), ClientMsg::Focus(Focus::Visible)));
 
     // The old variants keep their bytes: the new variants sit after them, so no index moved
     let tracking = Tracking { sample_time: 3, display_time: 4, head: Motion { pose: root.pose, ..Default::default() }, ..Default::default() };
@@ -311,6 +316,7 @@ fn an_older_peer_skips_the_new_messages_and_still_reads_the_old_ones() {
     assert_eq!(bytes[0], 8, "Hands is the ninth datagram variant");
     assert_eq!(offer[0], 9, "TrackingOffer is the tenth client message");
     assert_eq!(wish[0], 10, "TrackingWish is the eleventh host message");
+    assert_eq!(focus[0], 10, "Focus is the eleventh client message");
 }
 
 #[test]

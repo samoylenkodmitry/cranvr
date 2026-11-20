@@ -13,8 +13,10 @@
 //! The cost is two read-only locks and 512 pixel reads once a second, with no allocation. A frame
 //! between the checks costs one clock read.
 
-use log::info;
+use log::{info, warn};
 use cranvr_vt::PixelBuffer;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// Samples along each side of the grid
@@ -30,6 +32,66 @@ const CONTENT_SAMPLES: usize = 8;
 /// black right eye beside a lit left eye for this many seconds.
 const CHECKS_IN_A_ROW: u32 = 4;
 const INTERVAL: Duration = Duration::from_secs(1);
+
+/// The folder named by `CRANVR_EYE_DUMP`, if any. A test run sets it to see what a game drew: each
+/// check then writes both eyes of the game's newest frame as `eye-left.png` and `eye-right.png`.
+fn dump_dir() -> Option<&'static Path> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| std::env::var_os("CRANVR_EYE_DUMP").filter(|dir| !dir.is_empty()).map(PathBuf::from)).as_deref()
+}
+
+/// The CRC-32 that PNG chunks carry.
+fn crc32(parts: &[&[u8]]) -> u32 {
+    let mut crc = !0u32;
+    for byte in parts.iter().flat_map(|part| part.iter()) {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(kind);
+    out.extend_from_slice(data);
+    out.extend_from_slice(&crc32(&[kind, data]).to_be_bytes());
+}
+
+/// An 8-bit RGB PNG from `rgb` (`width` x `height` pixels, 3 bytes each). The data is not compressed
+/// (stored deflate blocks), which keeps this free of a library and is small enough at the sizes that the
+/// dump uses.
+fn png_rgb(width: usize, height: usize, rgb: &[u8]) -> Vec<u8> {
+    let mut raw = Vec::with_capacity((width * 3 + 1) * height);
+    for row in rgb.chunks(width * 3) {
+        raw.push(0);
+        raw.extend_from_slice(row);
+    }
+    let mut zlib = vec![0x78, 0x01];
+    let blocks = raw.chunks(65535).collect::<Vec<_>>();
+    for (i, block) in blocks.iter().enumerate() {
+        zlib.push(u8::from(i + 1 == blocks.len()));
+        zlib.extend_from_slice(&(block.len() as u16).to_le_bytes());
+        zlib.extend_from_slice(&(!(block.len() as u16)).to_le_bytes());
+        zlib.extend_from_slice(block);
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for byte in &raw {
+        a = (a + u32::from(*byte)) % 65521;
+        b = (b + a) % 65521;
+    }
+    zlib.extend_from_slice(&((b << 16) | a).to_be_bytes());
+    let mut header = Vec::new();
+    header.extend_from_slice(&(width as u32).to_be_bytes());
+    header.extend_from_slice(&(height as u32).to_be_bytes());
+    header.extend_from_slice(&[8, 2, 0, 0, 0]);
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png_chunk(&mut png, b"IHDR", &header);
+    png_chunk(&mut png, b"IDAT", &zlib);
+    png_chunk(&mut png, b"IEND", &[]);
+    png
+}
 
 /// The brightest color channel of each sampled pixel of one eye.
 pub struct Grid([u8; SAMPLES]);
@@ -75,6 +137,29 @@ impl Grid {
             }
         }
         true
+    }
+
+    /// The part of a BGRA image inside `rect` as a PNG, shrunk by a whole factor to at most 640 pixels
+    /// across. The rect follows the rules of `fill`.
+    fn png(data: &[u8], stride: usize, size: (usize, usize), rect: [i32; 4]) -> Option<Vec<u8>> {
+        let (width, height) = size;
+        if width == 0 || height == 0 || stride < width * 4 || data.len() < stride * (height - 1) + width * 4 {
+            return None;
+        }
+        let clamp = |value: i32, limit: usize| (value.max(0) as usize).min(limit);
+        let (x0, y0) = (clamp(rect[0], width), clamp(rect[1], height));
+        let (w, h) = (clamp(rect[2], width - x0), clamp(rect[3], height - y0));
+        let (x0, y0, w, h) = if w == 0 || h == 0 { (0, 0, width, height) } else { (x0, y0, w, h) };
+        let step = w.div_ceil(640);
+        let (out_w, out_h) = (w / step, h / step);
+        let mut rgb = Vec::with_capacity(out_w * out_h * 3);
+        for y in 0..out_h {
+            for x in 0..out_w {
+                let at = (y0 + y * step) * stride + (x0 + x * step) * 4;
+                rgb.extend_from_slice(&[data[at + 2], data[at + 1], data[at]]);
+            }
+        }
+        Some(png_rgb(out_w, out_h, &rgb))
     }
 
     /// Reads the grid from a game's swapchain image. False when the image cannot be read.
@@ -134,6 +219,17 @@ impl Watch {
     /// symptom has held long enough to report.
     pub fn check(&mut self, images: [&PixelBuffer; 2], rects: [[i32; 4]; 2]) -> bool {
         self.last = Some(Instant::now());
+        if let Some(dir) = dump_dir() {
+            for (name, image, rect) in [("left", images[0], rects[0]), ("right", images[1], rects[1])] {
+                let size = (image.width(), image.height());
+                let png = image.with_pixels(|data, stride| Grid::png(data, stride, size, rect)).flatten();
+                if let Some(png) = png {
+                    if let Err(e) = std::fs::write(dir.join(format!("eye-{name}.png")), png) {
+                        warn!("Eye check: cannot write the {name} eye to {}: {e}", dir.display());
+                    }
+                }
+            }
+        }
         if self.left.read(images[0], rects[0]) && self.right.read(images[1], rects[1]) {
             // The log keeps the first check of a run and each change, so it shows what the host saw
             let seen = (self.left.has_content(), self.right.is_black());
@@ -286,6 +382,44 @@ mod tests {
         assert_eq!(grid.lit(), SAMPLES / 2);
         assert!(grid.fill(&data, 64 * 4 + 8, (64, 32), [500, 500, 10, 10]));
         assert_eq!(grid.lit(), SAMPLES / 2);
+    }
+
+    #[test]
+    fn a_png_has_valid_chunks_and_the_pixels_of_the_rect() {
+        // 8 x 4 pixels, the left half blue (BGRA 255, 0, 0): the PNG holds RGB (0, 0, 255) there
+        let data = image(8, 4, 8 * 4, |x, _| if x < 4 { [255, 0, 0, 255] } else { [0, 255, 0, 255] });
+        let png = Grid::png(&data, 8 * 4, (8, 4), [0, 0, 8, 4]).expect("an image");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        // Walk the chunks and check each CRC
+        let mut at = 8;
+        let mut kinds = Vec::new();
+        while at < png.len() {
+            let length = u32::from_be_bytes(png[at..at + 4].try_into().unwrap()) as usize;
+            let kind: [u8; 4] = png[at + 4..at + 8].try_into().unwrap();
+            let body = &png[at + 8..at + 8 + length];
+            let crc = u32::from_be_bytes(png[at + 8 + length..at + 12 + length].try_into().unwrap());
+            assert_eq!(crc, crc32(&[&kind, body]), "chunk {}", String::from_utf8_lossy(&kind));
+            if &kind == b"IHDR" {
+                assert_eq!(u32::from_be_bytes(body[..4].try_into().unwrap()), 8);
+                assert_eq!(u32::from_be_bytes(body[4..8].try_into().unwrap()), 4);
+            }
+            if &kind == b"IDAT" {
+                // zlib header, then one stored block that holds the 4 rows of (1 + 8 * 3) bytes
+                assert_eq!(&body[..2], &[0x78, 0x01]);
+                assert_eq!(body[2], 1);
+                assert_eq!(u16::from_le_bytes(body[3..5].try_into().unwrap()), 100);
+                assert_eq!(&body[7..11], &[0, 0, 0, 255], "filter byte, then the first pixel as RGB");
+            }
+            kinds.push(kind);
+            at += 12 + length;
+        }
+        assert_eq!(kinds, [*b"IHDR", *b"IDAT", *b"IEND"]);
+        // A known CRC-32: "123456789" gives 0xCBF43926
+        assert_eq!(crc32(&[b"123456789"]), 0xCBF4_3926);
+        // A rect shrinks the picture: the right half only
+        let half = Grid::png(&data, 8 * 4, (8, 4), [4, 0, 4, 4]).expect("an image");
+        let width = u32::from_be_bytes(half[16..20].try_into().unwrap());
+        assert_eq!(width, 4);
     }
 
     #[test]

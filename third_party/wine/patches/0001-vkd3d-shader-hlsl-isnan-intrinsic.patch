@@ -1,0 +1,30 @@
+diff --git a/libs/vkd3d/libs/vkd3d-shader/hlsl.y b/libs/vkd3d/libs/vkd3d-shader/hlsl.y
+index 6c1f73d..77ef542 100644
+--- a/libs/vkd3d/libs/vkd3d-shader/hlsl.y
++++ b/libs/vkd3d/libs/vkd3d-shader/hlsl.y
+@@ -4231,6 +4231,17 @@ static bool intrinsic_isinf(struct hlsl_ctx *ctx,
+     return !!add_expr(ctx, params->instrs, HLSL_OP1_ISINF, args, bool_type, loc);
+ }
+ 
++static bool intrinsic_isnan(struct hlsl_ctx *ctx,
++        const struct parse_initializer *params, const struct vkd3d_shader_location *loc)
++{
++    if (!elementwise_intrinsic_float_convert_args(ctx, params, loc))
++        return false;
++
++    /* NaN is the one value that differs from itself. The comparison is unordered, so it is true for NaN. */
++    return !!add_binary_comparison_expr(ctx, params->instrs, HLSL_OP2_NEQUAL,
++            params->args[0], params->args[0], loc);
++}
++
+ static bool intrinsic_ldexp(struct hlsl_ctx *ctx,
+         const struct parse_initializer *params, const struct vkd3d_shader_location *loc)
+ {
+@@ -5615,6 +5626,7 @@ intrinsic_functions[] =
+     {"frexp",                               2, true,  intrinsic_frexp},
+     {"fwidth",                              1, true,  intrinsic_fwidth},
+     {"isinf",                               1, true,  intrinsic_isinf},
++    {"isnan",                               1, true,  intrinsic_isnan},
+     {"ldexp",                               2, true,  intrinsic_ldexp},
+     {"length",                              1, true,  intrinsic_length},
+     {"lerp",                                3, true,  intrinsic_lerp},

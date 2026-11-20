@@ -6,7 +6,9 @@
 //! The app uses Cranpose's public API and plain Rust crates. The protocol is `cranvr-proto`.
 //! `connection.rs` runs the link on its own threads. `hub.rs` hands the results to the UI.
 //! `tracking.rs` turns the headset's frames into the tracking that the host takes. `tracked.rs` does
-//! the same for the user's hands, body, face and eyes.
+//! the same for the user's hands, body, face and eyes. `focus.rs` maps the app's lifecycle to the
+//! focus that the host hears of: an app without the input focus sends no tracking and no input.
+//! `hands.rs` holds the rule for the user's hands between the panels and the game.
 
 // The app has no unsafe code. The Android entry points that `android_main!` expands to carry
 // their own expectation of this lint.
@@ -18,10 +20,14 @@ mod console;
 mod console_panel;
 mod desktop;
 mod discovery;
+mod focus;
+mod hands;
 mod hub;
 mod panels_ball;
 mod phone;
 mod place;
+#[cfg(all(feature = "scripted-hand", target_os = "android"))]
+mod scripted;
 mod settings;
 mod sizing;
 mod tracked;

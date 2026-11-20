@@ -1,0 +1,53 @@
+diff --git a/src/d3d11/d3d11_context_impl.cpp b/src/d3d11/d3d11_context_impl.cpp
+index d53be63..4c546c1 100644
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -1216,8 +1216,16 @@ public:
+     more like a hint of optimization, and Metal manages resources on its own)
+     FIXME: for render targets we can use this information: LoadActionDontCare
+     FIXME: A Map with D3D11_MAP_WRITE type could become D3D11_MAP_WRITE_DISCARD?
++    The D3D11 documentation lets a driver ignore the hint. A game that asks
++    the device for discard support (D3D11 options, DiscardAPIsSeenByDriver)
++    calls it every frame. The message "Not implemented" that this call printed
++    was no failure. It gave no name: a reader of the log looked for the cause
++    of a black picture there. The log now names the call, once, as a warning.
+     */
+-    ERR_ONCE("Not implemented");
++    static bool s_shown = false;
++    if (!std::exchange(s_shown, true)) {
++      WARN("ID3D11DeviceContext1::DiscardResource is ignored: it is only a hint");
++    }
+   }
+ 
+   void
+@@ -1229,7 +1237,10 @@ public:
+   void
+   STDMETHODCALLTYPE
+   DiscardView1(ID3D11View *pResourceView, const D3D11_RECT *pRects, UINT NumRects) override {
+-    ERR_ONCE("Not implemented");
++    static bool s_shown = false;
++    if (!std::exchange(s_shown, true)) {
++      WARN("ID3D11DeviceContext1::DiscardView1 is ignored: it is only a hint");
++    }
+   }
+ #pragma endregion
+ 
+diff --git a/src/d3d11/d3d11_device.cpp b/src/d3d11/d3d11_device.cpp
+index 1b70ee0..f4fe5cd 100644
+--- a/src/d3d11/d3d11_device.cpp
++++ b/src/d3d11/d3d11_device.cpp
+@@ -731,12 +731,12 @@ public:
+   }
+ 
+   HRESULT STDMETHODCALLTYPE SetExceptionMode(UINT RaiseFlags) override {
+-    ERR("Not implemented");
++    ERR("ID3D11Device::SetExceptionMode: not implemented");
+     return E_NOTIMPL;
+   }
+ 
+   UINT STDMETHODCALLTYPE GetExceptionMode() override {
+-    ERR("Not implemented");
++    ERR("ID3D11Device::GetExceptionMode: not implemented");
+     return 0;
+   }
+ 
