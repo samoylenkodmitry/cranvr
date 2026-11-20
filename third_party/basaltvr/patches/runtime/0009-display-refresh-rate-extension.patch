@@ -55,7 +55,7 @@ index 798fe2b..b9a4a78 100644
      XrSession session,
      const XrFrameBeginInfo* frameBeginInfo) {
 diff --git a/runtime/pe/runtime.cpp b/runtime/pe/runtime.cpp
-index b81493b..4fc36d1 100644
+index b81493b..49baa10 100644
 --- a/runtime/pe/runtime.cpp
 +++ b/runtime/pe/runtime.cpp
 @@ -16,6 +16,7 @@ SRWLOCK gInstanceLock = SRWLOCK_INIT;
@@ -66,21 +66,23 @@ index b81493b..4fc36d1 100644
  
  XrResult XRAPI_CALL basaltEnumerateInstanceExtensionProperties(
      const char* layerName,
-@@ -33,7 +34,8 @@ XrResult XRAPI_CALL basaltEnumerateInstanceExtensionProperties(
+@@ -33,7 +34,10 @@ XrResult XRAPI_CALL basaltEnumerateInstanceExtensionProperties(
      // cranvr: the tracking extensions that the headset's features allow. Without a headset's
      // file this adds none, and the list is the one of the stock runtime.
      const uint32_t trackingCount = basalt::offeredTrackingExtensionCount();
 -    const uint32_t total = (d3d11Available ? 1u : 0u) + trackingCount;
-+    // cranvr: XR_FB_display_refresh_rate is always offered. It tells a game the rate that cranvr-host runs at.
-+    const uint32_t total = (d3d11Available ? 1u : 0u) + trackingCount + 1u;
++    // cranvr: XR_FB_display_refresh_rate tells a game the rate that cranvr-host runs at. It is offered
++    // with the graphics extension: a runtime that offers no graphics offers nothing (negotiation_smoke).
++    const uint32_t displayCount = d3d11Available ? 1u : 0u;
++    const uint32_t total = (d3d11Available ? 1u : 0u) + trackingCount + displayCount;
      *propertyCountOutput = total;
      if (propertyCapacityInput == 0) {
          return XR_SUCCESS;
-@@ -73,6 +75,15 @@ XrResult XRAPI_CALL basaltEnumerateInstanceExtensionProperties(
+@@ -73,6 +77,15 @@ XrResult XRAPI_CALL basaltEnumerateInstanceExtensionProperties(
          properties[next].extensionVersion = version;
          ++next;
      }
-+    if (next < total) {
++    if (displayCount != 0) {
 +        std::strncpy(
 +            properties[next].extensionName,
 +            XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME,
@@ -92,7 +94,7 @@ index b81493b..4fc36d1 100644
      return XR_SUCCESS;
  }
  
-@@ -125,6 +136,7 @@ XrResult XRAPI_CALL basaltCreateInstance(
+@@ -125,6 +138,7 @@ XrResult XRAPI_CALL basaltCreateInstance(
          return XR_ERROR_API_VERSION_UNSUPPORTED;
      }
      bool enableD3D11 = false;
@@ -100,7 +102,7 @@ index b81493b..4fc36d1 100644
      uint32_t enabledTracking = 0;
      for (uint32_t index = 0; index < createInfo->enabledExtensionCount; ++index) {
          const char* extensionName = createInfo->enabledExtensionNames[index];
-@@ -138,6 +150,10 @@ XrResult XRAPI_CALL basaltCreateInstance(
+@@ -138,6 +152,10 @@ XrResult XRAPI_CALL basaltCreateInstance(
              enabledTracking |= trackingBit;
              continue;
          }
@@ -111,7 +113,7 @@ index b81493b..4fc36d1 100644
          if (std::strcmp(extensionName, XR_KHR_D3D11_ENABLE_EXTENSION_NAME) != 0) {
              std::fprintf(stderr, "Basalt OpenXR: unsupported enabled extension '%s'\n", extensionName);
              return XR_ERROR_EXTENSION_NOT_PRESENT;
-@@ -160,6 +176,7 @@ XrResult XRAPI_CALL basaltCreateInstance(
+@@ -160,6 +178,7 @@ XrResult XRAPI_CALL basaltCreateInstance(
      }
      gLiveInstance = reinterpret_cast<XrInstance>(gNextInstanceHandle);
      gD3D11ExtensionEnabled = enableD3D11;
@@ -119,7 +121,7 @@ index b81493b..4fc36d1 100644
      gNextInstanceHandle += kInstanceHandleStride;
      *instance = gLiveInstance;
      ReleaseSRWLockExclusive(&gInstanceLock);
-@@ -179,6 +196,7 @@ XrResult XRAPI_CALL basaltDestroyInstance(XrInstance instance) {
+@@ -179,6 +198,7 @@ XrResult XRAPI_CALL basaltDestroyInstance(XrInstance instance) {
      }
      gLiveInstance = XR_NULL_HANDLE;
      gD3D11ExtensionEnabled = false;
@@ -127,7 +129,7 @@ index b81493b..4fc36d1 100644
      ReleaseSRWLockExclusive(&gInstanceLock);
      basalt::setEnabledTrackingExtensions(0);
      basalt::invalidateSessionForInstance(instance);
-@@ -288,6 +306,16 @@ bool isValidInstance(XrInstance instance) {
+@@ -288,6 +308,16 @@ bool isValidInstance(XrInstance instance) {
      return valid;
  }
  
@@ -144,7 +146,7 @@ index b81493b..4fc36d1 100644
  bool isD3D11ExtensionEnabled(XrInstance instance) {
      if (instance == XR_NULL_HANDLE) {
          return false;
-@@ -385,6 +413,15 @@ XrResult XRAPI_CALL getInstanceProcAddr(
+@@ -385,6 +415,15 @@ XrResult XRAPI_CALL getInstanceProcAddr(
      } else if (std::strcmp(name, "xrGetD3D11GraphicsRequirementsKHR") == 0 &&
                 isD3D11ExtensionEnabled(instance)) {
          *function = asVoidFunction(getD3D11GraphicsRequirements);

@@ -1,19 +1,34 @@
 diff --git a/runtime/pe/input.cpp b/runtime/pe/input.cpp
-index 20faec6..2882035 100644
+index 20faec6..14f75f4 100644
 --- a/runtime/pe/input.cpp
 +++ b/runtime/pe/input.cpp
-@@ -1865,8 +1865,12 @@ void invalidateInputForSession(XrSession session) {
-     }
+@@ -1166,10 +1166,16 @@ XrResult XRAPI_CALL attachSessionActionSets(
+             ReleaseSRWLockExclusive(&gInputLock);
+             return XR_ERROR_HANDLE_INVALID;
+         }
+-        // Attachment is permanent for the life of the action set, even after
++        // Attachment freezes the set's actions for the life of the set, even after
+         // its session is destroyed; a duplicate handle in this call is
+-        // harmless and behaves like a single occurrence.
+-        if (record->attached) {
++        // harmless and behaves like a single occurrence. cranvr: a set that its
++        // session no longer holds attaches to a new session. OpenComposite creates
++        // its action sets once. It attaches them to its first session, destroys
++        // that session when the game submits its first frame (it then makes a
++        // session on the game's own graphics device) and attaches the same sets to
++        // the new session. The set keeps its actions and the instance keeps the
++        // suggested bindings.
++        if (record->attached && record->attachedSession != XR_NULL_HANDLE) {
+             ReleaseSRWLockExclusive(&gInputLock);
+             return XR_ERROR_ACTIONSETS_ALREADY_ATTACHED;
+         }
+@@ -1866,7 +1872,8 @@ void invalidateInputForSession(XrSession session) {
      for (ActionSetRecord& record : gActionSets) {
          if (record.attachedSession == session) {
--            // `attached` stays true: attachment freezes a set's actions for
+             // `attached` stays true: attachment freezes a set's actions for
 -            // the set's whole lifetime, not just the session's.
-+            // cranvr: a set that was attached to this session may attach to the next one.
-+            // OpenComposite creates its action sets once. It attaches them to its first session,
-+            // destroys that session when the game submits its first frame (it then makes a session
-+            // on the game's own graphics device) and attaches the same sets to the new session. The
-+            // set keeps its actions and the suggested bindings of the instance.
-+            record.attached = false;
++            // the set's whole lifetime, not just the session's. cranvr: a set without a
++            // session may attach to the next one (see attachSessionActionSets).
              record.attachedSession = XR_NULL_HANDLE;
          }
      }

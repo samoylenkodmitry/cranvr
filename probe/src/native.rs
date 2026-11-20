@@ -33,7 +33,7 @@ use std::{
     f32::consts::FRAC_PI_4,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
@@ -102,6 +102,10 @@ struct Counters {
     malformed: AtomicU64,
     key_requests: AtomicU64,
     haptics: AtomicU64,
+    /// Pulses with no amplitude, and the strongest amplitude (as f32 bits) among the others: what a game's
+    /// pulses were worth
+    haptics_zero: AtomicU64,
+    haptics_max_bits: AtomicU32,
 }
 
 /// What the decode thread measured, in ms per frame.
@@ -322,14 +326,16 @@ pub fn run(o: Options) -> i32 {
     let r = results.lock().unwrap();
     let expected = (o.seconds * fps) as u64;
     println!(
-        "probe: done: {} received, {} decoded ({} good, {} wrong) at {}x{}, expected about {expected}; {} haptic pulses",
+        "probe: done: {} received, {} decoded ({} good, {} wrong) at {}x{}, expected about {expected}; {} haptic pulses ({} of them with no amplitude, the strongest {:.2})",
         r.received,
         r.decoded,
         r.good,
         r.bad,
         r.size.0,
         r.size.1,
-        shared.counters.haptics.load(Ordering::Relaxed)
+        shared.counters.haptics.load(Ordering::Relaxed),
+        shared.counters.haptics_zero.load(Ordering::Relaxed),
+        f32::from_bits(shared.counters.haptics_max_bits.load(Ordering::Relaxed))
     );
     print_summary(&shared, &r, o.seconds, expected);
     if o.tracking {
@@ -392,9 +398,15 @@ fn read_loop(shared: &Arc<Shared>, units: &mpsc::Sender<Received>, udp: bool) {
         Incoming::Datagram(HostDatagram::Pong(p)) => {
             shared.clock.lock().unwrap().add(p.ping_sent, p.received, p.sent, now_ns());
         }
-        Incoming::Datagram(HostDatagram::Haptics(_)) => {
+        Incoming::Datagram(HostDatagram::Haptics(pulse)) => {
             if shared.counters.haptics.fetch_add(1, Ordering::Relaxed) == 0 {
                 println!("probe: first haptic pulse");
+            }
+            if pulse.amplitude <= 0.0 {
+                shared.counters.haptics_zero.fetch_add(1, Ordering::Relaxed);
+            } else {
+                // Amplitudes above zero order like their bits
+                shared.counters.haptics_max_bits.fetch_max(pulse.amplitude.to_bits(), Ordering::Relaxed);
             }
         }
         Incoming::Datagram(HostDatagram::Audio(audio)) => {

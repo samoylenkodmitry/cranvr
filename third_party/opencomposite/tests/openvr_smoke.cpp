@@ -510,8 +510,10 @@ struct ActionTest {
 		if (!expect) {
 			return nullptr;
 		}
-		if (!pose_active[0] || !pose_active[1] || pose_valid[0] < frames / 2 || pose_valid[1] < frames / 2) {
-			return "a hand's pose action was not active and valid";
+		// The runtime drops a controller's pose for a frame when the headset's last sample is older than its freshness
+		// limit, which a Mac under load does now and then (the profile stays). A run on a quiet Mac holds above 98 percent.
+		if (!pose_active[0] || !pose_active[1] || pose_valid[0] < (frames - pose_first[0]) * 8 / 10 || pose_valid[1] < (frames - pose_first[1]) * 8 / 10) {
+			return "a hand's pose action was not active and valid in 80 percent of the frames";
 		}
 		// The probe's left grip stays at x -0.2 (the pose of /pose/raw sits a few centimeters off the grip) and the
 		// right one swings 10 cm to each side of 0.25

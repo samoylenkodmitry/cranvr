@@ -134,8 +134,9 @@ if (( openvr_wine )); then
     export CRANVR_OPENCOMPOSITE=1
     # The run tests the path of an OpenVR program, not the rate. On a Mac that other builds keep busy (a
     # load average above 20) the program loses frames to the scheduler: the report of its second-by-second
-    # frame counts shows 120 in the quiet seconds and 60 to 100 in the busy ones. The run therefore asks the
-    # host for 72 Hz unless --fps is given.
+    # frame counts shows 120 in the quiet seconds and 60 to 100 in the busy ones. The rest of the loss was
+    # the start (OpenComposite's restarts of the session). The run therefore asks the host for 72 Hz unless
+    # --fps is given.
     (( fps_given )) || fps=72
     # What the runtime tells the game about the display must be the rate that the host runs at
     wine_args+=(--expect-hz "${fps}")
