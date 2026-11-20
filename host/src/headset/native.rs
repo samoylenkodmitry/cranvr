@@ -506,6 +506,8 @@ fn run_session(shared: &Shared, session: &Arc<Session>, stream: cranvr_proto::me
     }
     audio::detach(session);
     *shared.session.lock().unwrap() = None;
+    // No panel of a gone headset holds a hand back
+    shared.emit(Event::Held([false; 2]));
     shared.emit(Event::TrackingOffer(Features::NONE));
     shared.emit(Event::Disconnected);
 }
@@ -1153,6 +1155,8 @@ impl Session {
             if !released.is_empty() {
                 shared.emit(Event::Buttons(released));
             }
+            // An app without the focus points at no panel
+            shared.emit(Event::Held([false; 2]));
         }
         // The headset's decoders may have dropped what came while the app was away, so the next
         // pictures start from key frames
