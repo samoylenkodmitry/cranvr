@@ -398,6 +398,15 @@ Steam runs in the prefix with BasaltVR's web helper shim (`scripts/setup-steam.s
 
 A rebuild of BasaltVR gives the web helper shim new bytes. The app then reports that Steam needs its setup step. "Set up games" then runs `setup-steam.sh` again. Do not use `steam.exe -applaunch`: a game that Steam starts gets Steam's environment, not the one with the runtime's control file. For a game under `steamapps\common` the script and the window find the Steam app ID in Steam's `appmanifest` files and set `SteamAppId`, which the game's Steam check needs.
 
+### Games from a folder
+
+A program that Steam does not list, such as a copy of a Steam game with mods, joins the Play tab through "Add a game from a folder" in the card "Other Windows programs". Choose the program's .exe. The app saves the game in `app.json` (`added_games`: its name, which is its folder's name, and the program's Mac path) and lists it with Play, Options and Remove, as it lists a Steam game. The console in VR lists it by its name too. Remove takes the game out of the list with its options and deletes no file. A name that a Steam game or an earlier game uses gets a number.
+
+cranvr reads the program's folder once, when the game is added, and fills in two launch options. Each shows its reason in the Options panel, and the user can change it (a changed value loses its reason):
+
+- **Steam app ID** (`steam_app_id`). The game's Steam check asks for it. cranvr takes it from `steam_appid.txt` next to the program, else from the Steam game that the folder is a copy of: a Steam game with the same program name whose folder holds at least four fifths of the files and folders of the original (and at least three). A copy has no manifest of its own. The app sets `SteamAppId` and `SteamGameId` from the option, and starts Steam first for a game that has an ID. `scripts/run-game.sh` reads the same option from `app.json`. `CRANVR_STEAM_APP_ID` sets it for one start. Without an option, a program under a Steam library's `steamapps\common` gets the ID of its install folder's manifest, as before.
+- **Wine DLL overrides** (`dll_overrides`). A folder that holds the DLL of a mod loader (`winhttp.dll`, `version.dll`, `winmm.dll`, `dinput8.dll` or `dsound.dll`) gets `NAME=n,b` for it. Wine skips a file with the name of one of its own DLLs and runs its own copy, unless an override names the file. cranvr changes no file of the game.
+
 The runtime speaks OpenXR with D3D11. A game that uses OpenVR runs through OpenComposite (see "OpenVR games"). The app looks for a game's program three folders deep, preferring a 64-bit folder.
 
 A game that the app or `scripts/run-game.sh` starts draws nothing into its Mac window: `DXMT_SKIP_PRESENT=1` (cranvr's DXMT patch 0008) sends each frame's GPU work without the present but tells the game that the present worked. `CRANVR_MAC_MIRROR=1` for the script draws the window again.

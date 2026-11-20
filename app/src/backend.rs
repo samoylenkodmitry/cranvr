@@ -39,6 +39,16 @@ pub fn config_dir() -> PathBuf {
     })
 }
 
+/// A program that the user added from a folder ("Add a game from a folder" in the Play tab). cranvr starts
+/// it like a Steam game: the Play tab and the console in VR list it, and it has launch options of its own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddedGame {
+    /// The name that the lists show: the folder's name
+    pub name: String,
+    /// The program, as a Mac path
+    pub program: PathBuf,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -79,6 +89,8 @@ pub struct Settings {
     pub launch: BTreeMap<String, GameOptions>,
     /// The options of every Windows program that cranvr starts
     pub wine: WineOptions,
+    /// The games that the user added from a folder, in the order of adding
+    pub added_games: Vec<AddedGame>,
 }
 
 impl Default for Settings {
@@ -102,6 +114,7 @@ impl Default for Settings {
             hand_controllers: true,
             launch: BTreeMap::new(),
             wine: WineOptions::default(),
+            added_games: Vec::new(),
         }
     }
 }

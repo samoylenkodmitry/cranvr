@@ -3,6 +3,7 @@
 //! every program sit in its Wine card.
 
 use serde::{Deserialize, Serialize};
+use std::{fs, path::Path};
 
 /// The launch options of one program.
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -24,6 +25,16 @@ pub struct GameOptions {
     /// Wine DLL overrides as WINEDLLOVERRIDES takes them, such as "winhttp=n,b" to load a
     /// winhttp.dll from the game's folder before Wine's own
     pub dll_overrides: String,
+    /// Why `dll_overrides` holds what it holds, when cranvr filled it (see [`loader_overrides`]). The
+    /// Options panel shows it. A change by the user clears it.
+    pub dll_overrides_reason: String,
+    /// The Steam app ID that the program's Steam check asks for: cranvr sets it as SteamAppId and
+    /// SteamGameId. Empty: a program in a Steam library gets the ID of its install folder's manifest, any
+    /// other program none. A copy of a Steam game needs the ID of the original (see [`detect`]).
+    pub steam_app_id: String,
+    /// Why `steam_app_id` holds what it holds, when cranvr filled it. The Options panel shows it. A
+    /// change by the user clears it.
+    pub steam_app_id_reason: String,
     /// More environment variables: NAME=value entries separated by spaces
     pub env: String,
     /// The program's arguments, separated by spaces
@@ -39,6 +50,12 @@ impl GameOptions {
         let mut plain = self.clone();
         if !plain.eye_per_pass {
             plain.eye_per_pass_reason.clear();
+        }
+        if plain.dll_overrides.is_empty() {
+            plain.dll_overrides_reason.clear();
+        }
+        if plain.steam_app_id.is_empty() {
+            plain.steam_app_id_reason.clear();
         }
         plain == Self::default()
     }
@@ -85,6 +102,11 @@ pub fn environment(wine: &WineOptions, game: &GameOptions) -> Vec<(String, Strin
     if game.eye_per_pass {
         vars.push(("BASALT_MAX_ARRAY_SIZE".to_owned(), "1".to_owned()));
     }
+    let steam_id = game.steam_app_id.trim();
+    if !steam_id.is_empty() {
+        vars.push(("SteamAppId".to_owned(), steam_id.to_owned()));
+        vars.push(("SteamGameId".to_owned(), steam_id.to_owned()));
+    }
     let overrides: Vec<&str> = [wine.dll_overrides.trim(), game.dll_overrides.trim()].into_iter().filter(|o| !o.is_empty()).collect();
     if !overrides.is_empty() {
         vars.push(("WINEDLLOVERRIDES".to_owned(), overrides.join(";")));
@@ -112,6 +134,68 @@ pub fn summary(wine: &WineOptions, game: &GameOptions) -> String {
     let mut parts: Vec<String> = environment(wine, game).into_iter().map(|(name, value)| format!("{name}={value}")).collect();
     parts.extend(arguments(game).map(str::to_owned));
     parts.join(" ")
+}
+
+/// The names (without ".dll") of Windows system DLLs that a mod loader ships in a program's folder in
+/// place of the system's. The program loads the loader's file, which loads the system's file and then
+/// starts the mods. Wine runs its own copy of each of them and skips the file in the folder, unless an
+/// override names the file ("n,b": the file first, Wine's own copy second).
+const LOADER_DLLS: [&str; 5] = ["dinput8", "dsound", "version", "winhttp", "winmm"];
+
+/// The loader DLLs that sit in `folder`, by name without ".dll", sorted.
+pub fn loader_dlls(folder: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(folder) else { return Vec::new() };
+    let mut found: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            let stem = name.strip_suffix(".dll")?;
+            LOADER_DLLS.contains(&stem).then(|| stem.to_owned())
+        })
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// The Steam app ID in `steam_appid.txt` next to a program: the file that Steam's own library uses to
+/// name the game of a program that Steam did not start.
+pub fn steam_appid_file(folder: &Path) -> Option<String> {
+    let text = fs::read_to_string(folder.join("steam_appid.txt")).ok()?;
+    let id = text.lines().next()?.trim();
+    (!id.is_empty() && id.len() <= 10 && id.bytes().all(|b| b.is_ascii_digit())).then(|| id.to_owned())
+}
+
+/// The launch options that cranvr fills in for a program that the user adds from a folder, each with
+/// the reason that the Options panel shows. It reads the program's own folder: DLLs of a mod loader get
+/// their override, and `steam_appid.txt` gives the Steam app ID. `copy_of` is the name and the app ID of
+/// a Steam game that this program is a copy of (see steam.rs): the ID is then that game's. The user can
+/// change each value, and a change clears its reason.
+pub fn detect(program: &Path, copy_of: Option<(&str, &str)>) -> GameOptions {
+    let mut options = GameOptions::default();
+    let Some(folder) = program.parent() else { return options };
+    let dlls = loader_dlls(folder);
+    if !dlls.is_empty() {
+        options.dll_overrides = dlls.iter().map(|dll| format!("{dll}=n,b")).collect::<Vec<_>>().join(";");
+        let files = match dlls.as_slice() {
+            [one] => format!("{one}.dll"),
+            [first, second] => format!("{first}.dll and {second}.dll"),
+            many => format!("{} such DLL files", many.len()),
+        };
+        options.dll_overrides_reason = format!(
+            "cranvr filled this in because the program's folder holds {files}. A mod loader uses such a file. Wine skips it and runs its own copy, unless an override names it."
+        );
+    }
+    if let Some(id) = steam_appid_file(folder) {
+        options.steam_app_id = id;
+        options.steam_app_id_reason = "cranvr took this from steam_appid.txt in the program's folder.".to_owned();
+    } else if let Some((name, id)) = copy_of {
+        options.steam_app_id = id.to_owned();
+        options.steam_app_id_reason = format!(
+            "cranvr took this from {name} in your Steam library. The program's folder holds the same files. A copy of a Steam game asks Steam for the ID of the original."
+        );
+    }
+    options
 }
 
 #[cfg(test)]
@@ -188,5 +272,69 @@ mod tests {
         assert_eq!(vars[0], ("WINEDLLOVERRIDES".to_owned(), "dxgi=n;winhttp=n,b".to_owned()));
         assert_eq!(vars.iter().rev().find(|(name, _)| name == "LEVEL").map(|(_, value)| value.as_str()), Some("2"));
         assert_eq!(summary(&wine, &game), "WINEDLLOVERRIDES=dxgi=n;winhttp=n,b LEVEL=1 LEVEL=2");
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("cranvr-launch-{name}-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_loader_dll_in_the_folder_gets_its_override_and_a_reason() {
+        let dir = scratch("loader");
+        fs::write(dir.join("Game.exe"), b"x").unwrap();
+        fs::write(dir.join("UnityPlayer.dll"), b"x").unwrap();
+        // Libraries that a game ships for itself are none of the loader's business
+        fs::write(dir.join("d3dcompiler_47.dll"), b"x").unwrap();
+        assert_eq!(detect(&dir.join("Game.exe"), None), GameOptions::default());
+        fs::write(dir.join("WinHTTP.dll"), b"x").unwrap();
+        let options = detect(&dir.join("Game.exe"), None);
+        assert_eq!(options.dll_overrides, "winhttp=n,b");
+        assert!(options.dll_overrides_reason.contains("winhttp.dll"));
+        assert!(options.steam_app_id.is_empty() && options.steam_app_id_reason.is_empty());
+        fs::write(dir.join("version.dll"), b"x").unwrap();
+        let options = detect(&dir.join("Game.exe"), None);
+        assert_eq!(options.dll_overrides, "version=n,b;winhttp=n,b");
+        assert!(options.dll_overrides_reason.contains("version.dll and winhttp.dll"));
+        // The override reaches Wine's environment as it is
+        let vars = environment(&WineOptions::default(), &options);
+        assert!(vars.contains(&("WINEDLLOVERRIDES".to_owned(), "version=n,b;winhttp=n,b".to_owned())));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_steam_app_id_comes_from_the_folder_first_then_from_the_copied_game() {
+        let dir = scratch("appid");
+        let program = dir.join("Game.exe");
+        fs::write(&program, b"x").unwrap();
+        let from_copy = detect(&program, Some(("Some Game", "123")));
+        assert_eq!(from_copy.steam_app_id, "123");
+        assert!(from_copy.steam_app_id_reason.contains("Some Game"));
+        fs::write(dir.join("steam_appid.txt"), "480\r\n").unwrap();
+        let from_file = detect(&program, Some(("Some Game", "123")));
+        assert_eq!(from_file.steam_app_id, "480");
+        assert!(from_file.steam_app_id_reason.contains("steam_appid.txt"));
+        // A file that holds no number is no ID
+        fs::write(dir.join("steam_appid.txt"), "not a number").unwrap();
+        assert_eq!(steam_appid_file(&dir), None);
+        fs::write(dir.join("steam_appid.txt"), "").unwrap();
+        assert_eq!(steam_appid_file(&dir), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_steam_app_id_reaches_the_environment_and_a_reason_without_it_is_a_leftover() {
+        let game = GameOptions { steam_app_id: " 620 ".into(), steam_app_id_reason: "because".into(), ..Default::default() };
+        let vars = environment(&WineOptions::default(), &game);
+        assert!(vars.contains(&("SteamAppId".to_owned(), "620".to_owned())));
+        assert!(vars.contains(&("SteamGameId".to_owned(), "620".to_owned())));
+        assert!(!game.is_default());
+        assert!(GameOptions { steam_app_id_reason: "because".into(), ..Default::default() }.is_default());
+        assert!(GameOptions { dll_overrides_reason: "because".into(), ..Default::default() }.is_default());
+        assert!(!GameOptions { dll_overrides: "winhttp=n,b".into(), ..Default::default() }.is_default());
+        let old: GameOptions = serde_json::from_str(r#"{"dll_overrides": "winhttp=n,b"}"#).unwrap();
+        assert!(old.steam_app_id.is_empty() && old.dll_overrides_reason.is_empty());
     }
 }
