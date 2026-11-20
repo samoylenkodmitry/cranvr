@@ -285,6 +285,12 @@ if [[ ${client} == quest && -f ${identity} ]]; then
     mkdir -p "${work}/config"
     cp "${identity}" "${work}/config/host-identity.txt"
 fi
+# An OpenVR program draws a picture with an upper and a lower half. The host writes both eyes of the game's newest
+# frame, and the run checks that the upper half is the bright one (see below).
+if (( openvr_wine )); then
+    mkdir -p "${work}/eyes"
+    export CRANVR_EYE_DUMP=${work}/eyes
+fi
 print "Starting the host at ${fps} Hz (log: ${work}/host.log)"
 "${bin}/cranvr-host" "${host_args[@]}" > "${work}/host.out" 2> "${work}/host.log" &
 pids+=($!)
@@ -377,6 +383,36 @@ if (( openvr_wine )); then
     done
     grep -h "openvr_smoke:" "${work}/game.log" || true
     grep -q "openvr_smoke: PASS" "${work}/game.log" || { print -u2 "The OpenVR program did not pass; see ${work}/game.log"; openvr_exit=1; }
+    # The picture of each eye reaches the host the right way up: the program's upper half is bright, its lower half nearly black
+    python3 -I - "${work}/eyes" <<'PYTHON' || { print -u2 "The picture of the OpenVR program is not the right way up in the host; see ${work}/eyes"; openvr_exit=1; }
+import struct, sys, zlib
+def read_png(path):
+    data = open(path, "rb").read()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    pos, idat, width, height = 8, b"", 0, 0
+    while pos < len(data):
+        length, kind = struct.unpack(">I4s", data[pos:pos + 8])
+        body = data[pos + 8:pos + 8 + length]
+        if kind == b"IHDR":
+            width, height = struct.unpack(">II", body[:8])
+        elif kind == b"IDAT":
+            idat += body
+        pos += 12 + length
+    raw = zlib.decompress(idat)
+    stride = width * 3 + 1
+    return width, height, [raw[y * stride + 1:(y + 1) * stride] for y in range(height)]
+def brightness(rows):
+    return sum(sum(row) for row in rows) / max(1, sum(len(row) for row in rows))
+bad = False
+for eye in ("left", "right"):
+    width, height, rows = read_png("%s/eye-%s.png" % (sys.argv[1], eye))
+    quarter = max(1, height // 4)
+    top, bottom = brightness(rows[:quarter]), brightness(rows[-quarter:])
+    print("eyes: the %s eye's upper quarter has brightness %.0f, its lower quarter %.0f" % (eye, top, bottom))
+    if not top > 2 * bottom:
+        bad = True
+sys.exit(1 if bad else 0)
+PYTHON
     if [[ -n ${openvr_actions} ]]; then
         # The program pulses the left haptic output when its grab action fires: the pulse crosses the runtime and the
         # host to the probe

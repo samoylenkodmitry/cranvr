@@ -1,0 +1,96 @@
+diff --git a/DrvOpenXR/XrBackend.cpp b/DrvOpenXR/XrBackend.cpp
+index 93bf64c..0de2a55 100644
+--- a/DrvOpenXR/XrBackend.cpp
++++ b/DrvOpenXR/XrBackend.cpp
+@@ -569,6 +569,19 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
+ 
+ IBackend::openvr_enum_t XrBackend::SetSkyboxOverride(const vr::Texture_t* pTextures, uint32_t unTextureCount)
+ {
++	// cranvr: the runtime ends a frame with projection layers only, and this override is a quad layer. A game
++	// that sets a skybox (a loading screen, as the Unity plugin of SteamVR does) would have the frame refused, or,
++	// with a texture that has mip levels, stop here with "Cannot create DX texture swap chain". The override
++	// does nothing: the game goes on to submit its frames.
++	if (unTextureCount && pTextures) {
++		static bool logged = false;
++		if (!logged) {
++			logged = true;
++			OOVR_LOG("Ignoring the skybox override: the runtime has no quad layers");
++		}
++		return 0;
++	}
++
+ 	// Needed for rFactor2 loading screens
+ 	if (unTextureCount && pTextures) {
+ 		CheckOrInitCompositors(pTextures);
+diff --git a/OpenOVR/Compositor/dx11compositor.cpp b/OpenOVR/Compositor/dx11compositor.cpp
+index 697b9d7..cbe7e78 100644
+--- a/OpenOVR/Compositor/dx11compositor.cpp
++++ b/OpenOVR/Compositor/dx11compositor.cpp
+@@ -30,6 +30,16 @@ psIn vs_fs(uint vI : SV_VERTEXID)
+ 	return output;
+ }
+ 
++// cranvr: the quad of vs_fs with the texture's rows in the order that they have. A copy that converts the channel
++// order of a game's image (DrawQuad) must not turn the picture over: vs_fs does, for bounds that say so.
++psIn vs_plain(uint vI : SV_VERTEXID)
++{
++	psIn output;
++	output.tex = float2(vI&1,vI>>1);
++	output.pos = float4((output.tex.x-0.5f)*2,-(output.tex.y-0.5f)*2,0,1);
++	return output;
++}
++
+ float4 ps_fs(psIn inputPS) : SV_TARGET
+ {
+ 	float4 textureColor = shaderTexture.Sample(SampleType, inputPS.tex);
+@@ -110,6 +120,9 @@ DX11Compositor::DX11Compositor(ID3D11Texture2D* initial)
+ 	ID3DBlob* fs_pixel_shader_blob = d3d_compile_shader(fs_shader_code, "ps_fs", "ps_5_0");
+ 	OOVR_FAILED_DX_ABORT(device->CreateVertexShader(fs_vert_shader_blob->GetBufferPointer(), fs_vert_shader_blob->GetBufferSize(), nullptr, &fs_vshader));
+ 	OOVR_FAILED_DX_ABORT(device->CreatePixelShader(fs_pixel_shader_blob->GetBufferPointer(), fs_pixel_shader_blob->GetBufferSize(), nullptr, &fs_pshader));
++	ID3DBlob* copy_vert_shader_blob = d3d_compile_shader(fs_shader_code, "vs_plain", "vs_5_0");
++	OOVR_FAILED_DX_ABORT(device->CreateVertexShader(copy_vert_shader_blob->GetBufferPointer(), copy_vert_shader_blob->GetBufferSize(), nullptr, &copy_vshader));
++	copy_vert_shader_blob->Release();
+ 
+ 	// Create a texture sampler state description.
+ 	D3D11_SAMPLER_DESC samplerDesc;
+@@ -246,7 +259,7 @@ void DX11Compositor::DrawQuad(ID3D11ShaderResourceView* view, ID3D11RenderTarget
+ 	context->RSSetState(nullptr);
+ 	context->RSSetViewports(1, &viewport);
+ 	context->RSSetScissorRects(1, &scissor);
+-	context->VSSetShader(fs_vshader, nullptr, 0);
++	context->VSSetShader(copy_vshader, nullptr, 0);
+ 	context->HSSetShader(nullptr, nullptr, 0);
+ 	context->DSSetShader(nullptr, nullptr, 0);
+ 	context->GSSetShader(nullptr, nullptr, 0);
+@@ -394,7 +407,9 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
+ 		desc.width = srcDesc.Width;
+ 		desc.height = srcDesc.Height;
+ 		desc.format = type;
+-		desc.mipCount = srcDesc.MipLevels;
++		// cranvr: the runtime takes images of one mip level. The copy fills level 0 only, so a game's texture with a
++		// chain of mip levels (a loading screen's) goes to an image of one.
++		desc.mipCount = 1;
+ 		desc.sampleCount = 1;
+ 		desc.arraySize = 1;
+ 		desc.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+@@ -663,7 +678,6 @@ bool DX11Compositor::CheckChainCompatible(D3D11_TEXTURE2D_DESC& inputDesc, vr::E
+ 
+ 	CHECK(Width, width)
+ 	CHECK(Height, height)
+-	CHECK(MipLevels, mipCount)
+ 
+ 	if (inputDesc.Format != createInfoFormat) {
+ 		FAIL("Format");
+diff --git a/OpenOVR/Compositor/dx11compositor.h b/OpenOVR/Compositor/dx11compositor.h
+index 5b4d1c0..3bf83d5 100644
+--- a/OpenOVR/Compositor/dx11compositor.h
++++ b/OpenOVR/Compositor/dx11compositor.h
+@@ -43,6 +43,8 @@ protected:
+ 	ID3D11ShaderResourceView* quad_texture_view;
+ 	ID3D11SamplerState* quad_sampleState;
+ 	ID3D11VertexShader* fs_vshader;
++	// cranvr: the same full-screen quad without the vertical flip of fs_vshader, for the converting copy (DrawQuad)
++	ID3D11VertexShader* copy_vshader = nullptr;
+ 	ID3D11PixelShader* fs_pshader;
+ 
+ 	std::vector<XrSwapchainImageD3D11KHR> imagesHandles;

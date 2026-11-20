@@ -29,3 +29,9 @@ cranvr runs Windows OpenVR games under Wine with [OpenComposite](https://gitlab.
 `0004-display-frequency-from-the-runtime.patch`
 
 - `GetFloatTrackedDeviceProperty(Prop_DisplayFrequency_Float)` answered 90 Hz at every refresh rate, with a TODO. It asks the runtime for the rate through `XR_FB_display_refresh_rate` when the runtime offers the extension (cranvr's does) and answers 90 otherwise. The header `RuntimeExtensions/XR_FB_display_refresh_rate.h` declares the one function, since the OpenXR SDK that OpenComposite bundles is older than the extension. `openvr_smoke.exe --expect-hz N` checks the answer.
+
+`0005-skybox-mip-chain-and-upright-converting-copy.patch`
+
+- The converting copy (0002) drew a game's R8G8B8A8 image into the runtime's B8G8R8A8 image with OpenComposite's inverting quad, which turns the picture over. Every OpenVR game whose eye textures are not B8G8R8A8 was upside down in the headset. The copy draws the same quad without the flip (`vs_plain`). `scripts/e2e.sh --openvr-wine` draws a picture with a bright upper half and checks the host's copy of it. It fails with OpenComposite 0004 and passes with 0005.
+- The swapchain has one mip level, whatever the game's texture has. The runtime takes images of one level, and the copy fills level 0 only. A game's loading screen (2048x1024 with a chain of mip levels) stopped the game with "Cannot create DX texture swap chain".
+- `SetSkyboxOverride` does nothing. The runtime ends a frame with projection layers only, and the override is a quad layer. The Unity plugin of SteamVR sets such a skybox for a loading screen; the game now goes on to submit its frames.
