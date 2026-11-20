@@ -951,9 +951,8 @@ fn display_host() -> (u16, Box<dyn EventSource>, Arc<ClientLink>, Receiver<HostM
 /// The next list of displays that the host sends, within a few seconds
 fn next_list(control: &Receiver<HostMsg>) -> cranvr_proto::message::DisplayList {
     loop {
-        match control.recv_timeout(Duration::from_secs(5)).expect("the host sent no list of displays") {
-            HostMsg::Displays(list) => return list,
-            _ => {}
+        if let HostMsg::Displays(list) = control.recv_timeout(Duration::from_secs(5)).expect("the host sent no list of displays") {
+            return list;
         }
     }
 }
