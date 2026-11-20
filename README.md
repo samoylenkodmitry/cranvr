@@ -320,6 +320,17 @@ A runtime without patch 0004 closes the connection at a message that it does not
 
 The host's stats line shows what reached the game in each 5 seconds: `Game input: 601 left and 601 right controller poses, 601 and 601 of them with an aim pose (tracked mask 0b11), 21 button and axis values, 2 haptic pulses from the game; left hand at (-0.20, 1.50, -0.40) m, moved 0.00 m; right hand at (0.31, 1.40, -0.40) m, moved 1.02 m`. The position and the distance of each hand tell a controller that lies on a table, or that reports a pose at the room's origin, from one that moves: a count of poses alone does not. `scripts/e2e.sh --game` runs a fake game (`cranvr-fake-game`) that checks the input of the probe's script: both hands tracked, each hand with the grip pose and the aim pose that the probe scripted (`probe/src/hands.rs`), the right hand moving, a pull of the right trigger, a press of A, the right stick and the left grip. The fake game reads the runtime's control messages. It does not call `xrLocateSpace`, so this run checks the way from the probe through the host to the runtime's control channel.
 
+### Beat Saber's menu shows one pointer at a time
+
+The owner saw that Beat Saber's menu points with one saber and that the left saber becomes the pointer only after its trigger is pressed. A run with the probe as the headset (`scripts/e2e.sh --wine 'C:\Program Files (x86)\Steam\steamapps\common\Beat Saber\Beat Saber.exe' --left-trigger 70:4 --right-trigger 85:3 --seconds 105`, with `CRANVR_EYE_DUMP` set) shows that the game decides this itself:
+
+- Both controllers reach the game from the start of the menu. The runtime's log in the game's `Player.log` lists the `devicepose` and `pointer` actions of both hands as active with "pose ... is tracked" before any trigger moves, the lines "the left controller's pose arrives" and "the right controller's pose arrives", and the host's stats line counts 361 left and 361 right poses with aim poses in each 5 seconds, the left hand at its scripted place.
+- The left trigger reaches the game: the first change of the `trigger` and `triggerpressed` actions of the left hand is 1.00 and "pressed" at the probe's second 70, and a release follows at 74.
+- The game picks one pointer. The probe's right hand points before the pull: the eye dumps show its laser (190 to 250 bright pixels in the part of the picture that holds it). At the second 70 of the probe, when the left trigger goes down, the laser goes away in the first dump after the press and stays away for 14 seconds (0 to 4 bright pixels, the stars). When the right trigger goes down at the second 85, the laser is back in the first dump (164 to 315). The left hand's own laser lies outside the dumped part of the picture, so the run did not show it.
+- The game's own names say the same. `VRUI.dll` holds `VRPointer` with `_leftVRController`, `_rightVRController`, `IsLeftControllerDown`, `IsRightControllerDown`, `SelectLeftController`, `SelectRightController`, `get_lastSelectedVrController`, `_leftLaserPointer`, `_rightLaserPointer`, `ShowLastSelectedPointer` and `HideLaserPointers`: the menu shows the laser of the controller that pressed last.
+
+The input path is not at fault, so nothing changed in it. In a song both sabers show, because the game draws both then.
+
 ## Hands, body, face and eyes in games
 
 A Windows VR game under cranvr's Wine stack gets the user's hands, body, face and eyes through the OpenXR extensions that a PC headset offers. The runtime lists an extension only while the connected headset offers its feature:
