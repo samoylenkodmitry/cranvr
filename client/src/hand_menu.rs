@@ -74,7 +74,7 @@ fn anchor() -> (FollowTarget, [f32; 3]) {
     }
 }
 
-/// Whether the launch opens the menu at the start.
+/// Whether the launch opens the menu at the start (the extra `hand_menu` with the value `open`).
 pub fn open_on_launch() -> bool {
     launch_args().string("hand_menu") == Some("open")
 }

@@ -37,11 +37,14 @@ pub struct Layout {
     in_game: bool,
     /// The display that rides on the left hand
     pinned: Option<u8>,
+    /// A test's panels (the launch extra `shown`): they show in the room and in each game, and nothing
+    /// is saved
+    test: Option<BTreeSet<PanelId>>,
 }
 
 impl Default for Layout {
     fn default() -> Self {
-        Self { room: [PanelId::Connection, PanelId::Stats, PanelId::Display(DESKTOP_STREAM)].into(), game: BTreeSet::new(), in_game: false, pinned: None }
+        Self { room: [PanelId::Connection, PanelId::Stats, PanelId::Display(DESKTOP_STREAM)].into(), game: BTreeSet::new(), in_game: false, pinned: None, test: None }
     }
 }
 
@@ -96,11 +99,28 @@ impl Layout {
     /// under `panels`.
     pub fn load() -> Self {
         let get = |key: &str| preferences().get(key);
-        Self::from_saved(get(ROOM_KEY).as_deref(), get(PINNED_KEY).as_deref(), get("panels").map(|text| text != "hidden"))
+        let mut layout = Self::from_saved(get(ROOM_KEY).as_deref(), get(PINNED_KEY).as_deref(), get("panels").map(|text| text != "hidden"));
+        // A test chooses the panels and the pinned display with launch extras and saves nothing:
+        // `shown` is a list such as `display1,stats` and `pinned` a display's number
+        let args = cranpose::launch_args();
+        if let Some(list) = args.string("shown") {
+            let set: BTreeSet<PanelId> = list.split(',').filter_map(from_name).collect();
+            layout.room.clone_from(&set);
+            layout.game.clone_from(&set);
+            layout.test = Some(set);
+        }
+        if let Some(stream) = args.int("pinned").and_then(|n| u8::try_from(n).ok()) {
+            layout.pinned = Some(stream);
+            layout.test.get_or_insert_with(|| layout.room.clone());
+        }
+        layout
     }
 
     /// Keeps the room's choice and the pinned display for the next start.
     pub fn save(&self) {
+        if self.test.is_some() {
+            return;
+        }
         for (key, text) in [(ROOM_KEY, self.room_text()), (PINNED_KEY, self.pinned_text())] {
             if let Err(e) = preferences().set(key, &text) {
                 log::warn!("the panels' layout was not saved: {e}");
@@ -147,7 +167,7 @@ impl Layout {
     /// when it ends.
     pub fn set_in_game(&mut self, in_game: bool) {
         if in_game && !self.in_game {
-            self.game.clear();
+            self.game = self.test.clone().unwrap_or_default();
         }
         self.in_game = in_game;
     }
@@ -182,9 +202,66 @@ impl Layout {
     }
 }
 
+/// What the app composes as panels and surfaces, each of which is a layer of the headset's compositor.
+/// The log shows it, so a run can check that a game with nothing shown carries the ball and nothing
+/// else.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Layers {
+    /// Panels with composables: the connection, the stats, the console, the menu and the hand's ball
+    pub panels: usize,
+    /// Surfaces that a decoder writes into: the displays
+    pub surfaces: usize,
+}
+
+/// The layers that the app composes. `with_video` names the displays whose video the host sends: a
+/// display without it composes nothing. `connected` says that the link streams: the connection panel
+/// then shows only when the user picked it. `room_free` is false while a tracked hand points at the
+/// panels in a game that asks for hands, which hides the room's panels and the ball.
+pub fn layers(layout: &Layout, connected: bool, console_open: bool, menu_open: bool, room_free: bool, with_video: &[u8]) -> Layers {
+    let mut out = Layers::default();
+    if room_free {
+        out.panels += usize::from(layout.shown(PanelId::Connection) || !connected) + usize::from(layout.shown(PanelId::Stats));
+    }
+    out.panels += usize::from(console_open);
+    let shown: Vec<u8> = layout.displays_shown().into_iter().filter(|stream| with_video.contains(stream)).collect();
+    out.surfaces = shown.len();
+    // A display that is not on the hand has a cursor ring when the host leaves the cursor out of the
+    // pictures. The host puts it into them, so no ring counts here.
+    if room_free {
+        // The ball, which is the pill with a second button while a display rides on the hand
+        out.panels += 1 + usize::from(menu_open);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_game_with_nothing_shown_carries_the_ball_and_nothing_else() {
+        let mut layout = Layout::default();
+        layout.set_in_game(true);
+        // The same count as the earlier ball: one panel and no surface
+        assert_eq!(layers(&layout, true, false, false, true, &[1, 2]), Layers { panels: 1, surfaces: 0 });
+        // The menu is one more panel while it is open. A display on the hand is one more surface.
+        assert_eq!(layers(&layout, true, false, true, true, &[1]), Layers { panels: 2, surfaces: 0 });
+        layout.set_shown(PanelId::Display(2), true);
+        assert_eq!(layers(&layout, true, false, false, true, &[1, 2]), Layers { panels: 1, surfaces: 1 });
+        // A display that the host sends no video for composes nothing
+        assert_eq!(layers(&layout, true, false, false, true, &[1]), Layers { panels: 1, surfaces: 0 });
+    }
+
+    #[test]
+    fn the_room_shows_the_connection_the_stats_and_the_first_display() {
+        let layout = Layout::default();
+        assert_eq!(layers(&layout, true, true, false, true, &[1]), Layers { panels: 4, surfaces: 1 });
+        // Before the link streams the connection panel shows even when the user hid it
+        let mut hidden = Layout::default();
+        hidden.toggle(PanelId::Connection);
+        assert_eq!(layers(&hidden, false, false, false, true, &[]).panels, 3);
+        assert_eq!(layers(&hidden, true, false, false, true, &[]).panels, 2);
+    }
 
     #[test]
     fn the_first_start_shows_the_connection_the_stats_and_the_first_display() {

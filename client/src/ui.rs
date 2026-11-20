@@ -19,7 +19,7 @@ use crate::{
     hold::{HoldFrame, PanelHold},
     hover,
     hub::{hub, DecoderView, Device, LinkState, Snapshot, Stats},
-    panel_layout::{Layout, PanelId},
+    panel_layout::{layers, Layout, PanelId},
     phone::{self, PhoneFrames},
     place, settings,
     usb::{self, Line, Path, UsbMac, CABLE_NAME},
@@ -154,6 +154,16 @@ pub fn ClientApp() {
     // It moves there again after each recenter. A panel that the user never carried starts at its
     // default pose in that frame, so the first start opens in front of the user. A saved pose is in
     // the same frame (see `place.rs`).
+    // What the app composes, in the log: a game with nothing shown carries the ball only
+    let shown_layers = {
+        let layout = layout.get();
+        let streaming = snapshot.get().state == LinkState::Streaming;
+        let with_video: Vec<u8> = displays().menu_view().displays.iter().filter(|d| d.streaming).map(|d| d.info.stream).collect();
+        layers(&layout, streaming, console.get().open, menu_open.get(), !hands_in_game.get(), &with_video)
+    };
+    LaunchedEffect(shown_layers, async move |_| {
+        log::info!("layers composed by the app: {} panels and {} display surfaces", shown_layers.panels, shown_layers.surfaces);
+    });
     // A press on Recenter makes the subspace compose again, a meter ahead of the head as it is now. The
     // panels keep their places relative to it.
     key(recenter.get(), move || {
@@ -392,13 +402,25 @@ fn held_hands(hold: &mut PanelHold, frame: &cranpose_xr::XrFrame, now: u64, menu
         Some(InputSource::Hands) => frame.hand(hand).aim.map_or(0.0, |aim| aim.index.strength),
         _ => frame.controller(hand).trigger.value,
     };
-    hold.update(&HoldFrame {
+    let held = hold.update(&HoldFrame {
         time: frame.predicted_display_time,
         hover,
         trigger: [trigger(XrHand::Left), trigger(XrHand::Right)],
         points: [frame.pointer(XrHand::Left).is_some(), frame.pointer(XrHand::Right).is_some()],
         menu_open,
-    })
+    });
+    // Each change goes to the log, so a run shows when a panel held a hand back
+    static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    let bits = u8::from(held[0]) | u8::from(held[1]) << 1;
+    if LAST.swap(bits, std::sync::atomic::Ordering::Relaxed) != bits {
+        log::info!("a panel holds back {} from the game", match held {
+            [false, false] => "no hand",
+            [true, false] => "the left hand",
+            [false, true] => "the right hand",
+            [true, true] => "both hands",
+        });
+    }
+    held
 }
 
 /// The game's picture. The decoder outputs frames. The headset's compositor shows each one from
