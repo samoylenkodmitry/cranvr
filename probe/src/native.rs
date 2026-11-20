@@ -60,7 +60,8 @@ pub struct Options {
     /// and its controller poses can be compared with the script's numbers
     pub still_head: bool,
     /// The right controller's aim sweeps over the room in front of the head and its trigger goes down for
-    /// half a second in every second, so that a game's panel gets a click somewhere along the sweep
+    /// half a second in every second, so that a game's panel gets a click somewhere along the sweep. The
+    /// head stands still then, so that the panel stays where the sweep looks.
     pub sweep_aim: bool,
     /// With `tracking`: where the face comes from
     pub face_source: tracked::FaceSource,
@@ -267,7 +268,7 @@ pub fn run(o: Options) -> i32 {
         desktop: o.desktop.then(DesktopProbe::new),
         wish: AtomicU8::new(0),
         tracking: o.tracking,
-        still_head: o.tracking || o.still_head,
+        still_head: o.tracking || o.still_head || o.sweep_aim,
         sweep_aim: o.sweep_aim,
         no_controllers: o.no_controllers,
         face_source: o.face_source,

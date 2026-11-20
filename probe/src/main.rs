@@ -46,7 +46,7 @@ fn usage() -> ! {
          \n                     probe's room and a game's controller poses match the script\
          \n  --sweep-aim        the right controller's aim sweeps over the room in front of the head and its trigger\
          \n                     goes down for half a second in every second, so that a game's panel (a warning\
-         \n                     with a Continue button) gets a click along the sweep\
+         \n                     with a Continue button) gets a click along the sweep. The head stands still\
          \n  --no-controllers   with --tracking: no controller is tracked, so a game without hand code\
          \n                     gets controllers made of the hands\
          \n  --face-source S    with --tracking: where the face comes from, visual (cameras), audio\

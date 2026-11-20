@@ -41,12 +41,12 @@ pub fn grip(hand: usize, position: [f32; 3], linear_velocity: [f32; 3]) -> Motio
 }
 
 /// The aim motion of the right hand at `t` seconds when the probe sweeps it (`--sweep-aim`): it turns over a range of
-/// 50 degrees from side to side and 30 degrees up and down about the direction ahead, in two periods (17 s and 11 s)
-/// that share no whole multiple, so that the sweep covers the range without repeating its path for minutes. The
-/// position stays.
+/// 90 degrees from side to side and 50 degrees up and down about a direction a little below straight ahead, in two
+/// periods (17 s and 11 s) that share no whole multiple, so that the sweep covers the range without repeating its
+/// path for minutes. The position stays.
 pub fn swept(aim: Motion, t: f32) -> Motion {
-    let yaw = 25.0 * (t * std::f32::consts::TAU / 17.0).sin();
-    let pitch = 5.0 + 15.0 * (t * std::f32::consts::TAU / 11.0).sin();
+    let yaw = 45.0 * (t * std::f32::consts::TAU / 17.0).sin();
+    let pitch = -10.0 + 25.0 * (t * std::f32::consts::TAU / 11.0).sin();
     let turn = Quat::from_rotation_y(yaw.to_radians()) * Quat::from_rotation_x(pitch.to_radians());
     Motion { pose: Pose { orientation: turn.to_array(), position: aim.pose.position }, ..aim }
 }
