@@ -301,7 +301,7 @@ fn ControlsPage(page: MutableState<Page>, hand: ControlHand, controls: Controls,
         ControlRow(hand, control, controls, editable);
     }
     let (first, second) = if editable {
-        ("A game still gets every button.", "A mouse action works where the controller points.")
+        ("A game still gets every button.", "A mouse action works on the Mac's desktop.")
     } else {
         ("Connect to the Mac to change the buttons.", "A game still gets every button.")
     };

@@ -10,6 +10,7 @@
 
 use crate::{
     console::Backdrop,
+    controls::{beams_wanted, pointer_mapping},
     hands,
     console_panel::{self, ConsolePanel},
     discovery::FoundHost,
@@ -24,8 +25,8 @@ use cranpose::prelude::*;
 use cranpose::text::{FontWeight, TextUnit};
 use cranpose::DecodedFrames;
 use cranpose_xr::{
-    local_haptics, local_headset_properties, local_spatial_capabilities, local_spatial_environment, FollowMode, FollowTarget, FollowingSubspace, Pose,
-    SpatialFrameEffect, SpatialPanel, StreamedScene, SubspaceModifier,
+    local_haptics, local_headset_properties, local_pointer_settings, local_spatial_capabilities, local_spatial_environment, FollowMode, FollowTarget,
+    FollowingSubspace, Pose, SpatialFrameEffect, SpatialPanel, StreamedScene, SubspaceModifier,
 };
 use cranvr_common::controls::Action as ControlAction;
 use cranvr_proto::clock::now_ns;
@@ -91,16 +92,38 @@ pub fn ClientApp() {
     // The address and the connect at launch belong to the app, not to the connect panel: a user who
     // hid the panels still connects at launch
     let address = address_field();
+    // Cranpose's pointer: the buttons of the controllers and the beams. `None` outside a headset.
+    let pointer_settings = local_pointer_settings().current();
     LaunchedEffect((), async move |_| {
         if settings::console_on_launch() {
             hub().pin_console();
         }
+        // What the pointer was last given, so a change of the mapping or of the panels is the only
+        // thing that calls it
+        let mut given = None;
         loop {
             console.set(hub().console());
             backdrop.set(hub().backdrop());
             hands_in_game.set(hands::belong_to_game(hub().feed.wish(), hub().feed.hand_points()));
             for fire in hub().take_fires() {
                 run_fire(fire.action, panels_shown, typing, recenters);
+            }
+            if let Some(pointer) = &pointer_settings {
+                let streaming = snapshot.get_non_reactive().state == LinkState::Streaming;
+                let beams = beams_wanted(
+                    !hands_in_game.get_non_reactive(),
+                    panels_shown.get_non_reactive(),
+                    streaming,
+                    console.get_non_reactive().open,
+                    crate::desktop::desktop().view().visible,
+                );
+                let want = (pointer_mapping(&hub().controls()), beams);
+                if given != Some(want) {
+                    log::info!("the pointer's beams {}, scrolling {}", if beams { "show" } else { "hide" }, if want.0.scroll_speed() > 0.0 { "on" } else { "off" });
+                    pointer.set_mapping(want.0);
+                    pointer.set_beams_visible(want.1);
+                    given = Some(want);
+                }
             }
             delay(CONSOLE_POLL).await;
         }

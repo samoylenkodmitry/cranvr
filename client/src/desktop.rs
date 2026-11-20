@@ -32,13 +32,14 @@
 
 use crate::{hub::hub, place};
 use cranpose::{
-    launch_args, prelude::*, AccessUnit, DecodedFrames, DecoderConfig, DecoderError, DecoderOutput, ExternalSurface, PointerButton,
+    launch_args, prelude::*, AccessUnit, DecodedFrames, DecoderConfig, DecoderError, DecoderOutput, ExternalSurface,
     PointerEvent, PointerEventKind, VideoCodec, VideoDecoder,
 };
 use cranpose_xr::{
-    Pose, ResizeLimits, ResizePolicy, SpatialExternalSurface, SpatialFrameEffect, SpatialMoveEvent, SpatialMoveEventType, SpatialPanel,
+    Controller, Pose, ResizeLimits, ResizePolicy, SpatialExternalSurface, SpatialFrameEffect, SpatialMoveEvent, SpatialMoveEventType, SpatialPanel,
     SpatialResizeEventType, StereoMode, SubspaceModifier, XrFrame, METERS_PER_DP,
 };
+use crate::controls::control_of;
 use cranvr_common::controls::{mouse, Action as ControlAction, Control, Controls, Hand};
 use cranvr_proto::{
     clock::now_ns,
@@ -107,16 +108,6 @@ pub struct PointerNow {
     pub scroll: [f32; 2],
 }
 
-/// The bit of a Compose pointer button, or 0 for a button that a mouse of the Mac has no use for here
-fn mouse_bit(button: PointerButton) -> u8 {
-    match button {
-        PointerButton::Primary => mouse::LEFT,
-        PointerButton::Secondary => mouse::RIGHT,
-        PointerButton::Middle => mouse::MIDDLE,
-        PointerButton::Back | PointerButton::Forward => 0,
-    }
-}
-
 impl PointerNow {
     /// Whether the host has something to do with it: a controller points at the panel or holds a
     /// button.
@@ -134,21 +125,112 @@ impl PointerNow {
         };
         moved || self.buttons != other.buttons || (0..2).any(|axis| (self.scroll[axis] - other.scroll[axis]).abs() > 0.02)
     }
+}
 
-    /// The pointer after a pointer event of the surface. `at` is the event's place as u and v.
-    /// The surface sends `Up` before `Exit` when the ray left the surface during a press, so an
-    /// `Exit` always ends with the buttons up.
-    fn after(mut self, kind: PointerEventKind, at: [f32; 2]) -> Self {
+/// The inputs that Cranpose's pointer reports as pointer buttons: the ones that `controls::button_of`
+/// gives a button.
+const CLICK_INPUTS: [Control; 5] = [Control::Trigger, Control::Grip, Control::Primary, Control::Secondary, Control::StickClick];
+
+/// What one controller does at the desktop panel.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct HandAt {
+    /// Where the controller points on the picture as u and v from its top left corner
+    hit: Option<[f32; 2]>,
+    /// The inputs that are down, as bits of the position in `CLICK_INPUTS`
+    held: u8,
+    /// The thumbstick's lean across and forward, as the headset's frame gave it
+    lean: [f32; 2],
+}
+
+impl HandAt {
+    fn holds(&self) -> bool {
+        self.held != 0
+    }
+
+    fn set(&mut self, control: Control, down: bool) {
+        if let Some(at) = CLICK_INPUTS.iter().position(|input| *input == control) {
+            if down {
+                self.held |= 1 << at;
+            } else {
+                self.held &= !(1 << at);
+            }
+        }
+    }
+}
+
+/// The two controllers at the desktop panel, and the one that owns the Mac's mouse. The Mac has one
+/// mouse, so one controller at a time drives it: the one that holds a button keeps it until it lets
+/// go. Else a controller that presses takes it. Else the controller that points at the panel, and the
+/// one that pointed first when both do.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Pointers {
+    hands: [HandAt; 2],
+    owner: Option<Hand>,
+}
+
+impl Pointers {
+    fn at(&mut self, hand: Hand) -> &mut HandAt {
+        &mut self.hands[hand.index()]
+    }
+
+    /// One pointer event of the surface. `hand` is the controller whose pointer it is, and `at` is
+    /// the event's place as u and v. The surface sends `Up` before `Exit` when the ray left the
+    /// surface during a press, so an `Exit` always ends with the buttons up.
+    fn on_event(&mut self, hand: Hand, kind: PointerEventKind, at: [f32; 2]) {
         match kind {
-            PointerEventKind::Enter | PointerEventKind::Move => self.hit = Some(at),
-            PointerEventKind::Down => (self.hit, self.buttons) = (Some(at), self.buttons | mouse::LEFT),
-            PointerEventKind::Up => (self.hit, self.buttons) = (Some(at), self.buttons & !mouse::LEFT),
-            PointerEventKind::ButtonDown(button) => (self.hit, self.buttons) = (Some(at), self.buttons | mouse_bit(button)),
-            PointerEventKind::ButtonUp(button) => (self.hit, self.buttons) = (Some(at), self.buttons & !mouse_bit(button)),
-            PointerEventKind::Exit => self = Self::default(),
+            PointerEventKind::Enter | PointerEventKind::Move => {
+                self.at(hand).hit = Some(at);
+                if self.owner.is_none_or(|owner| self.hands[owner.index()].hit.is_none()) {
+                    self.owner = Some(hand);
+                }
+            }
+            PointerEventKind::Down => self.press(hand, Control::Trigger, true, at),
+            PointerEventKind::Up => self.press(hand, Control::Trigger, false, at),
+            PointerEventKind::ButtonDown(button) => self.press(hand, control_of(button), true, at),
+            PointerEventKind::ButtonUp(button) => self.press(hand, control_of(button), false, at),
+            PointerEventKind::Exit => {
+                let lean = self.at(hand).lean;
+                *self.at(hand) = HandAt { lean, ..HandAt::default() };
+                if self.owner == Some(hand) {
+                    let other = if hand == Hand::Left { Hand::Right } else { Hand::Left };
+                    self.owner = self.hands[other.index()].hit.map(|_| other);
+                }
+            }
             _ => {}
         }
-        self
+    }
+
+    fn press(&mut self, hand: Hand, control: Control, down: bool, at: [f32; 2]) {
+        self.at(hand).hit = Some(at);
+        self.at(hand).set(control, down);
+        // A controller that holds a button keeps the mouse against a press of the other
+        let busy = self.owner.is_some_and(|owner| owner != hand && self.hands[owner.index()].holds());
+        if down && !busy {
+            self.owner = Some(hand);
+        }
+    }
+
+    /// The thumbsticks' lean for a hand, as the headset's frame gave it, with the dead zone left out
+    fn lean(&mut self, hand: Hand, lean: [f32; 2]) {
+        self.at(hand).lean = lean;
+    }
+
+    /// What goes to the host: where the owner points, the mouse buttons that its held inputs make
+    /// under the mapping, and its thumbstick's lean in the axes that the mapping gives to scrolling.
+    fn now(&self, controls: &Controls) -> PointerNow {
+        let Some(owner) = self.owner else { return PointerNow::default() };
+        let hand = &self.hands[owner.index()];
+        let Some(hit) = hand.hit else { return PointerNow::default() };
+        let buttons = CLICK_INPUTS.iter().enumerate().filter(|(at, _)| hand.held & (1 << at) != 0).fold(0, |bits, (_, control)| {
+            bits | match controls.action(owner, *control) {
+                ControlAction::LeftClick => mouse::LEFT,
+                ControlAction::RightClick => mouse::RIGHT,
+                ControlAction::MiddleClick => mouse::MIDDLE,
+                _ => 0,
+            }
+        });
+        let axis = |control: Control, lean: f32| if controls.action(owner, control) == ControlAction::Scroll { lean } else { 0.0 };
+        PointerNow { hit: Some(hit), buttons, scroll: [axis(Control::StickHorizontal, hand.lean[0]), axis(Control::StickVertical, hand.lean[1])] }
     }
 }
 
@@ -188,6 +270,9 @@ struct Inner {
 /// What goes to the host.
 #[derive(Default)]
 struct Uplink {
+    /// What the controllers do at the panel
+    pointers: Pointers,
+    /// What the host last heard of them
     pointer: PointerNow,
     dirty: bool,
     key: bool,
@@ -369,7 +454,7 @@ impl Desktop {
     pub fn set_surface(&self, surface: Option<ExternalSurface>) {
         if surface.is_none() {
             // A surface that leaves sends no `Exit`: a press that was on would stay down
-            self.update_pointer(|pointer| *pointer = PointerNow::default());
+            self.reset_pointers();
         }
         let mut inner = self.inner.lock().unwrap();
         log::info!("desktop: the surface {}", if surface.is_some() { "is there" } else { "is gone" });
@@ -398,11 +483,32 @@ impl Desktop {
         self.quick.cursor.lock().unwrap().filter(|c| c.on).map(|c| [c.u, c.v])
     }
 
-    /// Changes the pointer. It goes to the host when it differs from the one that went last.
-    fn update_pointer(&self, change: impl FnOnce(&mut PointerNow)) {
+    /// Changes what the controllers do at the panel. What the host should hear then follows from the
+    /// mapping, and goes out when it differs from what went last.
+    fn update_pointers(&self, change: impl FnOnce(&mut Pointers)) {
+        // The console's lock must not be taken under the uplink's
+        let controls = hub().controls();
         let mut uplink = self.uplink.lock().unwrap();
-        let mut pointer = uplink.pointer;
-        change(&mut pointer);
+        change(&mut uplink.pointers);
+        let pointer = uplink.pointers.now(&controls);
+        self.send_if_changed(uplink, pointer);
+    }
+
+    /// Forgets what the controllers did: nothing points at the panel and no button is down.
+    fn reset_pointers(&self) {
+        let mut uplink = self.uplink.lock().unwrap();
+        uplink.pointers = Pointers::default();
+        self.send_if_changed(uplink, PointerNow::default());
+    }
+
+    /// Sets the pointer that goes to the host, for the pointer test, which has no controller.
+    fn set_pointer(&self, pointer: PointerNow) {
+        let uplink = self.uplink.lock().unwrap();
+        self.send_if_changed(uplink, pointer);
+    }
+
+    /// The pointer goes to the host when it differs from the one that went last.
+    fn send_if_changed(&self, mut uplink: std::sync::MutexGuard<'_, Uplink>, pointer: PointerNow) {
         if pointer.differs(&uplink.pointer) || pointer.busy() != uplink.pointer.busy() {
             uplink.pointer = pointer;
             uplink.dirty = true;
@@ -412,10 +518,12 @@ impl Desktop {
     }
 
     /// A controller's ray on the surface. `size` is the surface's width and height in dp, the units
-    /// of the event's position.
+    /// of the event's position. Cranpose gives the pointer of the left hand the id 1 and the pointer
+    /// of the right hand the id 2.
     fn on_pointer_event(&self, event: &PointerEvent, size: [f32; 2]) {
         let at = [event.position.x / size[0], event.position.y / size[1]].map(|v| v.clamp(0.0, 1.0));
-        self.update_pointer(|pointer| *pointer = pointer.after(event.kind, at));
+        let hand = if event.id.0 == 1 { Hand::Left } else { Hand::Right };
+        self.update_pointers(|pointers| pointers.on_event(hand, event.kind, at));
     }
 }
 
@@ -766,8 +874,7 @@ fn synthetic_pointer(time: Duration) -> PointerNow {
 }
 
 /// How far the thumbstick that leans furthest along `axis` (0 across, 1 forward) leans, from -1 to
-/// 1, with the dead zone left out. A pointer event of the surface does not say which controller
-/// points, so the stronger of the two sticks counts.
+/// 1, with the dead zone left out. A panel that is carried follows the stronger of the two sticks.
 fn stick_lean(frame: &XrFrame, axis: usize) -> f32 {
     [&frame.left_controller, &frame.right_controller]
         .map(|controller| [controller.thumbstick.x, controller.thumbstick.y][axis])
@@ -777,20 +884,10 @@ fn stick_lean(frame: &XrFrame, axis: usize) -> f32 {
         .unwrap_or(0.0)
 }
 
-/// How far the thumbsticks lean in the axes that the mapping gives to scrolling: across, then
-/// forward. A stick whose axis does something else, or nothing, does not scroll. The stronger
-/// of the two sticks counts in each axis.
-fn scroll_lean(frame: &XrFrame, controls: &Controls) -> [f32; 2] {
-    let lean = |axis: usize, control: Control| {
-        [(Hand::Left, &frame.left_controller), (Hand::Right, &frame.right_controller)]
-            .into_iter()
-            .filter(|(hand, _)| controls.action(*hand, control) == ControlAction::Scroll)
-            .map(|(_, controller)| [controller.thumbstick.x, controller.thumbstick.y][axis])
-            .filter(|lean| lean.abs() >= DEAD_ZONE)
-            .max_by(|a, b| a.abs().total_cmp(&b.abs()))
-            .unwrap_or(0.0)
-    };
-    [lean(0, Control::StickHorizontal), lean(1, Control::StickVertical)]
+/// How far a controller's thumbstick leans across and forward, each from -1 to 1, with the dead zone
+/// left out.
+fn lean_of(controller: &Controller) -> [f32; 2] {
+    [controller.thumbstick.x, controller.thumbstick.y].map(|lean| if lean.abs() >= DEAD_ZONE { lean } else { 0.0 })
 }
 
 /// The desktop panel and the cursor over it. It composes nothing while the host has no desktop for
@@ -815,7 +912,7 @@ pub fn DesktopPanel() {
     let cursor = rememberMutableStateOf(|| None::<[f32; 2]>);
     SpatialFrameEffect(move |frame: &XrFrame| {
         if !desktop().view().visible {
-            desktop().update_pointer(|pointer| *pointer = PointerNow::default());
+            desktop().reset_pointers();
             // A surface that leaves during a carry sends no `End`
             if carrying.get_non_reactive() {
                 carrying.set(false);
@@ -831,11 +928,13 @@ pub fn DesktopPanel() {
             if after != before {
                 width.set(after);
             }
+            // The stick that carries a panel scrolls nothing
+            desktop().update_pointers(|pointers| Hand::BOTH.into_iter().for_each(|hand| pointers.lean(hand, [0.0; 2])));
         } else if pointer_test() {
-            desktop().update_pointer(|pointer| *pointer = synthetic_pointer(frame.predicted_display_time));
+            desktop().set_pointer(synthetic_pointer(frame.predicted_display_time));
         } else {
-            let lean = scroll_lean(frame, &hub().controls());
-            desktop().update_pointer(|pointer| pointer.scroll = if pointer.hit.is_some() { lean } else { [0.0; 2] });
+            let leans = [lean_of(&frame.left_controller), lean_of(&frame.right_controller)];
+            desktop().update_pointers(|pointers| Hand::BOTH.into_iter().for_each(|hand| pointers.lean(hand, leans[hand.index()])));
         }
         let at = desktop().cursor();
         if cursor.get_non_reactive() != at {
@@ -924,6 +1023,7 @@ fn CursorRing(pose: MutableState<Pose>, width: MutableState<f32>, cursor: Mutabl
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cranpose::PointerButton;
 
     fn close(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-5
@@ -958,41 +1058,129 @@ mod tests {
         assert!((w - 1000.0).abs() < 1e-2 && (h - 500.0).abs() < 1e-2, "{w} {h}");
     }
 
-    #[test]
-    fn a_ray_on_the_surface_is_a_point_on_the_picture_a_press_and_a_release() {
-        let at = [0.25, 0.75];
-        let idle = PointerNow::default();
-        let hover = idle.after(PointerEventKind::Enter, at);
-        assert_eq!(hover, PointerNow { hit: Some(at), buttons: 0, scroll: [0.0; 2] });
-        let moved = hover.after(PointerEventKind::Move, [0.3, 0.7]);
-        assert_eq!(moved.hit, Some([0.3, 0.7]));
-        let down = moved.after(PointerEventKind::Down, [0.3, 0.7]);
-        assert_eq!(down.buttons, mouse::LEFT);
-        // The thumbstick's lean survives the events of the same ray
-        let leaning = PointerNow { scroll: [0.25, 0.5], ..down };
-        assert_eq!(leaning.after(PointerEventKind::Move, [0.31, 0.7]).scroll, [0.25, 0.5]);
-        let up = down.after(PointerEventKind::Up, [0.3, 0.7]);
-        assert_eq!((up.buttons, up.hit), (0, Some([0.3, 0.7])));
-        // The ray leaves: nothing points, nothing presses and nothing scrolls
-        assert_eq!(leaning.after(PointerEventKind::Exit, [0.3, 0.7]), PointerNow::default());
-        assert!(!PointerNow::default().busy() && hover.busy() && down.busy());
+    const AT: [f32; 2] = [0.25, 0.75];
+
+    fn now(pointers: &Pointers) -> PointerNow {
+        pointers.now(&Controls::default())
+    }
+
+    fn pointing(hand: Hand, at: [f32; 2]) -> Pointers {
+        let mut pointers = Pointers::default();
+        pointers.on_event(hand, PointerEventKind::Enter, at);
+        pointers
     }
 
     #[test]
-    fn the_buttons_of_a_pointer_come_from_the_events_of_the_surface() {
-        let at = [0.5, 0.5];
-        let pointer = PointerNow::default().after(PointerEventKind::Enter, at);
-        let right = pointer.after(PointerEventKind::ButtonDown(PointerButton::Secondary), at);
-        assert_eq!(right.buttons, mouse::RIGHT);
-        // Another button joins the first, and each lets go on its own
-        let all = right.after(PointerEventKind::Down, at).after(PointerEventKind::ButtonDown(PointerButton::Middle), at);
-        assert_eq!(all.buttons, mouse::LEFT | mouse::RIGHT | mouse::MIDDLE);
-        let less = all.after(PointerEventKind::ButtonUp(PointerButton::Secondary), at).after(PointerEventKind::Up, at);
-        assert_eq!(less.buttons, mouse::MIDDLE);
-        // The side buttons of a mouse mean nothing on the Mac's desktop here
-        assert_eq!(pointer.after(PointerEventKind::ButtonDown(PointerButton::Back), at).buttons, 0);
-        // The ray leaves with buttons down: they all go up
-        assert_eq!(all.after(PointerEventKind::Exit, at), PointerNow::default());
+    fn a_ray_on_the_surface_is_a_point_on_the_picture_a_press_and_a_release() {
+        assert_eq!(now(&Pointers::default()), PointerNow::default());
+        let mut pointers = pointing(Hand::Right, AT);
+        assert_eq!(now(&pointers), PointerNow { hit: Some(AT), buttons: 0, scroll: [0.0; 2] });
+        pointers.on_event(Hand::Right, PointerEventKind::Move, [0.3, 0.7]);
+        assert_eq!(now(&pointers).hit, Some([0.3, 0.7]));
+        // The trigger is the left button in the standard mapping
+        pointers.on_event(Hand::Right, PointerEventKind::Down, [0.3, 0.7]);
+        assert_eq!(now(&pointers).buttons, mouse::LEFT);
+        pointers.on_event(Hand::Right, PointerEventKind::Up, [0.3, 0.7]);
+        assert_eq!((now(&pointers).buttons, now(&pointers).hit), (0, Some([0.3, 0.7])));
+        // The ray leaves: nothing points and nothing presses
+        pointers.on_event(Hand::Right, PointerEventKind::Exit, [0.3, 0.7]);
+        assert_eq!(now(&pointers), PointerNow::default());
+        assert!(!PointerNow::default().busy() && PointerNow { hit: Some(AT), ..PointerNow::default() }.busy());
+    }
+
+    #[test]
+    fn each_input_that_cranpose_reports_is_looked_up_in_the_mapping_of_its_hand() {
+        let mut pointers = pointing(Hand::Right, AT);
+        let press = |pointers: &mut Pointers, button| pointers.on_event(Hand::Right, PointerEventKind::ButtonDown(button), AT);
+        // A is the right button and the press of the stick is the middle button
+        press(&mut pointers, PointerButton::Secondary);
+        assert_eq!(now(&pointers).buttons, mouse::RIGHT);
+        press(&mut pointers, PointerButton::Middle);
+        assert_eq!(now(&pointers).buttons, mouse::RIGHT | mouse::MIDDLE);
+        // The grip and the second face button do nothing mouse-like in the standard mapping
+        press(&mut pointers, PointerButton::Back);
+        press(&mut pointers, PointerButton::Forward);
+        assert_eq!(now(&pointers).buttons, mouse::RIGHT | mouse::MIDDLE);
+        pointers.on_event(Hand::Right, PointerEventKind::ButtonUp(PointerButton::Secondary), AT);
+        assert_eq!(now(&pointers).buttons, mouse::MIDDLE);
+        // The user gives each hand its own mapping: the right trigger is the right button, and the
+        // left controller's X is the left button
+        let mut controls = Controls::default();
+        controls.set(Hand::Right, Control::Trigger, ControlAction::RightClick);
+        controls.set(Hand::Left, Control::Primary, ControlAction::LeftClick);
+        let mut right = pointing(Hand::Right, AT);
+        right.on_event(Hand::Right, PointerEventKind::Down, AT);
+        assert_eq!(right.now(&controls).buttons, mouse::RIGHT);
+        let mut left = pointing(Hand::Left, AT);
+        left.on_event(Hand::Left, PointerEventKind::ButtonDown(PointerButton::Secondary), AT);
+        assert_eq!(left.now(&controls).buttons, mouse::LEFT);
+        assert_eq!(left.now(&Controls::default()).buttons, mouse::RIGHT, "the right hand's mapping did not leak into the left's");
+        // An input whose action is not a mouse button presses nothing
+        let mut headset = Controls::default();
+        headset.set(Hand::Right, Control::Primary, ControlAction::Recenter);
+        assert_eq!(pointers.now(&headset).buttons, mouse::MIDDLE);
+    }
+
+    #[test]
+    fn the_mac_has_one_mouse_and_one_controller_owns_it() {
+        let mut pointers = pointing(Hand::Left, [0.2, 0.2]);
+        // The second controller to point does not take it
+        pointers.on_event(Hand::Right, PointerEventKind::Enter, [0.8, 0.8]);
+        assert_eq!(now(&pointers).hit, Some([0.2, 0.2]));
+        pointers.on_event(Hand::Right, PointerEventKind::Move, [0.81, 0.8]);
+        assert_eq!(now(&pointers).hit, Some([0.2, 0.2]));
+        // A press takes it
+        pointers.on_event(Hand::Right, PointerEventKind::Down, [0.81, 0.8]);
+        assert_eq!((now(&pointers).hit, now(&pointers).buttons), (Some([0.81, 0.8]), mouse::LEFT));
+        // While the right controller holds a button, a press of the left does not take the mouse
+        pointers.on_event(Hand::Left, PointerEventKind::Down, [0.2, 0.2]);
+        assert_eq!((now(&pointers).hit, now(&pointers).buttons), (Some([0.81, 0.8]), mouse::LEFT));
+        // The right lets go, and the left's next press takes it
+        pointers.on_event(Hand::Right, PointerEventKind::Up, [0.81, 0.8]);
+        pointers.on_event(Hand::Left, PointerEventKind::Up, [0.2, 0.2]);
+        pointers.on_event(Hand::Left, PointerEventKind::Down, [0.2, 0.2]);
+        assert_eq!((now(&pointers).hit, now(&pointers).buttons), (Some([0.2, 0.2]), mouse::LEFT));
+        // The owner leaves: the other controller that still points takes over, with nothing held
+        pointers.on_event(Hand::Left, PointerEventKind::Up, [0.2, 0.2]);
+        pointers.on_event(Hand::Left, PointerEventKind::Exit, [0.2, 0.2]);
+        assert_eq!((now(&pointers).hit, now(&pointers).buttons), (Some([0.81, 0.8]), 0));
+        pointers.on_event(Hand::Right, PointerEventKind::Exit, [0.81, 0.8]);
+        assert_eq!(now(&pointers), PointerNow::default());
+    }
+
+    #[test]
+    fn a_controller_that_leaves_with_a_button_down_lets_it_go() {
+        let mut pointers = pointing(Hand::Right, AT);
+        pointers.on_event(Hand::Right, PointerEventKind::Down, AT);
+        pointers.on_event(Hand::Right, PointerEventKind::ButtonDown(PointerButton::Secondary), AT);
+        assert_eq!(now(&pointers).buttons, mouse::LEFT | mouse::RIGHT);
+        pointers.on_event(Hand::Right, PointerEventKind::Exit, AT);
+        assert_eq!(now(&pointers), PointerNow::default());
+        // It comes back with nothing held
+        pointers.on_event(Hand::Right, PointerEventKind::Enter, AT);
+        assert_eq!(now(&pointers).buttons, 0);
+    }
+
+    #[test]
+    fn the_owners_thumbstick_scrolls_in_the_axes_that_its_mapping_gives_to_scrolling() {
+        let mut pointers = pointing(Hand::Right, AT);
+        pointers.lean(Hand::Right, [0.4, -0.8]);
+        pointers.lean(Hand::Left, [1.0, 1.0]);
+        assert_eq!(now(&pointers).scroll, [0.4, -0.8], "only the controller that owns the mouse scrolls");
+        let mut controls = Controls::default();
+        controls.set(Hand::Right, Control::StickHorizontal, ControlAction::Nothing);
+        assert_eq!(pointers.now(&controls).scroll, [0.0, -0.8]);
+        controls.set(Hand::Right, Control::StickVertical, ControlAction::Nothing);
+        assert_eq!(pointers.now(&controls).scroll, [0.0, 0.0]);
+        // A lean at no panel scrolls nothing, and the headset's frame gives the lean, not the events
+        let mut away = Pointers::default();
+        away.lean(Hand::Right, [0.5, 0.5]);
+        assert_eq!(now(&away), PointerNow::default());
+        pointers.on_event(Hand::Right, PointerEventKind::Move, [0.3, 0.3]);
+        assert_eq!(now(&pointers).scroll, [0.4, -0.8]);
+        pointers.on_event(Hand::Right, PointerEventKind::Exit, [0.3, 0.3]);
+        pointers.on_event(Hand::Right, PointerEventKind::Enter, [0.3, 0.3]);
+        assert_eq!(now(&pointers).scroll, [0.4, -0.8]);
     }
 
     #[test]
@@ -1028,7 +1216,7 @@ mod tests {
     fn the_pointer_test_presses_each_button_in_its_turn() {
         let seen: Vec<u8> = (0..60).map(|i| synthetic_pointer(Duration::from_secs_f32(i as f32 * 0.1)).buttons).collect();
         for bit in [mouse::LEFT, mouse::RIGHT, mouse::MIDDLE] {
-            assert!(seen.iter().any(|buttons| *buttons == bit), "{bit}: {seen:?}");
+            assert!(seen.contains(&bit), "{bit}: {seen:?}");
         }
         assert!(synthetic_pointer(Duration::from_secs_f32(4.5)).scroll[0] > 0.0);
     }

@@ -15,16 +15,14 @@ use std::fmt;
 /// What a button does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Action {
-    /// A left mouse click on the panel that the controller points at
+    /// A left mouse click on the Mac's desktop panel
     LeftClick,
-    /// A right mouse click
+    /// A right mouse click on the desktop panel
     RightClick,
-    /// A middle mouse click
+    /// A middle mouse click on the desktop panel
     MiddleClick,
-    /// Scrolls the panel that the controller points at. Only a thumbstick axis offers it.
+    /// Scrolls the desktop panel. Only a thumbstick axis offers it.
     Scroll,
-    /// Holds the panel that the controller points at, so it follows the controller
-    Grab,
     /// Shows or hides the connect and stats panels
     Panels,
     /// Opens or closes the console
@@ -39,12 +37,11 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 10] = [
+    pub const ALL: [Action; 9] = [
         Action::LeftClick,
         Action::RightClick,
         Action::MiddleClick,
         Action::Scroll,
-        Action::Grab,
         Action::Panels,
         Action::Console,
         Action::Recenter,
@@ -59,7 +56,6 @@ impl Action {
             Action::RightClick => "right_click",
             Action::MiddleClick => "middle_click",
             Action::Scroll => "scroll",
-            Action::Grab => "grab",
             Action::Panels => "panels",
             Action::Console => "console",
             Action::Recenter => "recenter",
@@ -79,7 +75,6 @@ impl Action {
             Action::RightClick => "Right click",
             Action::MiddleClick => "Middle click",
             Action::Scroll => "Scroll",
-            Action::Grab => "Grab a window",
             Action::Panels => "Show or hide panels",
             Action::Console => "Open the console",
             Action::Recenter => "Recenter",
@@ -91,20 +86,19 @@ impl Action {
     /// One plain sentence about what the action does
     pub fn describe(self) -> &'static str {
         match self {
-            Action::LeftClick => "Clicks the left mouse button where the controller points.",
-            Action::RightClick => "Clicks the right mouse button where the controller points.",
-            Action::MiddleClick => "Clicks the middle mouse button where the controller points.",
-            Action::Scroll => "Scrolls the panel that the controller points at.",
-            Action::Grab => "Holds the window that the controller points at and carries it.",
+            Action::LeftClick => "Clicks the left mouse button on the Mac's desktop panel.",
+            Action::RightClick => "Clicks the right mouse button on the Mac's desktop panel.",
+            Action::MiddleClick => "Clicks the middle mouse button on the Mac's desktop panel.",
+            Action::Scroll => "Scrolls the Mac's desktop panel.",
             Action::Panels => "Shows or hides the connect and stats panels.",
             Action::Console => "Opens or closes the console.",
             Action::Recenter => "Brings the panels in front of you.",
             Action::Keyboard => "Opens or closes the address field and its keyboard while no link runs.",
-            Action::Nothing => "Does nothing in the headset's own panels.",
+            Action::Nothing => "Does nothing.",
         }
     }
 
-    /// A mouse button of the Mac's desktop panel or a panel's own button
+    /// A mouse button of the Mac's desktop panel
     pub fn is_click(self) -> bool {
         matches!(self, Action::LeftClick | Action::RightClick | Action::MiddleClick)
     }
@@ -213,15 +207,16 @@ impl Control {
         matches!(self, Control::StickVertical | Control::StickHorizontal)
     }
 
-    /// The actions that make sense for the input: an axis scrolls or does nothing, and a button
-    /// does everything but scroll.
+    /// The actions that make sense for the input: an axis scrolls or does nothing. The menu button
+    /// has no mouse button, because the pointer of the headset's panels has five buttons and the
+    /// five other inputs use them (see `client/src/controls.rs`). A button does the rest.
     pub fn offers(self) -> &'static [Action] {
         const AXIS: [Action; 2] = [Action::Scroll, Action::Nothing];
-        const BUTTON: [Action; 9] = [
+        const MENU: [Action; 5] = [Action::Panels, Action::Console, Action::Recenter, Action::Keyboard, Action::Nothing];
+        const BUTTON: [Action; 8] = [
             Action::LeftClick,
             Action::RightClick,
             Action::MiddleClick,
-            Action::Grab,
             Action::Panels,
             Action::Console,
             Action::Recenter,
@@ -230,6 +225,8 @@ impl Control {
         ];
         if self.is_axis() {
             &AXIS
+        } else if self == Control::Menu {
+            &MENU
         } else {
             &BUTTON
         }
@@ -253,19 +250,19 @@ impl HandControls {
     /// The mapping that a controller has before the user changes anything:
     ///
     /// - The trigger is the left mouse button, as it was.
-    /// - The grip carries a window.
+    /// - The grip does nothing: a window is carried by its handle, as it was.
     /// - The first face button (A or X) is the right mouse button.
     /// - The second face button (B or Y) shows or hides the panels.
     /// - The thumbstick scrolls, and its press is the middle mouse button, as a mouse wheel's.
     /// - The left menu button opens the console, as it did. The right controller has none.
     ///
     /// The two controllers are the same, so a user may point with either. A mouse button works only
-    /// where the controller points at a panel, so it does nothing while a game is the only thing in
-    /// view.
+    /// where the controller points at the Mac's desktop panel, so it does nothing while a game is the
+    /// only thing in view.
     pub fn standard(hand: Hand) -> Self {
         Self {
             trigger: Action::LeftClick,
-            grip: Action::Grab,
+            grip: Action::Nothing,
             primary: Action::RightClick,
             secondary: Action::Panels,
             stick_click: Action::MiddleClick,
@@ -439,6 +436,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_name_that_this_version_does_not_know_reads_as_nothing() {
+        // A newer app may give an input an action that this headset lacks, such as a grab
+        let controls = Controls::from_json(r#"{"right":{"grip":"grab"}}"#).unwrap();
+        assert_eq!(controls.right.grip, Action::Nothing);
+        assert_eq!(Action::from_key("grab"), None);
+    }
+
+    #[test]
     fn the_standard_mapping_keeps_what_the_controllers_did_before() {
         let controls = Controls::default();
         // The trigger clicked, the thumbstick scrolled and the left menu button opened the console
@@ -502,6 +507,8 @@ mod tests {
         let mut controls = Controls::default();
         assert!(!controls.set(Hand::Left, Control::Trigger, Action::Scroll));
         assert!(!controls.set(Hand::Left, Control::StickVertical, Action::LeftClick));
+        // The menu button has no mouse button
+        assert!(!controls.set(Hand::Left, Control::Menu, Action::RightClick));
         assert_eq!(controls, Controls::default());
         let loaded = Controls::from_json(r#"{"left":{"trigger":"scroll","stick_vertical":"grab"}}"#).unwrap();
         assert_eq!((loaded.left.trigger, loaded.left.stick_vertical), (Action::Nothing, Action::Nothing));

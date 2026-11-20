@@ -4,17 +4,23 @@
 //! desktop panel and the headset itself). A game still gets every button through the tracking
 //! input, so this file never hides a button from a game.
 //!
-//! [`Runner::update`] reads one frame's input and gives two things:
-//! - the headset actions that fired in this frame ([`Fire`]): show or hide the panels, open the
-//!   console, recenter, the keyboard. While no game runs, the press fires the action. While a game
-//!   runs, only a hold of [`HOLD_NS`] does, so a short press stays with the game, as the menu
-//!   button's hold always did;
-//! - the pointer state of each hand ([`HandPointer`]): the mouse buttons that the hand's buttons
-//!   hold, whether it grabs and how its thumbstick leans. The desktop panel sends it to the Mac.
+//! [`Runner::update`] reads one frame's input and gives the headset actions that fired in this
+//! frame ([`Fire`]): show or hide the panels, open the console, recenter, the keyboard. While no
+//! game runs, the press fires the action. While a game runs, only a hold of [`HOLD_NS`] does, so a
+//! short press stays with the game, as the menu button's hold always did.
 //!
-//! The file has no Cranpose state, so a test drives it with plain numbers.
+//! The mouse actions belong to the desktop panel (`desktop.rs`). Cranpose's pointer turns each
+//! controller input into one of Compose's five pointer buttons, and `pointer_mapping` here fixes
+//! which. The desktop panel then reads which input a button press came from and which hand it came
+//! from, and looks up the action in the mapping. Cranpose's own panels take the trigger as their
+//! click whatever the mapping says.
+//!
+//! Apart from `pointer_mapping`, which makes a Cranpose value, the file has no Cranpose state, so a
+//! test drives it with plain numbers.
 
-use cranvr_common::controls::{mouse, Action, Control, Controls, Hand};
+use cranpose::PointerButton;
+use cranpose_xr::{ControllerInput, PointerMapping};
+use cranvr_common::controls::{Action, Control, Controls, Hand};
 use cranvr_proto::message::{buttons as bit, HandInput, Input};
 
 /// How long a button must stay down to fire a headset action while a game runs. A shorter press goes
@@ -33,24 +39,69 @@ pub struct Fire {
     pub action: Action,
 }
 
-/// What a controller does to the panel that it points at, from its buttons and the mapping.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct HandPointer {
-    /// The mouse buttons that the hand holds, as the bits of `cranvr_common::controls::mouse`
-    pub buttons: u8,
-    /// A button that grabs a window is down
-    pub grab: bool,
-    /// How far the thumbstick leans across (to the right) and forward, each from -1 to 1. An axis
-    /// that the mapping leaves to nothing gives 0.
-    pub scroll: [f32; 2],
+/// The speed of Cranpose's scroll at a full lean of the thumbstick, in dp each second. Cranpose's
+/// own panels scroll at this speed when any thumbstick axis scrolls.
+const SCROLL_SPEED: f32 = 800.0;
+
+/// The pointer button that Cranpose gives each input that can click, and no other input gets the
+/// same one: the desktop panel then knows from the button which input was pressed. The trigger is
+/// the primary button, because the trigger also takes the handles of panels and clicks their
+/// buttons. The pointer has five buttons, so the menu button has none.
+pub fn button_of(control: Control) -> Option<PointerButton> {
+    match control {
+        Control::Trigger => Some(PointerButton::Primary),
+        Control::Primary => Some(PointerButton::Secondary),
+        Control::StickClick => Some(PointerButton::Middle),
+        Control::Grip => Some(PointerButton::Back),
+        Control::Secondary => Some(PointerButton::Forward),
+        Control::Menu | Control::StickVertical | Control::StickHorizontal => None,
+    }
 }
 
-impl HandPointer {
-    /// Whether the hand does anything to a panel: a button is down, a window is grabbed or the
-    /// thumbstick scrolls.
-    pub fn active(&self) -> bool {
-        self.buttons != 0 || self.grab || self.scroll != [0.0; 2]
+/// The input whose press Cranpose reports as `button`.
+pub fn control_of(button: PointerButton) -> Control {
+    match button {
+        PointerButton::Primary => Control::Trigger,
+        PointerButton::Secondary => Control::Primary,
+        PointerButton::Middle => Control::StickClick,
+        PointerButton::Back => Control::Grip,
+        PointerButton::Forward => Control::Secondary,
     }
+}
+
+/// The mapping that Cranpose's pointer gets: each input has its own button (`button_of`), and the
+/// thumbstick scrolls Cranpose's panels while any axis of the mapping scrolls. Cranpose has one
+/// mapping for both hands, and the user's mapping has one for each hand. The desktop panel applies
+/// the user's mapping to each hand's presses (`desktop.rs`).
+pub fn pointer_mapping(controls: &Controls) -> PointerMapping {
+    let pairs = [
+        (ControllerInput::Trigger, Control::Trigger),
+        (ControllerInput::Squeeze, Control::Grip),
+        (ControllerInput::Primary, Control::Primary),
+        (ControllerInput::Secondary, Control::Secondary),
+        (ControllerInput::ThumbstickClick, Control::StickClick),
+        (ControllerInput::Menu, Control::Menu),
+    ];
+    let mapping = pairs.into_iter().fold(PointerMapping::new(), |mapping, (input, control)| mapping.with_button(input, button_of(control)));
+    let scrolls = Hand::BOTH.into_iter().any(|hand| {
+        [Control::StickVertical, Control::StickHorizontal].into_iter().any(|axis| controls.action(hand, axis) == Action::Scroll)
+    });
+    mapping.with_scroll_speed(if scrolls { SCROLL_SPEED } else { 0.0 })
+}
+
+/// Whether the beams of the controllers should show: while at least one of the app's own panels
+/// shows. A game draws its own rays, so with every panel hidden the beams would draw over them. The
+/// ball above the left controller does not count: it is a control that the other hand presses
+/// without a beam, and the beam that it needs would draw over the game.
+///
+/// - `room_for_panels`: the connect and stats panels may stand (the hands do not belong to a game)
+/// - `panels_shown`: the user did not hide the connect and stats panels
+/// - `streaming`: the link streams. The connect panel shows anyway while it does not.
+/// - `console_open`, `desktop_shown`: the console is open, and the host's desktop panel shows
+pub fn beams_wanted(room_for_panels: bool, panels_shown: bool, streaming: bool, console_open: bool, desktop_shown: bool) -> bool {
+    let connect = room_for_panels && (panels_shown || !streaming);
+    let stats = room_for_panels && panels_shown;
+    connect || stats || console_open || desktop_shown
 }
 
 /// The value of an input of a hand as 0 or 1 for a button and from 0 to 1 for the trigger and the
@@ -64,8 +115,7 @@ fn value(hand: &HandInput, control: Control) -> f32 {
         Control::Secondary => button(bit::SECONDARY),
         Control::StickClick => button(bit::STICK_CLICK),
         Control::Menu => button(bit::MENU),
-        Control::StickVertical => hand.stick[1],
-        Control::StickHorizontal => hand.stick[0],
+        Control::StickVertical | Control::StickHorizontal => 0.0,
     }
 }
 
@@ -82,7 +132,6 @@ struct Slot {
 #[derive(Debug, Default)]
 pub struct Runner {
     slots: [[Slot; Control::ALL.len()]; 2],
-    pointers: [HandPointer; 2],
 }
 
 impl Runner {
@@ -92,18 +141,11 @@ impl Runner {
         let mut fires = Vec::new();
         for hand in Hand::BOTH {
             let (inputs, mapped) = (&input.hands[hand.index()], controls.hand(hand));
-            let mut pointer = HandPointer::default();
             for (i, control) in Control::ALL.into_iter().enumerate() {
-                if !control.exists(hand) {
+                if !control.exists(hand) || control.is_axis() {
                     continue;
                 }
                 let (action, level) = (mapped.get(control), value(inputs, control));
-                if control.is_axis() {
-                    if action == Action::Scroll {
-                        pointer.scroll[usize::from(control == Control::StickVertical)] = level;
-                    }
-                    continue;
-                }
                 let slot = &mut self.slots[hand.index()][i];
                 let down = if slot.down { level > RELEASE } else { level > PRESS };
                 if down && !slot.down {
@@ -111,29 +153,13 @@ impl Runner {
                 } else if !down {
                     *slot = Slot::default();
                 }
-                if !down {
-                    continue;
-                }
-                match action {
-                    Action::LeftClick => pointer.buttons |= mouse::LEFT,
-                    Action::RightClick => pointer.buttons |= mouse::RIGHT,
-                    Action::MiddleClick => pointer.buttons |= mouse::MIDDLE,
-                    Action::Grab => pointer.grab = true,
-                    action if action.is_headset() && !slot.fired && (!game_runs || now.saturating_sub(slot.since) >= HOLD_NS) => {
-                        slot.fired = true;
-                        fires.push(Fire { hand, action });
-                    }
-                    _ => {}
+                if down && action.is_headset() && !slot.fired && (!game_runs || now.saturating_sub(slot.since) >= HOLD_NS) {
+                    slot.fired = true;
+                    fires.push(Fire { hand, action });
                 }
             }
-            self.pointers[hand.index()] = pointer;
         }
         fires
-    }
-
-    /// What a hand does to the panel that it points at, as of the last `update`
-    pub fn pointer(&self, hand: Hand) -> HandPointer {
-        self.pointers[hand.index()]
     }
 }
 
