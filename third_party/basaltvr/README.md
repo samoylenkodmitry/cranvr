@@ -84,6 +84,14 @@ applies these patches and builds both parts.
 - `xrGetFaceExpressionWeights2FB` reports the source of the newest sample as `dataSource`. The sample says it with flag 4 of `FACE_TRACKING`.
 - `tests/tracking_smoke.cpp` takes `--face-source visual|audio|unknown`. It checks the support structure, the answer of the creation to each list of sources, a tracker with no list, a tracker that lists only the other source and the `dataSource` of each sample. `--live-face` accepts any weights, for a face from a real headset.
 
+`0007-stage-reference-space.patch`
+
+- `xrCreateReferenceSpace` accepts `XR_REFERENCE_SPACE_TYPE_STAGE` and gives the LOCAL space. The host puts the floor at height 0 of that space (see `host/src/headset/native.rs`). OpenComposite asks for a STAGE space for the standing universe of an OpenVR game and stops without it.
+
+`0008-action-sets-attach-to-a-later-session.patch`
+
+- A destroyed session releases the action sets that were attached to it. The runtime kept the `attached` mark for the whole life of a set, so the second `xrAttachSessionActionSets` of the same set returned `XR_ERROR_ACTIONSETS_ALREADY_ATTACHED`. An OpenVR game that sets an action manifest (IVRInput) at its start reaches that call twice. OpenComposite creates the action sets and attaches them to its first session. When the game submits its first frame, OpenComposite destroys that session, makes a new one on the game's own graphics device and attaches the same sets again. It stopped there with the error, so no game with an action manifest could show a picture. A set keeps its actions and the instance keeps the suggested bindings. A session that still exists keeps the old rule: its own second attach, an action created after the attach and a suggestion after the attach return the error.
+
 ## patches/dxmt
 
 `0005-public-atomic-for-new-metal-compiler.patch`: DXMT 0.80 calls a private Metal builtin

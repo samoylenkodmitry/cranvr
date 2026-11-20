@@ -21,7 +21,19 @@
 // of cranvr offers B8G8R8A8 only, so OpenComposite converts it with a draw), B8G8R8A8_UNORM (copied as it is) and
 // B8G8R8A8_TYPELESS with a UNORM view, which is the texture that a game such as Serious Sam VR submits.
 //
-// Usage: openvr_smoke.exe [--seconds N] [--expect-input] [--format F] [--load-only --runtime DIR]
+// --actions touch|vive|both tests IVRInput, the way a game that ships an action manifest uses it. The program
+// writes a manifest and the default bindings that such a game ships (for Touch controllers, for the Vive wand or
+// for both) to a folder in %TEMP%, sets the manifest, and in each frame it updates the action set and reads the
+// actions that the probe's scripted controllers drive (the left grip, the right trigger, A, the right stick) and
+// both hands' poses. It also pulses the left hand's haptic output while the grip is down. With --expect-input the
+// run fails when an action does not fire.
+//
+// The frame loop reports where the time goes and how long each frame lasted (the intervals between the
+// returns of WaitGetPoses, as a histogram in periods of the display's refresh). --no-input leaves the
+// controller reads out to show what they cost.
+//
+// Usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--actions MODE] [--format F]
+//                         [--load-only --runtime DIR]
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -32,6 +44,7 @@
 #include <d3d11.h>
 #include <dxgi.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdarg>
 #include <cmath>
@@ -39,9 +52,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <direct.h>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <utility>
+#include <vector>
 
 // The header declares the API as plain functions when it is built static: this program defines them
 #define OPENVR_BUILD_STATIC
@@ -259,18 +275,298 @@ bool finite_pose(const vr::HmdMatrix34_t& m)
 	return true;
 }
 
+
+// === IVRInput: a manifest with default bindings, as a game ships it ===
+
+const char* kActionManifest = R"JSON({
+  "version": 1,
+  "minimum_runtime_version": 1,
+  "default_bindings": [
+%BINDINGS%
+  ],
+  "actions": [
+    { "name": "/actions/default/in/Grab", "type": "boolean", "requirement": "suggested" },
+    { "name": "/actions/default/in/TriggerPull", "type": "vector1", "requirement": "suggested" },
+    { "name": "/actions/default/in/TriggerClick", "type": "boolean", "requirement": "optional" },
+    { "name": "/actions/default/in/Stick", "type": "vector2", "requirement": "optional" },
+    { "name": "/actions/default/in/ButtonA", "type": "boolean", "requirement": "optional" },
+    { "name": "/actions/default/in/Hand", "type": "pose", "requirement": "mandatory" },
+    { "name": "/actions/default/out/Haptic", "type": "vibration", "requirement": "suggested" }
+  ],
+  "action_sets": [ { "name": "/actions/default", "usage": "leftright" } ],
+  "localization": [ { "language_tag": "en_US", "/actions/default": "Default", "/actions/default/in/Grab": "Grab" } ]
+})JSON";
+
+// The sources of a binding file. Touch controllers name the A button and the thumbstick, the Vive wand a
+// button on its trackpad ("click") and the trackpad.
+std::string binding_file(const char* controller_type, bool touch)
+{
+	std::string text = std::string("{\n  \"controller_type\": \"") + controller_type + "\",\n  \"name\": \"cranvr smoke\",\n  \"description\": \"\",\n";
+	text += "  \"bindings\": {\n    \"/actions/default\": {\n      \"sources\": [\n";
+	text += R"JSON(        { "path": "/user/hand/left/input/grip", "mode": "button", "parameters": { "click_activate_threshold": "0.8", "click_deactivate_threshold": "0.7" },
+          "inputs": { "click": { "output": "/actions/default/in/Grab" } } },
+        { "path": "/user/hand/right/input/trigger", "mode": "trigger",
+          "inputs": { "pull": { "output": "/actions/default/in/TriggerPull" }, "click": { "output": "/actions/default/in/TriggerClick" } } },
+)JSON";
+	if (touch) {
+		text += R"JSON(        { "path": "/user/hand/right/input/thumbstick", "mode": "joystick", "inputs": { "position": { "output": "/actions/default/in/Stick" } } },
+        { "path": "/user/hand/right/input/a", "mode": "button", "inputs": { "click": { "output": "/actions/default/in/ButtonA" } } }
+)JSON";
+	} else {
+		text += R"JSON(        { "path": "/user/hand/right/input/trackpad", "mode": "trackpad", "inputs": { "position": { "output": "/actions/default/in/Stick" } } },
+        { "path": "/user/hand/right/input/application_menu", "mode": "button", "inputs": { "click": { "output": "/actions/default/in/ButtonA" } } }
+)JSON";
+	}
+	text += R"JSON(      ],
+      "poses": [
+        { "output": "/actions/default/in/Hand", "path": "/user/hand/left/pose/raw" },
+        { "output": "/actions/default/in/Hand", "path": "/user/hand/right/pose/raw" }
+      ],
+      "haptics": [
+        { "output": "/actions/default/out/Haptic", "path": "/user/hand/left/output/haptic" },
+        { "output": "/actions/default/out/Haptic", "path": "/user/hand/right/output/haptic" }
+      ]
+    }
+  }
+}
+)JSON";
+	return text;
+}
+
+bool write_file(const std::string& path, const std::string& text)
+{
+	std::ofstream out(path, std::ios::binary);
+	out << text;
+	return static_cast<bool>(out);
+}
+
+// What the actions did over the run
+struct ActionTest {
+	vr::IVRInput* input = nullptr;
+	vr::VRActionSetHandle_t set = 0;
+	vr::VRActionHandle_t grab = 0, pull = 0, click = 0, stick = 0, button_a = 0, hand = 0, haptic = 0;
+	vr::VRInputValueHandle_t left = 0, right = 0;
+	bool touch = true;
+
+	bool grab_seen = false, click_seen = false, a_seen = false, stick_seen = false;
+	bool grab_active = false, pull_active = false, pose_active[2] = {};
+	float pull_max = 0.0f, stick_max = 0.0f;
+	uint64_t errors = 0, haptic_pulses = 0;
+	vr::EVRInputError first_error = vr::VRInputError_None;
+	float pose_x_min[2] = { 1e9f, 1e9f }, pose_x_max[2] = { -1e9f, -1e9f }, pose_y[2] = {}, pose_z[2] = {};
+	uint64_t pose_valid[2] = {}, frames = 0;
+	// The first frame with a valid pose, and how often the pose went from valid to not valid
+	uint64_t pose_first[2] = { 0, 0 }, pose_flips[2] = {};
+	bool pose_was_valid[2] = {};
+	bool haptic_was_down = false;
+
+	void note(vr::EVRInputError error)
+	{
+		if (error != vr::VRInputError_None) {
+			errors++;
+			if (first_error == vr::VRInputError_None) {
+				first_error = error;
+			}
+		}
+	}
+
+	bool setup(const std::string& mode)
+	{
+		const bool with_touch = mode == "touch" || mode == "both";
+		const bool with_vive = mode == "vive" || mode == "both";
+		touch = with_touch;
+		char temp[MAX_PATH] = {};
+		GetTempPathA(sizeof(temp), temp);
+		const std::string dir = std::string(temp) + "cranvr-openvr-actions";
+		_mkdir(dir.c_str());
+		std::string bindings;
+		if (with_touch) {
+			bindings += "    { \"controller_type\": \"oculus_touch\", \"binding_url\": \"bindings_oculus_touch.json\" }";
+			write_file(dir + "\\bindings_oculus_touch.json", binding_file("oculus_touch", true));
+		}
+		if (with_vive) {
+			bindings += std::string(bindings.empty() ? "" : ",\n") + "    { \"controller_type\": \"vive_controller\", \"binding_url\": \"bindings_vive_controller.json\" }";
+			write_file(dir + "\\bindings_vive_controller.json", binding_file("vive_controller", false));
+		}
+		std::string manifest = kActionManifest;
+		manifest.replace(manifest.find("%BINDINGS%"), 10, bindings);
+		const std::string manifest_path = dir + "\\actions.json";
+		if (!write_file(manifest_path, manifest)) {
+			say("cannot write %s", manifest_path.c_str());
+			return false;
+		}
+		input = vr::VRInput();
+		if (!input) {
+			say("no IVRInput");
+			return false;
+		}
+		vr::EVRInputError error = input->SetActionManifestPath(manifest_path.c_str());
+		say("SetActionManifestPath(%s): error %d", manifest_path.c_str(), static_cast<int>(error));
+		if (error != vr::VRInputError_None) {
+			return false;
+		}
+		const struct { const char* name; vr::VRActionHandle_t* handle; } actions[] = {
+			{ "/actions/default/in/Grab", &grab }, { "/actions/default/in/TriggerPull", &pull }, { "/actions/default/in/TriggerClick", &click },
+			{ "/actions/default/in/Stick", &stick }, { "/actions/default/in/ButtonA", &button_a }, { "/actions/default/in/Hand", &hand },
+			{ "/actions/default/out/Haptic", &haptic },
+		};
+		for (const auto& action : actions) {
+			error = input->GetActionHandle(action.name, action.handle);
+			if (error != vr::VRInputError_None || *action.handle == vr::k_ulInvalidActionHandle) {
+				say("GetActionHandle(%s): error %d", action.name, static_cast<int>(error));
+				return false;
+			}
+		}
+		if (input->GetActionSetHandle("/actions/default", &set) != vr::VRInputError_None || set == vr::k_ulInvalidActionSetHandle) {
+			say("GetActionSetHandle failed");
+			return false;
+		}
+		if (input->GetInputSourceHandle("/user/hand/left", &left) != vr::VRInputError_None || input->GetInputSourceHandle("/user/hand/right", &right) != vr::VRInputError_None) {
+			say("GetInputSourceHandle failed");
+			return false;
+		}
+		say("the manifest is loaded (%s bindings): 7 actions, 1 action set", mode.c_str());
+		return true;
+	}
+
+	void frame(vr::TrackedDevicePose_t* poses)
+	{
+		(void)poses;
+		frames++;
+		vr::VRActiveActionSet_t active{};
+		active.ulActionSet = set;
+		note(input->UpdateActionState(&active, sizeof(active), 1));
+
+		vr::InputDigitalActionData_t digital{};
+		if (input->GetDigitalActionData(grab, &digital, sizeof(digital), vr::k_ulInvalidInputValueHandle) == vr::VRInputError_None) {
+			grab_active |= digital.bActive;
+			grab_seen |= digital.bActive && digital.bState;
+			// The left grip drives a haptic pulse, as a game's "grab" feedback does
+			if (digital.bActive && digital.bState && !haptic_was_down) {
+				note(input->TriggerHapticVibrationAction(haptic, 0.0f, 0.1f, 160.0f, 0.8f, left));
+				haptic_pulses++;
+			}
+			haptic_was_down = digital.bActive && digital.bState;
+		} else {
+			note(vr::VRInputError_InvalidHandle);
+		}
+		if (input->GetDigitalActionData(click, &digital, sizeof(digital), vr::k_ulInvalidInputValueHandle) == vr::VRInputError_None) {
+			click_seen |= digital.bActive && digital.bState;
+		}
+		if (input->GetDigitalActionData(button_a, &digital, sizeof(digital), vr::k_ulInvalidInputValueHandle) == vr::VRInputError_None) {
+			a_seen |= digital.bActive && digital.bState;
+		}
+		vr::InputAnalogActionData_t analog{};
+		if (input->GetAnalogActionData(pull, &analog, sizeof(analog), vr::k_ulInvalidInputValueHandle) == vr::VRInputError_None) {
+			pull_active |= analog.bActive;
+			pull_max = std::max(pull_max, analog.x);
+		}
+		if (input->GetAnalogActionData(stick, &analog, sizeof(analog), vr::k_ulInvalidInputValueHandle) == vr::VRInputError_None) {
+			stick_max = std::max(stick_max, analog.x);
+			stick_seen |= analog.bActive && std::fabs(analog.x) > 0.3f;
+		}
+		const vr::VRInputValueHandle_t hands[2] = { left, right };
+		for (int i = 0; i < 2; i++) {
+			vr::InputPoseActionData_t pose{};
+			if (input->GetPoseActionDataForNextFrame(hand, vr::TrackingUniverseStanding, &pose, sizeof(pose), hands[i]) == vr::VRInputError_None) {
+				pose_active[i] |= pose.bActive;
+				const bool valid_now = pose.bActive && pose.pose.bPoseIsValid;
+				if (pose_was_valid[i] && !valid_now) {
+					pose_flips[i]++;
+				}
+				pose_was_valid[i] = valid_now;
+				if (pose.bActive && pose.pose.bPoseIsValid) {
+					if (pose_valid[i] == 0) {
+						pose_first[i] = frames;
+					}
+					pose_valid[i]++;
+					const auto& m = pose.pose.mDeviceToAbsoluteTracking.m;
+					pose_x_min[i] = std::min(pose_x_min[i], m[0][3]);
+					pose_x_max[i] = std::max(pose_x_max[i], m[0][3]);
+					pose_y[i] = m[1][3];
+					pose_z[i] = m[2][3];
+				}
+			}
+		}
+	}
+
+	// Returns the failure text, or nullptr
+	const char* verdict(bool expect)
+	{
+		say("actions: %llu frames, %llu errors (first %d); grab (left grip) %s, trigger pull up to %.2f, trigger click %s, A %s, stick x up to %.2f%s; "
+		    "haptic pulses sent %llu",
+		    static_cast<unsigned long long>(frames), static_cast<unsigned long long>(errors), static_cast<int>(first_error), grab_seen ? "seen" : "never",
+		    pull_max, click_seen ? "seen" : "never", a_seen ? "seen" : "never", stick_max, stick_seen ? "" : " (not seen)", static_cast<unsigned long long>(haptic_pulses));
+		for (int i = 0; i < 2; i++) {
+			say("pose of the %s hand: %s, %llu valid (first at frame %llu, %llu times lost), x from %.3f to %.3f, y %.3f, z %.3f", i == 0 ? "left" : "right",
+			    pose_active[i] ? "active" : "inactive", static_cast<unsigned long long>(pose_valid[i]), static_cast<unsigned long long>(pose_first[i]),
+			    static_cast<unsigned long long>(pose_flips[i]), pose_x_min[i], pose_x_max[i], pose_y[i], pose_z[i]);
+		}
+		if (errors) {
+			return "an IVRInput call failed";
+		}
+		if (!expect) {
+			return nullptr;
+		}
+		if (!pose_active[0] || !pose_active[1] || pose_valid[0] < frames / 2 || pose_valid[1] < frames / 2) {
+			return "a hand's pose action was not active and valid";
+		}
+		// The probe's left grip stays at x -0.2 (the pose of /pose/raw sits a few centimeters off the grip) and the
+		// right one swings 10 cm to each side of 0.25
+		if (std::fabs(pose_x_min[0] - -0.2f) > 0.1f || pose_x_max[0] - pose_x_min[0] > 0.02f) {
+			return "the left hand's pose is not where the probe holds it";
+		}
+		if (pose_x_max[1] - pose_x_min[1] < 0.15f) {
+			return "the right hand's pose does not swing as the probe's does";
+		}
+		// The probe's hands are 1.1 to 1.2 m above its floor, which the host puts at height 0 (the probe's floor lies
+		// 0.3 m below its room's origin, so the standing room puts the hands near 1.5 m)
+		if (pose_y[0] < 1.2f || pose_y[0] > 1.7f || pose_y[1] < 1.2f || pose_y[1] > 1.7f) {
+			return "the hands are not at the height that the probe's script and floor give";
+		}
+		if (!grab_active || !pull_active) {
+			return "the grab or the trigger action never became active";
+		}
+		if (!grab_seen) {
+			return "the grab action (left grip click) never fired";
+		}
+		if (pull_max < 0.7f || pull_max > 0.8f) {
+			return "the trigger pull action did not reach the scripted 0.75";
+		}
+		if (!click_seen) {
+			return "the trigger click action never fired";
+		}
+		if (!stick_seen || stick_max < 0.4f || stick_max > 0.6f) {
+			return "the stick or trackpad action did not reach the scripted 0.5";
+		}
+		if (touch && !a_seen) {
+			return "the A button action never fired";
+		}
+		return nullptr;
+	}
+};
+
 } // namespace
 
 int main(int argc, char** argv)
 {
 	double seconds = 15;
-	bool expect_input = false, load_only = false;
+	bool expect_input = false, load_only = false, no_input = false;
+	std::string actions_mode;
 	DXGI_FORMAT texture_format = DXGI_FORMAT_R8G8B8A8_UNORM, view_format = DXGI_FORMAT_R8G8B8A8_UNORM;
 	for (int i = 1; i < argc; i++) {
 		if (!std::strcmp(argv[i], "--seconds") && i + 1 < argc) {
 			seconds = std::atof(argv[++i]);
 		} else if (!std::strcmp(argv[i], "--expect-input")) {
 			expect_input = true;
+		} else if (!std::strcmp(argv[i], "--actions") && i + 1 < argc) {
+			actions_mode = argv[++i];
+			if (actions_mode != "touch" && actions_mode != "vive" && actions_mode != "both") {
+				std::fprintf(stderr, "--actions takes touch, vive or both\n");
+				return 2;
+			}
+		} else if (!std::strcmp(argv[i], "--no-input")) {
+			no_input = true;
 		} else if (!std::strcmp(argv[i], "--load-only")) {
 			load_only = true;
 		} else if (!std::strcmp(argv[i], "--format") && i + 1 < argc) {
@@ -290,11 +586,16 @@ int main(int argc, char** argv)
 			g_runtime_path = argv[++i];
 			g_runtime_given = true;
 		} else {
-			std::fprintf(stderr, "usage: openvr_smoke.exe [--seconds N] [--expect-input] [--format F] [--load-only --runtime DIR]\n");
+			std::fprintf(stderr, "usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--actions MODE] [--format F] [--load-only --runtime DIR]\n");
 			return 2;
 		}
 	}
 
+	// The legacy controller state would load OpenComposite's own empty manifest: with a manifest of the program's own
+	// the legacy reads stay out
+	if (!actions_mode.empty()) {
+		no_input = true;
+	}
 	if (load_only) {
 		if (!g_runtime_given) {
 			return fail("--load-only needs --runtime");
@@ -320,6 +621,10 @@ int main(int argc, char** argv)
 		return fail("no compositor");
 	}
 	say("initialised, runtime %s", g_runtime_path.c_str());
+	ActionTest actions;
+	if (!actions_mode.empty() && !actions.setup(actions_mode)) {
+		return fail("the action manifest did not load");
+	}
 
 	char text[256] = {};
 	vr::ETrackedPropertyError property = vr::TrackedProp_Success;
@@ -416,6 +721,13 @@ int main(int argc, char** argv)
 	vr::EVRCompositorError first_error = vr::VRCompositorError_None;
 	// Where a frame's time goes, in seconds over the run
 	double wait_time = 0, draw_time = 0, submit_time = 0, handoff_time = 0, input_time = 0;
+	// The time between two returns of WaitGetPoses, in milliseconds
+	std::vector<double> intervals;
+	// The frames that took far longer than a period, as (seconds since the start, milliseconds)
+	std::vector<std::pair<double, double>> stalls;
+	// Frames in each second of the run
+	std::vector<unsigned> per_second;
+	Clock::time_point last_return{};
 	const auto since = [](Clock::time_point& from) {
 		const auto now = Clock::now();
 		const double spent = std::chrono::duration<double>(now - from).count();
@@ -427,6 +739,20 @@ int main(int argc, char** argv)
 		Clock::time_point mark = Clock::now();
 		const vr::EVRCompositorError wait = compositor->WaitGetPoses(poses, vr::k_unMaxTrackedDeviceCount, nullptr, 0);
 		wait_time += since(mark);
+		if (last_return != Clock::time_point{}) {
+			intervals.push_back(1000.0 * std::chrono::duration<double>(mark - last_return).count());
+			if (intervals.back() > 40.0) {
+				stalls.emplace_back(std::chrono::duration<double>(mark - begin).count(), intervals.back());
+			}
+		}
+		last_return = mark;
+		{
+			const size_t second = static_cast<size_t>(std::chrono::duration<double>(mark - begin).count());
+			if (per_second.size() <= second) {
+				per_second.resize(second + 1, 0);
+			}
+			per_second[second]++;
+		}
 		if (wait != vr::VRCompositorError_None) {
 			wait_errors++;
 			if (first_error == vr::VRCompositorError_None) {
@@ -462,6 +788,9 @@ int main(int argc, char** argv)
 		compositor->PostPresentHandoff();
 		handoff_time += since(mark);
 		frames++;
+		if (!actions_mode.empty()) {
+			actions.frame(poses);
+		}
 
 		// The scripted controllers of cranvr-probe: the legacy state of OpenVR
 		const vr::TrackedDeviceIndex_t left = system->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_LeftHand);
@@ -469,11 +798,11 @@ int main(int argc, char** argv)
 		left_connected |= left != vr::k_unTrackedDeviceIndexInvalid && poses[left].bDeviceIsConnected && poses[left].bPoseIsValid;
 		right_connected |= right != vr::k_unTrackedDeviceIndexInvalid && poses[right].bDeviceIsConnected && poses[right].bPoseIsValid;
 		vr::VRControllerState_t state{};
-		if (left != vr::k_unTrackedDeviceIndexInvalid && system->GetControllerState(left, &state, sizeof(state))) {
+		if (!no_input && left != vr::k_unTrackedDeviceIndexInvalid && system->GetControllerState(left, &state, sizeof(state))) {
 			left_grip_pressed |= (state.ulButtonPressed & vr::ButtonMaskFromId(vr::k_EButton_Grip)) != 0;
 			max_left_grip_pulled = std::max(max_left_grip_pulled, state.rAxis[2].x);
 		}
-		if (right != vr::k_unTrackedDeviceIndexInvalid && system->GetControllerState(right, &state, sizeof(state))) {
+		if (!no_input && right != vr::k_unTrackedDeviceIndexInvalid && system->GetControllerState(right, &state, sizeof(state))) {
 			max_right_trigger = std::max(max_right_trigger, state.rAxis[1].x);
 			a_pressed |= (state.ulButtonPressed & vr::ButtonMaskFromId(vr::k_EButton_A)) != 0;
 			a_seen = std::max(a_seen, a_pressed ? 1.0f : 0.0f);
@@ -505,6 +834,47 @@ int main(int argc, char** argv)
 	    static_cast<unsigned long long>(wait_errors), static_cast<unsigned long long>(submit_errors), static_cast<int>(first_error));
 	say("per frame: wait %.2f ms, draw %.2f ms, submit %.2f ms, handoff %.2f ms, input %.2f ms", 1000 * wait_time / frames, 1000 * draw_time / frames,
 	    1000 * submit_time / frames, 1000 * handoff_time / frames, 1000 * input_time / frames);
+	if (intervals.size() > 10) {
+		// The refresh rate that the runtime reports: a frame that lasts 1.5 periods or more missed a slot
+		float hz = system->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float, &property);
+		if (property != vr::TrackedProp_Success || hz < 1.0f) {
+			hz = 120.0f;
+		}
+		const double period = 1000.0 / hz;
+		std::vector<double> sorted = intervals;
+		std::sort(sorted.begin(), sorted.end());
+		const auto percentile = [&](double q) { return sorted[static_cast<size_t>(q * static_cast<double>(sorted.size() - 1))]; };
+		size_t slots[4] = {}; // frames that took one, two, three, more periods
+		for (const double ms : intervals) {
+			slots[std::min<size_t>(3, static_cast<size_t>(std::max(0.0, ms / period - 0.5)))]++;
+		}
+		const double total = static_cast<double>(intervals.size());
+		say("frame intervals at %.1f Hz (period %.2f ms): median %.2f, p90 %.2f, p99 %.2f, max %.2f ms; frames of one period %.1f%%, two %.1f%%, three %.1f%%, more %.1f%%",
+		    hz, period, percentile(0.5), percentile(0.9), percentile(0.99), sorted.back(), 100.0 * slots[0] / total, 100.0 * slots[1] / total,
+		    100.0 * slots[2] / total, 100.0 * slots[3] / total);
+	}
+	if (!per_second.empty()) {
+		std::string line = "frames in each second:";
+		for (const unsigned n : per_second) {
+			line += " " + std::to_string(n);
+		}
+		say("%s", line.c_str());
+		// The rate once the start has settled: the second after the third, to the last full second
+		if (per_second.size() > 5) {
+			unsigned sum = 0;
+			for (size_t i = 3; i + 1 < per_second.size(); i++) {
+				sum += per_second[i];
+			}
+			say("after the start (seconds 3 to %llu): %.1f frames per second", static_cast<unsigned long long>(per_second.size() - 2),
+			    static_cast<double>(sum) / static_cast<double>(per_second.size() - 4));
+		}
+	}
+	for (size_t i = 0; i < stalls.size() && i < 12; i++) {
+		say("a frame took %.0f ms at %.2f s", stalls[i].second, stalls[i].first);
+	}
+	if (stalls.size() > 12) {
+		say("and %llu more frames of more than 40 ms", static_cast<unsigned long long>(stalls.size() - 12));
+	}
 	say("controllers: left %s, right %s, right trigger up to %.2f, left grip %s (axis up to %.2f), A %s", left_connected ? "tracked" : "missing",
 	    right_connected ? "tracked" : "missing", max_right_trigger, left_grip_pressed ? "pressed" : "not pressed", max_left_grip_pulled,
 	    a_pressed ? "pressed" : "not pressed");
@@ -531,7 +901,12 @@ int main(int argc, char** argv)
 	if (!(eye_distance > 0.03f && eye_distance < 0.09f)) {
 		return fail("the eyes are not 3 to 9 cm apart");
 	}
-	if (expect_input) {
+	if (!actions_mode.empty()) {
+		if (const char* problem = actions.verdict(expect_input)) {
+			return fail(problem);
+		}
+	}
+	if (expect_input && actions_mode.empty()) {
 		if (!left_connected || !right_connected) {
 			return fail("a controller was not tracked");
 		}

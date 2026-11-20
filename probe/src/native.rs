@@ -56,6 +56,9 @@ pub struct Options {
     pub tracking: bool,
     /// With `tracking`: no controller is tracked
     pub no_controllers: bool,
+    /// The head stands still, as it does with `tracking`, so that a game's room is the probe's room
+    /// and its controller poses can be compared with the script's numbers
+    pub still_head: bool,
     /// With `tracking`: where the face comes from
     pub face_source: tracked::FaceSource,
 }
@@ -143,6 +146,7 @@ struct Shared {
     /// The tracking that the host asked for last, as bits of `Features`, and what the probe sent
     wish: AtomicU8,
     tracking: bool,
+    still_head: bool,
     no_controllers: bool,
     face_source: tracked::FaceSource,
     sent_tracking: [AtomicU64; 4],
@@ -232,6 +236,7 @@ pub fn run(o: Options) -> i32 {
         desktop: o.desktop.then(DesktopProbe::new),
         wish: AtomicU8::new(0),
         tracking: o.tracking,
+        still_head: o.tracking || o.still_head,
         no_controllers: o.no_controllers,
         face_source: o.face_source,
         sent_tracking: Default::default(),
@@ -481,7 +486,7 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
         // sample. The head's pose is the one that is valid then, as a headset predicts it.
         let display_time = next_refresh(vsync_origin, period_ns, sample_time + 2 * period_ns);
         // A tracking script keeps the head still: the game's LOCAL space is then the room itself
-        let head = if shared.tracking { head_at(shared.pose_origin, shared.pose_origin) } else { head_at(shared.pose_origin, display_time) };
+        let head = if shared.still_head { head_at(shared.pose_origin, shared.pose_origin) } else { head_at(shared.pose_origin, display_time) };
         // The left hand stays where it is. The right hand swings 10 cm to each side of a point in
         // front of the head, with its velocity. Each hand has a grip pose and its own aim pose
         // (see hands.rs).

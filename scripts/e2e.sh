@@ -6,7 +6,7 @@
 # Usage: scripts/e2e.sh [--seconds N] [--fps HZ] [--game | --wine PROGRAM [--wine-arg ARG]...] [--desktop]
 #                       [--quest [SERIAL] | --native-tcp] [--native-drop PERCENT] [--native-port PORT]
 #                       [--host-arg ARG]... [--report FILE]
-#                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine | --openvr-wine]
+#                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine | --openvr-wine | --openvr-actions MODE]
 #                       [--face-source visual|audio|unknown]
 #
 #   --seconds N   how long the stream runs (default 20)
@@ -38,6 +38,10 @@
 #                 and the legacy state of the scripted controllers (a pull of the left grip, the right
 #                 trigger at 0.75, the A button). It prints "openvr_smoke: PASS" or "FAIL ...". Set
 #                 CRANVR_HOME to a stack that scripts/setup-wine.sh built with OpenComposite.
+#   --openvr-actions touch|vive|both  the same program with IVRInput: it writes an action manifest with default
+#                 bindings (for Touch controllers, the Vive wand or both, as a game that ships a manifest does),
+#                 sets it, and reads the actions that the scripted controllers drive. The run also fails
+#                 when the program's haptic pulse does not reach the probe. Implies --openvr-wine.
 #   --face-source SOURCE  with --tracking and --tracking-wine: where the probe's face comes from.
 #                 audio (the default) is a Quest 3's microphone face, visual is a face from cameras,
 #                 and unknown is an offer that names no source, as an older headset app sends. The
@@ -79,15 +83,15 @@
 set -euo pipefail
 
 root=${0:A:h:h}
-seconds=20 fps=120 game=0 desktop=0 client=mac serial="" report=""
-tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 openvr_wine=0 face_source=audio
+seconds=20 fps=120 fps_given=0 game=0 desktop=0 client=mac serial="" report=""
+tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 openvr_wine=0 openvr_actions="" face_source=audio
 wine="" wine_args=()
 native_tcp=0 native_drop=0 native_port=9950
 more_host_args=()
 while (( $# )); do
     case $1 in
         --seconds) seconds=$2; shift 2 ;;
-        --fps) fps=$2; shift 2 ;;
+        --fps) fps=$2; fps_given=1; shift 2 ;;
         --game) game=1; shift ;;
         --tracking)
             game=1 tracking=1; shift
@@ -95,6 +99,9 @@ while (( $# )); do
         --hand-controllers) game=1 hand_controllers=1; shift ;;
         --tracking-wine) tracking_wine=1; shift ;;
         --openvr-wine) openvr_wine=1; shift ;;
+        --openvr-actions)
+            openvr_wine=1 openvr_actions=$2; shift 2
+            [[ ${openvr_actions} == (touch|vive|both) ]] || { print -u2 "--openvr-actions takes touch, vive or both"; exit 2; } ;;
         --face-source)
             face_source=$2; shift 2
             [[ ${face_source} == (visual|audio|unknown) ]] || { print -u2 "--face-source takes visual, audio or unknown"; exit 2; } ;;
@@ -123,11 +130,12 @@ if (( openvr_wine )); then
     (( seconds >= 20 )) || seconds=20
     wine='C:\opencomposite\openvr_smoke.exe'
     wine_args=(--seconds $(( seconds - 6 )) --expect-input)
+    [[ -z ${openvr_actions} ]] || wine_args+=(--actions "${openvr_actions}")
     export CRANVR_OPENCOMPOSITE=1
     # The run tests the path of an OpenVR program, not the rate: a trivial program made 105 to 107 frames a
     # second at 120 Hz on a quiet Mac and 77 to 86 on a busy one (the OpenXR smoke made 118 on the same
-    # Mac), so the run asks the host for 72 Hz unless --fps says otherwise
-    (( fps != 120 )) || fps=72
+    # Mac), so the run asks the host for 72 Hz unless --fps is given
+    (( fps_given )) || fps=72
 fi
 if (( tracking_wine )); then
     # The Windows program waits for the headset's features, starts a session and reads the data
@@ -311,6 +319,8 @@ fi
 # The probe offers hands, body, face and eyes and plays the script of tracked.rs for what the host asks
 (( tracking || tracking_wine )) && probe_args+=(--tracking --face-source "${face_source}")
 (( hand_controllers )) && probe_args+=(--tracking --no-controllers)
+# A program that compares its controller poses with the probe's script needs the head still: its room is then the probe's room
+[[ -z ${openvr_actions} ]] || probe_args+=(--still-head)
 client_exit=0
 case ${client} in
     mac)
@@ -351,6 +361,16 @@ if (( openvr_wine )); then
     done
     grep -h "openvr_smoke:" "${work}/game.log" || true
     grep -q "openvr_smoke: PASS" "${work}/game.log" || { print -u2 "The OpenVR program did not pass; see ${work}/game.log"; openvr_exit=1; }
+    if [[ -n ${openvr_actions} ]]; then
+        # The program pulses the left haptic output when its grab action fires: the pulse crosses the runtime and the
+        # host to the probe
+        if [[ $(grep -hoE '[0-9]+ haptic pulses' "${work}/probe.log" | grep -oE '^[0-9]+' | head -1) -ge 1 ]]; then
+            grep -h "probe: first haptic pulse" "${work}/probe.log" || true
+        else
+            print -u2 "The program's haptic pulse did not reach the probe; see ${work}/probe.log"
+            openvr_exit=1
+        fi
+    fi
     # OpenComposite's own log, for a failure
     opencomposite_log=$(print -rl -- "${CRANVR_HOME:-$HOME/Library/Application Support/cranvr}"/wine/prefix/drive_c/users/*/AppData/Local/OpenComposite/logs/opencomposite.log(N) | head -1)
     if [[ -n ${opencomposite_log} ]]; then

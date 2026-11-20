@@ -1,0 +1,19 @@
+diff --git a/runtime/pe/input.cpp b/runtime/pe/input.cpp
+index 20faec6..2882035 100644
+--- a/runtime/pe/input.cpp
++++ b/runtime/pe/input.cpp
+@@ -1865,8 +1865,12 @@ void invalidateInputForSession(XrSession session) {
+     }
+     for (ActionSetRecord& record : gActionSets) {
+         if (record.attachedSession == session) {
+-            // `attached` stays true: attachment freezes a set's actions for
+-            // the set's whole lifetime, not just the session's.
++            // cranvr: a set that was attached to this session may attach to the next one.
++            // OpenComposite creates its action sets once. It attaches them to its first session,
++            // destroys that session when the game submits its first frame (it then makes a session
++            // on the game's own graphics device) and attaches the same sets to the new session. The
++            // set keeps its actions and the suggested bindings of the instance.
++            record.attached = false;
+             record.attachedSession = XR_NULL_HANDLE;
+         }
+     }
