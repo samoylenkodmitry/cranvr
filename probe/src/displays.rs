@@ -89,7 +89,8 @@ impl DisplaySet {
             let probe = DesktopProbe::new(info.stream);
             self.extras.lock().unwrap().push(Arc::clone(&probe));
             if self.wished.load(Ordering::Relaxed) {
-                probe.ask(link);
+                probe.wish(link, true, self.wish_size());
+                println!("probe: asked the host for {} at up to {} pixels and {} pictures a second", probe.name(), self.wish_size().0, self.wish_size().1);
             }
             start_pointer_script(info.stream);
         }
@@ -107,14 +108,28 @@ impl DisplaySet {
         }
     }
 
+    /// What the probe asks of each display, as the headset's client does (`client/src/display_wish.rs`):
+    /// one display gets the full size at 60 pictures a second, two get the full size at 30, more get 2560
+    /// pixels across at 30, and displays that show over a game get 2560 at 30. The Mac then encodes no
+    /// more pixels a second than it does for one display.
+    pub fn wish_size(&self) -> (u32, u8) {
+        match (self.plan.in_game, self.plan.wanted) {
+            (true, _) => (2560, 30),
+            (false, 0..=1) => (3840, 60),
+            (false, 2) => (3840, 30),
+            (false, _) => (2560, 30),
+        }
+    }
+
     /// Wishes or ends the wish of every display.
     pub fn set_wished(&self, link: &ClientLink, first: Option<&Arc<DesktopProbe>>, enabled: bool) {
         self.wished.store(enabled, Ordering::Relaxed);
+        let size = self.wish_size();
         if let Some(first) = first {
-            first.wish(link, enabled);
+            first.wish(link, enabled, size);
         }
         for probe in self.extras.lock().unwrap().iter() {
-            probe.wish(link, enabled);
+            probe.wish(link, enabled, size);
         }
         println!("probe: {} the video of every display", if enabled { "wishes" } else { "ends the wish for" });
     }

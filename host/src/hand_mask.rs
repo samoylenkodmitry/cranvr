@@ -147,7 +147,7 @@ mod tests {
     #[test]
     fn a_held_hand_gives_the_game_rest_values_and_keeps_the_other_hand() {
         let mut mask = HandMask::default();
-        let left = HandInput { trigger: 0.7, grip: 0.9, stick: [0.5, -0.5], buttons: buttons::PRIMARY | buttons::TRIGGER_CLICK, touches: buttons::PRIMARY, ..Default::default() };
+        let left = HandInput { trigger: 0.7, grip: 0.9, stick: [0.5, -0.5], buttons: buttons::PRIMARY | buttons::TRIGGER_CLICK, touches: buttons::PRIMARY };
         let right = pull(1.0, buttons::TRIGGER_CLICK);
         let out = mask.apply(&input(left, right), [false, true]);
         assert_eq!(out.hands[0], left);

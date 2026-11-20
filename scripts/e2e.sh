@@ -65,6 +65,9 @@
 #                 the video of each, decodes each stream, plays the pointer script on each and removes the last one
 #                 three seconds before the end. Needs this Mac to make virtual displays (it takes the owner's
 #                 displays through a short rearrangement: do not run it while the owner plays). Implies --desktop.
+#   --display-test  with --displays: the host adds no real display. An added display shows the main display
+#                 again (CRANVR_DISPLAY_TEST=main). The streams, wishes and pictures run as with a real one, and
+#                 the Mac's displays stay as they are, which is safe while the owner plays.
 #   --hold        the probe's right hand points at a panel in every other window of its script. The host must
 #                 give the game rest values for those windows, and the fake game checks that none of the panel's
 #                 presses reaches it, also not in the 0.1 s after the hold ends. Implies --game.
@@ -103,7 +106,7 @@ set -euo pipefail
 
 root=${0:A:h:h}
 seconds=20 fps=120 fps_given=0 game=0 desktop=0 client=mac serial="" report=""
-displays=1 hold=0 displays_in_game=0
+displays=1 hold=0 displays_in_game=0 display_test=0
 tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 openvr_wine=0 openvr_actions="" face_source=audio
 wine="" wine_args=()
 native_tcp=0 native_drop=0 native_port=9950 pause=""
@@ -127,6 +130,7 @@ while (( $# )); do
             [[ ${face_source} == (visual|audio|unknown) ]] || { print -u2 "--face-source takes visual, audio or unknown"; exit 2; } ;;
         --desktop) desktop=1; shift ;;
         --displays) displays=$2; shift 2 ;;
+        --display-test) display_test=1; shift ;;
         --hold) game=1 hold=1; shift ;;
         --displays-in-game) game=1 displays_in_game=1; shift ;;
         --wine) wine=$2; shift 2 ;;
@@ -222,6 +226,7 @@ case ${client} in
         host_args+=(--trust-all)
         ;;
 esac
+(( display_test )) && export CRANVR_DISPLAY_TEST=main
 if (( displays_in_game )); then
     # The host runs the displays and logs what they did in windows of one second
     host_args+=(--desktop)

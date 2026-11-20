@@ -308,7 +308,9 @@ pub fn run(o: Options) -> i32 {
     if let Some(desktop) = &shared.desktop {
         // A script in a game wishes the displays itself, later
         if !o.displays_in_game {
-            desktop.ask(&shared.link);
+            let (width, fps) = shared.displays.wish_size();
+            desktop.wish(&shared.link, true, (width, fps));
+            println!("probe: asked the host for the desktop at up to {width} pixels and {fps} pictures a second");
         }
         let (send, stop) = (Arc::clone(&shared), Arc::clone(&shared));
         DesktopProbe::pointer_script(
@@ -747,7 +749,7 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
             // with the trigger still down. The game must see none of it: it never sees 0.35 or B.
             let window = (t / 3.0) as u32;
             let in_window = shared.hold_script && window % 2 == 1 && t % 3.0 > 2.5;
-            let in_tail = shared.hold_script && window % 2 == 0 && window > 0 && t % 3.0 < 0.1;
+            let in_tail = shared.hold_script && window.is_multiple_of(2) && window > 0 && t % 3.0 < 0.1;
             let panel_press = in_window || in_tail;
             // A headset with no controller reports every input at rest
             if controllers {

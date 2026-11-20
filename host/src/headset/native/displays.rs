@@ -55,8 +55,11 @@ struct Slot {
     /// What the display's own loops share with the manager. The manager copies it to the host's
     /// shared layer state, because the frame loop wants one answer for all the displays.
     layer: Arc<LayerState>,
-    /// The helper that holds an added display. The first display has none.
+    /// The helper that holds an added display. The first display has none, and nor has a display of
+    /// a test (`CRANVR_DISPLAY_TEST=main`), which shows the main display again.
     process: Option<DisplayProcess>,
+    /// The client added this display and can remove it
+    removable: bool,
     name: String,
     /// The display's ID when the host knows it, for the size and for the check that it still exists
     display_id: Option<u32>,
@@ -175,6 +178,16 @@ impl Displays {
         if !virtual_display::is_supported() {
             return fail("This version of macOS cannot make a display for the headset.".to_string());
         }
+        // A test that must not rearrange the Mac's displays: the added display shows the main display
+        // again, so the streams, the wishes and the pictures run as they do for a virtual display
+        if std::env::var("CRANVR_DISPLAY_TEST").is_ok_and(|v| v == "main") {
+            let Some(stream) = self.free_stream() else { return fail(format!("The Mac shows {MAX_DISPLAYS} displays at most. Remove one first.")) };
+            let name = format!("Display {}", stream - DESKTOP_STREAM + 1);
+            info!("Native displays: {name} is a test display: the main display again");
+            let slot = Slot::new(&self.base, &session, Some((stream, None)), name);
+            self.slots.lock().unwrap().push(slot);
+            return;
+        }
         let Some(stream) = (1..MAX_DISPLAYS)
             .map(display_stream)
             .find(|stream| !self.slots.lock().unwrap().iter().any(|slot| slot.desktop.stream() == *stream))
@@ -185,19 +198,22 @@ impl Displays {
             Ok(process) => {
                 info!("Native displays: display {} is new on the Mac: {}", stream - DESKTOP_STREAM + 1, process.describe());
                 let name = format!("Display {}", stream - DESKTOP_STREAM + 1);
-                let display_id = process.id;
-                let slot = Slot::new(&self.base, &session, Some((stream, process)), name);
-                debug_assert_eq!(slot.display_id, Some(display_id));
+                let slot = Slot::new(&self.base, &session, Some((stream, Some(process))), name);
                 self.slots.lock().unwrap().push(slot);
             }
             Err(e) => fail(format!("The Mac made no display: {e}")),
         }
     }
 
+    /// The lowest stream after the first that no display has.
+    fn free_stream(&self) -> Option<u8> {
+        (1..MAX_DISPLAYS).map(display_stream).find(|stream| !self.slots.lock().unwrap().iter().any(|slot| slot.desktop.stream() == *stream))
+    }
+
     fn remove(&self, stream: u8) {
         let slot = {
             let mut slots = self.slots.lock().unwrap();
-            match slots.iter().position(|slot| slot.desktop.stream() == stream && slot.process.is_some()) {
+            match slots.iter().position(|slot| slot.desktop.stream() == stream && slot.removable) {
                 Some(index) => slots.remove(index),
                 None => {
                     info!("Native displays: the client removes stream {stream}, and no added display has it");
@@ -219,7 +235,7 @@ impl Displays {
                     stream: slot.desktop.stream(),
                     name: slot.name.clone(),
                     points: virtual_display::points_of(slot.display_id.unwrap_or_else(virtual_display::main_display_id)),
-                    removable: slot.process.is_some(),
+                    removable: slot.removable,
                 })
                 .collect()
         } else {
@@ -288,14 +304,17 @@ impl Displays {
 
 impl Slot {
     /// Starts the display's loops. An added display brings its stream and its helper.
-    fn new(base: &Options, session: &Arc<Session>, added: Option<(u8, DisplayProcess)>, name: String) -> Self {
+    fn new(base: &Options, session: &Arc<Session>, added: Option<(u8, Option<DisplayProcess>)>, name: String) -> Self {
         let layer: Arc<LayerState> = Arc::default();
+        let removable = added.is_some();
         let (stream, display_id, process) = match added {
-            Some((stream, process)) => (stream, Some(process.id), Some(process)),
+            Some((stream, Some(process))) => (stream, Some(process.id), Some(process)),
+            // A test display shows the main display again
+            Some((stream, None)) => (stream, base.display_id, None),
             None => (DESKTOP_STREAM, base.display_id, None),
         };
         let options = Options { layer: Arc::clone(&layer), stream, display_id, ..base.clone() };
-        Self { desktop: Desktop::start(options, Arc::clone(session)), layer, process, name, display_id, missing: 0 }
+        Self { desktop: Desktop::start(options, Arc::clone(session)), layer, process, removable, name, display_id, missing: 0 }
     }
 
     /// The display is gone: its loops end, its helper ends and its counts stay in `retired`.

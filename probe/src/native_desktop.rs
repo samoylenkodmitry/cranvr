@@ -28,9 +28,6 @@ use std::{
 };
 
 const KEY_REQUEST_GAP: Duration = Duration::from_millis(250);
-/// The wish that the probe sends: a Quest 3 takes pictures of this width
-const MAX_WIDTH: u32 = 3840;
-const MAX_FPS: u8 = 60;
 /// The pointer script's rate, as a headset's frame rate
 const POINTER_HZ: f32 = 120.0;
 
@@ -96,12 +93,6 @@ impl DesktopProbe {
         })
     }
 
-    /// Asks the host for the desktop.
-    pub fn ask(&self, link: &ClientLink) {
-        self.wish(link, true);
-        println!("probe: asked the host for {} at up to {MAX_WIDTH} pixels and {MAX_FPS} pictures a second", self.name());
-    }
-
     /// The label of this display's lines in the output: `desktop` for the first one
     fn label(&self) -> String {
         if self.stream == DESKTOP_STREAM {
@@ -120,9 +111,10 @@ impl DesktopProbe {
         }
     }
 
-    /// Wishes the video of this display, or ends the wish: the host then runs no capture for it.
-    pub fn wish(&self, link: &ClientLink, enabled: bool) {
-        let wish = if enabled { DesktopWish { enabled, max_width: MAX_WIDTH, max_fps: MAX_FPS } } else { DesktopWish { enabled, max_width: 0, max_fps: 0 } };
+    /// Wishes the video of this display at up to `(width, fps)`, or ends the wish: the host then runs no
+    /// capture for it.
+    pub fn wish(&self, link: &ClientLink, enabled: bool, (width, fps): (u32, u8)) {
+        let wish = if enabled { DesktopWish { enabled, max_width: width, max_fps: fps } } else { DesktopWish { enabled, max_width: 0, max_fps: 0 } };
         let message = if self.stream == DESKTOP_STREAM { ClientMsg::Desktop(wish) } else { ClientMsg::DisplayWish { stream: self.stream, wish } };
         link.duplex.send_control(&message).ok();
         if !enabled {
