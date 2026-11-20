@@ -379,7 +379,7 @@ fn tracking_travels_through_a_session_and_an_older_client_is_not_asked() {
     let host = Arc::new(host.join().unwrap());
     let client = Arc::new(client);
     assert!(host.version >= TRACKING_VERSION && client.welcome.version >= TRACKING_VERSION);
-    assert_eq!(PROTOCOL_VERSION, TRACKING_VERSION);
+    assert!(PROTOCOL_VERSION >= TRACKING_VERSION);
 
     let (to_host, host_inbox) = mpsc::channel();
     let (to_client, client_inbox) = mpsc::channel();

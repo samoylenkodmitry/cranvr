@@ -243,6 +243,14 @@ pub enum ClientMsg {
     /// that never sends it is focused. A host that does not know the message skips it. The message
     /// needs no new protocol version: it stands after the last variant.
     Focus(Focus),
+    /// The client adds a display to the Mac or removes one it added (see [`DisplayRequest`]). The
+    /// host answers with [`HostMsg::Displays`]. Protocol version 8 added this message.
+    Display(DisplayRequest),
+    /// What the client asks of the video of one display, as [`ClientMsg::Desktop`] does for the
+    /// first one. A display that the client does not wish costs the Mac and the headset nothing:
+    /// the host runs no capture, no encoder and sends nothing for it. Protocol version 8 added this
+    /// message.
+    DisplayWish { stream: u8, wish: DesktopWish },
 }
 
 /// How much of the headset the app has. The values follow the states of an OpenXR session and
@@ -320,6 +328,19 @@ pub enum HostMsg {
     /// connects and when it changes, and only to a client of protocol version 6. A client that does
     /// not know the message skips it.
     TrackingWish(Features),
+    /// The displays that the client can show, and whether it can add one. The host sends the list
+    /// when the client connects and after each change. Protocol version 8 added this message.
+    Displays(DisplayList),
+    /// The state of the video of a display, as [`HostMsg::Desktop`] says it for the first one: its
+    /// parameters, or `None` while the host runs none for this client. The decoder's parameter sets
+    /// follow in a [`HostMsg::DecoderConfig`] of the same stream. Protocol version 8 added this
+    /// message.
+    DisplayStream { stream: u8, params: Option<DesktopParams> },
+    /// Whether a game runs on the host: it sends frames or it loads. The host sends it when the
+    /// client connects and when it changes. A client of protocol version 7 or older learns it from
+    /// the hiding of the desktop (`DesktopParams::visible`). A host of version 8 hides nothing for a
+    /// game: a display that the client wishes goes on. Protocol version 8 added this message.
+    GameRuns(bool),
 }
 
 /// Datagram messages from the client to the host.
@@ -347,6 +368,13 @@ pub enum ClientDatagram {
     Face(Face),
     /// The gaze, while the host wishes [`Features::EYES`]
     Eyes(Eyes),
+    /// Where a controller points on the panel of a display other than the first, as
+    /// [`ClientDatagram::Pointer`] says it for the first one. Protocol version 8 added this datagram.
+    DisplayPointer { stream: u8, pointer: Pointer },
+    /// The controllers' input with the hands that the app holds back from the game (see
+    /// [`InputHold`]). The client sends it in place of [`ClientDatagram::Input`] to a host of
+    /// protocol version 8. Protocol version 8 added this datagram.
+    InputHold(InputHold),
 }
 
 /// Datagram messages from the host to the client.
@@ -358,6 +386,9 @@ pub enum HostDatagram {
     Pong(Pong),
     /// Where the Mac's cursor is on the desktop
     Cursor(Cursor),
+    /// Where the Mac's cursor is on a display other than the first. Protocol version 8 added this
+    /// datagram.
+    DisplayCursor { stream: u8, cursor: Cursor },
 }
 
 /// The head and the controllers at one moment.
@@ -554,6 +585,71 @@ pub struct DesktopParams {
     /// panel cannot show a cursor over a surface panel today: the compositor draws surfaces over
     /// panels.
     pub cursor_in_video: bool,
+}
+
+/// The most displays that a client shows at once: the first display, which the host captures from
+/// the start, and the ones that the client adds.
+pub const MAX_DISPLAYS: u8 = 4;
+
+/// The stream of the display with this index. Index 0 is the first display, which
+/// [`DESKTOP_STREAM`] has always carried.
+pub const fn display_stream(index: u8) -> u8 {
+    DESKTOP_STREAM + index
+}
+
+/// The index of the display that a stream carries, or `None` for a stream that is no display's.
+pub const fn display_index(stream: u8) -> Option<u8> {
+    if stream >= DESKTOP_STREAM && stream < DESKTOP_STREAM + MAX_DISPLAYS {
+        Some(stream - DESKTOP_STREAM)
+    } else {
+        None
+    }
+}
+
+/// What the client asks of the Mac's displays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisplayRequest {
+    /// The Mac makes one more display, which only the headset shows. The first one that the host
+    /// captures from the start stays.
+    Add,
+    /// The Mac removes the display that carries this stream, if the client added it.
+    Remove { stream: u8 },
+}
+
+/// A display that the client can show as a panel.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DisplayInfo {
+    /// The stream that carries its video. It names the display in every message.
+    pub stream: u8,
+    /// The words for the headset's menu, such as "Mac display" or "Added display 2"
+    pub name: String,
+    /// The display's size in points
+    pub points: [u32; 2],
+    /// The client can remove it with [`DisplayRequest::Remove`]: the host made it for the client.
+    pub removable: bool,
+}
+
+/// The displays of the host, in the order of their streams.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DisplayList {
+    pub displays: Vec<DisplayInfo>,
+    /// The host can add one more display now
+    pub can_add: bool,
+    /// One line of plain words about a request that failed, such as an add that macOS refused. It
+    /// stays until the next list.
+    pub notice: Option<String>,
+}
+
+/// The controllers' input and the hands that the app holds back from the game. A hand points at a
+/// panel of the app, or holds a press that began on one: its buttons belong to the panel, so the
+/// game must not see them. The input and the mask travel in one datagram, so no input of a held
+/// hand reaches the game before the mask does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct InputHold {
+    pub input: Input,
+    /// Left, then right. The host gives the game rest values in place of the held hand's buttons,
+    /// touches, trigger, grip and thumbstick. The hand's poses stay.
+    pub held: [bool; 2],
 }
 
 /// Where a controller points on the desktop panel, as the client measures it. The client sends it

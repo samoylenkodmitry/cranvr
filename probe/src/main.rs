@@ -7,6 +7,7 @@
 //! Exit code 0 means at least half the expected frames arrived and decoded with the right badges.
 
 mod compositor;
+mod displays;
 mod hands;
 mod native;
 mod native_desktop;
@@ -40,6 +41,12 @@ fn usage() -> ! {
          \n  --drop-percent P   drop this share of the media packets, to test the parity\
          \n  --desktop          ask for the Mac's desktop as a second stream, play a pointer script\
          \n                     and count the sound (start the host with --desktop and CRANVR_POINTER_DRY_RUN=1)\
+         \n  --displays N       show N displays: the Mac's own and N-1 that the probe asks the host to add (start\
+         \n                     the host with --desktop and CRANVR_POINTER_DRY_RUN=1). It removes the last one near the end.\
+         \n  --displays-in-game against a game that runs: wish no display for 5 s, show them for 5 s, hide them again\
+         \n                     and count the pictures in each part. Implies --desktop's streams, not its wish.\
+         \n  --hold-script      the right hand points at a panel in every other window of its script: the input of\
+         \n                     those windows must not reach the game (cranvr-fake-game --expect-held)\
          \n  --tracking         offer hands, body, face and eyes, and send the script of tracked.rs for\
          \n                     each feature that the host asks for. The head stands still.\
          \n  --still-head       the head stands still (as with --tracking), so a game's room is the\
@@ -73,6 +80,9 @@ fn main() {
         tcp: false,
         drop_percent: 0.0,
         desktop: false,
+        displays: 1,
+        displays_in_game: false,
+        hold_script: false,
         tracking: false,
         no_controllers: false,
         still_head: false,
@@ -94,6 +104,9 @@ fn main() {
             "--connect" => options.connect = value().to_socket_addrs().ok().and_then(|mut a| a.next()).unwrap_or_else(|| usage()),
             "--tcp" => options.tcp = true,
             "--desktop" => options.desktop = true,
+            "--displays" => options.displays = value().parse().ok().filter(|n| (1..=cranvr_proto::message::MAX_DISPLAYS).contains(n)).unwrap_or_else(|| usage()),
+            "--displays-in-game" => options.displays_in_game = true,
+            "--hold-script" => options.hold_script = true,
             "--tracking" => options.tracking = true,
             "--no-controllers" => options.no_controllers = true,
             "--still-head" => options.still_head = true,

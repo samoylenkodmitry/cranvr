@@ -26,6 +26,7 @@ use cranvr_proto::{
     clock::now_ns,
     media::FrameMeta,
     message::{Cursor, DesktopParams, DesktopWish, HostDatagram, HostMsg, Pointer, DESKTOP_STREAM},
+    DISPLAYS_VERSION,
     wire::{Codec, Pose, Rect},
 };
 use cranvr_vt::{EncodedFrame, Encoder, EncoderConfig, Flipper};
@@ -49,23 +50,39 @@ pub struct Options {
     pub display_id: Option<u32>,
     /// The flags that the frame loop reads: the client shows the desktop, a game hides it
     pub layer: Arc<LayerState>,
-    /// The picture stream's average bitrate
+    /// The picture stream's average bitrate at the full size and rate (see [`scaled_mbps`])
     pub mbps: u64,
+    /// The stream that carries this display's pictures. The first display has `DESKTOP_STREAM`, and
+    /// it talks in the messages of the older versions. The displays that the client adds have the
+    /// streams after it (see `displays.rs`).
+    pub stream: u8,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { enabled: false, display_id: None, layer: Arc::default(), mbps: MBPS }
+        Self { enabled: false, display_id: None, layer: Arc::default(), mbps: MBPS, stream: DESKTOP_STREAM }
     }
 }
 
 /// The picture stream's average bitrate in Mbps. A still desktop needs far less.
 pub const MBPS: u64 = 40;
+/// The smallest bitrate that a smaller or slower display gets
+const MIN_MBPS: u64 = 6;
+
+/// The bitrate for a display of `size` pixels at `fps` pictures a second: `base` at 3840 x 2160 and
+/// 60 pictures a second, less in proportion to the pixels that the stream carries. A display that
+/// shows over a game shares the media path with the eye stream, so it takes no more than it needs.
+pub fn scaled_mbps(base: u64, [width, height]: [u32; 2], fps: i32) -> u64 {
+    let share = f64::from(width) * f64::from(height) * f64::from(fps.max(1)) / (3840.0 * 2160.0 * 60.0);
+    ((base as f64 * share).round() as u64).clamp(MIN_MBPS.min(base), base)
+}
 /// Pictures a second at most
 const MAX_FPS: i32 = 60;
 /// The cursor's position goes out this often while the mouse moves. It goes out at least this often
 const CURSOR_EVERY: Duration = Duration::from_millis(2);
 const CURSOR_KEEPALIVE: Duration = Duration::from_millis(50);
+/// The cursor loop looks this often for a capture while none runs
+const CURSOR_IDLE: Duration = Duration::from_millis(100);
 /// A pointer that the client stopped reporting counts as lifted after this time
 const POINTER_STALE: Duration = Duration::from_millis(250);
 /// The desktop thread logs its numbers this often
@@ -76,6 +93,11 @@ const RETRY_AFTER: Duration = Duration::from_secs(2);
 /// What one session counts about the desktop. The log line shows the changes since its last look.
 #[derive(Default)]
 struct Counters {
+    /// Pictures that the capture gave the encoder's turn: a display that is not shown captures none
+    captured: AtomicU64,
+    /// Pictures that the encoder finished
+    encoded: AtomicU64,
+    /// Pictures that went out
     frames: AtomicU64,
     bytes: AtomicU64,
     keys: AtomicU64,
@@ -97,6 +119,43 @@ struct Inner {
     pointer: Sender<Pointer>,
     stop: AtomicBool,
     counters: Counters,
+}
+
+/// What a display did, as counts since the host started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct DisplayCounts {
+    pub captured: u64,
+    pub encoded: u64,
+    pub sent: u64,
+    pub cursors: u64,
+}
+
+impl Inner {
+    /// The name of this display in the log. The first display keeps the name of the older versions.
+    fn label(&self) -> String {
+        match self.options.stream {
+            DESKTOP_STREAM => "Native desktop".to_string(),
+            stream => format!("Native display {}", stream - DESKTOP_STREAM + 1),
+        }
+    }
+
+    /// Tells the client the state of this display's video: its parameters, or `None` while the host
+    /// runs none. The first display uses the message of the older versions, so a client that knows
+    /// no other one still shows it.
+    fn announce(&self, session: &Session, params: Option<DesktopParams>) {
+        let message = match self.options.stream {
+            DESKTOP_STREAM => HostMsg::Desktop(params),
+            stream => HostMsg::DisplayStream { stream, params },
+        };
+        session.link.duplex.send_control(&message).ok();
+    }
+
+    /// Whether the game hides this display from the client. A client of an older version learns
+    /// that a game runs only from the hiding. A client of this version gets the game's state in a
+    /// message of its own and decides itself which displays to show, so the host hides none for it.
+    fn hidden_by_game(&self, session: &Session) -> bool {
+        self.options.layer.game.load(Ordering::Relaxed) && session.version < DISPLAYS_VERSION
+    }
 }
 
 /// The desktop of one session.
@@ -140,13 +199,41 @@ impl Desktop {
     /// The client asks for the stream, or stops it. A host without `--desktop` answers that it has
     /// none.
     pub(super) fn on_wish(&self, wish: DesktopWish, session: &Session) {
+        let label = self.inner.label();
         if !self.inner.options.enabled {
-            info!("Native desktop: the client asks for the desktop and the host runs without --desktop");
-            session.link.duplex.send_control(&HostMsg::Desktop(None)).ok();
+            info!("{label}: the client asks for the display and the host runs without --desktop");
+            self.inner.announce(session, None);
             return;
         }
-        info!("Native desktop: the client {} the desktop at up to {} pixels across and {} pictures a second", if wish.enabled { "asks for" } else { "stops" }, wish.max_width, wish.max_fps);
+        info!(
+            "{label}: the client {} the display at up to {} pixels across and {} pictures a second",
+            if wish.enabled { "asks for" } else { "stops" },
+            wish.max_width,
+            wish.max_fps
+        );
         *self.inner.wish.lock().unwrap() = Some(wish);
+    }
+
+    /// What this display did since the host started: pictures captured, pictures encoded, pictures
+    /// sent and cursor datagrams sent. A display that no client shows counts none of them.
+    pub(super) fn counts(&self) -> DisplayCounts {
+        let c = &self.inner.counters;
+        DisplayCounts {
+            captured: c.captured.load(Ordering::Relaxed),
+            encoded: c.encoded.load(Ordering::Relaxed),
+            sent: c.frames.load(Ordering::Relaxed),
+            cursors: c.cursor_datagrams.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Whether a capture of this display runs now.
+    pub(super) fn is_running(&self) -> bool {
+        self.inner.options.layer.active.load(Ordering::Relaxed)
+    }
+
+    /// The stream of this display's pictures.
+    pub(super) fn stream(&self) -> u8 {
+        self.inner.options.stream
     }
 
     /// The client lost a picture of the desktop stream.
@@ -205,18 +292,19 @@ impl Running {
         )?;
         let (width, height) = capture.size;
         let (sender, encoded) = mpsc::channel();
+        let mbps = scaled_mbps(options.mbps, [width, height], fps);
         let encoder = Encoder::new(
-            &EncoderConfig { width, height, fps: fps as f32, bitrate_bps: options.mbps * 1_000_000, full_range: true, strict_rate: false },
+            &EncoderConfig { width, height, fps: fps as f32, bitrate_bps: mbps * 1_000_000, full_range: true, strict_rate: false },
             sender,
         )?;
         let flipper = if flip_pictures() { Some(Flipper::new()?) } else { None };
         let params = DesktopParams {
-            stream: DESKTOP_STREAM,
+            stream: options.stream,
             codec: Codec::Hevc,
             size: [width, height],
             points: [capture.points.0 as f32, capture.points.1 as f32],
             max_fps: fps as f32,
-            bitrate_bps: options.mbps * 1_000_000,
+            bitrate_bps: mbps * 1_000_000,
             full_range: true,
             flipped: flipper.is_some(),
             visible: true,
@@ -240,24 +328,25 @@ fn desktop_loop(inner: &Inner, session: &Session) {
             (None, Some(wish)) if retry_at.is_none_or(|at| Instant::now() >= at) => match Running::open(&inner.options, wish, &notify) {
                 Ok(run) => {
                     info!(
-                        "Native desktop: capturing display {} at {}x{} pixels ({}x{} points), {} Mbps, up to {} pictures a second{}",
+                        "{}: capturing display {} at {}x{} pixels ({}x{} points), {} Mbps, up to {} pictures a second{}",
+                        inner.label(),
                         run.capture.display_id,
                         run.params.size[0],
                         run.params.size[1],
                         run.params.points[0],
                         run.params.points[1],
-                        inner.options.mbps,
+                        run.params.bitrate_bps / 1_000_000,
                         run.params.max_fps,
                         if cursor_in_video() { ", the cursor in the pictures" } else { "" }
                     );
                     inner.display.store(run.capture.display_id, Ordering::Relaxed);
                     inner.options.layer.active.store(true, Ordering::Relaxed);
-                    session.link.duplex.send_control(&HostMsg::Desktop(Some(run.params))).ok();
+                    inner.announce(session, Some(run.params));
                     running = Some(run);
                 }
                 Err(e) => {
-                    warn!("Native desktop: no capture: {e}");
-                    session.link.duplex.send_control(&HostMsg::Desktop(None)).ok();
+                    warn!("{}: no capture: {e}", inner.label());
+                    inner.announce(session, None);
                     retry_at = Some(Instant::now() + RETRY_AFTER);
                 }
             },
@@ -271,7 +360,7 @@ fn desktop_loop(inner: &Inner, session: &Session) {
                 running = None;
                 inner.display.store(0, Ordering::Relaxed);
                 inner.options.layer.active.store(false, Ordering::Relaxed);
-                session.link.duplex.send_control(&HostMsg::Desktop(None)).ok();
+                inner.announce(session, None);
             }
             _ => {}
         }
@@ -289,16 +378,17 @@ fn desktop_loop(inner: &Inner, session: &Session) {
 /// One pass: visibility, the encode of a new capture and the send of the frames that came out.
 fn step(inner: &Inner, session: &Session, run: &mut Running, next_frame: &mut u32, captured: &Receiver<()>) {
     captured.recv_timeout(Duration::from_millis(5)).ok();
-    // A game hides the desktop: the capture stops and the client takes the panel away
-    let visible = !inner.options.layer.game.load(Ordering::Relaxed);
+    // A game hides the display from a client of an older version: the capture stops and the client
+    // takes the panel away. A client of this version decides itself (see `Inner::hidden_by_game`).
+    let visible = !inner.hidden_by_game(session);
     if visible != run.params.visible {
         run.params.visible = visible;
         run.capture.set_running(visible);
         if visible {
             run.key = true;
         }
-        info!("Native desktop: {}", if visible { "visible again" } else { "hidden: a game runs" });
-        session.link.duplex.send_control(&HostMsg::Desktop(Some(run.params))).ok();
+        info!("{}: {}", inner.label(), if visible { "visible again" } else { "hidden: a game runs" });
+        inner.announce(session, Some(run.params));
     }
     // A headset without the input focus gets no new pictures. Its panel keeps the last one.
     let live = visible && !session.paused();
@@ -310,6 +400,7 @@ fn step(inner: &Inner, session: &Session, run: &mut Running, next_frame: &mut u3
     }
     if live && run.encoder.in_flight() < 2 {
         if let Some((seq, image)) = run.capture.latest().filter(|(seq, _)| *seq != run.last_seq || run.key) {
+            inner.counters.captured.fetch_add(1, Ordering::Relaxed);
             let timestamp = now_ns();
             let result = match &run.flipper {
                 Some(flipper) => run.encoder.pixel_buffer().ok_or("the encoder has no buffer pool".to_string()).and_then(|flipped| {
@@ -323,11 +414,12 @@ fn step(inner: &Inner, session: &Session, run: &mut Running, next_frame: &mut u3
                     (run.last_seq, run.key) = (seq, false);
                     run.index += 1;
                 }
-                Err(e) => warn!("Native desktop: the encoder refused a picture: {e}"),
+                Err(e) => warn!("{}: the encoder refused a picture: {e}", inner.label()),
             }
         }
     }
     while let Ok(frame) = run.encoded.try_recv() {
+        inner.counters.encoded.fetch_add(1, Ordering::Relaxed);
         send_frame(inner, session, run, &frame, next_frame);
     }
 }
@@ -335,16 +427,16 @@ fn step(inner: &Inner, session: &Session, run: &mut Running, next_frame: &mut u3
 fn send_frame(inner: &Inner, session: &Session, run: &mut Running, frame: &EncodedFrame, next_frame: &mut u32) {
     // The decoder needs the parameter sets before the first key frame and again when they change
     if let Some(config) = frame.config_nals.as_ref().filter(|c| run.config.as_ref() != Some(*c)) {
-        let message = HostMsg::DecoderConfig { stream: DESKTOP_STREAM, codec: Codec::Hevc, config: config.clone() };
+        let message = HostMsg::DecoderConfig { stream: inner.options.stream, codec: Codec::Hevc, config: config.clone() };
         if let Err(e) = session.link.duplex.send_control(&message) {
-            warn!("Native desktop: the decoder config did not go out: {e}");
+            warn!("{}: the decoder config did not go out: {e}", inner.label());
             return;
         }
         run.config = Some(config.clone());
     }
     let [width, height] = run.params.size;
     let meta = FrameMeta {
-        stream: DESKTOP_STREAM,
+        stream: inner.options.stream,
         frame: *next_frame,
         slice: 0,
         key: frame.is_idr,
@@ -367,7 +459,7 @@ fn send_frame(inner: &Inner, session: &Session, run: &mut Running, frame: &Encod
             c.send_us.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             inner.options.layer.frames.fetch_add(1, Ordering::Relaxed);
         }
-        Err(e) => warn!("Native desktop: a picture did not go out: {e}"),
+        Err(e) => warn!("{}: a picture did not go out: {e}", inner.label()),
     }
 }
 
@@ -403,7 +495,8 @@ impl LogState {
         let n = frames.max(1) as f64;
         let mouse = desktop::injected_counts();
         info!(
-            "Native desktop: {:.1} pictures a second, {:.1} Mbps, {:.1} KB a picture, {} key, encode {:.2} ms, send {:.2} ms; the client sent {} pointer datagrams, {} cursor datagrams; mouse events: {} moves, {} downs, {} ups, {} px scrolled",
+            "{}: {:.1} pictures a second, {:.1} Mbps, {:.1} KB a picture, {} key, encode {:.2} ms, send {:.2} ms; the client sent {} pointer datagrams, {} cursor datagrams; mouse events: {} moves, {} downs, {} ups, {} px scrolled",
+            inner.label(),
             frames as f64 / seconds,
             d(now.1, self.seen.1) as f64 * 8.0 / seconds / 1e6,
             d(now.1, self.seen.1) as f64 / n / 1000.0,
@@ -520,6 +613,11 @@ fn cursor_loop(inner: &Inner, session: &Session) {
     let circle = std::env::var("CRANVR_CURSOR_TEST").is_ok_and(|v| v == "circle");
     let start = Instant::now();
     while !inner.stop.load(Ordering::Relaxed) && !*session.stopped.lock().unwrap() {
+        // A display that no capture serves has no cursor to follow: the loop only waits for one
+        if inner.display.load(Ordering::Relaxed) == 0 {
+            thread::sleep(CURSOR_IDLE);
+            continue;
+        }
         thread::sleep(CURSOR_EVERY);
         let display = inner.display.load(Ordering::Relaxed);
         if display == 0 {
@@ -538,7 +636,12 @@ fn cursor_loop(inner: &Inner, session: &Session) {
         let (u, v) = if on { (((point.x - bounds.origin.x) / bounds.size.x.max(1.0)) as f32, ((point.y - bounds.origin.y) / bounds.size.y.max(1.0)) as f32) } else { (0.0, 0.0) };
         let now = Some((u.to_bits(), v.to_bits(), on));
         if now != last || sent.elapsed() >= CURSOR_KEEPALIVE {
-            session.link.duplex.send_datagram(&HostDatagram::Cursor(Cursor { seq, u, v, on })).ok();
+            let cursor = Cursor { seq, u, v, on };
+            let datagram = match inner.options.stream {
+                DESKTOP_STREAM => HostDatagram::Cursor(cursor),
+                stream => HostDatagram::DisplayCursor { stream, cursor },
+            };
+            session.link.duplex.send_datagram(&datagram).ok();
             inner.counters.cursor_datagrams.fetch_add(1, Ordering::Relaxed);
             (seq, last, sent) = (seq.wrapping_add(1), now, Instant::now());
         }

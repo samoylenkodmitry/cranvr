@@ -18,6 +18,7 @@
 
 pub mod audio;
 pub mod desktop;
+mod displays;
 
 use super::{display_lock::{DisplayLock, Report}, Button, Device, Event, EventSource, FramePlan, Headset, OutFrame};
 use crate::{
@@ -38,14 +39,15 @@ use cranvr_proto::{
     link::{HostLink, HostListener, HostSide, Incoming, MediaMode, Pending},
     media::{FrameMeta, DEFAULT_SHARD_LEN},
     message::{
-        buttons, negotiate, ClientDatagram, ClientMsg, FrameTiming, Focus, HostDatagram, HostMsg, HostWishes, Input,
-        LossReport, Ping, Pong, RejectReason, Tracking, VersionRange, Views as ProtoViews, UPDATE_HEADSET, UPDATE_MAC,
+        buttons, display_index, negotiate, ClientDatagram, ClientMsg, FrameTiming, Focus, HostDatagram, HostMsg, HostWishes, Input,
+        InputHold, LossReport, DESKTOP_STREAM, Ping, Pong, RejectReason, Tracking, VersionRange, Views as ProtoViews, UPDATE_HEADSET, UPDATE_MAC,
     },
     motion::extrapolate,
     tracking::{Features, Tracked, TRACKING_VERSION},
     wire::{Codec, Error as ProtoError, Motion, Nanos, Pose as ProtoPose, Rect},
     APPROVAL_VERSION,
 };
+use crate::hand_mask::HandMask;
 use serde_json::{json, Value};
 use std::{
     collections::VecDeque,
@@ -461,7 +463,7 @@ fn start_session(config: &Config, shared: &Arc<Shared>, pending: Pending, name: 
     };
     info!("Native protocol: {name} at {peer} connected, {} media, sealed", if link.duplex.has_udp() { "UDP" } else { "TCP" });
     let session = Arc::new(Session::new(link, &stream, config.display_lock));
-    session.desktop.set(desktop::Desktop::start(config.desktop.clone(), Arc::clone(&session))).ok();
+    session.displays.set(displays::Displays::start(config.desktop.clone(), Arc::clone(&session))).ok();
     if config.audio {
         audio::attach(&session);
     }
@@ -499,8 +501,8 @@ fn run_session(shared: &Shared, session: &Arc<Session>, stream: cranvr_proto::me
         info!("Native protocol: the headset link ended: {reason}");
         session.stop();
     });
-    if let Some(desktop) = session.desktop.get() {
-        desktop.stop();
+    if let Some(displays) = session.displays.get() {
+        displays.stop();
     }
     audio::detach(session);
     *shared.session.lock().unwrap() = None;
@@ -541,19 +543,21 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
         // before it lost the focus may arrive after the message. It would press a button that the host
         // let go of. An app without the focus has none to send: the host drops what comes.
         Incoming::Datagram(
-            ClientDatagram::Tracking(_) | ClientDatagram::Input(_) | ClientDatagram::Hands(_) | ClientDatagram::Body(_) | ClientDatagram::Face(_) | ClientDatagram::Eyes(_),
+            ClientDatagram::Tracking(_)
+            | ClientDatagram::Input(_)
+            | ClientDatagram::InputHold(_)
+            | ClientDatagram::Hands(_)
+            | ClientDatagram::Body(_)
+            | ClientDatagram::Face(_)
+            | ClientDatagram::Eyes(_),
         ) if session.paused() => {}
         Incoming::Datagram(ClientDatagram::Tracking(t)) => {
             session.history.lock().unwrap().push(t);
             session.lock.lock().unwrap().on_tracking(t.display_time);
             shared.emit(Event::Tracking { sample_ns: t.sample_time });
         }
-        Incoming::Datagram(ClientDatagram::Input(input)) => {
-            let buttons = session.input.lock().unwrap().changes(&input);
-            if !buttons.is_empty() {
-                shared.emit(Event::Buttons(buttons));
-            }
-        }
+        Incoming::Datagram(ClientDatagram::Input(input)) => session.on_input(shared, &input, [false; 2]),
+        Incoming::Datagram(ClientDatagram::InputHold(InputHold { input, held })) => session.on_input(shared, &input, held),
         Incoming::Datagram(ClientDatagram::FrameTiming(t)) => session.on_timing(&t),
         Incoming::Datagram(ClientDatagram::Loss(report)) => session.on_loss(&report),
         Incoming::Datagram(ClientDatagram::Ping(p)) => {
@@ -591,20 +595,35 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
             session.apply_wish(*shared.wish.lock().unwrap());
         }
         Incoming::Datagram(ClientDatagram::Hello { .. }) | Incoming::Media(_) => {}
-        Incoming::Control(ClientMsg::RequestKeyFrame { stream, .. }) if stream == cranvr_proto::message::DESKTOP_STREAM => {
-            if let Some(desktop) = session.desktop.get() {
-                desktop.request_key_frame();
+        Incoming::Control(ClientMsg::RequestKeyFrame { stream, .. }) if display_index(stream).is_some() => {
+            if let Some(displays) = session.displays.get() {
+                displays.request_key_frame(stream);
             }
         }
         Incoming::Control(ClientMsg::RequestKeyFrame { .. }) => shared.emit(Event::RequestIdr),
         Incoming::Control(ClientMsg::Desktop(wish)) => {
-            if let Some(desktop) = session.desktop.get() {
-                desktop.on_wish(wish, session);
+            if let Some(displays) = session.displays.get() {
+                displays.on_wish(DESKTOP_STREAM, wish, session);
+            }
+        }
+        Incoming::Control(ClientMsg::DisplayWish { stream, wish }) => {
+            if let Some(displays) = session.displays.get() {
+                displays.on_wish(stream, wish, session);
+            }
+        }
+        Incoming::Control(ClientMsg::Display(request)) => {
+            if let Some(displays) = session.displays.get() {
+                displays.on_request(request);
             }
         }
         Incoming::Datagram(ClientDatagram::Pointer(pointer)) => {
-            if let Some(desktop) = session.desktop.get() {
-                desktop.on_pointer(pointer);
+            if let Some(displays) = session.displays.get() {
+                displays.on_pointer(DESKTOP_STREAM, pointer);
+            }
+        }
+        Incoming::Datagram(ClientDatagram::DisplayPointer { stream, pointer }) => {
+            if let Some(displays) = session.displays.get() {
+                displays.on_pointer(stream, pointer);
             }
         }
         Incoming::Control(ClientMsg::Views(v)) => shared.emit(Event::Views(views_config(&v))),
@@ -805,7 +824,12 @@ impl History {
 /// The inputs the host last saw. It turns a new input message into button changes.
 #[derive(Default)]
 struct InputState {
+    /// What the game saw last, after the mask
     last: Option<Input>,
+    /// The hands that the app holds back from the game (see `hand_mask.rs`)
+    mask: HandMask,
+    /// The hands that were held at the last input
+    held: [bool; 2],
 }
 
 /// The path ids of one hand: binary inputs by bit, then the analog inputs.
@@ -868,11 +892,22 @@ fn hand_ids(hand: usize) -> HandIds {
 
 impl InputState {
     /// Lets go of every button that the last input held. Nothing goes out before the first input.
+    /// A press that was down stays the user's: the mask forgets it.
     fn release(&mut self) -> Vec<Button> {
+        self.mask.reset();
+        self.held = [false; 2];
         if self.last.is_none() {
             return Vec::new();
         }
         self.changes(&Input::default())
+    }
+
+    /// The buttons that the game sees change when the client sends `input` with the hands that it
+    /// holds back.
+    fn changes_held(&mut self, input: &Input, held: [bool; 2]) -> Vec<Button> {
+        self.held = held;
+        let masked = self.mask.apply(input, held);
+        self.changes(&masked)
     }
 
     /// The buttons whose value differs from the last input. The first input reports all of them.
@@ -1000,9 +1035,9 @@ struct Session {
     offered: Mutex<Features>,
     /// The tracking features that the host asked the headset for last. `None` before the first ask.
     asked: Mutex<Option<Features>>,
-    /// The desktop panel's stream and pointer. It starts after the session exists, because its
-    /// threads share the session.
-    desktop: std::sync::OnceLock<desktop::Desktop>,
+    /// The displays that the client shows as panels: their streams and pointers. They start after
+    /// the session exists, because their threads share the session.
+    displays: std::sync::OnceLock<Arc<displays::Displays>>,
     next_frame: AtomicU32,
     heard: Mutex<Instant>,
     stopped: Mutex<bool>,
@@ -1031,11 +1066,37 @@ impl Session {
             version,
             offered: Mutex::new(Features::NONE),
             asked: Mutex::new(None),
-            desktop: std::sync::OnceLock::new(),
+            displays: std::sync::OnceLock::new(),
             next_frame: AtomicU32::new(0),
             heard: Mutex::new(Instant::now()),
             stopped: Mutex::new(false),
             wake: Condvar::new(),
+        }
+    }
+
+    /// The controllers' input came, with the hands that the app holds back from the game. The
+    /// buttons that the game sees change go to the host's loop. A change of the held hands goes
+    /// there too, for the hand that a pinch makes a controller of.
+    fn on_input(&self, shared: &Shared, input: &Input, held: [bool; 2]) {
+        let (buttons, held_before) = {
+            let mut state = self.input.lock().unwrap();
+            let before = state.held;
+            (state.changes_held(input, held), before)
+        };
+        if held != held_before {
+            info!(
+                "Native protocol: the app holds back {} from the game",
+                match held {
+                    [false, false] => "no hand",
+                    [true, false] => "the left hand",
+                    [false, true] => "the right hand",
+                    [true, true] => "both hands",
+                }
+            );
+            shared.emit(Event::Held(held));
+        }
+        if !buttons.is_empty() {
+            shared.emit(Event::Buttons(buttons));
         }
     }
 
@@ -1096,8 +1157,8 @@ impl Session {
         // The headset's decoders may have dropped what came while the app was away, so the next
         // pictures start from key frames
         if focus.is_focused() {
-            if let Some(desktop) = self.desktop.get() {
-                desktop.request_key_frame();
+            if let Some(displays) = self.displays.get() {
+                displays.request_key_frames();
             }
         }
         shared.emit(Event::Focus(focus));

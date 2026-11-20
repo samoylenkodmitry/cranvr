@@ -19,11 +19,14 @@
 //! `--expect-hand-controllers` plays a game without hand code: with `cranvr-probe --tracking
 //! --no-controllers` the host must make the controllers of the probe's hands.
 //!
-//! Usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input]
+//! `--expect-held` checks the host's mask: with the probe's `--hold-script`, the right hand's presses
+//! that belong to a panel must never reach the game, and the ones that belong to the game must.
+//!
+//! Usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input] [--expect-held]
 //!        [--use-tracking FEATURES] [--release-tracking] [--expect-tracking] [--expect-hand-controllers]
 //!        [--expect-no-controllers]
 
-use cranvr_common::inputs::{LEFT_SQUEEZE_VALUE_ID, LEFT_TRIGGER_VALUE_ID, RIGHT_A_CLICK_ID, RIGHT_SQUEEZE_VALUE_ID, RIGHT_THUMBSTICK_X_ID, RIGHT_TRIGGER_VALUE_ID};
+use cranvr_common::inputs::{LEFT_SQUEEZE_VALUE_ID, LEFT_TRIGGER_VALUE_ID, RIGHT_A_CLICK_ID, RIGHT_B_CLICK_ID, RIGHT_SQUEEZE_VALUE_ID, RIGHT_THUMBSTICK_X_ID, RIGHT_TRIGGER_VALUE_ID};
 use cranvr_proto::wire::Motion;
 use cranvr_vt::PixelBuffer;
 use std::{
@@ -110,6 +113,8 @@ struct Input {
     profiles: [bool; 2],
     /// The last value of each button path and how often it changed
     buttons: BTreeMap<u64, (f32, u32)>,
+    /// Every value that each button path took, as f32 bits
+    values: BTreeMap<u64, Vec<u32>>,
     resets: u32,
 }
 
@@ -146,11 +151,37 @@ impl Input {
     }
 
     fn button(&mut self, path: u64, value: f32) {
+        let seen = self.values.entry(path).or_default();
+        if !seen.contains(&value.to_bits()) {
+            seen.push(value.to_bits());
+        }
         let entry = self.buttons.entry(path).or_insert((value, 0));
         if entry.0 != value {
             entry.1 += 1;
         }
         entry.0 = value;
+    }
+
+    /// Whether the path ever took `value`
+    fn took(&self, id: u64, value: f32) -> bool {
+        self.values.get(&id).is_some_and(|seen| seen.contains(&value.to_bits()))
+    }
+
+    /// What the host's masking must have done to the probe's `--hold-script`: the right hand's
+    /// panel presses (trigger 0.35 and B) never reach the game, and its game presses (trigger 0.75
+    /// and A) do. The left hand is never held.
+    fn held_problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.took(RIGHT_TRIGGER_VALUE_ID, 0.35) {
+            out.push("the right trigger reached the game at 0.35, a press that belongs to a panel".into());
+        }
+        if self.buttons.get(&RIGHT_B_CLICK_ID).is_some_and(|b| b.0 != 0.0 || self.took(RIGHT_B_CLICK_ID, 1.0)) {
+            out.push("the right B button went down in the game, a press that belongs to a panel".into());
+        }
+        if !self.took(RIGHT_TRIGGER_VALUE_ID, 0.75) || !self.took(RIGHT_A_CLICK_ID, 1.0) {
+            out.push("the right hand's presses that belong to the game did not arrive".into());
+        }
+        out
     }
 
     fn last(&self, id: u64) -> Option<f32> {
@@ -477,7 +508,7 @@ fn paint(image: &mut PixelBuffer, eye: usize) {
 }
 
 fn main() {
-    let (mut control, mut fps, mut seconds, mut expect_input) = (None, 72.0f64, 10.0f64, false);
+    let (mut control, mut fps, mut seconds, mut expect_input, mut expect_held) = (None, 72.0f64, 10.0f64, false, false);
     let (mut use_tracking, mut expect_tracking, mut expect_hand_controllers, mut expect_no_controllers) = (String::new(), false, false, false);
     let mut release_tracking = false;
     let mut face_source = tracked::FaceSource::default();
@@ -488,6 +519,7 @@ fn main() {
             "--fps" => fps = args.next().and_then(|v| v.parse().ok()).expect("--fps N"),
             "--seconds" => seconds = args.next().and_then(|v| v.parse().ok()).expect("--seconds N"),
             "--expect-input" => expect_input = true,
+            "--expect-held" => expect_held = true,
             "--use-tracking" => use_tracking = args.next().expect("--use-tracking FEATURES"),
             "--expect-tracking" => expect_tracking = true,
             "--expect-hand-controllers" => expect_hand_controllers = true,
@@ -495,7 +527,7 @@ fn main() {
             "--release-tracking" => release_tracking = true,
             "--face-source" => face_source = args.next().as_deref().and_then(tracked::FaceSource::parse).expect("--face-source visual|audio|unknown"),
             _ => {
-                eprintln!("usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input] [--use-tracking FEATURES] [--expect-tracking] [--face-source visual|audio|unknown] [--expect-hand-controllers] [--expect-no-controllers] [--release-tracking]");
+                eprintln!("usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input] [--expect-held] [--use-tracking FEATURES] [--expect-tracking] [--face-source visual|audio|unknown] [--expect-hand-controllers] [--expect-no-controllers] [--release-tracking]");
                 std::process::exit(2);
             }
         }
@@ -733,7 +765,11 @@ fn main() {
         );
     }
     println!("fake-game: input: {} button paths, buttons that changed: {:?}", input.buttons.len(), input.buttons.iter().filter(|(_, b)| b.1 > 0).map(|(id, b)| (id, b.0, b.1)).collect::<Vec<_>>());
-    let problems = if expect_input { input.problems() } else { Vec::new() };
+    let mut problems = if expect_input { input.problems() } else { Vec::new() };
+    if expect_held {
+        problems.extend(input.held_problems());
+        println!("fake-game: input: the right trigger took the values {:?}", input.values.get(&RIGHT_TRIGGER_VALUE_ID).map(|v| v.iter().map(|b| f32::from_bits(*b)).collect::<Vec<_>>()));
+    }
     for problem in &problems {
         println!("fake-game: input problem: {problem}");
     }

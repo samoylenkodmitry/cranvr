@@ -66,6 +66,11 @@ pub enum Event {
     /// `cranvr_proto::message::Focus`). The link has released the inputs already. The host stops
     /// the stream while the app is not focused.
     Focus(Focus),
+    /// The hands that the headset's app holds back from the game, left then right: each points at
+    /// a panel of the app (see `cranvr_proto::message::InputHold`). The link gives the game rest
+    /// values for the buttons of a held hand already. This event is for the hand that a pinch
+    /// makes a controller of: its pinch counts for the panel only.
+    Held([bool; 2]),
 }
 
 /// Where the events of a link come from. The host's event loop owns it.
