@@ -259,6 +259,7 @@ impl PhoneReader {
             left_aim: None,
             right_aim: None,
             input: Input::default(),
+            held: [false; 2],
         };
         // The views wait for the rate, because the Hello needs both
         let views = self.info().map(|info| phone_views(info.screen));

@@ -18,7 +18,7 @@ use crate::{
         ClientAuth, Ephemeral, HostHello, Role, TcpRx, TcpTx, UdpRx, UdpTx, CLIENT_HELLO_LEN, HOST_HELLO_LEN, OVERHEAD,
     },
     wire::{decode, encode, read_tcp_packet, read_tcp_packet_limited, Error, PacketBuf, KIND_CONTROL, KIND_DATAGRAM, KIND_HANDSHAKE, KIND_MEDIA},
-    APPROVAL_VERSION, MTU,
+    MTU, PROTOCOL_VERSION,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -414,7 +414,6 @@ pub struct Pending {
     tcp: TcpStream,
     channels: Channels,
     pub peer: SocketAddr,
-    pub version: u16,
     pub caps: ClientCaps,
     /// The client's public key. The client proved that it holds the key, so the host may look it
     /// up in its pairings. The host does that after this call: a client on this Mac needs no
@@ -441,7 +440,7 @@ impl HostListener {
     }
 
     /// Waits for a client and runs the version exchange and the key exchange. A client that sends
-    /// bad bytes, speaks no common version or cannot prove its key gives an error and the caller
+    /// bad bytes, speaks another version or cannot prove its key gives an error and the caller
     /// calls `accept` again.
     pub fn accept(&self) -> Result<Pending, Error> {
         let (mut tcp, peer) = self.listener.accept()?;
@@ -451,13 +450,12 @@ impl HostListener {
         let mut client_pre = [0u8; CLIENT_PREAMBLE_LEN];
         tcp.read_exact(&mut client_pre)?;
         let theirs = parse_client_preamble(&client_pre)?;
-        let version = VersionRange::OURS.common(theirs);
-        let host_pre = host_preamble(version, VersionRange::OURS);
+        // The host answers with its own version, so a client of another one can say which side to update
+        let host_pre = host_preamble(PROTOCOL_VERSION);
         tcp.write_all(&host_pre)?;
-        let version = version.ok_or(Error::Version {
-            ours: (VersionRange::OURS.min, VersionRange::OURS.max),
-            theirs: (theirs.min, theirs.max),
-        })?;
+        if theirs != PROTOCOL_VERSION {
+            return Err(Error::Version { ours: PROTOCOL_VERSION, theirs });
+        }
         let mut buf = Vec::new();
         // Flight 1: the client's fresh key. Flight 2: the host's fresh key, its key and its
         // signature over both preambles and both fresh keys.
@@ -478,7 +476,7 @@ impl HostListener {
             return Err(Error::Crypto("the client does not hold the key that it claims"));
         }
         match read_control::<ClientMsg>(&mut tcp, &mut channels.tcp_rx, &mut buf)? {
-            ClientMsg::Hello(caps) => Ok(Pending { tcp, channels, peer, version, caps, client_key: auth.key, transcript }),
+            ClientMsg::Hello(caps) => Ok(Pending { tcp, channels, peer, caps, client_key: auth.key, transcript }),
             _ => Err(Error::Unexpected("the client's first message is not Hello")),
         }
     }
@@ -487,14 +485,9 @@ impl HostListener {
 impl Pending {
     /// Tells a client that the host's user must allow it, and runs the exchange of numbers that
     /// gives both sides the approval code (see [`approval_code`]). It returns the code. The caller
-    /// shows it to the host's user, then calls [`Pending::accept`] or [`Pending::reject`]. It fails
-    /// for a client of version 4, which cannot wait: the caller rejects it with
-    /// [`RejectReason::NotPaired`]. The call takes up to the handshake timeout, for a client that
-    /// does not answer.
+    /// shows it to the host's user, then calls [`Pending::accept`] or [`Pending::reject`]. The call
+    /// takes up to the handshake timeout, for a client that does not answer.
     pub fn hold_for_approval(&mut self, host_name: &str) -> Result<u32, Error> {
-        if self.version < APPROVAL_VERSION {
-            return Err(Error::Unexpected("a client of this version cannot wait for an approval"));
-        }
         let nonce = random_bytes()?;
         let commit = approval_commit(&nonce, &self.transcript, &self.client_key);
         write_control(&mut self.tcp, &mut self.channels.tcp_tx, &HostMsg::AwaitApproval { host_name: host_name.to_owned(), commit })?;
@@ -544,7 +537,7 @@ impl Pending {
             Some(udp) => MediaPlan::Udp { port: udp.local_addr()?.port() },
             None => MediaPlan::Tcp,
         };
-        let welcome = Welcome { session, version: self.version, stream: stream.clone(), media, shard_len: shard_len as u16 };
+        let welcome = Welcome { session, stream: stream.clone(), media, shard_len: shard_len as u16 };
         write_control(&mut self.tcp, &mut self.channels.tcp_tx, &HostMsg::Welcome(welcome))?;
         if let Some(udp) = &udp {
             // The client repeats its hello until the host answers, so a lost datagram costs 50 ms
@@ -579,7 +572,6 @@ impl Pending {
             peer: self.peer,
             client_key: self.client_key,
             session,
-            version: self.version,
             stream,
             media,
         })
@@ -594,7 +586,6 @@ pub struct HostLink {
     /// The key that the client proved
     pub client_key: [u8; KEY_LEN],
     pub session: u64,
-    pub version: u16,
     pub stream: StreamParams,
     pub media: MediaPlan,
 }
@@ -631,12 +622,12 @@ impl ConnectObserver for NoObserver {
 }
 
 /// What a host shows to anyone who opens a connection, before it knows who asks: the protocol
-/// versions that it speaks and, when they match ours, its key.
+/// version and, when it matches ours, its key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostProbe {
-    /// The protocol versions of the host
-    pub versions: VersionRange,
-    /// The host's key. `None` when the host speaks no version that this side speaks: it then ends
+    /// The protocol version of the host
+    pub version: u16,
+    /// The host's key. `None` when the host speaks another version than this side: it then ends
     /// the exchange after the version exchange.
     pub key: Option<[u8; KEY_LEN]>,
 }
@@ -652,13 +643,13 @@ pub fn probe_host(host: SocketAddr, timeout: Duration) -> Result<HostProbe, Erro
     tcp.set_nodelay(true)?;
     tcp.set_read_timeout(Some(timeout))?;
     tcp.set_write_timeout(Some(timeout))?;
-    let client_pre = client_preamble(VersionRange::OURS);
+    let client_pre = client_preamble(PROTOCOL_VERSION);
     tcp.write_all(&client_pre)?;
     let mut host_pre = [0u8; HOST_PREAMBLE_LEN];
     tcp.read_exact(&mut host_pre)?;
-    let (chosen, theirs) = parse_host_preamble(&host_pre)?;
-    if chosen.is_none() {
-        return Ok(HostProbe { versions: theirs, key: None });
+    let theirs = parse_host_preamble(&host_pre)?;
+    if theirs != PROTOCOL_VERSION {
+        return Ok(HostProbe { version: theirs, key: None });
     }
     let mut buf = Vec::new();
     let fresh = Ephemeral::new()?;
@@ -668,7 +659,7 @@ pub fn probe_host(host: SocketAddr, timeout: Duration) -> Result<HostProbe, Erro
     if !verify_host(&hello.key, &transcript, &hello.signature) {
         return Err(Error::Crypto("the host's signature is not valid"));
     }
-    Ok(HostProbe { versions: theirs, key: Some(hello.key) })
+    Ok(HostProbe { version: theirs, key: Some(hello.key) })
 }
 
 /// The client's end of a session.
@@ -682,7 +673,7 @@ pub struct ClientLink {
 }
 
 impl ClientLink {
-    /// Connects to the host, agrees on a version, proves its key and checks the host's, sends the
+    /// Connects to the host, checks its version, proves its key and checks the host's, sends the
     /// capabilities and waits for the host's choices and for the media path. `expected_host` is
     /// the key that the client paired with, if it has one: a host with another key fails with
     /// [`Error::HostKeyChanged`] before the client says anything about itself. `timeout` bounds each step.
@@ -711,15 +702,14 @@ impl ClientLink {
         tcp.set_nodelay(true)?;
         tcp.set_read_timeout(Some(timeout))?;
         tcp.set_write_timeout(Some(timeout))?;
-        let client_pre = client_preamble(VersionRange::OURS);
+        let client_pre = client_preamble(PROTOCOL_VERSION);
         tcp.write_all(&client_pre)?;
         let mut host_pre = [0u8; HOST_PREAMBLE_LEN];
         tcp.read_exact(&mut host_pre)?;
-        let (chosen, theirs) = parse_host_preamble(&host_pre)?;
-        let version = chosen.ok_or(Error::Version {
-            ours: (VersionRange::OURS.min, VersionRange::OURS.max),
-            theirs: (theirs.min, theirs.max),
-        })?;
+        let theirs = parse_host_preamble(&host_pre)?;
+        if theirs != PROTOCOL_VERSION {
+            return Err(Error::Version { ours: PROTOCOL_VERSION, theirs });
+        }
         let mut buf = Vec::new();
         let fresh = Ephemeral::new()?;
         write_flight(&mut tcp, &fresh.public())?;
@@ -742,16 +732,8 @@ impl ClientLink {
         let welcome = loop {
             match read_control::<HostMsg>(&mut tcp, &mut channels.tcp_rx, &mut buf) {
                 Ok(HostMsg::Welcome(w)) => break w,
-                // A host of version 4 has no approval: it refuses a client that it does not know.
-                // This side could have asked its user, so the host is the side to update.
-                Ok(HostMsg::Reject(RejectReason::NotPaired)) if version < APPROVAL_VERSION && VersionRange::OURS.max >= APPROVAL_VERSION => {
-                    return Err(Error::Version {
-                        ours: (VersionRange::OURS.min, VersionRange::OURS.max),
-                        theirs: (theirs.min, theirs.max),
-                    })
-                }
                 Ok(HostMsg::Reject(reason)) => return Err(Error::Rejected(reason)),
-                Ok(HostMsg::AwaitApproval { host_name, commit }) if waiting_since.is_none() && version >= APPROVAL_VERSION => {
+                Ok(HostMsg::AwaitApproval { host_name, commit }) if waiting_since.is_none() => {
                     let nonce = random_bytes()?;
                     write_control(&mut tcp, &mut channels.tcp_tx, &ClientMsg::PairNonce(nonce))?;
                     let host_nonce = match read_control::<HostMsg>(&mut tcp, &mut channels.tcp_rx, &mut buf)? {

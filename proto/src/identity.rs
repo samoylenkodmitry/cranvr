@@ -2,12 +2,10 @@
 //! with another one remembers that side's public key.
 //!
 //! The client keeps a 32-byte seed. Its public key goes to the host in the handshake. A host
-//! that does not know the key asks its user (protocol version 5): both screens show a code that
-//! comes from the session (see [`crate::secure::approval_code`]), and the user allows the headset
-//! on the Mac. The host then remembers the public key. A version 4 client shows a short code that
-//! comes from its public key. The user enters it at the host (`cranvr-host --pair CODE`). The host
-//! has a key of its own. A client remembers the key of the host that it paired with, and refuses a
-//! host with another key.
+//! that does not know the key asks its user: both screens show a code that comes from the session
+//! (see [`crate::secure::approval_code`]), and the user allows the headset on the Mac. The host
+//! then remembers the public key. The host has a key of its own. A client remembers the key of the
+//! host that it paired with, and refuses a host with another key.
 //!
 //! Each connection proves the keys. Both sides sign a hash of the handshake with their seeds (see
 //! [`crate::secure`]). The hash covers the fresh keys of that connection, so a signature serves for
@@ -30,13 +28,11 @@ use std::{fs::File, io::Read};
 pub const KEY_LEN: usize = 32;
 /// The length of a signature in bytes
 pub const SIGNATURE_LEN: usize = 64;
-/// What the pairing code hashes in front of the public key
-const CODE_LABEL: &[u8] = b"cranvr pairing code v1";
 /// What the fingerprint hashes in front of the public key
 const FINGERPRINT_LABEL: &[u8] = b"cranvr key fingerprint v1";
 /// The bytes of a fingerprint
 pub const FINGERPRINT_LEN: usize = 8;
-/// The pairing code has this many digits.
+/// The approval code has this many digits.
 pub const CODE_DIGITS: u32 = 6;
 
 /// A key of a client or of a host.
@@ -63,11 +59,6 @@ impl Identity {
         self.key.verifying_key().to_bytes()
     }
 
-    /// The code that the user enters at the host
-    pub fn code(&self) -> u32 {
-        pairing_code(&self.public_key())
-    }
-
     /// Signs a message with the key. [`crate::secure`] builds the message from a label and the
     /// hash of the handshake.
     pub fn sign_message(&self, message: &[u8]) -> [u8; SIGNATURE_LEN] {
@@ -80,12 +71,6 @@ pub fn verify_message(public_key: &[u8; KEY_LEN], message: &[u8], signature: &[u
     let Ok(key) = VerifyingKey::from_bytes(public_key) else { return false };
     // The strict check also refuses a public key of small order, which signs for every message
     key.verify_strict(message, &Signature::from_bytes(signature)).is_ok()
-}
-
-/// The code of a public key, from 0 to 999999.
-pub fn pairing_code(public_key: &[u8; KEY_LEN]) -> u32 {
-    let hash = Sha256::new().chain_update(CODE_LABEL).chain_update(public_key).finalize();
-    u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]) % 10u32.pow(CODE_DIGITS)
 }
 
 /// The start of a key's SHA-256 hash. A host names itself with it in the discovery answer, and a
@@ -101,13 +86,6 @@ pub fn format_code(code: u32) -> String {
     let digits = format!("{code:0width$}", width = CODE_DIGITS as usize);
     let (first, second) = digits.split_at(digits.len() / 2);
     format!("{first} {second}")
-}
-
-/// Reads a code that the user typed. Spaces are allowed. It gives `None` for anything but six
-/// digits.
-pub fn parse_code(text: &str) -> Option<u32> {
-    let digits: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    (digits.len() == CODE_DIGITS as usize && digits.chars().all(|c| c.is_ascii_digit())).then(|| digits.parse().ok()).flatten()
 }
 
 /// Random bytes from the system, for seeds and challenges. macOS, Linux and Android all have
@@ -153,17 +131,9 @@ mod tests {
     }
 
     #[test]
-    fn the_code_comes_from_the_public_key_and_has_six_digits() {
-        let a = Identity::from_seed([1; KEY_LEN]);
-        assert_eq!(a.code(), Identity::from_seed([1; KEY_LEN]).code());
-        assert!(a.code() < 1_000_000);
-        assert_ne!(a.code(), Identity::from_seed([2; KEY_LEN]).code());
+    fn a_code_is_shown_as_six_digits_with_a_space_in_the_middle() {
         assert_eq!(format_code(4829), "004 829");
-        assert_eq!(parse_code("004 829"), Some(4829));
-        assert_eq!(parse_code("004829"), Some(4829));
-        assert_eq!(parse_code("12345"), None);
-        assert_eq!(parse_code("12a456"), None);
-        assert_eq!(parse_code("1234567"), None);
+        assert_eq!(format_code(999_999), "999 999");
     }
 
     #[test]

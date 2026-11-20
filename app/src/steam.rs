@@ -53,6 +53,16 @@ pub fn game_support_outdated() -> bool {
     wine_ready() && is_older(game_support_installed().as_deref(), game_support_expected())
 }
 
+/// An error that tells the user to update the game support, while the installed one is older than
+/// this app expects. Nothing starts with an older game support: its runtime and the host speak
+/// different versions of the control protocol.
+pub fn require_current_game_support() -> Result<(), String> {
+    if game_support_outdated() {
+        return Err("The game support is older than this app expects. Press Update game support in the Play tab.".into());
+    }
+    Ok(())
+}
+
 /// Whether `installed` is older than `expected`. Versions are dates, "2026.11.19", with an optional
 /// fourth number for a second release on one day. A missing or unreadable version is older.
 fn is_older(installed: Option<&str>, expected: &str) -> bool {
@@ -234,10 +244,20 @@ fn vdf_value(text: &str, key: &str) -> Option<String> {
     })
 }
 
-/// The game's program: `<installdir>.exe` if present, else the largest .exe that is not a crash
-/// handler, installer or redistributable. The search goes three folders deep, as Serious Sam VR
-/// keeps its program in Bin/x64. A program in a 64-bit folder (x64, Win64) goes first.
+/// The launcher of Easy Anti-Cheat that a protected game ships. It starts the game with the protection on,
+/// as the developer set it up.
+const EAC_LAUNCHER: &str = "start_protected_game.exe";
+
+/// The game's program: the launcher of Easy Anti-Cheat if the game ships it, else `<installdir>.exe` if
+/// present, else the largest .exe that is not a crash handler, installer or redistributable. The search goes
+/// three folders deep, as Serious Sam VR keeps its program in Bin/x64. A program in a 64-bit folder (x64,
+/// Win64) goes first. A protected game starts through its launcher: the game's own program refuses to run
+/// without the anti-cheat, and cranvr never starts a protected game without it.
 fn find_exe(dir: &Path, installdir: &str) -> Option<PathBuf> {
+    let launcher = dir.join(EAC_LAUNCHER);
+    if launcher.exists() {
+        return Some(launcher);
+    }
     let named = dir.join(format!("{installdir}.exe"));
     if named.exists() {
         return Some(named);
@@ -281,7 +301,6 @@ fn game_wine(program: &str) -> Command {
     let settings = backend::Settings::load();
     let options = settings.launch.get(program).cloned().unwrap_or_default();
     let on = launch::opencomposite(&settings.wine, &options);
-    // An older game support has no OpenComposite: the Play tab then offers its update, so a start says nothing
     if let Err(e) = openvr::apply(&prefix(), on) {
         backend::notify(format!("cranvr could not set the OpenVR runtime: {e}"));
     }
@@ -326,6 +345,7 @@ fn log_file(name: &str) -> Stdio {
 /// Starts Steam with the flags BasaltVR found to work under Wine on macOS: no update at start
 /// (an update would replace the web helper shim), no file check, no CEF sandbox.
 pub fn start() -> Result<(), String> {
+    require_current_game_support()?;
     match state() {
         SteamState::Ready => {}
         SteamState::NoWine => return Err("Set up game support first".into()),
@@ -351,6 +371,7 @@ pub fn start() -> Result<(), String> {
 /// has a Steam check, so Steam starts first. A game with none (a program that the user added from a
 /// folder, with no ID in its options) starts without Steam.
 pub fn play(game: &Game) -> Result<(), String> {
+    require_current_game_support()?;
     let exe = game.exe.clone().ok_or(format!("No program found for {}", game.name))?;
     let program = mac_to_windows(&exe);
     let app_id = steam_id(&program, Some(&game.app_id));
@@ -383,6 +404,7 @@ pub fn run_program(path: &Path) -> Result<(), String> {
     if !wine_ready() {
         return Err("Set up game support first".into());
     }
+    require_current_game_support()?;
     let program = mac_to_windows(path);
     let mut command = game_wine(&program);
     if let Some(id) = steam_id(&program, backend::steam_app_id(path.parent().unwrap_or(path)).as_deref()) {
@@ -545,6 +567,19 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+
+    #[test]
+    fn a_protected_game_starts_through_the_launcher_of_its_anti_cheat() {
+        let dir = std::env::temp_dir().join(format!("cranvr-exe-eac-{}", std::process::id()));
+        fs::create_dir_all(dir.join("EasyAntiCheat")).unwrap();
+        fs::write(dir.join("Some Game.exe"), vec![0u8; 5000]).unwrap();
+        fs::write(dir.join("launch.exe"), vec![0u8; 100]).unwrap();
+        fs::write(dir.join("EasyAntiCheat/EasyAntiCheat_EOS_Setup.exe"), vec![0u8; 900]).unwrap();
+        assert_eq!(find_exe(&dir, "Some Game"), Some(dir.join("Some Game.exe")));
+        fs::write(dir.join("start_protected_game.exe"), vec![0u8; 400]).unwrap();
+        assert_eq!(find_exe(&dir, "Some Game"), Some(dir.join("start_protected_game.exe")));
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn finds_a_program_in_a_64_bit_subfolder() {

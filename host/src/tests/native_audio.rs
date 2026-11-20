@@ -20,7 +20,7 @@ fn the_sound_reaches_the_client_in_datagrams_of_five_milliseconds() {
     let config = Config {
         port,
         identity: cranvr_proto::identity::Identity::from_seed([7; 32]),
-        pairings: Arc::new(crate::pairing::Pairings::load(&std::env::temp_dir().join(format!("cranvr-native-audio-test-{port}")), None)),
+        pairings: Arc::new(crate::pairing::Pairings::load(&std::env::temp_dir().join(format!("cranvr-native-audio-test-{port}")))),
         name: "Test Mac".into(),
         discovery_port: None,
         approval_wait: Duration::from_secs(30),

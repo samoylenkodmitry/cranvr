@@ -5,7 +5,7 @@
 use cranvr_proto::{
     discovery::{find, Answer, Finder, Responder},
     identity::{fingerprint, Identity},
-    message::VersionRange,
+    PROTOCOL_VERSION,
 };
 use std::{
     net::{Ipv4Addr, SocketAddr, UdpSocket},
@@ -16,7 +16,7 @@ use std::{
 
 fn answer(name: &str, port: u16, seed: u8) -> Answer {
     Answer {
-        versions: VersionRange::OURS,
+        version: PROTOCOL_VERSION,
         port,
         fingerprint: fingerprint(&Identity::from_seed([seed; 32]).public_key()),
         nonce: 0,
@@ -65,7 +65,7 @@ fn a_finder_hears_the_name_the_port_and_the_fingerprint_of_a_host() {
     assert_eq!(found.socket_addr(), loopback(9961));
     assert_eq!(found.answer.name, "Dmitry's MacBook");
     assert_eq!(found.answer.fingerprint, fingerprint(&Identity::from_seed([7; 32]).public_key()));
-    assert_eq!(found.answer.versions, VersionRange::OURS);
+    assert_eq!(found.answer.version, PROTOCOL_VERSION);
 }
 
 #[test]

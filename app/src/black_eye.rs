@@ -1,10 +1,14 @@
 //! A game whose right eye stays black. The host looks at the game's pictures and sends a
 //! `black_eye` status line once for each game run (host/src/eye_check.rs). The app answers with
 //! the launch option "Each eye in its own pass": it turns the option on for the program, records
-//! why, shows a notice and starts the game again. When the option is on already, the picture is
-//! still black with it. The app then says so once and changes nothing, so no run ends in a loop.
-//! When the user turned the option off by hand, the choice stays the user's: the app only says how
-//! to fix the picture.
+//! why, shows a notice and starts the game again. When cranvr turned that option on and the picture
+//! is still black with it, the game draws both eyes into a texture of its own (a Unity game with the
+//! OpenVR provider does), which the option cannot reach. The app then turns the option off and turns
+//! on "Both eyes in one pass" (DXMT reports that a vertex shader may write the slice), and starts the
+//! game again. When the picture is still black with that option, the app says so once and changes
+//! nothing, so no run ends in a loop. When the user turned an option off by hand, or turned
+//! "Each eye in its own pass" on by hand, the choice stays the user's: the app only says how to fix
+//! the picture.
 //!
 //! The option is data of the program's launch options, as the Play tab shows it. Nothing here
 //! depends on which game it is.
@@ -15,6 +19,9 @@ use std::{collections::BTreeMap, time::Duration};
 /// The reason that the Options panel shows beside the option.
 pub const REASON: &str = "cranvr turned this on because the right eye stayed black.";
 
+/// The reason that the Options panel shows beside "Both eyes in one pass".
+pub const REASON_ONE_PASS: &str = "cranvr turned this on because the right eye stayed black with \"Each eye in its own pass\".";
+
 /// How long the notice stays in the window and in the console in VR.
 pub const NOTICE_TIME: Duration = Duration::from_secs(120);
 
@@ -23,8 +30,12 @@ pub const NOTICE_TIME: Duration = Duration::from_secs(120);
 pub enum Outcome {
     /// The option was off. It is on now, with its reason. The game starts again.
     Restart { program: String },
-    /// The option was on already: the right eye stays black with it. Nothing changes.
-    Leave { program: String },
+    /// "Each eye in its own pass" was on (cranvr's choice) and the right eye stays black. It is off now
+    /// and "Both eyes in one pass" is on. The game starts again.
+    Switch { program: String },
+    /// The option was on already: the right eye stays black with it. Nothing changes. `one_pass` tells
+    /// which option: "Both eyes in one pass" (true) or "Each eye in its own pass".
+    Leave { program: String, one_pass: bool },
     /// The user turned the option off by hand. Nothing changes.
     Declined { program: String },
     /// The host named no program, so no option can change.
@@ -38,8 +49,19 @@ pub fn apply(launch: &mut BTreeMap<String, GameOptions>, known: &[String], progr
     let Some(program) = program.filter(|program| !program.is_empty()) else { return Outcome::Unknown };
     let key = launch.keys().chain(known).find(|key| key.eq_ignore_ascii_case(program)).cloned().unwrap_or_else(|| program.to_owned());
     let options = launch.entry(key.clone()).or_default();
+    if options.eye_one_pass {
+        return Outcome::Leave { program: key, one_pass: true };
+    }
     if options.eye_per_pass {
-        return Outcome::Leave { program: key };
+        // Only cranvr's own choice gives way to the other option: a user's choice stays
+        if !options.eye_per_pass_reason.is_empty() && !options.eye_one_pass_declined {
+            options.eye_per_pass = false;
+            options.eye_per_pass_reason.clear();
+            options.eye_one_pass = true;
+            options.eye_one_pass_reason = REASON_ONE_PASS.to_owned();
+            return Outcome::Switch { program: key };
+        }
+        return Outcome::Leave { program: key, one_pass: false };
     }
     if options.eye_per_pass_declined {
         return Outcome::Declined { program: key };
@@ -63,8 +85,17 @@ pub fn notice(outcome: &Outcome, name: &str) -> Notice {
             format!("The right eye of {name} stayed black. cranvr turned on \"Each eye in its own pass\". The game starts again."),
             "The right eye stayed black. The game restarts.",
         ),
-        Outcome::Leave { .. } => (
-            format!("The right eye of {name} is still black with \"Each eye in its own pass\". cranvr leaves the game as it is."),
+        Outcome::Switch { .. } => (
+            format!(
+                "The right eye of {name} stayed black with \"Each eye in its own pass\". cranvr turned that off and turned on \"Both eyes in one pass\". The game starts again."
+            ),
+            "Still black. Another try. The game restarts.",
+        ),
+        Outcome::Leave { one_pass, .. } => (
+            format!(
+                "The right eye of {name} is still black with \"{}\". cranvr leaves the game as it is.",
+                if *one_pass { "Both eyes in one pass" } else { "Each eye in its own pass" }
+            ),
             "The right eye is still black. No restart.",
         ),
         Outcome::Declined { .. } => (
@@ -93,11 +124,11 @@ pub struct Response {
 pub fn respond(launch: &mut BTreeMap<String, GameOptions>, games: &[Game], program: Option<&str>) -> Response {
     let known: Vec<String> = games.iter().filter_map(crate::steam::program).collect();
     let outcome = apply(launch, &known, program);
-    let (Outcome::Restart { program } | Outcome::Leave { program } | Outcome::Declined { program }) = &outcome else {
+    let (Outcome::Restart { program } | Outcome::Switch { program } | Outcome::Leave { program, .. } | Outcome::Declined { program }) = &outcome else {
         return Response { notice: notice(&outcome, ""), restart: None };
     };
     let notice = notice(&outcome, &name(games, program));
-    let restart = matches!(outcome, Outcome::Restart { .. }).then(|| program.clone());
+    let restart = matches!(outcome, Outcome::Restart { .. } | Outcome::Switch { .. }).then(|| program.clone());
     Response { notice, restart }
 }
 
@@ -139,23 +170,44 @@ mod tests {
     }
 
     #[test]
-    fn a_second_report_with_the_option_on_restarts_nothing_and_changes_nothing() {
+    fn a_second_report_switches_to_both_eyes_in_one_pass_and_a_third_leaves_the_game() {
         let mut launch = BTreeMap::new();
         assert!(matches!(apply(&mut launch, &[], Some(PROGRAM)), Outcome::Restart { .. }));
-        let after_first = launch.clone();
+        // Still black with each eye in its own pass: the game owns a two-slice texture
+        assert_eq!(apply(&mut launch, &[], Some(PROGRAM)), Outcome::Switch { program: PROGRAM.into() });
+        let options = &launch[PROGRAM];
+        assert!(!options.eye_per_pass && options.eye_per_pass_reason.is_empty());
+        assert!(options.eye_one_pass);
+        assert_eq!(options.eye_one_pass_reason, REASON_ONE_PASS);
+        // The option reaches the game's environment, and the first one no longer does
+        let environment = crate::launch::environment(&Default::default(), options);
+        assert!(environment.iter().any(|(name, value)| name == "DXMT_RT_ARRAY_INDEX_FROM_ANY_SHADER" && value == "1"));
+        assert!(!environment.iter().any(|(name, _)| name == "BASALT_MAX_ARRAY_SIZE"));
+        // Still black with that too: nothing more changes, however often the report comes
+        let after_second = launch.clone();
         for _ in 0..3 {
-            assert_eq!(apply(&mut launch, &[], Some(PROGRAM)), Outcome::Leave { program: PROGRAM.into() });
+            assert_eq!(apply(&mut launch, &[], Some(PROGRAM)), Outcome::Leave { program: PROGRAM.into(), one_pass: true });
         }
-        assert_eq!(launch, after_first);
+        assert_eq!(launch, after_second);
+    }
+
+    #[test]
+    fn a_user_who_turned_one_pass_off_keeps_each_eye_in_its_own_pass() {
+        let mut launch = BTreeMap::new();
+        assert!(matches!(apply(&mut launch, &[], Some(PROGRAM)), Outcome::Restart { .. }));
+        launch.get_mut(PROGRAM).unwrap().eye_one_pass_declined = true;
+        assert_eq!(apply(&mut launch, &[], Some(PROGRAM)), Outcome::Leave { program: PROGRAM.into(), one_pass: false });
+        assert!(launch[PROGRAM].eye_per_pass && !launch[PROGRAM].eye_one_pass);
     }
 
     #[test]
     fn an_option_that_the_user_turned_on_counts_as_on() {
         let mut launch = BTreeMap::new();
         launch.insert(PROGRAM.to_owned(), GameOptions { eye_per_pass: true, ..Default::default() });
-        assert_eq!(apply(&mut launch, &[], Some(PROGRAM)), Outcome::Leave { program: PROGRAM.into() });
-        // The user's own choice has no reason from cranvr
+        assert_eq!(apply(&mut launch, &[], Some(PROGRAM)), Outcome::Leave { program: PROGRAM.into(), one_pass: false });
+        // The user's own choice has no reason from cranvr, and it stays
         assert_eq!(launch[PROGRAM].eye_per_pass_reason, "");
+        assert!(launch[PROGRAM].eye_per_pass && !launch[PROGRAM].eye_one_pass);
     }
 
     #[test]
@@ -183,7 +235,7 @@ mod tests {
         assert_eq!(apply(&mut launch, &listed, Some(PROGRAM)), Outcome::Restart { program: listed[0].clone() });
         assert!(launch.contains_key(&listed[0]) && launch.len() == 1);
         // The entry exists now: the same program in a third spelling finds it
-        assert_eq!(apply(&mut launch, &[], Some("c:\\games\\some game\\GAME.EXE")), Outcome::Leave { program: listed[0].clone() });
+        assert_eq!(apply(&mut launch, &[], Some("c:\\games\\some game\\GAME.EXE")), Outcome::Switch { program: listed[0].clone() });
     }
 
     #[test]
@@ -195,13 +247,17 @@ mod tests {
         assert_eq!(first.restart.as_deref(), Some(program));
         assert!(first.notice.window.contains("Some Game") && first.notice.window.contains("starts again"));
         assert_eq!(launch[program].eye_per_pass_reason, REASON);
-        // The game starts again with the option and is still black: the app leaves it
+        // The game starts again with the option and is still black: the app tries the other option once
+        let second = respond(&mut launch, std::slice::from_ref(&game), Some(program));
+        assert_eq!(second.restart.as_deref(), Some(program));
+        assert!(second.notice.window.contains("Both eyes in one pass") && second.notice.window.contains("Some Game"));
+        // Still black with that too: the app leaves it
         for _ in 0..3 {
             let later = respond(&mut launch, std::slice::from_ref(&game), Some(program));
             assert_eq!(later.restart, None);
             assert!(later.notice.window.contains("still black") && later.notice.window.contains("Some Game"));
         }
-        assert!(launch[program].eye_per_pass);
+        assert!(launch[program].eye_one_pass && !launch[program].eye_per_pass);
         // A report without a program restarts nothing either
         assert_eq!(respond(&mut launch, &[game], None).restart, None);
     }
@@ -210,10 +266,11 @@ mod tests {
     fn the_notice_says_what_happens() {
         let restart = notice(&Outcome::Restart { program: PROGRAM.into() }, "Some Game");
         assert!(restart.window.contains("Some Game") && restart.window.contains("starts again"));
-        let leave = notice(&Outcome::Leave { program: PROGRAM.into() }, "Some Game");
+        let leave = notice(&Outcome::Leave { program: PROGRAM.into(), one_pass: false }, "Some Game");
         assert!(leave.window.contains("still black") && leave.headset.contains("No restart"));
+        let switched = notice(&Outcome::Switch { program: PROGRAM.into() }, "Some Game");
         // The console in VR has one line of 45 characters or so
-        for text in [&restart.headset, &leave.headset, &notice(&Outcome::Unknown, "x").headset] {
+        for text in [&restart.headset, &leave.headset, &switched.headset, &notice(&Outcome::Unknown, "x").headset] {
             assert!(text.len() <= 50, "{text}");
         }
     }

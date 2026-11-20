@@ -1,0 +1,127 @@
+diff --git a/DrvOpenXR/XrController.cpp b/DrvOpenXR/XrController.cpp
+index 361d51d..8d52e92 100644
+--- a/DrvOpenXR/XrController.cpp
++++ b/DrvOpenXR/XrController.cpp
+@@ -1,5 +1,7 @@
+ #include "XrController.h"
+ 
++#include <atomic>
++
+ // HACK: grab the pose from BaseInput
+ #include "../OpenOVR/Misc/xrmoreutils.h"
+ #include "../OpenOVR/Reimpl/BaseInput.h"
+@@ -163,6 +165,17 @@ ITrackedDevice::TrackedDeviceType XrController::GetHand()
+ 
+ void XrController::GetPose(vr::ETrackingUniverseOrigin origin, vr::TrackedDevicePose_t* pose, ETrackingStateType trackingState)
+ {
++	// cranvr: the log tells when the source of a controller's pose changes. A game that gets no valid pose
++	// for a controller draws it at the origin, which is the floor. The count limits the lines.
++	static std::atomic<int> logLines{ 0 };
++	auto note = [&](int source, const char* what) {
++		if (source != lastPoseSource) {
++			lastPoseSource = source;
++			if (logLines++ < 60)
++				OOVR_LOGF("The %s controller's pose: %s", GetHand() == HAND_LEFT ? "left" : "right", what);
++		}
++	};
++
+ 	// Default to an invalid pose
+ 	ZeroMemory(pose, sizeof(*pose));
+ 	pose->bDeviceIsConnected = true;
+@@ -170,8 +183,10 @@ void XrController::GetPose(vr::ETrackingUniverseOrigin origin, vr::TrackedDevice
+ 	pose->eTrackingResult = vr::TrackingResult_Running_OutOfRange;
+ 
+ 	BaseInput* input = GetUnsafeBaseInput();
+-	if (input == nullptr)
++	if (input == nullptr) {
++		note(0, "the input system does not exist yet");
+ 		return;
++	}
+ 
+ 	// Lie and say the pose is valid if the actions haven't even been loaded yet.
+ 	// This is a workaround for games like DCS, which appear to require valid poses before
+@@ -187,20 +202,58 @@ void XrController::GetPose(vr::ETrackingUniverseOrigin origin, vr::TrackedDevice
+ 	// Specifically use grip pose, since that's what InteractionProfile::GetGripToSteamVRTransform uses
+ 	GetBaseInput()->GetHandSpace(DeviceIndex(), space, false);
+ 
+-	if (!space)
++	if (!space) {
++		note(1, input->AreActionsLoaded() ? "no action space (invalid)" : "the actions are not loaded yet (the pose says valid, with no position)");
+ 		return;
++	}
+ 
+ 	// Find the hand transform matrix, and include that
+ 	glm::mat4 transform = profile.GetGripToSteamVRTransform(GetHand());
+ 
+ 	if (xr_utils::PoseFromSpace(pose, space, origin, transform)) {
+ 		isPoseFromHandTracking = false;
++		{
++			std::lock_guard<std::mutex> lock(lastGoodPoseMutex);
++			lastGoodPose = *pose;
++			lastGoodPoseAt = std::chrono::steady_clock::now();
++		}
++		note(2, "valid, from the runtime's grip pose action");
++		return;
++	}
++
++	// cranvr: a controller that drops out for a moment stays where it was. An invalid pose is a zero matrix, and a game
++	// puts the controller at the origin, which is the floor. A pose that is at most 0.25 s old is held before the
++	// hand tracking pose, which lies elsewhere (the palm). A pose that hand tracking cannot replace is held for up to
++	// a second. Then it is invalid, as before. The held pose keeps no velocity.
++	auto hold = [&](std::chrono::milliseconds limit) {
++		using namespace std::chrono;
++		std::lock_guard<std::mutex> lock(lastGoodPoseMutex);
++		if (lastGoodPoseAt == steady_clock::time_point{} || steady_clock::now() - lastGoodPoseAt >= limit || !lastGoodPose.bPoseIsValid)
++			return false;
++		*pose = lastGoodPose;
++		pose->vVelocity = {};
++		pose->vAngularVelocity = {};
++		return true;
++	};
++	if (hold(std::chrono::milliseconds(250))) {
++		isPoseFromHandTracking = false;
++		note(5, "valid, held at its last place (the runtime has no pose of it for a moment)");
+ 		return;
+ 	}
+ 
+ 	// Fallback to pose from hand tracking if the controller one isn't valid
+ 	GetPoseFromHandTracking(input, pose);
+ 	isPoseFromHandTracking = true;
++	if (pose->bPoseIsValid) {
++		note(3, "valid, from hand tracking (the grip pose action has no position)");
++		return;
++	}
++	if (hold(std::chrono::milliseconds(1000))) {
++		isPoseFromHandTracking = false;
++		note(5, "valid, held at its last place (the runtime has no pose of it for a moment)");
++		return;
++	}
++	note(4, "invalid (the runtime has no grip pose and no hand)");
+ }
+ 
+ void XrController::GetPoseFromHandTracking(BaseInput* input, vr::TrackedDevicePose_t* pose)
+diff --git a/DrvOpenXR/XrController.h b/DrvOpenXR/XrController.h
+index 6686235..3fdc875 100644
+--- a/DrvOpenXR/XrController.h
++++ b/DrvOpenXR/XrController.h
+@@ -1,5 +1,8 @@
+ #pragma once
+ 
++#include <chrono>
++#include <mutex>
++
+ #include "Misc/Input/InteractionProfile.h"
+ #include "XrTrackedDevice.h"
+ 
+@@ -40,4 +43,11 @@ private:
+ 	const InteractionProfile& profile;
+ 	bool isHandTrackingValid = false;
+ 	bool isPoseFromHandTracking = false;
++	// cranvr: where the last pose came from, so the log tells when it changes (see GetPose)
++	int lastPoseSource = -1;
++	// cranvr: the last pose that a controller's grip pose action gave, and when. A pose that drops out for a moment
++	// stays where it was (see GetPose).
++	vr::TrackedDevicePose_t lastGoodPose = {};
++	std::chrono::steady_clock::time_point lastGoodPoseAt = {};
++	std::mutex lastGoodPoseMutex;
+ };

@@ -9,6 +9,7 @@ use crate::{
 };
 use cranpose::prelude::*;
 use cranpose::text::{FontWeight, TextUnit};
+use cranvr_common::controls::{Action as ControlAction, Control, Controls, Hand};
 use cranpose::widgets::{FlowRow, FlowSpec};
 use std::{
     thread,
@@ -122,20 +123,18 @@ fn change(settings: MutableState<Settings>, model: MutableState<Model>, edit: im
     let s = settings.with(Clone::clone);
     s.save();
     if backend::host_running() {
-        let result = backend::start_host(&s, None);
+        let result = backend::start_host(&s);
         model.update(|m| m.message = result.err());
     }
 }
 
-// A start by hand begins a fresh check of the network: old notices go away. A pairing code opens
-// the pairing window of the native protocol for this start only. It serves a headset with the older
-// cranvr app. The window's field for it is gone: a newer headset asks the user with a card.
-fn start_host(settings: MutableState<Settings>, model: MutableState<Model>, pair_code: Option<&str>) {
+// A start by hand begins a fresh check of the network: old notices go away.
+fn start_host(settings: MutableState<Settings>, model: MutableState<Model>) {
     model.update(|m| {
         m.network.clear();
         m.audio = None;
     });
-    let result = backend::start_host(&settings.with(Clone::clone), pair_code);
+    let result = backend::start_host(&settings.with(Clone::clone));
     model.update(|m| {
         m.running = result.is_ok();
         m.message = result.err();
@@ -145,7 +144,7 @@ fn start_host(settings: MutableState<Settings>, model: MutableState<Model>, pair
 /// Games see the headset only while the host runs.
 fn ensure_host(settings: MutableState<Settings>, model: MutableState<Model>) {
     if !backend::host_running() {
-        start_host(settings, model, None);
+        start_host(settings, model);
     }
 }
 
@@ -253,16 +252,7 @@ fn vr_requests(settings: MutableState<Settings>, next: &mut Model, requests: Vec
             }
             Some("set") => {
                 let before = settings.with(Clone::clone);
-                let mut after = before.clone();
-                if let Some(fps) = request["fps"].as_u64() {
-                    after.fps = fps as u32;
-                }
-                if let Some(scale) = request["game_scale"].as_f64() {
-                    after.game_scale = scale as f32;
-                }
-                if let Some(samples) = request["msaa"].as_u64() {
-                    after.game_msaa_limit = samples as u32;
-                }
+                let after = backend::apply_set_request(before.clone(), &request);
                 if after == before {
                     continue;
                 }
@@ -271,7 +261,7 @@ fn vr_requests(settings: MutableState<Settings>, next: &mut Model, requests: Vec
                 // The anti-aliasing limit applies at a game's start; the rest are the host's options
                 let host_options = |s: &Settings| (s.fps, s.game_scale.to_bits());
                 if host_options(&before) != host_options(&after) && backend::host_running() {
-                    if let Err(e) = backend::start_host(&after, None) {
+                    if let Err(e) = backend::start_host(&after) {
                         next.message = Some(e);
                     }
                 }
@@ -281,11 +271,23 @@ fn vr_requests(settings: MutableState<Settings>, next: &mut Model, requests: Vec
     }
 }
 
+/// The tab that the window opens on: the Play tab, or the one that `CRANVR_TAB` names (`play`,
+/// `desktop`, `settings`, `controls` or `log`). A test that takes a screen capture of a page uses it,
+/// because it cannot press the tab's button.
+fn start_tab() -> Tab {
+    match std::env::var("CRANVR_TAB").as_deref() {
+        Ok("desktop") => Tab::Desktop,
+        Ok("settings" | "controls") => Tab::Settings,
+        Ok("log") => Tab::Log,
+        _ => Tab::Play,
+    }
+}
+
 #[composable]
 pub fn CranvrApp() {
     let settings = rememberMutableStateOf(Settings::load);
     let model = rememberMutableStateOf(Model::default);
-    let tab = rememberMutableStateOf(|| Tab::Play);
+    let tab = rememberMutableStateOf(|| start_tab());
 
     LaunchedEffect((), async move |_| {
         // The choice comes first: a Mac set to Wi-Fi must not get a link in the thread's first look
@@ -301,7 +303,7 @@ pub fn CranvrApp() {
             }
         }
         if settings.with(|s| s.autostart) && !backend::host_running() {
-            start_host(settings, model, None);
+            start_host(settings, model);
         }
         let mut last_slow = Instant::now();
         loop {
@@ -358,7 +360,7 @@ fn Header(settings: MutableState<Settings>, model: MutableState<Model>) {
             });
         } else {
             Text("Host stopped".to_string(), Modifier::empty().padding(8.0), dim_style());
-            Primary("Start".into(), move || start_host(settings, model, None));
+            Primary("Start".into(), move || start_host(settings, model));
         }
     });
 }
@@ -528,8 +530,8 @@ fn PlayTab(settings: MutableState<Settings>, model: MutableState<Model>) {
     // The program whose launch options are open in the list of added games
     let added_open = rememberMutableStateOf(|| None::<String>);
     let plan = setup::plan(rosetta, state, outdated);
-    // Steam cannot start before the setup. An outdated game support alone leaves it working: the
-    // library shows an Update button then.
+    // Steam cannot start before the setup. An outdated game support starts nothing: the library
+    // shows the Update button alone then.
     let needs_setup = !rosetta || state != SteamState::Ready;
     let running = setup.as_ref().is_some_and(Setup::running);
     Card(move || {
@@ -705,6 +707,7 @@ fn SteamLibrary(settings: MutableState<Settings>, model: MutableState<Model>, la
     let open = rememberMutableStateOf(|| None::<String>);
     if outdated {
         GameSupportUpdate(installed, last);
+        return;
     }
     if !signed_in {
         Label(if running {
@@ -804,11 +807,28 @@ fn LaunchOptions(settings: MutableState<Settings>, program: String) {
             let shown = advanced.get();
             FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
                 let key = key.clone();
+                let one_key = key.clone();
                 Choice("Each eye in its own pass".into(), options.eye_per_pass, move || {
                     edit_launch(settings, &key, |o| {
                         o.eye_per_pass = !o.eye_per_pass;
                         o.eye_per_pass_declined = !o.eye_per_pass;
                         o.eye_per_pass_reason.clear();
+                        // The two options ask for opposite things
+                        if o.eye_per_pass {
+                            o.eye_one_pass = false;
+                            o.eye_one_pass_reason.clear();
+                        }
+                    })
+                });
+                Choice("Both eyes in one pass".into(), options.eye_one_pass, move || {
+                    edit_launch(settings, &one_key, |o| {
+                        o.eye_one_pass = !o.eye_one_pass;
+                        o.eye_one_pass_declined = !o.eye_one_pass;
+                        o.eye_one_pass_reason.clear();
+                        if o.eye_one_pass {
+                            o.eye_per_pass = false;
+                            o.eye_per_pass_reason.clear();
+                        }
                     })
                 });
                 Choice("Advanced".into(), shown, move || advanced.set(!shown));
@@ -816,7 +836,10 @@ fn LaunchOptions(settings: MutableState<Settings>, program: String) {
             if options.eye_per_pass && !options.eye_per_pass_reason.is_empty() {
                 Hint(options.eye_per_pass_reason.clone());
             }
-            Hint("For a game whose right eye stays black. The runtime then refuses two-eye images, so the game draws each eye apart. This costs frames.".into());
+            if options.eye_one_pass && !options.eye_one_pass_reason.is_empty() {
+                Hint(options.eye_one_pass_reason.clone());
+            }
+            Hint("For a game whose right eye stays black. \"Each eye in its own pass\": the runtime refuses two-eye images, so the game draws each eye apart. This costs frames. \"Both eyes in one pass\": for a game that draws both eyes into a picture of its own, as a Unity game with the OpenVR provider does.".into());
             let (own, default_on) = (options.opencomposite, wine.opencomposite);
             let key = program.clone();
             FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
@@ -1032,8 +1055,85 @@ fn DesktopTab(settings: MutableState<Settings>, model: MutableState<Model>) {
     });
 }
 
+/// The two pages of the Settings tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsPage {
+    General,
+    Controls,
+}
+
 #[composable]
 fn SettingsTab(settings: MutableState<Settings>, model: MutableState<Model>) {
+    let page = rememberMutableStateOf(|| {
+        if std::env::var("CRANVR_TAB").is_ok_and(|tab| tab == "controls") {
+            SettingsPage::Controls
+        } else {
+            SettingsPage::General
+        }
+    });
+    let current = page.get();
+    FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+        for (choice, name) in [(SettingsPage::General, "General"), (SettingsPage::Controls, "Controls")] {
+            Choice(name.into(), current == choice, move || page.set(choice));
+        }
+    });
+    match current {
+        SettingsPage::General => GeneralSettings(settings, model),
+        SettingsPage::Controls => ControlsPage(settings),
+    }
+}
+
+/// Changes one button of one controller. The headset gets the new mapping through `vr-menu.json`.
+/// The host keeps running: the mapping is the headset's business.
+fn set_control(settings: MutableState<Settings>, hand: Hand, control: Control, action: ControlAction) {
+    settings.update(|s| {
+        s.controls.set(hand, control, action);
+    });
+    settings.with(Settings::save);
+}
+
+fn reset_controls(settings: MutableState<Settings>) {
+    settings.update(|s| s.controls = Controls::default());
+    settings.with(Settings::save);
+}
+
+/// What each button of each controller does in the headset. A row lists the actions that the
+/// button can have and marks the current one. The headset's console has the same page.
+#[composable]
+fn ControlsPage(settings: MutableState<Settings>) {
+    let controls = settings.with(|s| s.controls);
+    Card(move || {
+        Heading("Controls".into());
+        Hint("Each button of each controller does one thing in the headset's own panels. A game that runs still gets every button. The Meta button belongs to the headset's system and is not listed.".into());
+        for hand in Hand::BOTH {
+            Heading(hand.label().to_string());
+            for control in Control::ALL.into_iter().filter(|control| control.exists(hand)) {
+                let current = controls.action(hand, control);
+                FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+                    Text(control.label(hand).to_string(), Modifier::empty().width(230.0).padding(8.0), TextStyle::default());
+                    for action in control.offers() {
+                        let action = *action;
+                        Choice(action.label().into(), current == action, move || set_control(settings, hand, control, action));
+                    }
+                });
+            }
+        }
+        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+            Action("Use the standard controls".into(), move || reset_controls(settings));
+        });
+    });
+    Card(move || {
+        Heading("What the actions do".into());
+        for action in ControlAction::ALL {
+            Hint(format!("{}: {}", action.label(), action.describe()));
+        }
+        Hint("A mouse action works on the Mac's desktop panel, where the controller points. The headset's own panels take the trigger as their click, whatever it is set to here. Show or hide panels, Open the console, Recenter and Keyboard work wherever the controller points. While the headset streams they need a hold of 0.8 seconds, so a short press still belongs to the game.".into());
+        Hint("The Mac has one mouse. The controller that holds a button keeps it, and the controller that presses next takes it. A change reaches the headset within a second.".into());
+    });
+}
+
+#[composable]
+fn GeneralSettings(settings: MutableState<Settings>, model: MutableState<Model>) {
     let s = settings.with(Clone::clone);
     let s1 = s.clone();
     // The way of the stream comes first: the cable is the choice that a user looks for

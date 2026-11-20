@@ -2,16 +2,17 @@
 //!
 //! The client sends a [`Query`] by UDP broadcast. Each host that runs the native protocol answers
 //! the sender with an [`Answer`]: its name, its TCP port, the start of its key's fingerprint and
-//! the protocol versions that it speaks. The client lists the answers. The user presses one, and
+//! its protocol version. The client lists the answers. The user presses one, and
 //! the client connects to the address that the answer came from, at the port in it.
 //!
 //! The answer proves nothing. Anyone on the network can send one. The handshake proves the host's
 //! key, and the approval of a new headset on the Mac (see [`crate::secure::approval_code`]) makes
 //! the user check that the headset talks to the Mac that it means.
 //!
-//! The bytes are fixed, not postcard, and they stay readable across protocol versions. A client
-//! needs the host's versions to say which side to update before it connects. A receiver ignores
-//! bytes after the fields that it knows. A new kind of message gets a new kind byte.
+//! The bytes are fixed, not postcard. After the magic and the kind comes the protocol version, in
+//! every release of this layout, so a client can say which side to update before it connects. A
+//! receiver ignores bytes after the fields that it knows. A new kind of message gets a new kind
+//! byte.
 //!
 //! A query is longer than any answer, so a host cannot serve to amplify a spoofed query. The client
 //! listens for answers to the queries that it sent, never for broadcasts, so it needs neither a
@@ -20,7 +21,7 @@
 
 use crate::{
     identity::{random_bytes, FINGERPRINT_LEN},
-    message::VersionRange,
+    PROTOCOL_VERSION,
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
@@ -41,7 +42,7 @@ pub const MAX_NAME: usize = 40;
 /// The length of a query. An answer is never longer.
 pub const QUERY_LEN: usize = 80;
 /// The bytes of an answer before its name
-const ANSWER_HEAD: usize = 4 + 1 + 2 + 2 + 2 + FINGERPRINT_LEN + 8 + 1;
+const ANSWER_HEAD: usize = 4 + 1 + 2 + 2 + FINGERPRINT_LEN + 8 + 1;
 /// How often a search repeats its query
 const ASK_EVERY: Duration = Duration::from_millis(250);
 
@@ -69,8 +70,8 @@ pub fn clean_name(name: &str) -> String {
 /// What a client asks: who is here?
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Query {
-    /// The protocol versions of the client
-    pub versions: VersionRange,
+    /// The protocol version of the client
+    pub version: u16,
     /// A number that the answer repeats, so a client takes only answers to its own queries
     pub nonce: u64,
 }
@@ -80,9 +81,8 @@ impl Query {
         let mut out = [0u8; QUERY_LEN];
         out[..4].copy_from_slice(&MAGIC);
         out[4] = KIND_QUERY;
-        out[5..7].copy_from_slice(&self.versions.min.to_le_bytes());
-        out[7..9].copy_from_slice(&self.versions.max.to_le_bytes());
-        out[9..17].copy_from_slice(&self.nonce.to_le_bytes());
+        out[5..7].copy_from_slice(&self.version.to_le_bytes());
+        out[7..15].copy_from_slice(&self.nonce.to_le_bytes());
         out
     }
 
@@ -91,15 +91,15 @@ impl Query {
         if bytes.len() < QUERY_LEN || bytes[..4] != MAGIC || bytes[4] != KIND_QUERY {
             return None;
         }
-        Some(Self { versions: VersionRange { min: read_u16(bytes, 5), max: read_u16(bytes, 7) }, nonce: read_u64(bytes, 9) })
+        Some(Self { version: read_u16(bytes, 5), nonce: read_u64(bytes, 7) })
     }
 }
 
 /// What a host answers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Answer {
-    /// The protocol versions of the host
-    pub versions: VersionRange,
+    /// The protocol version of the host
+    pub version: u16,
     /// The host's TCP port for the native protocol
     pub port: u16,
     /// The start of the hash of the host's key (see [`crate::identity::fingerprint`])
@@ -116,8 +116,7 @@ impl Answer {
         let mut out = Vec::with_capacity(ANSWER_HEAD + name.len());
         out.extend_from_slice(&MAGIC);
         out.push(KIND_ANSWER);
-        out.extend_from_slice(&self.versions.min.to_le_bytes());
-        out.extend_from_slice(&self.versions.max.to_le_bytes());
+        out.extend_from_slice(&self.version.to_le_bytes());
         out.extend_from_slice(&self.port.to_le_bytes());
         out.extend_from_slice(&self.fingerprint);
         out.extend_from_slice(&self.nonce.to_le_bytes());
@@ -133,10 +132,10 @@ impl Answer {
         }
         let name_len = bytes[ANSWER_HEAD - 1] as usize;
         let name = bytes.get(ANSWER_HEAD..ANSWER_HEAD + name_len).filter(|_| name_len <= MAX_NAME)?;
-        let fingerprint_at = 4 + 1 + 2 + 2 + 2;
+        let fingerprint_at = 4 + 1 + 2 + 2;
         Some(Self {
-            versions: VersionRange { min: read_u16(bytes, 5), max: read_u16(bytes, 7) },
-            port: read_u16(bytes, 9),
+            version: read_u16(bytes, 5),
+            port: read_u16(bytes, 7),
             fingerprint: bytes[fingerprint_at..fingerprint_at + FINGERPRINT_LEN].try_into().expect("eight bytes"),
             nonce: read_u64(bytes, fingerprint_at + FINGERPRINT_LEN),
             name: clean_name(std::str::from_utf8(name).ok()?),
@@ -221,7 +220,7 @@ impl Finder {
     /// Sends the query to every target. A target that the network refuses is skipped: a network
     /// without broadcast still has the other targets.
     pub fn ask(&self) {
-        let query = Query { versions: VersionRange::OURS, nonce: self.nonce }.to_bytes();
+        let query = Query { version: PROTOCOL_VERSION, nonce: self.nonce }.to_bytes();
         for target in &self.targets {
             self.socket.send_to(&query, target).ok();
         }
@@ -289,7 +288,7 @@ mod tests {
 
     fn answer() -> Answer {
         Answer {
-            versions: VersionRange { min: 4, max: 5 },
+            version: 8,
             port: 9950,
             fingerprint: [1, 2, 3, 4, 5, 6, 7, 8],
             nonce: 0xdead_beef_0102_0304,
@@ -299,7 +298,7 @@ mod tests {
 
     #[test]
     fn a_query_round_trips_and_has_the_length_of_the_longest_answer() {
-        let query = Query { versions: VersionRange { min: 4, max: 5 }, nonce: 77 };
+        let query = Query { version: 8, nonce: 77 };
         let bytes = query.to_bytes();
         assert_eq!(Query::parse(&bytes), Some(query));
         // The longest answer is not longer than a query: no amplification
@@ -319,7 +318,7 @@ mod tests {
     fn an_answer_round_trips() {
         let bytes = answer().to_bytes();
         assert_eq!(Answer::parse(&bytes), Some(answer()));
-        // Later versions may add fields: bytes after the name do not matter
+        // Bytes after the name do not matter
         let mut longer = bytes.clone();
         longer.extend_from_slice(b"more fields");
         assert_eq!(Answer::parse(&longer), Some(answer()));

@@ -9,7 +9,10 @@
 //     WaitGetPoses, Submit and PostPresentHandoff for the time that --seconds says.
 //   - It reads the head pose and, with --expect-input, the legacy controller state, which the
 //     scripted controllers of cranvr-probe move (a pull of the left grip, the right trigger at 0.75,
-//     the A button).
+//     the A button), and the controllers' poses in the array that WaitGetPoses fills, as a game with no
+//     action manifest reads them (valid in 90 percent of the frames before the last 8 seconds, the left
+//     one where the probe holds it, the right one swinging). The probe's head must stand still for
+//     this (cranvr-probe --still-head): the game's room is then the probe's room.
 //
 // The last line is "openvr_smoke: PASS" or "openvr_smoke: FAIL ...". The program takes no part of
 // Valve's code except the headers of OpenComposite's OpenVRHeaders (BSD 3-Clause).
@@ -34,7 +37,9 @@
 // returns of WaitGetPoses, as a histogram in periods of the display's refresh). --no-input leaves the
 // controller reads out to show what they cost.
 //
-// Usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--actions MODE] [--expect-hz N] [--format F]
+// --trace-poses prints the legacy pose of each controller (the poses that WaitGetPoses fills) every half second.
+//
+// Usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--trace-poses] [--actions MODE] [--expect-hz N] [--format F]
 //                         [--load-only --runtime DIR]
 
 #ifndef NOMINMAX
@@ -555,7 +560,7 @@ struct ActionTest {
 int main(int argc, char** argv)
 {
 	double seconds = 15;
-	bool expect_input = false, load_only = false, no_input = false;
+	bool expect_input = false, load_only = false, no_input = false, trace_poses = false;
 	std::string actions_mode;
 	float expect_hz = 0.0f;
 	DXGI_FORMAT texture_format = DXGI_FORMAT_R8G8B8A8_UNORM, view_format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -574,6 +579,8 @@ int main(int argc, char** argv)
 			}
 		} else if (!std::strcmp(argv[i], "--no-input")) {
 			no_input = true;
+		} else if (!std::strcmp(argv[i], "--trace-poses")) {
+			trace_poses = true;
 		} else if (!std::strcmp(argv[i], "--load-only")) {
 			load_only = true;
 		} else if (!std::strcmp(argv[i], "--format") && i + 1 < argc) {
@@ -697,9 +704,32 @@ int main(int argc, char** argv)
 		return fail("D3D11CreateDevice");
 	}
 
+	// An eye's picture has an upper half and a lower half that differ, so that the host's copy of the picture shows
+	// whether the runtime turned it over: the upper half has the eye's color (blue for the left eye, orange for the
+	// right), the lower half is nearly black. Each frame the upper 16 rows change, so that each frame differs.
+	const bool blue_first = texture_format == DXGI_FORMAT_B8G8R8A8_UNORM || texture_format == DXGI_FORMAT_B8G8R8A8_TYPELESS;
+	const auto pixel = [blue_first](uint8_t* out, float r, float g, float b) {
+		const auto byte = [](float v) { return static_cast<uint8_t>(std::lround(255.0f * std::min(1.0f, std::max(0.0f, v)))); };
+		out[blue_first ? 2 : 0] = byte(r);
+		out[1] = byte(g);
+		out[blue_first ? 0 : 2] = byte(b);
+		out[3] = 255;
+	};
+	constexpr uint32_t band_rows = 16;
 	ID3D11Texture2D* targets[2] = {};
 	ID3D11RenderTargetView* views[2] = {};
 	for (int i = 0; i < 2; i++) {
+		std::vector<uint8_t> picture(static_cast<size_t>(width) * height * 4);
+		for (uint32_t y = 0; y < height; y++) {
+			for (uint32_t x = 0; x < width; x++) {
+				if (y < height / 2) {
+					pixel(&picture[(static_cast<size_t>(y) * width + x) * 4], i == 0 ? 0.1f : 0.9f, 0.5f, i == 0 ? 0.9f : 0.1f);
+				} else {
+					pixel(&picture[(static_cast<size_t>(y) * width + x) * 4], 0.06f, 0.06f, 0.06f);
+				}
+			}
+		}
+		D3D11_SUBRESOURCE_DATA initial{ picture.data(), width * 4, 0 };
 		D3D11_TEXTURE2D_DESC desc{};
 		desc.Width = width;
 		desc.Height = height;
@@ -712,7 +742,7 @@ int main(int argc, char** argv)
 		D3D11_RENDER_TARGET_VIEW_DESC view_desc{};
 		view_desc.Format = view_format;
 		view_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-		if (FAILED(device->CreateTexture2D(&desc, nullptr, &targets[i])) || FAILED(device->CreateRenderTargetView(targets[i], &view_desc, &views[i]))) {
+		if (FAILED(device->CreateTexture2D(&desc, &initial, &targets[i])) || FAILED(device->CreateRenderTargetView(targets[i], &view_desc, &views[i]))) {
 			return fail("the render target of an eye");
 		}
 	}
@@ -726,6 +756,19 @@ int main(int argc, char** argv)
 	float eye_distance = 0.0f;
 	Clock::time_point last_eye_read = begin;
 	bool left_connected = false, right_connected = false, left_grip_pressed = false, a_pressed = false;
+	// A game that tells its controllers apart by their serial numbers (Serious Sam VR does) takes two controllers with one
+	// number for a single controller: the second stays where it has no pose. The head and the two controllers must differ.
+	// They are read once, while both controllers are there.
+	char serials[3][64] = {};
+	bool serials_read = false;
+	// The poses of the two controllers in the array that WaitGetPoses fills, as a game with no action manifest reads
+	// them: how often each was valid, from which frame on, how often it was lost, and where it was
+	// (the verdict counts the frames up to the last valid head pose: a program that runs longer than the headset's
+	// client, as a slow start on a busy Mac makes it, sees the controllers and the head leave in its last seconds)
+	uint64_t legacy_valid[2] = {}, legacy_first[2] = {}, legacy_lost[2] = {};
+	std::vector<uint8_t> controller_ok[2], head_ok;
+	bool legacy_was_valid[2] = {};
+	float legacy_x_min[2] = { 1e9f, 1e9f }, legacy_x_max[2] = { -1e9f, -1e9f }, legacy_y[2] = {};
 	vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
 	vr::EVRCompositorError first_error = vr::VRCompositorError_None;
 	// Where a frame's time goes, in seconds over the run
@@ -768,18 +811,24 @@ int main(int argc, char** argv)
 				first_error = wait;
 			}
 		}
-		if (poses[vr::k_unTrackedDeviceIndex_Hmd].bPoseIsValid && poses[vr::k_unTrackedDeviceIndex_Hmd].bDeviceIsConnected
-		    && finite_pose(poses[vr::k_unTrackedDeviceIndex_Hmd].mDeviceToAbsoluteTracking)) {
+		const bool head_valid = poses[vr::k_unTrackedDeviceIndex_Hmd].bPoseIsValid && poses[vr::k_unTrackedDeviceIndex_Hmd].bDeviceIsConnected
+		    && finite_pose(poses[vr::k_unTrackedDeviceIndex_Hmd].mDeviceToAbsoluteTracking);
+		head_ok.push_back(head_valid ? 1 : 0);
+		if (head_valid) {
 			valid_poses++;
 		}
 
 		// The two eyes differ, and each frame differs from the one before, so a frame that the
 		// host shows is a frame of this program
 		const float shade = static_cast<float>(frames % 120) / 120.0f;
-		const float left_color[4] = { 0.1f, 0.2f + 0.6f * shade, 0.9f, 1.0f };
-		const float right_color[4] = { 0.9f, 0.2f + 0.6f * shade, 0.1f, 1.0f };
-		context->ClearRenderTargetView(views[0], left_color);
-		context->ClearRenderTargetView(views[1], right_color);
+		for (int i = 0; i < 2; i++) {
+			std::vector<uint8_t> band(static_cast<size_t>(width) * band_rows * 4);
+			for (size_t p = 0; p < band.size(); p += 4) {
+				pixel(&band[p], i == 0 ? 0.1f : 0.9f, 0.2f + 0.6f * shade, i == 0 ? 0.9f : 0.1f);
+			}
+			const D3D11_BOX rows{ 0, 0, 0, width, band_rows, 1 };
+			context->UpdateSubresource(targets[i], 0, &rows, band.data(), width * 4, 0);
+		}
 		context->Flush();
 		draw_time += since(mark);
 
@@ -806,6 +855,46 @@ int main(int argc, char** argv)
 		const vr::TrackedDeviceIndex_t right = system->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
 		left_connected |= left != vr::k_unTrackedDeviceIndexInvalid && poses[left].bDeviceIsConnected && poses[left].bPoseIsValid;
 		right_connected |= right != vr::k_unTrackedDeviceIndexInvalid && poses[right].bDeviceIsConnected && poses[right].bPoseIsValid;
+		if (!serials_read && left_connected && right_connected && frames > 10) {
+			serials_read = true;
+			for (vr::TrackedDeviceIndex_t index = 0; index < 3; index++) {
+				vr::ETrackedPropertyError error = vr::TrackedProp_Success;
+				system->GetStringTrackedDeviceProperty(index, vr::Prop_SerialNumber_String, serials[index], sizeof(serials[index]), &error);
+			}
+		}
+		for (int i = 0; i < 2; i++) {
+			const vr::TrackedDeviceIndex_t index = i == 0 ? left : right;
+			const bool valid = index != vr::k_unTrackedDeviceIndexInvalid && poses[index].bDeviceIsConnected && poses[index].bPoseIsValid
+			    && finite_pose(poses[index].mDeviceToAbsoluteTracking);
+			if (legacy_was_valid[i] && !valid) {
+				legacy_lost[i]++;
+			}
+			legacy_was_valid[i] = valid;
+			controller_ok[i].push_back(valid ? 1 : 0);
+			if (valid) {
+				if (legacy_valid[i] == 0) {
+					legacy_first[i] = frames;
+				}
+				legacy_valid[i]++;
+				const auto& m = poses[index].mDeviceToAbsoluteTracking.m;
+				legacy_x_min[i] = std::min(legacy_x_min[i], m[0][3]);
+				legacy_x_max[i] = std::max(legacy_x_max[i], m[0][3]);
+				legacy_y[i] = m[1][3];
+			}
+		}
+		if (trace_poses && frames % 36 == 0) {
+			for (int i = 0; i < 2; i++) {
+				const vr::TrackedDeviceIndex_t index = i == 0 ? left : right;
+				if (index == vr::k_unTrackedDeviceIndexInvalid) {
+					say("pose of the %s controller: no device", i == 0 ? "left" : "right");
+					continue;
+				}
+				const auto& m = poses[index].mDeviceToAbsoluteTracking.m;
+				say("pose of the %s controller (device %u) at frame %llu: %s, connected %d, position (%.3f, %.3f, %.3f), first row (%.3f, %.3f, %.3f), result %d",
+				    i == 0 ? "left" : "right", index, static_cast<unsigned long long>(frames), poses[index].bPoseIsValid ? "valid" : "invalid",
+				    poses[index].bDeviceIsConnected, m[0][3], m[1][3], m[2][3], m[0][0], m[0][1], m[0][2], static_cast<int>(poses[index].eTrackingResult));
+			}
+		}
 		vr::VRControllerState_t state{};
 		if (!no_input && left != vr::k_unTrackedDeviceIndexInvalid && system->GetControllerState(left, &state, sizeof(state))) {
 			left_grip_pressed |= (state.ulButtonPressed & vr::ButtonMaskFromId(vr::k_EButton_Grip)) != 0;
@@ -885,6 +974,32 @@ int main(int argc, char** argv)
 	    right_connected ? "tracked" : "missing", max_right_trigger, left_grip_pressed ? "pressed" : "not pressed", max_left_grip_pulled,
 	    a_pressed ? "pressed" : "not pressed");
 
+	// The frames up to the last valid head pose count for the verdict
+	size_t judged = head_ok.size();
+	while (judged > 0 && !head_ok[judged - 1]) {
+		judged--;
+	}
+	uint64_t judged_head_valid = 0, judged_valid[2] = {}, judged_frames[2] = {};
+	for (size_t f = 0; f < judged; f++) {
+		judged_head_valid += head_ok[f];
+	}
+	for (int i = 0; i < 2; i++) {
+		for (size_t f = legacy_first[i] > 0 ? static_cast<size_t>(legacy_first[i]) - 1 : 0; f < judged && f < controller_ok[i].size(); f++) {
+			judged_frames[i]++;
+			judged_valid[i] += controller_ok[i][f];
+		}
+	}
+	for (int i = 0; i < 2; i++) {
+		say("the %s controller's pose in the poses of WaitGetPoses: %llu valid frames of %llu (first at frame %llu, %llu times lost; %llu of %llu frames up to the last valid head pose), x from %.3f to %.3f, y %.3f",
+		    i == 0 ? "left" : "right", static_cast<unsigned long long>(legacy_valid[i]), static_cast<unsigned long long>(frames),
+		    static_cast<unsigned long long>(legacy_first[i]), static_cast<unsigned long long>(legacy_lost[i]),
+		    static_cast<unsigned long long>(judged_valid[i]), static_cast<unsigned long long>(judged_frames[i]), legacy_x_min[i], legacy_x_max[i], legacy_y[i]);
+	}
+
+	say("serial numbers: head \"%s\", device 1 \"%s\", device 2 \"%s\"", serials[0], serials[1], serials[2]);
+	const bool serials_differ = serials_read && serials[1][0] != '\0' && std::strcmp(serials[1], serials[2]) != 0 && std::strcmp(serials[0], serials[1]) != 0
+	    && std::strcmp(serials[0], serials[2]) != 0;
+
 	say("the eyes are %.1f mm apart", eye_distance * 1000.0f);
 
 	for (int i = 0; i < 2; i++) {
@@ -901,8 +1016,11 @@ int main(int argc, char** argv)
 	if (wait_errors || submit_errors) {
 		return fail("the compositor reported errors");
 	}
-	if (valid_poses < frames * 9 / 10) {
+	if (judged_head_valid < judged * 9 / 10) {
 		return fail("the head pose was not valid in 90 percent of the frames");
+	}
+	if (!serials_differ) {
+		return fail("the head and the two controllers do not have serial numbers of their own");
 	}
 	if (!(eye_distance > 0.03f && eye_distance < 0.09f)) {
 		return fail("the eyes are not 3 to 9 cm apart");
@@ -927,6 +1045,23 @@ int main(int argc, char** argv)
 		}
 		if (!a_pressed) {
 			return fail("the A button was never pressed");
+		}
+		// A game with no action manifest takes its controllers' places from these poses. The probe's left grip stays
+		// at x -0.2 and its right grip swings 10 cm to each side of x 0.25, at heights near 1.2 and 1.1 (plus the floor).
+		for (int i = 0; i < 2; i++) {
+			if (legacy_valid[i] == 0 || judged_valid[i] < judged_frames[i] * 9 / 10) {
+				return fail(i == 0 ? "the left controller's pose was not valid in 90 percent of the frames"
+				                   : "the right controller's pose was not valid in 90 percent of the frames");
+			}
+			if (legacy_y[i] < 1.0f || legacy_y[i] > 1.7f) {
+				return fail("a controller's pose is not at the height where the probe holds it (the controller lies on the floor)");
+			}
+		}
+		if (std::fabs(legacy_x_min[0] - -0.2f) > 0.1f || legacy_x_max[0] - legacy_x_min[0] > 0.02f) {
+			return fail("the left controller's pose is not where the probe holds it");
+		}
+		if (legacy_x_max[1] - legacy_x_min[1] < 0.15f) {
+			return fail("the right controller's pose does not swing as the probe's does");
 		}
 	}
 	say("PASS");

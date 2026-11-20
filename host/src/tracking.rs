@@ -10,6 +10,7 @@
 
 use crate::{
     hand_controller,
+    hand_mask::PinchMask,
     headset::{Device, Headset},
     pose::{DeviceMotion, Pose, Quat, Vec3},
     runtime_link::RuntimeLink,
@@ -87,6 +88,10 @@ pub struct Hub {
     real: [bool; 2],
     /// The hand makes the game's controller now, and the last button values that it sent
     made: [Option<[f32; 3]>; 2],
+    /// The hands that the headset's app holds back from the game: a pinch of such a hand is the
+    /// panel's press, not the game's trigger
+    held: [bool; 2],
+    pinch_mask: PinchMask,
 }
 
 impl Hub {
@@ -102,12 +107,20 @@ impl Hub {
             seen: [None, None],
             real: [false; 2],
             made: [None, None],
+            held: [false; 2],
+            pinch_mask: PinchMask::default(),
         }
+    }
+
+    /// The headset's app says which hands it holds back from the game now.
+    pub fn set_held(&mut self, held: [bool; 2]) {
+        self.held = held;
     }
 
     /// The headset's app lost the input focus: no hand makes a controller, and the buttons that a
     /// hand made go back to 0 (Meta's rule: an app without the focus shows no controllers).
     pub fn pause(&mut self) {
+        self.pinch_mask.reset();
         self.seen = [None, None];
         for hand in 0..2 {
             self.release(hand);
@@ -220,7 +233,8 @@ impl Hub {
             return;
         }
         self.link.controller(ns, index as u32, &controller.grip, Some(&controller.aim));
-        let values = [controller.trigger, controller.squeeze, f32::from(controller.trigger > TOUCHING)];
+        let (trigger, squeeze) = self.pinch_mask.apply(index, self.held[index], controller.trigger, controller.squeeze);
+        let values = [trigger, squeeze, f32::from(trigger > TOUCHING)];
         let last = self.made[index].get_or_insert_with(|| {
             info!("Tracking: the {} hand makes the game's controller", if index == 0 { "left" } else { "right" });
             [f32::NAN; 3]

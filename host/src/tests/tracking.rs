@@ -65,15 +65,14 @@ struct Rig {
     events: std::sync::mpsc::Receiver<GameEvent>,
 }
 
-/// A hub with a game's runtime attached. `features` is what the runtime wrote to
-/// runtime-features.txt before it connected.
-fn rig(name: &str, features: &str, hand_controllers: bool) -> Rig {
+/// A hub with a game's runtime attached. The runtime writes runtime-features.txt before it connects.
+fn rig(name: &str, hand_controllers: bool) -> Rig {
     let dir = std::env::temp_dir().join(format!("cranvr-tracking-test-{name}-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     let (link, events) = RuntimeLink::start(&dir.join("control.txt"), (1600, 1700), 120, |_| ()).unwrap();
     let text = fs::read_to_string(link.control_file()).unwrap();
     let fields: Vec<&str> = text.split_whitespace().collect();
-    fs::write(dir.join("runtime-features.txt"), features).unwrap();
+    fs::write(dir.join("runtime-features.txt"), "aim tracking\n").unwrap();
     let mut runtime = TcpStream::connect(("127.0.0.1", fields[0].parse::<u16>().unwrap())).unwrap();
     let mut hello = PROTOCOL_VERSION.to_le_bytes().to_vec();
     hello.extend_from_slice(fields[1].as_bytes());
@@ -185,7 +184,7 @@ fn the_need_for_hands_comes_after_a_pause_and_stays_after_a_short_return() {
 
 #[test]
 fn features_that_no_game_uses_are_not_asked_for() {
-    let mut rig = rig("none", "aim tracking\n", true);
+    let mut rig = rig("none", true);
     rig.hub.on_offer(Features::ALL);
     // Both controllers tracked: no hand is needed, and no game uses any feature
     for i in 0..50u64 {
@@ -198,7 +197,7 @@ fn features_that_no_game_uses_are_not_asked_for() {
 
 #[test]
 fn a_game_with_hand_tracking_is_given_joints_and_no_controller() {
-    let mut rig = rig("joints", "aim tracking\n", true);
+    let mut rig = rig("joints", true);
     rig.hub.on_offer(Features::HANDS.union(Features::EYES));
     rig.game_uses(Features::HANDS);
     // The game's request is the wish, with no controller in sight
@@ -242,7 +241,7 @@ fn a_game_with_hand_tracking_is_given_joints_and_no_controller() {
 
 #[test]
 fn a_game_without_hand_code_gets_the_controller_that_a_hand_makes() {
-    let mut rig = rig("controller", "aim tracking\n", true);
+    let mut rig = rig("controller", true);
     rig.hub.on_offer(Features::HANDS);
     let ms = |n: u64| n * 1_000_000;
     // The headset tracks no controller. A game that has hand code creates its tracker in the
@@ -302,7 +301,7 @@ fn a_game_without_hand_code_gets_the_controller_that_a_hand_makes() {
 
 #[test]
 fn the_user_can_turn_off_controllers_made_of_hands() {
-    let mut rig = rig("off", "aim tracking\n", false);
+    let mut rig = rig("off", false);
     rig.hub.on_offer(Features::HANDS);
     for i in 0..600u64 {
         rig.hub.on_sample(i * 11_000_000, 0);
@@ -314,31 +313,8 @@ fn the_user_can_turn_off_controllers_made_of_hands() {
 }
 
 #[test]
-fn a_runtime_without_tracking_still_gets_a_controller_from_a_hand_in_the_old_messages() {
-    // The older runtime wrote only "aim"
-    let mut rig = rig("old", "aim\n", true);
-    rig.hub.on_offer(Features::HANDS);
-    for i in 0..600u64 {
-        rig.hub.on_sample(i * 11_000_000, 0);
-    }
-    assert_eq!(rig.headset.last_wish(), Features::HANDS);
-    rig.hub.on_tracked(hands(6_600_000_000, Some(tracked_hand([-0.2, 1.2, -0.4], 0.08)), None));
-    assert_eq!(rig.next().0, msg::CONTROLLER_MOTION_AIM);
-    // It never gets a message that it does not know
-    rig.hub.on_tracked(Tracked::Eyes(Eyes { sample_time: 1, display_time: 2, gaze: Some(ProtoPose::IDENTITY) }));
-    let mut kinds = Vec::new();
-    while let Ok((kind, _)) = {
-        rig.runtime.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
-        read_message(&mut rig.runtime)
-    } {
-        kinds.push(kind);
-    }
-    assert!(kinds.iter().all(|k| [msg::BUTTON_STATE, msg::INPUT_RESET, msg::INTERACTION_PROFILE].contains(k)), "{kinds:?}");
-}
-
-#[test]
 fn body_face_and_eyes_reach_the_runtime_when_the_game_uses_them() {
-    let mut rig = rig("others", "aim tracking\n", true);
+    let mut rig = rig("others", true);
     rig.hub.on_offer(Features::ALL);
     rig.game_uses(Features::FULL_BODY.union(Features::FACE).union(Features::EYES));
     rig.hub.on_sample(1_000_000, 3);
@@ -394,7 +370,7 @@ fn body_face_and_eyes_reach_the_runtime_when_the_game_uses_them() {
 
 #[test]
 fn the_runtime_learns_which_features_the_headset_offers_through_a_file() {
-    let mut rig = rig("file", "aim tracking\n", true);
+    let mut rig = rig("file", true);
     let file = rig.dir.join(TRACKING_FILE);
     assert!(!file.exists(), "no headset offered anything yet");
     rig.hub.on_offer(Features::HANDS.union(Features::EYES));
@@ -413,7 +389,7 @@ fn the_runtime_learns_which_features_the_headset_offers_through_a_file() {
 
 #[test]
 fn the_runtimes_request_ends_with_its_connection() {
-    let mut rig = rig("gone", "aim tracking\n", true);
+    let mut rig = rig("gone", true);
     rig.hub.on_offer(Features::ALL);
     rig.game_uses(Features::FACE);
     assert_eq!(rig.hub.on_sample(1, 3), 3);
@@ -432,7 +408,7 @@ fn the_runtimes_request_ends_with_its_connection() {
 
 #[test]
 fn a_game_that_creates_its_hand_tracker_in_the_first_seconds_sees_no_controller_come_and_go() {
-    let mut rig = rig("grace", "aim tracking\n", true);
+    let mut rig = rig("grace", true);
     rig.hub.on_offer(Features::HANDS);
     let ms = |n: u64| n * 1_000_000;
     // The headset tracks no controller and a hand. The game starts its tracker after 1.5 seconds.

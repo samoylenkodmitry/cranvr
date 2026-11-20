@@ -5,7 +5,8 @@
 use crate::{hub::Hub, settings};
 use cranvr_proto::{
     discovery::{broadcast_targets, find, Finder, Found, DEFAULT_PORT},
-    message::{VersionRange, UPDATE_HEADSET, UPDATE_MAC},
+    message::{peer_must_update, UPDATE_HEADSET, UPDATE_MAC},
+    PROTOCOL_VERSION,
 };
 use std::{
     net::SocketAddr,
@@ -30,21 +31,20 @@ pub struct FoundHost {
     pub address: SocketAddr,
     /// The start of the hash of the host's key
     pub fingerprint: [u8; 8],
-    /// The protocol versions of the host
-    pub versions: VersionRange,
+    /// The protocol version of the host
+    pub version: u16,
     /// This headset paired with the host before: it remembers the host's key
     pub paired: bool,
 }
 
 impl FoundHost {
-    /// What the user must do when this headset and the host speak no common protocol version.
-    /// `None` when they can talk.
+    /// What the user must do when the host speaks another protocol version than this headset: the
+    /// side with the older version updates. `None` when they can talk.
     pub fn update_advice(&self) -> Option<&'static str> {
-        let ours = VersionRange::OURS;
-        if ours.common(self.versions).is_some() {
+        if self.version == PROTOCOL_VERSION {
             return None;
         }
-        Some(if ours.peer_is_older(self.versions) { UPDATE_MAC } else { UPDATE_HEADSET })
+        Some(if peer_must_update(PROTOCOL_VERSION, self.version) { UPDATE_MAC } else { UPDATE_HEADSET })
     }
 
     /// The address as the connect panel's field takes it
@@ -68,7 +68,7 @@ fn host_of(found: &Found) -> FoundHost {
         name: found.answer.name.clone(),
         address: found.socket_addr(),
         fingerprint: found.answer.fingerprint,
-        versions: found.answer.versions,
+        version: found.answer.version,
         paired: settings::host_key_by_fingerprint(&found.answer.fingerprint).is_some(),
     }
 }
@@ -143,34 +143,29 @@ fn list(seen: &[(FoundHost, Instant)]) -> Vec<FoundHost> {
 mod tests {
     use super::*;
 
-    fn host(name: &str, port: u16, paired: bool, versions: VersionRange) -> FoundHost {
-        FoundHost { name: name.into(), address: ([192, 168, 1, 20], port).into(), fingerprint: [0; 8], versions, paired }
+    fn host(name: &str, port: u16, paired: bool, version: u16) -> FoundHost {
+        FoundHost { name: name.into(), address: ([192, 168, 1, 20], port).into(), fingerprint: [0; 8], version, paired }
     }
 
     #[test]
     fn a_host_of_the_same_protocol_needs_no_update() {
-        assert_eq!(host("Mac", 9950, false, VersionRange::OURS).update_advice(), None);
-        // A host that speaks only version 4 still talks to this client
-        assert_eq!(host("Mac", 9950, false, VersionRange { min: 4, max: 4 }).update_advice(), None);
+        assert_eq!(host("Mac", 9950, false, PROTOCOL_VERSION).update_advice(), None);
     }
 
     #[test]
     fn the_older_side_is_told_to_update() {
-        let ours = VersionRange::OURS;
-        let old = VersionRange { min: ours.min - 1, max: ours.min - 1 };
-        let new = VersionRange { min: ours.max + 1, max: ours.max + 2 };
-        assert_eq!(host("Mac", 9950, false, old).update_advice(), Some("Update cranvr on the Mac."));
-        assert_eq!(host("Mac", 9950, false, new).update_advice(), Some("Update the cranvr app on the headset."));
+        assert_eq!(host("Mac", 9950, false, PROTOCOL_VERSION - 1).update_advice(), Some("Update cranvr on the Mac."));
+        assert_eq!(host("Mac", 9950, false, PROTOCOL_VERSION + 1).update_advice(), Some("Update the cranvr app on the headset."));
     }
 
     #[test]
     fn a_host_on_this_machine_is_listed_once_by_its_network_address() {
         let now = Instant::now();
-        let mut local = host("Mac", 9950, false, VersionRange::OURS);
+        let mut local = host("Mac", 9950, false, PROTOCOL_VERSION);
         local.address = ([127, 0, 0, 1], 9950).into();
-        let network = host("Mac", 9950, false, VersionRange::OURS);
+        let network = host("Mac", 9950, false, PROTOCOL_VERSION);
         // A host that answered on loopback only stays, and so does another host of the same Mac on another port
-        let mut only_local = host("Other", 9962, false, VersionRange::OURS);
+        let mut only_local = host("Other", 9962, false, PROTOCOL_VERSION);
         only_local.address = ([127, 0, 0, 1], 9962).into();
         let seen = vec![(local, now), (network.clone(), now), (only_local.clone(), now)];
         assert_eq!(list(&seen), [network, only_local]);
@@ -180,9 +175,9 @@ mod tests {
     fn the_list_puts_paired_hosts_first_and_sorts_by_name() {
         let now = Instant::now();
         let seen = vec![
-            (host("zeta", 9950, false, VersionRange::OURS), now),
-            (host("Beta", 9950, false, VersionRange::OURS), now),
-            (host("Omega", 9950, true, VersionRange::OURS), now),
+            (host("zeta", 9950, false, PROTOCOL_VERSION), now),
+            (host("Beta", 9950, false, PROTOCOL_VERSION), now),
+            (host("Omega", 9950, true, PROTOCOL_VERSION), now),
         ];
         let names: Vec<_> = list(&seen).into_iter().map(|host| host.name).collect();
         assert_eq!(names, ["Omega", "Beta", "zeta"]);

@@ -5,19 +5,20 @@
 //! headset has one separate from the grip pose. Wire format: `runtime/pe/basalt_control_protocol.h`
 //! in BasaltVR.
 //!
-//! The aim pose is cranvr's extension (runtime patch 0004, message `CONTROLLER_MOTION_AIM`). A
-//! runtime without the patch drops the connection at a message that it does not know, so a runtime
-//! with the patch says so in `runtime-features.txt` next to the control file before it connects.
-//! The host sends the message only to such a runtime. Without it, a game gets the grip pose for
-//! its aim space too.
+//! The aim pose is cranvr's extension (runtime patch 0004, message `CONTROLLER_MOTION_AIM`). The
+//! runtime of the game support that this host belongs to has the patch, and the host sends the
+//! message to every runtime. A hand without an aim pose gets the plain grip message, so the game's
+//! aim space lies at the grip pose.
 //!
 //! Tracking of hands, body, face and eyes is cranvr's extension too (runtime patch 0005, messages 19
 //! to 23). The runtime tells the host which features its game uses (`TRACKING_REQUEST`), and the host
-//! sends their data. The runtime writes the word `tracking` to `runtime-features.txt`, and the host
-//! sends the data only to a runtime that did. The host also writes `tracking-features.txt` next to
-//! the control file: the features that the connected headset offers. The runtime reads it before a
-//! game creates its OpenXR instance, because the game asks for the instance's extensions first, and
-//! lists the extensions of those features only.
+//! sends their data. The host also writes `tracking-features.txt` next to the control file: the
+//! features that the connected headset offers. The runtime reads it before a game creates its OpenXR
+//! instance, because the game asks for the instance's extensions first, and lists the extensions of
+//! those features only.
+//!
+//! The runtime still writes `runtime-features.txt` next to the control file when it connects, as it
+//! did for hosts that asked. This host has no use for the file and takes it away.
 //!
 //! The runtime finds the host through a control file: "<port> <token> <eye width> <eye height>".
 //! The launcher passes the file's Windows path to the game in the `BASALT_CONTROL` variable.
@@ -123,7 +124,7 @@ fn forwards_haptic(quiet: &mut [bool; 2], hand: u32, amplitude: f32) -> bool {
     let Some(was_quiet) = quiet.get_mut(hand as usize) else {
         return false;
     };
-    let silent = !(amplitude > 0.0);
+    let silent = amplitude.is_nan() || amplitude <= 0.0;
     let forward = !(silent && *was_quiet);
     *was_quiet = silent;
     forward
@@ -154,6 +155,17 @@ pub struct InputCounts {
     pub tracking: [u32; 4],
     /// The features that the game asks for now
     pub requested: Features,
+    /// Where each hand's grip pose was at its last message, in millimeters, and how far it travelled since the last call.
+    /// A controller that lies on a table or reports a pose at the room's origin travels nothing.
+    pub at_mm: [[i32; 3]; 2],
+    pub moved_mm: [u32; 2],
+}
+
+/// The last grip position of a hand and the distance that it travelled since the stats line.
+#[derive(Clone, Copy, Default)]
+struct HandTravel {
+    at: Option<[f32; 3]>,
+    moved: f32,
 }
 
 #[derive(Default)]
@@ -164,6 +176,7 @@ struct InputCounters {
     buttons: AtomicU32,
     haptics: AtomicU32,
     tracking: [AtomicU32; 4],
+    travel: Mutex<[HandTravel; 2]>,
 }
 
 /// What the host knows about the headset, sent to each new runtime connection.
@@ -180,16 +193,10 @@ pub struct RuntimeLink {
     last_sent: Mutex<Instant>,
     calibration: Mutex<Calibration>,
     counters: InputCounters,
-    /// The connected runtime takes aim poses (see the top of the file)
-    aim_support: AtomicBool,
-    /// The connected runtime takes the tracking messages, and asks for them
-    tracking_support: AtomicBool,
     /// The tracking features that the connected game asks for: the bits of `Features`
     requested: AtomicU8,
     /// The tracking features that the connected headset offers, as the file tells the runtime
     offered: AtomicU8,
-    /// The host has already said that the runtime lacks aim poses, for this connection
-    aim_warned: AtomicBool,
     /// The runtime dropped the controllers' interaction profiles at an INPUT_RESET. The next pose
     /// of a controller sends them again.
     profiles_dropped: AtomicBool,
@@ -216,11 +223,8 @@ impl RuntimeLink {
             last_sent: Mutex::new(Instant::now()),
             calibration: Mutex::new(Calibration::default()),
             counters: InputCounters::default(),
-            aim_support: AtomicBool::new(false),
-            tracking_support: AtomicBool::new(false),
             requested: AtomicU8::new(0),
             offered: AtomicU8::new(0),
-            aim_warned: AtomicBool::new(false),
             profiles_dropped: AtomicBool::new(false),
             control_file: control_file.to_owned(),
             port,
@@ -238,7 +242,6 @@ impl RuntimeLink {
                     }
                     *link.writer.lock().unwrap() = None;
                     link.requested.store(0, Ordering::Relaxed);
-                    link.tracking_support.store(false, Ordering::Relaxed);
                     events.send(GameEvent::Disconnected).ok();
                 }
             })?;
@@ -312,27 +315,15 @@ impl RuntimeLink {
         let _session = r.u64()?;
         let len = r.u16()? as usize;
         let renderer = String::from_utf8_lossy(r.bytes(len)?).into_owned();
-        // The file names this game only: the host takes it away, so an older runtime that writes
-        // none leaves the game unnamed
+        // The file names this game only: the host takes it away, so a game whose runtime writes
+        // none stays unnamed
         let program_file = self.control_dir().join("game-program.txt");
         let program = fs::read_to_string(&program_file).ok().map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
         fs::remove_file(&program_file).ok();
-        // Likewise for the features: the file belongs to this game, and an older runtime writes none
-        let features_file = self.control_dir().join("runtime-features.txt");
-        let features = fs::read_to_string(&features_file).unwrap_or_default();
-        fs::remove_file(&features_file).ok();
-        let aim = features.split_whitespace().any(|feature| feature == "aim");
-        let tracking = features.split_whitespace().any(|feature| feature == "tracking");
-        self.aim_support.store(aim, Ordering::Relaxed);
-        self.aim_warned.store(false, Ordering::Relaxed);
-        self.tracking_support.store(tracking, Ordering::Relaxed);
+        // The file belongs to this game: the host has no use for it and takes it away
+        fs::remove_file(self.control_dir().join("runtime-features.txt")).ok();
         self.requested.store(0, Ordering::Relaxed);
-        info!(
-            "Game runtime connected: {renderer}, {}, {}, {}",
-            program.as_deref().unwrap_or("program not named"),
-            if aim { "takes aim poses" } else { "takes no aim poses" },
-            if tracking { "takes hand, body, face and eye tracking" } else { "takes no hand, body, face or eye tracking" }
-        );
+        info!("Game runtime connected: {renderer}, {}", program.as_deref().unwrap_or("program not named"));
 
         *self.last_sent.lock().unwrap() = Instant::now();
         *self.writer.lock().unwrap() = Some(stream.try_clone().map_err(|e| e.to_string())?);
@@ -454,19 +445,23 @@ impl RuntimeLink {
     }
 
     /// The pose of a controller's grip with its velocities and, when the headset reports one, the
-    /// aim pose. A runtime without aim poses gets the grip pose alone, and a game then finds its aim
-    /// space at the grip pose, as it did before aim poses existed.
+    /// aim pose. A hand without an aim pose sends the grip pose alone, and a game then finds its aim
+    /// space at the grip pose.
     pub fn controller(&self, timestamp_ns: u64, hand: u32, grip: &DeviceMotion, aim: Option<&DeviceMotion>) {
         if self.profiles_dropped.swap(false, Ordering::Relaxed) {
             self.send_profiles();
         }
         let index = (hand as usize).min(1);
         self.counters.poses[index].fetch_add(1, Ordering::Relaxed);
-        let supported = self.aim_support.load(Ordering::Relaxed);
-        if aim.is_some() && !supported && !self.aim_warned.swap(true, Ordering::Relaxed) {
-            warn!("Game runtime: it takes no aim poses, so the game finds its aim space at the grip pose. Install the newer game support.");
+        {
+            let mut travel = self.counters.travel.lock().unwrap();
+            let at = grip.pose.position;
+            let track = &mut travel[index];
+            if let Some(before) = track.at {
+                track.moved += ((at.x - before[0]).powi(2) + (at.y - before[1]).powi(2) + (at.z - before[2]).powi(2)).sqrt();
+            }
+            track.at = Some([at.x, at.y, at.z]);
         }
-        let aim = aim.filter(|_| supported);
         let mut p = timestamp_ns.to_le_bytes().to_vec();
         p.extend_from_slice(&hand.to_le_bytes());
         p.extend_from_slice(&0u32.to_le_bytes());
@@ -502,6 +497,14 @@ impl RuntimeLink {
     /// What went to the runtime and came back from it since the last call.
     pub fn take_counts(&self) -> InputCounts {
         let c = &self.counters;
+        let travel = {
+            let mut travel = c.travel.lock().unwrap();
+            let seen = *travel;
+            for track in travel.iter_mut() {
+                track.moved = 0.0;
+            }
+            seen
+        };
         InputCounts {
             poses: [c.poses[0].swap(0, Ordering::Relaxed), c.poses[1].swap(0, Ordering::Relaxed)],
             aim_poses: [c.aim_poses[0].swap(0, Ordering::Relaxed), c.aim_poses[1].swap(0, Ordering::Relaxed)],
@@ -510,6 +513,8 @@ impl RuntimeLink {
             haptics: c.haptics.swap(0, Ordering::Relaxed),
             tracking: std::array::from_fn(|i| c.tracking[i].swap(0, Ordering::Relaxed)),
             requested: self.requested_tracking(),
+            at_mm: travel.map(|t| t.at.map_or([0; 3], |at| at.map(|v| (v * 1000.0).round() as i32))),
+            moved_mm: travel.map(|t| (t.moved * 1000.0).round() as u32),
         }
     }
 
@@ -542,7 +547,7 @@ impl RuntimeLink {
     /// One hand of a tracking sample, or `None` while the headset does not track it. `root` is the
     /// pose of the wrist with its velocities. The joints lie in the host's room.
     pub fn hand(&self, timestamp_ns: u64, hand: u32, tracked: Option<(&DeviceMotion, &[Joint; HAND_JOINTS])>) {
-        if !self.tracking_support.load(Ordering::Relaxed) {
+        if !self.is_connected() {
             return;
         }
         self.counters.tracking[0].fetch_add(1, Ordering::Relaxed);
@@ -558,7 +563,7 @@ impl RuntimeLink {
 
     /// The body of a tracking sample. `root` is the pose of the first joint with its velocities.
     pub fn body(&self, timestamp_ns: u64, root: &DeviceMotion, body: &Body, joints: &[Joint]) {
-        if !self.tracking_support.load(Ordering::Relaxed) || ![BODY_JOINTS, FULL_BODY_JOINTS].contains(&joints.len()) {
+        if !self.is_connected() || ![BODY_JOINTS, FULL_BODY_JOINTS].contains(&joints.len()) {
             return;
         }
         self.counters.tracking[1].fetch_add(1, Ordering::Relaxed);
@@ -573,7 +578,7 @@ impl RuntimeLink {
 
     /// The face of a tracking sample
     pub fn face(&self, timestamp_ns: u64, face: &Face, weights: &[f32; FACE_WEIGHTS]) {
-        if !self.tracking_support.load(Ordering::Relaxed) {
+        if !self.is_connected() {
             return;
         }
         self.counters.tracking[2].fetch_add(1, Ordering::Relaxed);
@@ -588,7 +593,7 @@ impl RuntimeLink {
 
     /// The gaze of a tracking sample, or `None` while the headset has none
     pub fn eyes(&self, timestamp_ns: u64, eyes: &Eyes) {
-        if !self.tracking_support.load(Ordering::Relaxed) {
+        if !self.is_connected() {
             return;
         }
         self.counters.tracking[3].fetch_add(1, Ordering::Relaxed);
@@ -810,13 +815,11 @@ mod tests {
     }
 
     /// A fake runtime that connected to `link`'s control file and got the hello reply and the two
-    /// controller profiles. `features` is what it wrote to runtime-features.txt before it connected.
-    fn connected_runtime(link: &RuntimeLink, features: Option<&str>) -> TcpStream {
+    /// controller profiles. The runtime writes runtime-features.txt before it connects.
+    fn connected_runtime(link: &RuntimeLink) -> TcpStream {
         let text = fs::read_to_string(link.control_file()).unwrap();
         let fields: Vec<&str> = text.split_whitespace().collect();
-        if let Some(features) = features {
-            fs::write(link.control_dir().join("runtime-features.txt"), features).unwrap();
-        }
+        fs::write(link.control_dir().join("runtime-features.txt"), "aim\ntracking\n").unwrap();
         let mut runtime = TcpStream::connect(("127.0.0.1", fields[0].parse::<u16>().unwrap())).unwrap();
         let mut hello = PROTOCOL_VERSION.to_le_bytes().to_vec();
         hello.extend_from_slice(fields[1].as_bytes());
@@ -835,11 +838,11 @@ mod tests {
     }
 
     #[test]
-    fn a_runtime_that_announces_aim_poses_gets_both_poses_of_a_hand_in_one_message() {
+    fn a_runtime_gets_both_poses_of_a_hand_in_one_message() {
         let dir = std::env::temp_dir().join(format!("cranvr-link-aim-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let (link, events) = RuntimeLink::start(&dir.join("control.txt"), (1600, 1700), 120, |_| ()).unwrap();
-        let mut runtime = connected_runtime(&link, Some("aim\n"));
+        let mut runtime = connected_runtime(&link);
         assert!(matches!(events.recv_timeout(Duration::from_secs(2)).unwrap(), GameEvent::Connected { .. }));
         assert!(!dir.join("runtime-features.txt").exists(), "the host takes the file away");
 
@@ -862,7 +865,7 @@ mod tests {
         // The grip pose first, then the aim pose, each with its velocities
         assert_eq!(values[..13], expected(&grip)[..]);
         assert_eq!(values[13..], expected(&aim)[..]);
-        // A hand without an aim pose sends the old message
+        // A hand without an aim pose sends the message of the grip pose alone
         link.controller(100, 0, &grip, None);
         let (kind, payload) = read_message(&mut runtime).unwrap();
         assert_eq!((kind, payload.len()), (msg::CONTROLLER_MOTION, 8 + 4 + 4 + 13 * 4));
@@ -875,7 +878,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cranvr-link-reset-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let (link, _events) = RuntimeLink::start(&dir.join("control.txt"), (1600, 1700), 120, |_| ()).unwrap();
-        let mut runtime = connected_runtime(&link, Some("aim\n"));
+        let mut runtime = connected_runtime(&link);
         let motion = DeviceMotion { pose: Pose { orientation: Quat::IDENTITY, position: Vec3::new(0.2, 1.2, -0.4) }, linear_velocity: Vec3::ZERO, angular_velocity: Vec3::ZERO };
         // No pose flows, as while the user sets up the room: the keepalive resets the input
         assert_eq!(read_message(&mut runtime).unwrap().0, msg::INPUT_RESET);
@@ -885,23 +888,6 @@ mod tests {
         // The profiles go once per reset
         link.controller(8, 1, &motion, Some(&motion));
         assert_eq!(read_message(&mut runtime).unwrap().0, msg::CONTROLLER_MOTION_AIM);
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn a_runtime_without_aim_poses_gets_the_grip_pose_alone() {
-        let dir = std::env::temp_dir().join(format!("cranvr-link-noaim-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let (link, _events) = RuntimeLink::start(&dir.join("control.txt"), (1600, 1700), 120, |_| ()).unwrap();
-        // An older runtime writes no features file. It would drop the connection at message 18.
-        let mut runtime = connected_runtime(&link, None);
-        let motion = DeviceMotion { pose: Pose { orientation: Quat::IDENTITY, position: Vec3::new(0.2, 1.2, -0.4) }, linear_velocity: Vec3::ZERO, angular_velocity: Vec3::ZERO };
-        for _ in 0..2 {
-            link.controller(5, 1, &motion, Some(&motion));
-            let (kind, payload) = read_message(&mut runtime).unwrap();
-            assert_eq!((kind, payload.len()), (msg::CONTROLLER_MOTION, 8 + 4 + 4 + 13 * 4));
-        }
-        assert_eq!(link.take_counts().aim_poses, [0, 0]);
         fs::remove_dir_all(&dir).ok();
     }
 

@@ -4,6 +4,7 @@ use crate::{
     launch::{GameOptions, WineOptions},
     usb::Connection,
 };
+use cranvr_common::controls::Controls;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -84,6 +85,10 @@ pub struct Settings {
     /// A game without hand tracking gets controllers made of the headset's tracked hands, while the
     /// headset tracks no controller
     pub hand_controllers: bool,
+    /// What each button of each controller does in the headset's panels (see
+    /// `cranvr_common::controls`). The Controls page of the Settings tab and the headset's console
+    /// change it. The host sends it to the headset in `vr-menu.json`.
+    pub controls: Controls,
     /// The launch options of each Windows program, by its Windows path. A program with no entry
     /// starts with the default options.
     pub launch: BTreeMap<String, GameOptions>,
@@ -112,6 +117,7 @@ impl Default for Settings {
             game_msaa_limit: 2,
             unscale_displays: true,
             hand_controllers: true,
+            controls: Controls::default(),
             launch: BTreeMap::new(),
             wine: WineOptions::default(),
             added_games: Vec::new(),
@@ -387,17 +393,13 @@ pub fn answer_pairing(key: &str, allow: bool) {
     }
 }
 
-/// The command line of `cranvr-host`. `pair_code` opens the pairing window for a headset of the
-/// older cranvr app, which has no Allow button. `test` is for tests on one Mac: the probe needs no
-/// pairing and TCP media.
-fn host_args(settings: &Settings, pair_code: Option<&str>, config_dir: &Path, test: bool) -> Vec<OsString> {
+/// The command line of `cranvr-host`. `test` is for tests on one Mac: the probe needs no pairing and
+/// TCP media.
+fn host_args(settings: &Settings, config_dir: &Path, test: bool) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![];
     args.extend(["--status", "--fps", &settings.fps.to_string(), "--mbps", &settings.mbps.to_string()].map(OsString::from));
     if native_port() != NATIVE_PORT {
         args.extend(["--native-port".into(), native_port().to_string().into()]);
-    }
-    if let Some(code) = pair_code {
-        args.extend(["--pair", code].map(OsString::from));
     }
     args.extend(["--config-dir".into(), config_dir.as_os_str().to_owned()]);
     if test {
@@ -428,12 +430,11 @@ fn host_args(settings: &Settings, pair_code: Option<&str>, config_dir: &Path, te
     args
 }
 
-/// Starts the host with these settings, after stopping a running one. See `host_args` for the
-/// pairing code.
-pub fn start_host(settings: &Settings, pair_code: Option<&str>) -> Result<(), String> {
+/// Starts the host with these settings, after stopping a running one.
+pub fn start_host(settings: &Settings) -> Result<(), String> {
     stop_host();
     let mut command = Command::new(host_binary()?);
-    command.args(host_args(settings, pair_code, &config_dir(), env::var_os("CRANVR_TEST_TRUST_ALL").is_some()));
+    command.args(host_args(settings, &config_dir(), env::var_os("CRANVR_TEST_TRUST_ALL").is_some()));
     let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
     *HOST_INPUT.lock().unwrap() = child.stdin.take();
     let sender = channel().0.clone();
@@ -513,11 +514,30 @@ fn vr_menu(settings: &Settings, games: &[crate::steam::Game], notice: Option<&st
         "fps": settings.fps,
         "game_scale": settings.game_scale,
         "msaa": settings.game_msaa_limit,
+        "controls": settings.controls,
     });
     if let Some(notice) = notice {
         menu["notice"] = notice.into();
     }
     menu.to_string()
+}
+
+/// The settings after a request of the console in VR with the action "set". A field that the
+/// request lacks keeps its value. A `controls` value that is no mapping changes nothing.
+pub fn apply_set_request(mut settings: Settings, request: &Value) -> Settings {
+    if let Some(fps) = request["fps"].as_u64() {
+        settings.fps = fps as u32;
+    }
+    if let Some(scale) = request["game_scale"].as_f64() {
+        settings.game_scale = scale as f32;
+    }
+    if let Some(samples) = request["msaa"].as_u64() {
+        settings.game_msaa_limit = samples as u32;
+    }
+    if let Some(controls) = request.get("controls").and_then(|controls| Controls::from_json(&controls.to_string())) {
+        settings.controls = controls;
+    }
+    settings
 }
 
 pub fn stop_host() {
@@ -686,30 +706,27 @@ mod tests {
         assert_eq!(model.network, ["no UDP", "tunnel"]);
     }
 
-    fn host_options(settings: &Settings, pair_code: Option<&str>) -> Vec<String> {
-        host_args(settings, pair_code, Path::new("/cfg"), false).into_iter().map(|a| a.to_string_lossy().into_owned()).collect()
+    fn host_options(settings: &Settings) -> Vec<String> {
+        host_args(settings, Path::new("/cfg"), false).into_iter().map(|a| a.to_string_lossy().into_owned()).collect()
     }
 
     #[test]
-    fn the_host_gets_its_arguments_with_or_without_a_pairing_code() {
-        let without = host_options(&Settings::default(), None);
+    fn the_host_gets_its_arguments() {
+        let args = host_options(&Settings::default());
         assert_eq!(
-            without,
+            args,
             ["--status", "--fps", "120", "--mbps", "100", "--config-dir", "/cfg", "--game-scale", "0.7", "--desktop", "--desktop-fps", "30"]
         );
-        let with = host_options(&Settings::default(), Some("482913"));
-        assert_eq!(with[5..7], ["--pair", "482913"]);
-        assert_eq!(with.len(), without.len() + 2);
         // `--tcp` would force TCP media on every client: only a test asks for it
-        assert!(!without.contains(&"--tcp".to_string()));
-        let test = host_args(&Settings::default(), None, Path::new("/cfg"), true);
+        assert!(!args.contains(&"--tcp".to_string()));
+        let test = host_args(&Settings::default(), Path::new("/cfg"), true);
         assert!(test.iter().any(|a| a == "--tcp") && test.iter().any(|a| a == "--trust-all"));
     }
 
     #[test]
     fn the_settings_reach_the_host() {
         let quiet = Settings { foveation: false, game_audio: false, hand_controllers: false, virtual_display: Some((1920, 1080)), ..Default::default() };
-        let args = host_options(&quiet, None);
+        let args = host_options(&quiet);
         for wanted in ["--no-foveation", "--no-game-audio", "--no-hand-controllers", "--virtual-display", "1920x1080"] {
             assert!(args.contains(&wanted.to_string()), "{wanted} in {args:?}");
         }
@@ -722,13 +739,40 @@ mod tests {
     }
 
     #[test]
+    fn the_controls_travel_with_the_menu_and_come_back_with_a_request() {
+        use cranvr_common::controls::{Action, Control, Hand};
+        let mut settings = Settings::default();
+        // A file without `controls` gets the standard mapping
+        let partial: Settings = serde_json::from_str(r#"{"fps": 90}"#).unwrap();
+        assert_eq!((partial.fps, partial.controls), (90, Controls::default()));
+        settings.controls.set(Hand::Right, Control::Secondary, Action::Keyboard);
+        let menu: Value = serde_json::from_str(&vr_menu(&settings, &[], None)).unwrap();
+        assert_eq!(menu["controls"]["right"]["secondary"], "keyboard");
+        assert_eq!(menu["controls"]["left"]["menu"], "console");
+        // The headset sends the whole mapping back as it changed it
+        let mut changed = settings.controls;
+        assert!(changed.set(Hand::Left, Control::Grip, Action::Recenter));
+        let request = serde_json::json!({"action": "set", "controls": changed});
+        let after = apply_set_request(settings.clone(), &request);
+        assert_eq!(after.controls.left.grip, Action::Recenter);
+        assert_eq!(after.controls.right.secondary, Action::Keyboard);
+        assert_eq!((after.fps, after.game_scale), (settings.fps, settings.game_scale));
+        // A value that is no mapping, and a request without one, change nothing
+        assert_eq!(apply_set_request(settings.clone(), &serde_json::json!({"controls": 5})), settings);
+        assert_eq!(apply_set_request(settings.clone(), &serde_json::json!({"action": "set"})), settings);
+        // The other settings travel in the same request
+        let both = apply_set_request(settings.clone(), &serde_json::json!({"fps": 72, "controls": changed}));
+        assert_eq!((both.fps, both.controls), (72, changed));
+    }
+
+    #[test]
     fn the_hosts_native_line_shows_the_paired_headsets_and_the_one_that_waits() {
         let mut model = Model::default();
-        model.apply_status(&serde_json::json!({"type": "native", "port": 9950, "paired": [], "pairing_s": null, "pending": []}));
+        model.apply_status(&serde_json::json!({"type": "native", "port": 9950, "paired": [], "pending": []}));
         let native = model.native.clone().unwrap();
         assert_eq!((native.port, native.paired.len(), native.pending.len()), (9950, 0, 0));
         model.apply_status(&serde_json::json!({
-            "type": "native", "port": 9951, "paired": ["Meta Quest 3"], "pairing_s": null,
+            "type": "native", "port": 9951, "paired": ["Meta Quest 3"],
             "pending": [{"key": "ab12", "name": "Meta Quest 3", "ip": "192.168.1.30", "code": "482 913"}, {"name": "no key"}]
         }));
         let native = model.native.unwrap();
@@ -797,20 +841,8 @@ mod tests {
         assert_eq!(serde_json::from_str::<Settings>(r#"{"connection": "Usb"}"#).unwrap().connection, Connection::Usb);
     }
 
-    // The settings of the retired choices of headset app, stream protocol, low latency and trusted
-    // names stay in an old app.json. The app reads the file as before and drops the keys when it
-    // saves.
     #[test]
-    fn a_settings_file_with_the_retired_keys_loads() {
-        let old = serde_json::from_str::<Settings>(
-            r#"{"fps": 90, "headset_app": "Alvr", "stream_protocol": "Tcp", "low_latency": true, "trusted": ["1234.client"]}"#,
-        )
-        .unwrap();
-        assert_eq!(old.fps, 90);
-        let saved = serde_json::to_string(&old).unwrap();
-        for retired in ["headset_app", "stream_protocol", "low_latency", "trusted"] {
-            assert!(!saved.contains(retired), "{retired} in {saved}");
-        }
+    fn a_settings_file_saves_and_loads_what_it_holds() {
         assert_eq!(serde_json::from_str::<Settings>(&serde_json::to_string(&Settings::default()).unwrap()).unwrap(), Settings::default());
         assert!(serde_json::from_str::<Settings>(r#"{"fps": 90}"#).unwrap().autostart);
     }
@@ -858,7 +890,7 @@ mod tests {
         // The user's host keeps port 9950
         env::set_var("CRANVR_NATIVE_PORT", "9962");
         let settings = Settings { fps: 72, desktop: false, ..Default::default() };
-        start_host(&settings, None).expect("host starts");
+        start_host(&settings).expect("host starts");
         std::thread::sleep(std::time::Duration::from_secs(2));
         let probe_home = home.join("probe");
         fs::create_dir_all(&probe_home).unwrap();

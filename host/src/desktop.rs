@@ -1,11 +1,13 @@
 //! The Mac desktop in VR. ScreenCaptureKit captures the main display, the renderer shows the
-//! newest capture on a flat screen in front of the user, and the right controller works as a
-//! mouse: point to move the cursor, pull the trigger to click, push the thumbstick to scroll.
+//! newest capture on a flat screen in front of the user, and a controller works as a mouse: point
+//! to move the cursor, press a button to click with the left, right or middle mouse button, lean the
+//! thumbstick to scroll up, down and to the sides.
 //!
 //! macOS asks for two permissions on first use: Screen Recording (for the capture) and
 //! Accessibility (for the mouse events). Without Accessibility the screen still shows.
 
 use crate::pose::{Pose, Quat, Vec3};
+use cranvr_common::controls::mouse::{LEFT, MIDDLE, RIGHT};
 use log::warn;
 use cranvr_vt::PixelBuffer;
 use crate::screen_capture::{self, SendBox};
@@ -75,7 +77,7 @@ extern "C" {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct CGPoint {
     x: f64,
     y: f64,
@@ -94,6 +96,7 @@ extern "C" {
     fn CGEventCreateMouseEvent(source: *const c_void, kind: u32, point: CGPoint, button: u32) -> *mut c_void;
     fn CGEventCreateScrollWheelEvent2(source: *const c_void, units: u32, count: u32, w1: i32, w2: i32, w3: i32) -> *mut c_void;
     fn CGEventPost(tap: u32, event: *mut c_void);
+    fn CGEventSetIntegerValueField(event: *mut c_void, field: u32, value: i64);
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -331,25 +334,60 @@ pub fn aim_ray(aim: &Pose) -> (Vec3, Vec3) {
     (aim.position, aim.orientation * Vec3::NEG_Z)
 }
 
-/// Turns pointing, trigger and thumbstick into mouse events on one display.
+/// Turns pointing, mouse buttons and thumbstick lean into mouse events on one display.
+///
+/// The Mac has one mouse. The client names the controller that owns it, so this type sees one
+/// point, one set of buttons and one lean at a time.
 pub struct Pointer {
     display_id: u32,
-    pressed: bool,
+    /// The buttons that are down, as the bits of `cranvr_common::controls::mouse`
+    held: u8,
     last: Option<CGPoint>,
-    scroll: f32,
+    /// The scroll that is owed to the Mac, in pixels, across and forward
+    scroll: [f32; 2],
+    /// The last press, for the click count of a double click
+    run: Option<ClickRun>,
     trusted: bool,
     /// When the Accessibility permission was last checked: the user may allow it while the
     /// host runs
     checked: std::time::Instant,
 }
 
+/// The presses of one button that follow each other closely, which the Mac counts as a double or a
+/// triple click.
+#[derive(Clone, Copy, Debug)]
+struct ClickRun {
+    bit: u8,
+    at: std::time::Instant,
+    point: CGPoint,
+    count: i64,
+}
+
+/// A second press of the same button within this time and within `CLICK_REACH` points of the first
+/// counts as the next click of a run. The Mac's own double click time is 0.5 s by default.
+const CLICK_RUN: std::time::Duration = std::time::Duration::from_millis(500);
+const CLICK_REACH: f64 = 4.0;
+
 // CGEventType and CGMouseButton values
 const LEFT_MOUSE_DOWN: u32 = 1;
 const LEFT_MOUSE_UP: u32 = 2;
+const RIGHT_MOUSE_DOWN: u32 = 3;
+const RIGHT_MOUSE_UP: u32 = 4;
 const MOUSE_MOVED: u32 = 5;
 const LEFT_MOUSE_DRAGGED: u32 = 6;
+const RIGHT_MOUSE_DRAGGED: u32 = 7;
+const OTHER_MOUSE_DOWN: u32 = 25;
+const OTHER_MOUSE_UP: u32 = 26;
+const OTHER_MOUSE_DRAGGED: u32 = 27;
+const BUTTON_LEFT: u32 = 0;
+const BUTTON_RIGHT: u32 = 1;
+const BUTTON_CENTER: u32 = 2;
 const HID_EVENT_TAP: u32 = 0;
 const SCROLL_UNITS_PIXEL: u32 = 0;
+/// kCGMouseEventClickState: how many clicks of a run this press is
+const MOUSE_EVENT_CLICK_STATE: u32 = 1;
+/// A lean inside this share of the stick's range scrolls nothing
+const SCROLL_DEAD_ZONE: f32 = 0.15;
 
 impl Pointer {
     pub fn new(display_id: u32) -> Self {
@@ -357,7 +395,7 @@ impl Pointer {
         if !trusted {
             warn!("Desktop: no Accessibility permission, so the controller cannot move the mouse. Allow cranvr-host (or the terminal running it) under Privacy & Security > Accessibility.");
         }
-        Self { display_id, pressed: false, last: None, scroll: 0.0, trusted, checked: std::time::Instant::now() }
+        Self { display_id, held: 0, last: None, scroll: [0.0; 2], run: None, trusted, checked: std::time::Instant::now() }
     }
 
     /// Points on another display from now on.
@@ -367,15 +405,20 @@ impl Pointer {
         }
     }
 
-    /// Call once per frame. `hit` is where the controller points on the screen, if anywhere.
+    /// Call once per frame of the host's own scene, which has one controller with a trigger and a
+    /// thumbstick. `hit` is where the controller points on the screen, if anywhere. The trigger is
+    /// the left button, with a hysteresis so a half pulled trigger does not click many times, and
+    /// the thumbstick scrolls up and down.
     pub fn update(&mut self, hit: Option<[f32; 2]>, trigger: f32, stick_y: f32) {
-        self.update_scaled(hit, trigger, stick_y, 1.0);
+        self.update_mouse(hit, trigger_buttons(self.held, trigger), [0.0, stick_y], 1.0);
     }
 
-    /// Like `update`, with the scroll speed scaled: the scroll of one call at full tilt is 20
-    /// pixels, which suits 72 calls a second. A caller that updates at another rate passes
-    /// `72 / rate`, or the time since its last call times 72.
-    pub fn update_scaled(&mut self, hit: Option<[f32; 2]>, trigger: f32, stick_y: f32, scroll_scale: f32) {
+    /// Call once per update of the client. `hit` is where the controller points on the screen, if
+    /// anywhere. `buttons` holds the bits of the buttons that are down. `lean` is the thumbstick's
+    /// lean across and forward, each from -1 to 1. The scroll of one call at full lean is 20
+    /// pixels, which suits 72 calls a second: a caller that updates at another rate passes
+    /// `scroll_scale` as `72 / rate`, or as the time since its last call times 72.
+    pub fn update_mouse(&mut self, hit: Option<[f32; 2]>, buttons: u8, lean: [f32; 2], scroll_scale: f32) {
         if !self.trusted && self.checked.elapsed() > std::time::Duration::from_secs(2) {
             self.checked = std::time::Instant::now();
             self.trusted = unsafe { AXIsProcessTrusted() };
@@ -389,55 +432,118 @@ impl Pointer {
             return;
         }
         let bounds = unsafe { CGDisplayBounds(self.display_id) };
+        for event in self.plan(bounds, hit, buttons, lean, scroll_scale, std::time::Instant::now()) {
+            post(event);
+        }
+    }
+
+    /// The mouse events that a change of the controller calls for, in the order in which they go
+    /// out: the move, then each button that went down or up, then the scroll. The state of the
+    /// pointer moves on as if the caller posted them.
+    fn plan(&mut self, bounds: CGRect, hit: Option<[f32; 2]>, buttons: u8, lean: [f32; 2], scroll_scale: f32, now: std::time::Instant) -> Vec<Out> {
+        let mut out = Vec::new();
         if let Some([u, v]) = hit {
-            let point = CGPoint {
-                x: bounds.origin.x + u as f64 * bounds.size.x,
-                y: bounds.origin.y + v as f64 * bounds.size.y,
-            };
+            let point = CGPoint { x: bounds.origin.x + u as f64 * bounds.size.x, y: bounds.origin.y + v as f64 * bounds.size.y };
             // A controller at rest shakes by a point or two: it moves the mouse only when it
             // points 3 points away, so the Mac's own mouse wins over a resting controller. A
             // pressed button follows every point, for drags.
-            let step = if self.pressed { 1.0 } else { 3.0 };
+            let step = if self.held != 0 { 1.0 } else { 3.0 };
             let moved = self.last.is_none_or(|l| (l.x - point.x).abs() + (l.y - point.y).abs() >= step);
             if moved {
-                post_mouse(if self.pressed { LEFT_MOUSE_DRAGGED } else { MOUSE_MOVED }, point);
+                // The Mac drags with the button that went down first
+                let drag = [LEFT, RIGHT, MIDDLE].into_iter().find(|bit| self.held & bit != 0);
+                out.push(Out::Move { drag, point });
                 self.last = Some(point);
             }
         }
-        // Hysteresis, so a half pulled trigger does not click many times
-        let press = if self.pressed { trigger > 0.4 } else { trigger > 0.6 };
-        if press != self.pressed {
+        for bit in [LEFT, RIGHT, MIDDLE] {
+            let (was, is) = (self.held & bit != 0, buttons & bit != 0);
+            if was == is {
+                continue;
+            }
             if let Some(point) = self.last {
-                post_mouse(if press { LEFT_MOUSE_DOWN } else { LEFT_MOUSE_UP }, point);
-            }
-            self.pressed = press;
-        }
-        // Up to about 1500 pixels per second at full tilt (at 72 frames per second)
-        if stick_y.abs() > 0.15 {
-            self.scroll += stick_y * 20.0 * scroll_scale;
-            let whole = self.scroll.trunc();
-            if whole != 0.0 {
-                self.scroll -= whole;
-                post_scroll(whole as i32);
+                let clicks = if is { self.count_click(bit, point, now) } else { self.run.map_or(1, |run| run.count) };
+                out.push(Out::Button { bit, down: is, point, clicks });
             }
         }
+        // A button that a press without a point never posted still counts as down: its release
+        // posts nothing either, because no point exists to post it at
+        self.held = buttons & (LEFT | RIGHT | MIDDLE);
+        // Up to about 1500 pixels per second at full lean (at 72 frames per second)
+        let mut whole = [0i32; 2];
+        for axis in 0..2 {
+            if lean[axis].abs() > SCROLL_DEAD_ZONE {
+                self.scroll[axis] += lean[axis] * 20.0 * scroll_scale;
+                let trunc = self.scroll[axis].trunc();
+                self.scroll[axis] -= trunc;
+                whole[axis] = trunc as i32;
+            }
+        }
+        if whole != [0, 0] {
+            out.push(Out::Scroll { across: whole[0], forward: whole[1] });
+        }
+        out
     }
+
+    /// The click count of a press of `bit` at `point`: 1 for a first click and one more for each
+    /// press of the same button that follows the last within `CLICK_RUN` and `CLICK_REACH` points.
+    fn count_click(&mut self, bit: u8, point: CGPoint, now: std::time::Instant) -> i64 {
+        let count = match self.run {
+            Some(run) if run.bit == bit && now.duration_since(run.at) <= CLICK_RUN && (run.point.x - point.x).abs() + (run.point.y - point.y).abs() <= CLICK_REACH => {
+                run.count + 1
+            }
+            _ => 1,
+        };
+        self.run = Some(ClickRun { bit, at: now, point, count });
+        count
+    }
+}
+
+/// The buttons that a trigger holds, for the host's own scene: the trigger is the left button. It goes down past 0.6 and up below 0.4, so a trigger that rests near one value does not
+/// click many times. `held` is what is down now.
+fn trigger_buttons(held: u8, trigger: f32) -> u8 {
+    let down = if held & LEFT != 0 { trigger > 0.4 } else { trigger > 0.6 };
+    if down {
+        LEFT
+    } else {
+        0
+    }
+}
+
+/// One mouse event that the pointer posts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Out {
+    /// The mouse moves to `point`. `drag` is the button that is down, if one is.
+    Move { drag: Option<u8>, point: CGPoint },
+    Button { bit: u8, down: bool, point: CGPoint, clicks: i64 },
+    /// Pixels to the right and forward (up), as a thumbstick leans. A negative number goes the
+    /// other way.
+    Scroll { across: i32, forward: i32 },
 }
 
 /// What the pointer injected since the host started, or would have injected in a dry run
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InjectedCounts {
     pub moves: u64,
+    /// Button presses and releases of every button. The two lists below say how many belong to the
+    /// right and the middle button.
     pub downs: u64,
     pub ups: u64,
-    /// Pixels scrolled, up and down summed by their sizes
+    pub right_downs: u64,
+    pub middle_downs: u64,
+    /// Pixels scrolled forward and back, up and down summed by their sizes
     pub scroll_pixels: u64,
+    /// Pixels scrolled to the sides
+    pub scroll_across_pixels: u64,
 }
 
 static MOVES: AtomicU64 = AtomicU64::new(0);
 static DOWNS: AtomicU64 = AtomicU64::new(0);
 static UPS: AtomicU64 = AtomicU64::new(0);
+static RIGHT_DOWNS: AtomicU64 = AtomicU64::new(0);
+static MIDDLE_DOWNS: AtomicU64 = AtomicU64::new(0);
 static SCROLL_PIXELS: AtomicU64 = AtomicU64::new(0);
+static SCROLL_ACROSS_PIXELS: AtomicU64 = AtomicU64::new(0);
 
 /// The mouse events injected so far
 pub fn injected_counts() -> InjectedCounts {
@@ -445,7 +551,10 @@ pub fn injected_counts() -> InjectedCounts {
         moves: MOVES.load(Ordering::Relaxed),
         downs: DOWNS.load(Ordering::Relaxed),
         ups: UPS.load(Ordering::Relaxed),
+        right_downs: RIGHT_DOWNS.load(Ordering::Relaxed),
+        middle_downs: MIDDLE_DOWNS.load(Ordering::Relaxed),
         scroll_pixels: SCROLL_PIXELS.load(Ordering::Relaxed),
+        scroll_across_pixels: SCROLL_ACROSS_PIXELS.load(Ordering::Relaxed),
     }
 }
 
@@ -462,44 +571,95 @@ fn dry_run() -> bool {
     })
 }
 
-fn post_scroll(pixels: i32) {
-    SCROLL_PIXELS.fetch_add(u64::from(pixels.unsigned_abs()), Ordering::Relaxed);
-    if dry_run() {
-        log::info!("Desktop (dry run): scroll {pixels} pixels");
-        return;
+/// The name of a button for the log
+fn button_name(bit: u8) -> &'static str {
+    match bit {
+        LEFT => "left",
+        RIGHT => "right",
+        _ => "middle",
     }
+}
+
+/// The Core Graphics event for a mouse event, or null when the system gives none. The caller posts
+/// it and releases it.
+fn build(event: Out) -> *mut c_void {
     unsafe {
-        let event = CGEventCreateScrollWheelEvent2(std::ptr::null(), SCROLL_UNITS_PIXEL, 1, pixels, 0, 0);
-        if !event.is_null() {
-            CGEventPost(HID_EVENT_TAP, event);
-            CFRelease(event);
+        match event {
+            Out::Move { drag, point } => {
+                let (kind, button) = match drag {
+                    Some(LEFT) => (LEFT_MOUSE_DRAGGED, BUTTON_LEFT),
+                    Some(RIGHT) => (RIGHT_MOUSE_DRAGGED, BUTTON_RIGHT),
+                    Some(_) => (OTHER_MOUSE_DRAGGED, BUTTON_CENTER),
+                    None => (MOUSE_MOVED, BUTTON_LEFT),
+                };
+                CGEventCreateMouseEvent(std::ptr::null(), kind, point, button)
+            }
+            Out::Button { bit, down, point, clicks } => {
+                let (kind, button) = match (bit, down) {
+                    (LEFT, true) => (LEFT_MOUSE_DOWN, BUTTON_LEFT),
+                    (LEFT, false) => (LEFT_MOUSE_UP, BUTTON_LEFT),
+                    (RIGHT, true) => (RIGHT_MOUSE_DOWN, BUTTON_RIGHT),
+                    (RIGHT, false) => (RIGHT_MOUSE_UP, BUTTON_RIGHT),
+                    (_, true) => (OTHER_MOUSE_DOWN, BUTTON_CENTER),
+                    (_, false) => (OTHER_MOUSE_UP, BUTTON_CENTER),
+                };
+                let event = CGEventCreateMouseEvent(std::ptr::null(), kind, point, button);
+                if !event.is_null() {
+                    CGEventSetIntegerValueField(event, MOUSE_EVENT_CLICK_STATE, clicks);
+                }
+                event
+            }
+            // The first wheel scrolls up for a positive number. The second wheel scrolls to the
+            // left for a positive number, so a lean to the right is a negative one.
+            Out::Scroll { across, forward } => CGEventCreateScrollWheelEvent2(std::ptr::null(), SCROLL_UNITS_PIXEL, 2, forward, -across, 0),
         }
     }
 }
 
-fn post_mouse(kind: u32, point: CGPoint) {
-    let counter = match kind {
-        LEFT_MOUSE_DOWN => &DOWNS,
-        LEFT_MOUSE_UP => &UPS,
-        _ => &MOVES,
-    };
-    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-    if dry_run() {
-        // A move comes up to 120 times a second: the first and every hundredth go to the log
-        let name = match kind {
-            LEFT_MOUSE_DOWN => "button down",
-            LEFT_MOUSE_UP => "button up",
-            LEFT_MOUSE_DRAGGED => "drag",
-            _ => "move",
-        };
-        if matches!(kind, LEFT_MOUSE_DOWN | LEFT_MOUSE_UP) || count == 1 || count % 100 == 0 {
-            log::info!("Desktop (dry run): mouse {name} at ({:.0}, {:.0}) points, event {count} of its kind", point.x, point.y);
+fn post(event: Out) {
+    // The counts and the log of a dry run come from the plan, not from the event
+    match event {
+        Out::Move { drag, point } => {
+            let count = MOVES.fetch_add(1, Ordering::Relaxed) + 1;
+            if dry_run() {
+                // A move comes up to 120 times a second: the first and every hundredth go to the log
+                if count == 1 || count.is_multiple_of(100) {
+                    let name = drag.map_or("move".to_string(), |bit| format!("{} drag", button_name(bit)));
+                    log::info!("Desktop (dry run): mouse {name} at ({:.0}, {:.0}) points, event {count} of its kind", point.x, point.y);
+                }
+                return;
+            }
         }
-        return;
+        Out::Button { bit, down, point, clicks } => {
+            (if down { &DOWNS } else { &UPS }).fetch_add(1, Ordering::Relaxed);
+            match (bit, down) {
+                (RIGHT, true) => drop(RIGHT_DOWNS.fetch_add(1, Ordering::Relaxed)),
+                (MIDDLE, true) => drop(MIDDLE_DOWNS.fetch_add(1, Ordering::Relaxed)),
+                _ => {}
+            }
+            if dry_run() {
+                log::info!(
+                    "Desktop (dry run): {} button {} at ({:.0}, {:.0}) points, click {clicks}",
+                    button_name(bit),
+                    if down { "down" } else { "up" },
+                    point.x,
+                    point.y
+                );
+                return;
+            }
+        }
+        Out::Scroll { across, forward } => {
+            SCROLL_PIXELS.fetch_add(u64::from(forward.unsigned_abs()), Ordering::Relaxed);
+            SCROLL_ACROSS_PIXELS.fetch_add(u64::from(across.unsigned_abs()), Ordering::Relaxed);
+            if dry_run() {
+                log::info!("Desktop (dry run): scroll {forward} pixels forward and {across} across");
+                return;
+            }
+        }
     }
-    unsafe {
-        let event = CGEventCreateMouseEvent(std::ptr::null(), kind, point, 0);
-        if !event.is_null() {
+    let event = build(event);
+    if !event.is_null() {
+        unsafe {
             CGEventPost(HID_EVENT_TAP, event);
             CFRelease(event);
         }
@@ -540,6 +700,194 @@ mod tests {
             }
             seq = wait_past(&capture, seq);
         }
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventGetIntegerValueField(event: *mut c_void, field: u32) -> i64;
+        fn CGEventGetType(event: *mut c_void) -> u32;
+        fn CGEventGetLocation(event: *mut c_void) -> CGPoint;
+    }
+
+    // CGEventField values
+    const BUTTON_NUMBER: u32 = 3;
+    const SCROLL_POINT_DELTA_FORWARD: u32 = 96;
+    const SCROLL_POINT_DELTA_ACROSS: u32 = 97;
+
+    /// What the system's event holds, which the host would post. Building an event needs no
+    /// permission, so the test reads each one back instead of posting it.
+    fn read_back(out: Out) -> (u32, i64, i64, CGPoint) {
+        let event = build(out);
+        assert!(!event.is_null(), "{out:?}");
+        let held = unsafe {
+            (CGEventGetType(event), CGEventGetIntegerValueField(event, BUTTON_NUMBER), CGEventGetIntegerValueField(event, MOUSE_EVENT_CLICK_STATE), CGEventGetLocation(event))
+        };
+        unsafe { CFRelease(event) };
+        held
+    }
+
+    #[test]
+    fn each_planned_event_becomes_the_system_event_of_its_kind() {
+        let point = CGPoint { x: 640.0, y: 360.0 };
+        let button = |bit, down, clicks| read_back(Out::Button { bit, down, point, clicks });
+        // The kind, the button number, the click count and the point of each button's press and release
+        assert_eq!(button(LEFT, true, 1), (LEFT_MOUSE_DOWN, 0, 1, point));
+        assert_eq!(button(LEFT, false, 1), (LEFT_MOUSE_UP, 0, 1, point));
+        assert_eq!(button(RIGHT, true, 1), (RIGHT_MOUSE_DOWN, 1, 1, point));
+        assert_eq!(button(RIGHT, false, 1), (RIGHT_MOUSE_UP, 1, 1, point));
+        assert_eq!(button(MIDDLE, true, 2), (OTHER_MOUSE_DOWN, 2, 2, point), "the middle button is button number 2 of the other kind");
+        assert_eq!(button(MIDDLE, false, 2), (OTHER_MOUSE_UP, 2, 2, point));
+        // A move is a plain move, and a drag has the kind of the button that is down
+        assert_eq!(read_back(Out::Move { drag: None, point }).0, MOUSE_MOVED);
+        assert_eq!(read_back(Out::Move { drag: Some(LEFT), point }).0, LEFT_MOUSE_DRAGGED);
+        let right_drag = read_back(Out::Move { drag: Some(RIGHT), point });
+        assert_eq!((right_drag.0, right_drag.1), (RIGHT_MOUSE_DRAGGED, 1));
+        let middle_drag = read_back(Out::Move { drag: Some(MIDDLE), point });
+        assert_eq!((middle_drag.0, middle_drag.1), (OTHER_MOUSE_DRAGGED, 2));
+        assert_eq!(right_drag.3, point);
+    }
+
+    #[test]
+    fn a_scroll_event_carries_pixels_in_both_axes() {
+        let event = build(Out::Scroll { across: 12, forward: 20 });
+        assert!(!event.is_null());
+        let (forward, across) = unsafe {
+            (CGEventGetIntegerValueField(event, SCROLL_POINT_DELTA_FORWARD), CGEventGetIntegerValueField(event, SCROLL_POINT_DELTA_ACROSS))
+        };
+        unsafe { CFRelease(event) };
+        // Forward is up. The second wheel scrolls to the left for a positive number, so a lean to the
+        // right reads back negative.
+        assert_eq!((forward, across), (20, -12));
+    }
+
+    fn display() -> CGRect {
+        CGRect { origin: CGPoint { x: 100.0, y: 50.0 }, size: CGPoint { x: 1000.0, y: 500.0 } }
+    }
+
+    /// A pointer with no display behind it, so the tests plan the events and post none.
+    fn pointer() -> Pointer {
+        Pointer { display_id: 0, held: 0, last: None, scroll: [0.0; 2], run: None, trusted: true, checked: std::time::Instant::now() }
+    }
+
+    fn at(u: f32, v: f32) -> CGPoint {
+        CGPoint { x: 100.0 + u as f64 * 1000.0, y: 50.0 + v as f64 * 500.0 }
+    }
+
+    fn plan(pointer: &mut Pointer, hit: Option<[f32; 2]>, buttons: u8, lean: [f32; 2]) -> Vec<Out> {
+        pointer.plan(display(), hit, buttons, lean, 1.0, std::time::Instant::now())
+    }
+
+    #[test]
+    fn each_button_goes_down_and_up_at_the_point_that_the_controller_points_at() {
+        for (bit, name) in [(LEFT, "left"), (RIGHT, "right"), (MIDDLE, "middle")] {
+            let mut pointer = pointer();
+            let down = plan(&mut pointer, Some([0.5, 0.5]), bit, [0.0; 2]);
+            assert_eq!(
+                down,
+                vec![Out::Move { drag: None, point: at(0.5, 0.5) }, Out::Button { bit, down: true, point: at(0.5, 0.5), clicks: 1 }],
+                "{name}"
+            );
+            // The controller drifts and the button stays down: a drag with that button
+            let drag = plan(&mut pointer, Some([0.6, 0.5]), bit, [0.0; 2]);
+            assert_eq!(drag, vec![Out::Move { drag: Some(bit), point: at(0.6, 0.5) }], "{name}");
+            let up = plan(&mut pointer, Some([0.6, 0.5]), 0, [0.0; 2]);
+            assert_eq!(up, vec![Out::Button { bit, down: false, point: at(0.6, 0.5), clicks: 1 }], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_button_that_is_down_goes_up_when_the_controller_stops_pointing_at_the_panel() {
+        let mut pointer = pointer();
+        plan(&mut pointer, Some([0.2, 0.2]), RIGHT | MIDDLE, [0.0; 2]);
+        // The client lets go with no point, or the host finds the client silent
+        let end = plan(&mut pointer, None, 0, [0.0; 2]);
+        assert_eq!(
+            end,
+            vec![
+                Out::Button { bit: RIGHT, down: false, point: at(0.2, 0.2), clicks: 1 },
+                Out::Button { bit: MIDDLE, down: false, point: at(0.2, 0.2), clicks: 1 }
+            ]
+        );
+        assert_eq!(pointer.held, 0);
+        assert!(plan(&mut pointer, None, 0, [0.0; 2]).is_empty());
+    }
+
+    #[test]
+    fn two_buttons_at_once_each_post_their_own_press_and_the_drag_follows_the_first() {
+        let mut pointer = pointer();
+        plan(&mut pointer, Some([0.5, 0.5]), RIGHT, [0.0; 2]);
+        let both = plan(&mut pointer, Some([0.5, 0.5]), RIGHT | LEFT, [0.0; 2]);
+        assert_eq!(both, vec![Out::Button { bit: LEFT, down: true, point: at(0.5, 0.5), clicks: 1 }]);
+        // The left button is the first in the order of the drags
+        let drag = plan(&mut pointer, Some([0.7, 0.5]), RIGHT | LEFT, [0.0; 2]);
+        assert_eq!(drag, vec![Out::Move { drag: Some(LEFT), point: at(0.7, 0.5) }]);
+    }
+
+    #[test]
+    fn a_resting_controller_moves_the_mouse_only_past_three_points() {
+        let mut pointer = pointer();
+        assert_eq!(plan(&mut pointer, Some([0.5, 0.5]), 0, [0.0; 2]).len(), 1);
+        // 2 points away: the Mac's own mouse wins
+        assert!(plan(&mut pointer, Some([0.502, 0.5]), 0, [0.0; 2]).is_empty());
+        // With a button down every point counts
+        plan(&mut pointer, Some([0.502, 0.5]), LEFT, [0.0; 2]);
+        assert_eq!(plan(&mut pointer, Some([0.5025, 0.5]), LEFT, [0.0; 2]).len(), 1);
+    }
+
+    #[test]
+    fn the_thumbstick_scrolls_in_both_axes_and_its_dead_zone_scrolls_nothing() {
+        let mut pointer = pointer();
+        // Full lean forward: 20 pixels at one call
+        assert_eq!(plan(&mut pointer, None, 0, [0.0, 1.0]), vec![Out::Scroll { across: 0, forward: 20 }]);
+        assert_eq!(plan(&mut pointer, None, 0, [-1.0, -0.5]), vec![Out::Scroll { across: -20, forward: -10 }]);
+        // A lean inside the dead zone is nothing, on each axis by itself
+        assert!(plan(&mut pointer, None, 0, [0.1, -0.14]).is_empty());
+        assert_eq!(plan(&mut pointer, None, 0, [0.1, 1.0]), vec![Out::Scroll { across: 0, forward: 20 }]);
+        // The pixels that a call owes carry over to the next
+        let mut pointer = self::pointer();
+        let mut total = 0;
+        for _ in 0..10 {
+            for event in plan(&mut pointer, None, 0, [0.5, 0.0]) {
+                if let Out::Scroll { across, .. } = event {
+                    total += across;
+                }
+            }
+        }
+        assert_eq!(total, 100, "ten calls at half lean owe 100 pixels across");
+    }
+
+    #[test]
+    fn presses_in_quick_succession_at_one_place_count_as_a_double_click() {
+        let mut pointer = pointer();
+        let start = std::time::Instant::now();
+        let press = |pointer: &mut Pointer, bit: u8, point: [f32; 2], after_ms: u64| {
+            let now = start + std::time::Duration::from_millis(after_ms);
+            let down = pointer.plan(display(), Some(point), bit, [0.0; 2], 1.0, now);
+            let up = pointer.plan(display(), Some(point), 0, [0.0; 2], 1.0, now + std::time::Duration::from_millis(30));
+            let clicks = |events: &[Out]| events.iter().find_map(|e| if let Out::Button { clicks, .. } = e { Some(*clicks) } else { None }).unwrap();
+            (clicks(&down), clicks(&up))
+        };
+        assert_eq!(press(&mut pointer, LEFT, [0.5, 0.5], 0), (1, 1));
+        assert_eq!(press(&mut pointer, LEFT, [0.5, 0.5], 200), (2, 2));
+        assert_eq!(press(&mut pointer, LEFT, [0.5, 0.5], 400), (3, 3));
+        // Another button, a far point and a long pause each start a new run
+        assert_eq!(press(&mut pointer, RIGHT, [0.5, 0.5], 600).0, 1);
+        assert_eq!(press(&mut pointer, RIGHT, [0.9, 0.9], 800).0, 1);
+        assert_eq!(press(&mut pointer, RIGHT, [0.9, 0.9], 1500).0, 1);
+    }
+
+    #[test]
+    fn the_hosts_own_scene_clicks_with_its_trigger() {
+        let mut pointer = pointer();
+        let now = std::time::Instant::now();
+        let step = |pointer: &mut Pointer, trigger: f32| {
+            let buttons = trigger_buttons(pointer.held, trigger);
+            pointer.plan(display(), Some([0.5, 0.5]), buttons, [0.0, 0.0], 1.0, now)
+        };
+        assert_eq!(step(&mut pointer, 0.5).len(), 1, "a half pulled trigger only moves the mouse");
+        assert!(step(&mut pointer, 0.7).iter().any(|e| matches!(e, Out::Button { bit: LEFT, down: true, .. })));
+        assert!(step(&mut pointer, 0.5).is_empty(), "the hysteresis keeps the button down");
+        assert!(step(&mut pointer, 0.3).iter().any(|e| matches!(e, Out::Button { bit: LEFT, down: false, .. })));
     }
 
     #[test]

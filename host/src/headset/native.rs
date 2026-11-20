@@ -18,10 +18,11 @@
 
 pub mod audio;
 pub mod desktop;
+mod displays;
 
 use super::{display_lock::{DisplayLock, Report}, Button, Device, Event, EventSource, FramePlan, Headset, OutFrame};
 use crate::{
-    pairing::{display_name, Attempt, Pairings},
+    pairing::{display_name, Pairings},
     runtime_link::Haptic,
     session::Negotiated,
     status,
@@ -34,18 +35,19 @@ use cranvr_proto::{
     clock::{now_ns, ClockSync},
     discovery::{self, clean_name},
     fec::ParityController,
-    identity::{fingerprint, format_code, from_hex, pairing_code, to_hex, Identity, KEY_LEN},
+    identity::{fingerprint, format_code, from_hex, to_hex, Identity, KEY_LEN},
     link::{HostLink, HostListener, HostSide, Incoming, MediaMode, Pending},
     media::{FrameMeta, DEFAULT_SHARD_LEN},
     message::{
-        buttons, negotiate, ClientDatagram, ClientMsg, FrameTiming, Focus, HostDatagram, HostMsg, HostWishes, Input,
-        LossReport, Ping, Pong, RejectReason, Tracking, VersionRange, Views as ProtoViews, UPDATE_HEADSET, UPDATE_MAC,
+        buttons, display_index, negotiate, ClientDatagram, ClientMsg, FrameTiming, Focus, HostDatagram, HostMsg, HostWishes, Input,
+        InputHold, LossReport, Ping, Pong, RejectReason, Tracking, Views as ProtoViews, UPDATE_HEADSET, UPDATE_MAC,
     },
     motion::extrapolate,
-    tracking::{Features, Tracked, TRACKING_VERSION},
+    tracking::{Features, Tracked},
     wire::{Codec, Error as ProtoError, Motion, Nanos, Pose as ProtoPose, Rect},
-    APPROVAL_VERSION,
+    PROTOCOL_VERSION,
 };
+use crate::hand_mask::HandMask;
 use serde_json::{json, Value};
 use std::{
     collections::VecDeque,
@@ -170,18 +172,17 @@ impl EventSource for Events {
     }
 }
 
-/// The `native` status line (see status.rs): where the host listens, the paired headsets, the
-/// seconds that a `--pair` window stays open, and the headsets that wait for the user. A waiting
-/// headset has its key (the answer names it), its name, its address and the code that both screens
-/// show.
+/// The `native` status line (see status.rs): where the host listens, the paired headsets and the
+/// headsets that wait for the user. A waiting headset has its key (the answer names it), its name,
+/// its address and the code that both screens show.
 fn status_line(port: u16, pairings: &Pairings) -> Value {
-    let (paired, pairing_s) = pairings.summary();
+    let paired = pairings.summary();
     let pending: Vec<Value> = pairings
         .waiting()
         .iter()
         .map(|request| json!({"key": to_hex(&request.key), "name": request.name, "ip": request.ip.to_string(), "code": format_code(request.code)}))
         .collect();
-    json!({"type": "native", "port": port, "paired": paired, "pairing_s": pairing_s, "pending": pending})
+    json!({"type": "native", "port": port, "paired": paired, "pending": pending})
 }
 
 fn announce(config: &Config) {
@@ -222,7 +223,7 @@ fn start_discovery(port: u16, config: &Config) {
         }
     };
     let answer = discovery::Answer {
-        versions: VersionRange::OURS,
+        version: PROTOCOL_VERSION,
         port: config.port,
         fingerprint: fingerprint(&config.identity.public_key()),
         nonce: 0,
@@ -303,7 +304,7 @@ fn accept_loop(listener: HostListener, config: Arc<Config>, shared: Arc<Shared>)
             || config.pairings.contains(&pending.client_key);
         if known {
             start_session(&config, &shared, pending, &name);
-        } else if pending.version >= APPROVAL_VERSION {
+        } else {
             let (config, shared) = (Arc::clone(&config), Arc::clone(&shared));
             let Some(place) = shared.asking.enter() else {
                 warn!("Native protocol: {name} at {} was refused: too many headsets wait for the user", pending.peer);
@@ -317,32 +318,8 @@ fn accept_loop(listener: HostListener, config: Arc<Config>, shared: Arc<Shared>)
             if let Err(e) = spawned {
                 warn!("Native protocol: no thread for an approval: {e}");
             }
-        } else {
-            refuse_old_headset(&config, &shared, pending, &name);
         }
     }
-}
-
-/// A client of protocol version 4 cannot wait for the user. It pairs with `--pair CODE` as before,
-/// or the host refuses it and tells the user to update the headset's app.
-fn refuse_old_headset(config: &Config, shared: &Arc<Shared>, pending: Pending, name: &str) {
-    let key = pending.client_key;
-    let outcome = config.pairings.try_pair(&key, name);
-    if outcome != Attempt::NoWindow {
-        // The window closed, or the headset is paired now
-        announce(config);
-    }
-    if outcome == Attempt::Paired {
-        info!("Native protocol: paired {name} at {}", pending.peer);
-        return start_session(config, shared, pending, name);
-    }
-    warn!("Native protocol: {name} at {} runs an older cranvr app and is not paired. Its code is {}", pending.peer, format_code(pairing_code(&key)));
-    status::emit(json!({
-        "type": "network",
-        "problem": "incompatible_client",
-        "message": format!("The headset {name} at {} is not paired, and its cranvr app is too old to ask. {UPDATE_HEADSET}", pending.peer.ip()),
-    }));
-    pending.reject(RejectReason::NotPaired);
 }
 
 /// How an approval ended.
@@ -461,7 +438,7 @@ fn start_session(config: &Config, shared: &Arc<Shared>, pending: Pending, name: 
     };
     info!("Native protocol: {name} at {peer} connected, {} media, sealed", if link.duplex.has_udp() { "UDP" } else { "TCP" });
     let session = Arc::new(Session::new(link, &stream, config.display_lock));
-    session.desktop.set(desktop::Desktop::start(config.desktop.clone(), Arc::clone(&session))).ok();
+    session.displays.set(displays::Displays::start(config.desktop.clone(), Arc::clone(&session))).ok();
     if config.audio {
         audio::attach(&session);
     }
@@ -499,11 +476,13 @@ fn run_session(shared: &Shared, session: &Arc<Session>, stream: cranvr_proto::me
         info!("Native protocol: the headset link ended: {reason}");
         session.stop();
     });
-    if let Some(desktop) = session.desktop.get() {
-        desktop.stop();
+    if let Some(displays) = session.displays.get() {
+        displays.stop();
     }
     audio::detach(session);
     *shared.session.lock().unwrap() = None;
+    // No panel of a gone headset holds a hand back
+    shared.emit(Event::Held([false; 2]));
     shared.emit(Event::TrackingOffer(Features::NONE));
     shared.emit(Event::Disconnected);
 }
@@ -541,19 +520,19 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
         // before it lost the focus may arrive after the message. It would press a button that the host
         // let go of. An app without the focus has none to send: the host drops what comes.
         Incoming::Datagram(
-            ClientDatagram::Tracking(_) | ClientDatagram::Input(_) | ClientDatagram::Hands(_) | ClientDatagram::Body(_) | ClientDatagram::Face(_) | ClientDatagram::Eyes(_),
+            ClientDatagram::Tracking(_)
+            | ClientDatagram::InputHold(_)
+            | ClientDatagram::Hands(_)
+            | ClientDatagram::Body(_)
+            | ClientDatagram::Face(_)
+            | ClientDatagram::Eyes(_),
         ) if session.paused() => {}
         Incoming::Datagram(ClientDatagram::Tracking(t)) => {
             session.history.lock().unwrap().push(t);
             session.lock.lock().unwrap().on_tracking(t.display_time);
             shared.emit(Event::Tracking { sample_ns: t.sample_time });
         }
-        Incoming::Datagram(ClientDatagram::Input(input)) => {
-            let buttons = session.input.lock().unwrap().changes(&input);
-            if !buttons.is_empty() {
-                shared.emit(Event::Buttons(buttons));
-            }
-        }
+        Incoming::Datagram(ClientDatagram::InputHold(InputHold { input, held })) => session.on_input(shared, &input, held),
         Incoming::Datagram(ClientDatagram::FrameTiming(t)) => session.on_timing(&t),
         Incoming::Datagram(ClientDatagram::Loss(report)) => session.on_loss(&report),
         Incoming::Datagram(ClientDatagram::Ping(p)) => {
@@ -591,20 +570,25 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
             session.apply_wish(*shared.wish.lock().unwrap());
         }
         Incoming::Datagram(ClientDatagram::Hello { .. }) | Incoming::Media(_) => {}
-        Incoming::Control(ClientMsg::RequestKeyFrame { stream, .. }) if stream == cranvr_proto::message::DESKTOP_STREAM => {
-            if let Some(desktop) = session.desktop.get() {
-                desktop.request_key_frame();
+        Incoming::Control(ClientMsg::RequestKeyFrame { stream, .. }) if display_index(stream).is_some() => {
+            if let Some(displays) = session.displays.get() {
+                displays.request_key_frame(stream);
             }
         }
         Incoming::Control(ClientMsg::RequestKeyFrame { .. }) => shared.emit(Event::RequestIdr),
-        Incoming::Control(ClientMsg::Desktop(wish)) => {
-            if let Some(desktop) = session.desktop.get() {
-                desktop.on_wish(wish, session);
+        Incoming::Control(ClientMsg::DisplayWish { stream, wish }) => {
+            if let Some(displays) = session.displays.get() {
+                displays.on_wish(stream, wish, session);
             }
         }
-        Incoming::Datagram(ClientDatagram::Pointer(pointer)) => {
-            if let Some(desktop) = session.desktop.get() {
-                desktop.on_pointer(pointer);
+        Incoming::Control(ClientMsg::Display(request)) => {
+            if let Some(displays) = session.displays.get() {
+                displays.on_request(request);
+            }
+        }
+        Incoming::Datagram(ClientDatagram::DisplayMouse { stream, mouse }) => {
+            if let Some(displays) = session.displays.get() {
+                displays.on_mouse(stream, mouse);
             }
         }
         Incoming::Control(ClientMsg::Views(v)) => shared.emit(Event::Views(views_config(&v))),
@@ -695,13 +679,9 @@ fn device_motion(motion: Motion, floor: f32) -> DeviceMotion {
     }
 }
 
-/// The wish that goes to a client, or `None` when nothing goes. A client of an older protocol version
-/// knows no such message. The wish stays within what the client offers. The host asks again only
+/// The wish that goes to a client, or `None` when nothing goes. The wish stays within what the client offers. The host asks again only
 /// when the answer changes, and the first ask for nothing is no ask.
-fn wish_to_send(version: u16, wish: Features, offered: Features, asked: Option<Features>) -> Option<Features> {
-    if version < TRACKING_VERSION {
-        return None;
-    }
+fn wish_to_send(wish: Features, offered: Features, asked: Option<Features>) -> Option<Features> {
     // The first 70 joints of the full body are the default set: a headset that offers the full body
     // serves a game that asks for the default one
     let wish = if wish.contains(Features::BODY) && !offered.contains(Features::BODY) && offered.contains(Features::FULL_BODY) {
@@ -805,7 +785,12 @@ impl History {
 /// The inputs the host last saw. It turns a new input message into button changes.
 #[derive(Default)]
 struct InputState {
+    /// What the game saw last, after the mask
     last: Option<Input>,
+    /// The hands that the app holds back from the game (see `hand_mask.rs`)
+    mask: HandMask,
+    /// The hands that were held at the last input
+    held: [bool; 2],
 }
 
 /// The path ids of one hand: binary inputs by bit, then the analog inputs.
@@ -868,11 +853,22 @@ fn hand_ids(hand: usize) -> HandIds {
 
 impl InputState {
     /// Lets go of every button that the last input held. Nothing goes out before the first input.
+    /// A press that was down stays the user's: the mask forgets it.
     fn release(&mut self) -> Vec<Button> {
+        self.mask.reset();
+        self.held = [false; 2];
         if self.last.is_none() {
             return Vec::new();
         }
         self.changes(&Input::default())
+    }
+
+    /// The buttons that the game sees change when the client sends `input` with the hands that it
+    /// holds back.
+    fn changes_held(&mut self, input: &Input, held: [bool; 2]) -> Vec<Button> {
+        self.held = held;
+        let masked = self.mask.apply(input, held);
+        self.changes(&masked)
     }
 
     /// The buttons whose value differs from the last input. The first input reports all of them.
@@ -994,15 +990,13 @@ struct Session {
     focus: Mutex<FocusState>,
     /// The video frames that the session sent, to tell what a pause cost
     frames_sent: AtomicU64,
-    /// The protocol version of the session
-    version: u16,
     /// The tracking features that the headset offered: none until it says so
     offered: Mutex<Features>,
     /// The tracking features that the host asked the headset for last. `None` before the first ask.
     asked: Mutex<Option<Features>>,
-    /// The desktop panel's stream and pointer. It starts after the session exists, because its
-    /// threads share the session.
-    desktop: std::sync::OnceLock<desktop::Desktop>,
+    /// The displays that the client shows as panels: their streams and pointers. They start after
+    /// the session exists, because their threads share the session.
+    displays: std::sync::OnceLock<Arc<displays::Displays>>,
     next_frame: AtomicU32,
     heard: Mutex<Instant>,
     stopped: Mutex<bool>,
@@ -1011,7 +1005,6 @@ struct Session {
 
 impl Session {
     fn new(link: HostLink, stream: &cranvr_proto::message::StreamParams, lock_on: bool) -> Self {
-        let version = link.version;
         let period = (1e9 / stream.refresh_hz.max(1.0) as f64) as Nanos;
         let udp = link.duplex.has_udp();
         Self {
@@ -1028,14 +1021,39 @@ impl Session {
             floor: Mutex::new(None),
             focus: Mutex::new(FocusState { focus: Focus::Focused, since: Instant::now(), frames_at: 0 }),
             frames_sent: AtomicU64::new(0),
-            version,
             offered: Mutex::new(Features::NONE),
             asked: Mutex::new(None),
-            desktop: std::sync::OnceLock::new(),
+            displays: std::sync::OnceLock::new(),
             next_frame: AtomicU32::new(0),
             heard: Mutex::new(Instant::now()),
             stopped: Mutex::new(false),
             wake: Condvar::new(),
+        }
+    }
+
+    /// The controllers' input came, with the hands that the app holds back from the game. The
+    /// buttons that the game sees change go to the host's loop. A change of the held hands goes
+    /// there too, for the hand that a pinch makes a controller of.
+    fn on_input(&self, shared: &Shared, input: &Input, held: [bool; 2]) {
+        let (buttons, held_before) = {
+            let mut state = self.input.lock().unwrap();
+            let before = state.held;
+            (state.changes_held(input, held), before)
+        };
+        if held != held_before {
+            info!(
+                "Native protocol: the app holds back {} from the game",
+                match held {
+                    [false, false] => "no hand",
+                    [true, false] => "the left hand",
+                    [false, true] => "the right hand",
+                    [true, true] => "both hands",
+                }
+            );
+            shared.emit(Event::Held(held));
+        }
+        if !buttons.is_empty() {
+            shared.emit(Event::Buttons(buttons));
         }
     }
 
@@ -1092,24 +1110,25 @@ impl Session {
             if !released.is_empty() {
                 shared.emit(Event::Buttons(released));
             }
+            // An app without the focus points at no panel
+            shared.emit(Event::Held([false; 2]));
         }
         // The headset's decoders may have dropped what came while the app was away, so the next
         // pictures start from key frames
         if focus.is_focused() {
-            if let Some(desktop) = self.desktop.get() {
-                desktop.request_key_frame();
+            if let Some(displays) = self.displays.get() {
+                displays.request_key_frames();
             }
         }
         shared.emit(Event::Focus(focus));
     }
 
-    /// Asks the headset for the tracking features that a game uses, within what it offers. A client
-    /// of an older protocol version knows no such message, so it hears nothing. The host asks again
-    /// when the set changes, and sends nothing when the answer stays the same.
+    /// Asks the headset for the tracking features that a game uses, within what it offers. The host
+    /// asks again when the set changes, and sends nothing when the answer stays the same.
     fn apply_wish(&self, wish: Features) {
         let offered = *self.offered.lock().unwrap();
         let mut asked = self.asked.lock().unwrap();
-        let Some(effective) = wish_to_send(self.version, wish, offered, *asked) else { return };
+        let Some(effective) = wish_to_send(wish, offered, *asked) else { return };
         *asked = Some(effective);
         match self.link.duplex.send_control(&HostMsg::TrackingWish(effective)) {
             Ok(()) => info!("Native protocol: the headset is asked for {}", describe(effective)),

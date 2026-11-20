@@ -22,6 +22,17 @@ pub struct GameOptions {
     /// The user turned `eye_per_pass` off by hand. cranvr then leaves the option to the user: a
     /// black right eye gives a notice, not a change.
     pub eye_per_pass_declined: bool,
+    /// Both eyes in one pass (DXMT_RT_ARRAY_INDEX_FROM_ANY_SHADER=1, cranvr's DXMT patch 0010): DXMT
+    /// reports that a vertex shader may write the render target's slice. A Unity game with the OpenVR
+    /// provider draws both eyes into one two-slice texture that it owns, and with the report off its
+    /// instanced draws reach slice 0 only: the right eye stays black, and `eye_per_pass` cannot help,
+    /// because the game's texture is not a swapchain of the runtime. The black-eye answer (black_eye.rs)
+    /// turns this on when the picture stays black with `eye_per_pass` on, and turns that off.
+    pub eye_one_pass: bool,
+    /// Why `eye_one_pass` is on, when cranvr turned it on. A change by the user clears it.
+    pub eye_one_pass_reason: String,
+    /// The user turned `eye_one_pass` off by hand: cranvr leaves it to the user.
+    pub eye_one_pass_declined: bool,
     /// Wine DLL overrides as WINEDLLOVERRIDES takes them, such as "winhttp=n,b" to load a
     /// winhttp.dll from the game's folder before Wine's own
     pub dll_overrides: String,
@@ -50,6 +61,9 @@ impl GameOptions {
         }
         if plain.steam_app_id.is_empty() {
             plain.steam_app_id_reason.clear();
+        }
+        if !plain.eye_one_pass {
+            plain.eye_one_pass_reason.clear();
         }
         plain == Self::default()
     }
@@ -100,6 +114,9 @@ pub fn environment(wine: &WineOptions, game: &GameOptions) -> Vec<(String, Strin
     if !steam_id.is_empty() {
         vars.push(("SteamAppId".to_owned(), steam_id.to_owned()));
         vars.push(("SteamGameId".to_owned(), steam_id.to_owned()));
+    }
+    if game.eye_one_pass {
+        vars.push(("DXMT_RT_ARRAY_INDEX_FROM_ANY_SHADER".to_owned(), "1".to_owned()));
     }
     let overrides: Vec<&str> = [wine.dll_overrides.trim(), game.dll_overrides.trim()].into_iter().filter(|o| !o.is_empty()).collect();
     if !overrides.is_empty() {
@@ -203,6 +220,17 @@ mod tests {
         let wine = WineOptions { mac_window: true, ..Default::default() };
         assert!(environment(&wine, &GameOptions::default()).is_empty());
         assert_eq!(arguments(&GameOptions::default()).count(), 0);
+    }
+
+    #[test]
+    fn both_eyes_in_one_pass_reaches_the_environment_and_a_reason_without_it_is_a_leftover() {
+        let game = GameOptions { eye_one_pass: true, eye_one_pass_reason: "because".into(), ..Default::default() };
+        let vars = environment(&WineOptions::default(), &game);
+        assert!(vars.contains(&("DXMT_RT_ARRAY_INDEX_FROM_ANY_SHADER".to_owned(), "1".to_owned())));
+        assert!(!vars.iter().any(|(name, _)| name == "BASALT_MAX_ARRAY_SIZE"));
+        assert!(!game.is_default());
+        let reason = GameOptions { eye_one_pass_reason: "because".into(), ..Default::default() };
+        assert!(reason.is_default());
     }
 
     #[test]

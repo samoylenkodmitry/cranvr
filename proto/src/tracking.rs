@@ -3,8 +3,8 @@
 //! which offers it through `XR_EXT_hand_tracking`, `XR_FB_body_tracking`,
 //! `XR_META_body_tracking_full_body`, `XR_FB_face_tracking2` and `XR_EXT_eye_gaze_interaction`.
 //!
-//! Protocol version [`TRACKING_VERSION`] added these messages. The flow:
-//! 1. After the welcome, a client of that version sends [`crate::message::ClientMsg::TrackingOffer`]
+//! The flow:
+//! 1. After the welcome, the client sends [`crate::message::ClientMsg::TrackingOffer`]
 //!    with the features that its headset has and its user allowed.
 //! 2. The host sends [`crate::message::HostMsg::TrackingWish`] with the features that a game uses now.
 //!    It sends the wish again when the set changes and when the headset connects. A feature that no
@@ -13,14 +13,11 @@
 //!    carries the sample time and the display time of the frame's [`crate::message::Tracking`], so the
 //!    host pairs them with the head and the controllers.
 //!
-//! A peer that does not know a message skips it (see `link.rs`), so an older host or client takes no
-//! harm from them. The host sends a wish only to a client of version [`TRACKING_VERSION`] or newer.
-//!
 //! The offer also says where the face comes from: [`Features::FACE_VISUAL`] for cameras and
 //! [`Features::FACE_AUDIO`] for the microphone. A Quest 3 has no camera that sees the mouth, so its
 //! face is the audio one. The game's runtime reports these sources in `XR_FB_face_tracking2`, and a
-//! game decides from them which data source it asks for. The bits sit above the five features. An
-//! older peer drops them with [`Features::known`] and keeps the face as a face of an unknown source.
+//! game decides from them which data source it asks for. The bits sit above the five features.
+//! [`Features::known`] drops them.
 //!
 //! All poses are in the headset's room, like the head's and the controllers'. Joints travel as poses
 //! relative to a root pose that has full precision and a velocity. The relative parts are quantized:
@@ -32,9 +29,6 @@
 use crate::wire::{Motion, Nanos, Pose};
 use crate::Error;
 use serde::{Deserialize, Serialize};
-
-/// The first protocol version with the tracking messages.
-pub const TRACKING_VERSION: u16 = 6;
 
 /// The joints of one hand in `XR_EXT_hand_tracking`, in its order: palm, wrist, then the thumb with
 /// four joints and each other finger with five.
@@ -93,8 +87,8 @@ impl Features {
         Features(self.0 & other.0)
     }
 
-    /// Keeps the five features. A wish uses it: a newer peer's bits and the face sources do no harm
-    /// there.
+    /// Keeps the five features and drops the face sources. A wish uses it: the host asks for a
+    /// feature, and the headset decides the source.
     pub fn known(self) -> Features {
         self.intersect(Features::ALL)
     }
@@ -111,7 +105,7 @@ impl Features {
     }
 
     /// Whether the offered face comes from the cameras. It is false for a face of an unknown source,
-    /// which an older client or a headset that has not yet given a face offers.
+    /// which a headset that has not yet given a face offers.
     pub fn offers_face_visual(self) -> bool {
         self.contains(Features::FACE.union(Features::FACE_VISUAL))
     }

@@ -9,6 +9,7 @@ mod eye_check;
 mod game_audio;
 mod game_sizes;
 mod hand_controller;
+mod hand_mask;
 mod headset;
 mod logger;
 mod network;
@@ -116,18 +117,14 @@ impl Default for Views {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: cranvr-host [--protocol native] [--native-port PORT] [--fps 72|80|90|120, default 120] [--eye-width PIXELS] [--mbps N] [--trust-all] [--pair CODE] [--discovery-port N] [--no-display-lock] [--tcp] [--no-foveation] [--game-scale F] [--strict-rate-control] [--no-game-audio] [--no-hand-controllers] [--desktop] [--desktop-fps N] [--virtual-display WxH] [--vr-main-display] [--pointer-pitch DEG] [--screen-in-view] [--no-desktop-layer] [--config-dir DIR] [--status]\n\
-         \n  --protocol native the headset protocol; cranvr's own is the only one. The option stays so\
-         \n                    that older command lines work.\
+        "usage: cranvr-host [--native-port PORT] [--fps 72|80|90|120, default 120] [--eye-width PIXELS] [--mbps N] [--trust-all] [--discovery-port N] [--no-display-lock] [--tcp] [--no-foveation] [--game-scale F] [--strict-rate-control] [--no-game-audio] [--no-hand-controllers] [--desktop] [--desktop-fps N] [--virtual-display WxH] [--vr-main-display] [--pointer-pitch DEG] [--screen-in-view] [--no-desktop-layer] [--config-dir DIR] [--status]\n\
          \n  --native-port N   the TCP port to listen on (default 9950)\
          \n  --trust-all       accept any client on the network without a pairing (for tests)\
-         \n  --pair CODE       pair a headset of the older cranvr app, which shows a code of six\
-         \n                    digits when the host does not know it. A newer app waits instead: the\
-         \n                    cranvr app on this Mac shows Allow and Deny. With --status you may\
-         \n                    type `allow KEY` or `deny KEY` into the host's input (the status line\
-         \n                    gives the key). The host remembers the headset in\
-         \n                    paired-headsets.txt. It has a key of its own in host-identity.txt:\
-         \n                    keep it, or the paired headsets refuse the host.\
+         \n  A headset that the host does not know waits for the user: the cranvr app on this Mac\
+         \n                    shows Allow and Deny. With --status you may type `allow KEY` or `deny KEY`\
+         \n                    into the host's input (the status line gives the key). The host remembers\
+         \n                    an allowed headset in paired-headsets.txt. It has a key of its own in\
+         \n                    host-identity.txt: keep it, or the paired headsets refuse the host.\
          \n  --discovery-port N  the UDP port that answers the headsets' search for this Mac\
          \n                    (default 9950; 0 turns it off)\
          \n  --no-display-lock render at the arrival of each pose, not at a time that follows the\
@@ -175,7 +172,6 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
         eye_width_given: false,
         mbps: 100,
         trust_all: false,
-        pair_code: None,
         discovery_port: Some(cranvr_proto::discovery::DEFAULT_PORT),
         display_lock: true,
         tcp: false,
@@ -205,12 +201,6 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
     while let Some(arg) = args.next() {
         let mut value = || args.next().unwrap_or_else(|| usage());
         match arg.as_str() {
-            "--protocol" => {
-                if value() != "native" {
-                    eprintln!("--protocol takes native: cranvr's own protocol is the only one");
-                    usage()
-                }
-            }
             "--native-port" => options.native_port = value().parse().unwrap_or_else(|_| usage()),
             "--fps" => options.fps = value().parse().unwrap_or_else(|_| usage()),
             "--eye-width" => options.eye_width = value().parse().unwrap_or_else(|_| usage()),
@@ -219,12 +209,6 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
             "--discovery-port" => {
                 // 0 turns discovery off
                 options.discovery_port = Some(value().parse().unwrap_or_else(|_| usage())).filter(|port| *port != 0)
-            }
-            "--pair" => {
-                options.pair_code = Some(cranvr_proto::identity::parse_code(&value()).unwrap_or_else(|| {
-                    eprintln!("--pair takes the six digits that the headset shows");
-                    usage()
-                }))
             }
             "--no-display-lock" => options.display_lock = false,
             "--tcp" => options.tcp = true,
@@ -333,7 +317,7 @@ fn native_config(
     headset::native::Config {
         port: options.native_port,
         identity: pairing::host_identity(config_dir),
-        pairings: Arc::new(pairing::Pairings::load(config_dir, options.pair_code)),
+        pairings: Arc::new(pairing::Pairings::load(config_dir)),
         name: pairing::mac_name(),
         discovery_port: options.discovery_port,
         approval_wait: cranvr_proto::message::APPROVAL_WAIT,
@@ -361,6 +345,9 @@ fn native_config(
 fn main() {
     raise_file_limit();
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--display-helper") {
+        virtual_display::helper_main(&args[2..]);
+    }
     if args.get(1).map(String::as_str) == Some("--unscale-displays") {
         display_modes::helper_main();
     }
@@ -407,6 +394,7 @@ fn main() {
             display_id: desktop.display_id,
             layer: Arc::clone(&layer),
             mbps: headset::native::desktop::MBPS,
+            ..Default::default()
         };
         let config = native_config(&options, &config_dir, panel);
         // The cranvr app sends the user's answers to the headsets' requests on the host's input.
@@ -607,6 +595,7 @@ fn main() {
                     shared.force_idr.store(true, Ordering::Relaxed);
                 }
             }
+            Event::Held(held) => tracking.set_held(held),
             Event::TrackingOffer(offered) => tracking.on_offer(offered),
             Event::Tracked(data) => tracking.on_tracked(data),
             Event::RequestIdr => shared.force_idr.store(true, Ordering::Relaxed),
@@ -736,7 +725,8 @@ fn realtime_thread() {
 /// How long the frame loop sleeps between two turns while the headset's app has no input focus. A
 /// game's frames go back to it within this time, and the stream starts again within it.
 const PAUSED_TURN: Duration = Duration::from_millis(4);
-/// A game that sent no frame for this long counts as paused, and the test scene comes back.
+/// A game that sent no frame for this long no longer counts as running at the headset's rate: the stats
+/// leave its slow windows out. The headset still shows the game's last picture (see `GAME_STALL`).
 const GAME_IDLE: Duration = Duration::from_millis(500);
 /// A planned frame's wait ends this long before its start, and the loop spins until the start. A
 /// timer wakes the thread up to a millisecond late: the lateness counted as part of the frame's need
@@ -744,7 +734,11 @@ const GAME_IDLE: Duration = Duration::from_millis(500);
 const START_SPIN: Duration = Duration::from_micros(1500);
 /// A game that sent frames and then none for this long gives the desktop back, with the console
 /// and its Stop button. SUPERHOT VR sent no frame after the headset left for 11 seconds and came
-/// back, and the user saw only black.
+/// back, and the user saw only black. Until then the game holds the headset's picture: the host
+/// draws no scene of its own, and the headset shows the game's last frame again, corrected for the
+/// head's newer pose. A game that loads a level or compiles shaders sends no frame for a second or
+/// more. The host's own scene replaced the game's picture after half a second then, and the user
+/// saw it flash in (a Serious Sam VR session had 82 such frames in one 5-second window).
 const GAME_STALL: Duration = Duration::from_secs(3);
 /// A game that sent no frame this long after it connected gives the desktop back too.
 const GAME_LOAD: Duration = Duration::from_secs(90);
@@ -785,6 +779,12 @@ impl Game {
 
     fn active(&self) -> bool {
         self.connected && self.last_frame.is_some_and(|t| t.elapsed() < GAME_IDLE)
+    }
+
+    /// Whether the game's last picture stays on the headset: the game sent a frame lately, so the
+    /// host draws no scene of its own and waits for the next frame.
+    fn holds_picture(&self) -> bool {
+        self.connected && self.last_frame.is_some_and(|t| t.elapsed() < GAME_STALL)
     }
 
 
@@ -957,7 +957,7 @@ fn frame_loop(
         // A plan holds while its start lies ahead: a pose that arrives meanwhile wakes the loop,
         // and the loop goes on waiting for the same start. A plan whose start passed without a
         // frame is made again.
-        let planned = if game.active() {
+        let planned = if game.holds_picture() {
             pending_plan = None;
             None
         } else {
@@ -973,7 +973,7 @@ fn frame_loop(
             }
         };
         let planned_at = Instant::now();
-        let wait = if game.active() {
+        let wait = if game.holds_picture() {
             GAME_IDLE
         } else if let Some(plan) = &planned {
             plan.start_in.saturating_sub(START_SPIN)
@@ -1009,14 +1009,14 @@ fn frame_loop(
                         continue;
                     }
                 }
-                if !start_now && game_frame.is_none() && (game.active() || !pose || !pacer.ready()) {
+                if !start_now && game_frame.is_none() && (game.holds_picture() || !pose || !pacer.ready()) {
                     continue;
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
                 // The plan holds the frame to the display's grid, so the pacer's budget does not
                 // refuse it.
-                if game.active() || (planned.is_none() && !pacer.ready()) {
+                if game.holds_picture() || (planned.is_none() && !pacer.ready()) {
                     continue;
                 }
                 // The wait ended early: the loop spins until the start
@@ -1372,9 +1372,15 @@ fn frame_loop(
                 );
             }
             if game.connected || input.buttons > 0 || input.haptics > 0 {
+                // Where each hand is, and how far it moved in the window: a controller that lies still or that reports a pose at the
+                // room's origin shows no travel
+                let hand = |i: usize| {
+                    let [x, y, z] = input.at_mm[i];
+                    format!("at ({:.2}, {:.2}, {:.2}) m, moved {:.2} m", x as f32 / 1000.0, y as f32 / 1000.0, z as f32 / 1000.0, input.moved_mm[i] as f32 / 1000.0)
+                };
                 info!(
-                    "Game input: {} left and {} right controller poses, {} and {} of them with an aim pose (tracked mask {:#b}), {} button and axis values, {} haptic pulses from the game",
-                    input.poses[0], input.poses[1], input.aim_poses[0], input.aim_poses[1], input.mask, input.buttons, input.haptics
+                    "Game input: {} left and {} right controller poses, {} and {} of them with an aim pose (tracked mask {:#b}), {} button and axis values, {} haptic pulses from the game; left hand {}; right hand {}",
+                    input.poses[0], input.poses[1], input.aim_poses[0], input.aim_poses[1], input.mask, input.buttons, input.haptics, hand(0), hand(1)
                 );
             }
             let layer_fps = shared.layer.frames.swap(0, Ordering::Relaxed) as f64 / secs;
@@ -1449,5 +1455,24 @@ mod tests {
         assert!(!game(60, Some(5)).hides_desktop(false));
         assert!(!game(120, None).hides_desktop(false));
         assert!(!Game::default().hides_desktop(false));
+    }
+
+    #[test]
+    fn a_game_that_stalls_holds_the_headsets_picture_until_it_gives_the_desktop_back() {
+        let ago = |ms: u64| Instant::now() - Duration::from_millis(ms);
+        let game = |connected: bool, last: Option<u64>| Game { connected, last_frame: last.map(ago), ..Default::default() };
+        // A frame came lately: the game runs
+        assert!(game(true, Some(100)).active() && game(true, Some(100)).holds_picture());
+        // No frame for a second, as while a level loads: the stats do not count it as running,
+        // and the headset keeps the last picture, with no scene of the host's own
+        assert!(!game(true, Some(1000)).active());
+        assert!(game(true, Some(1000)).holds_picture());
+        // The picture and the hidden desktop end at the same time
+        assert!(!game(true, Some(3500)).holds_picture());
+        assert_eq!(game(true, Some(1000)).hides_desktop(false), game(true, Some(1000)).holds_picture());
+        assert_eq!(game(true, Some(3500)).hides_desktop(false), game(true, Some(3500)).holds_picture());
+        // A game that has not sent a frame, or is gone, holds nothing
+        assert!(!game(true, None).holds_picture());
+        assert!(!game(false, Some(100)).holds_picture());
     }
 }
