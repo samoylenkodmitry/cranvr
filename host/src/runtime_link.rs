@@ -439,8 +439,9 @@ impl RuntimeLink {
     }
 
     pub fn head_pose(&self, timestamp_ns: u64, motion: &DeviceMotion) {
+        let motion = crate::test_input::game_head(motion);
         let mut p = timestamp_ns.to_le_bytes().to_vec();
-        put_pose(&mut p, motion);
+        put_pose(&mut p, &motion);
         self.send(msg::HEAD_POSE, &p);
     }
 
@@ -448,6 +449,9 @@ impl RuntimeLink {
     /// aim pose. A hand without an aim pose sends the grip pose alone, and a game then finds its aim
     /// space at the grip pose.
     pub fn controller(&self, timestamp_ns: u64, hand: u32, grip: &DeviceMotion, aim: Option<&DeviceMotion>) {
+        let grip = &crate::test_input::game_controller(grip);
+        let aim = aim.map(crate::test_input::game_controller);
+        let aim = aim.as_ref();
         if self.profiles_dropped.swap(false, Ordering::Relaxed) {
             self.send_profiles();
         }

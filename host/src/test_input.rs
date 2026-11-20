@@ -9,15 +9,18 @@
 //!   yaw turns to the left and a positive pitch turns up. The default is 0.
 //! - `trigger`: the trigger's pull from 0 to 1 (a pull of 0.7 or more clicks it). The default is 0.
 //! - `primary`, `secondary`: 1 presses A or B. `stick_x`, `stick_y`: the stick from -1 to 1.
-//! - `head_yaw`, `head_pitch`: the head turns by these degrees (the same signs) before the controller follows it, so that
-//!   a test can look at a panel that the game put at the side. A test with a headset on a desk leaves them at 0: the
-//!   headset shows the frame for the pose that the host reports.
+//! - `turn`: the game's room turns by this many degrees about the vertical axis through the head (a positive turn
+//!   to the left): the game sees the head and both controllers turned, and the picture that the headset shows is the
+//!   one for the headset's real pose. A game that puts its panels at the side of a headset that lies on a desk then
+//!   shows them in front of it. The turn changes only the poses that go to the game, not the poses of the frames.
 //! - `x`, `y`, `z`: where the controller's grip sits, in meters right, up and forward of the head, in the head's
 //!   axes. The default is 0.2 right, 0.35 below and 0.3 in front.
 //!
-//! The pose follows the head: a headset that lies on a desk and a game that put its panels in front of that headset
-//! get a hand that points at the panels by the same angles.
+//! The hand follows the head: the angles are those of the direction that the headset's real pose faces. With `turn`
+//! the game sees the angles from the direction that its own head faces, which is the one that the headset's picture
+//! shows.
 
+use crate::pose::{DeviceMotion, Pose as RoomPose};
 use cranvr_proto::{
     message::{buttons, Input, Tracking},
     wire::{Motion, Pose},
@@ -36,8 +39,7 @@ const CLICK: f32 = 0.7;
 /// What the file says.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Hand {
-    head_yaw: f32,
-    head_pitch: f32,
+    turn: f32,
     yaw: f32,
     pitch: f32,
     trigger: f32,
@@ -49,7 +51,7 @@ pub struct Hand {
 
 impl Default for Hand {
     fn default() -> Self {
-        Self { head_yaw: 0.0, head_pitch: 0.0, yaw: 0.0, pitch: 0.0, trigger: 0.0, primary: false, secondary: false, stick: [0.0; 2], at: [0.2, -0.35, -0.3] }
+        Self { turn: 0.0, yaw: 0.0, pitch: 0.0, trigger: 0.0, primary: false, secondary: false, stick: [0.0; 2], at: [0.2, -0.35, -0.3] }
     }
 }
 
@@ -61,8 +63,7 @@ impl Hand {
             let Some((name, value)) = word.split_once('=') else { continue };
             let Ok(value) = value.parse::<f32>() else { continue };
             match name {
-                "head_yaw" => hand.head_yaw = value,
-                "head_pitch" => hand.head_pitch = value,
+                "turn" => hand.turn = value,
                 "yaw" => hand.yaw = value,
                 "pitch" => hand.pitch = value,
                 "trigger" => hand.trigger = value.clamp(0.0, 1.0),
@@ -80,14 +81,6 @@ impl Hand {
         hand
     }
 
-    /// The head's pose after the turn that the file asks for.
-    fn head(&self, head: &Pose) -> Pose {
-        let turn = Quat::from_array(head.orientation)
-            * Quat::from_rotation_y(self.head_yaw.to_radians())
-            * Quat::from_rotation_x(self.head_pitch.to_radians());
-        Pose { orientation: turn.to_array(), position: head.position }
-    }
-
     /// The right controller's motion for a head at `head`: the grip at the offset in the head's axes, the aim along the
     /// direction that the angles name. The velocities are zero.
     fn motion(&self, head: &Pose) -> Motion {
@@ -97,13 +90,17 @@ impl Hand {
         Motion { pose: Pose { orientation: aim.to_array(), position: at.to_array() }, linear_velocity: [0.0; 3], angular_velocity: [0.0; 3] }
     }
 
-    /// Turns the head of a tracking sample and replaces its right hand. The grip and the aim are the same pose, as a
-    /// controller that is held straight has them.
+    /// Replaces the right hand of a tracking sample. The grip and the aim are the same pose, as a controller that is
+    /// held straight has them.
     pub fn apply_tracking(&self, tracking: &mut Tracking) {
-        tracking.head.pose = self.head(&tracking.head.pose);
         let motion = self.motion(&tracking.head.pose);
         tracking.right_grip = Some(motion);
         tracking.right_aim = Some(motion);
+    }
+
+    /// The rotation of the game's room.
+    fn room(&self) -> Quat {
+        Quat::from_rotation_y(self.turn.to_radians())
     }
 
     /// Replaces the right hand of an input sample.
@@ -116,6 +113,38 @@ impl Hand {
             | (buttons::PRIMARY * u32::from(self.primary))
             | (buttons::SECONDARY * u32::from(self.secondary));
         hand.touches = (buttons::TRIGGER_CLICK * u32::from(self.trigger > 0.0)) | (buttons::PRIMARY * u32::from(self.primary));
+    }
+}
+
+/// Turns a pose that goes to the game about the head's place `about`, by the room's turn `room`.
+fn turned(motion: &DeviceMotion, room: Quat, about: Vec3) -> DeviceMotion {
+    DeviceMotion {
+        pose: RoomPose { orientation: room * motion.pose.orientation, position: about + room * (motion.pose.position - about) },
+        linear_velocity: room * motion.linear_velocity,
+        angular_velocity: room * motion.angular_velocity,
+    }
+}
+
+/// Where the head was in the last pose that went to the game: the controllers of the same sample turn about it.
+fn head_place() -> &'static Mutex<Vec3> {
+    static PLACE: OnceLock<Mutex<Vec3>> = OnceLock::new();
+    PLACE.get_or_init(|| Mutex::new(Vec3::ZERO))
+}
+
+/// The head pose that goes to the game, turned when a test turns the room.
+pub fn game_head(head: &DeviceMotion) -> DeviceMotion {
+    *head_place().lock().unwrap() = head.pose.position;
+    match current() {
+        Some(hand) if hand.turn != 0.0 => turned(head, hand.room(), head.pose.position),
+        _ => *head,
+    }
+}
+
+/// A controller pose that goes to the game, turned with the room about the head of the same sample.
+pub fn game_controller(motion: &DeviceMotion) -> DeviceMotion {
+    match current() {
+        Some(hand) if hand.turn != 0.0 => turned(motion, hand.room(), *head_place().lock().unwrap()),
+        _ => *motion,
     }
 }
 
@@ -173,7 +202,7 @@ mod tests {
         assert!(hand.primary && !hand.secondary);
         assert_eq!(hand.at, [0.2, -0.35, -0.5]);
         assert_eq!(Hand::parse(""), Hand::default());
-        assert_eq!(Hand::parse("head_yaw=40 head_pitch=-5").head_yaw, 40.0);
+        assert_eq!(Hand::parse("turn=40").turn, 40.0);
     }
 
     #[test]
@@ -196,15 +225,25 @@ mod tests {
     }
 
     #[test]
-    fn the_head_turns_before_the_hand_follows_it() {
-        let mut tracking = Tracking::default();
-        tracking.head.pose = Pose { orientation: [0.0, 0.0, 0.0, 1.0], position: [0.0, 1.6, 0.0] };
-        Hand::parse("head_yaw=90 x=0 y=0 z=1").apply_tracking(&mut tracking);
-        // The head faces -x, so the grip sits one meter along -x
-        let at = tracking.right_grip.unwrap().pose.position;
-        assert!((Vec3::from_array(at) - Vec3::new(-1.0, 1.6, 0.0)).length() < 1e-5, "{at:?}");
-        let forward = Quat::from_array(tracking.head.pose.orientation) * Vec3::NEG_Z;
-        assert!((forward - Vec3::NEG_X).length() < 1e-5);
+    fn the_rooms_turn_moves_the_head_and_the_hands_about_the_head() {
+        let head = DeviceMotion {
+            pose: RoomPose { orientation: Quat::IDENTITY, position: Vec3::new(0.0, 1.6, 0.0) },
+            linear_velocity: Vec3::ZERO,
+            angular_velocity: Vec3::ZERO,
+        };
+        let hand = DeviceMotion {
+            pose: RoomPose { orientation: Quat::IDENTITY, position: Vec3::new(0.0, 1.4, -1.0) },
+            linear_velocity: Vec3::new(0.0, 0.0, -1.0),
+            angular_velocity: Vec3::ZERO,
+        };
+        // A turn of 90 degrees to the left: ahead (-z) becomes -x
+        let room = Hand::parse("turn=90").room();
+        let turned_head = turned(&head, room, head.pose.position);
+        assert!((turned_head.pose.orientation * Vec3::NEG_Z - Vec3::NEG_X).length() < 1e-5);
+        assert_eq!(turned_head.pose.position, head.pose.position);
+        let turned_hand = turned(&hand, room, head.pose.position);
+        assert!((turned_hand.pose.position - Vec3::new(-1.0, 1.4, 0.0)).length() < 1e-5, "{:?}", turned_hand.pose.position);
+        assert!((turned_hand.linear_velocity - Vec3::NEG_X).length() < 1e-5);
     }
 
     #[test]

@@ -759,7 +759,7 @@ struct Game {
     rates: Vec<f64>,
     /// Frames the game delivered since the last stats window, encoded or not
     delivered: u32,
-    /// Looks for a black right eye in this run (see eye_check.rs)
+    /// Looks for a black picture in this run (see eye_check.rs)
     eye_watch: eye_check::Watch,
     /// Set the displays to their panels' pixels while the game runs
     unscale: bool,
@@ -836,13 +836,19 @@ impl Game {
     }
 }
 
-/// Checks the two eyes of a game frame about once a second. The cranvr app hears of a black right
-/// eye once for each game run, as a `black_eye` status line, and decides what to do. The caller
+/// Checks the two eyes of a game frame about once a second. The cranvr app hears of a black picture
+/// once for each game run, as a `black_eye` status line, and decides what to do. The caller
 /// holds the images, so this takes the fields of `Game` that it needs, not the whole of it.
 fn watch_eyes(watch: &mut eye_check::Watch, program: Option<&str>, frame: &GameFrame, left: &PixelBuffer, right: &PixelBuffer) {
-    if watch.due() && watch.check([left, right], [frame.views[0].rect, frame.views[1].rect]) {
-        warn!("The right eye of the game stays black while the left eye shows a picture");
-        status::emit(json!({"type": "black_eye", "eye": "right", "program": program}));
+    if !watch.due() {
+        return;
+    }
+    if let Some(symptom) = watch.check([left, right], [frame.views[0].rect, frame.views[1].rect]) {
+        match symptom {
+            eye_check::Symptom::RightEye => warn!("The right eye of the game stays black while the left eye shows a picture"),
+            eye_check::Symptom::BothEyes => warn!("Both eyes of the game stay black while the game delivers frames"),
+        }
+        status::emit(json!({"type": "black_eye", "eye": symptom.eye(), "program": program}));
     }
 }
 

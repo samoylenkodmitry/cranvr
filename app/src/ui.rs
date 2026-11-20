@@ -207,13 +207,15 @@ fn refresh(settings: MutableState<Settings>, model: MutableState<Model>, slow: b
     }
 }
 
-/// Answers the host's reports of a black right eye (see black_eye.rs): the program's option "Each
+/// Answers the host's reports of a black picture (see black_eye.rs): the program's option "Each
 /// eye in its own pass" turns on once, and the game starts again with it. A report with the option
 /// on already only shows a notice.
 fn black_eye_reports(settings: MutableState<Settings>, next: &mut Model, reports: Vec<serde_json::Value>) {
     for report in reports {
         let mut response = None;
-        settings.update(|s| response = Some(black_eye::respond(&mut s.launch, &next.games, report["program"].as_str())));
+        settings.update(|s| {
+            response = Some(black_eye::respond(&mut s.launch, &next.games, report["program"].as_str(), report["eye"].as_str().unwrap_or("right")))
+        });
         let Some(black_eye::Response { notice, restart }) = response else { continue };
         next.notice = Some((notice, Instant::now() + black_eye::NOTICE_TIME));
         if let Some(program) = restart {
@@ -839,7 +841,7 @@ fn LaunchOptions(settings: MutableState<Settings>, program: String) {
             if options.eye_one_pass && !options.eye_one_pass_reason.is_empty() {
                 Hint(options.eye_one_pass_reason.clone());
             }
-            Hint("For a game whose right eye stays black. \"Each eye in its own pass\": the runtime refuses two-eye images, so the game draws each eye apart. This costs frames. \"Both eyes in one pass\": for a game that draws both eyes into a picture of its own, as a Unity game with the OpenVR provider does.".into());
+            Hint("For a game whose picture stays black, in the right eye or in both eyes. \"Each eye in its own pass\": the runtime refuses two-eye images, so the game draws each eye apart. This costs frames. \"Both eyes in one pass\": the runtime tells the game that a vertex shader may choose the eye, as a game that draws both eyes in one pass needs, or that draws both eyes into a picture of its own, as a Unity game with the OpenVR provider does.".into());
             let (own, default_on) = (options.opencomposite, wine.opencomposite);
             let key = program.clone();
             FlowRow(Modifier::empty().fill_max_width(), flow(), move || {

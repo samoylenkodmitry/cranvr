@@ -1,14 +1,19 @@
-//! Finds a game whose right eye stays black. A game that renders both eyes in one pass into a
+//! Finds a game whose picture stays black. A game that renders both eyes in one pass into a
 //! swapchain with two slices draws slice 1 through a path that DXMT does not support, so the right
-//! eye stays empty. The host cannot tell this from the swapchain's description, because games that
-//! render both eyes into two slices work too. It looks at the pictures instead.
+//! eye stays empty. A game of another engine version draws nothing into either slice. The host cannot
+//! tell this from the swapchain's description, because games that render both eyes into two slices
+//! work too. It looks at the pictures instead.
 //!
 //! About once a second the frame loop reads a grid of 64 x 64 pixels from each eye of the game's
-//! newest frame. Three states decide: the right eye is black when none of its samples is lit, and
-//! the left eye has content when enough of its samples are lit. The symptom counts when the left
-//! eye has content and the right eye is black for several checks in a row. A dark screen in both
-//! eyes (a loading screen) and a flicker between states never count. The host reports the symptom
-//! once for each game run (see `status.rs`, the `black_eye` line).
+//! newest frame. An eye is black when none of its samples is lit, and it has content when enough of
+//! its samples are lit. Two symptoms count:
+//! - The left eye has content and the right eye is black for several checks in a row.
+//! - Both eyes are black for `DARK_CHECKS` checks in a row, while the game keeps delivering frames. A
+//!   game that loads shows a black picture for about 40 seconds before its first scene. The limit is
+//!   more than twice that.
+//!
+//! A flicker between states never counts. The host reports the symptom once for each game run (see
+//! `status.rs`, the `black_eye` line).
 //!
 //! The grid has 4096 samples because a menu in a dark room lights few pixels. A game that showed the
 //! spectrum bars of its menu in the left eye and nothing in the right eye lit about 0.5 percent of the
@@ -35,6 +40,10 @@ const CONTENT_SAMPLES: usize = 8;
 /// The checks in a row that must show the symptom. At one check a second the game has shown a
 /// black right eye beside a lit left eye for this many seconds.
 const CHECKS_IN_A_ROW: u32 = 4;
+/// The checks in a row with two black eyes that count as a symptom: 90 seconds at one check a second.
+/// A Unity game under Wine showed a black picture for 42 seconds while it loaded, in a run that
+/// then drew both eyes.
+const DARK_CHECKS: u32 = 90;
 const INTERVAL: Duration = Duration::from_secs(1);
 
 /// The folder named by `CRANVR_EYE_DUMP`, if any. A test run sets it to see what a game drew: each
@@ -180,31 +189,58 @@ impl Grid {
     }
 }
 
-/// Decides from one pair of grids per check whether the symptom has held long enough.
+/// What a game's pictures show when the symptom holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Symptom {
+    /// The left eye has content and the right eye is black
+    RightEye,
+    /// Both eyes are black
+    BothEyes,
+}
+
+impl Symptom {
+    /// The word of the `black_eye` status line
+    pub fn eye(self) -> &'static str {
+        match self {
+            Self::RightEye => "right",
+            Self::BothEyes => "both",
+        }
+    }
+}
+
+/// Decides from one pair of grids per check whether a symptom has held long enough.
 #[derive(Default)]
 pub struct Detector {
+    /// The checks in a row with a lit left eye and a black right eye
     streak: u32,
+    /// The checks in a row with two black eyes
+    dark: u32,
     reported: bool,
 }
 
 impl Detector {
-    /// One check. Returns true once: at the check that completes the streak.
-    pub fn check(&mut self, left: &Grid, right: &Grid) -> bool {
+    /// One check. Returns the symptom once: at the check that completes a streak.
+    pub fn check(&mut self, left: &Grid, right: &Grid) -> Option<Symptom> {
         if self.reported {
-            return false;
+            return None;
         }
-        if left.has_content() && right.is_black() {
-            self.streak += 1;
+        self.streak = if left.has_content() && right.is_black() { self.streak + 1 } else { 0 };
+        self.dark = if left.is_black() && right.is_black() { self.dark + 1 } else { 0 };
+        let symptom = if self.streak >= CHECKS_IN_A_ROW {
+            Some(Symptom::RightEye)
+        } else if self.dark >= DARK_CHECKS {
+            Some(Symptom::BothEyes)
         } else {
-            self.streak = 0;
-        }
-        self.reported = self.streak >= CHECKS_IN_A_ROW;
-        self.reported
+            None
+        };
+        self.reported = symptom.is_some();
+        symptom
     }
 
-    /// A check that could not read an eye ends the streak.
+    /// A check that could not read an eye ends the streaks.
     fn unreadable(&mut self) {
         self.streak = 0;
+        self.dark = 0;
     }
 }
 
@@ -226,9 +262,9 @@ impl Watch {
         !self.detector.reported && self.last.is_none_or(|last| last.elapsed() >= INTERVAL)
     }
 
-    /// Checks the two eyes of a frame (the images and their rects). Returns true once, when the
-    /// symptom has held long enough to report.
-    pub fn check(&mut self, images: [&PixelBuffer; 2], rects: [[i32; 4]; 2]) -> bool {
+    /// Checks the two eyes of a frame (the images and their rects). Returns the symptom once, when it
+    /// has held long enough to report.
+    pub fn check(&mut self, images: [&PixelBuffer; 2], rects: [[i32; 4]; 2]) -> Option<Symptom> {
         self.last = Some(Instant::now());
         if let Some(dir) = dump_dir() {
             for (name, image, rect) in [("left", images[0], rects[0]), ("right", images[1], rects[1])] {
@@ -255,7 +291,7 @@ impl Watch {
             self.detector.check(&self.left, &self.right)
         } else {
             self.detector.unreadable();
-            false
+            None
         }
     }
 }
@@ -281,7 +317,7 @@ mod tests {
 
     /// Runs the checks and returns the number of the one that reported, counting from 1.
     fn reported_at(detector: &mut Detector, checks: &[(Grid, Grid)]) -> Option<usize> {
-        checks.iter().position(|(left, right)| detector.check(left, right)).map(|i| i + 1)
+        checks.iter().position(|(left, right)| detector.check(left, right).is_some()).map(|i| i + 1)
     }
 
     fn repeated(left: fn() -> Grid, right: fn() -> Grid, times: usize) -> Vec<(Grid, Grid)> {
@@ -294,7 +330,7 @@ mod tests {
         let checks = repeated(lit, black, 10);
         assert_eq!(reported_at(&mut detector, &checks), Some(4));
         // The later checks stay silent
-        assert!(!detector.check(&lit(), &black()));
+        assert_eq!(detector.check(&lit(), &black()), None);
     }
 
     #[test]
@@ -304,9 +340,43 @@ mod tests {
     }
 
     #[test]
-    fn two_dark_eyes_such_as_a_loading_screen_never_report() {
+    fn two_dark_eyes_such_as_a_loading_screen_do_not_report_before_the_limit() {
         let mut detector = Detector::default();
-        assert_eq!(reported_at(&mut detector, &repeated(black, black, 20)), None);
+        // The 42 seconds of a game that loaded and then drew both eyes, and then some
+        assert_eq!(reported_at(&mut detector, &repeated(black, black, 60)), None);
+        assert_eq!(reported_at(&mut detector, &repeated(black, black, DARK_CHECKS as usize - 60 - 1)), None);
+        assert_eq!(detector.check(&black(), &black()), Some(Symptom::BothEyes));
+        // The later checks stay silent
+        assert_eq!(detector.check(&black(), &black()), None);
+    }
+
+    #[test]
+    fn a_black_right_eye_beside_a_lit_left_eye_is_the_right_eye_symptom() {
+        let mut detector = Detector::default();
+        for _ in 1..CHECKS_IN_A_ROW {
+            assert_eq!(detector.check(&lit(), &black()), None);
+        }
+        assert_eq!(detector.check(&lit(), &black()), Some(Symptom::RightEye));
+        assert_eq!(Symptom::RightEye.eye(), "right");
+        assert_eq!(Symptom::BothEyes.eye(), "both");
+    }
+
+    #[test]
+    fn a_lit_sample_or_a_lit_eye_in_the_dark_resets_the_count() {
+        let mut detector = Detector::default();
+        // A loading screen with one lit sample, such as a spinner, is not black
+        let mut checks = repeated(black, black, DARK_CHECKS as usize - 1);
+        checks.push((grid(1, 255), black()));
+        checks.extend(repeated(black, black, DARK_CHECKS as usize - 1));
+        assert_eq!(reported_at(&mut detector, &checks), None);
+        // A scene between two dark stretches resets it too
+        let mut checks = repeated(black, black, DARK_CHECKS as usize - 1);
+        checks.push((lit(), lit()));
+        checks.extend(repeated(black, black, DARK_CHECKS as usize - 1));
+        assert_eq!(reported_at(&mut Detector::default(), &checks), None);
+        // A full stretch after the scene reports
+        checks.push((black(), black()));
+        assert_eq!(reported_at(&mut Detector::default(), &checks), Some(checks.len()));
     }
 
     #[test]
@@ -354,13 +424,20 @@ mod tests {
     fn an_unreadable_check_resets_the_count() {
         let mut detector = Detector::default();
         for _ in 0..3 {
-            assert!(!detector.check(&lit(), &black()));
+            assert_eq!(detector.check(&lit(), &black()), None);
         }
         detector.unreadable();
-        assert!(!detector.check(&lit(), &black()));
-        assert!(!detector.check(&lit(), &black()));
-        assert!(!detector.check(&lit(), &black()));
-        assert!(detector.check(&lit(), &black()));
+        assert_eq!(detector.check(&lit(), &black()), None);
+        assert_eq!(detector.check(&lit(), &black()), None);
+        assert_eq!(detector.check(&lit(), &black()), None);
+        assert_eq!(detector.check(&lit(), &black()), Some(Symptom::RightEye));
+        // The same holds for the dark count
+        let mut detector = Detector::default();
+        for _ in 0..DARK_CHECKS - 1 {
+            assert_eq!(detector.check(&black(), &black()), None);
+        }
+        detector.unreadable();
+        assert_eq!(detector.check(&black(), &black()), None);
     }
 
     /// 4-byte pixels of an image: `paint(x, y)` gives a pixel's [b, g, r, a].
@@ -479,7 +556,7 @@ mod tests {
         assert!(watch.due());
         let mut reports = 0;
         for check in 1..=8 {
-            if watch.check([&left, &right], rects) {
+            if watch.check([&left, &right], rects) == Some(Symptom::RightEye) {
                 reports += 1;
                 assert_eq!(check, CHECKS_IN_A_ROW as usize);
             }
@@ -495,7 +572,7 @@ mod tests {
         both.with_bgra_mut(|data, _| data.fill(255));
         let mut watch = Watch::default();
         assert!(watch.due());
-        assert!(!watch.check([&both, &both], [[0, 0, 64, 64]; 2]));
+        assert_eq!(watch.check([&both, &both], [[0, 0, 64, 64]; 2]), None);
         // The clock gates the next check
         assert!(!watch.due());
     }

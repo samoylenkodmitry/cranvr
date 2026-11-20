@@ -234,14 +234,16 @@ dxmt_commit=$(git -C "${runtime}/build/dxmt/src" rev-parse HEAD)
     print
     print -r -- "- Wine 11.10: Gcenx's macOS build, https://github.com/Gcenx/macOS_Wine_builds/releases/tag/11.10 (LGPL 2.1 or later; source at https://gitlab.winehq.org/wine/wine/-/tags/wine-11.10). Unchanged, apart from DXMT's DLLs and wined3d.dll (next line)."
     print -r -- "- wined3d.dll of Wine 11.10 (LGPL 2.1 or later), built from https://gitlab.winehq.org/wine/wine at the tag wine-11.10, commit ${wine_commit}, with cranvr's patch 0001 (the HLSL intrinsic isnan in vkd3d-shader). It replaces the file in the engine and in the Wine prefix. Its source, the patch and the build are in SOURCE/wine-source.tar.xz of this archive and in the file cranvr-wine-source.tar.xz of the release. wine-d3d/hlsl_compile.exe is cranvr's own test program (MIT)."
-    print -r -- "- DXMT v0.80 (MIT), https://github.com/3Shain/dxmt, with BasaltVR's patches 0001 to 0004 and cranvr's patches 0005 to 0010. Tree commit ${dxmt_commit}."
+    print -r -- "- DXMT v0.80 (MIT), https://github.com/3Shain/dxmt, with BasaltVR's patches 0001 to 0004 and cranvr's patches 0005 to 0012. Tree commit ${dxmt_commit}."
     print -r -- "- BasaltVR (MIT), https://github.com/Stooovie/BasaltVR at ${basalt_commit}, with cranvr's runtime patches."
     print -r -- "- The OpenXR SDK loader in the runtime's checks (Apache 2.0)."
     print -r -- "- OpenComposite (GPL 3), https://gitlab.com/znixian/OpenOVR at ${oc_commit}, with cranvr's patches 0001 to 0007. Its source, the patches and the build are in SOURCE/opencomposite-source.tar.xz of this archive and in the file cranvr-opencomposite-source.tar.xz of the release. It is a separate program: games load it as an OpenVR runtime (opencomposite/vrclient_x64.dll) and it calls the OpenXR runtime above. It contains the OpenXR SDK loader (Apache 2.0), jsoncpp (MIT), glm (MIT), inih (BSD), Valve's OpenVR headers (BSD 3-Clause) and hand models of Oculus (CC BY 4.0): their licenses are in LICENSES/."
     print
     print "cranvr's DXMT patches add a limit on MSAA samples, an MSAA resolve without a sample store, an"
     print "optional skip of the Mac window's present, a silent Discard hint (patch 0009) and an optional report of render-target"
-    print "array indexing from any shader (patch 0010, for a Unity game with the OpenVR provider). cranvr's runtime patches add the headset's refresh rate,"
+    print "array indexing from any shader (patch 0010, for a Unity game with the OpenVR provider), the shaders of a failed pipeline in the log"
+    print "(patch 0011) and a pipeline with the rasterizer off for a vertex shader that declares no output (patch 0012: Metal refused such a"
+    print "pipeline and a game's draw then ran with the pipeline of the draw before it). cranvr's runtime patches add the headset's refresh rate,"
     print "a view size per game, an optional limit of one slice per swapchain, a separate aim pose for each"
     print "controller and the tracking of hands, body, face and eyes (XR_EXT_hand_tracking, XR_FB_body_tracking,"
     print "XR_META_body_tracking_full_body, XR_FB_face_tracking2 and XR_EXT_eye_gaze_interaction). Patch 0006"

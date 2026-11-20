@@ -242,9 +242,9 @@ pub struct Model {
     pub network: Vec<String>,
     /// Requests from the console in VR that the window has not run yet
     pub vr_requests: Vec<Value>,
-    /// Reports of a black right eye that the window has not answered yet (see black_eye.rs)
+    /// Reports of a black picture that the window has not answered yet (see black_eye.rs)
     pub black_eyes: Vec<Value>,
-    /// What the window and the console in VR say about the last black right eye, until it expires
+    /// What the window and the console in VR say about the last black picture, until it expires
     pub notice: Option<(crate::black_eye::Notice, Instant)>,
 }
 
