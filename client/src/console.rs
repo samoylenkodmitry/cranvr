@@ -313,6 +313,10 @@ impl Console {
         self.open = false;
     }
 
+    pub fn open(&mut self) {
+        self.open = true;
+    }
+
     /// Opens the console and keeps it open when the link ends.
     pub fn pin(&mut self) {
         self.keep_open = true;

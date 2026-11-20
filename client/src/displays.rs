@@ -28,14 +28,20 @@
 //! The decoder lives in a mutex because the composition thread must drop it before the surface's
 //! end callback returns, while the decode thread feeds it.
 
-use crate::display_wish::Measured;
-use cranpose::{AccessUnit, DecodedFrames, DecoderConfig, DecoderError, DecoderOutput, ExternalSurface, VideoCodec, VideoDecoder};
+use crate::{
+    display_wish::{wish_for, Measured},
+    menu_model::place_of,
+    panel_layout::Layout,
+};
+use cranpose::{
+    AccessUnit, DecodedFrames, DecoderConfig, DecoderError, DecoderOutput, ExternalSurface, PointerEvent, PointerEventKind, VideoCodec, VideoDecoder,
+};
 use cranvr_proto::{
     link::ClientLink,
     media::Received,
     message::{
-        display_index, display_stream, ClientMsg, Cursor, DesktopParams, DesktopWish, DisplayInfo, DisplayList, DisplayRequest, HostMsg, DESKTOP_STREAM,
-        MAX_DISPLAYS,
+        display_index, display_stream, ClientDatagram, ClientMsg, Cursor, DesktopParams, DesktopWish, DisplayInfo, DisplayList, DisplayRequest, HostMsg,
+        Pointer, DESKTOP_STREAM, MAX_DISPLAYS,
     },
     wire::Codec,
     DISPLAYS_VERSION,
@@ -55,6 +61,8 @@ pub const SLOTS: usize = MAX_DISPLAYS as usize;
 /// How long the decoder waits for a free input buffer before it refuses a picture
 const INPUT_WAIT: Duration = Duration::from_millis(30);
 const KEY_REQUEST_GAP: Duration = Duration::from_millis(250);
+/// The pointer goes to the host this often while it points at a display, if nothing changes
+const POINTER_KEEPALIVE: Duration = Duration::from_millis(50);
 /// How often a decode thread logs its display's numbers, and the uplink thread logs the sum
 const LOG_EVERY: Duration = Duration::from_secs(2);
 const SUMMARY_EVERY: Duration = Duration::from_secs(5);
@@ -70,6 +78,51 @@ pub struct View {
     pub visible: bool,
     /// The picture's width over its height
     pub aspect: f32,
+}
+
+/// What the app sends the host about the pointer on one display.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PointerNow {
+    /// Where the controller points on the picture as u and v from its top left corner
+    pub hit: Option<[f32; 2]>,
+    /// 1 while the trigger is down and 0 while it is up. The host presses the button past 0.6 and
+    /// lets it go below 0.4.
+    pub trigger: f32,
+    /// How far the thumbstick leans forward, from -1 to 1
+    pub scroll: f32,
+}
+
+impl PointerNow {
+    /// Whether the host has something to do with it: a controller points at the display or holds a
+    /// press.
+    pub fn busy(&self) -> bool {
+        self.hit.is_some() || self.trigger > 0.4
+    }
+
+    /// Whether `other` differs enough to send. A move of a fifth of a pixel of a 4K picture does not
+    /// count.
+    pub fn differs(&self, other: &Self) -> bool {
+        let moved = match (self.hit, other.hit) {
+            (Some(a), Some(b)) => (a[0] - b[0]).abs() > 5e-5 || (a[1] - b[1]).abs() > 5e-5,
+            (None, None) => false,
+            _ => true,
+        };
+        moved || (self.trigger - other.trigger).abs() > 0.02 || (self.scroll - other.scroll).abs() > 0.02
+    }
+
+    /// The pointer after a pointer event of the surface. `at` is the event's place as u and v.
+    /// The surface sends `Up` before `Exit` when the ray left the surface during a press, so an
+    /// `Exit` always ends with the button up.
+    pub fn after(mut self, kind: PointerEventKind, at: [f32; 2]) -> Self {
+        match kind {
+            PointerEventKind::Enter | PointerEventKind::Move => self.hit = Some(at),
+            PointerEventKind::Down => (self.hit, self.trigger) = (Some(at), 1.0),
+            PointerEventKind::Up => (self.hit, self.trigger) = (Some(at), 0.0),
+            PointerEventKind::Exit => self = Self::default(),
+            _ => {}
+        }
+        self
+    }
 }
 
 #[derive(Default)]
@@ -159,6 +212,9 @@ struct Uplink {
     key: [bool; SLOTS],
     /// The newest frame number of each display's stream, for the key frame request
     frame: [u32; SLOTS],
+    /// The pointer on each display, and whether it changed since the last send
+    pointer: [PointerNow; SLOTS],
+    pointer_dirty: [bool; SLOTS],
     dirty: bool,
 }
 
@@ -448,6 +504,35 @@ impl Displays {
         self.wake.notify_all();
     }
 
+    /// Changes the pointer on a display. It goes to the host when it differs from the one that went
+    /// last.
+    pub fn update_pointer(&self, stream: u8, change: impl FnOnce(&mut PointerNow)) {
+        let Some(index) = slot_of(stream) else { return };
+        let mut uplink = self.uplink.lock().unwrap();
+        let before = uplink.pointer[index];
+        let mut pointer = before;
+        change(&mut pointer);
+        if pointer.differs(&before) || pointer.busy() != before.busy() {
+            uplink.pointer[index] = pointer;
+            uplink.pointer_dirty[index] = true;
+            uplink.dirty = true;
+            drop(uplink);
+            self.wake.notify_all();
+        }
+    }
+
+    /// A controller's ray on the surface of a display. `size` is the surface's width and height in dp,
+    /// the units of the event's position.
+    pub fn on_pointer_event(&self, stream: u8, event: &PointerEvent, size: [f32; 2]) {
+        let at = [event.position.x / size[0], event.position.y / size[1]].map(|v| v.clamp(0.0, 1.0));
+        self.update_pointer(stream, |pointer| *pointer = pointer.after(event.kind, at));
+    }
+
+    /// The pointer on a display as the app last set it.
+    pub fn pointer(&self, stream: u8) -> PointerNow {
+        slot_of(stream).map_or_else(PointerNow::default, |index| self.uplink.lock().unwrap().pointer[index])
+    }
+
     /// The user asks the host to add a display.
     pub fn request_add(&self) {
         self.state.lock().unwrap().adds += 1;
@@ -732,6 +817,25 @@ pub fn decode_loop(stream: u8, units: &mpsc::Receiver<Received>, stop: &AtomicBo
     }
 }
 
+/// The widest picture that the headset's decoder takes, once asked.
+fn decoder_width() -> Option<u32> {
+    static WIDTH: OnceLock<Option<u32>> = OnceLock::new();
+    *WIDTH.get_or_init(|| VideoDecoder::capabilities(VideoCodec::Hevc).ok().and_then(|limits| limits.max_width))
+}
+
+/// What the client asks of each display that shows in `layout`: `None` for the others. A display that
+/// is not shown is not asked for, and costs the Mac and the headset nothing.
+pub fn wishes_of(layout: &Layout) -> [Option<DesktopWish>; SLOTS] {
+    let shown = layout.displays_shown();
+    let mut wishes = [None; SLOTS];
+    for &stream in &shown {
+        if let Some(index) = slot_of(stream) {
+            wishes[index] = Some(wish_for(place_of(layout, stream), layout.in_game(), shown.len(), decoder_width()));
+        }
+    }
+    wishes
+}
+
 /// The message for the wish of a display, in the form of the host's protocol version. A host of an
 /// older version knows only the first display.
 fn wish_message(stream: u8, wish: DesktopWish) -> ClientMsg {
@@ -739,6 +843,17 @@ fn wish_message(stream: u8, wish: DesktopWish) -> ClientMsg {
         ClientMsg::Desktop(wish)
     } else {
         ClientMsg::DisplayWish { stream, wish }
+    }
+}
+
+/// The datagram for a pointer on a display. The first display uses the datagram of the older
+/// versions.
+fn pointer_datagram(stream: u8, seq: u32, pointer: &PointerNow) -> ClientDatagram {
+    let pointer = Pointer { seq, sent: cranvr_proto::clock::now_ns(), hit: pointer.hit, trigger: pointer.trigger, scroll: pointer.scroll };
+    if stream == DESKTOP_STREAM {
+        ClientDatagram::Pointer(pointer)
+    } else {
+        ClientDatagram::DisplayPointer { stream, pointer }
     }
 }
 
@@ -755,13 +870,16 @@ pub fn uplink(link: &ClientLink, stop: &AtomicBool) {
     }
     let newer = link.welcome.version >= DISPLAYS_VERSION;
     let mut last_key = [Instant::now() - KEY_REQUEST_GAP; SLOTS];
+    let mut last_send = [Instant::now(); SLOTS];
+    let mut seq = [0u32; SLOTS];
+    let mut pointers_sent = 0u64;
     let (mut summary_at, mut seen) = (Instant::now(), (0u64, 0u64));
     while !stop.load(Ordering::Relaxed) {
-        let (keys, frames) = {
+        let (keys, frames, pointers, pointer_dirty) = {
             let guard = owner.uplink.lock().unwrap();
-            let (mut uplink, _) = owner.wake.wait_timeout_while(guard, Duration::from_millis(100), |u| !u.dirty).unwrap();
+            let (mut uplink, _) = owner.wake.wait_timeout_while(guard, Duration::from_millis(20), |u| !u.dirty).unwrap();
             uplink.dirty = false;
-            (std::mem::take(&mut uplink.key), uplink.frame)
+            (std::mem::take(&mut uplink.key), uplink.frame, uplink.pointer, std::mem::take(&mut uplink.pointer_dirty))
         };
         // The wishes that changed, the displays to add and the displays to remove
         let (changes, adds, removes) = {
@@ -809,11 +927,21 @@ pub fn uplink(link: &ClientLink, stop: &AtomicBool) {
                 link.duplex.send_control(&ClientMsg::RequestKeyFrame { stream: display_stream(index as u8), frame: frames[index] }).ok();
             }
         }
+        for index in 0..SLOTS {
+            let pointer = pointers[index];
+            if pointer_dirty[index] || (pointer.busy() && last_send[index].elapsed() >= POINTER_KEEPALIVE) {
+                last_send[index] = Instant::now();
+                let datagram = pointer_datagram(display_stream(index as u8), seq[index], &pointer);
+                seq[index] = seq[index].wrapping_add(1);
+                link.duplex.send_datagram(&datagram).ok();
+                pointers_sent += 1;
+            }
+        }
         if summary_at.elapsed() >= SUMMARY_EVERY {
             summary_at = Instant::now();
             let (received, submitted, wished) = owner.totals();
             log::info!(
-                "displays: {wished} wished; in the last {} s: {} pictures received, {} sent to a decoder",
+                "displays: {wished} wished; in the last {} s: {} pictures received, {} sent to a decoder; {pointers_sent} pointer datagrams sent in all",
                 SUMMARY_EVERY.as_secs(),
                 received.saturating_sub(seen.0),
                 submitted.saturating_sub(seen.1)

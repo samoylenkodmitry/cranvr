@@ -670,6 +670,17 @@ impl Hub {
         self.console.lock().unwrap().close();
     }
 
+    /// Opens the console, as the hand menu asks. A game's start closes it again.
+    pub fn open_console(&self) {
+        self.console.lock().unwrap().open();
+    }
+
+    /// Opens the console on its page of the controls.
+    pub fn open_controls(&self) {
+        log::info!("the hand menu asks for the page of the controls");
+        self.console.lock().unwrap().open();
+    }
+
     /// Opens the console and keeps it open when the link ends (see `settings::console_on_launch`).
     pub fn pin_console(&self) {
         self.console.lock().unwrap().pin();
