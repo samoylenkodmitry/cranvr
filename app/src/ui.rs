@@ -164,6 +164,9 @@ fn refresh(settings: MutableState<Settings>, model: MutableState<Model>, slow: b
     vr_requests(settings, &mut next, requests);
     let reports = std::mem::take(&mut next.black_eyes);
     black_eye_reports(settings, &mut next, reports);
+    for chosen in backend::take_chosen() {
+        chosen_program(settings, &mut next, chosen);
+    }
     // A headset that asks to connect has a user who may not look at the Mac: the window comes up
     let waiting = |m: &Model| m.native.iter().flat_map(|n| n.pending.iter().map(|r| r.key.clone())).collect::<Vec<_>>();
     let known = model.with(|m| waiting(m));
@@ -226,6 +229,49 @@ fn black_eye_reports(settings: MutableState<Settings>, next: &mut Model, reports
                     backend::notify(e);
                 }
             });
+        }
+    }
+}
+
+/// Opens the file chooser for a program on a thread of its own. A chooser that runs inside the
+/// window's event handler makes winit panic ("tried to handle event while another event is currently
+/// being handled") and the app ends. The window takes the choice on its next refresh (`chosen_program`).
+fn choose_program(title: &'static str, start: std::path::PathBuf, add: bool) {
+    thread::spawn(move || {
+        let picked = rfd::FileDialog::new().set_title(title).add_filter("Windows program", &["exe"]).set_directory(&start).pick_file();
+        if let Some(path) = picked {
+            backend::choose(if add { backend::Chosen::Add(path) } else { backend::Chosen::Run(path) });
+        }
+    });
+}
+
+/// Uses a program that the user chose: adds it to the list of games, or starts it once.
+fn chosen_program(settings: MutableState<Settings>, next: &mut Model, chosen: backend::Chosen) {
+    match chosen {
+        backend::Chosen::Add(path) => {
+            let mut result = Ok(());
+            settings.update(|s| result = steam::add_game(s, &path, &steam::steam_games()));
+            if result.is_ok() {
+                settings.with(Settings::save);
+                // The list shows the game now, with its options open: they hold what cranvr filled in
+                next.games = steam::games();
+                next.open_options = Some(steam::mac_to_windows(&path));
+            }
+            next.message = result.err();
+        }
+        backend::Chosen::Run(path) => {
+            // Games see the headset only while the host runs
+            if !backend::host_running() {
+                match backend::start_host(&settings.with(Clone::clone)) {
+                    Ok(()) => next.running = true,
+                    Err(e) => next.message = Some(e),
+                }
+            }
+            let result = steam::run_program(&path);
+            let shown = path.display().to_string();
+            settings.update(|s| s.game = shown);
+            settings.with(Settings::save);
+            next.message = result.err();
         }
     }
 }
@@ -529,8 +575,6 @@ fn UsbNote(settings: MutableState<Settings>, model: MutableState<Model>) {
 fn PlayTab(settings: MutableState<Settings>, model: MutableState<Model>) {
     let (state, rosetta, outdated, setup) = model.with(|m| (m.steam, m.rosetta, m.game_support_outdated, m.setup.clone()));
     let open_program = rememberMutableStateOf(|| false);
-    // The program whose launch options are open in the list of added games
-    let added_open = rememberMutableStateOf(|| None::<String>);
     let plan = setup::plan(rosetta, state, outdated);
     // Steam cannot start before the setup. An outdated game support starts nothing: the library
     // shows the Update button alone then.
@@ -565,44 +609,15 @@ fn PlayTab(settings: MutableState<Settings>, model: MutableState<Model>) {
         // The games that the user added from a folder: each has Play and Options like a Steam game
         let added: Vec<steam::Game> = model.with(|m| m.games.iter().filter(|game| game.app_id.is_empty()).cloned().collect());
         for game in added {
-            GameRow(settings, model, game, added_open);
+            GameRow(settings, model, game);
         }
         FlowRow(Modifier::empty(), flow(), move || {
             Primary("Add a game from a folder".into(), move || {
                 let steam_games = steam::steam_dir().join("steamapps/common");
                 let start = if steam_games.exists() { steam_games } else { steam::prefix().join("drive_c") };
-                let picked = rfd::FileDialog::new()
-                    .set_title("Choose the program of the game")
-                    .add_filter("Windows program", &["exe"])
-                    .set_directory(&start)
-                    .pick_file();
-                if let Some(path) = picked {
-                    let mut result = Ok(());
-                    settings.update(|s| result = steam::add_game(s, &path, &steam::steam_games()));
-                    if result.is_ok() {
-                        settings.with(Settings::save);
-                        // The list shows the game now, with its options open: they hold what cranvr filled in
-                        model.update(|m| m.games = steam::games());
-                        added_open.set(Some(steam::mac_to_windows(&path)));
-                    }
-                    model.update(|m| m.message = result.err());
-                }
+                choose_program("Choose the program of the game", start, true);
             });
-            Action("Choose a program".into(), move || {
-                let start = steam::prefix().join("drive_c");
-                let picked = rfd::FileDialog::new()
-                    .set_title("Choose a Windows program")
-                    .add_filter("Windows program", &["exe"])
-                    .set_directory(&start)
-                    .pick_file();
-                if let Some(path) = picked {
-                    ensure_host(settings, model);
-                    let result = steam::run_program(&path);
-                    let shown = path.display().to_string();
-                    change(settings, model, move |s| s.game = shown);
-                    model.update(|m| m.message = result.err());
-                }
-            });
+            Action("Choose a program".into(), move || choose_program("Choose a Windows program", steam::prefix().join("drive_c"), false));
             Action("Stop Steam and games".into(), steam::stop_all);
         });
         Hint("Add a game: choose the program of a game that Steam does not list, such as a copy of a game with mods. cranvr reads the game's folder and fills in what the game needs. Options shows each value with its reason. Choose a program starts a program once.".into());
@@ -705,8 +720,6 @@ fn SteamLibrary(settings: MutableState<Settings>, model: MutableState<Model>, la
         let steam_games: Vec<steam::Game> = m.games.iter().filter(|game| !game.app_id.is_empty()).cloned().collect();
         (m.steam_running, m.steam_signed_in, steam_games, m.game_support_outdated, m.game_support.clone())
     });
-    // The game whose launch options are open, by its program
-    let open = rememberMutableStateOf(|| None::<String>);
     if outdated {
         GameSupportUpdate(installed, last);
         return;
@@ -739,17 +752,17 @@ fn SteamLibrary(settings: MutableState<Settings>, model: MutableState<Model>, la
     }
     Hint("Play starts Steam if needed, then the game. Put on the headset first. Options sets what the game starts with.".into());
     for game in games {
-        GameRow(settings, model, game, open);
+        GameRow(settings, model, game);
     }
 }
 
 /// One game of a list: its name, its options and its Play button. A game that the user added from a
-/// folder has a Remove button too. `open` holds the program whose launch options are open.
+/// folder has a Remove button too. The model holds the program whose launch options are open.
 #[composable]
-fn GameRow(settings: MutableState<Settings>, model: MutableState<Model>, game: steam::Game, open: MutableState<Option<String>>) {
+fn GameRow(settings: MutableState<Settings>, model: MutableState<Model>, game: steam::Game) {
     let g = game.clone();
     let program = steam::program(&game);
-    let shown = program.as_ref().is_some_and(|program| open.with(|open| open.as_ref() == Some(program)));
+    let shown = program.as_ref().is_some_and(|program| model.with(|m| m.open_options.as_ref() == Some(program)));
     let own = program.as_ref().is_some_and(|program| settings.with(|s| s.launch.contains_key(program)));
     let toggled = program.clone();
     FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
@@ -757,7 +770,7 @@ fn GameRow(settings: MutableState<Settings>, model: MutableState<Model>, game: s
         if let Some(program) = toggled.clone() {
             Choice(if own { "Options (own)".into() } else { "Options".into() }, shown, move || {
                 let program = program.clone();
-                open.update(move |open| *open = if open.as_ref() == Some(&program) { None } else { Some(program) });
+                model.update(move |m| m.open_options = if m.open_options.as_ref() == Some(&program) { None } else { Some(program) });
             });
         }
         if g.exe.is_some() {

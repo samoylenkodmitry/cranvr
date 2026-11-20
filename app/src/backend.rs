@@ -246,6 +246,8 @@ pub struct Model {
     pub black_eyes: Vec<Value>,
     /// What the window and the console in VR say about the last black picture, until it expires
     pub notice: Option<(crate::black_eye::Notice, Instant)>,
+    /// The program whose launch options are open in the lists of games
+    pub open_options: Option<String>,
 }
 
 const LOG_LINES: usize = 200;
@@ -364,6 +366,27 @@ fn channel() -> &'static (Sender<HostLine>, Mutex<Receiver<HostLine>>) {
         let (s, r) = mpsc::channel();
         (s, Mutex::new(r))
     })
+}
+
+/// A program that the user chose in a file chooser.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Chosen {
+    /// "Add a game from a folder"
+    Add(PathBuf),
+    /// "Choose a program": start it once
+    Run(PathBuf),
+}
+
+/// The choices that the window has not used yet. The chooser runs on a thread of its own (see
+/// `ui::choose_program`), and the window takes its choice on the next refresh.
+static CHOSEN: Mutex<Vec<Chosen>> = Mutex::new(Vec::new());
+
+pub fn choose(chosen: Chosen) {
+    CHOSEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(chosen);
+}
+
+pub fn take_chosen() -> Vec<Chosen> {
+    std::mem::take(&mut *CHOSEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
 static HOST: Mutex<Option<Child>> = Mutex::new(None);
@@ -782,6 +805,20 @@ mod tests {
             native.pending,
             [PairRequest { key: "ab12".into(), name: "Meta Quest 3".into(), ip: "192.168.1.30".into(), code: "482 913".into() }]
         );
+    }
+
+    #[test]
+    fn a_program_chosen_on_the_chooser_thread_waits_for_the_window_in_order() {
+        // The chooser runs on a thread of its own: the choices cross to the window through a queue
+        take_chosen();
+        std::thread::spawn(|| {
+            choose(Chosen::Add(PathBuf::from("/games/a/game.exe")));
+            choose(Chosen::Run(PathBuf::from("/games/b/other.exe")));
+        })
+        .join()
+        .unwrap();
+        assert_eq!(take_chosen(), [Chosen::Add(PathBuf::from("/games/a/game.exe")), Chosen::Run(PathBuf::from("/games/b/other.exe"))]);
+        assert!(take_chosen().is_empty());
     }
 
     #[test]
