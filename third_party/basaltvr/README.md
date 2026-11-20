@@ -100,6 +100,12 @@ applies these patches and builds both parts.
 
 - The runtime writes to stderr, which the cranvr app keeps as the game's log (`game.err.log`; a Unity game keeps it in its `Player.log`), what a game's input does. At the first `xrAttachSessionActionSets` of a session it tells how many action sets and actions are attached and how many actions have a binding for the Touch controllers. It tells when a controller joins or leaves (`xrSyncActions` sees its profile). For each action of each hand it tells the first time that the action is active and its first two changes, with the value (pressed, a float, a vector or a tracked pose). Each kind stops after 80 lines. A game that binds nothing, or whose bindings no controller input reaches, shows no such line.
 
+`0011-controller-poses-fresh-under-load.patch`
+
+- A controller's pose counted as stale when a reader found it newer than the reader's clock reading. The readers (`controlInputSnapshot` for the controllers, `controlHeadPose` for the head and `trackedFresh` for hands, body, face and eyes) read the clock first and then wait for `gControlLock`. The receiver thread holds that lock exclusively while it handles a message and sets the message's arrival time under it. A message handled during the wait has an arrival time after the reader's clock reading, and `now >= arrival` failed. The pose action of that hand went inactive for that call, and OpenComposite then took the hand tracking pose or none, which a game draws at the origin, on the floor. The failure needs the receiver and a reader to meet, so it grows with the Mac's load: an OpenVR program that reads both controllers in every frame, with the probe offering tracking at a load average of about 30, logged 40 such transitions in 40 seconds, and 2 with the fix. `arrivedWithin` treats a later arrival as fresh.
+- A pose is fresh for 1.5 seconds (it was 0.5). Under load the receiver ran 200 to 350 ms late. The host sends a mask when a controller is gone and an `INPUT_RESET` after a second of silence, so the runtime's own limit only has to catch a dead link, and the socket timeout catches that after 5 seconds.
+- `basalt::note` writes the runtime's input notes to stderr and to `game-input.log` beside the control file (see `README.md` of the repository). New notes: "the right controller's pose stopped arriving" and "arrives" (read by `xrSyncActions`), "came after a gap of N ms" (a gap of 200 ms or more between two poses of a hand) and "a pose ... is older than what the runtime has" (the timestamp check refused a pose, with the three timestamps). Each kind stops after 40 lines, and the transitions after 80.
+
 ## patches/dxmt
 
 `0005-public-atomic-for-new-metal-compiler.patch`: DXMT 0.80 calls a private Metal builtin
@@ -123,6 +129,15 @@ stored every sample back, although the pass changes none. The store now drops: t
 memory still holds the samples. In Beat Saber a pass took 0.31 ms instead of 0.38 ms on a base
 M5, and the picture on the Quest looked the same. `DXMT_RESOLVE_STORE_SAMPLES=1` brings the
 store back.
+
+`0010-optional-render-target-array-index-capability.patch`: `DXMT_RT_ARRAY_INDEX_FROM_ANY_SHADER=1` makes
+`CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS3)` report `VPAndRTArrayIndexFromAnyShaderFeedingRasterizer`, as upstream DXMT
+does. BasaltVR's patch 0004 turns the report off, so that Unity's OpenXR provider draws each eye in a pass of its own
+(runtime patch 0003 refuses its two-slice swapchain). Unity's OpenVR provider owns its two-slice texture, which no runtime
+refuses. With the report off, its instanced draws reach slice 0 only: the left eye shows the picture and the right eye
+stays black, and "Each eye in its own pass" cannot help. With the report on, the vertex shader writes the slice and DXMT's
+layered rendering delivers it: both eyes show the picture at the full frame rate. The launch option "Both eyes in one pass"
+sets the variable. The patch sits in a second place of the same file as patch 0004 and applies on its own.
 
 `0009-name-the-discard-and-exception-mode-messages.patch`: DXMT logged "Not implemented" with no name
 once for `DiscardResource` and `DiscardView1` of `ID3D11DeviceContext1` and each time for `SetExceptionMode`

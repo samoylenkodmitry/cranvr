@@ -29,3 +29,19 @@ cranvr runs Windows OpenVR games under Wine with [OpenComposite](https://gitlab.
 `0004-display-frequency-from-the-runtime.patch`
 
 - `GetFloatTrackedDeviceProperty(Prop_DisplayFrequency_Float)` answered 90 Hz at every refresh rate, with a TODO. It asks the runtime for the rate through `XR_FB_display_refresh_rate` when the runtime offers the extension (cranvr's does) and answers 90 otherwise. The header `RuntimeExtensions/XR_FB_display_refresh_rate.h` declares the one function, since the OpenXR SDK that OpenComposite bundles is older than the extension. `openvr_smoke.exe --expect-hz N` checks the answer.
+
+`0005-skybox-mip-chain-and-upright-converting-copy.patch`
+
+- The converting copy (0002) drew a game's R8G8B8A8 image into the runtime's B8G8R8A8 image with OpenComposite's inverting quad, which turns the picture over. Every OpenVR game whose eye textures are not B8G8R8A8 was upside down in the headset. The copy draws the same quad without the flip (`vs_plain`). `scripts/e2e.sh --openvr-wine` draws a picture with a bright upper half and checks the host's copy of it. It fails with OpenComposite 0004 and passes with 0005.
+- The swapchain has one mip level, whatever the game's texture has. The runtime takes images of one level, and the copy fills level 0 only. A game's loading screen (2048x1024 with a chain of mip levels) stopped the game with "Cannot create DX texture swap chain".
+- `SetSkyboxOverride` does nothing. The runtime ends a frame with projection layers only, and the override is a quad layer. The Unity plugin of SteamVR sets such a skybox for a loading screen; the game now goes on to submit its frames.
+
+`0006-controller-pose-log-and-hold.patch`
+
+- `XrController::GetPose` writes a line to OpenComposite's log when the source of a controller's pose changes: the runtime's grip pose action ("valid, from the runtime's grip pose action"), a held pose ("held at its last place"), the hand tracking fallback ("valid, from hand tracking"), no pose ("invalid"), or no action space yet. A game that gets no valid pose for a controller draws it at the origin, which is the floor. The line tells which hand, and when. At most 60 lines.
+- A controller whose pose action drops out stays where it was. The zero matrix of an invalid pose put it on the floor. The pose is held for 0.25 s before the hand tracking pose (the palm lies elsewhere, and a switch back and forth moved the controller by 10 cm), and for up to 1 s when hand tracking has no pose either. Then the pose is invalid, as before. The held pose has no velocity.
+
+`0007-distinct-serial-numbers.patch`
+
+- `GetStringTrackedDeviceProperty(Prop_SerialNumber_String)` answered `<unknown>` for every device (a TODO of OpenComposite). Serious Sam VR queries the serial number of both controllers in every frame (14175 times each in 2 minutes) and tells its controllers apart by it (its cvars `vr_strForceLeftHandControllerSN` and `vr_strForceRightHandControllerSN` name serial numbers). Two controllers with one serial number counted as one: the first showed and worked, the second stayed without a pose and lay on the floor, and no button of it reached the game. The controllers answer `oculus_touch_left` and `oculus_touch_right` now, the headset `oculus_hmd`. With the probe as the headset the game's menu shows both controllers with their laser pointers (before: the left one only), and the right one moves with the probe's. `openvr_smoke.exe` fails when the three serial numbers do not differ.
+

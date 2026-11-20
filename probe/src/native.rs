@@ -59,6 +59,10 @@ pub struct Options {
     /// The head stands still, as it does with `tracking`, so that a game's room is the probe's room
     /// and its controller poses can be compared with the script's numbers
     pub still_head: bool,
+    /// Both hands play their script this many meters higher. The hands of the script lie below the view of a
+    /// headset with a 45 degree field, so a game's picture does not show them; raised by 0.4 m they lie in front
+    /// of the chest and a test run can see their models in the host's copy of the eyes.
+    pub hands_lift: f32,
     /// With `tracking`: where the face comes from
     pub face_source: tracked::FaceSource,
     /// Loses the input focus at this many seconds for this many seconds, as under the system's
@@ -157,6 +161,7 @@ struct Shared {
     wish: AtomicU8,
     tracking: bool,
     still_head: bool,
+    hands_lift: f32,
     no_controllers: bool,
     face_source: tracked::FaceSource,
     sent_tracking: [AtomicU64; 4],
@@ -267,6 +272,7 @@ pub fn run(o: Options) -> i32 {
         wish: AtomicU8::new(0),
         tracking: o.tracking,
         still_head: o.tracking || o.still_head,
+        hands_lift: o.hands_lift,
         no_controllers: o.no_controllers,
         face_source: o.face_source,
         sent_tracking: Default::default(),
@@ -370,6 +376,21 @@ pub fn run(o: Options) -> i32 {
         f32::from_bits(shared.counters.haptics_max_bits.load(Ordering::Relaxed))
     );
     print_summary(&shared, &r, o.seconds, expected);
+    // The frames of the host's own scene, in runs: a game's stall must not show one (see `--game-stall` of scripts/e2e.sh)
+    if !r.bad_at.is_empty() {
+        let mut runs: Vec<(u128, u128, u32)> = Vec::new();
+        for &at in &r.bad_at {
+            match runs.last_mut() {
+                Some(run) if at - run.1 < 250 => {
+                    run.1 = at;
+                    run.2 += 1;
+                }
+                _ => runs.push((at, at, 1)),
+            }
+        }
+        let text: Vec<String> = runs.iter().map(|(from, to, n)| format!("{from}..{to} ms ({n})")).collect();
+        println!("probe: frames with the wrong badges, at unix ms: {}", text.join(", "));
+    }
     if o.tracking {
         let sent = |i: usize| shared.sent_tracking[i].load(Ordering::Relaxed);
         println!(
@@ -412,6 +433,8 @@ struct DecodeResults {
     decoded: u64,
     good: u64,
     bad: u64,
+    /// The wall-clock time in milliseconds of each frame with the wrong badges, up to a cap
+    bad_at: Vec<u128>,
     size: (usize, usize),
     /// What the model of the headset's queue did with the frames (see `compositor.rs`)
     queue: compositor::Counts,
@@ -585,11 +608,12 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
         // The left hand stays where it is. The right hand swings 10 cm to each side of a point in
         // front of the head, with its velocity. Each hand has a grip pose and its own aim pose
         // (see hands.rs).
-        let left = hands::grip(0, hands::LEFT_AT, [0.0; 3]);
+        let lift = shared.hands_lift;
+        let left = hands::grip(0, [hands::LEFT_AT[0], hands::LEFT_AT[1] + lift, hands::LEFT_AT[2]], [0.0; 3]);
         let swing = (t * std::f32::consts::PI).sin();
         let right = hands::grip(
             1,
-            [hands::RIGHT_AT[0] + hands::RIGHT_SWING * swing, hands::RIGHT_AT[1], hands::RIGHT_AT[2]],
+            [hands::RIGHT_AT[0] + hands::RIGHT_SWING * swing, hands::RIGHT_AT[1] + lift, hands::RIGHT_AT[2]],
             [hands::RIGHT_SWING * std::f32::consts::PI * (t * std::f32::consts::PI).cos(), 0.0, 0.0],
         );
         {
@@ -847,6 +871,9 @@ fn decode_loop(
             r.good += 1;
         } else {
             r.bad += 1;
+            if r.bad_at.len() < 100_000 {
+                r.bad_at.push(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis()));
+            }
             if r.bad <= 3 {
                 eprintln!("probe: wrong badge colors: left {left:?} right {right:?}");
             }

@@ -154,6 +154,17 @@ pub struct InputCounts {
     pub tracking: [u32; 4],
     /// The features that the game asks for now
     pub requested: Features,
+    /// Where each hand's grip pose was at its last message, in millimeters, and how far it travelled since the last call.
+    /// A controller that lies on a table or reports a pose at the room's origin travels nothing.
+    pub at_mm: [[i32; 3]; 2],
+    pub moved_mm: [u32; 2],
+}
+
+/// The last grip position of a hand and the distance that it travelled since the stats line.
+#[derive(Clone, Copy, Default)]
+struct HandTravel {
+    at: Option<[f32; 3]>,
+    moved: f32,
 }
 
 #[derive(Default)]
@@ -164,6 +175,7 @@ struct InputCounters {
     buttons: AtomicU32,
     haptics: AtomicU32,
     tracking: [AtomicU32; 4],
+    travel: Mutex<[HandTravel; 2]>,
 }
 
 /// What the host knows about the headset, sent to each new runtime connection.
@@ -462,6 +474,15 @@ impl RuntimeLink {
         }
         let index = (hand as usize).min(1);
         self.counters.poses[index].fetch_add(1, Ordering::Relaxed);
+        {
+            let mut travel = self.counters.travel.lock().unwrap();
+            let at = grip.pose.position;
+            let track = &mut travel[index];
+            if let Some(before) = track.at {
+                track.moved += ((at.x - before[0]).powi(2) + (at.y - before[1]).powi(2) + (at.z - before[2]).powi(2)).sqrt();
+            }
+            track.at = Some([at.x, at.y, at.z]);
+        }
         let supported = self.aim_support.load(Ordering::Relaxed);
         if aim.is_some() && !supported && !self.aim_warned.swap(true, Ordering::Relaxed) {
             warn!("Game runtime: it takes no aim poses, so the game finds its aim space at the grip pose. Install the newer game support.");
@@ -502,6 +523,14 @@ impl RuntimeLink {
     /// What went to the runtime and came back from it since the last call.
     pub fn take_counts(&self) -> InputCounts {
         let c = &self.counters;
+        let travel = {
+            let mut travel = c.travel.lock().unwrap();
+            let seen = *travel;
+            for track in travel.iter_mut() {
+                track.moved = 0.0;
+            }
+            seen
+        };
         InputCounts {
             poses: [c.poses[0].swap(0, Ordering::Relaxed), c.poses[1].swap(0, Ordering::Relaxed)],
             aim_poses: [c.aim_poses[0].swap(0, Ordering::Relaxed), c.aim_poses[1].swap(0, Ordering::Relaxed)],
@@ -510,6 +539,8 @@ impl RuntimeLink {
             haptics: c.haptics.swap(0, Ordering::Relaxed),
             tracking: std::array::from_fn(|i| c.tracking[i].swap(0, Ordering::Relaxed)),
             requested: self.requested_tracking(),
+            at_mm: travel.map(|t| t.at.map_or([0; 3], |at| at.map(|v| (v * 1000.0).round() as i32))),
+            moved_mm: travel.map(|t| (t.moved * 1000.0).round() as u32),
         }
     }
 

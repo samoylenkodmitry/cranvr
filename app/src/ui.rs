@@ -761,11 +761,28 @@ fn LaunchOptions(settings: MutableState<Settings>, program: String) {
             let shown = advanced.get();
             FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
                 let key = key.clone();
+                let one_key = key.clone();
                 Choice("Each eye in its own pass".into(), options.eye_per_pass, move || {
                     edit_launch(settings, &key, |o| {
                         o.eye_per_pass = !o.eye_per_pass;
                         o.eye_per_pass_declined = !o.eye_per_pass;
                         o.eye_per_pass_reason.clear();
+                        // The two options ask for opposite things
+                        if o.eye_per_pass {
+                            o.eye_one_pass = false;
+                            o.eye_one_pass_reason.clear();
+                        }
+                    })
+                });
+                Choice("Both eyes in one pass".into(), options.eye_one_pass, move || {
+                    edit_launch(settings, &one_key, |o| {
+                        o.eye_one_pass = !o.eye_one_pass;
+                        o.eye_one_pass_declined = !o.eye_one_pass;
+                        o.eye_one_pass_reason.clear();
+                        if o.eye_one_pass {
+                            o.eye_per_pass = false;
+                            o.eye_per_pass_reason.clear();
+                        }
                     })
                 });
                 Choice("Advanced".into(), shown, move || advanced.set(!shown));
@@ -773,7 +790,10 @@ fn LaunchOptions(settings: MutableState<Settings>, program: String) {
             if options.eye_per_pass && !options.eye_per_pass_reason.is_empty() {
                 Hint(options.eye_per_pass_reason.clone());
             }
-            Hint("For a game whose right eye stays black. The runtime then refuses two-eye images, so the game draws each eye apart. This costs frames.".into());
+            if options.eye_one_pass && !options.eye_one_pass_reason.is_empty() {
+                Hint(options.eye_one_pass_reason.clone());
+            }
+            Hint("For a game whose right eye stays black. \"Each eye in its own pass\": the runtime refuses two-eye images, so the game draws each eye apart. This costs frames. \"Both eyes in one pass\": for a game that draws both eyes into a picture of its own, as a Unity game with the OpenVR provider does.".into());
             let (own, default_on) = (options.opencomposite, wine.opencomposite);
             let key = program.clone();
             FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
