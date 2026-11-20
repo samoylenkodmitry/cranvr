@@ -10,6 +10,7 @@
 
 use crate::{
     console::Backdrop,
+    hands,
     console_panel::{self, ConsolePanel},
     discovery::FoundHost,
     panels_ball::PanelsBall,
@@ -30,7 +31,7 @@ use cranvr_proto::clock::now_ns;
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
 /// The sizes in dp that the connect and stats panels start at. The user can make them larger.
-const CONNECT_SIZE: [f32; 2] = [760.0, 840.0];
+pub(crate) const CONNECT_SIZE: [f32; 2] = [760.0, 840.0];
 const STATS_SIZE: [f32; 2] = [700.0, 840.0];
 /// How often the UI copies the link's numbers into its state
 const POLL: Duration = Duration::from_millis(250);
@@ -58,7 +59,7 @@ const SIDE_TURN: f32 = 45.0;
 
 /// The pose of a side panel before the user carries it, relative to the origin of the subspace, which
 /// lies a meter ahead of the head: `side` is -1 for the left and 1 for the right.
-fn side_pose(side: f32) -> Pose {
+pub(crate) fn side_pose(side: f32) -> Pose {
     SubspaceModifier::new().offset(side * SIDE_OFFSET[0], SIDE_OFFSET[1], SIDE_OFFSET[2]).rotate(0.0, -side * SIDE_TURN, 0.0).pose()
 }
 
@@ -70,12 +71,17 @@ pub fn ClientApp() {
     // The connection reads what the headset is from the hub. The values do not change in a
     // session, so this runs before any panel can start a connection.
     hub().attach(local_headset_properties().current(), local_haptics().current());
+    #[cfg(all(feature = "scripted-hand", target_os = "android"))]
+    crate::scripted::install_once();
     // The saved Room and Volume settings apply before any panel or link needs them
     hub().load_settings();
     let Link { snapshot, frames } = link();
     let console = rememberMutableStateOf(|| hub().console());
     let backdrop = rememberMutableStateOf(|| hub().backdrop());
     let panels_shown = rememberMutableStateOf(settings::panels_shown);
+    // The hands belong to the game while the host asks for them (see `hands.rs`): then no panel
+    // stands where a pinch could press it
+    let hands_in_game = rememberMutableStateOf(|| false);
     // The address and the connect at launch belong to the app, not to the connect panel: a user who
     // hid the panels still connects at launch
     let address = address_field();
@@ -86,6 +92,7 @@ pub fn ClientApp() {
         loop {
             console.set(hub().console());
             backdrop.set(hub().backdrop());
+            hands_in_game.set(hands::belong_to_game(hub().feed.wish(), hub().feed.hand_points()));
             delay(CONSOLE_POLL).await;
         }
     });
@@ -100,17 +107,20 @@ pub fn ClientApp() {
         // connect panel shows anyway, so a user always sees how to connect and sees the code that
         // the Mac asks them to compare.
         let streaming = snapshot.get().state == LinkState::Streaming;
-        if panels_shown.get() || !streaming {
+        let room_for_panels = !hands_in_game.get();
+        if room_for_panels && (panels_shown.get() || !streaming) {
             ConnectPanel(snapshot, address);
         }
-        if panels_shown.get() {
+        if room_for_panels && panels_shown.get() {
             StatsPanel(snapshot);
         }
         crate::desktop::DesktopPanel();
         ConsolePanel(console, snapshot);
         Behind(backdrop, frames);
     });
-    PanelsBall(panels_shown);
+    if !hands_in_game.get() {
+        PanelsBall(panels_shown);
+    }
 }
 
 /// What fills the view behind the panels. While no game runs and the user kept the Room setting at
@@ -189,7 +199,7 @@ fn PhonePanels(snapshot: MutableState<Snapshot>, address: TextFieldState, panels
                 Modifier::empty().weight(1.0).fill_max_height().vertical_scroll(left, false).clickable(|_| {}),
                 ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(16.0)),
                 move || {
-                    ConnectBody(snapshot, address, Modifier::empty().fill_max_width(), Entry::Keyboard);
+                    ConnectBody(snapshot, address, Modifier::empty().fill_max_width(), false);
                     PhoneButtons(panels);
                 },
             );
@@ -347,16 +357,6 @@ fn connect_found(host: &FoundHost, address: TextFieldState) {
     hub().connect(text, Some(host.fingerprint), settings::media_choice());
 }
 
-/// How the connect panel takes the address.
-#[derive(Clone, Copy, PartialEq)]
-enum Entry {
-    /// A keypad in the panel, because a headset has no keyboard in the room. A focused field asks
-    /// for the system keyboard too, where `system_keyboard` says so.
-    Keypad { system_keyboard: bool },
-    /// The system keyboard only, as on a phone
-    Keyboard,
-}
-
 /// The field's state for the host address. The caller composes it once. A launch with `connect`
 /// starts the connection.
 fn address_field() -> TextFieldState {
@@ -369,31 +369,29 @@ fn address_field() -> TextFieldState {
     address
 }
 
-/// The connect panel: the Macs that the search found, and the address with its keypad behind a
+/// The connect panel: the Macs that the search found, and the address field with its keypad behind a
 /// button. The app owns the address field (`address_field`).
 #[composable]
 fn ConnectPanel(snapshot: MutableState<Snapshot>, address: TextFieldState) {
-    // In a headset a focused field must not ask for a software keyboard
-    let in_headset = local_spatial_capabilities().current().is_spatial_ui_enabled();
     let pose = remember(|| place::start_pose("connect", side_pose(-1.0))).with(|pose| *pose);
     let size = rememberMutableStateOf(|| place::start_size("connect", CONNECT_SIZE));
     SpatialPanel(
         place::movable("connect", place::resizable("connect", size, CONNECT_SIZE), pose, |_| {}),
-        move || ConnectBody(snapshot, address, Modifier::empty().fill_max_size(), Entry::Keypad { system_keyboard: !in_headset }),
+        move || ConnectBody(snapshot, address, Modifier::empty().fill_max_size(), true),
     );
 }
 
 /// The content of the connect panel. `modifier` gives its size. While no link runs, it lists the
-/// Macs that answered the search. A press on one connects. The address field and the keypad stay
-/// behind the small button "Enter an address", for a headset on USB and for another network. They
-/// replace the list while they show.
+/// Macs that answered the search. A press on one connects. The address field stays
+/// behind the small button "Enter an address", for a headset on USB and for another network. It
+/// replaces the list while it shows. `keypad` adds the keypad of a headset.
 #[composable]
-fn ConnectBody(snapshot: MutableState<Snapshot>, address: TextFieldState, modifier: Modifier, entry: Entry) {
+fn ConnectBody(snapshot: MutableState<Snapshot>, address: TextFieldState, modifier: Modifier, keypad: bool) {
     let snap = snapshot.get();
     let state = snap.state.clone();
     let found = usb::entries(&snap.found, snap.usb.as_ref());
     let path = snap.path;
-    let typing = rememberMutableStateOf(|| false);
+    let typing = rememberMutableStateOf(settings::address_entry_on_launch);
     Column(
         modifier.background(PANEL_COLOR).rounded_corners(24.0).padding(36.0),
         ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(20.0)),
@@ -403,7 +401,7 @@ fn ConnectBody(snapshot: MutableState<Snapshot>, address: TextFieldState, modifi
                 LinkState::Idle | LinkState::Failed(_) => {
                     // The address entry takes the place of the list: both together would not fit the panel
                     if typing.get() {
-                        AddressEntry(address, state.clone(), entry);
+                        AddressEntry(address, state.clone(), keypad);
                     } else {
                         HostList(found.clone(), address);
                     }
@@ -541,9 +539,12 @@ fn AddressButtons(typing: MutableState<bool>, address: TextFieldState) {
 }
 
 /// The address of a Mac that the search does not find: a headset on USB (`127.0.0.1`) or on another
-/// network. A headset has no keyboard in the room, so the keypad edits the same text as the field.
+/// network. A press on the field opens the keyboard. In a Quest it is the keyboard that Cranpose
+/// draws under the panel, and a press on its keys types. On a phone it is the system's keyboard.
+/// A headset also gets a keypad in the panel, which edits the same text. It stays until the drawn
+/// keyboard has run on a Quest 3, because Cranpose tested it in a window and an emulator only.
 #[composable]
-fn AddressEntry(address: TextFieldState, state: LinkState, entry: Entry) {
+fn AddressEntry(address: TextFieldState, state: LinkState, keypad: bool) {
     Text("Address of the Mac", Modifier::empty(), text_style(22.0, MUTED_COLOR, None));
     Box(
         Modifier::empty().fill_max_width().background(FIELD_COLOR).rounded_corners(14.0).padding(18.0),
@@ -556,13 +557,13 @@ fn AddressEntry(address: TextFieldState, state: LinkState, entry: Entry) {
                     text_style: text_style(34.0, TEXT_COLOR, None),
                     cursor_color: TEXT_COLOR,
                     line_limits: TextFieldLineLimits::SingleLine,
-                    show_keyboard_on_focus: entry != (Entry::Keypad { system_keyboard: false }),
+                    show_keyboard_on_focus: true,
                     ..BasicTextFieldOptions::default()
                 },
             );
         },
     );
-    if matches!(entry, Entry::Keypad { .. }) {
+    if keypad {
         Keypad(address);
     }
     ConnectButton(state, address);
@@ -735,6 +736,10 @@ fn stat_lines(snap: &Snapshot) -> Vec<(&'static str, String, Color)> {
     let stats = &snap.stats;
     let (link, link_color) = state_text(&snap.state, "the host", snap.path);
     let mut lines = vec![("Link", link, link_color)];
+    // While the app has no input focus the host sends no pictures. The panel says why the numbers stop.
+    if !snap.focus.is_focused() {
+        lines.push(("Focus", format!("{}. The stream pauses and goes on when the focus returns.", crate::focus::describe(snap.focus)), WARN_COLOR));
+    }
     let Some(stream) = &snap.stream else {
         return lines;
     };

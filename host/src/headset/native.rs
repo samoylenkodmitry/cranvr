@@ -38,7 +38,7 @@ use cranvr_proto::{
     link::{HostLink, HostListener, HostSide, Incoming, MediaMode, Pending},
     media::{FrameMeta, DEFAULT_SHARD_LEN},
     message::{
-        buttons, negotiate, ClientDatagram, ClientMsg, FrameTiming, HostDatagram, HostMsg, HostWishes, Input,
+        buttons, negotiate, ClientDatagram, ClientMsg, FrameTiming, Focus, HostDatagram, HostMsg, HostWishes, Input,
         LossReport, Ping, Pong, RejectReason, Tracking, VersionRange, Views as ProtoViews, UPDATE_HEADSET, UPDATE_MAC,
     },
     motion::extrapolate,
@@ -51,7 +51,7 @@ use std::{
     collections::VecDeque,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, RecvTimeoutError},
         Arc, Condvar, Mutex,
     },
@@ -537,6 +537,12 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
     let now = now_ns();
     *session.heard.lock().unwrap() = Instant::now();
     match incoming {
+        // Tracking and input go over UDP and the focus over TCP, so a datagram that the client sent
+        // before it lost the focus may arrive after the message. It would press a button that the host
+        // let go of. An app without the focus has none to send: the host drops what comes.
+        Incoming::Datagram(
+            ClientDatagram::Tracking(_) | ClientDatagram::Input(_) | ClientDatagram::Hands(_) | ClientDatagram::Body(_) | ClientDatagram::Face(_) | ClientDatagram::Eyes(_),
+        ) if session.paused() => {}
         Incoming::Datagram(ClientDatagram::Tracking(t)) => {
             session.history.lock().unwrap().push(t);
             session.lock.lock().unwrap().on_tracking(t.display_time);
@@ -574,6 +580,7 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
                 }
             }
         }
+        Incoming::Control(ClientMsg::Focus(focus)) => session.on_focus(shared, focus),
         Incoming::Control(ClientMsg::TrackingOffer(offer)) => {
             // The offer keeps the face's sources, which the game's runtime reports to the game
             let offer = offer.offered();
@@ -860,6 +867,14 @@ fn hand_ids(hand: usize) -> HandIds {
 }
 
 impl InputState {
+    /// Lets go of every button that the last input held. Nothing goes out before the first input.
+    fn release(&mut self) -> Vec<Button> {
+        if self.last.is_none() {
+            return Vec::new();
+        }
+        self.changes(&Input::default())
+    }
+
     /// The buttons whose value differs from the last input. The first input reports all of them.
     fn changes(&mut self, now: &Input) -> Vec<Button> {
         let before = self.last.unwrap_or_default();
@@ -951,6 +966,14 @@ struct SentFrame {
     sent: Nanos,
 }
 
+/// The focus of the headset's app and when it began.
+struct FocusState {
+    focus: Focus,
+    since: Instant,
+    /// The session's count of sent frames when the focus began
+    frames_at: u64,
+}
+
 /// The host's end of a connected client.
 struct Session {
     link: HostLink,
@@ -967,6 +990,10 @@ struct Session {
     lock_on: bool,
     /// The height of the headset's floor in its room, once the client says it
     floor: Mutex<Option<f32>>,
+    /// How much of the headset the app has. A client that never says is focused.
+    focus: Mutex<FocusState>,
+    /// The video frames that the session sent, to tell what a pause cost
+    frames_sent: AtomicU64,
     /// The protocol version of the session
     version: u16,
     /// The tracking features that the headset offered: none until it says so
@@ -999,6 +1026,8 @@ impl Session {
             lock: Mutex::new(DisplayLock::new(period)),
             lock_on,
             floor: Mutex::new(None),
+            focus: Mutex::new(FocusState { focus: Focus::Focused, since: Instant::now(), frames_at: 0 }),
+            frames_sent: AtomicU64::new(0),
             version,
             offered: Mutex::new(Features::NONE),
             asked: Mutex::new(None),
@@ -1022,6 +1051,56 @@ impl Session {
         if let Err(e) = self.link.duplex.send_control(&message) {
             warn!("Native protocol: the decoder config did not go out: {e}");
         }
+    }
+
+    /// Whether the app on the headset has no input focus: the host sends no pictures and no sound.
+    fn paused(&self) -> bool {
+        !self.focus.lock().unwrap().focus.is_focused()
+    }
+
+    /// The app on the headset says how much of the headset it has. The client stops its tracking
+    /// and input while it is not focused, so a button that the user held would stay down in the
+    /// game: the host lets go of every button first. It then tells the frame loop, which stops the
+    /// stream. The client keeps its connection and its pings, so the session lives on.
+    fn on_focus(&self, shared: &Shared, focus: Focus) {
+        let (before, lasted, frames) = {
+            let mut state = self.focus.lock().unwrap();
+            if state.focus == focus {
+                return;
+            }
+            let sent = self.frames_sent.load(Ordering::Relaxed);
+            let before = (state.focus, state.since.elapsed(), sent - state.frames_at);
+            *state = FocusState { focus, since: Instant::now(), frames_at: sent };
+            before
+        };
+        info!(
+            "Native protocol: the headset's app {}. It was {} for {:.1} s, and the host sent {frames} video frames in that time",
+            match focus {
+                Focus::Focused => "has the input focus again: the stream goes on",
+                Focus::Visible => "is visible without the input focus: the stream pauses",
+                Focus::Hidden => "is hidden by the headset: the stream pauses",
+            },
+            match before {
+                Focus::Focused => "focused",
+                Focus::Visible => "visible without the input focus",
+                Focus::Hidden => "hidden",
+            },
+            lasted.as_secs_f64(),
+        );
+        if !focus.is_focused() {
+            let released = self.input.lock().unwrap().release();
+            if !released.is_empty() {
+                shared.emit(Event::Buttons(released));
+            }
+        }
+        // The headset's decoders may have dropped what came while the app was away, so the next
+        // pictures start from key frames
+        if focus.is_focused() {
+            if let Some(desktop) = self.desktop.get() {
+                desktop.request_key_frame();
+            }
+        }
+        shared.emit(Event::Focus(focus));
     }
 
     /// Asks the headset for the tracking features that a game uses, within what it offers. A client
@@ -1272,6 +1351,7 @@ impl Headset for Native {
                 }
             }
         }
+        session.frames_sent.fetch_add(1, Ordering::Relaxed);
         let mut stats = session.stats.lock().unwrap();
         stats.sent_frames += 1;
         stats.sent_bytes += sent_bytes as u64;

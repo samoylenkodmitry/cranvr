@@ -88,6 +88,12 @@ pub fn console_on_launch() -> bool {
     launch_args().boolean("console").unwrap_or(false)
 }
 
+/// Whether the launch asks for the address field open at the start, with `--address_entry` or the
+/// extra `address_entry`. A test that types into the field needs it there without a press.
+pub fn address_entry_on_launch() -> bool {
+    launch_args().boolean("address_entry").unwrap_or(false)
+}
+
 /// How the media should travel, from the launch argument `media` (`udp` or `tcp`).
 pub fn media_choice() -> MediaChoice {
     match launch_args().string("media") {

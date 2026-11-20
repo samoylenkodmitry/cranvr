@@ -46,9 +46,20 @@ fn usage() -> ! {
          \n                     gets controllers made of the hands\
          \n  --face-source S    with --tracking: where the face comes from, visual (cameras), audio\
          \n                     (the microphone, the default) or unknown (the offer names no source)\
+         \n  --pause AT:FOR     the app loses the input focus at AT seconds (2 or more) for FOR seconds, as under\
+         \n                     the system's menu: the probe tells the host, sends no tracking and no input and\
+         \n                     counts the frames that still arrive. The exit code says whether the stream paused\
+         \n                     and went on.\
          \n  --protocol native  accepted and ignored: cranvr's protocol is the only one"
     );
     std::process::exit(2);
+}
+
+/// `AT:FOR` as two numbers of seconds
+fn parse_pause(text: &str) -> Option<(f32, f32)> {
+    let (at, length) = text.split_once(':')?;
+    let (at, length) = (at.parse::<f32>().ok()?, length.parse::<f32>().ok()?);
+    (at >= 2.0 && length > 0.0).then_some((at, length))
 }
 
 fn main() {
@@ -63,6 +74,7 @@ fn main() {
         tracking: false,
         no_controllers: false,
         face_source: Default::default(),
+        pause: None,
     };
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -82,6 +94,7 @@ fn main() {
             "--tracking" => options.tracking = true,
             "--no-controllers" => options.no_controllers = true,
             "--face-source" => options.face_source = tracked::FaceSource::parse(&value()).unwrap_or_else(|| usage()),
+            "--pause" => options.pause = Some(parse_pause(&value()).unwrap_or_else(|| usage())),
             "--drop-percent" => options.drop_percent = value().parse().unwrap_or_else(|_| usage()),
             _ => usage(),
         }

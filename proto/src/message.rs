@@ -238,6 +238,35 @@ pub enum ClientMsg {
     /// changes, for example when the user allows the headset's face tracking. A host that does not
     /// know the message skips it. The message comes with protocol version 6.
     TrackingOffer(Features),
+    /// How much of the headset the app has (see [`Focus`]). The client sends it when the state
+    /// changes, and once after the welcome when the app starts without the input focus. A client
+    /// that never sends it is focused. A host that does not know the message skips it. The message
+    /// needs no new protocol version: it stands after the last variant.
+    Focus(Focus),
+}
+
+/// How much of the headset the app has. The values follow the states of an OpenXR session and
+/// Meta's rules for them: an app that loses the input focus keeps drawing and takes no input, and an
+/// app that the system pauses stops its interactive parts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Focus {
+    /// The app has the input focus. It sends tracking and input, and the host streams.
+    #[default]
+    Focused,
+    /// The app is on display and has no input focus, as under the system's menu or beside another
+    /// app's panel. The client sends no tracking and no input and keeps drawing the last picture.
+    /// The host pauses the stream.
+    Visible,
+    /// The headset shows none of the app, as with its display off or while another immersive app
+    /// runs. The client sends no tracking and no input. The host pauses the stream.
+    Hidden,
+}
+
+impl Focus {
+    /// Whether the app takes part: it sends its tracking and input and gets the stream.
+    pub fn is_focused(self) -> bool {
+        self == Focus::Focused
+    }
 }
 
 /// A change of the origin of the poses that the client sends. Every pose with a display time at or
