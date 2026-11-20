@@ -890,8 +890,10 @@ pub fn uplink(link: &ClientLink, stop: &AtomicBool) {
         let (keys, frames, pointers, pointer_dirty) = {
             let guard = owner.uplink.lock().unwrap();
             let (mut uplink, _) = owner.wake.wait_timeout_while(guard, Duration::from_millis(20), |u| !u.dirty).unwrap();
+            // A request for a key frame waits in `uplink.key` until it went out: it may come before the
+            // gap since the last request has passed. The next turn of the loop, at most 20 ms later, sees it.
             uplink.dirty = false;
-            (std::mem::take(&mut uplink.key), uplink.frame, uplink.pointer, std::mem::take(&mut uplink.pointer_dirty))
+            (uplink.key, uplink.frame, uplink.pointer, std::mem::take(&mut uplink.pointer_dirty))
         };
         // The wishes that changed, the displays to add and the displays to remove
         let (changes, adds, removes) = {
@@ -937,6 +939,7 @@ pub fn uplink(link: &ClientLink, stop: &AtomicBool) {
             if keys[index] && last_key[index].elapsed() >= KEY_REQUEST_GAP {
                 last_key[index] = Instant::now();
                 link.duplex.send_control(&ClientMsg::RequestKeyFrame { stream: display_stream(index as u8), frame: frames[index] }).ok();
+                owner.uplink.lock().unwrap().key[index] = false;
             }
         }
         for index in 0..SLOTS {
