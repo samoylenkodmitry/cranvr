@@ -6,7 +6,7 @@
 # Usage: scripts/e2e.sh [--seconds N] [--fps HZ] [--game | --wine PROGRAM [--wine-arg ARG]...] [--desktop]
 #                       [--quest [SERIAL] | --native-tcp] [--native-drop PERCENT] [--native-port PORT]
 #                       [--host-arg ARG]... [--probe-arg ARG]... [--report FILE]
-#                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine | --openvr-wine | --openvr-actions MODE]
+#                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine | --openvr-wine | --openvr-actions MODE | --openvr-overlay]
 #                       [--displays N] [--hold] [--hand-hold] [--displays-in-game]
 #                       [--game-stall AT:FOR]
 #                       [--pause AT:FOR] [--left-trigger AT:FOR] [--right-trigger AT:FOR]
@@ -47,6 +47,9 @@
 #                 bindings (for Touch controllers, the Vive wand or both, as a game that ships a manifest does),
 #                 sets it, and reads the actions that the scripted controllers drive. The run also fails
 #                 when the program's haptic pulse does not reach the probe. Implies --openvr-wine.
+#   --openvr-overlay  the same program with an overlay up for the whole run (a loading screen's). The runtime takes
+#                 no quad layer, so OpenComposite leaves the overlay out; the run fails when the host counts fewer
+#                 game frames than half of the rate. Implies --openvr-wine.
 #   --face-source SOURCE  with --tracking and --tracking-wine: where the probe's face comes from.
 #                 audio (the default) is a Quest 3's microphone face, visual is a face from cameras,
 #                 and unknown is an offer that names no source, as a headset's offer before its face gives data. The
@@ -132,7 +135,7 @@ unsetopt BG_NICE
 root=${0:A:h:h}
 seconds=20 fps=120 fps_given=0 game=0 desktop=0 client=mac serial="" report=""
 displays=1 hold=0 hand_hold=0 displays_in_game=0 display_test=0
-tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 openvr_wine=0 openvr_actions="" face_source=audio
+tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 openvr_wine=0 openvr_actions="" openvr_overlay=0 face_source=audio
 game_stall=""
 wine="" wine_args=()
 native_tcp=0 native_drop=0 native_port=9950 pause="" left_trigger="" right_trigger=""
@@ -149,6 +152,7 @@ while (( $# )); do
         --game-stall) game=1 game_stall=$2; shift 2 ;;
         --tracking-wine) tracking_wine=1; shift ;;
         --openvr-wine) openvr_wine=1; shift ;;
+        --openvr-overlay) openvr_wine=1 openvr_overlay=1; shift ;;
         --openvr-actions)
             openvr_wine=1 openvr_actions=$2; shift 2
             [[ ${openvr_actions} == (touch|vive|both) ]] || { print -u2 "--openvr-actions takes touch, vive or both"; exit 2; } ;;
@@ -199,6 +203,7 @@ if (( openvr_wine )); then
     wine='C:\opencomposite\openvr_smoke.exe'
     wine_args=(--seconds $(( seconds - 6 )) --expect-input)
     [[ -z ${openvr_actions} ]] || wine_args+=(--actions "${openvr_actions}")
+    (( ! openvr_overlay )) || wine_args+=(--overlay)
     export CRANVR_OPENCOMPOSITE=1
     # The run tests the path of an OpenVR program, not the rate. On a Mac that other builds keep busy (a
     # load average above 20) the program loses frames to the scheduler: the report of its second-by-second
@@ -461,6 +466,25 @@ if (( openvr_wine )); then
     done
     grep -h "openvr_smoke:" "${work}/game.log" || true
     grep -q "openvr_smoke: PASS" "${work}/game.log" || { print -u2 "The OpenVR program did not pass; see ${work}/game.log"; openvr_exit=1; }
+    if (( openvr_overlay )); then
+        # The frames of the program reach the host although an overlay is up: the host's count of game frames
+        python3 -I - "${work}/host.out" "${fps}" <<'PYTHON' || { print -u2 "The host got too few game frames from the OpenVR program while its overlay was up; see ${work}/host.out"; openvr_exit=1; }
+import json, sys
+fps = float(sys.argv[2])
+counts = []
+for line in open(sys.argv[1], errors="replace"):
+    if line.startswith("@cranvr") and '"type":"stats"' in line:
+        counts.append(json.loads(line[8:]).get("game_frames") or 0)
+# The first windows hold the start of the program; the run ends with a window that the program left early
+counts = counts[2:-1]
+if not counts:
+    print("overlay: no stats windows", file=sys.stderr)
+    sys.exit(1)
+mean = sum(counts) / len(counts) / 5.0
+print("overlay: the host got %.1f game frames a second at %g Hz (windows: %s)" % (mean, fps, counts))
+sys.exit(0 if mean >= 0.5 * fps else 1)
+PYTHON
+    fi
     # The picture of each eye reaches the host the right way up: the program's upper half is bright, its lower half nearly black
     python3 -I - "${work}/eyes" <<'PYTHON' || { print -u2 "The picture of the OpenVR program is not the right way up in the host; see ${work}/eyes"; openvr_exit=1; }
 import struct, sys, zlib

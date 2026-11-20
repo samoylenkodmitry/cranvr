@@ -1,0 +1,31 @@
+diff --git a/OpenOVR/Reimpl/BaseOverlay.cpp b/OpenOVR/Reimpl/BaseOverlay.cpp
+index f095f4e..5c3bf8b 100644
+--- a/OpenOVR/Reimpl/BaseOverlay.cpp
++++ b/OpenOVR/Reimpl/BaseOverlay.cpp
+@@ -101,9 +101,16 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
+ 	//  when it's initially set to false, and when it's reset to true.
+ 	bool checkUsingInput = false;
+ 
++	// cranvr: the runtime ends a frame with projection layers only. A quad layer (an overlay or the keyboard) makes
++	// xrEndFrame fail with XR_ERROR_LAYER_INVALID and the headset gets no frame at all. A game that keeps an overlay
++	// up (the loading screen of the Unity plugin of SteamVR) would freeze the picture for as long. The scene layer
++	// goes alone; the overlays are not shown.
++	constexpr bool runtimeTakesQuadLayers = false;
++
+ 	if (keyboard) {
+ #ifndef OC_XR_PORT
+-		layerHeaders.push_back(keyboard->Update());
++		if (runtimeTakesQuadLayers)
++			layerHeaders.push_back(keyboard->Update());
+ #endif
+ 		checkUsingInput = true;
+ 
+@@ -112,7 +119,7 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
+ 	}
+ 
+ 	for (const auto& kv : overlays) {
+-		if (kv.second) {
++		if (kv.second && runtimeTakesQuadLayers) {
+ 			OverlayData& overlay = *kv.second;
+ 
+ 			// Skip hiddden overlays, and those without a valid texture (eg, after calling ClearOverlayTexture).

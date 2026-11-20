@@ -39,7 +39,11 @@
 //
 // --trace-poses prints the legacy pose of each controller (the poses that WaitGetPoses fills) every half second.
 //
-// Usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--trace-poses] [--actions MODE] [--expect-hz N] [--format F]
+// --overlay keeps an overlay (IVROverlay) with a texture up for the whole run and sets its texture in each frame, as a
+// loading screen does. The runtime of cranvr takes no quad layer: the frames of the program must reach the host all
+// the same (scripts/e2e.sh --openvr-overlay checks the host's count of game frames).
+//
+// Usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--trace-poses] [--actions MODE] [--expect-hz N] [--overlay] [--format F]
 //                         [--load-only --runtime DIR]
 
 #ifndef NOMINMAX
@@ -560,7 +564,7 @@ struct ActionTest {
 int main(int argc, char** argv)
 {
 	double seconds = 15;
-	bool expect_input = false, load_only = false, no_input = false, trace_poses = false;
+	bool expect_input = false, load_only = false, no_input = false, trace_poses = false, with_overlay = false;
 	std::string actions_mode;
 	float expect_hz = 0.0f;
 	DXGI_FORMAT texture_format = DXGI_FORMAT_R8G8B8A8_UNORM, view_format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -581,6 +585,8 @@ int main(int argc, char** argv)
 			no_input = true;
 		} else if (!std::strcmp(argv[i], "--trace-poses")) {
 			trace_poses = true;
+		} else if (!std::strcmp(argv[i], "--overlay")) {
+			with_overlay = true;
 		} else if (!std::strcmp(argv[i], "--load-only")) {
 			load_only = true;
 		} else if (!std::strcmp(argv[i], "--format") && i + 1 < argc) {
@@ -600,7 +606,7 @@ int main(int argc, char** argv)
 			g_runtime_path = argv[++i];
 			g_runtime_given = true;
 		} else {
-			std::fprintf(stderr, "usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--actions MODE] [--expect-hz N] [--format F] [--load-only --runtime DIR]\n");
+			std::fprintf(stderr, "usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--actions MODE] [--expect-hz N] [--overlay] [--format F] [--load-only --runtime DIR]\n");
 			return 2;
 		}
 	}
@@ -747,6 +753,36 @@ int main(int argc, char** argv)
 		}
 	}
 
+	// The overlay's picture: a 512x256 texture, orange above and nearly black below
+	vr::VROverlayHandle_t overlay_handle = vr::k_ulOverlayHandleInvalid;
+	ID3D11Texture2D* overlay_texture = nullptr;
+	if (with_overlay) {
+		std::vector<uint8_t> picture(512 * 256 * 4);
+		for (uint32_t y = 0; y < 256; y++) {
+			for (uint32_t x = 0; x < 512; x++) {
+				pixel(&picture[(static_cast<size_t>(y) * 512 + x) * 4], y < 128 ? 0.9f : 0.06f, y < 128 ? 0.5f : 0.06f, y < 128 ? 0.1f : 0.06f);
+			}
+		}
+		D3D11_SUBRESOURCE_DATA initial{ picture.data(), 512 * 4, 0 };
+		D3D11_TEXTURE2D_DESC desc{};
+		desc.Width = 512;
+		desc.Height = 256;
+		desc.MipLevels = 1;
+		desc.ArraySize = 1;
+		desc.Format = texture_format;
+		desc.SampleDesc.Count = 1;
+		desc.Usage = D3D11_USAGE_DEFAULT;
+		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		vr::IVROverlay* overlays = vr::VROverlay();
+		if (!overlays || FAILED(device->CreateTexture2D(&desc, &initial, &overlay_texture))
+		    || overlays->CreateOverlay("cranvr.smoke", "cranvr smoke", &overlay_handle) != vr::VROverlayError_None) {
+			return fail("the overlay");
+		}
+		overlays->SetOverlayWidthInMeters(overlay_handle, 1.0f);
+		overlays->ShowOverlay(overlay_handle);
+		say("an overlay is up");
+	}
+
 	using Clock = std::chrono::steady_clock;
 	const auto begin = Clock::now();
 	uint64_t frames = 0, valid_poses = 0, submit_errors = 0, wait_errors = 0;
@@ -843,6 +879,10 @@ int main(int argc, char** argv)
 			}
 		}
 		submit_time += since(mark);
+		if (overlay_handle != vr::k_ulOverlayHandleInvalid) {
+			vr::Texture_t texture{ overlay_texture, vr::TextureType_DirectX, vr::ColorSpace_Gamma };
+			vr::VROverlay()->SetOverlayTexture(overlay_handle, &texture);
+		}
 		compositor->PostPresentHandoff();
 		handoff_time += since(mark);
 		frames++;
@@ -1007,6 +1047,10 @@ int main(int argc, char** argv)
 		release(targets[i]);
 	}
 	release(context);
+	if (overlay_handle != vr::k_ulOverlayHandleInvalid) {
+		vr::VROverlay()->DestroyOverlay(overlay_handle);
+	}
+	release(overlay_texture);
 	release(device);
 	vr::VR_Shutdown();
 
