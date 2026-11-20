@@ -116,6 +116,19 @@ pub enum GameEvent {
     HeadPose,
 }
 
+/// Whether a pulse of `amplitude` goes to the headset. A pulse with no amplitude only stops what the hand does, and
+/// a game may send one in every frame (a Unity game stops the haptics of its hands about 130 times a second): only
+/// the first of such pulses after a pulse with an amplitude goes on, so the hand is stopped once.
+fn forwards_haptic(quiet: &mut [bool; 2], hand: u32, amplitude: f32) -> bool {
+    let Some(was_quiet) = quiet.get_mut(hand as usize) else {
+        return false;
+    };
+    let silent = !(amplitude > 0.0);
+    let forward = !(silent && *was_quiet);
+    *was_quiet = silent;
+    forward
+}
+
 pub struct Haptic {
     pub hand: u32,
     pub duration: Duration,
@@ -280,6 +293,8 @@ impl RuntimeLink {
 
     fn serve(&self, mut stream: TcpStream, events: &mpsc::Sender<GameEvent>, on_haptic: &impl Fn(Haptic)) -> Result<(), String> {
         stream.set_nodelay(true).ok();
+        // Whether the last pulse that went to the headset left each hand quiet
+        let mut quiet = [true; 2];
         // HELLO first, with the token from the control file
         let (kind, payload) = read_message(&mut stream)?;
         let mut r = Reader(&payload);
@@ -383,8 +398,12 @@ impl RuntimeLink {
                 msg::HAPTIC => {
                     let hand = r.u32()?;
                     let duration = Duration::from_nanos(r.u64()?);
+                    let frequency = r.f32()?;
+                    let amplitude = r.f32()?;
                     self.counters.haptics.fetch_add(1, Ordering::Relaxed);
-                    on_haptic(Haptic { hand, duration, frequency: r.f32()?, amplitude: r.f32()? });
+                    if forwards_haptic(&mut quiet, hand, amplitude) {
+                        on_haptic(Haptic { hand, duration, frequency, amplitude });
+                    }
                 }
                 msg::TRACKING_REQUEST => {
                     let requested = Features(r.u32()? as u8).known();
@@ -692,6 +711,19 @@ impl Swapchains {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_hand_that_is_quiet_hears_no_more_stops() {
+        let mut quiet = [true; 2];
+        assert!(!super::forwards_haptic(&mut quiet, 0, 0.0), "a quiet hand needs no stop");
+        assert!(super::forwards_haptic(&mut quiet, 0, 0.4), "a pulse goes on");
+        assert!(super::forwards_haptic(&mut quiet, 0, 0.4), "so does the next pulse");
+        assert!(super::forwards_haptic(&mut quiet, 0, 0.0), "the first stop after a pulse goes on");
+        assert!(!super::forwards_haptic(&mut quiet, 0, 0.0), "the stops after it do not");
+        assert!(super::forwards_haptic(&mut quiet, 1, 0.1), "the other hand has its own state");
+        assert!(!super::forwards_haptic(&mut quiet, 0, 0.0));
+        assert!(!super::forwards_haptic(&mut quiet, 2, 0.5), "a hand that does not exist gets nothing");
+    }
+
     use super::*;
 
     use crate::pose::{Pose, Quat, Vec3};

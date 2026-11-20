@@ -98,7 +98,7 @@ applies these patches and builds both parts.
 
 `0010-log-what-reaches-the-game.patch`
 
-- The runtime writes to stderr, which the cranvr app keeps as the game's log (`game.err.log`), what a game's input does. At the first `xrAttachSessionActionSets` of a session it tells how many action sets and actions are attached and how many actions have a binding for the Touch controllers. It tells when a controller joins or leaves (`xrSyncActions` sees its profile). For each action of each hand it tells the first time that the action is active and its first two changes, with the value (pressed, a float, a vector or a tracked pose). Each kind stops after 80 lines. A game that binds nothing, or whose bindings no controller input reaches, shows no such line.
+- The runtime writes to stderr, which the cranvr app keeps as the game's log (`game.err.log`; a Unity game keeps it in its `Player.log`), what a game's input does. At the first `xrAttachSessionActionSets` of a session it tells how many action sets and actions are attached and how many actions have a binding for the Touch controllers. It tells when a controller joins or leaves (`xrSyncActions` sees its profile). For each action of each hand it tells the first time that the action is active and its first two changes, with the value (pressed, a float, a vector or a tracked pose). Each kind stops after 80 lines. A game that binds nothing, or whose bindings no controller input reaches, shows no such line.
 
 ## patches/dxmt
 
