@@ -67,6 +67,13 @@ const START_POSE: Pose = Pose::at([0.0, -0.1, -0.5]);
 /// 1.6 m wide fills 56 degrees at 1.5 m. The height follows the picture's aspect ratio.
 const START_WIDTH: f32 = 1.6;
 const WIDTH_RANGE: [f32; 2] = [0.4, 8.0];
+/// Where the panel stands and how wide it is before the user carries it, for the scripted controllers of
+/// a test build (`scripted.rs`)
+#[cfg(all(feature = "scripted-hand", target_os = "android"))]
+pub(crate) fn start_panel() -> (Pose, f32) {
+    (place::start_pose(PANEL, START_POSE), place::saved_width(PANEL).map_or(START_WIDTH, |width| width.clamp(WIDTH_RANGE[0], WIDTH_RANGE[1])))
+}
+
 /// How fast the thumbstick resizes a carried panel, as a share of the width a second at full lean
 const RESIZE_SPEED: f32 = 0.7;
 /// A thumbstick leaning less than this counts as at rest
