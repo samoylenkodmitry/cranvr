@@ -527,12 +527,16 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
             | ClientDatagram::Face(_)
             | ClientDatagram::Eyes(_),
         ) if session.paused() => {}
-        Incoming::Datagram(ClientDatagram::Tracking(t)) => {
+        Incoming::Datagram(ClientDatagram::Tracking(mut t)) => {
+            crate::test_input::tracking(&mut t);
             session.history.lock().unwrap().push(t);
             session.lock.lock().unwrap().on_tracking(t.display_time);
             shared.emit(Event::Tracking { sample_ns: t.sample_time });
         }
-        Incoming::Datagram(ClientDatagram::InputHold(InputHold { input, held })) => session.on_input(shared, &input, held),
+        Incoming::Datagram(ClientDatagram::InputHold(InputHold { mut input, held })) => {
+            crate::test_input::input(&mut input);
+            session.on_input(shared, &input, held)
+        }
         Incoming::Datagram(ClientDatagram::FrameTiming(t)) => session.on_timing(&t),
         Incoming::Datagram(ClientDatagram::Loss(report)) => session.on_loss(&report),
         Incoming::Datagram(ClientDatagram::Ping(p)) => {

@@ -44,6 +44,13 @@ fn dump_dir() -> Option<&'static Path> {
     DIR.get_or_init(|| std::env::var_os("CRANVR_EYE_DUMP").filter(|dir| !dir.is_empty()).map(PathBuf::from)).as_deref()
 }
 
+/// The widest dump in pixels: `CRANVR_EYE_DUMP_WIDTH`, else 640. A test that reads a game's menu asks for the whole
+/// width of an eye (1500 or more), which writes a file of several megabytes each second.
+fn dump_width() -> usize {
+    static WIDTH: OnceLock<usize> = OnceLock::new();
+    *WIDTH.get_or_init(|| std::env::var("CRANVR_EYE_DUMP_WIDTH").ok().and_then(|width| width.parse().ok()).filter(|width| *width > 0).unwrap_or(640))
+}
+
 /// The CRC-32 that PNG chunks carry.
 fn crc32(parts: &[&[u8]]) -> u32 {
     let mut crc = !0u32;
@@ -143,7 +150,7 @@ impl Grid {
         true
     }
 
-    /// The part of a BGRA image inside `rect` as a PNG, shrunk by a whole factor to at most 640 pixels
+    /// The part of a BGRA image inside `rect` as a PNG, shrunk by a whole factor to at most `dump_width()` pixels
     /// across. The rect follows the rules of `fill`.
     fn png(data: &[u8], stride: usize, size: (usize, usize), rect: [i32; 4]) -> Option<Vec<u8>> {
         let (width, height) = size;
@@ -154,7 +161,7 @@ impl Grid {
         let (x0, y0) = (clamp(rect[0], width), clamp(rect[1], height));
         let (w, h) = (clamp(rect[2], width - x0), clamp(rect[3], height - y0));
         let (x0, y0, w, h) = if w == 0 || h == 0 { (0, 0, width, height) } else { (x0, y0, w, h) };
-        let step = w.div_ceil(640);
+        let step = w.div_ceil(dump_width());
         let (out_w, out_h) = (w / step, h / step);
         let mut rgb = Vec::with_capacity(out_w * out_h * 3);
         for y in 0..out_h {

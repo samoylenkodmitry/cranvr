@@ -609,6 +609,18 @@ python3 scripts/perf/gpu-by-kind.py target/perf/bs.xml "Beat Saber"
 
 `game-run.sh` needs the cranvr app running and a headset that is paired with it. It wakes the headset without a wearer and starts cranvr's client and the game without sound. `CRANVR_HOST=ADDRESS:PORT` gives the client the Mac's address. Without it the client uses the address of its last connection. It prints one summary line of the rates and the latency stages. Then it gives the headset its guardian back. The proximity sensor stays closed, so the headset stays awake. `metal-trace.sh` records 5 seconds of GPU work of every process on the Mac while a game runs. `gpu-by-pass.py` sums that work per process and per pass. `gpu-by-kind.py` sums it per kind of pass. `display-modes.swift` lists the modes of the external display or holds one for its own run.
 
+### A hand for a test run
+
+A test with nobody in the headset can press the buttons of a game's menu. `CRANVR_TEST_INPUT=FILE` makes the host replace the right controller that the client reports with the one that FILE describes. The host reads FILE about every 30 ms. The file holds `NAME=VALUE` words, such as `head_yaw=100 yaw=12 pitch=25 trigger=1`:
+
+- `yaw` and `pitch` (degrees) say where the controller points, from the direction that the head faces. A positive yaw turns to the left and a positive pitch turns up.
+- `trigger` (0 to 1) is the pull. A pull of 0.7 or more clicks.
+- `primary`, `secondary`, `stick_x` and `stick_y` press A and B and lean the stick.
+- `x`, `y` and `z` place the grip in meters right, up and forward of the head (default 0.2, -0.35, 0.3).
+- `head_yaw` and `head_pitch` turn the head that the host reports, so that a test with the probe can look at a panel that a game put at the side. A headset on a desk leaves them at 0.
+
+`CRANVR_EYE_DUMP=FOLDER` writes both eyes of the game's newest frame once a second. `CRANVR_EYE_DUMP_WIDTH=1500` makes the files as wide as an eye (1444 pixels) instead of at most 640. A test reads the dump, finds a button in the picture, writes the angles of its direction into FILE and pulls the trigger for half a second. The pointer of a game's menu points a little higher than its controller: for the pictures of the probe's eye (a field of 90 degrees), the controller had to point 18.5 degrees above the direction of the button.
+
 ## Other settings of the host
 
 - The encoder overlaps up to two frames. A data rate limit over each second keeps the stream at or under the bitrate target. `--strict-rate-control` switches to VideoToolbox's low-latency rate control: even frame sizes, one frame at a time, slower per frame on an M5 (6.1 ms against 3.6 to 5.0).

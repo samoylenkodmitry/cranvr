@@ -22,6 +22,7 @@ mod runtime_link;
 mod screen_capture;
 mod session;
 mod status;
+mod test_input;
 mod tracking;
 mod virtual_display;
 
