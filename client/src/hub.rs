@@ -678,11 +678,13 @@ impl Hub {
     /// Returns the headset actions that fired in this frame. The console opens or closes here. The
     /// UI takes the other actions with `take_fires`.
     pub fn controls_frame(&self, input: &Input, now: Nanos) -> Vec<Fire> {
-        let game_runs = self.backdrop().game_runs;
+        // The host's word that a game runs can be late or missing, so a streaming link is enough to
+        // ask for the hold
+        let streams = self.snapshot.lock().unwrap().state == LinkState::Streaming;
         let fires = {
             let mut console = self.console.lock().unwrap();
             let controls = console.controls();
-            let fires = self.runner.lock().unwrap().update(&controls, input, now, game_runs);
+            let fires = self.runner.lock().unwrap().update(&controls, input, now, streams);
             for fire in &fires {
                 if fire.action == ControlAction::Console {
                     console.toggle_open();
