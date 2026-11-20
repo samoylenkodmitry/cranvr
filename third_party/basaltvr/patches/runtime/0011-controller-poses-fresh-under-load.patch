@@ -1,5 +1,5 @@
 diff --git a/runtime/pe/control.cpp b/runtime/pe/control.cpp
-index e56e131..6d0e7d7 100644
+index e56e131..5f0db7c 100644
 --- a/runtime/pe/control.cpp
 +++ b/runtime/pe/control.cpp
 @@ -9,6 +9,7 @@
@@ -25,15 +25,14 @@ index e56e131..6d0e7d7 100644
  constexpr XrDuration kSystemButtonRecenterHold = 600'000'000;
  
  // Serialized FrameReady payload: header (8 + 8 + 8 + 4) plus per view
-@@ -218,8 +223,17 @@ void resetSystemButtonLocked() {
+@@ -218,8 +223,16 @@ void resetSystemButtonLocked() {
      gSystemButtonRecentered = false;
  }
  
 +// cranvr: whether data that arrived at `arrival` is no older than `limit` at `now`. A reader reads the clock
 +// before it waits for the lock, and the receiver sets `arrival` under that lock. A message that the receiver
 +// handled while the reader waited has an arrival after the reader's `now`: that is the newest data, not
-+// stale data. Counting it as stale made a hand's pose flicker between valid and invalid under load, mostly the
-+// hand of the last pose message of a sample (the right one).
++// stale data. Counting it as stale made a hand's pose flicker between valid and invalid under load, for either hand.
 +bool arrivedWithin(XrTime arrival, XrTime now, XrDuration limit) {
 +    return arrival > 0 && (now < arrival || now - arrival <= limit);
 +}
@@ -44,7 +43,7 @@ index e56e131..6d0e7d7 100644
  }
  
  void resetTrackedLocked() {
-@@ -545,6 +559,21 @@ bool parseControllerMotion(const uint8_t* payload, size_t payloadLength, bool wi
+@@ -545,6 +558,21 @@ bool parseControllerMotion(const uint8_t* payload, size_t payloadLength, bool wi
      if (timestamp < record.questTimestamp ||
          timestamp < record.presenceTimestamp ||
          (timestamp == record.presenceTimestamp && !record.presenceActive)) {
@@ -66,7 +65,7 @@ index e56e131..6d0e7d7 100644
          return true;
      }
      if (!gLocalOriginValid) {
-@@ -562,7 +591,18 @@ bool parseControllerMotion(const uint8_t* payload, size_t payloadLength, bool wi
+@@ -562,7 +590,18 @@ bool parseControllerMotion(const uint8_t* payload, size_t payloadLength, bool wi
          record.rawAimAngularVelocity = {values[23], values[24], values[25]};
      }
      record.questTimestamp = timestamp;
@@ -86,7 +85,7 @@ index e56e131..6d0e7d7 100644
      record.poseValid = true;
      return true;
  }
-@@ -1380,6 +1420,44 @@ void adapterDescription(ID3D11Device* device, char* buffer, size_t capacity) {
+@@ -1380,6 +1419,44 @@ void adapterDescription(ID3D11Device* device, char* buffer, size_t capacity) {
  
  namespace basalt {
  
@@ -131,7 +130,7 @@ index e56e131..6d0e7d7 100644
  bool controlConfiguredViewSize(uint32_t* width, uint32_t* height) {
      if (width == nullptr || height == nullptr) {
          return false;
-@@ -1621,9 +1699,7 @@ bool controlHeadPose(
+@@ -1621,9 +1698,7 @@ bool controlHeadPose(
      AcquireSRWLockShared(&gControlLock);
      const bool fresh = session != XR_NULL_HANDLE && gControlSession == session &&
                         gSocket != INVALID_SOCKET && !gReceiverFailed &&
@@ -142,7 +141,7 @@ index e56e131..6d0e7d7 100644
      if (fresh) {
          if (questTimestampNanoseconds != nullptr) {
              *questTimestampNanoseconds = gHeadPoseQuestTimestamp;
-@@ -1656,9 +1732,7 @@ bool controlInputSnapshot(
+@@ -1656,9 +1731,7 @@ bool controlInputSnapshot(
              ControlControllerState& destination = snapshot->controllers[hand];
              destination.profileActive = source.profileActive;
              destination.profileId = source.profileId;

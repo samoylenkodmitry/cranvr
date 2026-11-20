@@ -9,7 +9,10 @@
 //     WaitGetPoses, Submit and PostPresentHandoff for the time that --seconds says.
 //   - It reads the head pose and, with --expect-input, the legacy controller state, which the
 //     scripted controllers of cranvr-probe move (a pull of the left grip, the right trigger at 0.75,
-//     the A button).
+//     the A button), and the controllers' poses in the array that WaitGetPoses fills, as a game with no
+//     action manifest reads them (valid in 90 percent of the frames before the last 8 seconds, the left
+//     one where the probe holds it, the right one swinging). The probe's head must stand still for
+//     this (cranvr-probe --still-head): the game's room is then the probe's room.
 //
 // The last line is "openvr_smoke: PASS" or "openvr_smoke: FAIL ...". The program takes no part of
 // Valve's code except the headers of OpenComposite's OpenVRHeaders (BSD 3-Clause).
@@ -755,9 +758,10 @@ int main(int argc, char** argv)
 	bool left_connected = false, right_connected = false, left_grip_pressed = false, a_pressed = false;
 	// The poses of the two controllers in the array that WaitGetPoses fills, as a game with no action manifest reads
 	// them: how often each was valid, from which frame on, how often it was lost, and where it was
-	// (the frames of the first part of the run only count for the verdict: when the program runs longer than
-	// the probe, the controllers leave in the last seconds)
-	uint64_t legacy_valid[2] = {}, legacy_first[2] = {}, legacy_lost[2] = {}, judged_frames[2] = {}, judged_valid[2] = {};
+	// (the verdict counts the frames up to the last valid head pose: a program that runs longer than the headset's
+	// client, as a slow start on a busy Mac makes it, sees the controllers and the head leave in its last seconds)
+	uint64_t legacy_valid[2] = {}, legacy_first[2] = {}, legacy_lost[2] = {};
+	std::vector<uint8_t> controller_ok[2], head_ok;
 	bool legacy_was_valid[2] = {};
 	float legacy_x_min[2] = { 1e9f, 1e9f }, legacy_x_max[2] = { -1e9f, -1e9f }, legacy_y[2] = {};
 	vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
@@ -802,8 +806,10 @@ int main(int argc, char** argv)
 				first_error = wait;
 			}
 		}
-		if (poses[vr::k_unTrackedDeviceIndex_Hmd].bPoseIsValid && poses[vr::k_unTrackedDeviceIndex_Hmd].bDeviceIsConnected
-		    && finite_pose(poses[vr::k_unTrackedDeviceIndex_Hmd].mDeviceToAbsoluteTracking)) {
+		const bool head_valid = poses[vr::k_unTrackedDeviceIndex_Hmd].bPoseIsValid && poses[vr::k_unTrackedDeviceIndex_Hmd].bDeviceIsConnected
+		    && finite_pose(poses[vr::k_unTrackedDeviceIndex_Hmd].mDeviceToAbsoluteTracking);
+		head_ok.push_back(head_valid ? 1 : 0);
+		if (head_valid) {
 			valid_poses++;
 		}
 
@@ -852,10 +858,7 @@ int main(int argc, char** argv)
 				legacy_lost[i]++;
 			}
 			legacy_was_valid[i] = valid;
-			if (legacy_valid[i] > 0 && std::chrono::duration<double>(Clock::now() - begin).count() < seconds - 8.0) {
-				judged_frames[i]++;
-				judged_valid[i] += valid ? 1 : 0;
-			}
+			controller_ok[i].push_back(valid ? 1 : 0);
 			if (valid) {
 				if (legacy_valid[i] == 0) {
 					legacy_first[i] = frames;
@@ -959,8 +962,23 @@ int main(int argc, char** argv)
 	    right_connected ? "tracked" : "missing", max_right_trigger, left_grip_pressed ? "pressed" : "not pressed", max_left_grip_pulled,
 	    a_pressed ? "pressed" : "not pressed");
 
+	// The frames up to the last valid head pose count for the verdict
+	size_t judged = head_ok.size();
+	while (judged > 0 && !head_ok[judged - 1]) {
+		judged--;
+	}
+	uint64_t judged_head_valid = 0, judged_valid[2] = {}, judged_frames[2] = {};
+	for (size_t f = 0; f < judged; f++) {
+		judged_head_valid += head_ok[f];
+	}
 	for (int i = 0; i < 2; i++) {
-		say("the %s controller's pose in the poses of WaitGetPoses: %llu valid frames of %llu (first at frame %llu, %llu times lost; %llu of %llu frames before the last 8 seconds), x from %.3f to %.3f, y %.3f",
+		for (size_t f = legacy_first[i] > 0 ? static_cast<size_t>(legacy_first[i]) - 1 : 0; f < judged && f < controller_ok[i].size(); f++) {
+			judged_frames[i]++;
+			judged_valid[i] += controller_ok[i][f];
+		}
+	}
+	for (int i = 0; i < 2; i++) {
+		say("the %s controller's pose in the poses of WaitGetPoses: %llu valid frames of %llu (first at frame %llu, %llu times lost; %llu of %llu frames up to the last valid head pose), x from %.3f to %.3f, y %.3f",
 		    i == 0 ? "left" : "right", static_cast<unsigned long long>(legacy_valid[i]), static_cast<unsigned long long>(frames),
 		    static_cast<unsigned long long>(legacy_first[i]), static_cast<unsigned long long>(legacy_lost[i]),
 		    static_cast<unsigned long long>(judged_valid[i]), static_cast<unsigned long long>(judged_frames[i]), legacy_x_min[i], legacy_x_max[i], legacy_y[i]);
@@ -982,7 +1000,7 @@ int main(int argc, char** argv)
 	if (wait_errors || submit_errors) {
 		return fail("the compositor reported errors");
 	}
-	if (valid_poses < frames * 9 / 10) {
+	if (judged_head_valid < judged * 9 / 10) {
 		return fail("the head pose was not valid in 90 percent of the frames");
 	}
 	if (!(eye_distance > 0.03f && eye_distance < 0.09f)) {

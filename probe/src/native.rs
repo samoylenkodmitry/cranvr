@@ -59,6 +59,10 @@ pub struct Options {
     /// The head stands still, as it does with `tracking`, so that a game's room is the probe's room
     /// and its controller poses can be compared with the script's numbers
     pub still_head: bool,
+    /// Both hands play their script this many meters higher. The hands of the script lie below the view of a
+    /// headset with a 45 degree field, so a game's picture does not show them; raised by 0.4 m they lie in front
+    /// of the chest and a test run can see their models in the host's copy of the eyes.
+    pub hands_lift: f32,
     /// With `tracking`: where the face comes from
     pub face_source: tracked::FaceSource,
     /// Loses the input focus at this many seconds for this many seconds, as under the system's
@@ -155,6 +159,7 @@ struct Shared {
     wish: AtomicU8,
     tracking: bool,
     still_head: bool,
+    hands_lift: f32,
     no_controllers: bool,
     face_source: tracked::FaceSource,
     sent_tracking: [AtomicU64; 4],
@@ -264,6 +269,7 @@ pub fn run(o: Options) -> i32 {
         wish: AtomicU8::new(0),
         tracking: o.tracking,
         still_head: o.tracking || o.still_head,
+        hands_lift: o.hands_lift,
         no_controllers: o.no_controllers,
         face_source: o.face_source,
         sent_tracking: Default::default(),
@@ -596,11 +602,12 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
         // The left hand stays where it is. The right hand swings 10 cm to each side of a point in
         // front of the head, with its velocity. Each hand has a grip pose and its own aim pose
         // (see hands.rs).
-        let left = hands::grip(0, hands::LEFT_AT, [0.0; 3]);
+        let lift = shared.hands_lift;
+        let left = hands::grip(0, [hands::LEFT_AT[0], hands::LEFT_AT[1] + lift, hands::LEFT_AT[2]], [0.0; 3]);
         let swing = (t * std::f32::consts::PI).sin();
         let right = hands::grip(
             1,
-            [hands::RIGHT_AT[0] + hands::RIGHT_SWING * swing, hands::RIGHT_AT[1], hands::RIGHT_AT[2]],
+            [hands::RIGHT_AT[0] + hands::RIGHT_SWING * swing, hands::RIGHT_AT[1] + lift, hands::RIGHT_AT[2]],
             [hands::RIGHT_SWING * std::f32::consts::PI * (t * std::f32::consts::PI).cos(), 0.0, 0.0],
         );
         {

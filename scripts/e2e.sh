@@ -36,9 +36,11 @@
 #   --openvr-wine  an OpenVR program through OpenComposite and the real runtime: C:\opencomposite\openvr_smoke.exe
 #                 runs in Wine. It finds the runtime through the prefix's OpenVR path file, which
 #                 scripts/run-game.sh writes when CRANVR_OPENCOMPOSITE is 1 (this option sets it). It
-#                 makes a Direct3D 11 device, submits both eyes in every frame and reads the head pose
-#                 and the legacy state of the scripted controllers (a pull of the left grip, the right
-#                 trigger at 0.75, the A button). It prints "openvr_smoke: PASS" or "FAIL ...". Set
+#                 makes a Direct3D 11 device, submits both eyes in every frame and reads the head pose,
+#                 the legacy state of the scripted controllers (a pull of the left grip, the right
+#                 trigger at 0.75, the A button) and their poses in the array of WaitGetPoses (valid in
+#                 90 percent of the frames, the left one where the probe holds it, the right one swinging;
+#                 the probe's head stands still). It prints "openvr_smoke: PASS" or "FAIL ...". Set
 #                 CRANVR_HOME to a stack that scripts/setup-wine.sh built with OpenComposite.
 #   --openvr-actions touch|vive|both  the same program with IVRInput: it writes an action manifest with default
 #                 bindings (for Touch controllers, the Vive wand or both, as a game that ships a manifest does),
@@ -94,6 +96,10 @@
 # the right picture. It exits with 1 otherwise.
 
 set -euo pipefail
+# zsh lowers the priority of a background job by 5 ("nice") unless this option is off. The host and the game run as
+# background jobs here. The cranvr app starts them at normal priority, so a test with the default option measured a
+# game that lost the Mac's CPU time to every build that ran beside it.
+unsetopt BG_NICE
 
 root=${0:A:h:h}
 seconds=20 fps=120 fps_given=0 game=0 desktop=0 client=mac serial="" report=""
