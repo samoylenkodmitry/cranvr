@@ -116,18 +116,14 @@ impl Default for Views {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: cranvr-host [--protocol native] [--native-port PORT] [--fps 72|80|90|120, default 120] [--eye-width PIXELS] [--mbps N] [--trust-all] [--pair CODE] [--discovery-port N] [--no-display-lock] [--tcp] [--no-foveation] [--game-scale F] [--strict-rate-control] [--no-game-audio] [--no-hand-controllers] [--desktop] [--desktop-fps N] [--virtual-display WxH] [--vr-main-display] [--pointer-pitch DEG] [--screen-in-view] [--no-desktop-layer] [--config-dir DIR] [--status]\n\
-         \n  --protocol native the headset protocol; cranvr's own is the only one. The option stays so\
-         \n                    that older command lines work.\
+        "usage: cranvr-host [--native-port PORT] [--fps 72|80|90|120, default 120] [--eye-width PIXELS] [--mbps N] [--trust-all] [--discovery-port N] [--no-display-lock] [--tcp] [--no-foveation] [--game-scale F] [--strict-rate-control] [--no-game-audio] [--no-hand-controllers] [--desktop] [--desktop-fps N] [--virtual-display WxH] [--vr-main-display] [--pointer-pitch DEG] [--screen-in-view] [--no-desktop-layer] [--config-dir DIR] [--status]\n\
          \n  --native-port N   the TCP port to listen on (default 9950)\
          \n  --trust-all       accept any client on the network without a pairing (for tests)\
-         \n  --pair CODE       pair a headset of the older cranvr app, which shows a code of six\
-         \n                    digits when the host does not know it. A newer app waits instead: the\
-         \n                    cranvr app on this Mac shows Allow and Deny. With --status you may\
-         \n                    type `allow KEY` or `deny KEY` into the host's input (the status line\
-         \n                    gives the key). The host remembers the headset in\
-         \n                    paired-headsets.txt. It has a key of its own in host-identity.txt:\
-         \n                    keep it, or the paired headsets refuse the host.\
+         \n  A headset that the host does not know waits for the user: the cranvr app on this Mac\
+         \n                    shows Allow and Deny. With --status you may type `allow KEY` or `deny KEY`\
+         \n                    into the host's input (the status line gives the key). The host remembers\
+         \n                    an allowed headset in paired-headsets.txt. It has a key of its own in\
+         \n                    host-identity.txt: keep it, or the paired headsets refuse the host.\
          \n  --discovery-port N  the UDP port that answers the headsets' search for this Mac\
          \n                    (default 9950; 0 turns it off)\
          \n  --no-display-lock render at the arrival of each pose, not at a time that follows the\
@@ -175,7 +171,6 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
         eye_width_given: false,
         mbps: 100,
         trust_all: false,
-        pair_code: None,
         discovery_port: Some(cranvr_proto::discovery::DEFAULT_PORT),
         display_lock: true,
         tcp: false,
@@ -205,12 +200,6 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
     while let Some(arg) = args.next() {
         let mut value = || args.next().unwrap_or_else(|| usage());
         match arg.as_str() {
-            "--protocol" => {
-                if value() != "native" {
-                    eprintln!("--protocol takes native: cranvr's own protocol is the only one");
-                    usage()
-                }
-            }
             "--native-port" => options.native_port = value().parse().unwrap_or_else(|_| usage()),
             "--fps" => options.fps = value().parse().unwrap_or_else(|_| usage()),
             "--eye-width" => options.eye_width = value().parse().unwrap_or_else(|_| usage()),
@@ -219,12 +208,6 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
             "--discovery-port" => {
                 // 0 turns discovery off
                 options.discovery_port = Some(value().parse().unwrap_or_else(|_| usage())).filter(|port| *port != 0)
-            }
-            "--pair" => {
-                options.pair_code = Some(cranvr_proto::identity::parse_code(&value()).unwrap_or_else(|| {
-                    eprintln!("--pair takes the six digits that the headset shows");
-                    usage()
-                }))
             }
             "--no-display-lock" => options.display_lock = false,
             "--tcp" => options.tcp = true,
@@ -333,7 +316,7 @@ fn native_config(
     headset::native::Config {
         port: options.native_port,
         identity: pairing::host_identity(config_dir),
-        pairings: Arc::new(pairing::Pairings::load(config_dir, options.pair_code)),
+        pairings: Arc::new(pairing::Pairings::load(config_dir)),
         name: pairing::mac_name(),
         discovery_port: options.discovery_port,
         approval_wait: cranvr_proto::message::APPROVAL_WAIT,

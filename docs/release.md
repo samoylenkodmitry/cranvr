@@ -34,4 +34,4 @@ The store needs the owner's Meta developer account. These steps are the owner's.
    `CRANVR_KEYSTORE=/path/cranvr-upload.jks CRANVR_KEYSTORE_PASSWORD=... CRANVR_KEY_ALIAS=cranvr scripts/build-client.sh` with `-PcranvrVersionCode=N` in `client/android/gradle.properties` or on the Gradle line.
 4. Upload the APK from `target/client/cranvr-client.apk` in the Meta Horizon developer dashboard.
 
-The Mac app and the headset app update apart. Both sides name the side to update when their protocol versions differ.
+The Mac app and the headset app of one release come from one commit. cranvr supports one protocol version. Both sides name the side to update when their protocol versions differ.

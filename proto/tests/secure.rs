@@ -52,14 +52,9 @@ impl Raw {
     /// Runs the version exchange and the three flights. `claimed` is the key that flight 3 names.
     /// `signer` signs it. They differ in the tests of a forged identity.
     fn handshake(addr: std::net::SocketAddr, claimed: &Identity, signer: &Identity) -> std::io::Result<Raw> {
-        Self::handshake_with_versions(addr, claimed, signer, VersionRange::OURS)
-    }
-
-    /// The same, for a client that speaks only the versions in `range`.
-    fn handshake_with_versions(addr: std::net::SocketAddr, claimed: &Identity, signer: &Identity, range: VersionRange) -> std::io::Result<Raw> {
         let mut tcp = TcpStream::connect(addr)?;
         tcp.set_read_timeout(Some(WAIT))?;
-        let client_pre = client_preamble(range);
+        let client_pre = client_preamble(cranvr_proto::PROTOCOL_VERSION);
         tcp.write_all(&client_pre)?;
         let mut host_pre = [0u8; HOST_PREAMBLE_LEN];
         tcp.read_exact(&mut host_pre)?;
@@ -361,7 +356,7 @@ fn the_proof_of_one_session_does_not_serve_in_another() {
     // A second session in which the attacker repeats the first session's signature
     let mut tcp = TcpStream::connect(addr).unwrap();
     tcp.set_read_timeout(Some(WAIT)).unwrap();
-    let client_pre = client_preamble(VersionRange::OURS);
+    let client_pre = client_preamble(cranvr_proto::PROTOCOL_VERSION);
     tcp.write_all(&client_pre).unwrap();
     let mut host_pre = [0u8; HOST_PREAMBLE_LEN];
     tcp.read_exact(&mut host_pre).unwrap();
@@ -425,7 +420,7 @@ fn a_man_in_the_middle_that_swaps_the_fresh_key_breaks_the_host_signature() {
         let (mut tcp, _) = listener.accept().unwrap();
         let mut client_pre = [0u8; CLIENT_PREAMBLE_LEN];
         tcp.read_exact(&mut client_pre).unwrap();
-        let host_pre = host_preamble(Some(VersionRange::OURS.max), VersionRange::OURS);
+        let host_pre = host_preamble(cranvr_proto::PROTOCOL_VERSION);
         tcp.write_all(&host_pre).unwrap();
         let mut buf = Vec::new();
         read_tcp_packet(&mut tcp, &mut buf).unwrap();
@@ -452,28 +447,12 @@ fn a_man_in_the_middle_that_swaps_the_fresh_key_breaks_the_host_signature() {
 }
 
 #[test]
-fn a_host_of_version_3_is_refused_by_the_client() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let old = thread::spawn(move || {
-        let (mut tcp, _) = listener.accept().unwrap();
-        let mut pre = [0u8; CLIENT_PREAMBLE_LEN];
-        tcp.read_exact(&mut pre).unwrap();
-        // The old host's answer: no common version, as its range is 3 to 3. It speaks in clear text.
-        tcp.write_all(&host_preamble(None, VersionRange { min: 3, max: 3 })).unwrap();
-    });
-    let result = ClientLink::connect(addr, &caps(), &identity(), None, WAIT);
-    assert!(matches!(result, Err(Error::Version { theirs: (3, 3), .. })), "{:?}", result.err());
-    old.join().unwrap();
-}
-
-#[test]
 fn a_flight_of_the_wrong_size_is_refused_before_it_sizes_a_buffer() {
     let listener = HostListener::bind("127.0.0.1:0", host_identity()).unwrap();
     let addr = listener.local_addr().unwrap();
     let host = thread::spawn(move || listener.accept().err());
     let mut raw = TcpStream::connect(addr).unwrap();
-    raw.write_all(&client_preamble(VersionRange::OURS)).unwrap();
+    raw.write_all(&client_preamble(cranvr_proto::PROTOCOL_VERSION)).unwrap();
     let mut answer = [0u8; HOST_PREAMBLE_LEN];
     raw.read_exact(&mut answer).unwrap();
     // A length of 16 MB from a peer that has proved nothing
@@ -661,25 +640,8 @@ fn a_man_in_the_middle_that_ends_both_legs_shows_two_different_codes() {
     assert_ne!(client_code, real_code, "the two legs showed the same code");
 }
 
-#[test]
-fn a_client_of_version_4_gets_no_approval_and_the_host_says_why() {
-    let listener = HostListener::bind("127.0.0.1:0", host_identity()).unwrap();
-    let addr = listener.local_addr().unwrap();
-    let host = thread::spawn(move || {
-        let mut pending = listener.accept().unwrap();
-        let version = pending.version;
-        let held = pending.hold_for_approval("Mac");
-        (version, held.err())
-    });
-    let mut raw = Raw::handshake_with_versions(addr, &identity(), &identity(), VersionRange { min: 4, max: 4 }).unwrap();
-    raw.send_control(&ClientMsg::Hello(caps()));
-    let (version, held) = host.join().unwrap();
-    assert_eq!(version, 4);
-    assert!(matches!(held, Some(Error::Unexpected(_))), "{held:?}");
-}
-
-/// A host written by hand. It runs the handshake as `versions` say, reads the client's key and
-/// its Hello, and returns the sealed channel for the test to continue.
+/// A host written by hand. It runs the handshake, reads the client's key and its Hello, and returns
+/// the sealed channel for the test to continue.
 struct FakeHost {
     tcp: TcpStream,
     channels: Channels,
@@ -688,11 +650,11 @@ struct FakeHost {
 }
 
 impl FakeHost {
-    fn accept(listener: &TcpListener, versions: VersionRange) -> FakeHost {
+    fn accept(listener: &TcpListener) -> FakeHost {
         let (mut tcp, _) = listener.accept().unwrap();
         let mut client_pre = [0u8; CLIENT_PREAMBLE_LEN];
         tcp.read_exact(&mut client_pre).unwrap();
-        let host_pre = host_preamble(Some(versions.max), versions);
+        let host_pre = host_preamble(cranvr_proto::PROTOCOL_VERSION);
         tcp.write_all(&host_pre).unwrap();
         let mut buf = Vec::new();
         read_tcp_packet(&mut tcp, &mut buf).unwrap();
@@ -731,7 +693,7 @@ fn a_host_that_reveals_another_number_than_it_committed_to_is_caught() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let fake = thread::spawn(move || {
-        let mut host = FakeHost::accept(&listener, VersionRange::OURS);
+        let mut host = FakeHost::accept(&listener);
         // The commitment is to one number, and the reveal shows another
         let commit = approval_commit(&[1; 32], &host.transcript, &host.client_key);
         host.send(&HostMsg::AwaitApproval { host_name: "Mac".into(), commit });
@@ -750,26 +712,8 @@ fn a_host_that_reveals_another_number_than_it_committed_to_is_caught() {
 }
 
 #[test]
-fn a_host_of_version_4_that_does_not_know_the_client_is_the_side_to_update() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let old = thread::spawn(move || {
-        let mut host = FakeHost::accept(&listener, VersionRange { min: 4, max: 4 });
-        // What a version 4 host did for a key that it did not know
-        host.send(&HostMsg::Reject(RejectReason::NotPaired));
-    });
-    let result = ClientLink::connect(addr, &caps(), &identity(), None, WAIT);
-    let error = result.err().expect("the old host refuses");
-    assert!(matches!(error, Error::Version { ours: (4, 7), theirs: (4, 4) }), "{error:?}");
-    assert_eq!(error.peer_must_update(), Some(true));
-    old.join().unwrap();
-}
-
-#[test]
-fn the_older_side_is_the_one_to_update() {
-    let ours = VersionRange { min: 4, max: 5 };
-    assert!(ours.peer_is_older(VersionRange { min: 4, max: 4 }));
-    assert!(ours.peer_is_older(VersionRange { min: 3, max: 3 }));
-    assert!(!ours.peer_is_older(VersionRange { min: 6, max: 7 }));
-    assert!(!ours.peer_is_older(VersionRange { min: 4, max: 5 }));
+fn the_lower_version_is_the_side_to_update() {
+    assert!(cranvr_proto::message::peer_must_update(8, 7));
+    assert!(cranvr_proto::message::peer_must_update(8, 1));
+    assert!(!cranvr_proto::message::peer_must_update(8, 9));
 }

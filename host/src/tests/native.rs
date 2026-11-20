@@ -41,7 +41,7 @@ fn config(port: u16) -> Config {
     Config {
         port,
         identity: cranvr_proto::identity::Identity::from_seed([7; 32]),
-        pairings: Arc::new(crate::pairing::Pairings::load(&config_dir(port), None)),
+        pairings: Arc::new(crate::pairing::Pairings::load(&config_dir(port))),
         name: "Test Mac".into(),
         discovery_port: None,
         approval_wait: Duration::from_secs(30),
@@ -513,14 +513,10 @@ fn a_second_headset_gets_busy_and_the_host_takes_the_next_one() {
 fn the_status_line_tells_the_app_who_is_paired_and_who_waits() {
     let dir = config_dir(1);
     // Nobody is paired and nobody waits
-    let none = status_line(9950, &Pairings::load(&dir, None));
-    assert_eq!(none, json!({"type": "native", "port": 9950, "paired": [], "pairing_s": null, "pending": []}));
-    // A code opens the window of the older protocol for ten minutes
-    let open = status_line(9951, &Pairings::load(&dir, Some(123_456)));
-    assert_eq!(open["port"].as_u64(), Some(9951));
-    assert!(open["pairing_s"].as_u64().is_some_and(|s| (590..=600).contains(&s)), "{open}");
+    let none = status_line(9950, &Pairings::load(&dir));
+    assert_eq!(none, json!({"type": "native", "port": 9950, "paired": [], "pending": []}));
     // A headset that waits has its key, name, address and the code that both screens show
-    let pairings = Pairings::load(&dir, None);
+    let pairings = Pairings::load(&dir);
     let key = identity().public_key();
     assert!(pairings.ask(key, "Meta Quest 3", [192, 168, 1, 30].into(), 4829));
     let waiting = status_line(9950, &pairings);
@@ -546,9 +542,9 @@ fn the_user_answers_with_a_line_that_names_the_key() {
 #[test]
 fn a_version_mismatch_tells_the_user_which_side_to_update() {
     use cranvr_proto::wire::Error;
-    let old = Error::Version { ours: (4, 5), theirs: (4, 4) };
+    let old = Error::Version { ours: 8, theirs: 7 };
     assert_eq!(version_notice(&old).unwrap(), "A headset tried to connect with a cranvr app of an older version. Update the cranvr app on the headset.");
-    let new = Error::Version { ours: (4, 5), theirs: (6, 7) };
+    let new = Error::Version { ours: 8, theirs: 9 };
     assert_eq!(version_notice(&new).unwrap(), "A headset tried to connect with a cranvr app of a newer version. Update cranvr on the Mac.");
     assert!(version_notice(&Error::Closed).is_none());
 }
@@ -705,65 +701,47 @@ fn a_headset_on_this_mac_needs_no_approval() {
     client.duplex.close();
 }
 
-/// A client of protocol version 4, written by hand: the real client speaks 5. It sends its Hello and
-/// returns what the host answers.
-fn old_client(addr: SocketAddr, identity: &cranvr_proto::identity::Identity) -> HostMsg {
-    use cranvr_proto::{
-        message::{client_preamble, VersionRange, HOST_PREAMBLE_LEN},
-        secure::{derive, sign_as_client, transcript_hash, Ephemeral, HostHello, Role, HOST_HELLO_LEN},
-        wire::{decode, encode, read_tcp_packet, PacketBuf, KIND_CONTROL, KIND_HANDSHAKE},
-    };
+/// A client that says it speaks `version`, written by hand: it sends the preamble and reads the
+/// host's answer, which holds the host's version.
+fn client_of_version(addr: SocketAddr, version: u16) -> u16 {
+    use cranvr_proto::message::{client_preamble, parse_host_preamble, HOST_PREAMBLE_LEN};
     use std::io::{Read, Write};
     let mut tcp = std::net::TcpStream::connect(addr).unwrap();
     tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let client_pre = client_preamble(VersionRange { min: 4, max: 4 });
-    tcp.write_all(&client_pre).unwrap();
+    tcp.write_all(&client_preamble(version)).unwrap();
     let mut host_pre = [0u8; HOST_PREAMBLE_LEN];
     tcp.read_exact(&mut host_pre).unwrap();
-    let fresh = Ephemeral::new().unwrap();
-    tcp.write_all(&[&33u32.to_le_bytes()[..], &[KIND_HANDSHAKE], &fresh.public()].concat()).unwrap();
-    let mut buf = Vec::new();
-    read_tcp_packet(&mut tcp, &mut buf).unwrap();
-    assert_eq!(buf.len() - 1, HOST_HELLO_LEN);
-    let hello = HostHello::parse(&buf[1..]).unwrap();
-    let transcript = transcript_hash(&client_pre, &host_pre, &fresh.public(), &hello.ephemeral, &hello.key);
-    let mut channels = derive(Role::Client, &fresh.agree(&hello.ephemeral).unwrap(), &transcript);
-    let mut auth = PacketBuf::new();
-    let body = auth.begin(KIND_HANDSHAKE);
-    body.extend_from_slice(&identity.public_key());
-    body.extend_from_slice(&sign_as_client(identity, &transcript));
-    tcp.write_all(channels.tcp_tx.seal(&mut auth).unwrap()).unwrap();
-    let mut hello_packet = PacketBuf::new();
-    // Over TCP the host needs no UDP hello from this hand-written client
-    encode(&ClientMsg::Hello(ClientCaps { tcp_only: true, ..caps("Old headset") }), hello_packet.begin(KIND_CONTROL)).unwrap();
-    tcp.write_all(channels.tcp_tx.seal(&mut hello_packet).unwrap()).unwrap();
-    read_tcp_packet(&mut tcp, &mut buf).unwrap();
-    let content = channels.tcp_rx.open(&mut buf).unwrap();
-    decode(&content[1..]).unwrap()
+    parse_host_preamble(&host_pre).unwrap()
 }
 
 #[test]
-fn a_headset_with_the_older_app_is_refused_with_a_note_to_update_it() {
+fn a_headset_of_another_version_is_refused_with_a_note_that_names_the_side_to_update() {
+    let ours = cranvr_proto::PROTOCOL_VERSION;
     let port = free_port();
     let (pairings, _events, _headset) = asking_host(port, Duration::from_secs(30));
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    // The older app cannot wait: the host refuses it at once, as before
-    assert_eq!(old_client(addr, &identity()), HostMsg::Reject(RejectReason::NotPaired));
-    assert!(pairings.waiting().is_empty());
-    let note = status::latest("network").expect("a note for the user");
+    // An older headset app: the host answers with its own version and tells its user to update the app
+    assert_eq!(client_of_version(addr, ours - 1), ours);
+    let note = wait_for_note(|note| note["message"].as_str().is_some_and(|m| m.ends_with("Update the cranvr app on the headset.")));
     assert_eq!(note["problem"], "incompatible_client");
-    assert!(note["message"].as_str().unwrap().ends_with("Update the cranvr app on the headset."), "{note}");
+    assert!(note["message"].as_str().unwrap().contains("an older"), "{note}");
+    // A newer headset app: the Mac is the side to update
+    assert_eq!(client_of_version(addr, ours + 1), ours);
+    let note = wait_for_note(|note| note["message"].as_str().is_some_and(|m| m.ends_with("Update cranvr on the Mac.")));
+    assert!(note["message"].as_str().unwrap().contains("a newer"), "{note}");
+    assert!(pairings.waiting().is_empty());
 }
 
-#[test]
-fn a_headset_with_the_older_app_that_the_host_paired_still_connects() {
-    let port = free_port();
-    let (pairings, mut events, _headset) = asking_host(port, Duration::from_secs(30));
-    pairings.add(&identity().public_key(), "Old headset");
-    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    // The host speaks version 4 to it and starts the session: the first answer is the welcome
-    assert!(matches!(old_client(addr, &identity()), HostMsg::Welcome(w) if w.version == 4));
-    wait_for(&mut *events, |e| matches!(e, Event::Connected { .. }));
+/// The newest `network` status line that `ok` takes, within a few seconds
+fn wait_for_note(ok: impl Fn(&Value) -> bool) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(note) = status::latest("network").filter(|note| ok(note)) {
+            return note;
+        }
+        assert!(Instant::now() < deadline, "no note");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
@@ -782,7 +760,7 @@ fn the_host_answers_a_search_with_its_name_its_port_and_its_key() {
     assert_eq!(host.answer.name, "Test Mac");
     assert_eq!(host.answer.port, port);
     assert_eq!(host.answer.fingerprint, cranvr_proto::identity::fingerprint(&cranvr_proto::identity::Identity::from_seed([7; 32]).public_key()));
-    assert_eq!(host.answer.versions, cranvr_proto::message::VersionRange::OURS);
+    assert_eq!(host.answer.version, cranvr_proto::PROTOCOL_VERSION);
     // The address in the answer is one that a client can connect to
     let client = ClientLink::connect(host.socket_addr(), &caps("Found it"), &identity(), None, Duration::from_secs(10));
     assert!(client.is_ok(), "{:?}", client.err());
@@ -800,28 +778,26 @@ fn only_a_few_threads_hold_clients_for_the_user_at_once() {
 }
 
 #[test]
-fn the_wish_for_tracking_stays_within_the_offer_and_the_version() {
+fn the_wish_for_tracking_stays_within_the_offer() {
     let (hands, face, eyes) = (Features::HANDS, Features::FACE, Features::EYES);
-    // A client of the version before the tracking messages is never asked
-    assert_eq!(wish_to_send(5, hands, Features::ALL, None), None);
     // Nothing to ask for at the start: no message
-    assert_eq!(wish_to_send(6, Features::NONE, Features::ALL, None), None);
+    assert_eq!(wish_to_send(Features::NONE, Features::ALL, None), None);
     // Only what the client offers
-    assert_eq!(wish_to_send(6, hands.union(face), hands.union(eyes), None), Some(hands));
+    assert_eq!(wish_to_send(hands.union(face), hands.union(eyes), None), Some(hands));
     // Before the offer came, a wish waits
-    assert_eq!(wish_to_send(6, hands, Features::NONE, None), None);
+    assert_eq!(wish_to_send(hands, Features::NONE, None), None);
     // The same answer again is not sent again. A change is, also the change to nothing.
-    assert_eq!(wish_to_send(6, hands, Features::ALL, Some(hands)), None);
-    assert_eq!(wish_to_send(6, face, Features::ALL, Some(hands)), Some(face));
-    assert_eq!(wish_to_send(6, Features::NONE, Features::ALL, Some(hands)), Some(Features::NONE));
+    assert_eq!(wish_to_send(hands, Features::ALL, Some(hands)), None);
+    assert_eq!(wish_to_send(face, Features::ALL, Some(hands)), Some(face));
+    assert_eq!(wish_to_send(Features::NONE, Features::ALL, Some(hands)), Some(Features::NONE));
     // A headset that offers the full body serves a game that asks for the default body
-    assert_eq!(wish_to_send(6, Features::BODY, Features::FULL_BODY, None), Some(Features::FULL_BODY));
-    assert_eq!(wish_to_send(6, Features::BODY, Features::BODY.union(Features::FULL_BODY), None), Some(Features::BODY));
-    // Bits that this version does not know are dropped
-    assert_eq!(wish_to_send(6, Features(0xe0 | 1), Features(0xff), None), Some(hands));
+    assert_eq!(wish_to_send(Features::BODY, Features::FULL_BODY, None), Some(Features::FULL_BODY));
+    assert_eq!(wish_to_send(Features::BODY, Features::BODY.union(Features::FULL_BODY), None), Some(Features::BODY));
+    // Bits that no feature has are dropped
+    assert_eq!(wish_to_send(Features(0xe0 | 1), Features(0xff), None), Some(hands));
     // The face's source is a detail of the offer: the wish for the face has none, whatever the offer says
     let audio = face.union(Features::FACE_AUDIO);
-    assert_eq!(wish_to_send(6, audio, audio, None), Some(face));
+    assert_eq!(wish_to_send(audio, audio, None), Some(face));
 }
 
 #[test]

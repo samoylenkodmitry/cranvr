@@ -1,8 +1,11 @@
 use super::*;
 
 const MENU: &str = r#"{"games":[{"name":"Beat Saber","program":"Beat Saber.exe"},{"name":"Half-Life: Alyx","program":"hlvr.exe"}],
-    "fps":120,"game_scale":0.6,"msaa":2,"low_latency":false,
+    "fps":120,"game_scale":0.6,"msaa":2,"controls":{},
     "status":{"refresh":120,"fps":119.4,"game_fps":117,"latency_ms":46.2,"game":"Beat Saber.exe"}}"#;
+
+/// A menu with the games and the settings only, as the app writes it before a headset streams
+const BARE: &str = r#"{"games":[],"fps":90,"game_scale":1.0,"msaa":0,"controls":{}}"#;
 
 fn menu(game: Option<&str>) -> Menu {
     let mut menu = Menu::parse(MENU).unwrap();
@@ -18,20 +21,24 @@ fn the_menu_comes_from_the_hosts_json() {
     assert!((menu.game_scale - 0.6).abs() < 1e-6);
     assert_eq!(menu.status, Status { refresh: 120.0, fps: 119.4, game_fps: 117.0, latency_ms: Some(46.2), game: Some("Beat Saber.exe".into()) });
     assert!(menu.runs(&menu.games[0]) && !menu.runs(&menu.games[1]));
-    // The host sends the file without a status while no headset streams, and an app may leave fields out
-    let bare = Menu::parse(r#"{"games":[]}"#).unwrap();
-    assert_eq!((bare.fps, bare.game_scale, bare.status.game), (120, 1.0, None));
+    // The host sends the file without a status while no headset streams
+    let bare = Menu::parse(BARE).unwrap();
+    assert_eq!((bare.fps, bare.game_scale, bare.status.game), (90, 1.0, None));
     assert_eq!(Menu::parse("not json"), None);
     assert_eq!(Menu::parse(r#"{"fps":90}"#), None, "a text without games is no menu");
+    // Every setting and the controls belong to the menu
+    for lacking in [r#"{"games":[],"game_scale":1.0,"msaa":0,"controls":{}}"#, r#"{"games":[],"fps":90,"msaa":0,"controls":{}}"#, r#"{"games":[],"fps":90,"game_scale":1.0,"controls":{}}"#, r#"{"games":[],"fps":90,"game_scale":1.0,"msaa":0}"#, r#"{"games":[],"fps":90,"game_scale":1.0,"msaa":0,"controls":5}"#] {
+        assert_eq!(Menu::parse(lacking), None, "{lacking}");
+    }
 }
 
 #[test]
 fn the_apps_notice_shows_in_the_menu_and_adds_a_line_to_the_height() {
-    let mut with = Menu::parse(r#"{"games":[],"notice":"The right eye stayed black. The game restarts."}"#).unwrap();
+    let mut with = Menu::parse(r#"{"games":[],"fps":90,"game_scale":1.0,"msaa":0,"controls":{},"notice":"The right eye stayed black. The game restarts."}"#).unwrap();
     assert_eq!(with.notice.as_deref(), Some("The right eye stayed black. The game restarts."));
-    let without = Menu::parse(r#"{"games":[],"notice":""}"#).unwrap();
+    let without = Menu::parse(r#"{"games":[],"fps":90,"game_scale":1.0,"msaa":0,"controls":{},"notice":""}"#).unwrap();
     assert_eq!(without.notice, None);
-    assert_eq!(Menu::parse(r#"{"games":[]}"#).unwrap().notice, None);
+    assert_eq!(Menu::parse(BARE).unwrap().notice, None);
     assert!((height(Some(&with)) - height(Some(&without)) - (size::TEXT + size::GAP)).abs() < 1e-3);
     with.notice = None;
     assert!((height(Some(&with)) - height(Some(&without))).abs() < 1e-3);
@@ -98,20 +105,17 @@ fn the_action_of_a_button_shows_or_hides_the_console() {
 
 fn with_controls(controls: &Controls) -> Menu {
     let mut menu = menu(None);
-    menu.controls = Some(*controls);
+    menu.controls = *controls;
     menu
 }
 
 #[test]
-fn the_menu_carries_the_controls_and_an_older_app_sends_none() {
+fn the_menu_carries_the_controls() {
     let mut mapped = Controls::default();
     mapped.set(Hand::Right, Control::Secondary, ControlAction::Keyboard);
-    let text = format!(r#"{{"games":[],"controls":{}}}"#, mapped.to_json());
-    assert_eq!(Menu::parse(&text).unwrap().controls, Some(mapped));
-    assert_eq!(Menu::parse(r#"{"games":[]}"#).unwrap().controls, None);
-    // A value that is no mapping counts as none
-    assert_eq!(Menu::parse(r#"{"games":[],"controls":5}"#).unwrap().controls, None);
-    assert!(!MENU.contains("controls"));
+    let text = format!(r#"{{"games":[],"fps":90,"game_scale":1.0,"msaa":0,"controls":{}}}"#, mapped.to_json());
+    assert_eq!(Menu::parse(&text).unwrap().controls, mapped);
+    assert_eq!(Menu::parse(BARE).unwrap().controls, Controls::default());
 }
 
 #[test]
@@ -125,9 +129,6 @@ fn the_mac_sets_the_controls_and_the_headset_keeps_them_without_a_link() {
     assert_eq!(console.on_menu_at(with_controls(&mapped), now), Some(mapped));
     assert_eq!(console.on_menu_at(with_controls(&mapped), now), None);
     assert_eq!(console.view().controls, mapped);
-    // A menu from an older app leaves it alone
-    assert_eq!(console.on_menu_at(menu(None), now), None);
-    assert_eq!(console.controls(), mapped);
     // The link ends: the mapping stays, and the page cannot change it
     console.clear();
     assert_eq!(console.controls(), mapped);
@@ -151,7 +152,7 @@ fn a_change_of_the_user_shows_at_once_and_a_menu_that_was_on_its_way_does_not_un
     let back = console.step_control(Hand::Right, Control::Trigger, -1, start).unwrap();
     assert_eq!(back, standard);
     let again = console.step_control(Hand::Right, Control::Trigger, 1, start).unwrap();
-    // The Mac still sends the mapping from before the change
+    // The Mac sends the mapping that it had before it saw the change
     let later = start + Duration::from_millis(500);
     assert_eq!(console.on_menu_at(with_controls(&standard), later), None);
     assert_eq!(console.controls(), again);

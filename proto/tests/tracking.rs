@@ -1,5 +1,4 @@
-//! The tracking messages: quantization, packet sizes, what an older peer does with them, and a
-//! session over loopback.
+//! The tracking messages: quantization, packet sizes, and a session over loopback.
 
 mod common;
 
@@ -13,7 +12,6 @@ use cranvr_proto::{
     wire::{decode, encode, Error, Motion, Pose},
     MTU,
 };
-use serde::Deserialize;
 use std::{
     sync::{mpsc, Arc},
     thread,
@@ -230,95 +228,6 @@ fn every_datagram_fits_a_packet_with_room_to_spare() {
     assert!(sizes[1].1 < MTU - 100, "{sizes:?}");
 }
 
-/// The datagram enum of protocol version 5, as a peer of that version has it
-#[derive(Debug, Deserialize)]
-#[allow(dead_code, clippy::large_enum_variant)]
-enum OldClientDatagram {
-    Hello { session: u64 },
-    Tracking(Tracking),
-    Input(Input),
-    FrameTiming(FrameTiming),
-    Loss(LossReport),
-    Ping(Ping),
-    Pong(Pong),
-    Pointer(Pointer),
-}
-
-/// The client's control enum of protocol version 5
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-enum OldClientMsg {
-    Hello(ClientCaps),
-    RequestKeyFrame { stream: u8, frame: u32 },
-    Views(Views),
-    Bye,
-    Recenter(Recenter),
-    Floor(f32),
-    Desktop(DesktopWish),
-    Console(String),
-    PairNonce([u8; 32]),
-}
-
-/// The host's control enum of protocol version 5
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-enum OldHostMsg {
-    Welcome(Welcome),
-    Reject(RejectReason),
-    MediaReady,
-    DecoderConfig { stream: u8, codec: cranvr_proto::wire::Codec, config: Vec<u8> },
-    StreamUpdate(StreamParams),
-    Bye,
-    Desktop(Option<DesktopParams>),
-    Menu(String),
-    AwaitApproval { host_name: String, commit: [u8; 32] },
-    PairReveal([u8; 32]),
-}
-
-#[test]
-fn an_older_peer_skips_the_new_messages_and_still_reads_the_old_ones() {
-    let mut rng = Rng(9);
-    let root = root_motion(&mut rng);
-    let hands = Hands { sample_time: 1, display_time: 2, left: None, right: None };
-    let mut bytes = Vec::new();
-    encode(&ClientDatagram::Hands(hands), &mut bytes).unwrap();
-    assert!(decode::<OldClientDatagram>(&bytes).is_err(), "the old enum has no such variant");
-    let mut offer = Vec::new();
-    encode(&ClientMsg::TrackingOffer(Features::ALL), &mut offer).unwrap();
-    assert!(decode::<OldClientMsg>(&offer).is_err());
-    let mut wish = Vec::new();
-    encode(&HostMsg::TrackingWish(Features::HANDS), &mut wish).unwrap();
-    assert!(decode::<OldHostMsg>(&wish).is_err());
-    // The focus of the app is a message that a host of version 6 from before it skips
-    let mut focus = Vec::new();
-    encode(&ClientMsg::Focus(Focus::Visible), &mut focus).unwrap();
-    assert!(decode::<OldClientMsg>(&focus).is_err());
-    assert!(matches!(decode::<ClientMsg>(&focus).unwrap(), ClientMsg::Focus(Focus::Visible)));
-
-    // The old variants keep their bytes: the new variants sit after them, so no index moved
-    let tracking = Tracking { sample_time: 3, display_time: 4, head: Motion { pose: root.pose, ..Default::default() }, ..Default::default() };
-    let mut now = Vec::new();
-    encode(&ClientDatagram::Tracking(tracking), &mut now).unwrap();
-    assert!(matches!(decode::<OldClientDatagram>(&now).unwrap(), OldClientDatagram::Tracking(t) if t == tracking));
-    let mut pointer = Vec::new();
-    encode(&ClientDatagram::Pointer(Pointer { seq: 1, sent: 2, hit: Some([0.5, 0.5]), trigger: 0.0, scroll: 0.0 }), &mut pointer).unwrap();
-    assert!(matches!(decode::<OldClientDatagram>(&pointer).unwrap(), OldClientDatagram::Pointer(_)));
-    let mut bye = Vec::new();
-    encode(&ClientMsg::Bye, &mut bye).unwrap();
-    assert!(matches!(decode::<OldClientMsg>(&bye).unwrap(), OldClientMsg::Bye));
-    let mut pair = Vec::new();
-    encode(&ClientMsg::PairNonce([4; 32]), &mut pair).unwrap();
-    assert!(matches!(decode::<OldClientMsg>(&pair).unwrap(), OldClientMsg::PairNonce(_)));
-    let mut reveal = Vec::new();
-    encode(&HostMsg::PairReveal([5; 32]), &mut reveal).unwrap();
-    assert!(matches!(decode::<OldHostMsg>(&reveal).unwrap(), OldHostMsg::PairReveal(_)));
-    // The variants' indices are what the old peer reads: the first new one comes right after the last old one
-    assert_eq!(bytes[0], 8, "Hands is the ninth datagram variant");
-    assert_eq!(offer[0], 9, "TrackingOffer is the tenth client message");
-    assert_eq!(wish[0], 10, "TrackingWish is the eleventh host message");
-    assert_eq!(focus[0], 10, "Focus is the eleventh client message");
-}
-
 #[test]
 fn feature_sets_keep_their_names_and_drop_unknown_bits() {
     assert_eq!(Features::ALL.names(), ["hands", "body", "full_body", "face", "eyes"]);
@@ -332,7 +241,7 @@ fn feature_sets_keep_their_names_and_drop_unknown_bits() {
 }
 
 #[test]
-fn the_face_sources_belong_to_the_offer_and_an_older_peer_keeps_the_face() {
+fn the_face_sources_belong_to_the_offer_and_a_wish_never_keeps_them() {
     let quest_3 = Features::HANDS.union(Features::FACE).union(Features::FACE_AUDIO);
     assert_eq!(quest_3.names(), ["hands", "face", "face_audio"]);
     assert!(quest_3.offers_face_audio() && !quest_3.offers_face_visual());
@@ -344,7 +253,7 @@ fn the_face_sources_belong_to_the_offer_and_an_older_peer_keeps_the_face() {
     assert_eq!(Features::FACE_AUDIO.union(Features::HANDS).offered(), Features::HANDS);
     assert_eq!(quest_3.offered(), quest_3);
     assert_eq!(Features(0xff).offered(), Features::ALL.union(Features::FACE_SOURCES));
-    assert_eq!(quest_3.known(), Features::HANDS.union(Features::FACE), "an older peer drops the sources and keeps the face");
+    assert_eq!(quest_3.known(), Features::HANDS.union(Features::FACE), "a wish drops the sources and keeps the face");
     assert!(Features::FACE_SOURCES.known().is_empty());
     // The sources travel as bits of the same byte
     let mut bytes = Vec::new();
@@ -354,7 +263,7 @@ fn the_face_sources_belong_to_the_offer_and_an_older_peer_keeps_the_face() {
 }
 
 #[test]
-fn tracking_travels_through_a_session_and_an_older_client_is_not_asked() {
+fn tracking_travels_through_a_session() {
     let listener = HostListener::bind("127.0.0.1:0", host_identity()).unwrap();
     let addr = listener.local_addr().unwrap();
     let host = thread::spawn(move || {
@@ -378,7 +287,6 @@ fn tracking_travels_through_a_session_and_an_older_client_is_not_asked() {
     let client = ClientLink::connect(addr, &caps(), &identity(), None, WAIT).unwrap();
     let host = Arc::new(host.join().unwrap());
     let client = Arc::new(client);
-    assert!(host.version >= TRACKING_VERSION && client.welcome.version >= TRACKING_VERSION);
 
     let (to_host, host_inbox) = mpsc::channel();
     let (to_client, client_inbox) = mpsc::channel();

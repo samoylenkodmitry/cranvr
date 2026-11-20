@@ -18,9 +18,9 @@
 //!   "incompatible_client": a headset whose cranvr app has another protocol version than the
 //!   host's, with the side to update in the message), and message
 //! - `native`: at the start and after each change of the pairings: port,
-//!   paired (the names of the paired headsets), pairing_s (seconds that a `--pair` window stays
-//!   open, or null) and pending (the headsets that wait for the user: key in hex, name, ip and
-//!   code). The user's answer comes back on the host's input as `allow KEY` or `deny KEY`.
+//!   paired (the names of the paired headsets) and pending (the headsets that wait for the user:
+//!   key in hex, name, ip and code). The user's answer comes back on the host's input as
+//!   `allow KEY` or `deny KEY`.
 //! - `black_eye`: eye "right" and program (the game's program path, or null): the game's right
 //!   eye stayed black for several seconds while its left eye showed a picture (see eye_check.rs).
 //!   The host sends it once for each game run.

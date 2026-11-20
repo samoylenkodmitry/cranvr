@@ -13,8 +13,7 @@
 //! - The cursor's position goes out as a datagram every 2 ms while the Mac's mouse moves.
 //! - `ClientDatagram::Mouse` carries where the controller that owns the mouse points on the panel,
 //!   the mouse buttons that it holds (left, right, middle) and its thumbstick's lean in two axes.
-//!   `ClientDatagram::Pointer` is the older form with a trigger and one axis, from a client of
-//!   protocol version 6. The host moves the Mac's mouse, clicks and scrolls (`desktop::Pointer`).
+//!   The host moves the Mac's mouse, clicks and scrolls (`desktop::Pointer`).
 //! - `LayerState` tells the frame loop that the client shows the desktop, so the eye stream leaves
 //!   its own copy of the screen out. It tells the loop that a game hides the desktop.
 
@@ -27,7 +26,7 @@ use log::{info, warn};
 use cranvr_proto::{
     clock::now_ns,
     media::FrameMeta,
-    message::{Cursor, DesktopParams, DesktopWish, HostDatagram, HostMsg, Mouse, Pointer, DESKTOP_STREAM},
+    message::{Cursor, DesktopParams, DesktopWish, HostDatagram, HostMsg, Mouse, DESKTOP_STREAM},
     wire::{Codec, Pose, Rect},
 };
 use cranvr_vt::{EncodedFrame, Encoder, EncoderConfig, Flipper};
@@ -96,7 +95,7 @@ struct Inner {
     key: AtomicBool,
     /// The display of the running capture, for the pointer. 0 while none runs.
     display: AtomicU32,
-    pointer: Sender<PointerIn>,
+    pointer: Sender<Mouse>,
     stop: AtomicBool,
     counters: Counters,
 }
@@ -156,50 +155,16 @@ impl Desktop {
         self.inner.key.store(true, Ordering::Relaxed);
     }
 
-    pub(super) fn on_pointer(&self, pointer: Pointer) {
-        self.inner.counters.pointer_datagrams.fetch_add(1, Ordering::Relaxed);
-        self.inner.pointer.send(PointerIn::Trigger(pointer)).ok();
-    }
-
     pub(super) fn on_mouse(&self, mouse: Mouse) {
         self.inner.counters.pointer_datagrams.fetch_add(1, Ordering::Relaxed);
-        self.inner.pointer.send(PointerIn::Mouse(mouse)).ok();
+        self.inner.pointer.send(mouse).ok();
     }
 }
 
-/// What the client says about the pointer, in the form of its protocol version.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum PointerIn {
-    /// Version 6: one controller with a trigger and one axis
-    Trigger(Pointer),
-    /// Version 7: the mouse buttons and two axes
-    Mouse(Mouse),
-}
-
-impl PointerIn {
-    fn seq(&self) -> u32 {
-        match self {
-            PointerIn::Trigger(p) => p.seq,
-            PointerIn::Mouse(m) => m.seq,
-        }
-    }
-
-    /// Whether the host has more to do for it than to wait: the controller points at the panel or
-    /// holds a button
-    fn busy(&self) -> bool {
-        match self {
-            PointerIn::Trigger(p) => p.hit.is_some() || p.trigger > 0.4,
-            PointerIn::Mouse(m) => m.hit.is_some() || m.buttons != 0,
-        }
-    }
-
-    /// Moves the Mac's mouse as the datagram says. `scroll_scale` is as in `desktop::Pointer`.
-    fn apply(&self, pointer: &mut desktop::Pointer, scroll_scale: f32) {
-        match self {
-            PointerIn::Trigger(p) => pointer.update_scaled(p.hit, p.trigger, p.scroll, scroll_scale),
-            PointerIn::Mouse(m) => pointer.update_mouse(m.hit, m.buttons, m.scroll, scroll_scale),
-        }
-    }
+/// Whether the host has more to do for a mouse datagram than to wait: the controller points at the
+/// panel or holds a button.
+fn busy(mouse: &Mouse) -> bool {
+    mouse.hit.is_some() || mouse.buttons != 0
 }
 
 /// A running capture, its encoder and what the stream has sent so far.
@@ -468,7 +433,7 @@ impl LogState {
 
 /// Moves the Mac's mouse to where the client says a controller points on the panel, clicks and
 /// scrolls. A client that falls silent with its trigger down gets its button lifted.
-fn pointer_loop(inner: &Inner, receiver: &Receiver<PointerIn>) {
+fn pointer_loop(inner: &Inner, receiver: &Receiver<Mouse>) {
     let mut pointer: Option<desktop::Pointer> = None;
     let mut last_seq: Option<u32> = None;
     let mut last_update = Instant::now();
@@ -499,15 +464,15 @@ fn pointer_loop(inner: &Inner, receiver: &Receiver<PointerIn>) {
             Some(p) => {
                 // UDP may swap datagrams: an older one would move the mouse back. A far older
                 // number means a new client session that counts from 0 again.
-                if last_seq.is_some_and(|last| last.wrapping_sub(p.seq()) < 1000) {
+                if last_seq.is_some_and(|last| last.wrapping_sub(p.seq) < 1000) {
                     continue;
                 }
-                last_seq = Some(p.seq());
+                last_seq = Some(p.seq);
                 // The scroll of one update is 20 pixels at 72 updates a second: scale it to the
                 // time since the last update, so the speed does not depend on the client's rate
                 let dt = now.duration_since(last_update).as_secs_f32().min(0.05);
-                p.apply(pointer, dt * 72.0);
-                active = p.busy();
+                pointer.update_mouse(p.hit, p.buttons, p.scroll, dt * 72.0);
+                active = busy(&p);
                 last_update = now;
             }
             // Every button that is down goes up

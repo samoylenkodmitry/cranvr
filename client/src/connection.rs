@@ -226,15 +226,13 @@ fn failure_text(error: &Error, host: &str) -> String {
         Error::Rejected(RejectReason::Denied) => "The Mac denied this headset. Press the Mac to ask again.".into(),
         Error::Rejected(RejectReason::NoAnswer) => "Nobody answered on the Mac. Press the Mac to ask again.".into(),
         Error::Rejected(RejectReason::Busy) => "The Mac is busy with another headset.".into(),
-        Error::Rejected(RejectReason::NotPaired) => format!("{host} does not know this headset."),
         Error::HostKeyChanged => format!(
             "{host} does not have the key that this headset paired with. Someone may pose as the Mac. If you reinstalled cranvr on the Mac, press Forget host key and connect again."
         ),
         Error::Timeout => format!("{host} did not answer. Is cranvr open on the Mac?"),
         Error::Closed => format!("{host} closed the connection"),
         Error::Io(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-            // A Mac with an older cranvr that paired no headset listens on its own address only
-            format!("{host} refused the connection. Is cranvr open on the Mac? An older cranvr on the Mac may cause this: update cranvr on the Mac.")
+            format!("{host} refused the connection. Is cranvr open on the Mac?")
         }
         other => other.to_string(),
     }
@@ -1209,11 +1207,11 @@ mod tests {
     #[test]
     fn a_failure_says_which_side_to_update() {
         let host = SocketAddr::from(([192, 168, 1, 20], 9950)).to_string();
-        // An older Mac: its range ends below the client's
-        let old_mac = failure_text(&Error::Version { ours: (4, 5), theirs: (4, 4) }, &host);
+        // A Mac with a lower version
+        let old_mac = failure_text(&Error::Version { ours: 8, theirs: 7 }, &host);
         assert!(old_mac.ends_with("Update cranvr on the Mac."), "{old_mac}");
         // A newer Mac
-        let new_mac = failure_text(&Error::Version { ours: (4, 5), theirs: (6, 6) }, &host);
+        let new_mac = failure_text(&Error::Version { ours: 8, theirs: 9 }, &host);
         assert!(new_mac.ends_with("Update the cranvr app on the headset."), "{new_mac}");
     }
 
@@ -1283,7 +1281,7 @@ mod tests {
             })
             .expect("a host on port 9962 answers the search from a network address of this Mac");
         assert!(!found.answer.name.is_empty());
-        assert_eq!(found.answer.versions, cranvr_proto::message::VersionRange::OURS);
+        assert_eq!(found.answer.version, cranvr_proto::PROTOCOL_VERSION);
 
         // The press
         hub().connect(found.socket_addr().to_string(), Some(found.answer.fingerprint), MediaChoice::Auto);
