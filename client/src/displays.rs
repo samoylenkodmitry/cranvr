@@ -242,14 +242,7 @@ pub struct Displays {
 /// The displays of the process. The activity may rebuild the composition. The link outlives it.
 pub fn displays() -> &'static Displays {
     static DISPLAYS: OnceLock<Displays> = OnceLock::new();
-    DISPLAYS.get_or_init(|| Displays {
-        slots: std::array::from_fn(|_| Slot::new()),
-        state: Mutex::new(State::default()),
-        uplink: Mutex::new(Uplink::default()),
-        wake: Condvar::new(),
-        game_message: AtomicU8::new(GAME_UNKNOWN),
-        version: std::sync::atomic::AtomicU16::new(0),
-    })
+    DISPLAYS.get_or_init(Displays::new)
 }
 
 /// What the menu shows of one display.
@@ -271,6 +264,17 @@ pub struct DisplaysView {
 }
 
 impl Displays {
+    fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| Slot::new()),
+            state: Mutex::new(State::default()),
+            uplink: Mutex::new(Uplink::default()),
+            wake: Condvar::new(),
+            game_message: AtomicU8::new(GAME_UNKNOWN),
+            version: std::sync::atomic::AtomicU16::new(0),
+        }
+    }
+
     /// A session begins. A headset shows displays and asks the host for them. Returns the receiver of
     /// each display's pictures, for its decode thread.
     pub fn session_start(&self, in_headset: bool, version: u16) -> Vec<mpsc::Receiver<Received>> {
@@ -977,5 +981,178 @@ impl Displays {
             }
         }
         (sum.0, sum.1, self.state.lock().unwrap().wanted.iter().flatten().count())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cranvr_proto::wire::Codec;
+
+    fn params(stream: u8, visible: bool) -> DesktopParams {
+        DesktopParams {
+            stream,
+            codec: Codec::Hevc,
+            size: [3840, 2160],
+            points: [1920.0, 1080.0],
+            max_fps: 60.0,
+            bitrate_bps: 40_000_000,
+            full_range: true,
+            flipped: false,
+            visible,
+            cursor_in_video: true,
+        }
+    }
+
+    fn info(stream: u8, removable: bool) -> DisplayInfo {
+        DisplayInfo { stream, name: format!("Display {}", stream - DESKTOP_STREAM + 1), points: [1920, 1080], removable }
+    }
+
+    fn wish(width: u32) -> DesktopWish {
+        DesktopWish { enabled: true, max_width: width, max_fps: 30 }
+    }
+
+    /// A set of displays that no other test shares, in a session that shows displays
+    fn fresh(version: u16) -> Displays {
+        let owner = Displays::new();
+        let _units = owner.session_start(true, version);
+        owner
+    }
+
+    #[test]
+    fn a_host_of_version_8_says_that_a_game_runs_and_a_host_of_an_older_version_hides_its_display() {
+        let owner = fresh(8);
+        assert_eq!(owner.game_runs(), None);
+        owner.on_message(&HostMsg::GameRuns(true));
+        assert_eq!(owner.game_runs(), Some(true));
+        owner.on_message(&HostMsg::GameRuns(false));
+        assert_eq!(owner.game_runs(), Some(false));
+
+        // A host of version 7 offers the first display and hides it while a game runs
+        let old = fresh(7);
+        assert_eq!(old.game_runs(), None);
+        old.on_message(&HostMsg::Desktop(Some(params(DESKTOP_STREAM, true))));
+        assert_eq!(old.game_runs(), Some(false));
+        old.on_message(&HostMsg::Desktop(Some(params(DESKTOP_STREAM, false))));
+        assert_eq!(old.game_runs(), Some(true));
+        // A session that shows no display says nothing of a game
+        old.session_end();
+        assert_eq!(old.game_runs(), None);
+    }
+
+    #[test]
+    fn the_menu_lists_the_hosts_displays_and_a_host_of_an_older_version_gets_one_entry() {
+        let owner = fresh(8);
+        assert!(owner.menu_view().displays.is_empty());
+        owner.on_message(&HostMsg::Displays(DisplayList { displays: vec![info(1, false), info(2, true)], can_add: true, notice: Some("one".into()) }));
+        let view = owner.menu_view();
+        assert_eq!(view.displays.iter().map(|d| d.info.stream).collect::<Vec<_>>(), vec![1, 2]);
+        assert!(view.can_add);
+        assert_eq!(view.notice.as_deref(), Some("one"));
+        assert_eq!(owner.listed_streams(), Some(vec![1, 2]));
+
+        let old = fresh(7);
+        assert!(old.menu_view().displays.is_empty());
+        old.on_message(&HostMsg::Desktop(Some(params(DESKTOP_STREAM, true))));
+        let view = old.menu_view();
+        assert_eq!(view.displays.len(), 1);
+        assert_eq!((view.displays[0].info.name.as_str(), view.displays[0].info.removable, view.can_add), ("Mac display", false, false));
+        assert_eq!(old.listed_streams(), None);
+    }
+
+    #[test]
+    fn only_the_displays_that_exist_are_asked_for() {
+        let wishes = [Some(wish(3840)), Some(wish(2560)), Some(wish(2560)), None];
+        // Before the host's list only the first display exists, as for a host of an older version
+        let owner = fresh(8);
+        assert_eq!(owner.existing(wishes), [Some(wish(3840)), None, None, None]);
+        owner.on_message(&HostMsg::Displays(DisplayList { displays: vec![info(1, false), info(3, true)], can_add: false, notice: None }));
+        assert_eq!(owner.existing(wishes), [Some(wish(3840)), None, Some(wish(2560)), None]);
+    }
+
+    #[test]
+    fn a_display_that_leaves_the_list_loses_its_stream() {
+        let owner = fresh(8);
+        owner.on_message(&HostMsg::DisplayStream { stream: 2, params: Some(params(2, true)) });
+        assert!(owner.slots[1].quick.params.lock().unwrap().is_some());
+        owner.on_message(&HostMsg::Displays(DisplayList { displays: vec![info(1, false)], can_add: true, notice: None }));
+        assert!(owner.slots[1].quick.params.lock().unwrap().is_none());
+        assert!(!owner.view(2).visible);
+    }
+
+    #[test]
+    fn a_change_of_the_wish_and_a_request_to_add_wake_the_uplink() {
+        let owner = fresh(8);
+        owner.uplink.lock().unwrap().dirty = false;
+        owner.set_wanted([None; SLOTS]);
+        assert!(!owner.uplink.lock().unwrap().dirty, "the same wish is nothing new");
+        owner.set_wanted([Some(wish(2560)), None, None, None]);
+        assert!(owner.uplink.lock().unwrap().dirty);
+        owner.uplink.lock().unwrap().dirty = false;
+        owner.request_add();
+        owner.request_remove(3);
+        let state = owner.state.lock().unwrap();
+        assert_eq!((state.adds, state.removes.clone()), (1, vec![3]));
+        assert!(owner.uplink.lock().unwrap().dirty);
+    }
+
+    #[test]
+    fn a_pointer_goes_to_the_display_that_the_ray_is_on() {
+        let owner = fresh(8);
+        owner.uplink.lock().unwrap().pointer_dirty = [false; SLOTS];
+        owner.update_pointer(3, |pointer| pointer.hit = Some([0.5, 0.5]));
+        let uplink = owner.uplink.lock().unwrap();
+        assert_eq!(uplink.pointer_dirty, [false, false, true, false]);
+        assert_eq!(uplink.pointer[2].hit, Some([0.5, 0.5]));
+        drop(uplink);
+        // A stream that is no display's changes nothing
+        owner.update_pointer(0, |pointer| pointer.hit = Some([0.1, 0.1]));
+        assert_eq!(owner.uplink.lock().unwrap().pointer_dirty, [false, false, true, false]);
+    }
+
+    #[test]
+    fn the_cursor_of_a_display_is_the_newest_datagram_on_the_display() {
+        let owner = fresh(8);
+        owner.on_cursor(2, Cursor { seq: 5, u: 0.2, v: 0.3, on: true });
+        owner.on_cursor(2, Cursor { seq: 4, u: 0.9, v: 0.9, on: true });
+        assert_eq!(owner.cursor(2), Some([0.2, 0.3]));
+        owner.on_cursor(2, Cursor { seq: 6, u: 0.0, v: 0.0, on: false });
+        assert_eq!(owner.cursor(2), None);
+        assert_eq!(owner.cursor(1), None);
+    }
+
+    #[test]
+    fn a_ray_on_the_surface_is_a_point_on_the_picture_a_press_and_a_release() {
+        let at = [0.25, 0.75];
+        let idle = PointerNow::default();
+        let hover = idle.after(PointerEventKind::Enter, at);
+        assert_eq!(hover, PointerNow { hit: Some(at), trigger: 0.0, scroll: 0.0 });
+        let down = hover.after(PointerEventKind::Move, [0.3, 0.7]).after(PointerEventKind::Down, [0.3, 0.7]);
+        assert_eq!(down.trigger, 1.0);
+        let leaning = PointerNow { scroll: 0.5, ..down };
+        assert_eq!(leaning.after(PointerEventKind::Move, [0.31, 0.7]).scroll, 0.5);
+        let up = down.after(PointerEventKind::Up, [0.3, 0.7]);
+        assert_eq!((up.trigger, up.hit), (0.0, Some([0.3, 0.7])));
+        assert_eq!(leaning.after(PointerEventKind::Exit, [0.3, 0.7]), PointerNow::default());
+        assert!(!PointerNow::default().busy() && hover.busy() && down.busy());
+        // A move of a fifth of a pixel is not worth sending
+        let a = PointerNow { hit: Some([0.5, 0.5]), trigger: 0.0, scroll: 0.0 };
+        assert!(!a.differs(&PointerNow { hit: Some([0.500_02, 0.5]), ..a }));
+        assert!(a.differs(&PointerNow { hit: None, ..a }) && a.differs(&PointerNow { trigger: 1.0, ..a }));
+    }
+
+    #[test]
+    fn the_wish_of_the_layout_follows_the_displays_that_show() {
+        let mut layout = Layout::default();
+        let wishes = wishes_of(&layout);
+        assert!(wishes[0].is_some() && wishes[1..].iter().all(Option::is_none));
+        layout.set_shown(crate::panel_layout::PanelId::Display(2), true);
+        layout.toggle_pinned(2);
+        let wishes = wishes_of(&layout);
+        // Two displays show: the first asks for less, and the one on the hand asks for the hand's size
+        assert_eq!(wishes[1].map(|w| (w.max_width, w.max_fps)), Some((1920, 30)));
+        assert_eq!(wishes[0].map(|w| w.max_fps), Some(30));
+        layout.set_in_game(true);
+        assert!(wishes_of(&layout).iter().all(Option::is_none), "a game starts with no display shown");
     }
 }
