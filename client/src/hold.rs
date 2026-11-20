@@ -16,7 +16,10 @@
 //! went down last, and the other hand only while the first points at no panel and the second does.
 //! The app follows the same rule to learn which hand the hover belongs to. A pull on a panel keeps
 //! the hand held until its trigger lets go, also when the ray leaves the panel during the press, as
-//! a drag does. The host keeps a press that is still down away from the game after the hold ends.
+//! a drag does. A hand that begins to pull while some panel has the pointer is held too, whichever hand
+//! the app takes for the pointer's: the estimate can be wrong, and Cranpose follows a hand only once its
+//! trigger is all the way down. The host keeps a press that is still down away from the game after the
+//! hold ends.
 //!
 //! What Cranpose would have to give for an exact answer: `XrFrame` with the panel or handle that each
 //! hand's ray meets (`left_hit` and `right_hit`, or the pointer event with the hand that made it).
@@ -32,6 +35,11 @@ pub const RELEASE_DELAY: Duration = Duration::from_millis(150);
 /// A pull counts as a pull on a panel when the ray was on a panel this long before it. The pull of a
 /// trigger turns the controller, and Cranpose takes the point from just before the pull.
 const PULL_LOOKBACK: Duration = Duration::from_millis(250);
+/// A trigger that rises past this while a panel has the pointer is a pull on that panel, whichever hand
+/// drives the pointer: Cranpose names no hand, and its pointer follows a hand only once its trigger is
+/// all the way down. The hand is held from the first part of its pull until the trigger is back at rest.
+const PULL_START: f32 = 0.15;
+const PULL_REST: f32 = 0.1;
 /// While the hand menu is open, the hand that does not carry it stays held this long after the ray
 /// left the menu: the user works the menu with it, and the pause between two presses is not a game.
 pub const MENU_GRACE: Duration = Duration::from_millis(1500);
@@ -60,13 +68,17 @@ pub struct PanelHold {
     down: [bool; 2],
     /// The hand pulled its trigger over a panel and has not let go
     pressing: [bool; 2],
+    /// The hand's trigger rose while a panel had the pointer and is not back at rest
+    pulling: [bool; 2],
+    /// Each hand's trigger in the frame before
+    last: [f32; 2],
     /// When each hand's ray was last on a panel
     hovered_at: [Option<Duration>; 2],
 }
 
 impl Default for PanelHold {
     fn default() -> Self {
-        Self { driver: 1, down: [false; 2], pressing: [false; 2], hovered_at: [None; 2] }
+        Self { driver: 1, down: [false; 2], pressing: [false; 2], pulling: [false; 2], last: [0.0; 2], hovered_at: [None; 2] }
     }
 }
 
@@ -99,10 +111,22 @@ impl PanelHold {
                 self.pressing[hand] = false;
             }
         }
+        // A hand that begins to pull while some panel has the pointer is held, whichever hand the app
+        // takes for the pointer's: the pull may be the one that Cranpose turns into a press a moment later
+        let hover_near = self.hovered_at.iter().flatten().any(|at| frame.time.saturating_sub(*at) <= PULL_LOOKBACK);
+        for hand in 0..2 {
+            // Only a trigger that rises counts: one that was down before the ray reached a panel is not a pull on it
+            if self.last[hand] < PULL_START && frame.trigger[hand] >= PULL_START && (frame.hover || hover_near) {
+                self.pulling[hand] = true;
+            } else if frame.trigger[hand] < PULL_REST {
+                self.pulling[hand] = false;
+            }
+            self.last[hand] = frame.trigger[hand];
+        }
         let mut held = [false; 2];
         for hand in 0..2 {
             let delay = if frame.menu_open && hand == 1 { MENU_GRACE } else { RELEASE_DELAY };
-            held[hand] = self.pressing[hand] || hover_within(hand, delay);
+            held[hand] = self.pressing[hand] || self.pulling[hand] || hover_within(hand, delay);
         }
         held
     }
@@ -136,9 +160,12 @@ mod tests {
         let mut hold = PanelHold::default();
         // The right hand drives by default
         assert_eq!(hold.update(&frame(0, true, [0.0, 0.0])), [false, true]);
-        // The left hand pulls its trigger in the game: it takes the pointer, and no panel is under its ray
-        assert_eq!(hold.update(&frame(20, false, [1.0, 0.0])), [false, true], "the right hand's hover lingers for the release delay");
+        // The left hand pulls its trigger in the game while no ray is on a panel any more: the game's pull
         assert_eq!(hold.update(&frame(300, false, [1.0, 0.0])), [false, false]);
+        // A pull that begins while a panel has the pointer is held, whichever hand it is
+        let mut hold = PanelHold::default();
+        assert_eq!(hold.update(&frame(0, true, [0.0, 0.0])), [false, true]);
+        assert_eq!(hold.update(&frame(20, false, [1.0, 0.0])), [true, true], "the right hand's hover lingers, and the left pull began under it");
     }
 
     #[test]
@@ -157,9 +184,10 @@ mod tests {
         // The ray drags off the panel and stays away for a second with the trigger down
         assert_eq!(hold.update(&frame(300, false, [0.0, 0.9])), [false, true]);
         assert_eq!(hold.update(&frame(1300, false, [0.0, 0.9])), [false, true]);
-        // The trigger lets go: the hold ends with the press. What the trigger still shows while it
-        // falls stays away from the game by the host's latch (`hand_mask.rs`).
-        assert_eq!(hold.update(&frame(1310, false, [0.0, 0.2])), [false, false]);
+        // The trigger falls: the press ends, and the pull holds the hand until the trigger is at rest.
+        // What the trigger still shows then stays away from the game by the host's latch (`hand_mask.rs`).
+        assert_eq!(hold.update(&frame(1310, false, [0.0, 0.2])), [false, true]);
+        assert_eq!(hold.update(&frame(1330, false, [0.0, 0.05])), [false, false]);
     }
 
     #[test]
@@ -183,9 +211,30 @@ mod tests {
     }
 
     #[test]
-    fn both_triggers_in_one_frame_go_to_the_right_hand() {
+    fn a_hand_that_starts_to_pull_while_a_panel_has_the_pointer_is_held_whichever_hand_drives() {
         let mut hold = PanelHold::default();
-        assert_eq!(hold.update(&frame(0, true, [1.0, 1.0])), [false, true]);
+        // The right hand's ray rests on a panel. The left hand begins to pull: it may be the one that
+        // Cranpose takes for the pointer a moment later, so it is held from the start of its pull.
+        assert_eq!(hold.update(&frame(0, true, [0.0, 0.0])), [false, true]);
+        assert_eq!(hold.update(&frame(20, true, [0.3, 0.0])), [true, true]);
+        // The pull goes on after the ray left the panel: the left hand stays held until its trigger is at rest
+        assert_eq!(hold.update(&frame(600, false, [0.5, 0.0])), [true, false]);
+        assert_eq!(hold.update(&frame(700, false, [0.05, 0.0])), [false, false]);
+        // A pull with no panel under any ray is the game's
+        let mut hold = PanelHold::default();
+        assert_eq!(hold.update(&frame(0, false, [0.0, 0.0])), [false, false]);
+        assert_eq!(hold.update(&frame(500, false, [0.9, 0.0])), [false, false]);
+    }
+
+    #[test]
+    fn both_triggers_pulled_over_a_panel_hold_both_hands() {
+        let mut hold = PanelHold::default();
+        // The pointer goes to the right hand, and the left pull may be the press as well: both are held
+        assert_eq!(hold.update(&frame(0, true, [0.0, 0.0])), [false, true]);
+        assert_eq!(hold.update(&frame(10, true, [1.0, 1.0])), [true, true]);
+        // Both pulls end: after the delay nothing is held
+        assert_eq!(hold.update(&frame(20, false, [0.0, 0.0])), [false, true]);
+        assert_eq!(hold.update(&frame(400, false, [0.0, 0.0])), [false, false]);
     }
 
     #[test]
