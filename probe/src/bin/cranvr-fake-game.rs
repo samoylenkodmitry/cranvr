@@ -4,16 +4,15 @@
 //! `cranvr-probe --game` can tell its frames from the host's test scene.
 //!
 //! It also reads the controller messages that the host sends and writes what arrived when it ends.
-//! Like the runtime with cranvr's patch 0004, it tells the host in `runtime-features.txt` that it
-//! takes aim poses, so each hand arrives with a grip pose and an aim pose. A pull of the left grip
+//! Each hand arrives with a grip pose and an aim pose. A pull of the left grip
 //! makes it answer with a haptic pulse on the left hand, as a game does. `--expect-input` makes the
 //! exit code depend on the input: the probe's scripted controllers (`cranvr-probe`) must have
 //! arrived on both hands with their own grip and aim poses, as `hands.rs` scripts them, and with
 //! the Touch buttons.
 //!
 //! With `--use-tracking hands,body,full_body,face,eyes` it plays a game that uses these features, as
-//! the runtime of patch 0005 does: it writes the word `tracking` to `runtime-features.txt`, tells the
-//! host a second after the start which features it uses (`TRACKING_REQUEST`). With `--release-tracking`
+//! the runtime of patch 0005 does: it tells the host a second after the start which features it uses
+//! (`TRACKING_REQUEST`). With `--release-tracking`
 //! it takes them away again six seconds before the end, while the probe still runs. The host then sends their data. With `cranvr-probe --tracking` the data
 //! is the script of `tracked.rs`, and `--expect-tracking` makes the exit code depend on it.
 //! `--expect-hand-controllers` plays a game without hand code: with `cranvr-probe --tracking
@@ -22,9 +21,13 @@
 //! `--expect-held` checks the host's mask: with the probe's `--hold-script`, the right hand's presses
 //! that belong to a panel must never reach the game, and the ones that belong to the game must.
 //!
+//! `--stall AT:FOR` plays a game that loads a level or compiles shaders: it sends no frame for FOR
+//! seconds from AT seconds after its start, and logs the stall's wall-clock times, so that a test can
+//! look at what the headset showed in the meantime (the host must keep the game's last picture).
+//!
 //! Usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input] [--expect-held]
 //!        [--use-tracking FEATURES] [--release-tracking] [--expect-tracking] [--expect-hand-controllers]
-//!        [--expect-no-controllers]
+//!        [--expect-no-controllers] [--stall AT:FOR]
 
 use cranvr_common::inputs::{LEFT_SQUEEZE_VALUE_ID, LEFT_TRIGGER_VALUE_ID, RIGHT_A_CLICK_ID, RIGHT_B_CLICK_ID, RIGHT_SQUEEZE_VALUE_ID, RIGHT_THUMBSTICK_X_ID, RIGHT_TRIGGER_VALUE_ID};
 use cranvr_proto::wire::Motion;
@@ -513,6 +516,7 @@ fn main() {
     let (mut use_tracking, mut expect_tracking, mut expect_hand_controllers, mut expect_no_controllers) = (String::new(), false, false, false);
     let mut expect_hand_held = false;
     let mut release_tracking = false;
+    let mut stall: Option<(f64, f64)> = None;
     let mut face_source = tracked::FaceSource::default();
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -528,9 +532,14 @@ fn main() {
             "--expect-hand-held" => expect_hand_held = true,
             "--expect-no-controllers" => expect_no_controllers = true,
             "--release-tracking" => release_tracking = true,
+            "--stall" => {
+                let value = args.next().expect("--stall AT:FOR");
+                stall = value.split_once(':').and_then(|(at, length)| Some((at.parse().ok()?, length.parse().ok()?)));
+                assert!(stall.is_some(), "--stall AT:FOR takes two numbers of seconds");
+            }
             "--face-source" => face_source = args.next().as_deref().and_then(tracked::FaceSource::parse).expect("--face-source visual|audio|unknown"),
             _ => {
-                eprintln!("usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input] [--expect-held] [--use-tracking FEATURES] [--expect-tracking] [--face-source visual|audio|unknown] [--expect-hand-controllers] [--expect-hand-held] [--expect-no-controllers] [--release-tracking]");
+                eprintln!("usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input] [--expect-held] [--use-tracking FEATURES] [--expect-tracking] [--face-source visual|audio|unknown] [--expect-hand-controllers] [--expect-hand-held] [--expect-no-controllers] [--release-tracking] [--stall AT:FOR]");
                 std::process::exit(2);
             }
         }
@@ -542,10 +551,6 @@ fn main() {
     let token = fields[1];
     let (w, h): (u32, u32) = (fields[2].parse().unwrap(), fields[3].parse().unwrap());
 
-    // The runtime of cranvr's patch 0004 writes this file before it connects. Without it the host
-    // sends no aim poses, because a runtime without the patch drops the connection at the message.
-    let features = std::path::Path::new(&control_path).with_file_name("runtime-features.txt");
-    fs::write(&features, "aim tracking\n").expect("write runtime-features.txt");
     // The host writes the headset's features here for the runtime (see runtime_link.rs)
     let tracking_file = std::path::Path::new(&control_path).with_file_name("tracking-features.txt");
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the host");
@@ -689,6 +694,8 @@ fn main() {
     };
     // The game creates its trackers a second after the start. It may destroy them six seconds before the end.
     let (mut requested, mut released) = (false, false);
+    let unix_ms = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    let mut stall_begun = false;
     while start.elapsed().as_secs_f64() < seconds {
         if !use_tracking.is_empty() {
             let at = start.elapsed().as_secs_f64();
@@ -704,6 +711,22 @@ fn main() {
         next += period;
         if let Some(wait) = next.checked_duration_since(Instant::now()) {
             thread::sleep(wait);
+        }
+        // A stall: the game sends no frame, as while it loads a level
+        if let Some((at, length)) = stall {
+            let now = start.elapsed().as_secs_f64();
+            if (at..at + length).contains(&now) {
+                if !stall_begun {
+                    stall_begun = true;
+                    println!("fake-game: no frames from unix {} ms for {length} s", unix_ms());
+                }
+                continue;
+            }
+            if stall_begun && now >= at + length {
+                stall_begun = false;
+                stall = None;
+                println!("fake-game: frames again at unix {} ms", unix_ms());
+            }
         }
         for n in consumed_rx.try_iter() {
             done += 1;

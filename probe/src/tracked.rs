@@ -107,7 +107,8 @@ pub enum FaceSource {
     /// The microphone, as a Quest 3's face
     #[default]
     Audio,
-    /// The offer names no source, as an older headset app does. The samples come from the microphone.
+    /// The offer names no source, as a headset's offer does before its face gives data. The samples
+    /// come from the microphone.
     Unknown,
 }
 

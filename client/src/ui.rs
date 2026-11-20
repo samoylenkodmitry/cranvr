@@ -624,7 +624,7 @@ fn HostList(found: Vec<Line>, address: TextFieldState) {
     if found.is_empty() {
         Text("Looking for a Mac that runs cranvr...", Modifier::empty(), text_style(28.0, TEXT_COLOR, None));
         Text(
-            "Open cranvr on the Mac. Put the Mac and this headset on the same Wi-Fi. A Mac with an older cranvr does not appear here: update cranvr on that Mac.",
+            "Open cranvr on the Mac. Put the Mac and this headset on the same Wi-Fi.",
             Modifier::empty(),
             text_style(22.0, MUTED_COLOR, None),
         );

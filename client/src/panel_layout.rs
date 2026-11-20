@@ -109,6 +109,12 @@ impl Layout {
             layout.game.clone_from(&set);
             layout.test = Some(set);
         }
+        // The launch asks for every panel hidden (`panels=hidden`), as a test of the beams needs
+        if crate::settings::panels_hidden_on_launch() && layout.test.is_none() {
+            layout.room.clear();
+            layout.game.clear();
+            layout.test = Some(BTreeSet::new());
+        }
         if let Some(stream) = args.int("pinned").and_then(|n| u8::try_from(n).ok()) {
             layout.pinned = Some(stream);
             layout.test.get_or_insert_with(|| layout.room.clone());

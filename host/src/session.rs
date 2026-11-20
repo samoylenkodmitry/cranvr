@@ -15,8 +15,6 @@ pub struct Options {
     pub mbps: u64,
     /// Accept every client without a pairing (for tests)
     pub trust_all: bool,
-    /// The pairing code of the headset to pair (see `pairing.rs`)
-    pub pair_code: Option<u32>,
     /// The UDP port that answers the headsets' discovery queries. `None` turns discovery off.
     pub discovery_port: Option<u16>,
     /// Plan the host's own scene's frames for the headset's display

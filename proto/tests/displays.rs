@@ -16,12 +16,6 @@ fn round_trip<T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + st
     assert_eq!(decode::<T>(&bytes).unwrap(), value);
 }
 
-fn tag<T: serde::Serialize>(value: &T) -> u8 {
-    let mut bytes = Vec::new();
-    encode(value, &mut bytes).unwrap();
-    bytes[0]
-}
-
 fn params(stream: u8) -> DesktopParams {
     DesktopParams {
         stream,
@@ -32,7 +26,6 @@ fn params(stream: u8) -> DesktopParams {
         bitrate_bps: 12_000_000,
         full_range: true,
         flipped: false,
-        visible: true,
         cursor_in_video: true,
     }
 }
@@ -69,57 +62,6 @@ fn the_display_messages_round_trip() {
     round_trip(HostDatagram::DisplayCursor { stream: 2, cursor: Cursor { seq: 8, u: 0.25, v: 0.75, on: true } });
     let input = Input { sample_time: 77, hands: [HandInput { trigger: 0.5, ..Default::default() }, HandInput { buttons: buttons::PRIMARY, ..Default::default() }] };
     round_trip(ClientDatagram::InputHold(InputHold { input, held: [false, true] }));
-}
-
-/// The new variants stand after the old ones, so a peer of version 7 reads every old message as
-/// before and skips these.
-#[test]
-fn the_new_variants_stand_after_the_old_ones() {
-    // The last variant of version 7 and the first of version 8 in each enum
-    assert_eq!(tag(&ClientMsg::Focus(Focus::Focused)), 10);
-    assert_eq!(tag(&ClientMsg::Display(DisplayRequest::Add)), 11);
-    assert_eq!(tag(&ClientMsg::DisplayWish { stream: 1, wish: DesktopWish { enabled: false, max_width: 0, max_fps: 0 } }), 12);
-    assert_eq!(tag(&HostMsg::TrackingWish(cranvr_proto::tracking::Features::NONE)), 10);
-    assert_eq!(tag(&HostMsg::Displays(DisplayList::default())), 11);
-    assert_eq!(tag(&HostMsg::DisplayStream { stream: 1, params: None }), 12);
-    assert_eq!(tag(&HostMsg::GameRuns(false)), 13);
-    // A datagram of version 6 and the version 8 ones that follow it
-    let eyes = tag(&ClientDatagram::Eyes(cranvr_proto::tracking::Eyes::default()));
-    let mouse = tag(&ClientDatagram::Mouse(Mouse { seq: 0, sent: 0, hit: None, buttons: 0, scroll: [0.0; 2] }));
-    let display_mouse = tag(&ClientDatagram::DisplayMouse { stream: 1, mouse: Mouse { seq: 0, sent: 0, hit: None, buttons: 0, scroll: [0.0; 2] } });
-    let held = tag(&ClientDatagram::InputHold(InputHold::default()));
-    assert!(eyes < mouse && mouse < display_mouse && display_mouse < held);
-    assert_eq!(tag(&HostDatagram::Cursor(Cursor { seq: 0, u: 0.0, v: 0.0, on: false })), 4);
-    assert_eq!(tag(&HostDatagram::DisplayCursor { stream: 1, cursor: Cursor { seq: 0, u: 0.0, v: 0.0, on: false } }), 5);
-}
-
-/// A host of version 7 has no such variant: its read loop skips the message.
-#[test]
-fn a_peer_of_version_7_skips_the_new_host_messages() {
-    #[derive(Debug, serde::Deserialize)]
-    #[allow(dead_code)]
-    enum V7HostMsg {
-        Welcome(Welcome),
-        Reject(RejectReason),
-        MediaReady,
-        DecoderConfig { stream: u8, codec: Codec, config: Vec<u8> },
-        StreamUpdate(StreamParams),
-        Bye,
-        Desktop(Option<DesktopParams>),
-        Menu(String),
-        AwaitApproval { host_name: String, commit: [u8; 32] },
-        PairReveal([u8; 32]),
-        TrackingWish(cranvr_proto::tracking::Features),
-    }
-    let mut bytes = Vec::new();
-    encode(&HostMsg::GameRuns(true), &mut bytes).unwrap();
-    assert!(decode::<V7HostMsg>(&bytes).is_err());
-    bytes.clear();
-    encode(&HostMsg::DisplayStream { stream: 2, params: None }, &mut bytes).unwrap();
-    assert!(decode::<V7HostMsg>(&bytes).is_err());
-    bytes.clear();
-    encode(&HostMsg::Desktop(None), &mut bytes).unwrap();
-    assert!(matches!(decode::<V7HostMsg>(&bytes).unwrap(), V7HostMsg::Desktop(None)));
 }
 
 /// Each display's pictures are units of their own stream, with their own frame numbers.

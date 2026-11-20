@@ -23,10 +23,7 @@ use crate::{
     desktop_layer::LayerState,
     virtual_display::{self, DisplayProcess},
 };
-use cranvr_proto::{
-    message::{display_stream, DesktopWish, DisplayInfo, DisplayList, DisplayRequest, HostMsg, Mouse, Pointer, DESKTOP_STREAM, MAX_DISPLAYS},
-    DISPLAYS_VERSION,
-};
+use cranvr_proto::message::{display_stream, DesktopWish, DisplayInfo, DisplayList, DisplayRequest, HostMsg, Mouse, DESKTOP_STREAM, MAX_DISPLAYS};
 use log::{info, warn};
 use std::{
     sync::{
@@ -123,12 +120,6 @@ impl Displays {
         match self.slots.lock().unwrap().iter().find(|slot| slot.desktop.stream() == stream) {
             Some(slot) => slot.desktop.on_wish(wish, session),
             None => info!("Native displays: the client wishes the video of stream {stream}, and no display has it"),
-        }
-    }
-
-    pub(super) fn on_pointer(&self, stream: u8, pointer: Pointer) {
-        if let Some(slot) = self.slots.lock().unwrap().iter().find(|slot| slot.desktop.stream() == stream) {
-            slot.desktop.on_pointer(pointer);
         }
     }
 
@@ -292,17 +283,15 @@ impl Displays {
         (sum, slots.len(), slots.iter().filter(|slot| slot.desktop.is_running()).count())
     }
 
-    /// Copies what the host's frame loop shares with the displays: it tells them whether a game
-    /// runs, and it hears whether any display shows and how many pictures went out. `owns_panels` is
-    /// true for a client of version 8: it owns the panels of the Mac's displays, so the frame loop
-    /// draws no screen of its own into the eye stream and moves no mouse with a controller, also while
-    /// the client shows no display.
-    fn mirror(&self, game: bool, owns_panels: bool) {
+    /// Copies what the displays tell the host's frame loop: whether any display shows and how many
+    /// pictures went out. `owns_panels` is true while the host has displays at all: the client owns
+    /// their panels, so the frame loop draws no screen of its own into the eye stream and moves no
+    /// mouse with a controller, also while the client shows no display.
+    fn mirror(&self, owns_panels: bool) {
         let slots = self.slots.lock().unwrap();
         let mut active = false;
         let mut frames = 0;
         for slot in slots.iter() {
-            slot.layer.game.store(game, Ordering::Relaxed);
             active |= slot.layer.active.load(Ordering::Relaxed);
             frames += slot.layer.frames.swap(0, Ordering::Relaxed);
         }
@@ -346,17 +335,15 @@ fn manage(displays: &Displays, session: &Session) {
     while !displays.stop.load(Ordering::Relaxed) && !*session.stopped.lock().unwrap() {
         thread::sleep(LOOK_EVERY);
         let game = displays.base.layer.game.load(Ordering::Relaxed);
-        displays.mirror(game, session.version >= DISPLAYS_VERSION && displays.base.enabled);
-        if session.version >= DISPLAYS_VERSION {
-            if game_sent != Some(game) {
-                game_sent = Some(game);
-                send(&HostMsg::GameRuns(game));
-            }
-            let list = displays.list();
-            if list_sent.as_ref() != Some(&list) {
-                send(&HostMsg::Displays(list.clone()));
-                list_sent = Some(list);
-            }
+        displays.mirror(displays.base.enabled);
+        if game_sent != Some(game) {
+            game_sent = Some(game);
+            send(&HostMsg::GameRuns(game));
+        }
+        let list = displays.list();
+        if list_sent.as_ref() != Some(&list) {
+            send(&HostMsg::Displays(list.clone()));
+            list_sent = Some(list);
         }
         if alive_at.elapsed() >= ALIVE_EVERY {
             alive_at = Instant::now();

@@ -405,17 +405,12 @@ impl Pointer {
         }
     }
 
-    /// Call once per frame. `hit` is where the controller points on the screen, if anywhere.
+    /// Call once per frame of the host's own scene, which has one controller with a trigger and a
+    /// thumbstick. `hit` is where the controller points on the screen, if anywhere. The trigger is
+    /// the left button, with a hysteresis so a half pulled trigger does not click many times, and
+    /// the thumbstick scrolls up and down.
     pub fn update(&mut self, hit: Option<[f32; 2]>, trigger: f32, stick_y: f32) {
-        self.update_scaled(hit, trigger, stick_y, 1.0);
-    }
-
-    /// Like `update`, for a client of the older protocol that sends a trigger and one axis: the
-    /// trigger is the left button, with a hysteresis so a half pulled trigger does not click many
-    /// times, and the axis scrolls up and down. The speed of the scroll is scaled as in
-    /// [`Pointer::update_mouse`].
-    pub fn update_scaled(&mut self, hit: Option<[f32; 2]>, trigger: f32, stick_y: f32, scroll_scale: f32) {
-        self.update_mouse(hit, trigger_buttons(self.held, trigger), [0.0, stick_y], scroll_scale);
+        self.update_mouse(hit, trigger_buttons(self.held, trigger), [0.0, stick_y], 1.0);
     }
 
     /// Call once per update of the client. `hit` is where the controller points on the screen, if
@@ -504,8 +499,7 @@ impl Pointer {
     }
 }
 
-/// The buttons that a trigger holds, for a client that sends no buttons: the trigger is the left
-/// button. It goes down past 0.6 and up below 0.4, so a trigger that rests near one value does not
+/// The buttons that a trigger holds, for the host's own scene: the trigger is the left button. It goes down past 0.6 and up below 0.4, so a trigger that rests near one value does not
 /// click many times. `held` is what is down now.
 fn trigger_buttons(held: u8, trigger: f32) -> u8 {
     let down = if held & LEFT != 0 { trigger > 0.4 } else { trigger > 0.6 };
@@ -883,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn a_client_of_the_older_protocol_clicks_with_its_trigger_and_scrolls_up_and_down() {
+    fn the_hosts_own_scene_clicks_with_its_trigger() {
         let mut pointer = pointer();
         let now = std::time::Instant::now();
         let step = |pointer: &mut Pointer, trigger: f32| {

@@ -4,16 +4,11 @@
 //! headsets in a file in its config folder, one line for each: the public key in hex, a space and
 //! the headset's name.
 //!
-//! A headset that the host does not know waits (protocol version 5). The host keeps one [`Request`]
+//! A headset that the host does not know waits. The host keeps one [`Request`]
 //! at a time: the headset's name and the code that both screens show (see
 //! `cranvr_proto::secure::approval_code`). The cranvr app lists the request in the host's status
 //! line and sends the user's answer back (`allow KEY` or `deny KEY` on the host's input). An
 //! answer for a headset that no request names does nothing. An allowed headset is paired for good.
-//!
-//! A headset with the older cranvr app (version 4) cannot wait. It pairs with `--pair CODE`: the
-//! host then pairs the headset whose key has that code, in a window that stays open for ten
-//! minutes or until it paired one headset. The window closes after five tries with a wrong code, so
-//! a device on the network cannot try all codes.
 //!
 //! The host has a key of its own, in `host-identity.txt` beside the file of the paired headsets.
 //! The headset remembers it when the host accepted the headset the first time. A host with another
@@ -23,20 +18,10 @@
 use log::{info, warn};
 use cranvr_proto::{
     discovery::clean_name,
-    identity::{format_code, from_hex, pairing_code, to_hex, Identity, KEY_LEN},
+    identity::{from_hex, to_hex, Identity, KEY_LEN},
 };
-use std::{
-    io::Write,
-    net::IpAddr,
-    path::PathBuf,
-    sync::Mutex,
-    time::{Duration, Instant},
-};
+use std::{io::Write, net::IpAddr, path::PathBuf, sync::Mutex};
 
-/// How long a window that `--pair` opened stays open
-const WINDOW_OPEN: Duration = Duration::from_secs(10 * 60);
-/// Tries with a wrong code that close the window
-const MAX_FAILURES: u32 = 5;
 const FILE: &str = "paired-headsets.txt";
 const HOST_KEY_FILE: &str = "host-identity.txt";
 
@@ -87,22 +72,6 @@ pub fn host_identity(config_dir: &std::path::Path) -> Identity {
     identity
 }
 
-struct Window {
-    code: u32,
-    opened: Instant,
-    failures: u32,
-}
-
-/// The result of an attempt to pair a headset whose key the host does not know
-#[derive(Debug, PartialEq, Eq)]
-pub enum Attempt {
-    Paired,
-    /// A window is open and the code did not match
-    WrongCode,
-    /// No window is open, or it expired, or too many tries closed it
-    NoWindow,
-}
-
 /// A headset that waits for the user's answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
@@ -118,13 +87,12 @@ pub struct Request {
 pub struct Pairings {
     path: PathBuf,
     keys: Mutex<Vec<([u8; KEY_LEN], String)>>,
-    window: Mutex<Option<Window>>,
     request: Mutex<Option<Request>>,
 }
 
 impl Pairings {
-    /// Reads the file in `config_dir`. `code` opens a pairing window.
-    pub fn load(config_dir: &std::path::Path, code: Option<u32>) -> Self {
+    /// Reads the file in `config_dir`.
+    pub fn load(config_dir: &std::path::Path) -> Self {
         let path = config_dir.join(FILE);
         let keys: Vec<_> = std::fs::read_to_string(&path)
             .unwrap_or_default()
@@ -137,30 +105,19 @@ impl Pairings {
         if !keys.is_empty() {
             info!("Native protocol: {} paired headsets in {}", keys.len(), path.display());
         }
-        if let Some(code) = code {
-            info!("Native protocol: pairing is open for the headset that shows the code {}", format_code(code));
-        }
-        Self {
-            path,
-            keys: Mutex::new(keys),
-            window: Mutex::new(code.map(|code| Window { code, opened: Instant::now(), failures: 0 })),
-            request: Mutex::new(None),
-        }
+        Self { path, keys: Mutex::new(keys), request: Mutex::new(None) }
     }
 
     /// What the `native` status line says about pairing: the names of the paired headsets (the
-    /// start of the key for a headset without a name) and the seconds that the window stays open,
-    /// or `None` while no window is open.
-    pub fn summary(&self) -> (Vec<String>, Option<u64>) {
-        let names = self
+    /// start of the key for a headset without a name).
+    pub fn summary(&self) -> Vec<String> {
+        self
             .keys
             .lock()
             .unwrap()
             .iter()
             .map(|(key, name)| if name.is_empty() { to_hex(&key[..4]) } else { name.clone() })
-            .collect();
-        let seconds = self.window.lock().unwrap().as_ref().and_then(|w| WINDOW_OPEN.checked_sub(w.opened.elapsed())).map(|left| left.as_secs());
-        (names, seconds)
+            .collect()
     }
 
     pub fn contains(&self, key: &[u8; KEY_LEN]) -> bool {
@@ -222,29 +179,6 @@ impl Pairings {
             warn!("Native protocol: the pairing of {name} was not saved to {}: {e}", self.path.display());
         }
     }
-
-    /// Pairs the headset if a window is open and `key` has its code. The caller has checked that
-    /// the headset holds the key.
-    pub fn try_pair(&self, key: &[u8; KEY_LEN], name: &str) -> Attempt {
-        let mut window = self.window.lock().unwrap();
-        let Some(open) = window.as_mut() else { return Attempt::NoWindow };
-        if open.opened.elapsed() > WINDOW_OPEN {
-            *window = None;
-            return Attempt::NoWindow;
-        }
-        if pairing_code(key) != open.code {
-            open.failures += 1;
-            if open.failures >= MAX_FAILURES {
-                warn!("Native protocol: {MAX_FAILURES} headsets showed a wrong code. Pairing is closed. Start the host again to open it.");
-                *window = None;
-            }
-            return Attempt::WrongCode;
-        }
-        *window = None;
-        drop(window);
-        self.add(key, name);
-        Attempt::Paired
-    }
 }
 
 #[cfg(test)]
@@ -259,40 +193,12 @@ mod tests {
         dir
     }
 
-    fn key(seed: u8) -> ([u8; 32], u32) {
-        let identity = Identity::from_seed([seed; 32]);
-        (identity.public_key(), identity.code())
+    fn key(seed: u8) -> [u8; 32] {
+        Identity::from_seed([seed; 32]).public_key()
     }
 
-    #[test]
-    fn a_matching_code_pairs_and_the_file_remembers_it() {
-        let dir = dir("match");
-        let (headset, code) = key(1);
-        let pairings = Pairings::load(&dir, Some(code));
-        assert!(!pairings.contains(&headset));
-        assert_eq!(pairings.try_pair(&headset, "Meta Quest 3"), Attempt::Paired);
-        assert!(pairings.contains(&headset));
-        // The window closed with the first pairing
-        assert_eq!(pairings.try_pair(&key(2).0, "Another"), Attempt::NoWindow);
-        // A new host process reads the key from the file and needs no window
-        let again = Pairings::load(&dir, None);
-        assert!(again.contains(&headset) && !again.contains(&key(2).0));
-    }
-
-    #[test]
-    fn a_wrong_code_does_not_pair_and_too_many_close_the_window() {
-        let dir = dir("wrong");
-        let (_, code) = key(1);
-        let pairings = Pairings::load(&dir, Some(code));
-        // Other keys have other codes. A few seeds lack the code by chance only with a very small probability.
-        for seed in 2..2 + MAX_FAILURES as u8 {
-            let (other, other_code) = key(seed);
-            assert_ne!(other_code, code);
-            assert_eq!(pairings.try_pair(&other, "Intruder"), Attempt::WrongCode);
-            assert!(!pairings.contains(&other));
-        }
-        // Five wrong tries closed the window, so even the right headset cannot pair now
-        assert_eq!(pairings.try_pair(&key(1).0, "Headset"), Attempt::NoWindow);
+    fn ip() -> IpAddr {
+        [192, 168, 1, 30].into()
     }
 
     #[test]
@@ -311,35 +217,22 @@ mod tests {
     }
 
     #[test]
-    fn the_summary_names_the_paired_headsets_and_the_open_window() {
+    fn the_summary_names_the_paired_headsets() {
         let dir = dir("summary");
-        let (headset, code) = key(4);
-        let pairings = Pairings::load(&dir, Some(code));
-        let (names, open) = pairings.summary();
-        assert!(names.is_empty());
-        assert!(open.is_some_and(|s| s > WINDOW_OPEN.as_secs() - 5 && s <= WINDOW_OPEN.as_secs()));
-        pairings.try_pair(&headset, "Meta Quest 3");
-        // The pairing closed the window
-        assert_eq!(pairings.summary(), (vec!["Meta Quest 3".to_string()], None));
+        let headset = key(4);
+        let pairings = Pairings::load(&dir);
+        assert!(pairings.summary().is_empty());
+        pairings.add(&headset, "Meta Quest 3");
+        assert_eq!(pairings.summary(), vec!["Meta Quest 3".to_string()]);
         // A line without a name shows the start of the key
         std::fs::write(dir.join(FILE), format!("{} \n", to_hex(&headset))).unwrap();
-        assert_eq!(Pairings::load(&dir, None).summary().0, [to_hex(&headset[..4])]);
-    }
-
-    #[test]
-    fn without_a_window_nothing_pairs() {
-        let pairings = Pairings::load(&dir("none"), None);
-        assert_eq!(pairings.try_pair(&key(1).0, "x"), Attempt::NoWindow);
-    }
-
-    fn ip() -> IpAddr {
-        [192, 168, 1, 30].into()
+        assert_eq!(Pairings::load(&dir).summary(), [to_hex(&headset[..4])]);
     }
 
     #[test]
     fn a_request_takes_the_answer_of_its_own_key_only() {
-        let pairings = Pairings::load(&dir("request"), None);
-        let (headset, other) = (key(1).0, key(2).0);
+        let pairings = Pairings::load(&dir("request"));
+        let (headset, other) = (key(1), key(2));
         assert!(pairings.ask(headset, "Meta Quest 3", ip(), 123_456));
         let waiting = pairings.waiting();
         assert_eq!(waiting.len(), 1);
@@ -362,24 +255,24 @@ mod tests {
 
     #[test]
     fn one_request_waits_at_a_time() {
-        let pairings = Pairings::load(&dir("one"), None);
-        assert!(pairings.ask(key(1).0, "First", ip(), 1));
-        assert!(!pairings.ask(key(2).0, "Second", ip(), 2));
+        let pairings = Pairings::load(&dir("one"));
+        assert!(pairings.ask(key(1), "First", ip(), 1));
+        assert!(!pairings.ask(key(2), "Second", ip(), 2));
         assert_eq!(pairings.waiting()[0].name, "First");
-        pairings.withdraw(&key(1).0);
-        assert!(pairings.ask(key(2).0, "Second", ip(), 2));
+        pairings.withdraw(&key(1));
+        assert!(pairings.ask(key(2), "Second", ip(), 2));
     }
 
     #[test]
     fn an_allowed_headset_stays_paired_after_a_restart() {
         let dir = dir("allowed");
-        let pairings = Pairings::load(&dir, None);
-        let headset = key(5).0;
+        let pairings = Pairings::load(&dir);
+        let headset = key(5);
         pairings.add(&headset, "Meta Quest 3");
         // A second add of the same key adds no second line
         pairings.add(&headset, "Meta Quest 3");
         assert_eq!(std::fs::read_to_string(dir.join(FILE)).unwrap().lines().count(), 1);
-        assert!(Pairings::load(&dir, None).contains(&headset));
+        assert!(Pairings::load(&dir).contains(&headset));
     }
 
     #[test]
@@ -393,10 +286,10 @@ mod tests {
     #[test]
     fn a_name_with_a_line_break_keeps_the_file_to_one_line_for_each_headset() {
         let dir = dir("name");
-        let (headset, code) = key(3);
-        Pairings::load(&dir, Some(code)).try_pair(&headset, "a\nb");
+        let headset = key(3);
+        Pairings::load(&dir).add(&headset, "a\nb");
         let text = std::fs::read_to_string(dir.join(FILE)).unwrap();
         assert_eq!(text.lines().count(), 1);
-        assert!(Pairings::load(&dir, None).contains(&headset));
+        assert!(Pairings::load(&dir).contains(&headset));
     }
 }

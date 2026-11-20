@@ -5,10 +5,11 @@
 #
 # Usage: scripts/e2e.sh [--seconds N] [--fps HZ] [--game | --wine PROGRAM [--wine-arg ARG]...] [--desktop]
 #                       [--quest [SERIAL] | --native-tcp] [--native-drop PERCENT] [--native-port PORT]
-#                       [--host-arg ARG]... [--report FILE]
+#                       [--host-arg ARG]... [--probe-arg ARG]... [--report FILE]
 #                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine | --openvr-wine | --openvr-actions MODE]
 #                       [--displays N] [--hold] [--hand-hold] [--displays-in-game]
-#                       [--pause AT:FOR] [--left-trigger AT:FOR]
+#                       [--game-stall AT:FOR]
+#                       [--pause AT:FOR] [--left-trigger AT:FOR] [--right-trigger AT:FOR]
 #                       [--face-source visual|audio|unknown]
 #
 #   --seconds N   how long the stream runs (default 20)
@@ -36,9 +37,11 @@
 #   --openvr-wine  an OpenVR program through OpenComposite and the real runtime: C:\opencomposite\openvr_smoke.exe
 #                 runs in Wine. It finds the runtime through the prefix's OpenVR path file, which
 #                 scripts/run-game.sh writes when CRANVR_OPENCOMPOSITE is 1 (this option sets it). It
-#                 makes a Direct3D 11 device, submits both eyes in every frame and reads the head pose
-#                 and the legacy state of the scripted controllers (a pull of the left grip, the right
-#                 trigger at 0.75, the A button). It prints "openvr_smoke: PASS" or "FAIL ...". Set
+#                 makes a Direct3D 11 device, submits both eyes in every frame and reads the head pose,
+#                 the controller state of IVRSystem for the scripted controllers (a pull of the left grip, the right
+#                 trigger at 0.75, the A button) and their poses in the array of WaitGetPoses (valid in
+#                 90 percent of the frames, the left one where the probe holds it, the right one swinging;
+#                 the probe's head stands still). It prints "openvr_smoke: PASS" or "FAIL ...". Set
 #                 CRANVR_HOME to a stack that scripts/setup-wine.sh built with OpenComposite.
 #   --openvr-actions touch|vive|both  the same program with IVRInput: it writes an action manifest with default
 #                 bindings (for Touch controllers, the Vive wand or both, as a game that ships a manifest does),
@@ -46,20 +49,25 @@
 #                 when the program's haptic pulse does not reach the probe. Implies --openvr-wine.
 #   --face-source SOURCE  with --tracking and --tracking-wine: where the probe's face comes from.
 #                 audio (the default) is a Quest 3's microphone face, visual is a face from cameras,
-#                 and unknown is an offer that names no source, as an older headset app sends. The
+#                 and unknown is an offer that names no source, as a headset's offer before its face gives data. The
 #                 offer, the host's file for the runtime and each sample carry the source. The
 #                 Windows program checks that the support structure says it, that a face tracker
 #                 which asks for the other source is refused, and each sample's dataSource.
+#   --game-stall AT:FOR  with the probe: the fake game sends no frame for FOR seconds (under 3) from AT seconds
+#                 after its start, as a game does while it loads a level. The host must keep the game's last
+#                 picture: the run fails when the probe decodes a frame of the host's own scene (wrong
+#                 badges) between the game's last frame and its first frame after the stall. Implies --game.
 #   --pause AT:FOR  with the probe: the app loses the input focus at AT seconds (2 or more) for FOR
 #                 seconds, as under the headset's system menu. The probe tells the host, sends no tracking
 #                 and no input and counts the frames that still arrive. The run fails when a frame
 #                 arrives after the first 0.3 s of the pause, or when the stream does not go on after it.
 #                 With --game the fake game keeps running through the pause.
-#   --left-trigger AT:FOR  with the probe: the left trigger goes to 1 at AT seconds and stays for FOR
-#                 seconds, once. The right trigger pulls to 0.75 for half a second in every 3 seconds.
-#                 A game that shows one pointer at a time then has its left controller pressed for the
-#                 first time at AT. A host started with CRANVR_EYE_DUMP=FOLDER writes what the game
-#                 drew into FOLDER once a second, so the run shows which pointer was up before and after.
+#   --left-trigger AT:FOR, --right-trigger AT:FOR  with the probe: that trigger goes to 1 at AT seconds and
+#                 stays for FOR seconds, once. The probe's cycle of presses is off then, so the pulls are
+#                 the only presses and the head stands still. A game that shows one pointer at a time,
+#                 such as a menu, then has its controller pressed for the first time at AT. A host
+#                 started with CRANVR_EYE_DUMP=FOLDER writes what the game drew into FOLDER once a
+#                 second, so the run shows which pointer was up before and after.
 #   --desktop     the host shows this Mac's screen. The probe asks for the desktop stream, plays a
 #                 pointer script (the host only logs its mouse events: CRANVR_POINTER_DRY_RUN) and
 #                 counts the Mac's sound. The script presses the left, right and middle buttons and
@@ -105,6 +113,8 @@
 #   --native-port PORT  the host's TCP port (default 9950)
 #   --host-arg ARG one more cranvr-host argument, for an A/B run of a setting:
 #                 --host-arg --no-display-lock
+#   --probe-arg ARG one more cranvr-probe argument, such as --still-head for a game whose room must stay the
+#                 probe's room
 #   --report FILE where the report goes (default: target/e2e/run-<time>/report.json)
 #
 # The options --native and --cranvr-client are accepted and change nothing: cranvr's protocol and
@@ -114,14 +124,19 @@
 # the right picture. It exits with 1 otherwise.
 
 set -euo pipefail
+# zsh lowers the priority of a background job by 5 ("nice") unless this option is off. The host and the game run as
+# background jobs here. The cranvr app starts them at normal priority, so a test with the default option measured a
+# game that lost the Mac's CPU time to every build that ran beside it.
+unsetopt BG_NICE
 
 root=${0:A:h:h}
 seconds=20 fps=120 fps_given=0 game=0 desktop=0 client=mac serial="" report=""
 displays=1 hold=0 hand_hold=0 displays_in_game=0 display_test=0
 tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 openvr_wine=0 openvr_actions="" face_source=audio
+game_stall=""
 wine="" wine_args=()
-native_tcp=0 native_drop=0 native_port=9950 pause="" left_trigger=""
-more_host_args=()
+native_tcp=0 native_drop=0 native_port=9950 pause="" left_trigger="" right_trigger=""
+more_host_args=() more_probe_args=()
 while (( $# )); do
     case $1 in
         --seconds) seconds=$2; shift 2 ;;
@@ -131,6 +146,7 @@ while (( $# )); do
             game=1 tracking=1; shift
             if (( $# )) && [[ $1 != --* ]]; then tracking_features=$1; shift; fi ;;
         --hand-controllers) game=1 hand_controllers=1; shift ;;
+        --game-stall) game=1 game_stall=$2; shift 2 ;;
         --tracking-wine) tracking_wine=1; shift ;;
         --openvr-wine) openvr_wine=1; shift ;;
         --openvr-actions)
@@ -153,10 +169,12 @@ while (( $# )); do
         --native-port) native_port=$2; shift 2 ;;
         --pause) pause=$2; shift 2 ;;
         --left-trigger) left_trigger=$2; shift 2 ;;
+        --right-trigger) right_trigger=$2; shift 2 ;;
         --quest)
             client=quest; shift
             if (( $# )) && [[ $1 != --* ]]; then serial=$1; shift; fi ;;
         --host-arg) more_host_args+=("$2"); shift 2 ;;
+        --probe-arg) more_probe_args+=("$2"); shift 2 ;;
         --report) report=$2; shift 2 ;;
         *) print -u2 "unknown option $1"; exit 2 ;;
     esac
@@ -334,6 +352,12 @@ if [[ ${client} == quest && -f ${identity} ]]; then
     mkdir -p "${work}/config"
     cp "${identity}" "${work}/config/host-identity.txt"
 fi
+# An OpenVR program draws a picture with an upper and a lower half. The host writes both eyes of the game's newest
+# frame, and the run checks that the upper half is the bright one (see below).
+if (( openvr_wine )); then
+    mkdir -p "${work}/eyes"
+    export CRANVR_EYE_DUMP=${work}/eyes
+fi
 print "Starting the host at ${fps} Hz (log: ${work}/host.log)"
 "${bin}/cranvr-host" "${host_args[@]}" > "${work}/host.out" 2> "${work}/host.log" &
 pids+=($!)
@@ -356,6 +380,7 @@ if (( game )); then
         (( hand_controllers )) && game_args=(--expect-hand-controllers)
         (( hand_hold )) && game_args+=(--expect-hand-held)
         (( hold )) && game_args+=(--expect-held)
+        [[ -n ${game_stall} ]] && game_args=(--stall "${game_stall}")
         "${bin}/cranvr-fake-game" --control "${work}/config/runtime-control.txt" --fps "${fps}" \
             --seconds $(( seconds + 4 )) "${game_args[@]}" > "${work}/game.log" 2>&1 &
     else
@@ -389,11 +414,13 @@ fi
 [[ -n ${pause} ]] && probe_args+=(--pause "${pause}")
 # The pull test needs a head that stands still, so the hands stay in view
 [[ -n ${left_trigger} ]] && probe_args+=(--left-trigger "${left_trigger}" --still-head)
+[[ -n ${right_trigger} ]] && probe_args+=(--right-trigger "${right_trigger}" --still-head)
 # The probe offers hands, body, face and eyes and plays the script of tracked.rs for what the host asks
 (( tracking || tracking_wine )) && probe_args+=(--tracking --face-source "${face_source}")
 (( hand_controllers )) && probe_args+=(--tracking --no-controllers)
-# A program that compares its controller poses with the probe's script needs the head still: its room is then the probe's room
-[[ -z ${openvr_actions} ]] || probe_args+=(--still-head)
+# A program that compares its controller poses with the probe's script (the OpenVR program does, with and without an action manifest) needs the head still: its room is then the probe's room
+(( openvr_wine )) && probe_args+=(--still-head)
+probe_args+=("${more_probe_args[@]}")
 client_exit=0
 case ${client} in
     mac)
@@ -434,6 +461,36 @@ if (( openvr_wine )); then
     done
     grep -h "openvr_smoke:" "${work}/game.log" || true
     grep -q "openvr_smoke: PASS" "${work}/game.log" || { print -u2 "The OpenVR program did not pass; see ${work}/game.log"; openvr_exit=1; }
+    # The picture of each eye reaches the host the right way up: the program's upper half is bright, its lower half nearly black
+    python3 -I - "${work}/eyes" <<'PYTHON' || { print -u2 "The picture of the OpenVR program is not the right way up in the host; see ${work}/eyes"; openvr_exit=1; }
+import struct, sys, zlib
+def read_png(path):
+    data = open(path, "rb").read()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    pos, idat, width, height = 8, b"", 0, 0
+    while pos < len(data):
+        length, kind = struct.unpack(">I4s", data[pos:pos + 8])
+        body = data[pos + 8:pos + 8 + length]
+        if kind == b"IHDR":
+            width, height = struct.unpack(">II", body[:8])
+        elif kind == b"IDAT":
+            idat += body
+        pos += 12 + length
+    raw = zlib.decompress(idat)
+    stride = width * 3 + 1
+    return width, height, [raw[y * stride + 1:(y + 1) * stride] for y in range(height)]
+def brightness(rows):
+    return sum(sum(row) for row in rows) / max(1, sum(len(row) for row in rows))
+bad = False
+for eye in ("left", "right"):
+    width, height, rows = read_png("%s/eye-%s.png" % (sys.argv[1], eye))
+    quarter = max(1, height // 4)
+    top, bottom = brightness(rows[:quarter]), brightness(rows[-quarter:])
+    print("eyes: the %s eye's upper quarter has brightness %.0f, its lower quarter %.0f" % (eye, top, bottom))
+    if not top > 2 * bottom:
+        bad = True
+sys.exit(1 if bad else 0)
+PYTHON
     if [[ -n ${openvr_actions} ]]; then
         # The program pulses the left haptic output when its grab action fires: the pulse crosses the runtime and the
         # host to the probe
@@ -485,6 +542,29 @@ PYTHON
 fi
 if [[ ${client} == mac ]] && (( game )); then
     wait ${game_pid} || game_exit=$?
+    if [[ -n ${game_stall} ]]; then
+        # The headset shows the game's last picture while the game sends nothing: no frame of the host's own scene
+        # (the probe's "wrong badges") lies between the game's last frame and its first frame after the stall
+        python3 -I - "${work}/probe.log" "${work}/game.log" <<'PYTHON' || game_exit=1
+import re, sys
+probe, game = (open(path, errors="replace").read() for path in sys.argv[1:3])
+stall = re.search(r"fake-game: no frames from unix (\d+) ms for ([\d.]+) s", game)
+again = re.search(r"fake-game: frames again at unix (\d+) ms", game)
+if not stall or not again:
+    print("stall: the fake game did not log its stall", file=sys.stderr)
+    sys.exit(1)
+begin, end = int(stall.group(1)), int(again.group(1))
+wrong = []
+for line in re.findall(r"probe: frames with the wrong badges, at unix ms: (.*)", probe):
+    for first, last, count in re.findall(r"(\d+)\.\.(\d+) ms \((\d+)\)", line):
+        wrong.append((int(first), int(last), int(count)))
+inside = [(a, b, n) for a, b, n in wrong if b >= begin and a <= end]
+print("stall: the game sent no frame for %d ms; frames of the host's own scene during that time: %d" % (end - begin, sum(n for _, _, n in inside)))
+if inside:
+    print("stall: the host drew its own scene while the game stalled: %s" % inside, file=sys.stderr)
+    sys.exit(1)
+PYTHON
+    fi
     grep -hE "fake-game: (input|tracking|controllers made|hand controller)" "${work}/game.log" || true
     (( game_exit == 0 )) || print -u2 "The fake game failed or saw wrong input; see ${work}/game.log"
 fi
@@ -594,6 +674,8 @@ python3 -I "${root}/scripts/e2e-report.py" "${work}/host.out" "${fps}" "${report
 # A pause empties some of the host's 5-second windows, so the report's frame rate says nothing then: the
 # probe's verdict on the pause counts, and it is part of the probe's exit code
 [[ -z ${pause} ]] || result=0
+# A stall empties some of the host's 5-second windows in the same way: the stall check counts
+[[ -z ${game_stall} ]] || result=0
 (( client_exit == 0 )) || result=1
 (( mouse_exit == 0 )) || result=1
 (( game_exit == 0 )) || result=1

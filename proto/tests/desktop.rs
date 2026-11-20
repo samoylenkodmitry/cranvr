@@ -1,5 +1,5 @@
-//! The desktop stream and its messages: a second video stream beside the eye stream, the pointer
-//! that goes to the host and the cursor that comes back.
+//! The video stream of a display and its messages: a second video stream beside the eye stream, the
+//! mouse that goes to the host and the cursor that comes back.
 
 mod common;
 
@@ -26,87 +26,21 @@ fn params() -> DesktopParams {
         bitrate_bps: 40_000_000,
         full_range: true,
         flipped: false,
-        visible: true,
         cursor_in_video: true,
     }
 }
 
 #[test]
-fn the_desktop_messages_round_trip() {
-    round_trip(ClientMsg::Desktop(DesktopWish { enabled: true, max_width: 3840, max_fps: 60 }));
-    round_trip(HostMsg::Desktop(Some(params())));
-    round_trip(HostMsg::Desktop(None));
-    round_trip(ClientDatagram::Pointer(Pointer { seq: 9, sent: 123_456, hit: Some([0.25, 0.75]), trigger: 0.9, scroll: -0.5 }));
-    round_trip(ClientDatagram::Pointer(Pointer { seq: 10, sent: 0, hit: None, trigger: 0.0, scroll: 0.0 }));
-    round_trip(HostDatagram::Cursor(Cursor { seq: 3, u: 0.5, v: 0.125, on: true }));
-}
-
-/// Protocol version 7 added the mouse datagram after the last variant of version 6. A host of an
-/// older version reads every message as before and skips this one.
-#[test]
-fn the_mouse_datagram_stands_after_the_variants_of_version_6() {
-    round_trip(ClientDatagram::Mouse(Mouse { seq: 4, sent: 99, hit: Some([0.1, 0.9]), buttons: 0b101, scroll: [-0.25, 1.0] }));
-    round_trip(ClientDatagram::Mouse(Mouse { seq: 5, sent: 0, hit: None, buttons: 0, scroll: [0.0, 0.0] }));
-    let mut bytes = Vec::new();
-    encode(&ClientDatagram::Mouse(Mouse { seq: 0, sent: 0, hit: None, buttons: 0, scroll: [0.0; 2] }), &mut bytes).unwrap();
-    assert_eq!(bytes[0], 12, "Mouse is the thirteenth datagram variant, after Eyes");
-    // The datagram of the older version
-    bytes.clear();
-    encode(&ClientDatagram::Eyes(cranvr_proto::tracking::Eyes::default()), &mut bytes).unwrap();
-    assert_eq!(bytes[0], 11);
-    // A host of version 6 has no such variant: its read loop skips the datagram
-    #[derive(Debug, serde::Deserialize)]
-    #[allow(dead_code, clippy::large_enum_variant)]
-    enum V6Datagram {
-        Hello { session: u64 },
-        Tracking(Tracking),
-        Input(Input),
-        FrameTiming(FrameTiming),
-        Loss(LossReport),
-        Ping(Ping),
-        Pong(Pong),
-        Pointer(Pointer),
-        Hands(cranvr_proto::tracking::Hands),
-        Body(cranvr_proto::tracking::Body),
-        Face(cranvr_proto::tracking::Face),
-        Eyes(cranvr_proto::tracking::Eyes),
-    }
-    bytes.clear();
-    encode(&ClientDatagram::Mouse(Mouse { seq: 1, sent: 2, hit: None, buttons: 1, scroll: [0.0; 2] }), &mut bytes).unwrap();
-    assert!(decode::<V6Datagram>(&bytes).is_err());
-    bytes.clear();
-    encode(&ClientDatagram::Pointer(Pointer { seq: 1, sent: 2, hit: None, trigger: 1.0, scroll: 0.0 }), &mut bytes).unwrap();
-    assert!(matches!(decode::<V6Datagram>(&bytes).unwrap(), V6Datagram::Pointer(_)));
-}
-
-/// The new variants stand after the old ones, so a host and a client that do not know them read
-/// every old message as before: an old message keeps its tag. A message that a side does not
-/// know fails to decode, which the read loops skip.
-#[test]
-fn the_new_variants_leave_the_old_tags_alone() {
-    let mut bytes = Vec::new();
-    // Version 4 took the challenge and the proof out: the handshake's own flights replace them.
-    // The tags below are those of version 4. A later variant stands after these.
-    encode(&ClientMsg::Floor(1.0), &mut bytes).unwrap();
-    assert_eq!(bytes[0], 5);
-    bytes.clear();
-    encode(&ClientMsg::Desktop(DesktopWish { enabled: true, max_width: 1, max_fps: 1 }), &mut bytes).unwrap();
-    assert_eq!(bytes[0], 6);
-    bytes.clear();
-    encode(&HostMsg::Desktop(None), &mut bytes).unwrap();
-    assert_eq!(bytes[0], 6);
-    bytes.clear();
-    encode(&ClientDatagram::Pong(Pong { id: 0, ping_sent: 0, received: 0, sent: 0 }), &mut bytes).unwrap();
-    assert_eq!(bytes[0], 6);
-    bytes.clear();
-    encode(&ClientDatagram::Pointer(Pointer { seq: 0, sent: 0, hit: None, trigger: 0.0, scroll: 0.0 }), &mut bytes).unwrap();
-    assert_eq!(bytes[0], 7);
-    bytes.clear();
-    encode(&HostDatagram::Pong(Pong { id: 0, ping_sent: 0, received: 0, sent: 0 }), &mut bytes).unwrap();
-    assert_eq!(bytes[0], 3);
-    bytes.clear();
-    encode(&HostDatagram::Cursor(Cursor { seq: 0, u: 0.0, v: 0.0, on: false }), &mut bytes).unwrap();
-    assert_eq!(bytes[0], 4);
+fn the_display_video_messages_round_trip() {
+    round_trip(ClientMsg::DisplayWish { stream: DESKTOP_STREAM, wish: DesktopWish { enabled: true, max_width: 3840, max_fps: 60 } });
+    round_trip(HostMsg::DisplayStream { stream: DESKTOP_STREAM, params: Some(params()) });
+    round_trip(HostMsg::DisplayStream { stream: DESKTOP_STREAM, params: None });
+    round_trip(ClientDatagram::DisplayMouse {
+        stream: DESKTOP_STREAM,
+        mouse: Mouse { seq: 4, sent: 99, hit: Some([0.1, 0.9]), buttons: 0b101, scroll: [-0.25, 1.0] },
+    });
+    round_trip(ClientDatagram::DisplayMouse { stream: DESKTOP_STREAM + 1, mouse: Mouse { seq: 5, sent: 0, hit: None, buttons: 0, scroll: [0.0, 0.0] } });
+    round_trip(HostDatagram::DisplayCursor { stream: DESKTOP_STREAM, cursor: Cursor { seq: 3, u: 0.5, v: 0.125, on: true } });
 }
 
 /// A desktop picture and an eye frame with the same frame number are two units. Neither hides the

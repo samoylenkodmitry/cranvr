@@ -115,12 +115,11 @@ impl Serialize for Action {
     }
 }
 
-/// A name that this version does not know reads as `Nothing`, so a mapping that a newer app wrote
-/// still loads.
+/// A name that is no action is an error.
 impl<'de> Deserialize<'de> for Action {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let key = String::deserialize(deserializer)?;
-        Ok(Self::from_key(&key).unwrap_or(Action::Nothing))
+        Self::from_key(&key).ok_or_else(|| serde::de::Error::custom(format!("no action is named {key}")))
     }
 }
 
@@ -436,11 +435,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_name_that_this_version_does_not_know_reads_as_nothing() {
-        // A newer app may give an input an action that this headset lacks, such as a grab
-        let controls = Controls::from_json(r#"{"right":{"grip":"grab"}}"#).unwrap();
-        assert_eq!(controls.right.grip, Action::Nothing);
+    fn a_name_that_is_no_action_makes_the_mapping_unreadable() {
         assert_eq!(Action::from_key("grab"), None);
+        assert_eq!(Controls::from_json(r#"{"right":{"grip":"grab"}}"#), None);
     }
 
     #[test]
@@ -490,11 +487,10 @@ mod tests {
     }
 
     #[test]
-    fn a_mapping_with_missing_or_unknown_entries_loads_the_rest() {
-        let text = r#"{"right":{"trigger":"right_click","grip":"teleport"}}"#;
+    fn a_mapping_with_missing_entries_keeps_the_standard_action_of_each() {
+        let text = r#"{"right":{"trigger":"right_click","grip":"nothing"}}"#;
         let controls = Controls::from_json(text).unwrap();
         assert_eq!(controls.right.trigger, Action::RightClick);
-        // The unknown action is nothing, and what the text leaves out keeps its standard action
         assert_eq!(controls.right.grip, Action::Nothing);
         assert_eq!(controls.right.primary, Action::RightClick);
         assert_eq!(controls.left, HandControls::standard(Hand::Left));
@@ -510,7 +506,7 @@ mod tests {
         // The menu button has no mouse button
         assert!(!controls.set(Hand::Left, Control::Menu, Action::RightClick));
         assert_eq!(controls, Controls::default());
-        let loaded = Controls::from_json(r#"{"left":{"trigger":"scroll","stick_vertical":"grab"}}"#).unwrap();
+        let loaded = Controls::from_json(r#"{"left":{"trigger":"scroll","stick_vertical":"left_click"}}"#).unwrap();
         assert_eq!((loaded.left.trigger, loaded.left.stick_vertical), (Action::Nothing, Action::Nothing));
     }
 

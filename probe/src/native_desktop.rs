@@ -16,7 +16,7 @@ use cranvr_proto::{
     clock::ClockSync,
     link::ClientLink,
     media::Received,
-    message::{Audio, ClientDatagram, ClientMsg, Cursor, DesktopParams, DesktopWish, HostMsg, Mouse, Pointer, DESKTOP_STREAM},
+    message::{Audio, ClientDatagram, ClientMsg, Cursor, DesktopParams, DesktopWish, HostMsg, Mouse, DESKTOP_STREAM},
 };
 use cranvr_vt::{DecodedFrame, Decoder};
 use std::{
@@ -116,8 +116,7 @@ impl DesktopProbe {
     /// capture for it.
     pub fn wish(&self, link: &ClientLink, enabled: bool, (width, fps): (u32, u8)) {
         let wish = if enabled { DesktopWish { enabled, max_width: width, max_fps: fps } } else { DesktopWish { enabled, max_width: 0, max_fps: 0 } };
-        let message = if self.stream == DESKTOP_STREAM { ClientMsg::Desktop(wish) } else { ClientMsg::DisplayWish { stream: self.stream, wish } };
-        link.duplex.send_control(&message).ok();
+        link.duplex.send_control(&ClientMsg::DisplayWish { stream: self.stream, wish }).ok();
         if !enabled {
             // The decoder and the picture that it holds go with the wish
             self.waiting_key.store(true, Ordering::Relaxed);
@@ -132,11 +131,11 @@ impl DesktopProbe {
 
     pub fn on_message(&self, message: &HostMsg) {
         match message {
-            HostMsg::Desktop(params) | HostMsg::DisplayStream { params, .. } => {
+            HostMsg::DisplayStream { params, .. } => {
                 match params {
                     Some(p) => println!(
-                        "probe: the host runs the stream of {}: {}x{} pixels, {}x{} points, up to {} a second, {} Mbps, visible {}, mirrored {}, cursor in the pictures {}",
-                        self.name(), p.size[0], p.size[1], p.points[0], p.points[1], p.max_fps, p.bitrate_bps / 1_000_000, p.visible, p.flipped, p.cursor_in_video
+                        "probe: the host runs the stream of {}: {}x{} pixels, {}x{} points, up to {} a second, {} Mbps, mirrored {}, cursor in the pictures {}",
+                        self.name(), p.size[0], p.size[1], p.points[0], p.points[1], p.max_fps, p.bitrate_bps / 1_000_000, p.flipped, p.cursor_in_video
                     ),
                     None => println!("probe: the host runs no stream of {} for this client", self.name()),
                 }
@@ -250,21 +249,15 @@ impl DesktopProbe {
     /// script of six seconds repeats. The left button goes down for 200 ms at the end of the first
     /// second, the right button at the end of the third and the middle button at the end of the
     /// fifth. The thumbstick leans forward for a second, then back for a second, and leans to the
-    /// right in the first three seconds of the six and to the left in the others. A probe of
-    /// protocol version 6 or older sends the older `Pointer`: a trigger for the left button and one
-    /// axis. `mouse` says that the host reads `Mouse`.
-    pub fn pointer_script(mouse: bool, send: impl Fn(ClientDatagram) + Send + 'static, stopped: impl Fn() -> bool + Send + 'static) {
+    /// right in the first three seconds of the six and to the left in the others.
+    pub fn pointer_script(stream: u8, send: impl Fn(ClientDatagram) + Send + 'static, stopped: impl Fn() -> bool + Send + 'static) {
         thread::Builder::new()
             .name("pointer-script".into())
             .spawn(move || {
                 let start = Instant::now();
                 let (mut seq, mut next) = (0u32, start);
                 let datagram = |seq: u32, hit: Option<[f32; 2]>, buttons: u8, scroll: [f32; 2]| {
-                    if mouse {
-                        ClientDatagram::Mouse(Mouse { seq, sent: now_ns(), hit, buttons, scroll })
-                    } else {
-                        ClientDatagram::Pointer(Pointer { seq, sent: now_ns(), hit, trigger: f32::from(buttons & controls::mouse::LEFT), scroll: scroll[1] })
-                    }
+                    ClientDatagram::DisplayMouse { stream, mouse: Mouse { seq, sent: now_ns(), hit, buttons, scroll } }
                 };
                 while !stopped() {
                     let t = start.elapsed().as_secs_f32();

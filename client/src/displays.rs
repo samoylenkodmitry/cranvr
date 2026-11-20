@@ -22,9 +22,8 @@
 //! One uplink thread ([`uplink`]) sends the wishes, the pointers, the requests for key frames and the
 //! requests to add or remove a display.
 //!
-//! A host of an older protocol version offers one display and no list: the first display then gets
-//! the entry "Mac display". It hides that display while a game runs, which is how this client learns
-//! that a game runs. A host of version 8 says so with `HostMsg::GameRuns`.
+//! The host says that a game runs with `HostMsg::GameRuns`. It hides no display for a game: this client
+//! decides which displays to show.
 //!
 //! The decoder lives in a mutex because the composition thread must drop it before the surface's
 //! end callback returns, while the decode thread feeds it.
@@ -42,10 +41,9 @@ use cranvr_proto::{
     media::Received,
     message::{
         display_index, display_stream, ClientDatagram, ClientMsg, Cursor, DesktopParams, DesktopWish, DisplayInfo, DisplayList, DisplayRequest, HostMsg,
-        Mouse, Pointer, DESKTOP_STREAM, MAX_DISPLAYS,
+        Mouse, DESKTOP_STREAM, MAX_DISPLAYS,
     },
     wire::Codec,
-    DISPLAYS_VERSION, MOUSE_VERSION,
 };
 use std::{
     sync::{
@@ -294,7 +292,7 @@ impl Slot {
 /// What the client knows of the host's displays and wants of them.
 #[derive(Default)]
 struct State {
-    /// The host's list, when it sent one (protocol version 8)
+    /// The host's list, when it sent one
     list: Option<DisplayList>,
     /// What the user wants of each display now: `None` for a display that is not shown
     wanted: [Option<DesktopWish>; SLOTS],
@@ -331,8 +329,6 @@ pub struct Displays {
     wake: Condvar,
     /// Whether a game runs, as the host said it with `HostMsg::GameRuns`, or `GAME_UNKNOWN`
     game_message: AtomicU8,
-    /// The protocol version of the session, 0 before the first
-    version: std::sync::atomic::AtomicU16,
 }
 
 /// The displays of the process. The activity may rebuild the composition. The link outlives it.
@@ -354,7 +350,7 @@ pub struct DisplayView {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DisplaysView {
     pub displays: Vec<DisplayView>,
-    /// The host can add one more display now. A host of an older version cannot.
+    /// The host can add one more display now
     pub can_add: bool,
     pub notice: Option<String>,
 }
@@ -367,14 +363,12 @@ impl Displays {
             uplink: Mutex::new(Uplink::default()),
             wake: Condvar::new(),
             game_message: AtomicU8::new(GAME_UNKNOWN),
-            version: std::sync::atomic::AtomicU16::new(0),
         }
     }
 
     /// A session begins. A headset shows displays and asks the host for them. Returns the receiver of
     /// each display's pictures, for its decode thread.
-    pub fn session_start(&self, in_headset: bool, version: u16) -> Vec<mpsc::Receiver<Received>> {
-        self.version.store(version, Ordering::Relaxed);
+    pub fn session_start(&self, in_headset: bool) -> Vec<mpsc::Receiver<Received>> {
         self.game_message.store(GAME_UNKNOWN, Ordering::Relaxed);
         *self.state.lock().unwrap() = State::default();
         *self.uplink.lock().unwrap() = Uplink::default();
@@ -411,7 +405,7 @@ impl Displays {
 
     /// Copies what the frame loop and the composition read into `quick`.
     fn publish(&self, slot: &Slot, inner: &Inner) {
-        let shown = inner.params.filter(|p| inner.active && p.visible);
+        let shown = inner.params.filter(|_| inner.active);
         if let Some(p) = shown {
             slot.quick.aspect.store((p.size[0] as f32 / p.size[1].max(1) as f32).to_bits(), Ordering::Relaxed);
         }
@@ -427,7 +421,6 @@ impl Displays {
     /// stream and whether a game runs.
     pub fn on_message(&self, message: &HostMsg) {
         match message {
-            HostMsg::Desktop(params) => self.on_params(DESKTOP_STREAM, *params),
             HostMsg::DisplayStream { stream, params } => self.on_params(*stream, *params),
             HostMsg::DecoderConfig { stream, config, .. } => {
                 if let Some(slot) = slot_of(*stream).map(|i| &self.slots[i]) {
@@ -471,7 +464,7 @@ impl Displays {
         let mut inner = slot.inner.lock().unwrap();
         match params {
             Some(p) => log::info!(
-                "displays: the host offers {}x{} pixels ({}x{} points) for display {}, up to {} a second, {:.0} Mbps, {}, mirrored: {}",
+                "displays: the host offers {}x{} pixels ({}x{} points) for display {}, up to {} a second, {:.0} Mbps, mirrored: {}",
                 p.size[0],
                 p.size[1],
                 p.points[0],
@@ -479,7 +472,6 @@ impl Displays {
                 index + 1,
                 p.max_fps,
                 p.bitrate_bps as f64 / 1e6,
-                if p.visible { "visible" } else { "hidden" },
                 p.flipped
             ),
             None => log::info!("displays: the host runs no video of display {} for this client", index + 1),
@@ -558,28 +550,19 @@ impl Displays {
         slot_of(stream).is_some_and(|index| self.slots[index].quick.cursor_in_video.load(Ordering::Relaxed))
     }
 
-    /// Whether a game runs on the host, as far as the displays tell. A host of version 8 says it in a
-    /// message. A host of an older version hides its one display for a game. `None` while neither
-    /// says anything.
+    /// Whether a game runs on the host, as the host said it. `None` before it says anything.
     pub fn game_runs(&self) -> Option<bool> {
         match self.game_message.load(Ordering::Relaxed) {
-            GAME_YES => return Some(true),
-            GAME_NO => return Some(false),
-            _ => {}
+            GAME_YES => Some(true),
+            GAME_NO => Some(false),
+            _ => None,
         }
-        let params = *self.slots[0].quick.params.lock().unwrap();
-        params.filter(|(_, active)| *active).map(|(p, _)| !p.visible)
     }
 
-    /// The list for the menu. A host of an older version gets the one entry for its one display.
+    /// The list for the menu
     pub fn menu_view(&self) -> DisplaysView {
         let state = self.state.lock().unwrap();
-        let mut infos: Vec<DisplayInfo> = state.list.as_ref().map(|list| list.displays.clone()).unwrap_or_default();
-        if state.list.is_none() {
-            if let Some((p, _)) = *self.slots[0].quick.params.lock().unwrap() {
-                infos.push(DisplayInfo { stream: DESKTOP_STREAM, name: "Mac display".into(), points: [p.points[0] as u32, p.points[1] as u32], removable: false });
-            }
-        }
+        let infos: Vec<DisplayInfo> = state.list.as_ref().map(|list| list.displays.clone()).unwrap_or_default();
         let displays = infos
             .into_iter()
             .map(|info| {
@@ -592,15 +575,12 @@ impl Displays {
         DisplaysView { displays, can_add: state.list.as_ref().is_some_and(|l| l.can_add), notice: state.list.as_ref().and_then(|l| l.notice.clone()) }
     }
 
-    /// Keeps the wishes for the displays that exist: the host's list when it sent one, else the first
-    /// display. A wish for a display that the host does not have has no answer.
+    /// Keeps the wishes for the displays that the host listed. A wish for a display that the host does
+    /// not have has no answer, and before the list no display exists.
     pub fn existing(&self, mut wishes: [Option<DesktopWish>; SLOTS]) -> [Option<DesktopWish>; SLOTS] {
         let state = self.state.lock().unwrap();
         for (index, wish) in wishes.iter_mut().enumerate() {
-            let exists = match &state.list {
-                Some(list) => list.displays.iter().any(|d| d.stream == display_stream(index as u8)),
-                None => index == 0,
-            };
+            let exists = state.list.as_ref().is_some_and(|list| list.displays.iter().any(|d| d.stream == display_stream(index as u8)));
             if !exists {
                 *wish = None;
             }
@@ -708,7 +688,7 @@ impl Inner {
     /// is made when the surface, the stream and its parameter sets are all there.
     fn rebuild(&mut self, owner: &Displays, stream: u8) {
         let wanted = match (&self.surface, self.params) {
-            (Some(surface), Some(p)) if self.active && p.visible && !self.config.is_empty() => Some((surface.clone(), p.size)),
+            (Some(surface), Some(p)) if self.active && !self.config.is_empty() => Some((surface.clone(), p.size)),
             _ => None,
         };
         if wanted == self.built_for && (wanted.is_none() || self.decoder.is_some()) {
@@ -878,11 +858,10 @@ fn lines_of(index: usize, inner: &Inner) -> Option<String> {
     let decoder = inner.frames.as_ref().map(DecodedFrames::stats).unwrap_or_default();
     let ms = |d: Duration| d.as_secs_f32() * 1000.0;
     let c = &inner.counts;
-    let state = match (&inner.decoder_error, inner.decoder.is_some(), params.visible) {
-        (Some(e), _, _) => format!("no decoder: {e}"),
-        (None, true, _) => "decoding".to_string(),
-        (None, false, false) => "hidden: a game runs".to_string(),
-        (None, false, true) => "waiting for the surface or the stream".to_string(),
+    let state = match (&inner.decoder_error, inner.decoder.is_some()) {
+        (Some(e), _) => format!("no decoder: {e}"),
+        (None, true) => "decoding".to_string(),
+        (None, false) => "waiting for the surface or the stream".to_string(),
     };
     Some(format!(
         "{}{state}; {}x{} pixels; {} pictures ({} key, {} skipped, {} refused), {:.1} MB; decoder {} decoded, {:.2} ms mean, {:.2} ms last, {:.2} ms longest, {} dropped",
@@ -971,31 +950,11 @@ pub fn wishes_of(layout: &Layout) -> [Option<DesktopWish>; SLOTS] {
     wishes
 }
 
-/// The message for the wish of a display, in the form of the host's protocol version. A host of an
-/// older version knows only the first display.
-fn wish_message(stream: u8, wish: DesktopWish) -> ClientMsg {
-    if stream == DESKTOP_STREAM {
-        ClientMsg::Desktop(wish)
-    } else {
-        ClientMsg::DisplayWish { stream, wish }
-    }
-}
-
-/// The datagram for a pointer on a display, in the form of the host's protocol version. The first
-/// display uses the datagrams of the older versions. A host of version 6 has the trigger and one axis
-/// only: the left button is its trigger, and the forward lean its scroll.
-fn pointer_datagram(version: u16, stream: u8, seq: u32, pointer: &PointerNow) -> ClientDatagram {
-    let sent = cranvr_proto::clock::now_ns();
-    if version >= MOUSE_VERSION {
-        let mouse = Mouse { seq, sent, hit: pointer.hit, buttons: pointer.buttons, scroll: pointer.scroll };
-        if stream == DESKTOP_STREAM {
-            ClientDatagram::Mouse(mouse)
-        } else {
-            ClientDatagram::DisplayMouse { stream, mouse }
-        }
-    } else {
-        let left = pointer.buttons & mouse::LEFT != 0;
-        ClientDatagram::Pointer(Pointer { seq, sent, hit: pointer.hit, trigger: if left { 1.0 } else { 0.0 }, scroll: pointer.scroll[1] })
+/// The datagram for the mouse on a display
+fn pointer_datagram(stream: u8, seq: u32, pointer: &PointerNow) -> ClientDatagram {
+    ClientDatagram::DisplayMouse {
+        stream,
+        mouse: Mouse { seq, sent: cranvr_proto::clock::now_ns(), hit: pointer.hit, buttons: pointer.buttons, scroll: pointer.scroll },
     }
 }
 
@@ -1010,7 +969,6 @@ pub fn uplink(link: &ClientLink, stop: &AtomicBool) {
     if !owner.slots[0].inner.lock().unwrap().active || cranpose::launch_args().boolean("desktop") == Some(false) {
         return;
     }
-    let newer = link.welcome.version >= DISPLAYS_VERSION;
     let mut last_key = [Instant::now() - KEY_REQUEST_GAP; SLOTS];
     let mut last_send = [Instant::now(); SLOTS];
     let mut seq = [0u32; SLOTS];
@@ -1033,10 +991,6 @@ pub fn uplink(link: &ClientLink, stop: &AtomicBool) {
             let mut state = owner.state.lock().unwrap();
             let mut changes = Vec::new();
             for index in 0..SLOTS {
-                // A host of an older version has the first display only
-                if !newer && index > 0 {
-                    continue;
-                }
                 let wanted = state.wanted[index];
                 match state.sent[index] {
                     Some(sent) if sent == wanted => {}
@@ -1058,15 +1012,13 @@ pub fn uplink(link: &ClientLink, stop: &AtomicBool) {
                 stream - DESKTOP_STREAM + 1,
                 if wish.enabled { format!(" at up to {} pixels across and {} pictures a second", wish.max_width, wish.max_fps) } else { String::new() }
             );
-            link.duplex.send_control(&wish_message(stream, wish)).ok();
+            link.duplex.send_control(&ClientMsg::DisplayWish { stream, wish }).ok();
         }
-        if newer {
-            for _ in 0..adds {
-                link.duplex.send_control(&ClientMsg::Display(DisplayRequest::Add)).ok();
-            }
-            for stream in removes {
-                link.duplex.send_control(&ClientMsg::Display(DisplayRequest::Remove { stream })).ok();
-            }
+        for _ in 0..adds {
+            link.duplex.send_control(&ClientMsg::Display(DisplayRequest::Add)).ok();
+        }
+        for stream in removes {
+            link.duplex.send_control(&ClientMsg::Display(DisplayRequest::Remove { stream })).ok();
         }
         for index in 0..SLOTS {
             if keys[index] && last_key[index].elapsed() >= KEY_REQUEST_GAP {
@@ -1079,7 +1031,7 @@ pub fn uplink(link: &ClientLink, stop: &AtomicBool) {
             let pointer = pointers[index];
             if pointer_dirty[index] || (pointer.busy() && last_send[index].elapsed() >= POINTER_KEEPALIVE) {
                 last_send[index] = Instant::now();
-                let datagram = pointer_datagram(link.welcome.version, display_stream(index as u8), seq[index], &pointer);
+                let datagram = pointer_datagram(display_stream(index as u8), seq[index], &pointer);
                 seq[index] = seq[index].wrapping_add(1);
                 link.duplex.send_datagram(&datagram).ok();
                 pointers_sent += 1;
@@ -1119,7 +1071,7 @@ mod tests {
     use cranpose::PointerButton;
     use cranvr_proto::wire::Codec;
 
-    fn params(stream: u8, visible: bool) -> DesktopParams {
+    fn params(stream: u8) -> DesktopParams {
         DesktopParams {
             stream,
             codec: Codec::Hevc,
@@ -1129,7 +1081,6 @@ mod tests {
             bitrate_bps: 40_000_000,
             full_range: true,
             flipped: false,
-            visible,
             cursor_in_video: true,
         }
     }
@@ -1143,36 +1094,28 @@ mod tests {
     }
 
     /// A set of displays that no other test shares, in a session that shows displays
-    fn fresh(version: u16) -> Displays {
+    fn fresh() -> Displays {
         let owner = Displays::new();
-        let _units = owner.session_start(true, version);
+        let _units = owner.session_start(true);
         owner
     }
 
     #[test]
-    fn a_host_of_version_8_says_that_a_game_runs_and_a_host_of_an_older_version_hides_its_display() {
-        let owner = fresh(8);
+    fn the_host_says_that_a_game_runs() {
+        let owner = fresh();
         assert_eq!(owner.game_runs(), None);
         owner.on_message(&HostMsg::GameRuns(true));
         assert_eq!(owner.game_runs(), Some(true));
         owner.on_message(&HostMsg::GameRuns(false));
         assert_eq!(owner.game_runs(), Some(false));
-
-        // A host of version 7 offers the first display and hides it while a game runs
-        let old = fresh(7);
-        assert_eq!(old.game_runs(), None);
-        old.on_message(&HostMsg::Desktop(Some(params(DESKTOP_STREAM, true))));
-        assert_eq!(old.game_runs(), Some(false));
-        old.on_message(&HostMsg::Desktop(Some(params(DESKTOP_STREAM, false))));
-        assert_eq!(old.game_runs(), Some(true));
-        // A session that shows no display says nothing of a game
-        old.session_end();
-        assert_eq!(old.game_runs(), None);
+        // A new session knows nothing of a game
+        owner.session_end();
+        assert_eq!(owner.game_runs(), None);
     }
 
     #[test]
-    fn the_menu_lists_the_hosts_displays_and_a_host_of_an_older_version_gets_one_entry() {
-        let owner = fresh(8);
+    fn the_menu_lists_the_hosts_displays() {
+        let owner = fresh();
         assert!(owner.menu_view().displays.is_empty());
         owner.on_message(&HostMsg::Displays(DisplayList { displays: vec![info(1, false), info(2, true)], can_add: true, notice: Some("one".into()) }));
         let view = owner.menu_view();
@@ -1180,30 +1123,22 @@ mod tests {
         assert!(view.can_add);
         assert_eq!(view.notice.as_deref(), Some("one"));
         assert_eq!(owner.listed_streams(), Some(vec![1, 2]));
-
-        let old = fresh(7);
-        assert!(old.menu_view().displays.is_empty());
-        old.on_message(&HostMsg::Desktop(Some(params(DESKTOP_STREAM, true))));
-        let view = old.menu_view();
-        assert_eq!(view.displays.len(), 1);
-        assert_eq!((view.displays[0].info.name.as_str(), view.displays[0].info.removable, view.can_add), ("Mac display", false, false));
-        assert_eq!(old.listed_streams(), None);
     }
 
     #[test]
     fn only_the_displays_that_exist_are_asked_for() {
         let wishes = [Some(wish(3840)), Some(wish(2560)), Some(wish(2560)), None];
-        // Before the host's list only the first display exists, as for a host of an older version
-        let owner = fresh(8);
-        assert_eq!(owner.existing(wishes), [Some(wish(3840)), None, None, None]);
+        // Before the host's list no display exists
+        let owner = fresh();
+        assert_eq!(owner.existing(wishes), [None; SLOTS]);
         owner.on_message(&HostMsg::Displays(DisplayList { displays: vec![info(1, false), info(3, true)], can_add: false, notice: None }));
         assert_eq!(owner.existing(wishes), [Some(wish(3840)), None, Some(wish(2560)), None]);
     }
 
     #[test]
     fn a_display_that_leaves_the_list_loses_its_stream() {
-        let owner = fresh(8);
-        owner.on_message(&HostMsg::DisplayStream { stream: 2, params: Some(params(2, true)) });
+        let owner = fresh();
+        owner.on_message(&HostMsg::DisplayStream { stream: 2, params: Some(params(2)) });
         assert!(owner.slots[1].quick.params.lock().unwrap().is_some());
         owner.on_message(&HostMsg::Displays(DisplayList { displays: vec![info(1, false)], can_add: true, notice: None }));
         assert!(owner.slots[1].quick.params.lock().unwrap().is_none());
@@ -1212,7 +1147,7 @@ mod tests {
 
     #[test]
     fn a_change_of_the_wish_and_a_request_to_add_wake_the_uplink() {
-        let owner = fresh(8);
+        let owner = fresh();
         owner.uplink.lock().unwrap().dirty = false;
         owner.set_wanted([None; SLOTS]);
         assert!(!owner.uplink.lock().unwrap().dirty, "the same wish is nothing new");
@@ -1228,7 +1163,7 @@ mod tests {
 
     #[test]
     fn a_pointer_goes_to_the_display_that_the_ray_is_on() {
-        let owner = fresh(8);
+        let owner = fresh();
         owner.uplink.lock().unwrap().pointer_dirty = [false; SLOTS];
         owner.update_pointers(3, |pointers| pointers.on_event(Hand::Right, PointerEventKind::Enter, [0.5, 0.5]));
         let uplink = owner.uplink.lock().unwrap();
@@ -1245,7 +1180,7 @@ mod tests {
 
     #[test]
     fn the_cursor_of_a_display_is_the_newest_datagram_on_the_display() {
-        let owner = fresh(8);
+        let owner = fresh();
         owner.on_cursor(2, Cursor { seq: 5, u: 0.2, v: 0.3, on: true });
         owner.on_cursor(2, Cursor { seq: 4, u: 0.9, v: 0.9, on: true });
         assert_eq!(owner.cursor(2), Some([0.2, 0.3]));
@@ -1380,21 +1315,15 @@ mod tests {
     }
 
     #[test]
-    fn each_display_and_each_protocol_version_has_its_datagram() {
+    fn each_display_names_its_stream_in_the_mouse_datagram() {
         let pointer = PointerNow { hit: Some([0.1, 0.2]), buttons: mouse::LEFT | mouse::RIGHT, scroll: [0.3, 0.6] };
-        // The first display uses the datagrams of the older versions: Mouse, and Pointer for a host of version 6
-        match pointer_datagram(8, DESKTOP_STREAM, 4, &pointer) {
-            ClientDatagram::Mouse(m) => assert_eq!((m.seq, m.hit, m.buttons, m.scroll), (4, Some([0.1, 0.2]), mouse::LEFT | mouse::RIGHT, [0.3, 0.6])),
-            other => panic!("{other:?}"),
-        }
-        match pointer_datagram(6, DESKTOP_STREAM, 5, &pointer) {
-            ClientDatagram::Pointer(p) => assert_eq!((p.seq, p.hit, p.trigger, p.scroll), (5, Some([0.1, 0.2]), 1.0, 0.6)),
-            other => panic!("{other:?}"),
-        }
-        // Another display names its stream
-        match pointer_datagram(8, 3, 6, &pointer) {
-            ClientDatagram::DisplayMouse { stream, mouse } => assert_eq!((stream, mouse.seq, mouse.buttons), (3, 6, mouse::LEFT | mouse::RIGHT)),
-            other => panic!("{other:?}"),
+        for (stream, seq) in [(DESKTOP_STREAM, 4), (3, 6)] {
+            match pointer_datagram(stream, seq, &pointer) {
+                ClientDatagram::DisplayMouse { stream: named, mouse } => {
+                    assert_eq!((named, mouse.seq, mouse.hit, mouse.buttons, mouse.scroll), (stream, seq, Some([0.1, 0.2]), mouse::LEFT | mouse::RIGHT, [0.3, 0.6]))
+                }
+                other => panic!("{other:?}"),
+            }
         }
     }
 

@@ -29,9 +29,8 @@ use cranvr_proto::{
     link::ClientLink,
     message::{buttons as bit, ClientDatagram, ClientMsg, Focus, HandInput, Input, InputHold, Recenter, Tracking, Views},
     motion::velocities,
-    tracking::{Body, Eyes, Face, Features, Hand, Hands, Joint, TRACKING_VERSION},
+    tracking::{Body, Eyes, Face, Features, Hand, Hands, Joint},
     wire::{Fov, Motion, Nanos, Pose},
-    DISPLAYS_VERSION,
 };
 use std::{
     sync::{
@@ -630,10 +629,8 @@ pub fn send_loop(link: &ClientLink, feed: &Feed, tracked: bool, refresh_hz: f32,
     let mut deadline = Instant::now();
     let mut sent_views = hello_views;
     let mut sent_floor: Option<f32> = None;
-    // The features that the host heard that the headset offers. A host of an older protocol version
-    // knows no such message.
+    // The features that the host heard that the headset offers
     let mut sent_offer: Option<Features> = None;
-    let sends_tracking = link.welcome.version >= TRACKING_VERSION;
     let mut outgoing = Outgoing::default();
     let mut buffer = Box::new(TrackedFrame::new());
     // A host takes a client that never says anything as focused
@@ -694,7 +691,7 @@ pub fn send_loop(link: &ClientLink, feed: &Feed, tracked: bool, refresh_hz: f32,
             let offer = feed.offer();
             if sent_offer != Some(offer) {
                 log::info!("the headset offers {}", describe(offer));
-                if sends_tracking && !(sent_offer.is_none() && offer.is_empty()) {
+                if !(sent_offer.is_none() && offer.is_empty()) {
                     link.duplex.send_control(&ClientMsg::TrackingOffer(offer)).ok();
                 }
                 sent_offer = Some(offer);
@@ -714,14 +711,9 @@ pub fn send_loop(link: &ClientLink, feed: &Feed, tracked: bool, refresh_hz: f32,
         }
         // The input goes out with every sample. A datagram may get lost, and the host takes the
         // changes from the values that it sees, so a lost one leaves a button wrong for one frame.
-        // A host of version 8 gets the hands that the app holds back from the game in the same datagram, so
-        // no press of such a hand reaches the game before the hold does
-        let datagram = if link.welcome.version >= DISPLAYS_VERSION {
-            ClientDatagram::InputHold(InputHold { input: frame.input, held: frame.held })
-        } else {
-            ClientDatagram::Input(frame.input)
-        };
-        link.duplex.send_datagram(&datagram).ok();
+        // The hands that the app holds back from the game go in the same datagram, so no press of such a
+        // hand reaches the game before the hold does
+        link.duplex.send_datagram(&ClientDatagram::InputHold(InputHold { input: frame.input, held: frame.held })).ok();
         // The hands, the body, the face and the eyes that the host wished, of the same sample
         let wish = feed.wish();
         if from_headset && !wish.is_empty() && feed.take_tracked(&mut buffer) && buffer.sample_time == frame.sample_time && !send_tracked(link, &buffer, wish, &mut outgoing) {

@@ -3,25 +3,23 @@
 //! its own stream, wish, capture, encoder and pointer. A display that the client does not wish has no
 //! capture and no encoder, sends nothing and follows no cursor.
 //!
-//! The client shows the desktop as a movable panel, a surface that a hardware decoder writes
+//! The client shows a display as a movable panel, a surface that a hardware decoder writes
 //! into. The compositor then samples the picture once, at the display's own resolution, so text
-//! stays sharp. This file sends the pictures and takes the pointer:
-//! - The client asks with `ClientMsg::Desktop`. The host captures the display at its full pixel
-//!   size (ScreenCaptureKit, YUV 4:2:0), encodes it with a second HEVC session and sends each
-//!   picture as a unit of the stream `DESKTOP_STREAM`. ScreenCaptureKit gives a picture only when
-//!   the display changes, so a still desktop costs nothing. A key frame goes out at the start,
-//!   after a loss that the client reports and when the desktop becomes visible again.
+//! stays sharp. This file sends the pictures and takes the mouse:
+//! - The client asks with `ClientMsg::DisplayWish`. The host captures the display at the size that
+//!   the wish allows (ScreenCaptureKit, YUV 4:2:0), encodes it with an HEVC session of its own and
+//!   sends each picture as a unit of the display's stream. ScreenCaptureKit gives a picture only when
+//!   the display changes, so a still desktop costs nothing. A key frame goes out at the start and
+//!   after a loss that the client reports.
 //! - The pictures are not mirrored: Cranpose's compositor layer already turns a decoder's surface
 //!   upright.
 //! - The cursor's position goes out as a datagram every 2 ms while the Mac's mouse moves.
-//! - `ClientDatagram::Mouse` carries where the controller that owns the mouse points on the panel,
+//! - `ClientDatagram::DisplayMouse` carries where the controller that owns the mouse points on the panel,
 //!   the mouse buttons that it holds (left, right, middle) and its thumbstick's lean in two axes.
-//!   `ClientDatagram::Pointer` is the older form with a trigger and one axis, from a client of
-//!   protocol version 6. The host moves the Mac's mouse, clicks and scrolls (`desktop::Pointer`).
-//! - `LayerState` tells the frame loop that the client shows the desktop, so the eye stream leaves
-//!   its own copy of the screen out. It tells the display that a game runs: a client of an older
-//!   protocol version then gets the display hidden. A client of version 8 hears of the game in a
-//!   message of its own and decides itself which displays to show.
+//!   The host moves the Mac's mouse, clicks and scrolls (`desktop::Pointer`).
+//! - `LayerState` tells the frame loop that the client owns the panels of the Mac's displays, so the
+//!   eye stream leaves its own copy of the screen out. The host hides no display for a game: the client
+//!   hears that a game runs (`HostMsg::GameRuns`) and decides itself which displays to show.
 
 use super::Session;
 use crate::{
@@ -32,8 +30,7 @@ use log::{info, warn};
 use cranvr_proto::{
     clock::now_ns,
     media::FrameMeta,
-    message::{Cursor, DesktopParams, DesktopWish, HostDatagram, HostMsg, Mouse, Pointer, DESKTOP_STREAM},
-    DISPLAYS_VERSION,
+    message::{Cursor, DesktopParams, DesktopWish, HostDatagram, HostMsg, Mouse, DESKTOP_STREAM},
     wire::{Codec, Pose, Rect},
 };
 use cranvr_vt::{EncodedFrame, Encoder, EncoderConfig, Flipper};
@@ -55,13 +52,12 @@ pub struct Options {
     pub enabled: bool,
     /// The display to capture, or `None` for the main display
     pub display_id: Option<u32>,
-    /// The flags that the frame loop reads: the client shows the desktop, a game hides it
+    /// The flags that the frame loop reads: the client shows the display
     pub layer: Arc<LayerState>,
     /// The picture stream's average bitrate at the full size and rate (see [`scaled_mbps`])
     pub mbps: u64,
-    /// The stream that carries this display's pictures. The first display has `DESKTOP_STREAM`, and
-    /// it talks in the messages of the older versions. The displays that the client adds have the
-    /// streams after it (see `displays.rs`).
+    /// The stream that carries this display's pictures. The first display has `DESKTOP_STREAM`. The
+    /// displays that the client adds have the streams after it (see `displays.rs`).
     pub stream: u8,
 }
 
@@ -123,7 +119,7 @@ struct Inner {
     key: AtomicBool,
     /// The display of the running capture, for the pointer. 0 while none runs.
     display: AtomicU32,
-    pointer: Sender<PointerIn>,
+    pointer: Sender<Mouse>,
     stop: AtomicBool,
     counters: Counters,
 }
@@ -138,30 +134,15 @@ pub(super) struct DisplayCounts {
 }
 
 impl Inner {
-    /// The name of this display in the log. The first display keeps the name of the older versions.
+    /// The name of this display in the log
     fn label(&self) -> String {
-        match self.options.stream {
-            DESKTOP_STREAM => "Native desktop".to_string(),
-            stream => format!("Native display {}", stream - DESKTOP_STREAM + 1),
-        }
+        format!("Native display {}", self.options.stream - DESKTOP_STREAM + 1)
     }
 
     /// Tells the client the state of this display's video: its parameters, or `None` while the host
-    /// runs none. The first display uses the message of the older versions, so a client that knows
-    /// no other one still shows it.
+    /// runs none.
     fn announce(&self, session: &Session, params: Option<DesktopParams>) {
-        let message = match self.options.stream {
-            DESKTOP_STREAM => HostMsg::Desktop(params),
-            stream => HostMsg::DisplayStream { stream, params },
-        };
-        session.link.duplex.send_control(&message).ok();
-    }
-
-    /// Whether the game hides this display from the client. A client of an older version learns
-    /// that a game runs only from the hiding. A client of this version gets the game's state in a
-    /// message of its own and decides itself which displays to show, so the host hides none for it.
-    fn hidden_by_game(&self, session: &Session) -> bool {
-        self.options.layer.game.load(Ordering::Relaxed) && session.version < DISPLAYS_VERSION
+        session.link.duplex.send_control(&HostMsg::DisplayStream { stream: self.options.stream, params }).ok();
     }
 }
 
@@ -243,55 +224,21 @@ impl Desktop {
         self.inner.options.stream
     }
 
-    /// The client lost a picture of the desktop stream.
+    /// The client lost a picture of this display's stream.
     pub(super) fn request_key_frame(&self) {
         self.inner.key.store(true, Ordering::Relaxed);
     }
 
-    pub(super) fn on_pointer(&self, pointer: Pointer) {
-        self.inner.counters.pointer_datagrams.fetch_add(1, Ordering::Relaxed);
-        self.inner.pointer.send(PointerIn::Trigger(pointer)).ok();
-    }
-
     pub(super) fn on_mouse(&self, mouse: Mouse) {
         self.inner.counters.pointer_datagrams.fetch_add(1, Ordering::Relaxed);
-        self.inner.pointer.send(PointerIn::Mouse(mouse)).ok();
+        self.inner.pointer.send(mouse).ok();
     }
 }
 
-/// What the client says about the pointer, in the form of its protocol version.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum PointerIn {
-    /// Version 6: one controller with a trigger and one axis
-    Trigger(Pointer),
-    /// Version 7: the mouse buttons and two axes
-    Mouse(Mouse),
-}
-
-impl PointerIn {
-    fn seq(&self) -> u32 {
-        match self {
-            PointerIn::Trigger(p) => p.seq,
-            PointerIn::Mouse(m) => m.seq,
-        }
-    }
-
-    /// Whether the host has more to do for it than to wait: the controller points at the panel or
-    /// holds a button
-    fn busy(&self) -> bool {
-        match self {
-            PointerIn::Trigger(p) => p.hit.is_some() || p.trigger > 0.4,
-            PointerIn::Mouse(m) => m.hit.is_some() || m.buttons != 0,
-        }
-    }
-
-    /// Moves the Mac's mouse as the datagram says. `scroll_scale` is as in `desktop::Pointer`.
-    fn apply(&self, pointer: &mut desktop::Pointer, scroll_scale: f32) {
-        match self {
-            PointerIn::Trigger(p) => pointer.update_scaled(p.hit, p.trigger, p.scroll, scroll_scale),
-            PointerIn::Mouse(m) => pointer.update_mouse(m.hit, m.buttons, m.scroll, scroll_scale),
-        }
-    }
+/// Whether the host has more to do for a mouse datagram than to wait: the controller points at the
+/// panel or holds a button.
+fn busy(mouse: &Mouse) -> bool {
+    mouse.hit.is_some() || mouse.buttons != 0
 }
 
 /// A running capture, its encoder and what the stream has sent so far.
@@ -354,7 +301,6 @@ impl Running {
             bitrate_bps: mbps * 1_000_000,
             full_range: true,
             flipped: flipper.is_some(),
-            visible: true,
             cursor_in_video: cursor_in_video(),
         };
         Ok(Self { capture, encoder, encoded, params, wish, flipper, last_seq: 0, index: 0, key: true, config: None })
@@ -422,26 +368,12 @@ fn desktop_loop(inner: &Inner, session: &Session) {
     inner.display.store(0, Ordering::Relaxed);
 }
 
-/// One pass: visibility, the encode of a new capture and the send of the frames that came out.
+/// One pass: the encode of a new capture and the send of the frames that came out.
 fn step(inner: &Inner, session: &Session, run: &mut Running, next_frame: &mut u32, captured: &Receiver<()>) {
     captured.recv_timeout(Duration::from_millis(5)).ok();
-    // A game hides the display from a client of an older version: the capture stops and the client
-    // takes the panel away. A client of this version decides itself (see `Inner::hidden_by_game`).
-    let visible = !inner.hidden_by_game(session);
-    if visible != run.params.visible {
-        run.params.visible = visible;
-        run.capture.set_running(visible);
-        if visible {
-            run.key = true;
-        }
-        info!("{}: {}", inner.label(), if visible { "visible again" } else { "hidden: a game runs" });
-        inner.announce(session, Some(run.params));
-    }
     // A headset without the input focus gets no new pictures. Its panel keeps the last one.
-    let live = visible && !session.paused();
-    if visible {
-        run.capture.set_running(live);
-    }
+    let live = !session.paused();
+    run.capture.set_running(live);
     if inner.key.swap(false, Ordering::Relaxed) {
         run.key = true;
     }
@@ -566,7 +498,7 @@ impl LogState {
 
 /// Moves the Mac's mouse to where the client says a controller points on the panel, clicks and
 /// scrolls. A client that falls silent with its trigger down gets its button lifted.
-fn pointer_loop(inner: &Inner, receiver: &Receiver<PointerIn>) {
+fn pointer_loop(inner: &Inner, receiver: &Receiver<Mouse>) {
     let mut pointer: Option<desktop::Pointer> = None;
     let mut last_seq: Option<u32> = None;
     let mut last_update = Instant::now();
@@ -597,15 +529,15 @@ fn pointer_loop(inner: &Inner, receiver: &Receiver<PointerIn>) {
             Some(p) => {
                 // UDP may swap datagrams: an older one would move the mouse back. A far older
                 // number means a new client session that counts from 0 again.
-                if last_seq.is_some_and(|last| last.wrapping_sub(p.seq()) < 1000) {
+                if last_seq.is_some_and(|last| last.wrapping_sub(p.seq) < 1000) {
                     continue;
                 }
-                last_seq = Some(p.seq());
+                last_seq = Some(p.seq);
                 // The scroll of one update is 20 pixels at 72 updates a second: scale it to the
                 // time since the last update, so the speed does not depend on the client's rate
                 let dt = now.duration_since(last_update).as_secs_f32().min(0.05);
-                p.apply(pointer, dt * 72.0);
-                active = p.busy();
+                pointer.update_mouse(p.hit, p.buttons, p.scroll, dt * 72.0);
+                active = busy(&p);
                 last_update = now;
             }
             // Every button that is down goes up
@@ -691,11 +623,7 @@ fn cursor_loop(inner: &Inner, session: &Session) {
         let now = Some((u.to_bits(), v.to_bits(), on));
         if now != last || sent.elapsed() >= CURSOR_KEEPALIVE {
             let cursor = Cursor { seq, u, v, on };
-            let datagram = match inner.options.stream {
-                DESKTOP_STREAM => HostDatagram::Cursor(cursor),
-                stream => HostDatagram::DisplayCursor { stream, cursor },
-            };
-            session.link.duplex.send_datagram(&datagram).ok();
+            session.link.duplex.send_datagram(&HostDatagram::DisplayCursor { stream: inner.options.stream, cursor }).ok();
             inner.counters.cursor_datagrams.fetch_add(1, Ordering::Relaxed);
             (seq, last, sent) = (seq.wrapping_add(1), now, Instant::now());
         }

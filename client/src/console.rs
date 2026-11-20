@@ -76,13 +76,13 @@ pub struct Menu {
     /// One short line from the app about something that happens now, such as a game that restarts.
     /// The app writes it into vr-menu.json while it applies.
     pub notice: Option<String>,
-    /// What the buttons of the controllers do, as the cranvr app on the Mac keeps it. A menu from an
-    /// app that does not know the mapping has none.
-    pub controls: Option<Controls>,
+    /// What the buttons of the controllers do, as the cranvr app on the Mac keeps it
+    pub controls: Controls,
 }
 
 impl Menu {
-    /// The menu from the host's text. `None` for a text that is no menu.
+    /// The menu from the host's text. `None` for a text that is no menu: it lacks the games, a
+    /// setting or the controls. The status is the host's own and is missing while no headset streams.
     pub fn parse(text: &str) -> Option<Self> {
         let v: Value = serde_json::from_str(text).ok()?;
         let s = &v["status"];
@@ -93,9 +93,9 @@ impl Menu {
                 .iter()
                 .filter_map(|g| Some(Game { name: g["name"].as_str()?.to_string(), program: g["program"].as_str().unwrap_or_default().to_string() }))
                 .collect(),
-            fps: v["fps"].as_u64().unwrap_or(120) as u32,
-            game_scale: number(&v["game_scale"]).unwrap_or(1.0),
-            msaa: v["msaa"].as_u64().unwrap_or(0) as u32,
+            fps: v["fps"].as_u64()? as u32,
+            game_scale: number(&v["game_scale"])?,
+            msaa: v["msaa"].as_u64()? as u32,
             status: Status {
                 refresh: number(&s["refresh"]).unwrap_or(0.0),
                 fps: number(&s["fps"]).unwrap_or(0.0),
@@ -104,7 +104,7 @@ impl Menu {
                 game: s["game"].as_str().map(str::to_string),
             },
             notice: v["notice"].as_str().filter(|notice| !notice.is_empty()).map(str::to_string),
-            controls: v.get("controls").and_then(|controls| Controls::from_json(&controls.to_string())),
+            controls: Controls::from_json(&v["controls"].to_string())?,
         })
     }
 
@@ -439,21 +439,20 @@ impl Console {
             self.open = !runs;
         }
         let mut changed = None;
-        if let Some(controls) = menu.controls {
-            // A change of the user's shows at once and the Mac repeats it a moment later. A menu that
-            // was on its way before the Mac saw the change must not undo it.
-            let waiting = match self.pending_controls {
-                Some((asked, since)) if controls == asked || now.saturating_duration_since(since) > ECHO_WAIT => {
-                    self.pending_controls = None;
-                    false
-                }
-                Some(_) => true,
-                None => false,
-            };
-            if !waiting && controls != self.controls {
-                self.controls = controls;
-                changed = Some(controls);
+        let controls = menu.controls;
+        // A change of the user's shows at once and the Mac repeats it a moment later. A menu that
+        // was on its way before the Mac saw the change must not undo it.
+        let waiting = match self.pending_controls {
+            Some((asked, since)) if controls == asked || now.saturating_duration_since(since) > ECHO_WAIT => {
+                self.pending_controls = None;
+                false
             }
+            Some(_) => true,
+            None => false,
+        };
+        if !waiting && controls != self.controls {
+            self.controls = controls;
+            changed = Some(controls);
         }
         self.menu = Some(menu);
         changed

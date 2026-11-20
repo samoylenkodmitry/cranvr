@@ -42,7 +42,7 @@ An adb tool stops a running adb server of another version. The downloaded copy o
 
 The address entry stays for a Mac on another network, which the search does not reach. Without the Mac's setup, `adb reverse tcp:9950 tcp:9950` and the address `127.0.0.1:9950` still work. The client keeps the last address that you pressed or typed. A start with the extras `--es host ADDRESS --ez connect true` connects to a Mac without a press (`adb shell am start ...`). The extra `--ei usb_port PORT` moves the port that the headset asks on the cable, for a test host on another port.
 
-The Mac and the headset update apart. When the two apps speak different protocol versions, both say which one to update: "Update cranvr on the Mac." or "Update the cranvr app on the headset." A Mac with a cranvr older than the headset's does not appear in the list, because it does not answer the search. Press "Enter an address" and type its address to see the advice. A Mac with an older cranvr that never paired a headset listens on its own address only. The headset then says that the Mac refused the connection. The text names the update of cranvr on the Mac as a cause. A headset that has paired with the Mac keeps connecting while both apps speak a common version. A headset with the older app that the Mac does not know cannot ask: the Mac shows a note that tells you to update the cranvr app on the headset.
+The Mac and the headset speak one protocol version, and both apps come from one commit. When the versions differ, there is no session. The connect panel shows "Update cranvr on the Mac." or "Update the cranvr app on the headset." on the Mac's entry, and the Mac shows a note that names the side to update.
 
 ## Work from the headset
 

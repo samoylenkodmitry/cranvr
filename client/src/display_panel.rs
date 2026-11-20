@@ -66,6 +66,15 @@ fn start_of(stream: u8) -> (Pose, f32) {
     }
 }
 
+/// Where the first display's panel stands and how wide it is before the user carries it, for the
+/// scripted controllers of a test build (`scripted.rs`)
+#[cfg(all(feature = "scripted-hand", target_os = "android"))]
+pub(crate) fn start_panel() -> (Pose, f32) {
+    let (pose, width) = start_of(DESKTOP_STREAM);
+    let name = panel_name(DESKTOP_STREAM);
+    (place::start_pose(name, pose), place::saved_width(name).map_or(width, |width| width.clamp(WIDTH_RANGE[0], WIDTH_RANGE[1])))
+}
+
 /// A test with no controller in the room: `--es desktop_pointer_test circle` sends the pointer of a
 /// controller that circles over the picture of each shown display, pulls its trigger for 0.3 s every 3 s
 /// and leans its thumbstick forward for 2 s every 6 s. The packets go to the host as the surface's events

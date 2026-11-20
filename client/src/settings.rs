@@ -79,6 +79,13 @@ pub fn remember_controls(controls: &Controls) {
     }
 }
 
+/// Whether the launch asks for the connect and stats panels hidden for this launch, with
+/// `--panels=hidden` or the extra `panels`. A headset on a desk has no controller that could press
+/// the ball, and a test of the beams and the models needs the panels hidden. It saves nothing.
+pub fn panels_hidden_on_launch() -> bool {
+    launch_args().string("panels") == Some("hidden")
+}
+
 /// Whether the launch asks to connect at once, with `--connect` or the extra `connect`.
 pub fn connect_on_launch() -> bool {
     launch_args().boolean("connect").unwrap_or(false)

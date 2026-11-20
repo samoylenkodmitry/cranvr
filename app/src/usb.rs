@@ -664,7 +664,7 @@ emulator-5554          device product:sdk_gphone64 model:sdk device:emu64 transp
     }
 
     #[test]
-    fn the_connection_setting_reads_old_settings_files_as_automatic() {
+    fn the_connection_setting_defaults_to_automatic_and_reads_back() {
         assert_eq!(Connection::default(), Connection::Automatic);
         assert_eq!(serde_json::from_str::<Connection>("\"WiFi\"").unwrap(), Connection::WiFi);
         for choice in [Connection::Automatic, Connection::WiFi, Connection::Usb] {

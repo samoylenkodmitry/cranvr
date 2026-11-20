@@ -1,8 +1,8 @@
 //! What the frame loop shares with the headset link's desktop panel, and the console's menu.
 //!
-//! The headset shows the Mac's desktop as a panel (`headset/native/desktop.rs`). The eye stream
-//! then leaves its own copy of the screen out. A game hides the panel. `LayerState` carries these
-//! two facts between the frame loop and the link.
+//! The headset shows the Mac's displays as panels (`headset/native/desktop.rs`). The eye stream
+//! then leaves its own copy of the screen out. `LayerState` carries this fact and whether a game
+//! runs between the frame loop and the link.
 
 use crate::status;
 use std::sync::atomic::{AtomicBool, AtomicU32};
@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32};
 /// What the frame loop and the panel's link share.
 #[derive(Default)]
 pub struct LayerState {
-    /// A game runs: the headset hides the panel
+    /// A game runs: the link tells the client, which decides which panels to show
     pub game: AtomicBool,
     /// The headset shows the panel: the eye stream leaves the screen out
     pub active: AtomicBool,

@@ -123,20 +123,18 @@ fn change(settings: MutableState<Settings>, model: MutableState<Model>, edit: im
     let s = settings.with(Clone::clone);
     s.save();
     if backend::host_running() {
-        let result = backend::start_host(&s, None);
+        let result = backend::start_host(&s);
         model.update(|m| m.message = result.err());
     }
 }
 
-// A start by hand begins a fresh check of the network: old notices go away. A pairing code opens
-// the pairing window of the native protocol for this start only. It serves a headset with the older
-// cranvr app. The window's field for it is gone: a newer headset asks the user with a card.
-fn start_host(settings: MutableState<Settings>, model: MutableState<Model>, pair_code: Option<&str>) {
+// A start by hand begins a fresh check of the network: old notices go away.
+fn start_host(settings: MutableState<Settings>, model: MutableState<Model>) {
     model.update(|m| {
         m.network.clear();
         m.audio = None;
     });
-    let result = backend::start_host(&settings.with(Clone::clone), pair_code);
+    let result = backend::start_host(&settings.with(Clone::clone));
     model.update(|m| {
         m.running = result.is_ok();
         m.message = result.err();
@@ -146,7 +144,7 @@ fn start_host(settings: MutableState<Settings>, model: MutableState<Model>, pair
 /// Games see the headset only while the host runs.
 fn ensure_host(settings: MutableState<Settings>, model: MutableState<Model>) {
     if !backend::host_running() {
-        start_host(settings, model, None);
+        start_host(settings, model);
     }
 }
 
@@ -263,7 +261,7 @@ fn vr_requests(settings: MutableState<Settings>, next: &mut Model, requests: Vec
                 // The anti-aliasing limit applies at a game's start; the rest are the host's options
                 let host_options = |s: &Settings| (s.fps, s.game_scale.to_bits());
                 if host_options(&before) != host_options(&after) && backend::host_running() {
-                    if let Err(e) = backend::start_host(&after, None) {
+                    if let Err(e) = backend::start_host(&after) {
                         next.message = Some(e);
                     }
                 }
@@ -305,7 +303,7 @@ pub fn CranvrApp() {
             }
         }
         if settings.with(|s| s.autostart) && !backend::host_running() {
-            start_host(settings, model, None);
+            start_host(settings, model);
         }
         let mut last_slow = Instant::now();
         loop {
@@ -362,7 +360,7 @@ fn Header(settings: MutableState<Settings>, model: MutableState<Model>) {
             });
         } else {
             Text("Host stopped".to_string(), Modifier::empty().padding(8.0), dim_style());
-            Primary("Start".into(), move || start_host(settings, model, None));
+            Primary("Start".into(), move || start_host(settings, model));
         }
     });
 }
@@ -530,8 +528,8 @@ fn PlayTab(settings: MutableState<Settings>, model: MutableState<Model>) {
     let (state, rosetta, outdated, setup) = model.with(|m| (m.steam, m.rosetta, m.game_support_outdated, m.setup.clone()));
     let open_program = rememberMutableStateOf(|| false);
     let plan = setup::plan(rosetta, state, outdated);
-    // Steam cannot start before the setup. An outdated game support alone leaves it working: the
-    // library shows an Update button then.
+    // Steam cannot start before the setup. An outdated game support starts nothing: the library
+    // shows the Update button alone then.
     let needs_setup = !rosetta || state != SteamState::Ready;
     let running = setup.as_ref().is_some_and(Setup::running);
     Card(move || {
@@ -678,6 +676,7 @@ fn SteamLibrary(settings: MutableState<Settings>, model: MutableState<Model>, la
     let open = rememberMutableStateOf(|| None::<String>);
     if outdated {
         GameSupportUpdate(installed, last);
+        return;
     }
     if !signed_in {
         Label(if running {
@@ -761,11 +760,28 @@ fn LaunchOptions(settings: MutableState<Settings>, program: String) {
             let shown = advanced.get();
             FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
                 let key = key.clone();
+                let one_key = key.clone();
                 Choice("Each eye in its own pass".into(), options.eye_per_pass, move || {
                     edit_launch(settings, &key, |o| {
                         o.eye_per_pass = !o.eye_per_pass;
                         o.eye_per_pass_declined = !o.eye_per_pass;
                         o.eye_per_pass_reason.clear();
+                        // The two options ask for opposite things
+                        if o.eye_per_pass {
+                            o.eye_one_pass = false;
+                            o.eye_one_pass_reason.clear();
+                        }
+                    })
+                });
+                Choice("Both eyes in one pass".into(), options.eye_one_pass, move || {
+                    edit_launch(settings, &one_key, |o| {
+                        o.eye_one_pass = !o.eye_one_pass;
+                        o.eye_one_pass_declined = !o.eye_one_pass;
+                        o.eye_one_pass_reason.clear();
+                        if o.eye_one_pass {
+                            o.eye_per_pass = false;
+                            o.eye_per_pass_reason.clear();
+                        }
                     })
                 });
                 Choice("Advanced".into(), shown, move || advanced.set(!shown));
@@ -773,7 +789,10 @@ fn LaunchOptions(settings: MutableState<Settings>, program: String) {
             if options.eye_per_pass && !options.eye_per_pass_reason.is_empty() {
                 Hint(options.eye_per_pass_reason.clone());
             }
-            Hint("For a game whose right eye stays black. The runtime then refuses two-eye images, so the game draws each eye apart. This costs frames.".into());
+            if options.eye_one_pass && !options.eye_one_pass_reason.is_empty() {
+                Hint(options.eye_one_pass_reason.clone());
+            }
+            Hint("For a game whose right eye stays black. \"Each eye in its own pass\": the runtime refuses two-eye images, so the game draws each eye apart. This costs frames. \"Both eyes in one pass\": for a game that draws both eyes into a picture of its own, as a Unity game with the OpenVR provider does.".into());
             let (own, default_on) = (options.opencomposite, wine.opencomposite);
             let key = program.clone();
             FlowRow(Modifier::empty().fill_max_width(), flow(), move || {

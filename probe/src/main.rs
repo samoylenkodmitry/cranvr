@@ -54,6 +54,7 @@ fn usage() -> ! {
          \n                     each feature that the host asks for. The head stands still.\
          \n  --still-head       the head stands still (as with --tracking), so a game's room is the\
          \n                     probe's room and a game's controller poses match the script\
+         \n  --hands-lift M     both hands play their script M meters higher, into the view of the eyes (default 0)\
          \n  --no-controllers   with --tracking: no controller is tracked, so a game without hand code\
          \n                     gets controllers made of the hands\
          \n  --face-source S    with --tracking: where the face comes from, visual (cameras), audio\
@@ -62,11 +63,11 @@ fn usage() -> ! {
          \n                     the system's menu: the probe tells the host, sends no tracking and no input and\
          \n                     counts the frames that still arrive. The exit code says whether the stream paused\
          \n                     and went on.\
-         \n  --left-trigger AT:FOR  the left trigger goes to 1 at AT seconds and stays for FOR seconds, once.\
-         \n                     The right trigger pulls to 0.75 for half a second in every 3 seconds. A game that\
-         \n                     shows only one pointer at a time, such as a menu, then has its left controller\
-         \n                     pressed for the first time at AT.\
-         \n  --protocol native  accepted and ignored: cranvr's protocol is the only one"
+         \n  --left-trigger AT:FOR  the left trigger goes to 1 at AT seconds and stays for FOR seconds, once. The script\
+         \n                     of the cycle is off then, so the pulls are the only presses. A game that shows one\
+         \n                     pointer at a time, such as a menu, then has its left controller pressed for the\
+         \n                     first time at AT.\
+         \n  --right-trigger AT:FOR  the same for the right trigger"
     );
     std::process::exit(2);
 }
@@ -101,9 +102,11 @@ fn main() {
         tracking: false,
         no_controllers: false,
         still_head: false,
+        hands_lift: 0.0,
         face_source: Default::default(),
         pause: None,
         left_trigger: None,
+        right_trigger: None,
     };
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -112,11 +115,6 @@ fn main() {
             "--seconds" => options.seconds = value().parse().unwrap_or_else(|_| usage()),
             "--game" => options.game = true,
             "--any-picture" => options.any_picture = true,
-            "--protocol" => {
-                if value() != "native" {
-                    usage()
-                }
-            }
             "--connect" => options.connect = value().to_socket_addrs().ok().and_then(|mut a| a.next()).unwrap_or_else(|| usage()),
             "--tcp" => options.tcp = true,
             "--desktop" => options.desktop = true,
@@ -127,8 +125,10 @@ fn main() {
             "--tracking" => options.tracking = true,
             "--no-controllers" => options.no_controllers = true,
             "--still-head" => options.still_head = true,
+            "--hands-lift" => options.hands_lift = value().parse().unwrap_or_else(|_| usage()),
             "--face-source" => options.face_source = tracked::FaceSource::parse(&value()).unwrap_or_else(|| usage()),
             "--left-trigger" => options.left_trigger = Some(parse_pull(&value()).unwrap_or_else(|| usage())),
+            "--right-trigger" => options.right_trigger = Some(parse_pull(&value()).unwrap_or_else(|| usage())),
             "--pause" => options.pause = Some(parse_pause(&value()).unwrap_or_else(|| usage())),
             "--drop-percent" => options.drop_percent = value().parse().unwrap_or_else(|_| usage()),
             _ => usage(),

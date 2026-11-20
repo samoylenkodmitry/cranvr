@@ -2,12 +2,13 @@
 //! arrive in order. Datagram messages may get lost and may arrive late.
 //!
 //! The handshake in order:
-//! 1. Both sides swap a preamble (see [`client_preamble`]) that picks the protocol version.
+//! 1. Both sides swap a preamble (see [`client_preamble`]) that holds the protocol version. A side
+//!    that sees another version than its own ends the exchange with an update message.
 //! 2. The key exchange of [`crate::secure`]: three flights. They prove the keys of both sides and
 //!    give both the keys of the session. Everything below is sealed.
 //! 3. The client sends [`ClientMsg::Hello`] with its capabilities.
 //! 4. The host answers [`HostMsg::Welcome`] with its choices, or [`HostMsg::Reject`]. A host that
-//!    does not know the client (version 5) first sends [`HostMsg::AwaitApproval`]. The client
+//!    does not know the client first sends [`HostMsg::AwaitApproval`]. The client
 //!    answers [`ClientMsg::PairNonce`], the host sends [`HostMsg::PairReveal`], and both show the
 //!    approval code. The host's user compares the codes and allows or denies the client. Then the
 //!    host sends the `Welcome` or `Reject(Denied)`.
@@ -18,74 +19,52 @@
 
 use crate::tracking::{Body, Eyes, Face, Features, Hands};
 use crate::wire::{Codec, Fov, Motion, Nanos, Pose};
-use crate::{Error, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
+use crate::Error;
 use cranvr_common::foveation::FoveationConfig;
 use serde::{Deserialize, Serialize};
 
 /// The first four bytes of both preambles.
 pub const MAGIC: [u8; 4] = *b"CRNV";
 
-/// A range of protocol versions, ends included.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct VersionRange {
-    pub min: u16,
-    pub max: u16,
-}
+/// The client's first bytes on the TCP connection: the magic and its protocol version.
+pub const CLIENT_PREAMBLE_LEN: usize = 6;
+/// The host's answer: the magic and the host's protocol version.
+pub const HOST_PREAMBLE_LEN: usize = 6;
 
-impl VersionRange {
-    /// The versions this crate speaks.
-    pub const OURS: VersionRange = VersionRange { min: MIN_PROTOCOL_VERSION, max: PROTOCOL_VERSION };
-
-    /// The highest version in both ranges.
-    pub fn common(self, other: VersionRange) -> Option<u16> {
-        let high = self.max.min(other.max);
-        (high >= self.min.max(other.min)).then_some(high)
-    }
-
-    /// Whether the other side's newest version is older than this side's. When two sides cannot
-    /// talk, the older one must update.
-    pub fn peer_is_older(self, other: VersionRange) -> bool {
-        other.max < self.max
-    }
-}
-
-/// The client's first bytes on the TCP connection: the magic and its version range.
-pub const CLIENT_PREAMBLE_LEN: usize = 8;
-/// The host's answer: the magic, the chosen version (0 for none) and the host's version range.
-pub const HOST_PREAMBLE_LEN: usize = 10;
-
-pub fn client_preamble(range: VersionRange) -> [u8; CLIENT_PREAMBLE_LEN] {
+pub fn client_preamble(version: u16) -> [u8; CLIENT_PREAMBLE_LEN] {
     let mut out = [0; CLIENT_PREAMBLE_LEN];
     out[..4].copy_from_slice(&MAGIC);
-    out[4..6].copy_from_slice(&range.min.to_le_bytes());
-    out[6..8].copy_from_slice(&range.max.to_le_bytes());
+    out[4..6].copy_from_slice(&version.to_le_bytes());
     out
 }
 
-pub fn parse_client_preamble(bytes: &[u8; CLIENT_PREAMBLE_LEN]) -> Result<VersionRange, Error> {
+/// The client's protocol version
+pub fn parse_client_preamble(bytes: &[u8; CLIENT_PREAMBLE_LEN]) -> Result<u16, Error> {
     if bytes[..4] != MAGIC {
         return Err(Error::Malformed("not a cranvr client"));
     }
-    Ok(VersionRange { min: u16::from_le_bytes([bytes[4], bytes[5]]), max: u16::from_le_bytes([bytes[6], bytes[7]]) })
+    Ok(u16::from_le_bytes([bytes[4], bytes[5]]))
 }
 
-pub fn host_preamble(chosen: Option<u16>, range: VersionRange) -> [u8; HOST_PREAMBLE_LEN] {
+pub fn host_preamble(version: u16) -> [u8; HOST_PREAMBLE_LEN] {
     let mut out = [0; HOST_PREAMBLE_LEN];
     out[..4].copy_from_slice(&MAGIC);
-    out[4..6].copy_from_slice(&chosen.unwrap_or(0).to_le_bytes());
-    out[6..8].copy_from_slice(&range.min.to_le_bytes());
-    out[8..10].copy_from_slice(&range.max.to_le_bytes());
+    out[4..6].copy_from_slice(&version.to_le_bytes());
     out
 }
 
-/// The chosen version (`None` when the ranges do not meet) and the host's range.
-pub fn parse_host_preamble(bytes: &[u8; HOST_PREAMBLE_LEN]) -> Result<(Option<u16>, VersionRange), Error> {
+/// The host's protocol version
+pub fn parse_host_preamble(bytes: &[u8; HOST_PREAMBLE_LEN]) -> Result<u16, Error> {
     if bytes[..4] != MAGIC {
         return Err(Error::Malformed("not a cranvr host"));
     }
-    let chosen = u16::from_le_bytes([bytes[4], bytes[5]]);
-    let range = VersionRange { min: u16::from_le_bytes([bytes[6], bytes[7]]), max: u16::from_le_bytes([bytes[8], bytes[9]]) };
-    Ok(((chosen != 0).then_some(chosen), range))
+    Ok(u16::from_le_bytes([bytes[4], bytes[5]]))
+}
+
+/// Whether the other side must update when two sides of different versions cannot talk: the side
+/// with the lower version.
+pub fn peer_must_update(ours: u16, theirs: u16) -> bool {
+    theirs < ours
 }
 
 /// What a headset can do.
@@ -170,7 +149,6 @@ pub struct Welcome {
     /// A number that the client repeats in its UDP hello. The hello is sealed, so only a client
     /// that finished the handshake can send it.
     pub session: u64,
-    pub version: u16,
     pub stream: StreamParams,
     pub media: MediaPlan,
     /// The payload bytes in each media packet. All data and parity packets of a unit have it.
@@ -179,9 +157,6 @@ pub struct Welcome {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RejectReason {
-    /// The host does not know the client's key. A client of version 4 shows its pairing code. A
-    /// client of version 5 never sees this: the host holds it and asks its user.
-    NotPaired,
     /// Another headset is connected, or another headset waits for the host's user
     Busy,
     NoCommonCodec,
@@ -196,10 +171,10 @@ pub enum RejectReason {
 /// How long a host holds a connection for its user's answer. A client waits a little longer.
 pub const APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
 
-/// What a client tells its user when the host's cranvr is older than its own: the user updates the
-/// Mac. The words are the same in every place that says it.
+/// What a client tells its user when the host's cranvr has another version than its own and is the
+/// older one: the user updates the Mac. The words are the same in every place that says it.
 pub const UPDATE_MAC: &str = "Update cranvr on the Mac.";
-/// What a host tells its user when the headset's cranvr app is older.
+/// What a host tells its user when the headset's cranvr app is the older one.
 pub const UPDATE_HEADSET: &str = "Update the cranvr app on the headset.";
 
 /// Control messages from the client to the host.
@@ -213,43 +188,34 @@ pub enum ClientMsg {
     Views(Views),
     Bye,
     /// The headset's runtime moved the origin of its tracking space, which the user asked for by
-    /// recentering. A receiver that does not know this message skips it.
+    /// recentering.
     Recenter(Recenter),
     /// The height of the floor in the headset's room in meters, from the headset's stage. It is
     /// negative when the floor lies below the room's origin, which is where the head was when the
     /// app started. The client sends it again when it changes. The host puts its scenes' floor
-    /// there. A host that does not know the message skips it.
+    /// there.
     Floor(f32),
-    /// The client shows the Mac's desktop as a panel and asks the host for its video, or stops the
-    /// stream. The host answers with [`HostMsg::Desktop`]. The video is the stream
-    /// [`DESKTOP_STREAM`]. A host that does not know the message skips it.
-    Desktop(DesktopWish),
-    /// A press on a button of the console, as the JSON object that the old client's console sent
-    /// (`{"action": "play", "game": "Beat Saber"}`, `{"action": "stop"}`, `{"action": "set",
-    /// "fps": 90}`). The host hands it to the cranvr app as a `vr_request` status line. A host
-    /// that does not know the message skips it.
+    /// A press on a button of the console, as a JSON object (`{"action": "play", "game": "Beat
+    /// Saber"}`, `{"action": "stop"}`, `{"action": "set", "fps": 90}`). The host hands it to the
+    /// cranvr app as a `vr_request` status line.
     Console(String),
     /// The client's half of the approval code (see [`crate::secure::approval_code`]): a random
-    /// number that it sends after it saw the host's [`HostMsg::AwaitApproval`]. A host of version
-    /// 4 does not know the message.
+    /// number that it sends after it saw the host's [`HostMsg::AwaitApproval`].
     PairNonce([u8; 32]),
     /// The tracking features that the headset offers: hands, body, face and eyes (see
     /// [`crate::tracking`]). The client sends it once after the welcome and again when the set
-    /// changes, for example when the user allows the headset's face tracking. A host that does not
-    /// know the message skips it. The message comes with protocol version 6.
+    /// changes, for example when the user allows the headset's face tracking.
     TrackingOffer(Features),
     /// How much of the headset the app has (see [`Focus`]). The client sends it when the state
     /// changes, and once after the welcome when the app starts without the input focus. A client
-    /// that never sends it is focused. A host that does not know the message skips it. The message
-    /// needs no new protocol version: it stands after the last variant.
+    /// that never sends it is focused.
     Focus(Focus),
     /// The client adds a display to the Mac or removes one it added (see [`DisplayRequest`]). The
-    /// host answers with [`HostMsg::Displays`]. Protocol version 8 added this message.
+    /// host answers with [`HostMsg::Displays`].
     Display(DisplayRequest),
-    /// What the client asks of the video of one display, as [`ClientMsg::Desktop`] does for the
-    /// first one. A display that the client does not wish costs the Mac and the headset nothing:
-    /// the host runs no capture, no encoder and sends nothing for it. Protocol version 8 added this
-    /// message.
+    /// What the client asks of the video of one display: the stream of its panel, how wide a picture
+    /// and how many a second. A display that the client does not wish costs the Mac and the headset
+    /// nothing: the host runs no capture and no encoder and sends nothing for it.
     DisplayWish { stream: u8, wish: DesktopWish },
 }
 
@@ -303,43 +269,33 @@ pub enum HostMsg {
     /// The host changed the stream, for example the foveation or the eye size
     StreamUpdate(StreamParams),
     Bye,
-    /// The state of the desktop stream: its parameters, or `None` when the host has no desktop for
-    /// this client. The host sends it after a [`ClientMsg::Desktop`] and again when the picture's
-    /// size or the visibility changes. The decoder's parameter sets follow in a
-    /// [`HostMsg::DecoderConfig`] of the stream [`DESKTOP_STREAM`].
-    Desktop(Option<DesktopParams>),
     /// The console's menu as a JSON object: the games and the settings that the cranvr app
     /// offers (its `vr-menu.json`) and the stream's state as `status`. The host sends it when the
-    /// client connects and again when it changes, at most once a second. A client that does not
-    /// know the message skips it.
+    /// client connects and again when it changes, at most once a second.
     Menu(String),
     /// The host does not know this client. It holds the connection until its user allows or denies
     /// the client. `commit` is the hash of a random number that the host keeps secret until the
     /// client answered with [`ClientMsg::PairNonce`]. The host then sends the number in
     /// [`HostMsg::PairReveal`], and both sides compute the approval code from both numbers. A
     /// client that is in the middle of two connections cannot make the two codes equal: it has
-    /// to fix its number on one connection before it sees the number of the other. The message
-    /// comes with protocol version 5.
+    /// to fix its number on one connection before it sees the number of the other.
     AwaitApproval { host_name: String, commit: [u8; 32] },
     /// The number that `commit` hides
     PairReveal([u8; 32]),
     /// The tracking features that a game uses now. The client sends the datagrams of these features
     /// and no others. The set is empty when no game asks. The host sends it when the headset
-    /// connects and when it changes, and only to a client of protocol version 6. A client that does
-    /// not know the message skips it.
+    /// connects and when it changes.
     TrackingWish(Features),
     /// The displays that the client can show, and whether it can add one. The host sends the list
-    /// when the client connects and after each change. Protocol version 8 added this message.
+    /// when the client connects and after each change.
     Displays(DisplayList),
-    /// The state of the video of a display, as [`HostMsg::Desktop`] says it for the first one: its
-    /// parameters, or `None` while the host runs none for this client. The decoder's parameter sets
-    /// follow in a [`HostMsg::DecoderConfig`] of the same stream. Protocol version 8 added this
-    /// message.
+    /// The state of the video of a display: its parameters, or `None` while the host runs none for
+    /// this client. The host sends it after a wish and again when the picture's size changes. The
+    /// decoder's parameter sets follow in a [`HostMsg::DecoderConfig`] of the same stream.
     DisplayStream { stream: u8, params: Option<DesktopParams> },
     /// Whether a game runs on the host: it sends frames or it loads. The host sends it when the
-    /// client connects and when it changes. A client of protocol version 7 or older learns it from
-    /// the hiding of the desktop (`DesktopParams::visible`). A host of version 8 hides nothing for a
-    /// game: a display that the client wishes goes on. Protocol version 8 added this message.
+    /// client connects and when it changes. The host hides no display for a game: a display that
+    /// the client wishes goes on.
     GameRuns(bool),
 }
 
@@ -352,15 +308,11 @@ pub enum ClientDatagram {
     /// The first datagram on the UDP path
     Hello { session: u64 },
     Tracking(Tracking),
-    Input(Input),
     FrameTiming(FrameTiming),
     Loss(LossReport),
     Ping(Ping),
     Pong(Pong),
-    /// Where a controller points on the desktop panel, with its trigger and thumbstick
-    Pointer(Pointer),
-    /// The hands' joints, for every headset frame while the host wishes [`Features::HANDS`].
-    /// Protocol version 6 added this datagram and the next three.
+    /// The hands' joints, for every headset frame while the host wishes [`Features::HANDS`]
     Hands(Hands),
     /// The body's joints, while the host wishes [`Features::BODY`] or [`Features::FULL_BODY`]
     Body(Body),
@@ -368,16 +320,11 @@ pub enum ClientDatagram {
     Face(Face),
     /// The gaze, while the host wishes [`Features::EYES`]
     Eyes(Eyes),
-    /// Where the controller that owns the Mac's mouse points on the desktop panel, with the mouse
-    /// buttons that it holds and its thumbstick's lean. Protocol version 7 added this datagram. A
-    /// client of that version sends it to a host of that version in place of [`ClientDatagram::Pointer`].
-    Mouse(Mouse),
-    /// The mouse on the panel of a display other than the first, as [`ClientDatagram::Mouse`] says it
-    /// for the first one. Protocol version 8 added this datagram.
+    /// The mouse on the panel of a display: where the controller that owns the Mac's mouse points,
+    /// with the mouse buttons that it holds and its thumbstick's lean. The stream names the display.
     DisplayMouse { stream: u8, mouse: Mouse },
     /// The controllers' input with the hands that the app holds back from the game (see
-    /// [`InputHold`]). The client sends it in place of [`ClientDatagram::Input`] to a host of
-    /// protocol version 8. Protocol version 8 added this datagram.
+    /// [`InputHold`]). The client sends it for every headset frame that has input.
     InputHold(InputHold),
 }
 
@@ -388,10 +335,7 @@ pub enum HostDatagram {
     Audio(Audio),
     Ping(Ping),
     Pong(Pong),
-    /// Where the Mac's cursor is on the desktop
-    Cursor(Cursor),
-    /// Where the Mac's cursor is on a display other than the first. Protocol version 8 added this
-    /// datagram.
+    /// Where the Mac's cursor is on a display. The stream names it.
     DisplayCursor { stream: u8, cursor: Cursor },
 }
 
@@ -414,7 +358,7 @@ pub struct Tracking {
     /// The left controller's aim pose: where it points. A game casts its pointing ray from it. The
     /// headset reports it next to the grip pose, so a hand with a grip pose has an aim pose too. A
     /// client that has none leaves it `None`, and the host then gives a game the grip pose for both.
-    /// Both poses are the headset's own, with no offset. Version 3 added the two aim fields.
+    /// Both poses are the headset's own, with no offset.
     pub left_aim: Option<Motion>,
     /// The right controller's aim pose
     pub right_aim: Option<Motion>,
@@ -548,7 +492,7 @@ pub struct Audio {
     pub pcm: Vec<u8>,
 }
 
-/// The id of the stream that carries the Mac's desktop. The eye stream is 0.
+/// The id of the stream that carries the first display of the Mac. The eye stream is 0.
 pub const DESKTOP_STREAM: u8 = 1;
 
 /// What the client asks of the desktop stream.
@@ -563,10 +507,10 @@ pub struct DesktopWish {
     pub max_fps: u8,
 }
 
-/// The desktop stream as the host runs it.
+/// The video of a display as the host runs it.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DesktopParams {
-    /// [`DESKTOP_STREAM`]
+    /// The display's stream (see [`display_stream`])
     pub stream: u8,
     pub codec: Codec,
     /// The size of the pictures in pixels: the display's full pixel size, or the client's
@@ -582,9 +526,6 @@ pub struct DesktopParams {
     /// decoder's surface bottom row first. Cranpose's compositor does not: the host sends the
     /// pictures upright and this is `false`.
     pub flipped: bool,
-    /// `false` while the host hides the desktop, as while a game runs. The host sends no pictures
-    /// then.
-    pub visible: bool,
     /// The Mac's cursor is part of the pictures. The client then draws none of its own. A client's
     /// panel cannot show a cursor over a surface panel today: the compositor draws surfaces over
     /// panels.
@@ -595,8 +536,7 @@ pub struct DesktopParams {
 /// the start, and the ones that the client adds.
 pub const MAX_DISPLAYS: u8 = 4;
 
-/// The stream of the display with this index. Index 0 is the first display, which
-/// [`DESKTOP_STREAM`] has always carried.
+/// The stream of the display with this index. Index 0 is the first display, [`DESKTOP_STREAM`].
 pub const fn display_stream(index: u8) -> u8 {
     DESKTOP_STREAM + index
 }
@@ -654,24 +594,6 @@ pub struct InputHold {
     /// Left, then right. The host gives the game rest values in place of the held hand's buttons,
     /// touches, trigger, grip and thumbstick. The hand's poses stay.
     pub held: [bool; 2],
-}
-
-/// Where a controller points on the desktop panel, as the client measures it. The client sends it
-/// for every headset frame while it changes and every 50 ms otherwise, so a lost datagram heals.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Pointer {
-    /// Counts up by one per datagram. The host drops a datagram that is older than the newest.
-    pub seq: u32,
-    /// When the client sampled the controller, on the client's clock
-    pub sent: Nanos,
-    /// The point on the panel as u and v from its top left corner (0, 0) to its bottom right corner
-    /// (1, 1), or `None` while no controller points at the panel
-    pub hit: Option<[f32; 2]>,
-    /// How far the pointing controller's trigger is pulled, from 0 to 1. A trigger past 0.6 presses
-    /// the mouse button, one below 0.4 releases it.
-    pub trigger: f32,
-    /// How far the pointing controller's thumbstick leans forward, from -1 to 1. The host scrolls.
-    pub scroll: f32,
 }
 
 /// Where the controller that owns the Mac's mouse points on the desktop panel. The Mac has one
