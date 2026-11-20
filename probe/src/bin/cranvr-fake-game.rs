@@ -19,9 +19,13 @@
 //! `--expect-hand-controllers` plays a game without hand code: with `cranvr-probe --tracking
 //! --no-controllers` the host must make the controllers of the probe's hands.
 //!
+//! `--stall AT:FOR` plays a game that loads a level or compiles shaders: it sends no frame for FOR
+//! seconds from AT seconds after its start, and logs the stall's wall-clock times, so that a test can
+//! look at what the headset showed in the meantime (the host must keep the game's last picture).
+//!
 //! Usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input]
 //!        [--use-tracking FEATURES] [--release-tracking] [--expect-tracking] [--expect-hand-controllers]
-//!        [--expect-no-controllers]
+//!        [--expect-no-controllers] [--stall AT:FOR]
 
 use cranvr_common::inputs::{LEFT_SQUEEZE_VALUE_ID, LEFT_TRIGGER_VALUE_ID, RIGHT_A_CLICK_ID, RIGHT_SQUEEZE_VALUE_ID, RIGHT_THUMBSTICK_X_ID, RIGHT_TRIGGER_VALUE_ID};
 use cranvr_proto::wire::Motion;
@@ -480,6 +484,7 @@ fn main() {
     let (mut control, mut fps, mut seconds, mut expect_input) = (None, 72.0f64, 10.0f64, false);
     let (mut use_tracking, mut expect_tracking, mut expect_hand_controllers, mut expect_no_controllers) = (String::new(), false, false, false);
     let mut release_tracking = false;
+    let mut stall: Option<(f64, f64)> = None;
     let mut face_source = tracked::FaceSource::default();
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -493,9 +498,14 @@ fn main() {
             "--expect-hand-controllers" => expect_hand_controllers = true,
             "--expect-no-controllers" => expect_no_controllers = true,
             "--release-tracking" => release_tracking = true,
+            "--stall" => {
+                let value = args.next().expect("--stall AT:FOR");
+                stall = value.split_once(':').and_then(|(at, length)| Some((at.parse().ok()?, length.parse().ok()?)));
+                assert!(stall.is_some(), "--stall AT:FOR takes two numbers of seconds");
+            }
             "--face-source" => face_source = args.next().as_deref().and_then(tracked::FaceSource::parse).expect("--face-source visual|audio|unknown"),
             _ => {
-                eprintln!("usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input] [--use-tracking FEATURES] [--expect-tracking] [--face-source visual|audio|unknown] [--expect-hand-controllers] [--expect-no-controllers] [--release-tracking]");
+                eprintln!("usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input] [--use-tracking FEATURES] [--expect-tracking] [--face-source visual|audio|unknown] [--expect-hand-controllers] [--expect-no-controllers] [--release-tracking] [--stall AT:FOR]");
                 std::process::exit(2);
             }
         }
@@ -654,6 +664,8 @@ fn main() {
     };
     // The game creates its trackers a second after the start. It may destroy them six seconds before the end.
     let (mut requested, mut released) = (false, false);
+    let unix_ms = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    let mut stall_begun = false;
     while start.elapsed().as_secs_f64() < seconds {
         if !use_tracking.is_empty() {
             let at = start.elapsed().as_secs_f64();
@@ -669,6 +681,22 @@ fn main() {
         next += period;
         if let Some(wait) = next.checked_duration_since(Instant::now()) {
             thread::sleep(wait);
+        }
+        // A stall: the game sends no frame, as while it loads a level
+        if let Some((at, length)) = stall {
+            let now = start.elapsed().as_secs_f64();
+            if (at..at + length).contains(&now) {
+                if !stall_begun {
+                    stall_begun = true;
+                    println!("fake-game: no frames from unix {} ms for {length} s", unix_ms());
+                }
+                continue;
+            }
+            if stall_begun && now >= at + length {
+                stall_begun = false;
+                stall = None;
+                println!("fake-game: frames again at unix {} ms", unix_ms());
+            }
         }
         for n in consumed_rx.try_iter() {
             done += 1;
