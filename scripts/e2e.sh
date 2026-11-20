@@ -132,10 +132,13 @@ if (( openvr_wine )); then
     wine_args=(--seconds $(( seconds - 6 )) --expect-input)
     [[ -z ${openvr_actions} ]] || wine_args+=(--actions "${openvr_actions}")
     export CRANVR_OPENCOMPOSITE=1
-    # The run tests the path of an OpenVR program, not the rate: a trivial program made 105 to 107 frames a
-    # second at 120 Hz on a quiet Mac and 77 to 86 on a busy one (the OpenXR smoke made 118 on the same
-    # Mac), so the run asks the host for 72 Hz unless --fps is given
+    # The run tests the path of an OpenVR program, not the rate. On a Mac that other builds keep busy (a
+    # load average above 20) the program loses frames to the scheduler: the report of its second-by-second
+    # frame counts shows 120 in the quiet seconds and 60 to 100 in the busy ones. The run therefore asks the
+    # host for 72 Hz unless --fps is given.
     (( fps_given )) || fps=72
+    # What the runtime tells the game about the display must be the rate that the host runs at
+    wine_args+=(--expect-hz "${fps}")
 fi
 if (( tracking_wine )); then
     # The Windows program waits for the headset's features, starts a session and reads the data

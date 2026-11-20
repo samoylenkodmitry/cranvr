@@ -92,6 +92,10 @@ applies these patches and builds both parts.
 
 - A destroyed session releases the action sets that were attached to it. The runtime kept the `attached` mark for the whole life of a set, so the second `xrAttachSessionActionSets` of the same set returned `XR_ERROR_ACTIONSETS_ALREADY_ATTACHED`. An OpenVR game that sets an action manifest (IVRInput) at its start reaches that call twice. OpenComposite creates the action sets and attaches them to its first session. When the game submits its first frame, OpenComposite destroys that session, makes a new one on the game's own graphics device and attaches the same sets again. It stopped there with the error, so no game with an action manifest could show a picture. A set keeps its actions and the instance keeps the suggested bindings. A session that still exists keeps the old rule: its own second attach, an action created after the attach and a suggestion after the attach return the error.
 
+`0009-display-refresh-rate-extension.patch`
+
+- The runtime offers `XR_FB_display_refresh_rate`. The headset's rate (the control file's refresh rate) is the only rate: `xrEnumerateDisplayRefreshRatesFB` lists it, `xrGetDisplayRefreshRateFB` returns it, and `xrRequestDisplayRefreshRateFB` accepts it and 0 (the default). A request for another rate returns `XR_ERROR_DISPLAY_REFRESH_RATE_UNSUPPORTED_FB`, which the extension allows for a rate that is not on the list. A Unity game that uses the extension asked for it and got `extension not enabled`. OpenComposite reads the rate from it.
+
 ## patches/dxmt
 
 `0005-public-atomic-for-new-metal-compiler.patch`: DXMT 0.80 calls a private Metal builtin

@@ -28,11 +28,13 @@
 // both hands' poses. It also pulses the left hand's haptic output while the grip is down. With --expect-input the
 // run fails when an action does not fire.
 //
+// --expect-hz N fails the run when the display frequency that the runtime reports to a game differs from N.
+//
 // The frame loop reports where the time goes and how long each frame lasted (the intervals between the
 // returns of WaitGetPoses, as a histogram in periods of the display's refresh). --no-input leaves the
 // controller reads out to show what they cost.
 //
-// Usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--actions MODE] [--format F]
+// Usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--actions MODE] [--expect-hz N] [--format F]
 //                         [--load-only --runtime DIR]
 
 #ifndef NOMINMAX
@@ -553,12 +555,15 @@ int main(int argc, char** argv)
 	double seconds = 15;
 	bool expect_input = false, load_only = false, no_input = false;
 	std::string actions_mode;
+	float expect_hz = 0.0f;
 	DXGI_FORMAT texture_format = DXGI_FORMAT_R8G8B8A8_UNORM, view_format = DXGI_FORMAT_R8G8B8A8_UNORM;
 	for (int i = 1; i < argc; i++) {
 		if (!std::strcmp(argv[i], "--seconds") && i + 1 < argc) {
 			seconds = std::atof(argv[++i]);
 		} else if (!std::strcmp(argv[i], "--expect-input")) {
 			expect_input = true;
+		} else if (!std::strcmp(argv[i], "--expect-hz") && i + 1 < argc) {
+			expect_hz = static_cast<float>(std::atof(argv[++i]));
 		} else if (!std::strcmp(argv[i], "--actions") && i + 1 < argc) {
 			actions_mode = argv[++i];
 			if (actions_mode != "touch" && actions_mode != "vive" && actions_mode != "both") {
@@ -586,7 +591,7 @@ int main(int argc, char** argv)
 			g_runtime_path = argv[++i];
 			g_runtime_given = true;
 		} else {
-			std::fprintf(stderr, "usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--actions MODE] [--format F] [--load-only --runtime DIR]\n");
+			std::fprintf(stderr, "usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--actions MODE] [--expect-hz N] [--format F] [--load-only --runtime DIR]\n");
 			return 2;
 		}
 	}
@@ -633,6 +638,8 @@ int main(int argc, char** argv)
 	text[0] = 0;
 	system->GetStringTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_ModelNumber_String, text, sizeof(text), &property);
 	say("head model: %s", text);
+	const float reported_hz = system->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float, &property);
+	say("display frequency %.1f Hz (property error %d)", reported_hz, property);
 
 	uint32_t width = 0, height = 0;
 	system->GetRecommendedRenderTargetSize(&width, &height);
@@ -836,10 +843,7 @@ int main(int argc, char** argv)
 	    1000 * submit_time / frames, 1000 * handoff_time / frames, 1000 * input_time / frames);
 	if (intervals.size() > 10) {
 		// The refresh rate that the runtime reports: a frame that lasts 1.5 periods or more missed a slot
-		float hz = system->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float, &property);
-		if (property != vr::TrackedProp_Success || hz < 1.0f) {
-			hz = 120.0f;
-		}
+		const float hz = reported_hz >= 1.0f ? reported_hz : 120.0f;
 		const double period = 1000.0 / hz;
 		std::vector<double> sorted = intervals;
 		std::sort(sorted.begin(), sorted.end());
@@ -900,6 +904,9 @@ int main(int argc, char** argv)
 	}
 	if (!(eye_distance > 0.03f && eye_distance < 0.09f)) {
 		return fail("the eyes are not 3 to 9 cm apart");
+	}
+	if (expect_hz > 0.0f && std::fabs(reported_hz - expect_hz) > 0.5f) {
+		return fail("the display frequency that the runtime reports is not the rate that the host runs at");
 	}
 	if (!actions_mode.empty()) {
 		if (const char* problem = actions.verdict(expect_input)) {

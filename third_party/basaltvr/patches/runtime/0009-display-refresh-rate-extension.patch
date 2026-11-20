@@ -1,0 +1,179 @@
+diff --git a/runtime/pe/frame.cpp b/runtime/pe/frame.cpp
+index 798fe2b..b9a4a78 100644
+--- a/runtime/pe/frame.cpp
++++ b/runtime/pe/frame.cpp
+@@ -573,6 +573,51 @@ XrResult XRAPI_CALL waitFrame(
+     return XR_SUCCESS;
+ }
+ 
++// cranvr: XR_FB_display_refresh_rate. The headset's rate comes from the control file and stays for
++// the life of the process (see displayPeriod), so it is the only rate on offer. A request for it,
++// and the request for the default (0), succeed. A request for another rate is refused, as the
++// extension allows for a rate that is not on the list.
++XrResult XRAPI_CALL enumerateDisplayRefreshRates(
++    XrSession session,
++    uint32_t capacityInput,
++    uint32_t* countOutput,
++    float* rates) {
++    if (!isValidSession(session)) {
++        return XR_ERROR_HANDLE_INVALID;
++    }
++    if (countOutput == nullptr || (capacityInput > 0 && rates == nullptr)) {
++        return XR_ERROR_VALIDATION_FAILURE;
++    }
++    *countOutput = 1;
++    if (capacityInput == 0) {
++        return XR_SUCCESS;
++    }
++    rates[0] = static_cast<float>(basalt::controlConfiguredRefreshHz());
++    return XR_SUCCESS;
++}
++
++XrResult XRAPI_CALL getDisplayRefreshRate(XrSession session, float* rate) {
++    if (!isValidSession(session)) {
++        return XR_ERROR_HANDLE_INVALID;
++    }
++    if (rate == nullptr) {
++        return XR_ERROR_VALIDATION_FAILURE;
++    }
++    *rate = static_cast<float>(basalt::controlConfiguredRefreshHz());
++    return XR_SUCCESS;
++}
++
++XrResult XRAPI_CALL requestDisplayRefreshRate(XrSession session, float rate) {
++    if (!isValidSession(session)) {
++        return XR_ERROR_HANDLE_INVALID;
++    }
++    const float hz = static_cast<float>(basalt::controlConfiguredRefreshHz());
++    if (rate == 0.0f || std::fabs(rate - hz) < 0.5f) {
++        return XR_SUCCESS;
++    }
++    return XR_ERROR_DISPLAY_REFRESH_RATE_UNSUPPORTED_FB;
++}
++
+ XrResult XRAPI_CALL beginFrame(
+     XrSession session,
+     const XrFrameBeginInfo* frameBeginInfo) {
+diff --git a/runtime/pe/runtime.cpp b/runtime/pe/runtime.cpp
+index b81493b..4fc36d1 100644
+--- a/runtime/pe/runtime.cpp
++++ b/runtime/pe/runtime.cpp
+@@ -16,6 +16,7 @@ SRWLOCK gInstanceLock = SRWLOCK_INIT;
+ uintptr_t gNextInstanceHandle = kFirstInstanceHandle;
+ XrInstance gLiveInstance = XR_NULL_HANDLE;
+ bool gD3D11ExtensionEnabled = false;
++bool gDisplayRefreshRateEnabled = false;
+ 
+ XrResult XRAPI_CALL basaltEnumerateInstanceExtensionProperties(
+     const char* layerName,
+@@ -33,7 +34,8 @@ XrResult XRAPI_CALL basaltEnumerateInstanceExtensionProperties(
+     // cranvr: the tracking extensions that the headset's features allow. Without a headset's
+     // file this adds none, and the list is the one of the stock runtime.
+     const uint32_t trackingCount = basalt::offeredTrackingExtensionCount();
+-    const uint32_t total = (d3d11Available ? 1u : 0u) + trackingCount;
++    // cranvr: XR_FB_display_refresh_rate is always offered. It tells a game the rate that cranvr-host runs at.
++    const uint32_t total = (d3d11Available ? 1u : 0u) + trackingCount + 1u;
+     *propertyCountOutput = total;
+     if (propertyCapacityInput == 0) {
+         return XR_SUCCESS;
+@@ -73,6 +75,15 @@ XrResult XRAPI_CALL basaltEnumerateInstanceExtensionProperties(
+         properties[next].extensionVersion = version;
+         ++next;
+     }
++    if (next < total) {
++        std::strncpy(
++            properties[next].extensionName,
++            XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME,
++            XR_MAX_EXTENSION_NAME_SIZE - 1);
++        properties[next].extensionName[XR_MAX_EXTENSION_NAME_SIZE - 1] = '\0';
++        properties[next].extensionVersion = XR_FB_display_refresh_rate_SPEC_VERSION;
++        ++next;
++    }
+     return XR_SUCCESS;
+ }
+ 
+@@ -125,6 +136,7 @@ XrResult XRAPI_CALL basaltCreateInstance(
+         return XR_ERROR_API_VERSION_UNSUPPORTED;
+     }
+     bool enableD3D11 = false;
++    bool enableDisplayRefreshRate = false;
+     uint32_t enabledTracking = 0;
+     for (uint32_t index = 0; index < createInfo->enabledExtensionCount; ++index) {
+         const char* extensionName = createInfo->enabledExtensionNames[index];
+@@ -138,6 +150,10 @@ XrResult XRAPI_CALL basaltCreateInstance(
+             enabledTracking |= trackingBit;
+             continue;
+         }
++        if (std::strcmp(extensionName, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME) == 0) {
++            enableDisplayRefreshRate = true;
++            continue;
++        }
+         if (std::strcmp(extensionName, XR_KHR_D3D11_ENABLE_EXTENSION_NAME) != 0) {
+             std::fprintf(stderr, "Basalt OpenXR: unsupported enabled extension '%s'\n", extensionName);
+             return XR_ERROR_EXTENSION_NOT_PRESENT;
+@@ -160,6 +176,7 @@ XrResult XRAPI_CALL basaltCreateInstance(
+     }
+     gLiveInstance = reinterpret_cast<XrInstance>(gNextInstanceHandle);
+     gD3D11ExtensionEnabled = enableD3D11;
++    gDisplayRefreshRateEnabled = enableDisplayRefreshRate;
+     gNextInstanceHandle += kInstanceHandleStride;
+     *instance = gLiveInstance;
+     ReleaseSRWLockExclusive(&gInstanceLock);
+@@ -179,6 +196,7 @@ XrResult XRAPI_CALL basaltDestroyInstance(XrInstance instance) {
+     }
+     gLiveInstance = XR_NULL_HANDLE;
+     gD3D11ExtensionEnabled = false;
++    gDisplayRefreshRateEnabled = false;
+     ReleaseSRWLockExclusive(&gInstanceLock);
+     basalt::setEnabledTrackingExtensions(0);
+     basalt::invalidateSessionForInstance(instance);
+@@ -288,6 +306,16 @@ bool isValidInstance(XrInstance instance) {
+     return valid;
+ }
+ 
++bool isDisplayRefreshRateEnabled(XrInstance instance) {
++    if (instance == XR_NULL_HANDLE) {
++        return false;
++    }
++    AcquireSRWLockShared(&gInstanceLock);
++    const bool enabled = instance == gLiveInstance && gDisplayRefreshRateEnabled;
++    ReleaseSRWLockShared(&gInstanceLock);
++    return enabled;
++}
++
+ bool isD3D11ExtensionEnabled(XrInstance instance) {
+     if (instance == XR_NULL_HANDLE) {
+         return false;
+@@ -385,6 +413,15 @@ XrResult XRAPI_CALL getInstanceProcAddr(
+     } else if (std::strcmp(name, "xrGetD3D11GraphicsRequirementsKHR") == 0 &&
+                isD3D11ExtensionEnabled(instance)) {
+         *function = asVoidFunction(getD3D11GraphicsRequirements);
++    } else if (std::strcmp(name, "xrEnumerateDisplayRefreshRatesFB") == 0 &&
++               isDisplayRefreshRateEnabled(instance)) {
++        *function = asVoidFunction(enumerateDisplayRefreshRates);
++    } else if (std::strcmp(name, "xrGetDisplayRefreshRateFB") == 0 &&
++               isDisplayRefreshRateEnabled(instance)) {
++        *function = asVoidFunction(getDisplayRefreshRate);
++    } else if (std::strcmp(name, "xrRequestDisplayRefreshRateFB") == 0 &&
++               isDisplayRefreshRateEnabled(instance)) {
++        *function = asVoidFunction(requestDisplayRefreshRate);
+     } else if (std::strcmp(name, "xrCreateSession") == 0) {
+         *function = asVoidFunction(createSession);
+     } else if (std::strcmp(name, "xrDestroySession") == 0) {
+diff --git a/runtime/pe/runtime.hpp b/runtime/pe/runtime.hpp
+index 7ae4fbd..9389ff9 100644
+--- a/runtime/pe/runtime.hpp
++++ b/runtime/pe/runtime.hpp
+@@ -56,6 +56,12 @@ bool getSpacePoseInLocal(XrSpace space, XrTime time, XrSession* session, XrPosef
+ 
+ bool isValidInstance(XrInstance instance);
+ bool isD3D11ExtensionEnabled(XrInstance instance);
++bool isDisplayRefreshRateEnabled(XrInstance instance);
++// XR_FB_display_refresh_rate (frame.cpp): the rate of cranvr-host's headset is the only rate
++XrResult XRAPI_CALL enumerateDisplayRefreshRates(
++    XrSession session, uint32_t capacityInput, uint32_t* countOutput, float* rates);
++XrResult XRAPI_CALL getDisplayRefreshRate(XrSession session, float* rate);
++XrResult XRAPI_CALL requestDisplayRefreshRate(XrSession session, float rate);
+ bool isD3D11RuntimeAvailable();
+ bool isValidSession(XrSession session);
+ ID3D11Device* retainSessionDevice(XrSession session);

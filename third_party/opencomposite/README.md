@@ -25,3 +25,7 @@ cranvr runs Windows OpenVR games under Wine with [OpenComposite](https://gitlab.
 
 - `DrvOpenXR::ShutdownSession` and `XrBackend::OnSessionCreated` slept for 250 ms between two looks at the session's state. The OpenXR runtime of cranvr has the state at once. A game restarts the session twice at its start: when it first asks for input and when it submits its first frame. The two sleeps stalled the first frames of every OpenVR game for half a second, and the average frame rate of a short run lost about 7 percent. The loops now look every 2 ms.
 - The Touch controller profile translates `trackpad` to `thumbstick`: the position, the click and the touch. A game that ships action bindings for the Vive wand only used the trackpad for walking or turning. OpenComposite built no Touch binding for it, and the action never fired.
+
+`0004-display-frequency-from-the-runtime.patch`
+
+- `GetFloatTrackedDeviceProperty(Prop_DisplayFrequency_Float)` answered 90 Hz at every refresh rate, with a TODO. It asks the runtime for the rate through `XR_FB_display_refresh_rate` when the runtime offers the extension (cranvr's does) and answers 90 otherwise. The header `RuntimeExtensions/XR_FB_display_refresh_rate.h` declares the one function, since the OpenXR SDK that OpenComposite bundles is older than the extension. `openvr_smoke.exe --expect-hz N` checks the answer.
