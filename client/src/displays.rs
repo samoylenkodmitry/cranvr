@@ -168,6 +168,9 @@ struct Quick {
     cursor: Mutex<Option<Cursor>>,
     /// The numbers last made, for when `Inner` is busy
     measured: Mutex<Measured>,
+    /// The parameters that the host sent and whether this session shows displays, a copy of what `Inner`
+    /// holds. The composition and the frame loop read it, and the decoder never holds it.
+    params: Mutex<Option<(DesktopParams, bool)>>,
 }
 
 struct Slot {
@@ -186,6 +189,7 @@ impl Slot {
                 cursor_in_video: AtomicBool::new(false),
                 cursor: Mutex::new(None),
                 measured: Mutex::new(Measured::default()),
+                params: Mutex::new(None),
             },
             inner: Mutex::new(Inner::default()),
             units: Mutex::new(None),
@@ -313,6 +317,7 @@ impl Displays {
         }
         slot.quick.cursor_in_video.store(inner.params.is_some_and(|p| p.cursor_in_video), Ordering::Relaxed);
         slot.quick.visible.store(shown.is_some(), Ordering::Relaxed);
+        *slot.quick.params.lock().unwrap() = inner.params.map(|p| (p, inner.active));
         if shown.is_none() {
             *slot.quick.cursor.lock().unwrap() = None;
         }
@@ -462,8 +467,8 @@ impl Displays {
             GAME_NO => return Some(false),
             _ => {}
         }
-        let inner = self.slots[0].inner.lock().ok()?;
-        inner.params.filter(|_| inner.active).map(|p| !p.visible)
+        let params = *self.slots[0].quick.params.lock().unwrap();
+        params.filter(|(_, active)| *active).map(|(p, _)| !p.visible)
     }
 
     /// The list for the menu. A host of an older version gets the one entry for its one display.
@@ -471,7 +476,7 @@ impl Displays {
         let state = self.state.lock().unwrap();
         let mut infos: Vec<DisplayInfo> = state.list.as_ref().map(|list| list.displays.clone()).unwrap_or_default();
         if state.list.is_none() {
-            if let Some(p) = self.slots[0].inner.lock().ok().and_then(|inner| inner.params) {
+            if let Some((p, _)) = *self.slots[0].quick.params.lock().unwrap() {
                 infos.push(DisplayInfo { stream: DESKTOP_STREAM, name: "Mac display".into(), points: [p.points[0] as u32, p.points[1] as u32], removable: false });
             }
         }
