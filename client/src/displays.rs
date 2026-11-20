@@ -67,6 +67,8 @@ const POINTER_KEEPALIVE: Duration = Duration::from_millis(50);
 /// How often a decode thread logs its display's numbers, and the uplink thread logs the sum
 const LOG_EVERY: Duration = Duration::from_secs(2);
 const SUMMARY_EVERY: Duration = Duration::from_secs(5);
+/// How long the uplink thread sleeps between turns while no display is wished
+const IDLE_TURN: Duration = Duration::from_millis(500);
 
 fn slot_of(stream: u8) -> Option<usize> {
     display_index(stream).map(usize::from)
@@ -1015,9 +1017,12 @@ pub fn uplink(link: &ClientLink, stop: &AtomicBool) {
     let mut pointers_sent = 0u64;
     let (mut summary_at, mut seen) = (Instant::now(), (0u64, 0u64));
     while !stop.load(Ordering::Relaxed) {
+        // With no display wished nothing needs the 20 ms turns (a key frame, a pointer's keep-alive): every
+        // change wakes the loop at once, so it sleeps longer then
+        let idle = owner.state.lock().unwrap().wanted.iter().all(Option::is_none);
         let (keys, frames, pointers, pointer_dirty) = {
             let guard = owner.uplink.lock().unwrap();
-            let (mut uplink, _) = owner.wake.wait_timeout_while(guard, Duration::from_millis(20), |u| !u.dirty).unwrap();
+            let (mut uplink, _) = owner.wake.wait_timeout_while(guard, if idle { IDLE_TURN } else { Duration::from_millis(20) }, |u| !u.dirty).unwrap();
             // A request for a key frame waits in `uplink.key` until it went out: it may come before the
             // gap since the last request has passed. The next turn of the loop, at most 20 ms later, sees it.
             uplink.dirty = false;
