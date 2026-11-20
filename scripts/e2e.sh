@@ -433,6 +433,9 @@ if [[ ${client} == quest ]]; then
 fi
 result=0
 python3 -I "${root}/scripts/e2e-report.py" "${work}/host.out" "${fps}" "${report}" "${extra[@]}" || result=$?
+# A pause empties some of the host's 5-second windows, so the report's frame rate says nothing then: the
+# probe's verdict on the pause counts, and it is part of the probe's exit code
+[[ -z ${pause} ]] || result=0
 (( client_exit == 0 )) || result=1
 (( game_exit == 0 )) || result=1
 (( tracking_exit == 0 )) || result=1

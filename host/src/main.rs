@@ -943,6 +943,8 @@ fn frame_loop(
     let (mut count, mut game_count, mut gpu_ms, mut gpu_exec_ms, mut since) = (0u32, 0u32, 0.0f64, 0.0f64, Instant::now());
     // Stats windows in a row in which a running game made fewer frames than the headset shows
     let mut slow_windows = 0u32;
+    // Whether the app on the headset had no input focus in the last turn
+    let mut was_paused = false;
     let sizes = game_sizes::Sizes::new(link.control_dir());
     // frames not encoded: no new tracking sample, no free buffer, encoder still busy, game frames
     // replaced by a newer one, game frames with an unknown swapchain image
@@ -1106,7 +1108,15 @@ fn frame_loop(
         let repeat = (planned.is_some() || (game_frame.is_some() && headset.repeats_samples())) && sample != 0 && sample == last_sample && repeats < MAX_REPEATS;
         // An app without the input focus gets no pictures, and its tracking does not come. The game
         // keeps running: its frames go back at once, as the frames of a stream that is not wanted.
-        if shared.paused.load(Ordering::Relaxed) {
+        let paused = shared.paused.load(Ordering::Relaxed);
+        if was_paused && !paused && game.connected {
+            // A game that waits for the headset's poses sends no frame during the pause. It counts as
+            // running when the focus returns, so the loop does not draw its own scene for the frames
+            // that the game still owes.
+            game.last_frame = Some(Instant::now());
+        }
+        was_paused = paused;
+        if paused {
             give_back(&game_frame);
             paused_frames += 1;
             if let Some(c) = &capture {
