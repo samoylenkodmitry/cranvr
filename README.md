@@ -85,6 +85,8 @@ The launch arguments are intent extras on Android (`adb shell am start -n dev.cr
 | `media` | `udp` or `tcp`: the media path. |
 | `room` | `scene` or `passthrough`, for this launch. |
 | `console` | Open the console and keep it open, for a headset on a desk. |
+| `address_entry` | Open the address field of the connect panel at the start. |
+| `scripted_text`, `scripted_hand` | Only in a build from `scripts/build-client.sh --scripted-hand`: a scripted hand (`left` or `right`) presses the address field and then the keys of the text. It shows that the keyboard opens and types on a headset on a desk. The build installs over the plain app, so install the plain build after the test. |
 | `usb_port` | The port that the headset asks on the USB cable, for a test host on another port. |
 | `desktop`, `desktop_width`, `cursor`, `desktop_pointer_test` | The desktop panel: `desktop false` asks for none, `desktop_width` is the widest picture to ask for. |
 

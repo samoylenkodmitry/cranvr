@@ -31,7 +31,7 @@ use cranvr_proto::clock::now_ns;
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
 /// The sizes in dp that the connect and stats panels start at. The user can make them larger.
-const CONNECT_SIZE: [f32; 2] = [760.0, 840.0];
+pub(crate) const CONNECT_SIZE: [f32; 2] = [760.0, 840.0];
 const STATS_SIZE: [f32; 2] = [700.0, 840.0];
 /// How often the UI copies the link's numbers into its state
 const POLL: Duration = Duration::from_millis(250);
@@ -59,7 +59,7 @@ const SIDE_TURN: f32 = 45.0;
 
 /// The pose of a side panel before the user carries it, relative to the origin of the subspace, which
 /// lies a meter ahead of the head: `side` is -1 for the left and 1 for the right.
-fn side_pose(side: f32) -> Pose {
+pub(crate) fn side_pose(side: f32) -> Pose {
     SubspaceModifier::new().offset(side * SIDE_OFFSET[0], SIDE_OFFSET[1], SIDE_OFFSET[2]).rotate(0.0, -side * SIDE_TURN, 0.0).pose()
 }
 
@@ -71,6 +71,8 @@ pub fn ClientApp() {
     // The connection reads what the headset is from the hub. The values do not change in a
     // session, so this runs before any panel can start a connection.
     hub().attach(local_headset_properties().current(), local_haptics().current());
+    #[cfg(all(feature = "scripted-hand", target_os = "android"))]
+    crate::scripted::install_once();
     // The saved Room and Volume settings apply before any panel or link needs them
     hub().load_settings();
     let Link { snapshot, frames } = link();
@@ -381,7 +383,7 @@ fn ConnectBody(snapshot: MutableState<Snapshot>, address: TextFieldState, modifi
     let state = snap.state.clone();
     let found = usb::entries(&snap.found, snap.usb.as_ref());
     let path = snap.path;
-    let typing = rememberMutableStateOf(|| false);
+    let typing = rememberMutableStateOf(settings::address_entry_on_launch);
     Column(
         modifier.background(PANEL_COLOR).rounded_corners(24.0).padding(36.0),
         ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(20.0)),

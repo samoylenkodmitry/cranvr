@@ -26,6 +26,8 @@ mod hub;
 mod panels_ball;
 mod phone;
 mod place;
+#[cfg(all(feature = "scripted-hand", target_os = "android"))]
+mod scripted;
 mod settings;
 mod sizing;
 mod tracked;

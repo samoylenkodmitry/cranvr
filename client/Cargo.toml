@@ -33,6 +33,8 @@ renderer-wgpu = ["cranpose/renderer-wgpu"]
 desktop = ["cranpose/desktop", "dep:env_logger"]
 android = ["renderer-wgpu", "cranpose/android", "cranpose-xr/openxr"]
 phone = ["renderer-wgpu", "cranpose/android"]
+# A test build for a headset on a desk: a scripted hand types into the address field (src/scripted.rs)
+scripted-hand = ["cranpose-xr/scripted-hand"]
 
 [dependencies]
 cranvr-proto = { path = "../proto" }

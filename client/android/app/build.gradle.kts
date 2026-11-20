@@ -13,6 +13,8 @@ plugins {
 }
 
 val phone = providers.gradleProperty("cranvrPhone").map { it == "true" }.orElse(false).get()
+// A test build for a headset on a desk: a scripted hand types into the address field (src/scripted.rs)
+val scriptedHand = providers.gradleProperty("cranvrScriptedHand").map { it == "true" }.orElse(false).get()
 
 cranpose {
     // The Cargo workspace is the client/ directory: two levels above this module.
@@ -26,6 +28,9 @@ cranpose {
         // `xr` makes the app an immersive headset app. The link uses plain sockets, so the app
         // needs no Cranpose service for them. Its manifest asks for the Internet permission.
         services.add("xr")
+        if (scriptedHand) {
+            features.set(listOf("android", "renderer-wgpu", "scripted-hand"))
+        }
     }
 }
 
