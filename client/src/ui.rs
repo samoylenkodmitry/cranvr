@@ -110,6 +110,10 @@ pub fn ClientApp() {
     // The models of the controllers. A game draws its own controllers, so they show with the beams.
     let controller_models = local_controller_models().current();
     LaunchedEffect((), async move |_| {
+        for address in settings::host_keys_to_forget_on_launch() {
+            log::info!("the launch forgets the host key of {address}");
+            settings::forget_host_key(&crate::connection::host_name(&address));
+        }
         if settings::console_on_launch() {
             hub().pin_console();
         }

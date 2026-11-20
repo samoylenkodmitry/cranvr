@@ -86,6 +86,18 @@ pub fn panels_hidden_on_launch() -> bool {
     launch_args().string("panels") == Some("hidden")
 }
 
+/// The addresses whose host keys the launch asks to forget, with `--forget_host_key=ADDRESS,ADDRESS` or
+/// the extra `forget_host_key`. A test that connected this headset to a test host on a network address
+/// leaves the key of that host behind: the headset then refuses the next test host on that address.
+/// Each address is as the connect panel shows it, with its port.
+pub fn host_keys_to_forget_on_launch() -> Vec<String> {
+    launch_args().string("forget_host_key").map(split_addresses).unwrap_or_default()
+}
+
+fn split_addresses(text: &str) -> Vec<String> {
+    text.split(',').map(str::trim).filter(|address| !address.is_empty()).map(str::to_owned).collect()
+}
+
 /// Whether the launch asks to connect at once, with `--connect` or the extra `connect`.
 pub fn connect_on_launch() -> bool {
     launch_args().boolean("connect").unwrap_or(false)
@@ -200,4 +212,15 @@ pub fn identity() -> &'static Identity {
 
 fn now_nanos() -> u128 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_launch_names_the_addresses_to_forget_in_a_comma_list() {
+        assert_eq!(split_addresses("192.168.1.20:9961, 192.168.1.20:9962,,"), vec!["192.168.1.20:9961", "192.168.1.20:9962"]);
+        assert!(split_addresses("  ").is_empty());
+    }
 }

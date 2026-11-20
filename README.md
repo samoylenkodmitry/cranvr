@@ -94,6 +94,7 @@ The launch arguments are intent extras on Android (`adb shell am start -n dev.cr
 | `scripted_point` | Only in the scripted build: `ball` points the scripted hand at the hand menu's ball (with `hand_anchor=view`) and pinches in a cycle. Each pinch presses the ball, and the host's log shows when the app held the hand back from the game. |
 | `hand_menu`, `hand_anchor` | `hand_menu=open` opens the hand menu at the start. In a flat window it shows the menu among the panels, for a screenshot. `hand_anchor=view` puts the ball, the menu and the hand's display in a subspace that follows the head, for a headset on a desk: the left controller's subspace shows nothing while no controller is tracked. |
 | `shown`, `pinned` | A test's panels (`display1,stats`) and the display on the hand (`pinned=2`). They show in the room and in every game, and nothing is saved. |
+| `forget_host_key` | A comma list of addresses with their ports, such as `192.168.1.20:9961,192.168.1.20:9962`: the headset forgets the key of each host at launch. A test that connected to a test host on a network address leaves its key behind, and the headset then refuses the next host on that address. |
 | `usb_port` | The port that the headset asks on the USB cable, for a test host on another port. |
 | `desktop`, `desktop_width`, `cursor`, `desktop_pointer_test` | The desktop panel: `desktop false` asks for none, `desktop_width` is the widest picture to ask for. |
 

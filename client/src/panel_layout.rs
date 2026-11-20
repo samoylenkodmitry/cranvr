@@ -70,17 +70,11 @@ fn from_name(name: &str) -> Option<PanelId> {
 
 impl Layout {
     /// The layout from the saved text of the room's choice and of the pinned display. A text that is
-    /// none gives the defaults. `old_panels_shown` is the choice that the ball made before the menu:
-    /// it hid the connection panel and the stats panel together.
-    pub fn from_saved(room: Option<&str>, pinned: Option<&str>, old_panels_shown: Option<bool>) -> Self {
+    /// none gives the defaults.
+    pub fn from_saved(room: Option<&str>, pinned: Option<&str>) -> Self {
         let mut layout = Self::default();
-        match room {
-            Some(text) => layout.room = text.split(',').filter_map(from_name).collect(),
-            None if old_panels_shown == Some(false) => {
-                layout.room.remove(&PanelId::Connection);
-                layout.room.remove(&PanelId::Stats);
-            }
-            None => {}
+        if let Some(text) = room {
+            layout.room = text.split(',').filter_map(from_name).collect();
         }
         layout.pinned = pinned.and_then(|text| text.trim().parse().ok()).filter(|stream| (DESKTOP_STREAM..DESKTOP_STREAM + cranvr_proto::message::MAX_DISPLAYS).contains(stream));
         layout
@@ -95,11 +89,10 @@ impl Layout {
         self.pinned.map_or(String::new(), |stream| stream.to_string())
     }
 
-    /// Reads the saved layout from the preferences. The ball of the earlier versions saved its choice
-    /// under `panels`.
+    /// Reads the saved layout from the preferences.
     pub fn load() -> Self {
         let get = |key: &str| preferences().get(key);
-        let mut layout = Self::from_saved(get(ROOM_KEY).as_deref(), get(PINNED_KEY).as_deref(), get("panels").map(|text| text != "hidden"));
+        let mut layout = Self::from_saved(get(ROOM_KEY).as_deref(), get(PINNED_KEY).as_deref());
         // A test chooses the panels and the pinned display with launch extras and saves nothing:
         // `shown` is a list such as `display1,stats` and `pinned` a display's number
         let args = cranpose::launch_args();
@@ -309,24 +302,15 @@ mod tests {
         layout.toggle_pinned(3);
         layout.set_in_game(true);
         layout.set_shown(PanelId::Display(2), true);
-        let back = Layout::from_saved(Some(&layout.room_text()), Some(&layout.pinned_text()), None);
+        let back = Layout::from_saved(Some(&layout.room_text()), Some(&layout.pinned_text()));
         assert!(back.shown(PanelId::Connection) && !back.shown(PanelId::Stats) && back.shown(PanelId::Display(3)) && back.shown(PanelId::Display(1)));
         assert!(!back.shown(PanelId::Display(2)));
         assert_eq!(back.pinned(), Some(3));
     }
 
     #[test]
-    fn the_old_choice_of_the_ball_hides_the_connection_and_the_stats_together() {
-        let layout = Layout::from_saved(None, None, Some(false));
-        assert!(!layout.shown(PanelId::Connection) && !layout.shown(PanelId::Stats) && layout.shown(PanelId::Display(1)));
-        assert!(Layout::from_saved(None, None, Some(true)).shown(PanelId::Connection));
-        // A saved choice wins over the old one
-        assert!(Layout::from_saved(Some("connection"), None, Some(false)).shown(PanelId::Connection));
-    }
-
-    #[test]
     fn a_text_that_means_nothing_is_ignored() {
-        let layout = Layout::from_saved(Some("connection,rubbish,display9x,display2"), Some("99"), None);
+        let layout = Layout::from_saved(Some("connection,rubbish,display9x,display2"), Some("99"));
         assert!(layout.shown(PanelId::Connection) && layout.shown(PanelId::Display(2)) && !layout.shown(PanelId::Stats));
         assert_eq!(layout.pinned(), None);
     }
