@@ -86,10 +86,12 @@ The launch arguments are intent extras on Android (`adb shell am start -n dev.cr
 | `media` | `udp` or `tcp`: the media path. |
 | `room` | `scene` or `passthrough`, for this launch. |
 | `console` | Open the console and keep it open, for a headset on a desk. |
+| `address_entry` | Open the address field of the connect panel at the start. |
+| `scripted_text`, `scripted_hand` | Only in a build from `scripts/build-client.sh --scripted-hand`: a scripted hand (`left` or `right`) presses the address field and then the keys of the text. It shows that the keyboard opens and types on a headset on a desk. The build installs over the plain app, so install the plain build after the test. |
 | `usb_port` | The port that the headset asks on the USB cable, for a test host on another port. |
 | `desktop`, `desktop_width`, `cursor`, `desktop_pointer_test` | The desktop panel: `desktop false` asks for none, `desktop_width` is the widest picture to ask for. |
 
-The client's modules: `connection.rs` runs the link on its own threads. `hub.rs` hands the numbers to the UI. `tracking.rs` turns Cranpose's `XrFrame` into the protocol's messages. `ui.rs` holds the panels, `console.rs` and `console_panel.rs` the console, `desktop.rs` the desktop panel, `audio.rs` the sound, `usb.rs` the cable and `phone.rs` the phone mode.
+The client's modules: `connection.rs` runs the link on its own threads. `hub.rs` hands the numbers to the UI. `tracking.rs` turns Cranpose's `XrFrame` into the protocol's messages. `focus.rs` and `hands.rs` hold the rules for the input focus and for the user's hands. `ui.rs` holds the panels, `console.rs` and `console_panel.rs` the console, `desktop.rs` the desktop panel, `audio.rs` the sound, `usb.rs` the cable and `phone.rs` the phone mode.
 
 ### Tracking
 
@@ -112,6 +114,44 @@ A hold of the left menu button (0.8 seconds) shows or hides the console, a movab
 The cranvr app writes the games and the settings to `vr-menu.json` and a one-line `notice` while it has something to say. The host adds the stream's state as `status` and sends the menu as `HostMsg::Menu` when the client connects and when it changes (at most once a second). A press sends `ClientMsg::Console` with the request as JSON (`{"action": "play", "game": "Beat Saber"}`, `{"action": "stop"}`, `{"action": "set", "fps": 90}`). The host hands it to the app as a `vr_request` status line. The app plays the game or changes the setting. A changed refresh rate or game size restarts the host. The client then connects again by itself every 2 seconds until the stream is back, unless the user pressed Disconnect.
 
 The console has two settings of the client itself, which never go to the host: Room (Passthrough or Scene) and Volume (100%, 150% (the default), 200% or 300%). Cranpose's preferences service saves them. The audio renderer multiplies each sample by the volume. A soft limiter above 0.8 keeps loud parts below 1.
+
+### Focus and pause
+
+The headset's runtime tells an app how much of the headset it has. Cranpose maps the state of the OpenXR session to the app's lifecycle (`cranpose::local_lifecycle_state()`). `Resumed` means that the app has the input focus. `Paused` means that the app is on display without the focus, under the system's menu or beside another app's panel. `Stopped` means that the headset shows none of the app. Meta's rules say that an app without the focus keeps drawing, shows no controllers and takes no input. Cranpose's backend does that for the panels and the streamed scene. The client does it for the link (`focus.rs`, `tracking.rs`):
+
+- The sender tells the host with `ClientMsg::Focus` when the state changes. The values are `Focused`, `Visible` (the lifecycle's `Paused`) and `Hidden` (`Stopped`). An app that starts without the focus says so once after the welcome. A client that never says anything is focused, and so is a host that never hears anything. The message is a new variant at the end of `ClientMsg`, so a host from before it skips it.
+- The sender sends no tracking and no input while the app is not focused. The connection goes on with its pings and loss reports, so the session lives. The scene keeps the last picture on display. The stats panel shows a Focus line. The client plays no haptic pulse of the host.
+- The host lets go of every button that the headset held and tells the game's runtime that no controller is tracked. It stops the video of the eye stream and of the desktop panel. It stops the sound too. The game keeps running on the Mac, because the runtime has no message for a change of focus. When the focus comes back, the host starts the eye stream and the desktop stream with key frames. The next tracking sample brings the controllers back. The host's log names each change and the frames that it sent in the time before: `the headset's app is visible without the input focus: the stream pauses. It was focused for 6.0 s, and the host sent 677 video frames in that time`.
+- A flat window of the client on a Mac keeps its placeholder samples at all times, whichever window the user works in.
+
+`scripts/e2e.sh --pause 6:6` runs the probe through such a pause on a Mac. The probe loses the focus at 6 seconds for 6 seconds, as the client does under the system's menu. It counts the frames that still arrive. The run passes when none arrives after the first 0.3 seconds of the pause and the stream goes on after it. With `--game` the fake game keeps running through the pause.
+
+### Hands and the panels
+
+An app that declares `Use::hand_tracking()` (`build.rs` does) has a hand pointer: a tracked hand with no controller in it points at the panels, and a pinch presses. A controller that the runtime tracks points first. Every panel works with a pinch.
+
+The client does not send such a hand to the host as a controller (`held` in `tracking.rs`). The runtime reports it through the hand interaction profile, with an aim pose and a pinch as the trigger, and a Quest keeps that aim pose valid when no hand is in view. The host decides by itself when a hand makes a controller, from the hand's joints (see "Controllers made of hands"): it asks for hands only while a controller is missing. A hand that counted as a controller would hide the missing one from the host. The game would then get a pose and a trigger when no hand is in view.
+
+The same pinch must not press a panel behind the game's picture while it is the game's input. **While the host asks the headset for the hands and a tracked hand points at the panels, the hands belong to the game, and the panels that stand in the room do not show** (`hands.rs`). That covers the connect panel and the stats panel. It covers the ball above the left controller as well. A panel that is not composed gets no hit, so no pinch can press a button such as Stop behind the picture. The console stays. The user opens it on purpose with a hold of the left menu button.
+
+- The host asks for the hands (`HostMsg::TrackingWish`) in two cases: a game creates a hand tracker, or a game without hand code runs while a controller is missing. Without a game the host asks for no hands, so the panels work with a pinch before a game starts and after it ends. The client names no game.
+- A user who holds both controllers has no hand pointer, so the panels stay. OpenComposite asks for hands for every OpenVR game, and such a game keeps its panels and its ball.
+- A hand that the cameras lose keeps the answer for a second and a half, so the panels do not flicker. The wish ends with the game or the link, and the panels come back at once.
+- The way out for a user who plays with hands only: the panels stay hidden. The user picks up a controller, whose ray points first, and holds its left menu button to open the console. Without a controller the user ends the game in the cranvr app on the Mac or leaves the headset app through the system's menu.
+
+### Text entry
+
+A text field asks for the platform's software keyboard when it takes focus. In a Quest, Cranpose draws the keyboard as a panel of keys under the panel of the field. A press of a controller's ray or a pinch of a hand on a key types. On Android XR the system's keyboard shows instead. The address field of the connect panel is the app's only text field. It takes the typed address of a Mac. A headset also keeps the keypad in that panel, which edits the same text. It stays until the drawn keyboard has run on a Quest 3, because Cranpose tested the keyboard in a window and in an emulator only. The phone build uses the system's keyboard.
+
+### The Meta store check
+
+Cranpose has an entitlement check for the Meta Horizon Store (the `meta-entitlement` feature of `cranpose-xr`). cranvr leaves it off. The real application id needs the owner's Meta developer account. Whoever turns the check on also accepts the license of Meta's Platform SDK, which the feature downloads from Maven Central. To turn it on:
+
+1. Add the feature to the Cranpose crate in `client/Cargo.toml`: `cranpose-xr = { git = "...", rev = "...", features = ["meta-entitlement"] }`.
+2. List the service in `client/android/app/build.gradle.kts` and give the id: `services.addAll("xr", "meta-entitlement")` and `metaAppId.set(providers.gradleProperty("cranposeMetaAppId"))` in the `cranpose { ... }` block.
+3. Build with the id from the developer dashboard (My Apps, Development, API): `-PcranposeMetaAppId=ID`.
+
+A failed check quits the app. A build that installs without the store fails the check, so a test needs the app's store channel or a test user.
 
 ### Phone mode
 
@@ -480,7 +520,9 @@ Use pairing for real use. `--trust-all` accepts any client on the network and is
 
 - An OpenVR game that draws a picture in the headset. The Direct3D 11 test program `openvr_smoke.exe` ran through the real runtime in a Quest 3 on a desk, with the picture of each eye checked by `adb exec-out screencap -p` (R8G8B8A8 and typeless B8G8R8A8 textures). Serious Sam VR (Steam app 465240) draws its own picture on the Mac: the host's eye check counted 213 of 256 lit samples in each eye at the menu. A copy of each eye (`CRANVR_EYE_DUMP`) shows its intro and its loading screen. Before the Wine patch (`third_party/wine`) the same game drew 0 lit samples and every copy was black. The game makes about 72 frames a second at 72 Hz in a test host. Its picture has not been seen in a headset yet (the Quest was off adb during the run). Google Earth VR loads OpenComposite and quits a second later without a message. A worn headset with controllers, the seated universe of OpenVR and a game with IVRInput actions (OpenComposite then needs the game's action manifest) are untested.
 - OpenComposite uses `XR_EXT_hand_tracking` when the runtime offers it, so the host logs "the game uses hands" for an OpenVR game and makes no controllers of the user's hands for it.
-- The STAGE space (runtime patch 0007) is offered to every OpenXR game now. Beat Saber's height with it has not been compared with its height before.
+- The focus and pause of this version on a Quest 3: the Universal Menu over the app (`systemux://file-manager`), the display going off and a worn headset that is taken off. The probe and an Android XR emulator ran them, a Quest did not. A headset that stops the app's threads while it is `Hidden` would end the link after the host's 5 seconds of silence. The emulator kept its pings.
+- The drawn keyboard of Cranpose on a Quest 3, and the pinch of a real hand on the panels. The hands rule (`hands.rs`) ran in the Android XR emulator with a scripted hand (`scripts/build-client.sh --scripted-hand --xr-store android-xr`) and the fake game that asks for hands: the connect panel, the stats panel and the ball were there before the game, gone while it asked, and back within a few seconds after it ended. The emulator reports the hand interaction profile for both hands, and the client's log says that it sends them as hands. A real hand's pinch has not been tried.
+- The STAGE space (runtime patch 0007) is offered to every OpenXR game now. Beat Saber 1.46 (Unity's OpenXR plugin) was run with the probe as the headset, once with a runtime that lacks STAGE and once with one that offers it. Both runtimes had a trace of `xrCreateReferenceSpace`, `xrLocateViews` and `xrLocateSpace`. Without STAGE the game creates a LOCAL and a VIEW space and locates its views in LOCAL. With STAGE it creates a STAGE space too and locates its views in STAGE at first. Later in the run it makes a new LOCAL space and locates its views there. The head's height is the same in each case: 1.900 m for a probe whose head stands 1.6 m above its room's origin with the floor 0.3 m below that origin. The runtime keeps STAGE as a LOCAL space, so the two cannot differ in the runtime. How the game places its camera in the Floor mode that STAGE enables was not compared by picture.
 - Hands, body, face and eyes from a worn headset. The tests run with the probe's script and the client's own tests. A real hand in view, a real face and the permission prompts of a user who answers them have not been tried. The face source of a worn Quest 3 and the face of a real Android XR headset have not been seen either.
 - The cranvr client in a worn headset: the controllers in a game, the carry of the desktop panel by a ray, a recenter and the cable from a Quest.
 - Beat Saber during a song. The game's frame rate and latency were measured on its first screen with the headset on a desk.

@@ -4,11 +4,14 @@
 # and adds the manifest entries of the `xr` service. Gradle takes the plugin and the Rust crates
 # from the Cranpose git checkout that client/Cargo.toml names, so the first build needs the network.
 #
-# Usage: scripts/build-client.sh [--phone] [--xr-store STORE] [--install [SERIAL]]
+# Usage: scripts/build-client.sh [--phone] [--scripted-hand] [--xr-store STORE] [--install [SERIAL]]
 #   --phone    builds cranvr-phone.apk instead: the same crate as a flat app for an Android phone or
 #              tablet, with no OpenXR. The screen shows the picture and the motion sensors are the
 #              head. It has the application id dev.cranvr.client.phone, so it installs beside the
 #              headset's APK.
+#   --scripted-hand  builds cranvr-client-scripted.apk with a hand that types into the address field
+#              (client/src/scripted.rs), for a headset on a desk. It has the id of the plain app and installs
+#              over it. Install the plain build after the test.
 #   --xr-store STORE  the store whose features the manifest carries: meta (the default of the Cranpose
 #              plugin), android-xr or open. The APK is named cranvr-client-STORE.apk, so a build
 #              for the Android XR emulator keeps the Quest's APK.
@@ -24,10 +27,11 @@
 set -euo pipefail
 
 root=${0:A:h:h}
-install=0 serial="" phone=0 store=""
+install=0 serial="" phone=0 store="" scripted=0
 while (( $# )); do
     case $1 in
         --phone) phone=1; shift ;;
+        --scripted-hand) scripted=1; shift ;;
         --xr-store) store=$2; shift 2 ;;
         --install)
             install=1; shift
@@ -50,6 +54,10 @@ if (( phone )); then
     name=cranvr-phone gradle_args=(-PcranvrPhone=true) app_id=dev.cranvr.client.phone
 else
     name=cranvr-client gradle_args=() app_id=dev.cranvr.client
+fi
+if (( scripted )); then
+    gradle_args+=(-PcranvrScriptedHand=true)
+    name=${name}-scripted
 fi
 if [[ -n ${store} ]]; then
     gradle_args+=("-PcranposeXrStore=${store}")

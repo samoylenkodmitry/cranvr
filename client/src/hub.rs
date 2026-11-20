@@ -22,7 +22,7 @@ use cranpose_xr::{
 use cranvr_common::foveation::{Foveation, FoveationConfig};
 use cranvr_proto::{
     clock::now_ns,
-    message::FoveationParams,
+    message::{FoveationParams, Focus},
     wire::{Fov, Nanos, Pose},
 };
 use std::{
@@ -192,11 +192,13 @@ pub struct Snapshot {
     pub usb: Option<UsbMac>,
     /// The way that the link goes, once a connection has chosen it
     pub path: Option<Path>,
+    /// How much of the headset the app has (see `focus.rs`). `Hub::snapshot` fills it.
+    pub focus: Focus,
 }
 
 impl Snapshot {
     fn idle() -> Self {
-        Self { state: LinkState::Idle, stream: None, stats: Stats::default(), found: Vec::new(), usb: None, path: None }
+        Self { state: LinkState::Idle, stream: None, stats: Stats::default(), found: Vec::new(), usb: None, path: None, focus: Focus::Focused }
     }
 }
 
@@ -403,6 +405,7 @@ impl Hub {
         let mut snapshot = self.snapshot.lock().unwrap().clone();
         snapshot.found = self.found.lock().unwrap().clone();
         snapshot.usb = self.usb.lock().unwrap().clone();
+        snapshot.focus = if self.device().is_live() { crate::focus::current() } else { Focus::Focused };
         snapshot
     }
 

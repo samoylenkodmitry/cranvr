@@ -598,6 +598,10 @@ fn session(hub: &'static Hub, id: u64, link: &ClientLink, device: Device, hello_
     if let (Some(format), true) = (stream.audio, device.is_live()) {
         crate::audio::open(format);
     }
+    // A change of the lifecycle wakes the sender, which tells the host about the focus. The sender
+    // would notice it on its own turn, at most 20 ms later. A headset that goes to sleep may stop the
+    // process right after it, so the host should hear of the change at once.
+    let _focus_watch = device.is_live().then(|| cranpose::observe_lifecycle(move |_| hub.feed.wake()));
     let reason = thread::scope(|scope| {
         let named = |name: &str| thread::Builder::new().name(name.into());
         if link.duplex.has_udp() {
@@ -606,7 +610,7 @@ fn session(hub: &'static Hub, id: u64, link: &ClientLink, device: Device, hello_
         }
         named("cranvr-upkeep").spawn_scoped(scope, move || upkeep(shared)).expect("the upkeep thread");
         named("cranvr-tracking")
-            .spawn_scoped(scope, move || tracking::send_loop(link, &hub.feed, device.is_live(), refresh_hz, hello_views, stop))
+            .spawn_scoped(scope, move || tracking::send_loop(link, &hub.feed, device.is_live(), refresh_hz, hello_views, &crate::focus::current, stop))
             .expect("the tracking thread");
         named("cranvr-decode").spawn_scoped(scope, move || decode_loop(shared, &units_rx)).expect("the decoder thread");
         named("cranvr-stats").spawn_scoped(scope, move || stats_loop(shared)).expect("the stats thread");
@@ -639,9 +643,12 @@ fn read_loop(s: &Shared<'_>, units: mpsc::Sender<Received>, udp: bool) -> Error 
         }
         Incoming::Datagram(HostDatagram::Haptics(pulse)) => {
             s.counters.haptics.fetch_add(1, Ordering::Relaxed);
-            if let Some(haptics) = s.hub.headset().and_then(|headset| headset.haptics) {
-                let (hand, vibration) = pulse_vibration(&pulse);
-                haptics.vibrate(hand, vibration);
+            // An app without the input focus drives no controller (Meta's rule)
+            if crate::focus::current().is_focused() {
+                if let Some(haptics) = s.hub.headset().and_then(|headset| headset.haptics) {
+                    let (hand, vibration) = pulse_vibration(&pulse);
+                    haptics.vibrate(hand, vibration);
+                }
             }
         }
         Incoming::Datagram(HostDatagram::Audio(audio)) => {

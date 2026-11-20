@@ -20,7 +20,7 @@ use cranvr_proto::{
     link::{ClientLink, ClientSide, Incoming},
     media::{FrameReceiver, Received},
     message::{
-        buttons, ClientCaps, ClientDatagram, ClientMsg, FrameTiming, HandInput, HostDatagram, HostMsg, Input, LossReport, Ping, Pong,
+        buttons, ClientCaps, ClientDatagram, ClientMsg, FrameTiming, Focus, HandInput, HostDatagram, HostMsg, Input, LossReport, Ping, Pong,
         Tracking, Views,
     },
     tracking::{BodySet, Features},
@@ -58,6 +58,10 @@ pub struct Options {
     pub no_controllers: bool,
     /// With `tracking`: where the face comes from
     pub face_source: tracked::FaceSource,
+    /// Loses the input focus at this many seconds for this many seconds, as under the system's
+    /// menu: the probe tells the host, sends no tracking and no input, and counts the frames that
+    /// still arrive
+    pub pause: Option<(f32, f32)>,
 }
 
 /// The probe's clock runs this far ahead of the process clock, as a headset's clock has its own
@@ -146,6 +150,25 @@ struct Shared {
     no_controllers: bool,
     face_source: tracked::FaceSource,
     sent_tracking: [AtomicU64; 4],
+    pause: Option<(f32, f32)>,
+    /// Frames of the eye stream that arrived, for the pause test
+    units_seen: AtomicU64,
+    /// What the pause test measured: frames that arrived in the first 0.3 s of the pause, frames
+    /// after that until the focus returned, and frames in the 1.5 s after the return
+    pause_result: Mutex<Option<PauseResult>>,
+}
+
+/// What the pause test counted.
+#[derive(Clone, Copy, Debug, Default)]
+struct PauseResult {
+    /// Frames in the 0.3 s after the pause began: the ones that were on their way
+    settling: u64,
+    /// Frames from then to the end of the pause
+    paused: u64,
+    /// Frames in the 1.5 s after the focus returned
+    resumed: u64,
+    /// Frames in the 1.5 s before the pause began
+    before: u64,
 }
 
 impl Shared {
@@ -235,6 +258,9 @@ pub fn run(o: Options) -> i32 {
         no_controllers: o.no_controllers,
         face_source: o.face_source,
         sent_tracking: Default::default(),
+        pause: o.pause,
+        units_seen: AtomicU64::new(0),
+        pause_result: Mutex::new(None),
     });
     if o.tracking {
         // The probe offers every feature that the protocol has, and names the face's source. Its head
@@ -339,7 +365,27 @@ pub fn run(o: Options) -> i32 {
         );
     }
     let desktop_ok = shared.desktop.as_ref().is_none_or(|d| d.summary());
-    i32::from(r.good * 2 < expected || !desktop_ok)
+    let pause_ok = match (shared.pause, *shared.pause_result.lock().unwrap()) {
+        (None, _) => true,
+        (Some(_), None) => {
+            println!("probe: pause test FAIL: the run ended before the focus came back and 1.5 s passed");
+            false
+        }
+        (Some((at, length)), Some(p)) => {
+            // The frames that were on their way arrive in the first 0.3 s. After that none may come.
+            let ok = p.before > 10 && p.paused == 0 && p.resumed > 10;
+            println!(
+                "probe: pause test {}: the focus left at {at} s for {length} s. Frames in the 1.5 s before: {}. In the first 0.3 s of the pause: {}. In the rest of the pause: {}. In the 1.5 s after the return: {}",
+                if ok { "PASS" } else { "FAIL" },
+                p.before,
+                p.settling,
+                p.paused,
+                p.resumed
+            );
+            ok
+        }
+    };
+    i32::from(r.good * 2 < expected && shared.pause.is_none() || !desktop_ok || !pause_ok)
 }
 
 #[derive(Default)]
@@ -474,8 +520,39 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
     let period = Duration::from_nanos(period_ns);
     let mut deadline = origin;
     let (mut last_report, mut last_ping, mut ping_id) = (origin, origin - PING_EVERY, 0u32);
+    // The pause test: the counts of arrived frames at the points of the script
+    let (mut paused, mut counts): (bool, Vec<(f32, u64)>) = (false, Vec::new());
+    let mut before = (0.0f32, 0u64);
     while !shared.stop.load(Ordering::Relaxed) {
         let t = origin.elapsed().as_secs_f32();
+        if let Some((at, length)) = shared.pause {
+            let seen = shared.units_seen.load(Ordering::Relaxed);
+            let now_paused = t >= at && t < at + length;
+            if t >= at - 1.5 && before.0 == 0.0 {
+                before = (t, seen);
+            }
+            if now_paused != paused {
+                paused = now_paused;
+                let state = if paused { Focus::Visible } else { Focus::Focused };
+                println!("probe: {:.2} s: the focus {} ({} frames arrived so far)", t, if paused { "leaves" } else { "returns" }, seen);
+                shared.link.duplex.send_control(&ClientMsg::Focus(state)).ok();
+                counts.push((t, seen));
+            }
+            // The points of the script after the pause began: 0.3 s in, and 1.5 s after the return
+            if paused && counts.len() == 1 && t >= at + 0.3 {
+                counts.push((t, seen));
+            }
+            if !paused && counts.len() == 3 && t >= at + length + 1.5 {
+                let (settled, returned) = (counts[1].1, counts[2].1);
+                *shared.pause_result.lock().unwrap() = Some(PauseResult {
+                    before: counts[0].1 - before.1,
+                    settling: counts[1].1 - counts[0].1,
+                    paused: returned - settled,
+                    resumed: seen - returned,
+                });
+                counts.push((t, seen));
+            }
+        }
         let sample_time = now_ns();
         // The simulated display shows the frame of this sample at its second refresh after the
         // sample. The head's pose is the one that is valid then, as a headset predicts it.
@@ -499,35 +576,38 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
             }
             sent.push_back((sample_time, head.pose));
         }
-        let controllers = !shared.no_controllers;
-        shared.link.duplex.send_datagram(&ClientDatagram::Tracking(Tracking {
-                sample_time,
-                display_time,
-                head,
-                left_grip: controllers.then_some(left),
-                right_grip: controllers.then_some(right),
-                left_aim: controllers.then(|| hands::aim_with(0, &left)),
-                right_aim: controllers.then(|| hands::aim_with(1, &right)),
-            })).ok();
-        send_tracked(shared, sample_time, display_time);
-        // The input goes out with each sample, as the client's does. For half a second in every
-        // 3 seconds the left grip squeezes, the right trigger goes to 0.75, A is down and the right
-        // stick leans to 0.5, as a game test may ask. A game answers the squeeze with a haptic pulse.
-        let held = t % 3.0 > 2.5;
-        let on = |v: f32| if held { v } else { 0.0 };
-        let mut input = Input { sample_time, ..Default::default() };
-        // A headset with no controller reports every input at rest
-        if controllers {
-            input.hands[0] = HandInput { grip: on(1.0), buttons: buttons::GRIP_CLICK * u32::from(held), ..Default::default() };
-            input.hands[1] = HandInput {
-                trigger: on(0.75),
-                stick: [on(0.5), 0.0],
-                buttons: (buttons::PRIMARY | buttons::TRIGGER_CLICK) * u32::from(held),
-                touches: buttons::PRIMARY * u32::from(held),
-                ..Default::default()
-            };
+        // An app without the input focus sends no tracking and no input
+        if !paused {
+            let controllers = !shared.no_controllers;
+            shared.link.duplex.send_datagram(&ClientDatagram::Tracking(Tracking {
+                    sample_time,
+                    display_time,
+                    head,
+                    left_grip: controllers.then_some(left),
+                    right_grip: controllers.then_some(right),
+                    left_aim: controllers.then(|| hands::aim_with(0, &left)),
+                    right_aim: controllers.then(|| hands::aim_with(1, &right)),
+                })).ok();
+            send_tracked(shared, sample_time, display_time);
+            // The input goes out with each sample, as the client's does. For half a second in every
+            // 3 seconds the left grip squeezes, the right trigger goes to 0.75, A is down and the right
+            // stick leans to 0.5, as a game test may ask. A game answers the squeeze with a haptic pulse.
+            let held = t % 3.0 > 2.5;
+            let on = |v: f32| if held { v } else { 0.0 };
+            let mut input = Input { sample_time, ..Default::default() };
+            // A headset with no controller reports every input at rest
+            if controllers {
+                input.hands[0] = HandInput { grip: on(1.0), buttons: buttons::GRIP_CLICK * u32::from(held), ..Default::default() };
+                input.hands[1] = HandInput {
+                    trigger: on(0.75),
+                    stick: [on(0.5), 0.0],
+                    buttons: (buttons::PRIMARY | buttons::TRIGGER_CLICK) * u32::from(held),
+                    touches: buttons::PRIMARY * u32::from(held),
+                    ..Default::default()
+                };
+            }
+            shared.link.duplex.send_datagram(&ClientDatagram::Input(input)).ok();
         }
-        shared.link.duplex.send_datagram(&ClientDatagram::Input(input)).ok();
         if last_ping.elapsed() >= PING_EVERY {
             last_ping = Instant::now();
             shared.link.duplex.send_datagram(&ClientDatagram::Ping(Ping { id: ping_id, sent: now_ns() })).ok();
@@ -629,6 +709,7 @@ fn decode_loop(
             }
             continue;
         }
+        shared.units_seen.fetch_add(1, Ordering::Relaxed);
         let mut r = results.lock().unwrap();
         // A new decoder config, or the first one
         let (generation, config) = shared.config.lock().unwrap().clone();
