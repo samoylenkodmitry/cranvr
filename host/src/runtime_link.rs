@@ -123,7 +123,7 @@ fn forwards_haptic(quiet: &mut [bool; 2], hand: u32, amplitude: f32) -> bool {
     let Some(was_quiet) = quiet.get_mut(hand as usize) else {
         return false;
     };
-    let silent = !(amplitude > 0.0);
+    let silent = amplitude.is_nan() || amplitude <= 0.0;
     let forward = !(silent && *was_quiet);
     *was_quiet = silent;
     forward
