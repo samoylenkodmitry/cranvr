@@ -13,7 +13,10 @@ use crate::{
     runtime_link::Haptic,
     session::Negotiated,
 };
-use cranvr_proto::tracking::{Features, Tracked};
+use cranvr_proto::{
+    message::Focus,
+    tracking::{Features, Tracked},
+};
 use serde_json::Value;
 use std::{net::IpAddr, sync::mpsc::RecvTimeoutError, time::Duration};
 
@@ -59,6 +62,10 @@ pub enum Event {
     /// Hands, body, face or eyes of one headset frame, for a feature that the host wished. Poses lie
     /// in the room of the host's scenes: the floor of the headset is at height 0.
     Tracked(Tracked),
+    /// The app on the headset lost or regained the input focus, or the headset hides it (see
+    /// `cranvr_proto::message::Focus`). The link has released the inputs already. The host stops
+    /// the stream while the app is not focused.
+    Focus(Focus),
 }
 
 /// Where the events of a link come from. The host's event loop owns it.

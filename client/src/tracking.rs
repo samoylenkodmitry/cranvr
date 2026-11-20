@@ -23,11 +23,11 @@
 //! velocities and with no offset. The host hands both to a game, which picks the one that it needs.
 
 use crate::tracked::{TrackedFrame, TrackedReader};
-use cranpose_xr::{Controller, Pose as XrPose, Recenter as XrRecenter, RenderViewpoint, TrackedPose, XrFrame};
+use cranpose_xr::{Controller, Hand as XrHand, InputSource, InteractionProfile, Pose as XrPose, Recenter as XrRecenter, RenderViewpoint, TrackedPose, XrFrame};
 use cranvr_proto::{
     clock::now_ns,
     link::ClientLink,
-    message::{buttons as bit, ClientDatagram, ClientMsg, HandInput, Input, Recenter, Tracking, Views},
+    message::{buttons as bit, ClientDatagram, ClientMsg, Focus, HandInput, Input, Recenter, Tracking, Views},
     motion::velocities,
     tracking::{Body, Eyes, Face, Features, Hand, Hands, Joint, TRACKING_VERSION},
     wire::{Fov, Motion, Nanos, Pose},
@@ -80,6 +80,8 @@ pub struct Read {
     pub recenter: Option<Recenter>,
     /// The height of the floor in the room, when the runtime gives its stage
     pub floor: Option<f32>,
+    /// A tracked hand is what points at the panels on at least one side (see `hands.rs`)
+    pub hand_pointer: bool,
 }
 
 /// Turns the frames of the headset into [`Read`]s. It keeps the head's last pose, from which it
@@ -88,6 +90,8 @@ pub struct Read {
 pub struct FrameReader {
     last_head: Option<(Duration, XrPose)>,
     tracked: TrackedReader,
+    /// The interaction profiles of the two hands in the newest frame, for the log
+    profiles: Option<[Option<InteractionProfile>; 2]>,
 }
 
 /// Two head poses further apart in time than this give no velocity.
@@ -110,20 +114,24 @@ impl FrameReader {
             // The poses before and after the change lie in different spaces
             self.last_head = None;
         }
+        self.note_profiles(xr);
+        // A hand that the cameras track is no controller (see `held`)
+        let (left, right) = (held(&xr.left_controller), held(&xr.right_controller));
         let frame = xr.device_pose.map(|pose| HeadsetFrame {
             sample_time: now,
             display_time: display.time,
             head: self.head(pose, xr.predicted_display_time, (xr.device_linear_velocity, xr.device_angular_velocity)),
-            left_grip: xr.left_controller.grip.as_ref().map(motion),
-            right_grip: xr.right_controller.grip.as_ref().map(motion),
-            left_aim: xr.left_controller.aim.as_ref().map(motion),
-            right_aim: xr.right_controller.aim.as_ref().map(motion),
-            input: Input { sample_time: now, hands: [hand_input(&xr.left_controller), hand_input(&xr.right_controller)] },
+            left_grip: left.and_then(|c| c.grip.as_ref()).map(motion),
+            right_grip: right.and_then(|c| c.grip.as_ref()).map(motion),
+            left_aim: left.and_then(|c| c.aim.as_ref()).map(motion),
+            right_aim: right.and_then(|c| c.aim.as_ref()).map(motion),
+            input: Input { sample_time: now, hands: [left.map_or_else(HandInput::default, hand_input), right.map_or_else(HandInput::default, hand_input)] },
         });
         if frame.is_none() {
             self.last_head = None;
         }
-        Read { display, frame, views: views(xr), recenter, floor: xr.floor_height().filter(|height| height.is_finite()) }
+        let hand_pointer = [XrHand::Left, XrHand::Right].into_iter().any(|hand| xr.pointer(hand) == Some(InputSource::Hands));
+        Read { display, frame, views: views(xr), recenter, floor: xr.floor_height().filter(|height| height.is_finite()), hand_pointer }
     }
 
     /// Hands the frame's hands, body, face and eyes to the feed: the features that the host wished,
@@ -139,6 +147,26 @@ impl FrameReader {
         }
         let scratch = self.tracked.read(xr, frame.sample_time, frame.display_time, wish);
         feed.swap_tracked(scratch);
+    }
+
+    /// Logs the interaction profile of each hand when it changes. A Quest reports the hand
+    /// interaction profile for a hand that the cameras track, and the profile of the controller
+    /// for a hand that holds one.
+    fn note_profiles(&mut self, xr: &XrFrame) {
+        let profiles = [xr.left_controller.profile, xr.right_controller.profile];
+        if self.profiles != Some(profiles) {
+            self.profiles = Some(profiles);
+            log::info!(
+                "the runtime reports the left hand as {:?} and the right hand as {:?}; {}",
+                profiles[0],
+                profiles[1],
+                if profiles.iter().any(|p| matches!(p, Some(InteractionProfile::ExtHand | InteractionProfile::MicrosoftHand))) {
+                    "a hand that the cameras track is sent to the host as a hand, never as a controller"
+                } else {
+                    "a controller is sent to the host as a controller"
+                }
+            );
+        }
     }
 
     /// The head's motion. The runtime's own velocities count. A runtime that gives none leaves the
@@ -157,6 +185,18 @@ impl FrameReader {
             angular_velocity: runtime.1.filter(|v| finite(*v)).unwrap_or(estimated_angular),
         }
     }
+}
+
+/// The controller of a hand, or `None` while a hand that the cameras track stands in its place. The
+/// runtime reports such a hand through the hand interaction profile, with an aim pose and a pinch
+/// as the trigger, and a Quest keeps that aim pose valid when no hand is in view. The host must not
+/// take it for a controller. It decides by itself when a hand makes a controller, from the hand's
+/// joints (`host/src/tracking.rs`): it asks for hands only while a controller is missing. A hand
+/// that counted as a controller would hide the missing one from the host. The game would then
+/// get a pose and a trigger when no hand is in view. The user's hands reach a game with hand code
+/// through the hand tracking that the game asked for (`tracked.rs`).
+fn held(controller: &Controller) -> Option<&Controller> {
+    (!matches!(controller.profile, Some(InteractionProfile::ExtHand | InteractionProfile::MicrosoftHand))).then_some(controller)
 }
 
 fn proto_pose(pose: &XrPose) -> Pose {
@@ -254,6 +294,10 @@ struct FeedInner {
     /// The hands, body, face and eyes of the newest frame, until the sender takes them
     tracked: Option<Box<TrackedFrame>>,
     tracked_fresh: bool,
+    /// Set by `Feed::wake`, so the sender's wait ends at once and looks at the app's focus
+    poked: bool,
+    /// The last frame in which a tracked hand pointed at the panels
+    hand_pointer_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -265,6 +309,8 @@ struct RateCount {
 
 /// A frame that came from the headset counts as live for this long.
 const LIVE_FOR: Duration = Duration::from_secs(1);
+/// A hand that pointed at the panels counts as pointing for this long after its last frame.
+const HAND_HOLD: Duration = Duration::from_millis(1500);
 
 impl Feed {
     /// Hands one frame of the headset to the sender. A frame that the sender has not taken yet is
@@ -278,6 +324,9 @@ impl Feed {
         inner.recenters.extend(read.recenter);
         if read.floor.is_some() {
             inner.floor = read.floor;
+        }
+        if read.hand_pointer {
+            inner.hand_pointer_at = Some(Instant::now());
         }
         if read.frame.is_some() {
             inner.pending = read.frame;
@@ -338,11 +387,24 @@ impl Feed {
         }
     }
 
+    /// Wakes the sender, so it looks at the app's focus now and not at its next turn.
+    pub fn wake(&self) {
+        self.inner.lock().unwrap().poked = true;
+        self.wake.notify_all();
+    }
+
+    /// Whether a tracked hand pointed at the panels lately. A hand that the cameras lose for a
+    /// moment keeps the answer for `HAND_HOLD`, so the panels do not flicker.
+    pub fn hand_points(&self) -> bool {
+        self.inner.lock().unwrap().hand_pointer_at.is_some_and(|at| at.elapsed() < HAND_HOLD)
+    }
+
     /// Waits up to `timeout` for a frame or a recenter.
     pub fn wait(&self, timeout: Duration) -> Wake {
         let guard = self.inner.lock().unwrap();
         let (mut inner, _) =
-            self.wake.wait_timeout_while(guard, timeout, |i| i.pending.is_none() && i.recenters.is_empty()).unwrap();
+            self.wake.wait_timeout_while(guard, timeout, |i| i.pending.is_none() && i.recenters.is_empty() && !i.poked).unwrap();
+        inner.poked = false;
         Wake { frame: inner.pending.take(), recenters: std::mem::take(&mut inner.recenters), views: inner.views, floor: inner.floor }
     }
 
@@ -551,7 +613,13 @@ const STOP_CHECK: Duration = Duration::from_millis(20);
 /// Sends the device's tracking to the host until `stop` is set. On a device that tracks (a headset
 /// or a phone) each frame of the feed goes out as it comes. Without one the sender makes placeholder
 /// frames once per refresh. `hello_views` are the views that the host got in the Hello.
-pub fn send_loop(link: &ClientLink, feed: &Feed, tracked: bool, refresh_hz: f32, hello_views: Views, stop: &AtomicBool) {
+///
+/// A device that tracks follows Meta's focus rules (see `focus.rs`). While the app has no input
+/// focus the sender tells the host so, and sends no tracking and no input. The connection and its
+/// pings go on. The host pauses the stream, lets go of the buttons and shows the game no controller. A
+/// window sends placeholder frames at all times. `focus_now` tells the app's focus: the lifecycle
+/// of the app in the real sender (`focus::current`).
+pub fn send_loop(link: &ClientLink, feed: &Feed, tracked: bool, refresh_hz: f32, hello_views: Views, focus_now: &dyn Fn() -> Focus, stop: &AtomicBool) {
     let period = Duration::from_secs_f64(1.0 / f64::from(refresh_hz.max(1.0)));
     let mut deadline = Instant::now();
     let mut sent_views = hello_views;
@@ -562,8 +630,23 @@ pub fn send_loop(link: &ClientLink, feed: &Feed, tracked: bool, refresh_hz: f32,
     let sends_tracking = link.welcome.version >= TRACKING_VERSION;
     let mut outgoing = Outgoing::default();
     let mut buffer = Box::new(TrackedFrame::new());
+    // A host takes a client that never says anything as focused
+    let mut sent_focus = Focus::Focused;
     while !stop.load(Ordering::Relaxed) {
         let wake = feed.wait(if tracked { STOP_CHECK } else { period.min(STOP_CHECK) });
+        let focus = if tracked { focus_now() } else { Focus::Focused };
+        if focus != sent_focus {
+            if focus.is_focused() {
+                log::info!("the app is focused again: tracking and input go on and the host resumes the stream");
+            } else {
+                log::info!(
+                    "the app lost the focus ({}): tracking and input stop, the host pauses the stream and the link stays up",
+                    crate::focus::describe(focus)
+                );
+            }
+            link.duplex.send_control(&ClientMsg::Focus(focus)).ok();
+            sent_focus = focus;
+        }
         for recenter in wake.recenters {
             log::info!("the headset recentered; the new origin takes effect at {} ns", recenter.change_time);
             link.duplex.send_control(&ClientMsg::Recenter(recenter)).ok();
@@ -579,6 +662,10 @@ pub fn send_loop(link: &ClientLink, feed: &Feed, tracked: bool, refresh_hz: f32,
             log::info!("the headset's floor lies {floor:.2} m from the room's origin");
             sent_floor = Some(floor);
             link.duplex.send_control(&ClientMsg::Floor(floor)).ok();
+        }
+        // No tracking and no input without the focus. The frame that the wait took is not sent.
+        if !focus.is_focused() {
+            continue;
         }
         let from_headset = wake.frame.is_some();
         let frame = match wake.frame {
@@ -786,6 +873,137 @@ mod tests {
     }
 
     #[test]
+    fn an_app_without_the_focus_sends_no_tracking_and_no_input_and_tells_the_host_once() {
+        use std::sync::atomic::AtomicU8;
+        let (link, inbox) = loopback();
+        let link = std::sync::Arc::new(link);
+        let feed = std::sync::Arc::new(Feed::default());
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let focus = std::sync::Arc::new(AtomicU8::new(0));
+        let sender = {
+            let (link, feed, stop, focus) = (link.clone(), feed.clone(), stop.clone(), focus.clone());
+            let hello = FrameReader::default().read(&frame(), 1).views.unwrap();
+            let now = move || [Focus::Focused, Focus::Visible, Focus::Hidden][usize::from(focus.load(Ordering::Relaxed))];
+            thread::spawn(move || send_loop(&link, &feed, true, 120.0, hello, &now, &stop))
+        };
+        let next = |what: &str| inbox.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|_| panic!("no {what}"));
+        let mut reader = FrameReader::default();
+        let mut xr = frame();
+        xr.right_controller.primary = Button { pressed: true, touched: true };
+        feed.push(reader.read(&xr, 100));
+        assert!(matches!(next("tracking"), Heard::Datagram(ClientDatagram::Tracking(t)) if t.sample_time == 100));
+        assert!(matches!(next("input"), Heard::Datagram(ClientDatagram::Input(_))));
+
+        // The system's menu takes the focus: the host hears it once, and the frames after it go nowhere
+        focus.store(1, Ordering::Relaxed);
+        feed.wake();
+        loop {
+            if let Heard::Control(ClientMsg::Focus(state)) = next("the focus") {
+                assert_eq!(state, Focus::Visible);
+                break;
+            }
+        }
+        for sample in 200..210 {
+            feed.push(reader.read(&xr, sample));
+            thread::sleep(Duration::from_millis(5));
+        }
+        // The headset hides the app: one more message, and still nothing else
+        focus.store(2, Ordering::Relaxed);
+        feed.wake();
+        let mut messages = Vec::new();
+        let quiet_until = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < quiet_until {
+            feed.push(reader.read(&xr, 300));
+            if let Ok(heard) = inbox.recv_timeout(Duration::from_millis(20)) {
+                messages.push(heard);
+            }
+        }
+        assert!(
+            messages.iter().all(|heard| matches!(heard, Heard::Control(ClientMsg::Focus(Focus::Hidden)) | Heard::Datagram(ClientDatagram::Ping(_)))),
+            "only the focus and pings go out while the app is not focused"
+        );
+        assert_eq!(messages.iter().filter(|heard| matches!(heard, Heard::Control(ClientMsg::Focus(_)))).count(), 1);
+
+        // The focus returns: the host hears it, and the next frame goes out
+        focus.store(0, Ordering::Relaxed);
+        feed.wake();
+        let mut saw = (false, false);
+        while saw != (true, true) {
+            feed.push(reader.read(&xr, 400));
+            match inbox.recv_timeout(Duration::from_millis(50)) {
+                Ok(Heard::Control(ClientMsg::Focus(state))) => {
+                    assert_eq!(state, Focus::Focused);
+                    saw.0 = true;
+                }
+                Ok(Heard::Datagram(ClientDatagram::Tracking(t))) if t.sample_time == 400 => saw.1 = true,
+                _ => {}
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn a_wake_ends_the_senders_wait_at_once() {
+        let feed = std::sync::Arc::new(Feed::default());
+        let waker = {
+            let feed = feed.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(50));
+                feed.wake();
+            })
+        };
+        let started = Instant::now();
+        let wake = feed.wait(Duration::from_secs(10));
+        assert!(started.elapsed() < Duration::from_secs(5), "the wait ran to its timeout");
+        assert!(wake.frame.is_none() && wake.recenters.is_empty());
+        waker.join().unwrap();
+        // The poke is used up: the next wait runs to its timeout
+        let started = Instant::now();
+        feed.wait(Duration::from_millis(100));
+        assert!(started.elapsed() >= Duration::from_millis(90));
+    }
+
+    #[test]
+    fn a_hand_pointer_counts_for_a_moment_after_the_last_frame_that_had_one() {
+        let feed = Feed::default();
+        assert!(!feed.hand_points());
+        let mut read = FrameReader::default().read(&frame(), 1);
+        assert!(!read.hand_pointer);
+        read.hand_pointer = true;
+        feed.push(read.clone());
+        assert!(feed.hand_points());
+        read.hand_pointer = false;
+        feed.push(read);
+        assert!(feed.hand_points(), "a hand that the cameras lose for a moment keeps the answer");
+    }
+
+    #[test]
+    fn a_hand_that_the_cameras_track_is_no_controller() {
+        let mut xr = frame();
+        let pointing = |profile| Controller {
+            profile: Some(profile),
+            aim: Some(TrackedPose { pose: pose_at(0.2, 1.1, -0.4), linear_velocity: None, angular_velocity: None }),
+            grip: Some(TrackedPose { pose: pose_at(0.2, 1.1, -0.3), linear_velocity: None, angular_velocity: None }),
+            trigger: Trigger { value: 0.9, touched: true },
+            squeeze: 0.8,
+            ..Controller::default()
+        };
+        // The left hand holds a Touch controller. The right hand is a hand that the cameras track, and its pinch
+        // is the trigger of the hand interaction profile.
+        xr.left_controller = pointing(InteractionProfile::MetaTouchPlus);
+        xr.right_controller = pointing(InteractionProfile::ExtHand);
+        let read = FrameReader::default().read(&xr, 1).frame.unwrap();
+        assert!(read.left_grip.is_some() && read.left_aim.is_some());
+        assert_eq!(read.input.hands[0].trigger, 0.9);
+        assert!(read.right_grip.is_none() && read.right_aim.is_none());
+        assert_eq!(read.input.hands[1], HandInput::default());
+        // Microsoft's hand interaction is a hand too
+        xr.right_controller = pointing(InteractionProfile::MicrosoftHand);
+        assert!(FrameReader::default().read(&xr, 1).frame.unwrap().right_grip.is_none());
+    }
+
+    #[test]
     fn a_recenter_keeps_its_distance_from_the_frames_clock() {
         let mut xr = frame();
         xr.recenter = Some(XrRecenter {
@@ -885,7 +1103,7 @@ mod tests {
         let sender = {
             let (link, feed, stop) = (link.clone(), feed.clone(), stop.clone());
             let hello = FrameReader::default().read(&frame(), 1).views.unwrap();
-            thread::spawn(move || send_loop(&link, &feed, true, 120.0, hello, &stop))
+            thread::spawn(move || send_loop(&link, &feed, true, 120.0, hello, &|| Focus::Focused, &stop))
         };
         let next = |what: &str| inbox.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|_| panic!("no {what}"));
         let mut reader = FrameReader::default();
@@ -965,7 +1183,7 @@ mod tests {
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let sender = {
             let (link, feed, stop) = (link.clone(), feed.clone(), stop.clone());
-            thread::spawn(move || send_loop(&link, &feed, false, 120.0, placeholder_views(), &stop))
+            thread::spawn(move || send_loop(&link, &feed, false, 120.0, placeholder_views(), &|| Focus::Focused, &stop))
         };
         let mut heard = 0;
         while heard < 3 {
@@ -1032,7 +1250,7 @@ mod tests {
         let sender = {
             let (link, feed, stop) = (link.clone(), feed.clone(), stop.clone());
             let hello = FrameReader::default().read(&frame(), 1).views.unwrap();
-            thread::spawn(move || send_loop(&link, &feed, true, 120.0, hello, &stop))
+            thread::spawn(move || send_loop(&link, &feed, true, 120.0, hello, &|| Focus::Focused, &stop))
         };
         let mut reader = FrameReader::default();
         // A headset frame, as the frame loop hands it over: the tracked data first, then the frame

@@ -74,6 +74,10 @@ pub fn send(pcm: &[u8]) {
         DISCARDED_FRAMES.fetch_add((pcm.len() / BYTES_PER_FRAME) as u64, Ordering::Relaxed);
         return;
     };
+    // A headset without the input focus plays no sound. The Mac's capture goes on.
+    if session.paused() {
+        return;
+    }
     let arrived = now_ns();
     let total_frames = pcm.len() / BYTES_PER_FRAME;
     LAST_BUFFER_FRAMES.store(total_frames as u64, Ordering::Relaxed);

@@ -146,6 +146,65 @@ fn input_changes_name_the_buttons_that_moved() {
 }
 
 #[test]
+fn a_release_lets_go_of_every_button_that_the_last_input_held() {
+    let mut state = InputState::default();
+    // Before the first input nothing is held
+    assert!(state.release().is_empty());
+    let mut input = Input::default();
+    state.changes(&input);
+    input.hands[1].buttons = buttons::TRIGGER_CLICK;
+    input.hands[1].trigger = 0.9;
+    input.hands[0].stick = [0.0, -1.0];
+    state.changes(&input);
+    let released = state.release();
+    assert_eq!(released.len(), 3);
+    assert!(released.iter().all(|b| b.value == 0.0));
+    // Everything is let go: the next release has nothing to do, and a new press is a change again
+    assert!(state.release().is_empty());
+    assert_eq!(state.changes(&input).len(), 3);
+}
+
+#[test]
+fn an_app_without_the_focus_lets_go_of_its_buttons_and_the_host_hears_of_each_change_once() {
+    let port = free_port();
+    let (_headset, mut events) = start(config(port)).unwrap();
+    let client = ClientLink::connect(([127, 0, 0, 1], port).into(), &caps("Test headset"), &identity(), None, Duration::from_secs(10)).unwrap();
+    wait_for(&mut *events, |e| matches!(e, Event::Connected { .. }));
+    // The user holds the right trigger. The datagram may get lost, so the client repeats it.
+    let mut held = Input::default();
+    held.hands[1].trigger = 1.0;
+    loop {
+        client.duplex.send_datagram(&ClientDatagram::Input(held)).unwrap();
+        if let Ok(Event::Buttons(buttons)) = events.next(Duration::from_millis(100)) {
+            assert!(buttons.iter().any(|b| b.path_id == RIGHT_TRIGGER_VALUE_ID && b.value == 1.0));
+            break;
+        }
+    }
+    // The app loses the focus, as under the system's menu: the trigger goes up in the game
+    client.duplex.send_control(&ClientMsg::Focus(Focus::Visible)).unwrap();
+    let Event::Buttons(released) = wait_for(&mut *events, |e| matches!(e, Event::Buttons(b) if b.iter().any(|b| b.path_id == RIGHT_TRIGGER_VALUE_ID && b.value == 0.0))) else { unreachable!() };
+    assert!(released.iter().all(|b| b.value == 0.0));
+    let Event::Focus(focus) = wait_for(&mut *events, |e| matches!(e, Event::Focus(_))) else { unreachable!() };
+    assert_eq!(focus, Focus::Visible);
+    // The same state again is no change. The headset then hides the app, and later gives the focus back.
+    client.duplex.send_control(&ClientMsg::Focus(Focus::Visible)).unwrap();
+    client.duplex.send_control(&ClientMsg::Focus(Focus::Hidden)).unwrap();
+    let Event::Focus(focus) = wait_for(&mut *events, |e| matches!(e, Event::Focus(_))) else { unreachable!() };
+    assert_eq!(focus, Focus::Hidden);
+    client.duplex.send_control(&ClientMsg::Focus(Focus::Focused)).unwrap();
+    let Event::Focus(focus) = wait_for(&mut *events, |e| matches!(e, Event::Focus(_))) else { unreachable!() };
+    assert_eq!(focus, Focus::Focused);
+    // The input after the return reports what changed since the release: the trigger goes down again
+    loop {
+        client.duplex.send_datagram(&ClientDatagram::Input(held)).unwrap();
+        if let Ok(Event::Buttons(buttons)) = events.next(Duration::from_millis(100)) {
+            assert!(buttons.iter().any(|b| b.path_id == RIGHT_TRIGGER_VALUE_ID && b.value == 1.0));
+            break;
+        }
+    }
+}
+
+#[test]
 fn a_hand_has_a_grip_pose_and_an_aim_pose_that_the_host_does_not_offset() {
     let motion = |x: f32, pitch: f32| Motion {
         pose: ProtoPose { orientation: Quat::from_rotation_x(pitch.to_radians()).to_array(), position: [x, 1.2, -0.3] },

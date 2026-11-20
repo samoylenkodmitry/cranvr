@@ -57,6 +57,8 @@ struct Shared {
     latest_sample_ns: AtomicU64,
     views: Mutex<Views>,
     force_idr: AtomicBool,
+    /// The app on the headset has no input focus (`Event::Focus`): the frame loop sends no pictures
+    paused: AtomicBool,
     inputs: Mutex<Inputs>,
     /// What the frame loop and the headset's desktop panel share (desktop_layer.rs)
     layer: Arc<desktop_layer::LayerState>,
@@ -423,6 +425,7 @@ fn main() {
         latest_sample_ns: AtomicU64::new(0),
         views: Mutex::new(Views::default()),
         force_idr: AtomicBool::new(true),
+        paused: AtomicBool::new(false),
         inputs: Mutex::new(Inputs::default()),
         layer,
     });
@@ -498,7 +501,11 @@ fn main() {
                 status::emit(json!({"type": "headset", "connected": false}));
                 *shared.stream.lock().unwrap() = None;
                 shared.latest_sample_ns.store(0, Ordering::Relaxed);
+                // The next headset starts focused
+                shared.paused.store(false, Ordering::Relaxed);
             }
+            // A sample that was on its way when the app lost the focus
+            Event::Tracking { .. } if shared.paused.load(Ordering::Relaxed) => {}
             Event::Tracking { sample_ns: ns } => {
                 shared.latest_sample_ns.store(ns, Ordering::Relaxed);
                 pose_gaps::record();
@@ -579,6 +586,25 @@ fn main() {
                 info!("The console asks for {request}");
                 if !status::console_request(&request) {
                     warn!("A console request that is no JSON object");
+                }
+            }
+            Event::Focus(focus) => {
+                let paused = !focus.is_focused();
+                shared.paused.store(paused, Ordering::Relaxed);
+                if paused {
+                    // The first frame after the return must render for a pose of that moment, not for
+                    // the last one before the pause
+                    shared.latest_sample_ns.store(0, Ordering::Relaxed);
+                    // Meta's rule: an app without the input focus shows no controllers and takes no
+                    // input. The link let go of the buttons already. The game sees no controller
+                    // until the next sample, and a hand that made one lets go of it.
+                    if link.is_connected() {
+                        link.controller_mask(shared.latest_sample_ns.load(Ordering::Relaxed), 0);
+                    }
+                    tracking.pause();
+                } else {
+                    // The headset's decoder may have dropped what came while the app was away
+                    shared.force_idr.store(true, Ordering::Relaxed);
                 }
             }
             Event::TrackingOffer(offered) => tracking.on_offer(offered),
@@ -707,6 +733,9 @@ fn realtime_thread() {
     unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
 }
 
+/// How long the frame loop sleeps between two turns while the headset's app has no input focus. A
+/// game's frames go back to it within this time, and the stream starts again within it.
+const PAUSED_TURN: Duration = Duration::from_millis(4);
 /// A game that sent no frame for this long counts as paused, and the test scene comes back.
 const GAME_IDLE: Duration = Duration::from_millis(500);
 /// A planned frame's wait ends this long before its start, and the loop spins until the start. A
@@ -917,7 +946,7 @@ fn frame_loop(
     let sizes = game_sizes::Sizes::new(link.control_dir());
     // frames not encoded: no new tracking sample, no free buffer, encoder still busy, game frames
     // replaced by a newer one, game frames with an unknown swapchain image
-    let (mut no_sample, mut no_buffer, mut busy, mut dropped, mut missing) = (0u32, 0u32, 0u32, 0u32, 0u32);
+    let (mut no_sample, mut no_buffer, mut busy, mut dropped, mut missing, mut paused_frames) = (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
 
     loop {
         // While a game runs its frames set the pace. Otherwise the display lock plans the frame,
@@ -1075,6 +1104,31 @@ fn frame_loop(
         // reports find a frame by it. The number is the sample's time plus the count of repeats.
         // The pose lookup takes the sample for the nearest one.
         let repeat = (planned.is_some() || (game_frame.is_some() && headset.repeats_samples())) && sample != 0 && sample == last_sample && repeats < MAX_REPEATS;
+        // An app without the input focus gets no pictures, and its tracking does not come. The game
+        // keeps running: its frames go back at once, as the frames of a stream that is not wanted.
+        if shared.paused.load(Ordering::Relaxed) {
+            give_back(&game_frame);
+            paused_frames += 1;
+            if let Some(c) = &capture {
+                c.set_running(false);
+            }
+            // The stats block below runs only for a frame that went out. The cranvr app keeps the last
+            // numbers that it heard, so a pause says so: no frames, nothing sent.
+            if since.elapsed() >= Duration::from_secs(5) {
+                info!("Headset focus: the stream is paused. No frame went out in {:.0} s", since.elapsed().as_secs_f64());
+                status::emit(json!({
+                    "type": "stats", "fps": 0.0, "game_frames": 0, "render_ms": 0.0, "encode_ms": 0.0,
+                    "mbps": bitrate / 1_000_000, "audio_s": 0.0, "latency": null, "paused": true,
+                }));
+                (count, game_count, gpu_ms, gpu_exec_ms, since) = (0, 0, 0.0, 0.0, Instant::now());
+                encoded_frames.store(0, Ordering::Relaxed);
+                encoder_time_us.store(0, Ordering::Relaxed);
+                paused_frames = 0;
+            }
+            // Nothing is due until the focus returns: the loop turns slowly
+            thread::sleep(PAUSED_TURN);
+            continue;
+        }
         if sample == 0 || (sample == last_sample && !repeat) {
             give_back(&game_frame);
             no_sample += 1;
@@ -1327,7 +1381,7 @@ fn frame_loop(
                 "latency": latency,
             }));
             info!(
-                "{:.1} fps ({game_count} game frames), render {:.2} ms (GPU {:.2} ms), encode {:.2} ms, {} Mbps target, skipped: {no_sample} no new pose, {no_buffer} no buffer, {busy} encoder busy, {dropped} game frames replaced, {missing} unknown images; desktop layer {layer_fps:.1} fps; poses {poses}",
+                "{:.1} fps ({game_count} game frames), render {:.2} ms (GPU {:.2} ms), encode {:.2} ms, {} Mbps target, skipped: {no_sample} no new pose, {paused_frames} loop turns while the headset's app had no focus, {no_buffer} no buffer, {busy} encoder busy, {dropped} game frames replaced, {missing} unknown images; desktop layer {layer_fps:.1} fps; poses {poses}",
                 count as f64 / secs,
                 gpu_ms / n,
                 gpu_exec_ms / n,
@@ -1364,7 +1418,7 @@ fn frame_loop(
                 }
             }
             (count, game_count, gpu_ms, gpu_exec_ms, since) = (0, 0, 0.0, 0.0, Instant::now());
-            (no_sample, no_buffer, busy, dropped, missing) = (0, 0, 0, 0, 0);
+            (no_sample, no_buffer, busy, dropped, missing, paused_frames) = (0, 0, 0, 0, 0, 0);
         }
     }
 }

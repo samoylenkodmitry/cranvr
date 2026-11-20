@@ -7,6 +7,7 @@
 #                       [--quest [SERIAL] | --native-tcp] [--native-drop PERCENT] [--native-port PORT]
 #                       [--host-arg ARG]... [--report FILE]
 #                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine | --openvr-wine]
+#                       [--pause AT:FOR]
 #                       [--face-source visual|audio|unknown]
 #
 #   --seconds N   how long the stream runs (default 20)
@@ -44,6 +45,11 @@
 #                 offer, the host's file for the runtime and each sample carry the source. The
 #                 Windows program checks that the support structure says it, that a face tracker
 #                 which asks for the other source is refused, and each sample's dataSource.
+#   --pause AT:FOR  with the probe: the app loses the input focus at AT seconds (2 or more) for FOR
+#                 seconds, as under the headset's system menu. The probe tells the host, sends no tracking
+#                 and no input and counts the frames that still arrive. The run fails when a frame
+#                 arrives after the first 0.3 s of the pause, or when the stream does not go on after it.
+#                 With --game the fake game keeps running through the pause.
 #   --desktop     the host shows this Mac's screen. The probe asks for the desktop stream, plays a
 #                 pointer script (the host only logs its mouse events: CRANVR_POINTER_DRY_RUN) and
 #                 counts the Mac's sound. It counts every frame of the right size, since the
@@ -82,7 +88,7 @@ root=${0:A:h:h}
 seconds=20 fps=120 game=0 desktop=0 client=mac serial="" report=""
 tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 openvr_wine=0 face_source=audio
 wine="" wine_args=()
-native_tcp=0 native_drop=0 native_port=9950
+native_tcp=0 native_drop=0 native_port=9950 pause=""
 more_host_args=()
 while (( $# )); do
     case $1 in
@@ -105,6 +111,7 @@ while (( $# )); do
         --native-tcp) native_tcp=1; shift ;;
         --native-drop) native_drop=$2; shift 2 ;;
         --native-port) native_port=$2; shift 2 ;;
+        --pause) pause=$2; shift 2 ;;
         --quest)
             client=quest; shift
             if (( $# )) && [[ $1 != --* ]]; then serial=$1; shift; fi ;;
@@ -136,6 +143,10 @@ if (( tracking_wine )); then
     (( seconds >= 40 )) || seconds=40
 fi
 
+if [[ -n ${pause} && ${client} == quest ]]; then
+    print -u2 "--pause belongs to the probe: it cannot combine with --quest."
+    exit 2
+fi
 if [[ ${client} == quest ]] && (( native_tcp || native_drop )); then
     print -u2 "--native-tcp and --native-drop belong to the probe: they cannot combine with --quest."
     exit 2
@@ -308,6 +319,7 @@ if [[ -n ${wine} ]] || (( desktop )); then
 fi
 # The probe asks for the desktop stream, plays a pointer script and counts the Mac's sound
 (( desktop )) && probe_args+=(--desktop)
+[[ -n ${pause} ]] && probe_args+=(--pause "${pause}")
 # The probe offers hands, body, face and eyes and plays the script of tracked.rs for what the host asks
 (( tracking || tracking_wine )) && probe_args+=(--tracking --face-source "${face_source}")
 (( hand_controllers )) && probe_args+=(--tracking --no-controllers)
@@ -425,6 +437,6 @@ python3 -I "${root}/scripts/e2e-report.py" "${work}/host.out" "${fps}" "${report
 (( game_exit == 0 )) || result=1
 (( tracking_exit == 0 )) || result=1
 (( openvr_exit == 0 )) || result=1
-grep -hE "probe: (done|frame arrival|native|desktop|audio)" "${work}/probe.log" 2>/dev/null || true
+grep -hE "probe: (done|frame arrival|native|desktop|audio|pause test|[0-9.]+ s: the focus)" "${work}/probe.log" 2>/dev/null || true
 print "Report: ${report}"
 exit ${result}

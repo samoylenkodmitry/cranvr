@@ -300,13 +300,15 @@ fn step(inner: &Inner, session: &Session, run: &mut Running, next_frame: &mut u3
         info!("Native desktop: {}", if visible { "visible again" } else { "hidden: a game runs" });
         session.link.duplex.send_control(&HostMsg::Desktop(Some(run.params))).ok();
     }
+    // A headset without the input focus gets no new pictures. Its panel keeps the last one.
+    let live = visible && !session.paused();
     if visible {
-        run.capture.set_running(true);
+        run.capture.set_running(live);
     }
     if inner.key.swap(false, Ordering::Relaxed) {
         run.key = true;
     }
-    if visible && run.encoder.in_flight() < 2 {
+    if live && run.encoder.in_flight() < 2 {
         if let Some((seq, image)) = run.capture.latest().filter(|(seq, _)| *seq != run.last_seq || run.key) {
             let timestamp = now_ns();
             let result = match &run.flipper {
