@@ -147,14 +147,45 @@ pub fn running() -> bool {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Game {
+    /// The app ID of the game's Steam manifest. A game that the user added from a folder (see
+    /// [`added_games`]) has none: it is empty, and the program's launch options may name an ID.
     pub app_id: String,
     pub name: String,
     /// The program to start, found in the install folder
     pub exe: Option<PathBuf>,
 }
 
-/// Installed games from every Steam library in the prefix.
+/// Installed games from every Steam library in the prefix, then the games that the user added from a
+/// folder. A name is unique in the list, because the console in VR plays a game by its name.
 pub fn games() -> Vec<Game> {
+    let mut all = steam_games();
+    for added in added_games(&backend::Settings::load()) {
+        let taken = |name: &str, all: &[Game]| all.iter().any(|game| game.name.eq_ignore_ascii_case(name));
+        let mut game = added;
+        let base = game.name.clone();
+        for n in 2.. {
+            if !taken(&game.name, &all) {
+                break;
+            }
+            game.name = format!("{base} ({n})");
+        }
+        all.push(game);
+    }
+    all
+}
+
+/// The games that the user added from a folder, in the order of adding. Each is a program that cranvr
+/// starts like a Steam game. Its name is its folder's name unless the user changed it.
+pub fn added_games(settings: &backend::Settings) -> Vec<Game> {
+    settings
+        .added_games
+        .iter()
+        .map(|added| Game { app_id: String::new(), name: added.name.clone(), exe: Some(added.program.clone()) })
+        .collect()
+}
+
+/// The games of the Steam libraries, with no game that the user added.
+pub fn steam_games() -> Vec<Game> {
     let mut games = Vec::new();
     for steamapps in libraries() {
         let Ok(entries) = fs::read_dir(&steamapps) else { continue };
@@ -278,6 +309,15 @@ fn game_wine(program: &str) -> Command {
     command
 }
 
+/// The Steam app ID that a program's Steam check gets: the one in its launch options, else the one of
+/// the Steam manifest that names its install folder. None when it has neither.
+fn steam_id(program: &str, manifest_id: Option<&str>) -> Option<String> {
+    let options = backend::Settings::load().launch.get(program).cloned().unwrap_or_default();
+    let own = options.steam_app_id.trim();
+    let id = if own.is_empty() { manifest_id.unwrap_or_default().trim() } else { own };
+    (!id.is_empty()).then(|| id.to_owned())
+}
+
 /// `wine` with an MSAA limit for the game: 0 leaves it to the game.
 fn wine_with(program: &str, msaa_limit: u32) -> Command {
     let home = config_dir();
@@ -326,11 +366,16 @@ pub fn start() -> Result<(), String> {
 }
 
 /// Starts a game by its program while Steam runs. A game started by `steam.exe -applaunch`
-/// would get Steam's environment; this one gets the host's control file and its app ID.
+/// would get Steam's environment; this one gets the host's control file and its app ID. The ID
+/// comes from the program's launch options, else from the game's Steam manifest. A game with an ID
+/// has a Steam check, so Steam starts first. A game with none (a program that the user added from a
+/// folder, with no ID in its options) starts without Steam.
 pub fn play(game: &Game) -> Result<(), String> {
     require_current_game_support()?;
     let exe = game.exe.clone().ok_or(format!("No program found for {}", game.name))?;
-    if !running() {
+    let program = mac_to_windows(&exe);
+    let app_id = steam_id(&program, Some(&game.app_id));
+    if app_id.is_some() && !running() {
         start()?;
         // Steam must answer the game's Steam check: give it time to come up
         let since = Instant::now();
@@ -338,11 +383,15 @@ pub fn play(game: &Game) -> Result<(), String> {
             thread::sleep(Duration::from_millis(500));
         }
         thread::sleep(Duration::from_secs(5));
+    } else if !wine_ready() {
+        return Err("Set up game support first".into());
     }
-    game_wine(&mac_to_windows(&exe))
+    let mut command = game_wine(&program);
+    if let Some(id) = &app_id {
+        command.env("SteamAppId", id).env("SteamGameId", id);
+    }
+    command
         .current_dir(exe.parent().unwrap_or(Path::new("/")))
-        .env("SteamAppId", &game.app_id)
-        .env("SteamGameId", &game.app_id)
         .stdout(log_file("game.log"))
         .stderr(log_file("game.err.log"))
         .spawn()
@@ -356,9 +405,10 @@ pub fn run_program(path: &Path) -> Result<(), String> {
         return Err("Set up game support first".into());
     }
     require_current_game_support()?;
-    let mut command = game_wine(&mac_to_windows(path));
-    if let Some(app_id) = backend::steam_app_id(path.parent().unwrap_or(path)) {
-        command.env("SteamAppId", &app_id).env("SteamGameId", &app_id);
+    let program = mac_to_windows(path);
+    let mut command = game_wine(&program);
+    if let Some(id) = steam_id(&program, backend::steam_app_id(path.parent().unwrap_or(path)).as_deref()) {
+        command.env("SteamAppId", &id).env("SteamGameId", &id);
     }
     command
         .current_dir(path.parent().unwrap_or(Path::new("/")))
@@ -418,6 +468,67 @@ pub fn mac_to_windows(path: &Path) -> String {
     }
 }
 
+/// Adds the program at `program` (a Mac path) to the games that the user added from a folder, and fills in
+/// its launch options as far as its folder shows what it needs (see [`launch::detect`]): the Steam app ID
+/// of the game that it is a copy of. `steam` is the list of
+/// Steam games. A value that the program's options hold already stays. The list grows by one game, named
+/// after the program's folder, and the options keep the reasons for the user to read.
+pub fn add_game(settings: &mut backend::Settings, program: &Path, steam: &[Game]) -> Result<(), String> {
+    if !program.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("exe")) || !program.is_file() {
+        return Err("Choose a Windows program: a file that ends in .exe.".into());
+    }
+    if settings.added_games.iter().any(|added| added.program == program) {
+        return Err("This program is in the list already.".into());
+    }
+    if steam.iter().any(|game| game.exe.as_deref() == Some(program)) {
+        return Err("Steam lists this program already. Start it from the Steam list.".into());
+    }
+    let name = program
+        .parent()
+        .and_then(Path::file_name)
+        .or_else(|| program.file_stem())
+        .map_or_else(|| "Windows program".to_owned(), |name| name.to_string_lossy().into_owned());
+    let original = copy_of(program, steam);
+    let detected = launch::detect(program, original.map(|game| (game.name.as_str(), game.app_id.as_str())));
+    if !detected.is_default() {
+        let options = settings.launch.entry(mac_to_windows(program)).or_default();
+        if options.steam_app_id.trim().is_empty() {
+            options.steam_app_id = detected.steam_app_id;
+            options.steam_app_id_reason = detected.steam_app_id_reason;
+        }
+    }
+    settings.added_games.push(backend::AddedGame { name, program: program.to_owned() });
+    Ok(())
+}
+
+/// Takes the game at `program` out of the list of added games, with its launch options. No file of
+/// the game changes.
+pub fn remove_game(settings: &mut backend::Settings, program: &Path) {
+    settings.added_games.retain(|added| added.program != program);
+    settings.launch.remove(&mac_to_windows(program));
+}
+
+/// The Steam game that the program at `program` is a copy of: the same program name, and a folder that
+/// holds at least four fifths of the files and folders that the game's own folder holds (and at least
+/// three). A copy of a game with a mod loader holds more than the original and so passes. A Steam
+/// check asks for the ID of the original, which the copy has no manifest for.
+fn copy_of<'a>(program: &Path, games: &'a [Game]) -> Option<&'a Game> {
+    let name = program.file_name()?.to_string_lossy().to_lowercase();
+    let entries = |folder: &Path| -> Vec<String> {
+        fs::read_dir(folder).into_iter().flatten().flatten().map(|entry| entry.file_name().to_string_lossy().to_lowercase()).collect()
+    };
+    let mine = entries(program.parent()?);
+    games.iter().filter(|game| !game.app_id.is_empty()).find(|game| {
+        let Some(exe) = &game.exe else { return false };
+        if exe.file_name().map(|file| file.to_string_lossy().to_lowercase()).as_deref() != Some(name.as_str()) {
+            return false;
+        }
+        let Some(original) = exe.parent().map(entries) else { return false };
+        let shared = original.iter().filter(|entry| mine.contains(entry)).count();
+        original.len() >= 3 && shared * 5 >= original.len() * 4
+    })
+}
+
 /// Ends Steam and every game in the prefix.
 pub fn stop_all() {
     Command::new(config_dir().join("wine/engine/bin/wineserver"))
@@ -430,6 +541,7 @@ pub fn stop_all() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::launch::GameOptions;
 
     #[test]
     fn games_get_the_msaa_limit_unless_it_is_off() {
@@ -480,6 +592,91 @@ mod tests {
         fs::write(dir.join("Redist/big.exe"), vec![0u8; 9000]).unwrap();
         assert_eq!(find_exe(&dir, "Serious Sam VR The Last Hope"), Some(dir.join("Bin/x64/SamTLH.exe")));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A folder with the given files (folders end in a slash) and its program.
+    fn folder(name: &str, entries: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cranvr-steam-{name}-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        for entry in entries {
+            match entry.strip_suffix('/') {
+                Some(folder) => fs::create_dir_all(dir.join(folder)).unwrap(),
+                None => fs::write(dir.join(entry), b"x").unwrap(),
+            }
+        }
+        dir
+    }
+
+    #[test]
+    fn a_folder_with_the_same_files_and_more_is_a_copy_of_a_steam_game() {
+        let original = folder("original", &["Some Game.exe", "Some Game_Data/", "UnityPlayer.dll", "MonoBleedingEdge/", "Crash.exe"]);
+        let copy = folder("copy", &["Some Game.exe", "Some Game_Data/", "UnityPlayer.dll", "MonoBleedingEdge/", "Crash.exe", "Plugins/", "winhttp.dll"]);
+        let other = folder("other", &["Some Game.exe", "readme.txt", "data.pak"]);
+        let renamed = folder("renamed", &["Other.exe", "Some Game_Data/", "UnityPlayer.dll", "MonoBleedingEdge/", "Crash.exe"]);
+        let steam = [Game { app_id: "620".into(), name: "Some Game".into(), exe: Some(original.join("Some Game.exe")) }];
+        assert_eq!(copy_of(&copy.join("Some Game.exe"), &steam), Some(&steam[0]));
+        // The same program name alone is no copy: another game may call its program the same
+        assert_eq!(copy_of(&other.join("Some Game.exe"), &steam), None);
+        assert_eq!(copy_of(&renamed.join("Other.exe"), &steam), None);
+        // A game without an app ID (one that the user added) is no original
+        let added = [Game { app_id: String::new(), name: "Added".into(), exe: steam[0].exe.clone() }];
+        assert_eq!(copy_of(&copy.join("Some Game.exe"), &added), None);
+        for dir in [original, copy, other, renamed] {
+            fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    #[test]
+    fn adding_a_copy_of_a_modded_game_fills_in_its_steam_app_id_and_no_override() {
+        let original = folder("add-original", &["Some Game.exe", "Some Game_Data/", "UnityPlayer.dll", "MonoBleedingEdge/"]);
+        let copy = folder("add-copy", &["Some Game.exe", "Some Game_Data/", "UnityPlayer.dll", "MonoBleedingEdge/", "winhttp.dll", "Plugins/"]);
+        let steam = [Game { app_id: "620".into(), name: "Some Game".into(), exe: Some(original.join("Some Game.exe")) }];
+        let mut settings = backend::Settings::default();
+        let program = copy.join("Some Game.exe");
+        assert_eq!(add_game(&mut settings, &program, &steam), Ok(()));
+        // The name is the folder's name
+        let name = copy.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(settings.added_games, [backend::AddedGame { name: name.clone(), program: program.clone() }]);
+        let options = &settings.launch[&mac_to_windows(&program)];
+        assert_eq!(options.steam_app_id, "620");
+        assert!(options.steam_app_id_reason.contains("Some Game"));
+        // The mod loader's DLL in the folder is no reason for an override: BSIPA-like loaders start twice with one
+        assert!(options.dll_overrides.is_empty());
+        // The game's environment holds what its Steam check needs
+        let vars = launch::environment(&settings.wine, options);
+        assert!(vars.contains(&("SteamAppId".to_owned(), "620".to_owned())));
+        assert!(!vars.iter().any(|(name, _)| name == "WINEDLLOVERRIDES"));
+        // The second add, the original's own program and a file that is no program are refused
+        assert!(add_game(&mut settings, &program, &steam).is_err());
+        assert!(add_game(&mut settings, &original.join("Some Game.exe"), &steam).is_err());
+        assert!(add_game(&mut settings, &copy.join("UnityPlayer.dll"), &steam).is_err());
+        assert_eq!(settings.added_games.len(), 1);
+        // The added game is a game like the others, with no manifest
+        let games = added_games(&settings);
+        assert_eq!((games[0].name.as_str(), games[0].app_id.as_str(), games[0].exe.as_deref()), (name.as_str(), "", Some(program.as_path())));
+        // Removing it takes its options too
+        remove_game(&mut settings, &program);
+        assert!(settings.added_games.is_empty() && settings.launch.is_empty());
+        for dir in [original, copy] {
+            fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    #[test]
+    fn a_program_with_nothing_to_fill_in_leaves_no_options_and_keeps_the_ones_it_has() {
+        let dir = folder("plain", &["Plain Game.exe", "data.pak"]);
+        let program = dir.join("Plain Game.exe");
+        let mut settings = backend::Settings::default();
+        settings.launch.insert(mac_to_windows(&program), GameOptions { args: "-x".into(), ..Default::default() });
+        assert_eq!(add_game(&mut settings, &program, &[]), Ok(()));
+        assert_eq!(settings.launch[&mac_to_windows(&program)], GameOptions { args: "-x".into(), ..Default::default() });
+        fs::remove_dir_all(&dir).ok();
+        let again = folder("plain-two", &["Plain Game.exe"]);
+        let mut settings = backend::Settings::default();
+        assert_eq!(add_game(&mut settings, &again.join("Plain Game.exe"), &[]), Ok(()));
+        assert!(settings.launch.is_empty());
+        fs::remove_dir_all(&again).ok();
     }
 
     #[test]

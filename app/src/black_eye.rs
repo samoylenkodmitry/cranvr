@@ -1,5 +1,6 @@
-//! A game whose right eye stays black. The host looks at the game's pictures and sends a
-//! `black_eye` status line once for each game run (host/src/eye_check.rs). The app answers with
+//! A game whose picture stays black: the right eye alone, or both eyes. The host looks at the game's
+//! pictures and sends a `black_eye` status line once for each game run, with the eye "right" or
+//! "both" (host/src/eye_check.rs). The app answers in the same way for both. It answers with
 //! the launch option "Each eye in its own pass": it turns the option on for the program, records
 //! why, shows a notice and starts the game again. When cranvr turned that option on and the picture
 //! is still black with it, the game draws both eyes into a texture of its own (a Unity game with the
@@ -17,10 +18,10 @@ use crate::{launch::GameOptions, steam::Game};
 use std::{collections::BTreeMap, time::Duration};
 
 /// The reason that the Options panel shows beside the option.
-pub const REASON: &str = "cranvr turned this on because the right eye stayed black.";
+pub const REASON: &str = "cranvr turned this on because the picture stayed black.";
 
 /// The reason that the Options panel shows beside "Both eyes in one pass".
-pub const REASON_ONE_PASS: &str = "cranvr turned this on because the right eye stayed black with \"Each eye in its own pass\".";
+pub const REASON_ONE_PASS: &str = "cranvr turned this on because the picture stayed black with \"Each eye in its own pass\".";
 
 /// How long the notice stays in the window and in the console in VR.
 pub const NOTICE_TIME: Duration = Duration::from_secs(120);
@@ -30,10 +31,10 @@ pub const NOTICE_TIME: Duration = Duration::from_secs(120);
 pub enum Outcome {
     /// The option was off. It is on now, with its reason. The game starts again.
     Restart { program: String },
-    /// "Each eye in its own pass" was on (cranvr's choice) and the right eye stays black. It is off now
+    /// "Each eye in its own pass" was on (cranvr's choice) and the picture stays black. It is off now
     /// and "Both eyes in one pass" is on. The game starts again.
     Switch { program: String },
-    /// The option was on already: the right eye stays black with it. Nothing changes. `one_pass` tells
+    /// The option was on already: the picture stays black with it. Nothing changes. `one_pass` tells
     /// which option: "Both eyes in one pass" (true) or "Each eye in its own pass".
     Leave { program: String, one_pass: bool },
     /// The user turned the option off by hand. Nothing changes.
@@ -79,36 +80,42 @@ pub struct Notice {
     pub headset: String,
 }
 
-pub fn notice(outcome: &Outcome, name: &str) -> Notice {
+/// `eye` is the report's word: "both", else the right eye alone.
+pub fn notice(outcome: &Outcome, name: &str, eye: &str) -> Notice {
+    let name = if name.is_empty() { "the game" } else { name };
+    let (what, short) = if eye == "both" {
+        (format!("Both eyes of {name}"), "Both eyes")
+    } else {
+        (format!("The right eye of {name}"), "The right eye")
+    };
     let (window, headset) = match outcome {
         Outcome::Restart { .. } => (
-            format!("The right eye of {name} stayed black. cranvr turned on \"Each eye in its own pass\". The game starts again."),
-            "The right eye stayed black. The game restarts.",
+            format!("{what} stayed black. cranvr turned on \"Each eye in its own pass\". The game starts again."),
+            format!("{short} stayed black. The game restarts."),
         ),
         Outcome::Switch { .. } => (
             format!(
-                "The right eye of {name} stayed black with \"Each eye in its own pass\". cranvr turned that off and turned on \"Both eyes in one pass\". The game starts again."
+                "{what} stayed black with \"Each eye in its own pass\". cranvr turned that off and turned on \"Both eyes in one pass\". The game starts again."
             ),
-            "Still black. Another try. The game restarts.",
+            "Still black. Another try. The game restarts.".to_owned(),
         ),
         Outcome::Leave { one_pass, .. } => (
             format!(
-                "The right eye of {name} is still black with \"{}\". cranvr leaves the game as it is.",
+                "{what} stayed black again with \"{}\". cranvr leaves the game as it is.",
                 if *one_pass { "Both eyes in one pass" } else { "Each eye in its own pass" }
             ),
-            "The right eye is still black. No restart.",
+            format!("{short} stayed black. No restart."),
         ),
         Outcome::Declined { .. } => (
-            format!("The right eye of {name} stays black. Turn on \"Each eye in its own pass\" in its options in the Play tab to fix it."),
-            "The right eye stays black. See the cranvr window.",
+            format!("{what} stayed black. Turn on \"Each eye in its own pass\" in its options in the Play tab to fix it."),
+            format!("{short} stayed black. See the cranvr window."),
         ),
         Outcome::Unknown => (
-            "The right eye of the game stays black. Open the options of the game in the Play tab and turn on \"Each eye in its own pass\"."
-                .to_owned(),
-            "The right eye stays black. See the cranvr window.",
+            format!("{what} stayed black. Open the options of the game in the Play tab and turn on \"Each eye in its own pass\"."),
+            format!("{short} stayed black. See the cranvr window."),
         ),
     };
-    Notice { window, headset: headset.to_owned() }
+    Notice { window, headset }
 }
 
 /// What the app does with one report.
@@ -119,15 +126,15 @@ pub struct Response {
     pub restart: Option<String>,
 }
 
-/// Answers one report: changes the launch options as `apply` says and words the notice. The
-/// caller saves the options and starts the program again.
-pub fn respond(launch: &mut BTreeMap<String, GameOptions>, games: &[Game], program: Option<&str>) -> Response {
+/// Answers one report (`eye` is its word, "right" or "both"): changes the launch options as `apply`
+/// says and words the notice. The caller saves the options and starts the program again.
+pub fn respond(launch: &mut BTreeMap<String, GameOptions>, games: &[Game], program: Option<&str>, eye: &str) -> Response {
     let known: Vec<String> = games.iter().filter_map(crate::steam::program).collect();
     let outcome = apply(launch, &known, program);
     let (Outcome::Restart { program } | Outcome::Switch { program } | Outcome::Leave { program, .. } | Outcome::Declined { program }) = &outcome else {
-        return Response { notice: notice(&outcome, ""), restart: None };
+        return Response { notice: notice(&outcome, "", eye), restart: None };
     };
-    let notice = notice(&outcome, &name(games, program));
+    let notice = notice(&outcome, &name(games, program), eye);
     let restart = matches!(outcome, Outcome::Restart { .. } | Outcome::Switch { .. }).then(|| program.clone());
     Response { notice, restart }
 }
@@ -214,7 +221,7 @@ mod tests {
     fn a_program_whose_option_the_user_turned_off_keeps_it_off() {
         let mut launch = BTreeMap::new();
         launch.insert(PROGRAM.to_owned(), GameOptions { eye_per_pass_declined: true, ..Default::default() });
-        let response = respond(&mut launch, &[], Some(PROGRAM));
+        let response = respond(&mut launch, &[], Some(PROGRAM), "right");
         assert_eq!(response.restart, None);
         assert!(!launch[PROGRAM].eye_per_pass);
         assert!(response.notice.window.contains("Turn on"));
@@ -243,34 +250,39 @@ mod tests {
         let game = Game { app_id: "1".into(), name: "Some Game".into(), exe: Some(PathBuf::from("/Users/x/game.exe")) };
         let program = "Z:\\Users\\x\\game.exe";
         let mut launch = BTreeMap::new();
-        let first = respond(&mut launch, std::slice::from_ref(&game), Some(program));
+        let first = respond(&mut launch, std::slice::from_ref(&game), Some(program), "right");
         assert_eq!(first.restart.as_deref(), Some(program));
         assert!(first.notice.window.contains("Some Game") && first.notice.window.contains("starts again"));
         assert_eq!(launch[program].eye_per_pass_reason, REASON);
         // The game starts again with the option and is still black: the app tries the other option once
-        let second = respond(&mut launch, std::slice::from_ref(&game), Some(program));
+        let second = respond(&mut launch, std::slice::from_ref(&game), Some(program), "right");
         assert_eq!(second.restart.as_deref(), Some(program));
         assert!(second.notice.window.contains("Both eyes in one pass") && second.notice.window.contains("Some Game"));
         // Still black with that too: the app leaves it
         for _ in 0..3 {
-            let later = respond(&mut launch, std::slice::from_ref(&game), Some(program));
+            let later = respond(&mut launch, std::slice::from_ref(&game), Some(program), "right");
             assert_eq!(later.restart, None);
-            assert!(later.notice.window.contains("still black") && later.notice.window.contains("Some Game"));
+            assert!(later.notice.window.contains("black again") && later.notice.window.contains("Some Game"));
         }
         assert!(launch[program].eye_one_pass && !launch[program].eye_per_pass);
         // A report without a program restarts nothing either
-        assert_eq!(respond(&mut launch, &[game], None).restart, None);
+        assert_eq!(respond(&mut launch, &[game], None, "right").restart, None);
     }
 
     #[test]
     fn the_notice_says_what_happens() {
-        let restart = notice(&Outcome::Restart { program: PROGRAM.into() }, "Some Game");
-        assert!(restart.window.contains("Some Game") && restart.window.contains("starts again"));
-        let leave = notice(&Outcome::Leave { program: PROGRAM.into(), one_pass: false }, "Some Game");
-        assert!(leave.window.contains("still black") && leave.headset.contains("No restart"));
-        let switched = notice(&Outcome::Switch { program: PROGRAM.into() }, "Some Game");
+        let restart = notice(&Outcome::Restart { program: PROGRAM.into() }, "Some Game", "right");
+        assert!(restart.window.contains("The right eye of Some Game") && restart.window.contains("starts again"));
+        let leave = notice(&Outcome::Leave { program: PROGRAM.into(), one_pass: false }, "Some Game", "right");
+        assert!(leave.window.contains("black again") && leave.headset.contains("No restart"));
+        let switched = notice(&Outcome::Switch { program: PROGRAM.into() }, "Some Game", "right");
+        // Both eyes black: the words name both eyes
+        let both = notice(&Outcome::Restart { program: PROGRAM.into() }, "Some Game", "both");
+        assert!(both.window.starts_with("Both eyes of Some Game stayed black.") && both.headset.starts_with("Both eyes stayed black"));
+        let unknown = notice(&Outcome::Unknown, "", "both");
+        assert!(unknown.window.starts_with("Both eyes of the game stayed black."));
         // The console in VR has one line of 45 characters or so
-        for text in [&restart.headset, &leave.headset, &switched.headset, &notice(&Outcome::Unknown, "x").headset] {
+        for text in [&restart.headset, &leave.headset, &switched.headset, &both.headset, &unknown.headset, &notice(&Outcome::Unknown, "x", "right").headset] {
             assert!(text.len() <= 50, "{text}");
         }
     }

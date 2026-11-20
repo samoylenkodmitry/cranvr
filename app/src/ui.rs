@@ -207,13 +207,15 @@ fn refresh(settings: MutableState<Settings>, model: MutableState<Model>, slow: b
     }
 }
 
-/// Answers the host's reports of a black right eye (see black_eye.rs): the program's option "Each
+/// Answers the host's reports of a black picture (see black_eye.rs): the program's option "Each
 /// eye in its own pass" turns on once, and the game starts again with it. A report with the option
 /// on already only shows a notice.
 fn black_eye_reports(settings: MutableState<Settings>, next: &mut Model, reports: Vec<serde_json::Value>) {
     for report in reports {
         let mut response = None;
-        settings.update(|s| response = Some(black_eye::respond(&mut s.launch, &next.games, report["program"].as_str())));
+        settings.update(|s| {
+            response = Some(black_eye::respond(&mut s.launch, &next.games, report["program"].as_str(), report["eye"].as_str().unwrap_or("right")))
+        });
         let Some(black_eye::Response { notice, restart }) = response else { continue };
         next.notice = Some((notice, Instant::now() + black_eye::NOTICE_TIME));
         if let Some(program) = restart {
@@ -527,6 +529,8 @@ fn UsbNote(settings: MutableState<Settings>, model: MutableState<Model>) {
 fn PlayTab(settings: MutableState<Settings>, model: MutableState<Model>) {
     let (state, rosetta, outdated, setup) = model.with(|m| (m.steam, m.rosetta, m.game_support_outdated, m.setup.clone()));
     let open_program = rememberMutableStateOf(|| false);
+    // The program whose launch options are open in the list of added games
+    let added_open = rememberMutableStateOf(|| None::<String>);
     let plan = setup::plan(rosetta, state, outdated);
     // Steam cannot start before the setup. An outdated game support starts nothing: the library
     // shows the Update button alone then.
@@ -558,7 +562,32 @@ fn PlayTab(settings: MutableState<Settings>, model: MutableState<Model>) {
     Card(move || {
         Heading("Other Windows programs".into());
         Hint("Any Windows VR program that uses OpenXR with Direct3D 11.".into());
+        // The games that the user added from a folder: each has Play and Options like a Steam game
+        let added: Vec<steam::Game> = model.with(|m| m.games.iter().filter(|game| game.app_id.is_empty()).cloned().collect());
+        for game in added {
+            GameRow(settings, model, game, added_open);
+        }
         FlowRow(Modifier::empty(), flow(), move || {
+            Primary("Add a game from a folder".into(), move || {
+                let steam_games = steam::steam_dir().join("steamapps/common");
+                let start = if steam_games.exists() { steam_games } else { steam::prefix().join("drive_c") };
+                let picked = rfd::FileDialog::new()
+                    .set_title("Choose the program of the game")
+                    .add_filter("Windows program", &["exe"])
+                    .set_directory(&start)
+                    .pick_file();
+                if let Some(path) = picked {
+                    let mut result = Ok(());
+                    settings.update(|s| result = steam::add_game(s, &path, &steam::steam_games()));
+                    if result.is_ok() {
+                        settings.with(Settings::save);
+                        // The list shows the game now, with its options open: they hold what cranvr filled in
+                        model.update(|m| m.games = steam::games());
+                        added_open.set(Some(steam::mac_to_windows(&path)));
+                    }
+                    model.update(|m| m.message = result.err());
+                }
+            });
             Action("Choose a program".into(), move || {
                 let start = steam::prefix().join("drive_c");
                 let picked = rfd::FileDialog::new()
@@ -576,6 +605,7 @@ fn PlayTab(settings: MutableState<Settings>, model: MutableState<Model>) {
             });
             Action("Stop Steam and games".into(), steam::stop_all);
         });
+        Hint("Add a game: choose the program of a game that Steam does not list, such as a copy of a game with mods. cranvr reads the game's folder and fills in what the game needs. Options shows each value with its reason. Choose a program starts a program once.".into());
         // The options of the program chosen last, which the button above starts
         let last = settings.with(|s| s.game.clone());
         if last.starts_with('/') {
@@ -670,8 +700,11 @@ fn GameSupportUpdate(installed: Option<String>, last: Option<Setup>) {
 
 #[composable]
 fn SteamLibrary(settings: MutableState<Settings>, model: MutableState<Model>, last: Option<Setup>) {
-    let (running, signed_in, games, outdated, installed) =
-        model.with(|m| (m.steam_running, m.steam_signed_in, m.games.clone(), m.game_support_outdated, m.game_support.clone()));
+    let (running, signed_in, games, outdated, installed) = model.with(|m| {
+        // A game that the user added has no manifest: the card of other programs lists it
+        let steam_games: Vec<steam::Game> = m.games.iter().filter(|game| !game.app_id.is_empty()).cloned().collect();
+        (m.steam_running, m.steam_signed_in, steam_games, m.game_support_outdated, m.game_support.clone())
+    });
     // The game whose launch options are open, by its program
     let open = rememberMutableStateOf(|| None::<String>);
     if outdated {
@@ -706,38 +739,52 @@ fn SteamLibrary(settings: MutableState<Settings>, model: MutableState<Model>, la
     }
     Hint("Play starts Steam if needed, then the game. Put on the headset first. Options sets what the game starts with.".into());
     for game in games {
-        let g = game.clone();
-        let program = steam::program(&game);
-        let shown = program.as_ref().is_some_and(|program| open.with(|open| open.as_ref() == Some(program)));
-        let own = program.as_ref().is_some_and(|program| settings.with(|s| s.launch.contains_key(program)));
-        let toggled = program.clone();
-        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-            Text(g.name.clone(), Modifier::empty().padding(8.0), TextStyle::default());
-            if let Some(program) = toggled.clone() {
-                Choice(if own { "Options (own)".into() } else { "Options".into() }, shown, move || {
-                    let program = program.clone();
-                    open.update(move |open| *open = if open.as_ref() == Some(&program) { None } else { Some(program) });
-                });
-            }
-            if g.exe.is_some() {
-                let game = g.clone();
-                Primary("Play".into(), move || {
-                    ensure_host(settings, model);
-                    let game = game.clone();
-                    // Steam may need seconds to start: keep the window responsive
-                    thread::spawn(move || {
-                        if let Err(e) = steam::play(&game) {
-                            backend::notify(e);
-                        }
-                    });
-                });
-            } else {
-                Hint("no program found in its folder".into());
-            }
-        });
-        if let Some(program) = program.filter(|_| shown) {
-            LaunchOptions(settings, program);
+        GameRow(settings, model, game, open);
+    }
+}
+
+/// One game of a list: its name, its options and its Play button. A game that the user added from a
+/// folder has a Remove button too. `open` holds the program whose launch options are open.
+#[composable]
+fn GameRow(settings: MutableState<Settings>, model: MutableState<Model>, game: steam::Game, open: MutableState<Option<String>>) {
+    let g = game.clone();
+    let program = steam::program(&game);
+    let shown = program.as_ref().is_some_and(|program| open.with(|open| open.as_ref() == Some(program)));
+    let own = program.as_ref().is_some_and(|program| settings.with(|s| s.launch.contains_key(program)));
+    let toggled = program.clone();
+    FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+        Text(g.name.clone(), Modifier::empty().padding(8.0), TextStyle::default());
+        if let Some(program) = toggled.clone() {
+            Choice(if own { "Options (own)".into() } else { "Options".into() }, shown, move || {
+                let program = program.clone();
+                open.update(move |open| *open = if open.as_ref() == Some(&program) { None } else { Some(program) });
+            });
         }
+        if g.exe.is_some() {
+            let game = g.clone();
+            Primary("Play".into(), move || {
+                ensure_host(settings, model);
+                let game = game.clone();
+                // Steam may need seconds to start: keep the window responsive
+                thread::spawn(move || {
+                    if let Err(e) = steam::play(&game) {
+                        backend::notify(e);
+                    }
+                });
+            });
+        } else {
+            Hint("no program found in its folder".into());
+        }
+        // A game that the user added has no Steam manifest: only the list holds it
+        if let (true, Some(exe)) = (g.app_id.is_empty(), g.exe.clone()) {
+            Action("Remove".into(), move || {
+                settings.update(|s| steam::remove_game(s, &exe));
+                settings.with(Settings::save);
+            });
+        }
+    });
+    if let Some(program) = program.filter(|_| shown) {
+        LaunchOptions(settings, program);
     }
 }
 
@@ -747,9 +794,11 @@ fn SteamLibrary(settings: MutableState<Settings>, model: MutableState<Model>, la
 #[composable]
 fn LaunchOptions(settings: MutableState<Settings>, program: String) {
     let (options, wine) = settings.with(|s| (s.launch.get(&program).cloned().unwrap_or_default(), s.wine.clone()));
-    let raw_fields_set = !(options.dll_overrides.is_empty() && options.env.is_empty() && options.args.is_empty());
+    let raw_fields_set =
+        !(options.dll_overrides.is_empty() && options.env.is_empty() && options.args.is_empty() && options.steam_app_id.is_empty());
     let advanced = rememberMutableStateOf(move || raw_fields_set);
     let dll = cranpose_core::remember(|| TextFieldState::new(&options.dll_overrides)).with(|state| *state);
+    let steam_id = cranpose_core::remember(|| TextFieldState::new(&options.steam_app_id)).with(|state| *state);
     let env = cranpose_core::remember(|| TextFieldState::new(&options.env)).with(|state| *state);
     let args = cranpose_core::remember(|| TextFieldState::new(&options.args)).with(|state| *state);
     Column(
@@ -792,7 +841,7 @@ fn LaunchOptions(settings: MutableState<Settings>, program: String) {
             if options.eye_one_pass && !options.eye_one_pass_reason.is_empty() {
                 Hint(options.eye_one_pass_reason.clone());
             }
-            Hint("For a game whose right eye stays black. \"Each eye in its own pass\": the runtime refuses two-eye images, so the game draws each eye apart. This costs frames. \"Both eyes in one pass\": for a game that draws both eyes into a picture of its own, as a Unity game with the OpenVR provider does.".into());
+            Hint("For a game whose picture stays black, in the right eye or in both eyes. \"Each eye in its own pass\": the runtime refuses two-eye images, so the game draws each eye apart. This costs frames. \"Both eyes in one pass\": the runtime tells the game that a vertex shader may choose the eye, as a game that draws both eyes in one pass needs, or that draws both eyes into a picture of its own, as a Unity game with the OpenVR provider does.".into());
             let (own, default_on) = (options.opencomposite, wine.opencomposite);
             let key = program.clone();
             FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
@@ -809,7 +858,12 @@ fn LaunchOptions(settings: MutableState<Settings>, program: String) {
             Hint("An OpenVR game needs OpenComposite to run, because SteamVR is not installed. Off leaves the game no OpenVR runtime, so a game with an OpenXR mode takes that. It applies when the game starts.".into());
             if shown {
                 OptionField("Wine DLL overrides", dll);
-                Hint("As WINEDLLOVERRIDES takes them, such as winhttp=n,b to load a winhttp.dll from the game's folder before Wine's own. Beat Saber's mod loader BSIPA ran without it in cranvr's Wine.".into());
+                Hint("As WINEDLLOVERRIDES takes them, such as winhttp=n,b. The program then loads a winhttp.dll from its own folder before Wine's. Use it only for a mod loader that does not start without it: a loader that patched the game's files already starts twice with it.".into());
+                OptionField("Steam app ID", steam_id);
+                if !options.steam_app_id.is_empty() && !options.steam_app_id_reason.is_empty() {
+                    Hint(options.steam_app_id_reason.clone());
+                }
+                Hint("The ID that the program's Steam check asks for. A copy of a Steam game needs the ID of the original. Empty: a program in a Steam library gets the ID of its folder's manifest, and any other program gets none. A program with an ID starts Steam first.".into());
                 OptionField("Environment", env);
                 Hint("NAME=value entries, separated by spaces.".into());
                 OptionField("Arguments", args);
@@ -818,7 +872,13 @@ fn LaunchOptions(settings: MutableState<Settings>, program: String) {
                     let key = key.clone();
                     Primary("Save options".into(), move || {
                         edit_launch(settings, &key, |o| {
+                            // A value that the user changed has no reason of cranvr's any more
+                            let steam_text = steam_id.text().trim().to_owned();
+                            if steam_text != o.steam_app_id {
+                                o.steam_app_id_reason.clear();
+                            }
                             o.dll_overrides = dll.text().trim().to_owned();
+                            o.steam_app_id = steam_text;
                             o.env = env.text().trim().to_owned();
                             o.args = args.text().trim().to_owned();
                         })

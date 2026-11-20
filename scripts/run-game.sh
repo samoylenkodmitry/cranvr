@@ -15,7 +15,8 @@
 # Environment: CRANVR_MAX_MSAA caps the MSAA samples a game may use (default: the app's setting, else
 # 2; 0 for no cap). The script applies no option of a particular game: set them yourself, as the
 # app's launch options do, for example BASALT_MAX_ARRAY_SIZE=1 for a game whose right eye stays
-# black, or WINEDLLOVERRIDES='winhttp=n,b' for a mod loader that ships winhttp.dll.
+# black, or WINEDLLOVERRIDES='winhttp=n,b' for a mod loader that does not start without its winhttp.dll
+# (BSIPA, which patches the game's files, does start without it and starts twice with it).
 #
 # Examples:
 #   scripts/run-game.sh 'C:\basalt\runtime\d3d11_runtime_smoke.exe' --render-frames 7200 --visual
@@ -23,9 +24,10 @@
 #   scripts/run-game.sh 'C:\Program Files (x86)\Steam\steamapps\common\Beat Saber\Beat Saber.exe'
 #
 # Start a Steam game by its .exe while Steam runs, not with steam.exe -applaunch: a game that
-# Steam starts gets Steam's environment, not the one this script sets. For a game under
-# steamapps\common the script finds the Steam app ID in Steam's appmanifest files and sets
-# SteamAppId, which the game's Steam check needs.
+# Steam starts gets Steam's environment, not the one this script sets. SteamAppId, which the game's
+# Steam check needs, comes from the first of these: CRANVR_STEAM_APP_ID; the "Steam app ID" in the
+# program's launch options in app.json (the Play tab fills it in for a game added from a folder, such
+# as a copy of a Steam game); for a game under steamapps\common, the app ID in Steam's appmanifest files.
 #
 # Environment: CRANVR_HOME (default ~/Library/Application Support/cranvr) is the host's config
 # dir; the host writes runtime-control.txt there. CRANVR_CONTROL names another control file, for a
@@ -94,7 +96,33 @@ else
     dir=${program:A:h}
 fi
 cd "${dir}"
-if [[ ${dir} == */steamapps/common/* ]]; then
+app_id=${CRANVR_STEAM_APP_ID:-}
+if [[ -z ${app_id} && -f ${home}/app.json ]]; then
+    # The launch options are saved by the program's Windows path (C:\ inside the prefix, Z:\ elsewhere)
+    if [[ ${program} == [A-Za-z]:\\* ]]; then option_key=${program}; else option_key=${program:A}; fi
+    app_id=$(python3 -I -c '
+import json, sys
+app_json, program, prefix = sys.argv[1:4]
+def windows(path):
+    if len(path) > 1 and path[1] == ":":
+        return path
+    drive_c = prefix.rstrip("/") + "/drive_c/"
+    if path.startswith(drive_c):
+        return "C:\\" + path[len(drive_c):].replace("/", "\\")
+    return "Z:" + path.replace("/", "\\")
+want = windows(program).lower()
+for key, options in json.load(open(app_json)).get("launch", {}).items():
+    if key.lower() == want:
+        print(str(options.get("steam_app_id", "")).strip())
+        break
+' "${home}/app.json" "${option_key}" "${home}/wine/prefix" 2>/dev/null || true)
+    if [[ -n ${app_id} ]]; then
+        print "Steam app ${app_id} (the program's launch options)"
+    fi
+fi
+if [[ -n ${app_id} ]]; then
+    export SteamAppId=${app_id} SteamGameId=${app_id}
+elif [[ ${dir} == */steamapps/common/* ]]; then
     steamapps=${dir%%/steamapps/common/*}/steamapps
     installdir=${${dir#*/steamapps/common/}%%/*}
     manifest=$(grep -l "\"installdir\"[[:space:]]*\"${installdir}\"" "${steamapps}"/appmanifest_*.acf 2>/dev/null | head -1 || true)

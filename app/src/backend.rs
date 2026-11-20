@@ -40,6 +40,16 @@ pub fn config_dir() -> PathBuf {
     })
 }
 
+/// A program that the user added from a folder ("Add a game from a folder" in the Play tab). cranvr starts
+/// it like a Steam game: the Play tab and the console in VR list it, and it has launch options of its own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddedGame {
+    /// The name that the lists show: the folder's name
+    pub name: String,
+    /// The program, as a Mac path
+    pub program: PathBuf,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -84,6 +94,8 @@ pub struct Settings {
     pub launch: BTreeMap<String, GameOptions>,
     /// The options of every Windows program that cranvr starts
     pub wine: WineOptions,
+    /// The games that the user added from a folder, in the order of adding
+    pub added_games: Vec<AddedGame>,
 }
 
 impl Default for Settings {
@@ -108,6 +120,7 @@ impl Default for Settings {
             controls: Controls::default(),
             launch: BTreeMap::new(),
             wine: WineOptions::default(),
+            added_games: Vec::new(),
         }
     }
 }
@@ -229,9 +242,9 @@ pub struct Model {
     pub network: Vec<String>,
     /// Requests from the console in VR that the window has not run yet
     pub vr_requests: Vec<Value>,
-    /// Reports of a black right eye that the window has not answered yet (see black_eye.rs)
+    /// Reports of a black picture that the window has not answered yet (see black_eye.rs)
     pub black_eyes: Vec<Value>,
-    /// What the window and the console in VR say about the last black right eye, until it expires
+    /// What the window and the console in VR say about the last black picture, until it expires
     pub notice: Option<(crate::black_eye::Notice, Instant)>,
 }
 
