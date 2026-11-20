@@ -40,13 +40,20 @@ pub fn grip(hand: usize, position: [f32; 3], linear_velocity: [f32; 3]) -> Motio
     Motion { pose: Pose { orientation: grip_orientation(hand), position }, linear_velocity, angular_velocity: [0.0; 3] }
 }
 
-/// The aim motion of the right hand at `t` seconds when the probe sweeps it (`--sweep-aim`): it turns over a range of
-/// 90 degrees from side to side and 50 degrees up and down about a direction a little below straight ahead, in two
-/// periods (17 s and 11 s) that share no whole multiple, so that the sweep covers the range without repeating its
-/// path for minutes. The position stays.
+/// Columns and rows of the sweep's raster: 13 turns to the side in steps of 8 degrees (from 48 degrees to
+/// the right to 48 degrees to the left) and 17 turns up and down in steps of 3 degrees (from 35 degrees below
+/// the direction ahead to 13 degrees above it).
+const SWEEP_COLUMNS: usize = 13;
+const SWEEP_ROWS: usize = 17;
+
+/// The aim motion of the right hand at `t` seconds when the probe sweeps it (`--sweep-aim`): it points at one
+/// place of the raster for each second, row by row, and goes over the whole raster in about 3.7 minutes. A panel
+/// with a button of 10 by 4 degrees gets a click. The position stays.
 pub fn swept(aim: Motion, t: f32) -> Motion {
-    let yaw = 45.0 * (t * std::f32::consts::TAU / 17.0).sin();
-    let pitch = -10.0 + 25.0 * (t * std::f32::consts::TAU / 11.0).sin();
+    let step = t.max(0.0) as usize % (SWEEP_COLUMNS * SWEEP_ROWS);
+    let (row, column) = (step / SWEEP_COLUMNS, step % SWEEP_COLUMNS);
+    let yaw = 48.0 - 8.0 * column as f32;
+    let pitch = -35.0 + 3.0 * row as f32;
     let turn = Quat::from_rotation_y(yaw.to_radians()) * Quat::from_rotation_x(pitch.to_radians());
     Motion { pose: Pose { orientation: turn.to_array(), position: aim.pose.position }, ..aim }
 }
@@ -64,6 +71,22 @@ pub fn aim_with(hand: usize, grip: &Motion) -> Motion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sweep_visits_every_place_of_its_raster_once_in_a_pass() {
+        let aim = aim_with(1, &grip(1, RIGHT_AT, [0.0; 3]));
+        let mut seen = std::collections::HashSet::new();
+        for second in 0..(SWEEP_COLUMNS * SWEEP_ROWS) {
+            let turned = swept(aim, second as f32 + 0.5);
+            // The place is the direction that the aim points to
+            let forward = Quat::from_array(turned.pose.orientation) * Vec3::NEG_Z;
+            seen.insert(((forward.x * 1000.0) as i32, (forward.y * 1000.0) as i32));
+            assert_eq!(turned.pose.position, aim.pose.position);
+        }
+        assert_eq!(seen.len(), SWEEP_COLUMNS * SWEEP_ROWS);
+        // The next pass starts again
+        assert_eq!(swept(aim, 0.5).pose.orientation, swept(aim, (SWEEP_COLUMNS * SWEEP_ROWS) as f32 + 0.5).pose.orientation);
+    }
 
     #[test]
     fn the_hands_differ_in_every_pose() {
