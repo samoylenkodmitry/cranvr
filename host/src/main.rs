@@ -9,6 +9,7 @@ mod eye_check;
 mod game_audio;
 mod game_sizes;
 mod hand_controller;
+mod hand_interaction;
 mod hand_mask;
 mod headset;
 mod logger;

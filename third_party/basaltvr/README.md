@@ -69,7 +69,7 @@ applies these patches and builds both parts.
 - `XR_EXT_eye_gaze_interaction` is an interaction profile: `/interaction_profiles/ext/eye_gaze_interaction`
   with a pose on `/user/eyes_ext/input/gaze_ext/pose`. The runtime binds an action to it, reports
   it active while the gaze is tracked, and gives the pose in `xrLocateSpace` with
-  `XrEyeGazeSampleTimeEXT`. `XR_EXT_hand_interaction` is not implemented.
+  `XrEyeGazeSampleTimeEXT`. Patch 0012 adds `XR_EXT_hand_interaction`.
 - The runtime tells the host which features the game uses when a game creates or destroys a
   tracker, or attaches an eye gaze action. The host asks the headset for these only.
 - `tests/tracking_smoke.cpp` reads every feature through the loader and compares it with the script
@@ -103,6 +103,33 @@ applies these patches and builds both parts.
 - A controller's pose counted as stale when a reader found it newer than the reader's clock reading. The readers (`controlInputSnapshot` for the controllers, `controlHeadPose` for the head and `trackedFresh` for hands, body, face and eyes) read the clock first and then wait for `gControlLock`. The receiver thread holds that lock exclusively while it handles a message and sets the message's arrival time under it. A message handled during the wait has an arrival time after the reader's clock reading, and `now >= arrival` failed. The pose action of that hand went inactive for that call, and OpenComposite then took the hand tracking pose or none, which a game draws at the origin, on the floor. The failure needs the receiver and a reader to meet, so it grows with the Mac's load: an OpenVR program that reads both controllers in every frame, with the probe offering tracking at a load average of about 30, logged 40 such transitions in 40 seconds, and 2 with the fix. `arrivedWithin` treats a later arrival as fresh.
 - A pose is fresh for 1.5 seconds (it was 0.5). Under load the receiver ran 200 to 350 ms late. The host sends a mask when a controller is gone and an `INPUT_RESET` after a second of silence, so the runtime's own limit only has to catch a dead link, and the socket timeout catches that after 5 seconds.
 - `basalt::note` writes the runtime's input notes to stderr and to `game-input.log` beside the control file (see `README.md` of the repository). New notes: "the right controller's pose stopped arriving" and "arrives" (read by `xrSyncActions`), "came after a gap of N ms" (a gap of 200 ms or more between two poses of a hand) and "a pose ... is older than what the runtime has" (the timestamp check refused a pose, with the three timestamps). Each kind stops after 40 lines, and the transitions after 80.
+
+`0012-hand-interaction.patch`
+
+- The runtime offers `XR_EXT_hand_interaction` with its graphics extension. It needs no headset feature: a Touch
+  controller serves the profile too, as the extension asks of a runtime with controllers.
+- `/interaction_profiles/ext/hand_interaction_ext` takes the paths of the extension for both hands: the aim, grip,
+  pinch and poke poses, and `/value` and `/ready_ext` of `pinch_ext`, `aim_activate_ext` and `grasp_ext`. A game that
+  did not enable the extension gets `XR_ERROR_PATH_UNSUPPORTED` for the profile. With the extension enabled, every
+  profile of the hands takes `/input/pinch_ext/pose` and `/input/poke_ext/pose` (the extension's rule). The Touch
+  controller's pinch and poke poses lie 3 and 4 cm ahead of its aim pose, with its orientation.
+- The Touch bindings and the hand interaction bindings share one table, and each record names its profile. A
+  suggestion replaces the bindings of its own profile only.
+- `xrSyncActions` picks each hand's current profile before the actions read it. A tracked Touch controller takes the
+  Touch profile when the game bound it, else the hand interaction profile, whose pinch and aim activation are then the
+  trigger and whose grasp is the squeeze, always ready. A tracked hand without a tracked controller takes the hand
+  interaction profile. While neither is tracked, the hand keeps its profile. A change of the profile's path queues
+  `XrEventDataInteractionProfileChanged`. A game that bound only the Touch profile gets it exactly when it did before.
+- A new control message, `HAND_INTERACTION` (24), carries a hand's three values with their ready flags and the four
+  poses with their velocities, which cranvr-host makes from the hand's joints. The runtime asks for it with the bit
+  `HAND_INTERACTION` (128) of `TRACKING_REQUEST` while an attached action has a binding for the profile. The poses
+  move forward by their velocity from the sample's arrival to the locate time, at most 50 ms, as a hand's joints do.
+  A gesture that is not ready has the value 0. A value bound to a boolean action presses at 0.6 and lets go below 0.4.
+- Action spaces read a pose source (the hand, the pose and whether a tracked hand gives it) in `xrLocateSpace`,
+  `xrLocateViews` and the base space of a tracker's locate call. The haptics go to a Touch binding only.
+- `tests/hand_interaction_smoke.cpp` binds the profile alone or with the Touch profile, drives cranvr-host's test hand
+  through its words file and checks the values, the ready flags, the poses and the switch of profiles
+  (`scripts/e2e.sh --hand-interaction [hand|both]`).
 
 ## patches/dxmt
 

@@ -24,7 +24,8 @@
 # The archive holds:
 #   engine/      Wine 11.10 (Gcenx's macOS build), with DXMT's DLLs and the patched Wine files in place
 #   dxmt/        DXMT's DLLs again, for the Wine prefix's system32
-#   runtime/     the OpenXR runtime, its manifest, its checks and the Steam web helper shim
+#   runtime/     the OpenXR runtime, its manifest, its checks (hand_interaction_smoke.exe among them) and the Steam web
+#                helper shim
 #   opencomposite/  OpenComposite's vrclient_x64.dll, its empty version.txt and openvr_smoke.exe, cranvr's
 #                OpenVR test program
 #   wine-patched/  Wine's wined3d.dll, wininet.dll, winemac.so and opengl32.so with cranvr's patches,
@@ -52,7 +53,7 @@ wine_build=${CRANVR_WINE_D3D_BUILD:-${cranvr}/third_party/wine/build}
 wine_support=${cranvr}/third_party/wine
 
 for f in "${wine_app}/bin/wine" "${fork}/x86_64-windows/d3d11.dll" "${fork}/x86_64-unix/winemetal.so" \
-         "${runtime_bin}/basalt_openxr.dll" "${runtime_bin}/steamwebhelper_compat.exe"; do
+         "${runtime_bin}/basalt_openxr.dll" "${runtime_bin}/steamwebhelper_compat.exe" "${runtime_bin}/hand_interaction_smoke.exe"; do
     if [[ ! -e ${f} ]]; then
         print -u2 "Missing ${f}. Run scripts/build-basaltvr.sh first."
         exit 1
@@ -129,7 +130,7 @@ cp "${fork}/x86_64-unix/winemetal.so" "${root}/engine/lib/wine/x86_64-unix/winem
 cp "${fork}/x86_64-unix/winemetal.so" "${root}/dxmt/x86_64-unix/winemetal.so"
 
 print "Copying the OpenXR runtime"
-for f in basalt_openxr.dll basalt_openxr.json loader_smoke.exe d3d11_runtime_smoke.exe tracking_smoke.exe steamwebhelper_compat.exe; do
+for f in basalt_openxr.dll basalt_openxr.json loader_smoke.exe d3d11_runtime_smoke.exe tracking_smoke.exe hand_interaction_smoke.exe steamwebhelper_compat.exe; do
     cp "${runtime_bin}/${f}" "${root}/runtime/${f}"
 done
 
@@ -275,6 +276,9 @@ dxmt_commit=$(git -C "${runtime}/build/dxmt/src" rev-parse HEAD)
     print "bound actions of a game and the first input that reaches each of them. Patch 0011 keeps the controllers' poses"
     print "fresh under load: a reader of a pose that found it newer than its own clock reading counted it as stale, and a"
     print "pose is fresh for 1.5 seconds, not 0.5. It also writes the input notes to game-input.log beside the control file."
+    print "Patch 0012 offers XR_EXT_hand_interaction: the hand interaction profile with its four poses and three gestures,"
+    print "made by cranvr-host from a tracked hand's joints or mapped from a Touch controller, and the pinch and poke poses on"
+    print "every profile of the hands. Each hand takes the profile of what the user holds."
 } > "${root}/SOURCES.md"
 
 print -r -- "${version}" > "${root}/VERSION"

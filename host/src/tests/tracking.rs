@@ -102,6 +102,19 @@ impl Rig {
         panic!("the host did not take the request");
     }
 
+    /// The runtime tells the host that its game binds the hand interaction profile
+    /// (`BASALT_TRACKING_HAND_INTERACTION`), and waits until the host has it.
+    fn game_binds_hand_interaction(&mut self) {
+        self.runtime.write_all(&message(msg::TRACKING_REQUEST, &128u32.to_le_bytes())).unwrap();
+        for _ in 0..200 {
+            if self.link.wants_hand_interaction() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the host did not take the request");
+    }
+
     /// The next message from the host that is not the keepalive's reset
     fn next(&mut self) -> (u16, Vec<u8>) {
         self.runtime.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -427,4 +440,54 @@ fn a_game_that_creates_its_hand_tracker_in_the_first_seconds_sees_no_controller_
     }
     assert!(kinds.contains(&msg::HAND_TRACKING));
     assert!(!kinds.contains(&msg::CONTROLLER_MOTION_AIM) && !kinds.contains(&msg::CONTROLLER_MOTION) && !kinds.contains(&msg::BUTTON_STATE), "{kinds:?}");
+}
+
+#[test]
+fn a_game_that_binds_the_hand_interaction_profile_gets_it_made_of_the_hands() {
+    let mut rig = rig("interaction", true);
+    rig.hub.on_offer(Features::HANDS);
+    rig.game_binds_hand_interaction();
+    assert_eq!(rig.link.requested_tracking(), Features::NONE, "the bit is no feature of the headset");
+    // The headset is asked for hands at once, and no controller is made of them later
+    assert_eq!(rig.hub.on_sample(1_000_000, 0), 0);
+    assert_eq!(rig.headset.last_wish(), Features::HANDS);
+
+    // The right hand pinches: its tips touch
+    rig.hub.on_tracked(hands(5_000_000_000, None, Some(tracked_hand([0.25, 1.25, -0.35], 0.018))));
+    let (kind, payload) = rig.next();
+    assert_eq!((kind, payload.len()), (msg::HAND_INTERACTION, 16));
+    assert_eq!((&payload[8..12], &payload[12..16]), (&0u32.to_le_bytes()[..], &0u32.to_le_bytes()[..]));
+    let (kind, payload) = rig.next();
+    // A timestamp, the hand, its flags, three values and four poses of 13 floats each
+    assert_eq!((kind, payload.len()), (msg::HAND_INTERACTION, 16 + 3 * 4 + 4 * 13 * 4));
+    assert_eq!(&payload[..8], &5_000_000_000u64.to_le_bytes());
+    assert_eq!(&payload[8..12], &1u32.to_le_bytes());
+    // Tracked, and every gesture is ready
+    assert_eq!(&payload[12..16], &15u32.to_le_bytes());
+    let values = floats(&payload[16..]);
+    assert!(values[0] > 0.99 && values[1] > 0.99 && values[2] == 0.0, "{:?}", &values[..3]);
+    // The grip pose lies at the palm and moves with the wrist's velocity
+    let grip = &values[3..16];
+    assert!((grip[4] - 0.25).abs() < 2e-4 && (grip[6] - (-0.35 - 0.04)).abs() < 2e-4, "{grip:?}");
+    assert_eq!(&grip[7..10], &[0.5, 0.0, 0.0]);
+    // The pinch pose lies between the tips of thumb and index finger
+    let pinch = &values[3 + 2 * 13..3 + 3 * 13];
+    assert!((pinch[5] - (1.25 - 0.009)).abs() < 2e-4 && (pinch[6] - (-0.35 - 0.14)).abs() < 2e-4, "{pinch:?}");
+    // The game has hand code: the host sends no joints and makes no controller
+    assert!(rig.quiet());
+    assert_eq!(rig.hub.on_sample(6_000_000_000, 0), 0);
+
+    // The app holds the right hand back (it points at a panel): the pinch is the panel's
+    rig.hub.set_held([false, true]);
+    rig.hub.on_tracked(hands(6_000_000_000, None, Some(tracked_hand([0.25, 1.25, -0.35], 0.018))));
+    rig.next();
+    let (_, payload) = rig.next();
+    assert_eq!(floats(&payload[16..28]), vec![0.0, 0.0, 0.0]);
+    // A pause takes both hands away at once
+    rig.hub.pause();
+    for hand in 0..2u32 {
+        let (kind, payload) = rig.next();
+        assert_eq!((kind, payload.len()), (msg::HAND_INTERACTION, 16));
+        assert_eq!((&payload[..8], &payload[8..12]), (&6_000_000_000u64.to_le_bytes()[..], &hand.to_le_bytes()[..]));
+    }
 }

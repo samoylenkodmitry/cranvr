@@ -17,10 +17,15 @@
 //! instance, because the game asks for the instance's extensions first, and lists the extensions of
 //! those features only.
 //!
+//! `XR_EXT_hand_interaction` is cranvr's extension too (runtime patch 0012, message 24). A game that
+//! binds the hand interaction profile makes the runtime set the bit `HAND_INTERACTION` in its
+//! `TRACKING_REQUEST`. The host then asks the headset for hands and sends each hand's poses and
+//! gestures (`HAND_INTERACTION`), which it makes from the joints (see `hand_interaction.rs`).
+//!
 //! The runtime finds the host through a control file: "<port> <token> <eye width> <eye height>".
 //! The launcher passes the file's Windows path to the game in the `BASALT_CONTROL` variable.
 
-use crate::pose::DeviceMotion;
+use crate::{hand_interaction::HandInteraction, pose::DeviceMotion};
 use cranvr_proto::tracking::{Body, Eyes, Face, Features, Joint, BODY_JOINTS, FACE_CONFIDENCES, FACE_WEIGHTS, FULL_BODY_JOINTS, HAND_JOINTS};
 use log::{info, warn};
 use cranvr_common::inputs::QUEST_TOUCH_PROFILE_ID;
@@ -77,7 +82,14 @@ pub(crate) mod msg {
     pub const BODY_TRACKING: u16 = 21;
     pub const FACE_TRACKING: u16 = 22;
     pub const EYE_GAZE: u16 = 23;
+    /// cranvr's runtime patch 0012: the poses and gestures of a hand for XR_EXT_hand_interaction
+    pub const HAND_INTERACTION: u16 = 24;
 }
+
+/// The bit of `TRACKING_REQUEST` with which the runtime asks for the hand interaction profile
+/// (`BASALT_TRACKING_HAND_INTERACTION`). It is no feature of the headset: the host makes the
+/// profile of the hands, so it sits above the bits of `Features`.
+const HAND_INTERACTION_BIT: u32 = 128;
 
 /// One eye of a finished game frame.
 #[derive(Clone, Copy, Debug)]
@@ -192,6 +204,8 @@ pub struct RuntimeLink {
     counters: InputCounters,
     /// The tracking features that the connected game asks for: the bits of `Features`
     requested: AtomicU8,
+    /// The connected game has bindings for the hand interaction profile
+    hand_interaction: AtomicBool,
     /// The tracking features that the connected headset offers, as the file tells the runtime
     offered: AtomicU8,
     /// The runtime dropped the controllers' interaction profiles at an INPUT_RESET. The next pose
@@ -221,6 +235,7 @@ impl RuntimeLink {
             calibration: Mutex::new(Calibration::default()),
             counters: InputCounters::default(),
             requested: AtomicU8::new(0),
+            hand_interaction: AtomicBool::new(false),
             offered: AtomicU8::new(0),
             profiles_dropped: AtomicBool::new(false),
             control_file: control_file.to_owned(),
@@ -239,6 +254,7 @@ impl RuntimeLink {
                     }
                     *link.writer.lock().unwrap() = None;
                     link.requested.store(0, Ordering::Relaxed);
+                    link.hand_interaction.store(false, Ordering::Relaxed);
                     events.send(GameEvent::Disconnected).ok();
                 }
             })?;
@@ -318,6 +334,7 @@ impl RuntimeLink {
         let program = fs::read_to_string(&program_file).ok().map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
         fs::remove_file(&program_file).ok();
         self.requested.store(0, Ordering::Relaxed);
+        self.hand_interaction.store(false, Ordering::Relaxed);
         info!("Game runtime connected: {renderer}, {}", program.as_deref().unwrap_or("program not named"));
 
         *self.last_sent.lock().unwrap() = Instant::now();
@@ -392,9 +409,16 @@ impl RuntimeLink {
                     }
                 }
                 msg::TRACKING_REQUEST => {
-                    let requested = Features(r.u32()? as u8).known();
-                    if self.requested.swap(requested.0, Ordering::Relaxed) != requested.0 {
-                        info!("Game runtime: the game uses {}", if requested.is_empty() { "no tracking".to_string() } else { requested.names().join(", ") });
+                    let bits = r.u32()?;
+                    let requested = Features(bits as u8).known();
+                    let hand_interaction = bits & HAND_INTERACTION_BIT != 0;
+                    let changed = self.requested.swap(requested.0, Ordering::Relaxed) != requested.0;
+                    if self.hand_interaction.swap(hand_interaction, Ordering::Relaxed) != hand_interaction || changed {
+                        let mut words = requested.names();
+                        if hand_interaction {
+                            words.push("the hand interaction profile");
+                        }
+                        info!("Game runtime: the game uses {}", if words.is_empty() { "no tracking".to_string() } else { words.join(", ") });
                     }
                 }
                 msg::TEARDOWN => {
@@ -519,6 +543,36 @@ impl RuntimeLink {
 
     /// The tracking features that the connected game uses now. It is empty when no game runs, or when
     /// the runtime lacks cranvr's tracking patch.
+    /// Whether the connected game has bindings for the hand interaction profile
+    pub fn wants_hand_interaction(&self) -> bool {
+        self.hand_interaction.load(Ordering::Relaxed)
+    }
+
+    /// The hand interaction profile of one hand, or `None` while the headset does not track the
+    /// hand. The poses lie in the host's room.
+    pub fn hand_interaction(&self, timestamp_ns: u64, hand: u32, interaction: Option<&HandInteraction>) {
+        if !self.is_connected() {
+            return;
+        }
+        let mut p = timestamp_ns.to_le_bytes().to_vec();
+        p.extend_from_slice(&hand.to_le_bytes());
+        let flags = match interaction {
+            Some(i) => i.ready.iter().enumerate().fold(1u32, |flags, (k, &ready)| flags | (u32::from(ready) << (k + 1))),
+            None => 0,
+        };
+        p.extend_from_slice(&flags.to_le_bytes());
+        if let Some(i) = interaction {
+            for value in i.values {
+                p.extend_from_slice(&value.to_le_bytes());
+            }
+            for pose in &i.poses {
+                // A test's turn of the room turns these poses as it turns the controllers
+                put_motion(&mut p, &crate::test_input::game_controller(pose));
+            }
+        }
+        self.send(msg::HAND_INTERACTION, &p);
+    }
+
     pub fn requested_tracking(&self) -> Features {
         Features(self.requested.load(Ordering::Relaxed))
     }

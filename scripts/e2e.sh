@@ -6,7 +6,8 @@
 # Usage: scripts/e2e.sh [--seconds N] [--fps HZ] [--game | --wine PROGRAM [--wine-arg ARG]...] [--desktop]
 #                       [--quest [SERIAL] | --native-tcp] [--native-drop PERCENT] [--native-port PORT]
 #                       [--host-arg ARG]... [--probe-arg ARG]... [--report FILE]
-#                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine | --openvr-wine | --openvr-actions MODE | --openvr-overlay | --openvr-gl]
+#                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine | --hand-interaction [hand|both]
+#                        | --openvr-wine | --openvr-actions MODE | --openvr-overlay | --openvr-gl]
 #                       [--displays N] [--hold] [--hand-hold] [--displays-in-game]
 #                       [--game-stall AT:FOR]
 #                       [--pause AT:FOR] [--left-trigger AT:FOR] [--right-trigger AT:FOR]
@@ -34,6 +35,15 @@
 #                 face tracker and an eye gaze action, and compares what it reads with the script.
 #                 Set CRANVR_HOME to a stack that scripts/setup-wine.sh built from the runtime to
 #                 test. The run lasts at least 40 seconds.
+#   --hand-interaction [hand|both]  the hand interaction profile of XR_EXT_hand_interaction through the real runtime:
+#                 C:\basalt\runtime\hand_interaction_smoke.exe runs in Wine and binds that profile alone (hand, the
+#                 default) or with the Touch controller's profile (both). It creates no hand tracker. It drives the
+#                 host's test hand (CRANVR_TEST_INPUT, host/src/test_input.rs) through a file of the run: the right
+#                 hand becomes a tracked hand that pinches, closes into a fist, moves, rolls and leaves the cameras'
+#                 view, and the program checks the values, the ready flags and the four poses that reach it. The
+#                 left hand stays the probe's controller, which the runtime maps onto the profile. With both, the
+#                 right hand must switch between the two profiles with an event each time. The probe's head stands
+#                 still. Set CRANVR_HOME to a stack that scripts/setup-wine.sh built from the runtime to test.
 #   --openvr-wine  an OpenVR program through OpenComposite and the real runtime: C:\opencomposite\openvr_smoke.exe
 #                 runs in Wine. It finds the runtime through the prefix's OpenVR path file, which
 #                 scripts/run-game.sh writes when CRANVR_OPENCOMPOSITE is 1 (this option sets it). It
@@ -142,7 +152,7 @@ unsetopt BG_NICE
 root=${0:A:h:h}
 seconds=20 fps=120 fps_given=0 game=0 desktop=0 client=mac serial="" report=""
 displays=1 hold=0 hand_hold=0 displays_in_game=0 display_test=0
-tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 openvr_wine=0 openvr_actions="" openvr_overlay=0 openvr_gl=0 face_source=audio
+tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 hand_interaction="" openvr_wine=0 openvr_actions="" openvr_overlay=0 openvr_gl=0 face_source=audio
 game_stall=""
 wine="" wine_args=()
 native_tcp=0 native_drop=0 native_port=9950 pause="" left_trigger="" right_trigger=""
@@ -158,6 +168,10 @@ while (( $# )); do
         --hand-controllers) game=1 hand_controllers=1; shift ;;
         --game-stall) game=1 game_stall=$2; shift 2 ;;
         --tracking-wine) tracking_wine=1; shift ;;
+        --hand-interaction)
+            hand_interaction=hand; shift
+            if (( $# )) && [[ $1 != --* ]]; then hand_interaction=$1; shift; fi
+            [[ ${hand_interaction} == (hand|both) ]] || { print -u2 "--hand-interaction takes hand or both"; exit 2; } ;;
         --openvr-wine) openvr_wine=1; shift ;;
         --openvr-overlay) openvr_wine=1 openvr_overlay=1; shift ;;
         --openvr-gl) openvr_wine=1 openvr_gl=1; shift ;;
@@ -203,6 +217,10 @@ if (( displays_in_game )); then
 fi
 if [[ ${client} == quest ]] && (( hold || displays > 1 || displays_in_game || tracking || hand_controllers || tracking_wine || openvr_wine )); then
     print -u2 "--tracking, --hand-controllers, --tracking-wine and --openvr-wine belong to the probe: they cannot combine with --quest."
+    exit 2
+fi
+if [[ ${client} == quest && -n ${hand_interaction} ]]; then
+    print -u2 "--hand-interaction belongs to the probe: its checks need the probe's still head and controllers."
     exit 2
 fi
 if (( openvr_wine )); then
@@ -254,6 +272,16 @@ is_quest() { adb -s "$1" shell getprop ro.product.model | grep -qi quest }
 bin=${root}/target/release
 work=${root}/target/e2e/run-$(date +%Y%m%d-%H%M%S)
 mkdir -p "${work}"
+if [[ -n ${hand_interaction} ]]; then
+    # The program writes the test hand's words into this file, and the host reads them from it. Wine sees the Mac's
+    # files on drive Z.
+    words=${work}/test-hand.txt
+    : > "${words}"
+    export CRANVR_TEST_INPUT=${words}
+    wine='C:\basalt\runtime\hand_interaction_smoke.exe'
+    wine_args=(--words "Z:${words//\//\\}" --profiles "${hand_interaction}")
+    (( seconds >= 45 )) || seconds=45
+fi
 report=${report:-${work}/report.json}
 print "Building the host and the probe (log: ${work}/build.log)"
 if ! (cd "${root}" && cargo build --release -p cranvr-host -p cranvr-probe > "${work}/build.log" 2>&1); then
@@ -462,6 +490,8 @@ fi
 (( hand_controllers )) && probe_args+=(--tracking --no-controllers)
 # A program that compares its controller poses with the probe's script (the OpenVR program does, with and without an action manifest) needs the head still: its room is then the probe's room
 (( openvr_wine )) && probe_args+=(--still-head)
+# The hand interaction program places the test hand from the head, which must stand still
+[[ -n ${hand_interaction} ]] && probe_args+=(--still-head)
 probe_args+=("${more_probe_args[@]}")
 client_exit=0
 case ${client} in
@@ -577,6 +607,17 @@ if (( tracking_wine )); then
     done
     grep -h "tracking_smoke:" "${work}/game.log" || true
     grep -q "tracking_smoke: PASS" "${work}/game.log" || { print -u2 "The tracking program did not pass; see ${work}/game.log"; tracking_exit=1; }
+fi
+hand_interaction_exit=0
+if [[ -n ${hand_interaction} ]]; then
+    # The Windows program ends on its own: wait for its verdict
+    for i in {1..60}; do
+        grep -qE "hand_interaction_smoke: (PASS|FAIL)" "${work}/game.log" && break
+        sleep 0.5
+    done
+    grep -h "hand_interaction_smoke:" "${work}/game.log" || true
+    grep -q "hand_interaction_smoke: PASS" "${work}/game.log" || { print -u2 "The hand interaction program did not pass; see ${work}/game.log"; hand_interaction_exit=1; }
+    grep -h "the game uses" "${work}/host.log" | tail -2 || true
 fi
 if (( tracking || tracking_wine )); then
     # The host asks the headset for tracking only after the game created its trackers
@@ -741,6 +782,7 @@ python3 -I "${root}/scripts/e2e-report.py" "${work}/host.out" "${fps}" "${report
 (( mouse_exit == 0 )) || result=1
 (( game_exit == 0 )) || result=1
 (( tracking_exit == 0 )) || result=1
+(( hand_interaction_exit == 0 )) || result=1
 (( openvr_exit == 0 )) || result=1
 (( displays_exit == 0 )) || result=1
 grep -hE "probe: (done|frame arrival|native|desktop|audio|pause test|displays|in-game displays|[0-9.]+ s: the focus)" "${work}/probe.log" 2>/dev/null || true
