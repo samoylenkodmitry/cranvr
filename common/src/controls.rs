@@ -123,6 +123,60 @@ impl<'de> Deserialize<'de> for Action {
     }
 }
 
+/// When the headset draws its own models of the controllers while a game runs. A game draws its
+/// own controllers, so the headset's models stand at the same place as a second copy. Outside a
+/// game the headset's models show with the rays.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ModelsInGame {
+    /// Both models show for the whole game
+    Always,
+    /// A hand's model shows while its ray points at a cranvr panel
+    #[default]
+    WhilePointing,
+    /// No model shows while a game runs
+    Never,
+}
+
+impl ModelsInGame {
+    pub const ALL: [ModelsInGame; 3] = [ModelsInGame::Always, ModelsInGame::WhilePointing, ModelsInGame::Never];
+
+    /// The name in the files and messages
+    pub fn key(self) -> &'static str {
+        match self {
+            ModelsInGame::Always => "always",
+            ModelsInGame::WhilePointing => "while_pointing",
+            ModelsInGame::Never => "never",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|choice| choice.key() == key)
+    }
+
+    /// The text of the choice's button
+    pub fn label(self) -> &'static str {
+        match self {
+            ModelsInGame::Always => "Always",
+            ModelsInGame::WhilePointing => "While pointing at a cranvr panel",
+            ModelsInGame::Never => "Never",
+        }
+    }
+}
+
+impl Serialize for ModelsInGame {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.key())
+    }
+}
+
+/// A name that is no choice is an error.
+impl<'de> Deserialize<'de> for ModelsInGame {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let key = String::deserialize(deserializer)?;
+        Self::from_key(&key).ok_or_else(|| serde::de::Error::custom(format!("no choice of the controller models is named {key}")))
+    }
+}
+
 /// The two controllers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Hand {
@@ -299,16 +353,17 @@ impl HandControls {
     }
 }
 
-/// The actions of both controllers.
+/// The actions of both controllers, and when the headset draws its models of them in a game.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct Controls {
     pub left: HandControls,
     pub right: HandControls,
+    pub models_in_game: ModelsInGame,
 }
 
 impl Default for Controls {
     fn default() -> Self {
-        Self { left: HandControls::standard(Hand::Left), right: HandControls::standard(Hand::Right) }
+        Self { left: HandControls::standard(Hand::Left), right: HandControls::standard(Hand::Right), models_in_game: ModelsInGame::default() }
     }
 }
 
@@ -346,6 +401,7 @@ impl PartialHand {
 struct PartialControls {
     left: Option<PartialHand>,
     right: Option<PartialHand>,
+    models_in_game: Option<ModelsInGame>,
 }
 
 impl<'de> Deserialize<'de> for Controls {
@@ -354,6 +410,7 @@ impl<'de> Deserialize<'de> for Controls {
         Ok(Self {
             left: partial.left.unwrap_or_default().over(HandControls::standard(Hand::Left)),
             right: partial.right.unwrap_or_default().over(HandControls::standard(Hand::Right)),
+            models_in_game: partial.models_in_game.unwrap_or_default(),
         })
     }
 }
@@ -433,6 +490,20 @@ pub mod mouse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_models_in_a_game_show_while_pointing_unless_the_text_names_another_choice() {
+        assert_eq!(Controls::default().models_in_game, ModelsInGame::WhilePointing);
+        assert_eq!(Controls::from_json("{}").unwrap().models_in_game, ModelsInGame::WhilePointing);
+        for choice in ModelsInGame::ALL {
+            let controls = Controls { models_in_game: choice, ..Controls::default() };
+            assert_eq!(Controls::from_json(&controls.to_json()), Some(controls));
+            assert_eq!(ModelsInGame::from_key(choice.key()), Some(choice));
+        }
+        assert_eq!(Controls::from_json(r#"{"models_in_game":"never"}"#).unwrap().models_in_game, ModelsInGame::Never);
+        // A name that is no choice makes the mapping unreadable, as a wrong action does
+        assert_eq!(Controls::from_json(r#"{"models_in_game":"sometimes"}"#), None);
+    }
 
     #[test]
     fn a_name_that_is_no_action_makes_the_mapping_unreadable() {

@@ -11,7 +11,7 @@
 //! This file holds the data and the rules, with no Cranpose state. `console_panel.rs` draws them
 //! and places the panel.
 
-use cranvr_common::controls::{Action as ControlAction, Control, Controls, Hand};
+use cranvr_common::controls::{Action as ControlAction, Control, Controls, Hand, ModelsInGame};
 use serde_json::{json, Value};
 use std::{
     sync::atomic::{AtomicU8, Ordering},
@@ -220,12 +220,13 @@ impl Volume {
 }
 
 /// What a console button does. Most of them ask the host. The room and the volume are the client's
-/// own settings.
+/// own settings. The controller models in a game go to the Mac with the controls.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Press {
     Host(Action),
     Room(Room),
     Volume(Volume),
+    Models(ModelsInGame),
 }
 
 /// What decides whether the room shows behind the panels.
@@ -285,9 +286,14 @@ pub fn height(menu: Option<&Menu>) -> f32 {
     let games = menu.listed().len().max(1) as f32;
     // The notice has a line of its own
     let notice = if menu.notice.is_some() { TEXT + GAP } else { 0.0 };
-    // The title, the game's state, the heading and the games, the heading and six rows for the five
-    // settings (one row is spare), the note and the buttons at the bottom
-    2.0 * PADDING + notice + rows(&[TITLE, TEXT, HEADING]) + games * (BUTTON + GAP) + rows(&[HEADING, BUTTON, BUTTON, BUTTON, BUTTON, BUTTON, BUTTON, TEXT, BUTTON])
+    // The title, the game's state, the heading and the games, the heading and a row for each of the
+    // five settings, the name and the choices of the controller models, the note and the buttons at
+    // the bottom
+    2.0 * PADDING
+        + notice
+        + rows(&[TITLE, TEXT, HEADING])
+        + games * (BUTTON + GAP)
+        + rows(&[HEADING, BUTTON, BUTTON, BUTTON, BUTTON, BUTTON, TEXT, BUTTON, TEXT, BUTTON])
 }
 
 /// How long the headset waits for the Mac to repeat a change of the controls that the user made in
@@ -376,6 +382,13 @@ impl Console {
         self.menu.as_ref()?;
         let mut next = self.controls;
         next.set(hand, control, action).then_some(())?;
+        self.show_controls(next, now)
+    }
+
+    /// The user picks when the controllers' models show in a game. See `step_control`.
+    pub fn pick_models(&mut self, choice: ModelsInGame, now: Instant) -> Option<Controls> {
+        self.menu.as_ref()?;
+        let next = Controls { models_in_game: choice, ..self.controls };
         self.show_controls(next, now)
     }
 

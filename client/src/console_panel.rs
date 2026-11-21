@@ -18,7 +18,7 @@ use crate::{
 use cranpose::prelude::*;
 use cranpose::text::FontWeight;
 use cranpose_xr::{FollowMode, FollowTarget, TrackedDimensions, FollowingSubspace, Hand, Pose, SpatialPanel, SubspaceModifier, Vibration};
-use cranvr_common::controls::{Control, Controls, Hand as ControlHand};
+use cranvr_common::controls::{Control, Controls, Hand as ControlHand, ModelsInGame};
 use cranvr_proto::wire::Nanos;
 use std::time::Duration;
 
@@ -39,6 +39,13 @@ const START_TILT_DEGREES: f32 = 34.0;
 /// action that fires gives the hand that fired it a click, so the user knows that the press took.
 pub fn on_frame(read: &Read, now: Nanos) {
     let input = read.frame.as_ref().map_or_else(Default::default, |frame| frame.input);
+    #[cfg(all(feature = "scripted-hand", target_os = "android"))]
+    {
+        crate::scripted::note_input(&input);
+        if let Some(frame) = &read.frame {
+            crate::scripted::note_poses(frame);
+        }
+    }
     for fire in hub().controls_frame(&input, now) {
         if let Some(haptics) = hub().headset().and_then(|headset| headset.haptics) {
             let hand = match fire.hand {
@@ -48,6 +55,12 @@ pub fn on_frame(read: &Read, now: Nanos) {
             haptics.vibrate(hand, Vibration::new(0.4, Duration::from_millis(40)));
         }
     }
+}
+
+/// Where the console starts in its subspace: the place of the user's last carry, else the default.
+pub fn start_place() -> Pose {
+    let default = SubspaceModifier::new().offset(START_OFFSET[0], START_OFFSET[1], START_OFFSET[2]).rotate(-START_TILT_DEGREES, 0.0, 0.0).pose();
+    place::start_pose("console", default)
 }
 
 /// The console, while it is open.
@@ -77,11 +90,7 @@ fn OpenConsole(view: View, state: LinkState) {
         Page::Main => console::height(view.menu.as_ref()),
         Page::Controls(_) => console::controls_height(),
     };
-    let start = remember(|| {
-        let default = SubspaceModifier::new().offset(START_OFFSET[0], START_OFFSET[1], START_OFFSET[2]).rotate(-START_TILT_DEGREES, 0.0, 0.0).pose();
-        place::start_pose("console", default)
-    })
-    .with(|pose: &Pose| *pose);
+    let start = remember(start_place).with(|pose: &Pose| *pose);
     let modifier = SubspaceModifier::new().size(size::WIDTH, height).layer_priority(crate::panel_layout::layer_rank::TEXT);
     SpatialPanel(place::movable("console", modifier, start, |_| {}), move || {
         // The pointer over the console holds the pointing hand back from the game (see `hold.rs`)
@@ -95,7 +104,7 @@ fn OpenConsole(view: View, state: LinkState) {
             ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(size::GAP)),
             move || match (shown, &menu) {
                 (Page::Controls(hand), _) => ControlsPage(page, hand, controls, editable),
-                (Page::Main, Some(menu)) => MenuRows(menu.clone(), room, volume, page),
+                (Page::Main, Some(menu)) => MenuRows(menu.clone(), room, volume, controls.models_in_game, page),
                 (Page::Main, None) => NoMenu(state.clone(), room, volume, page),
             },
         );
@@ -122,7 +131,7 @@ fn NoMenu(state: LinkState, room: Room, volume: Volume, page: MutableState<Page>
 }
 
 #[composable]
-fn MenuRows(menu: Menu, room: Room, volume: Volume, page: MutableState<Page>) {
+fn MenuRows(menu: Menu, room: Room, volume: Volume, models: ModelsInGame, page: MutableState<Page>) {
     let status = menu.status.clone();
     let stream = if status.refresh > 0.0 {
         let latency = status.latency_ms.map_or(String::new(), |ms| format!(", {ms:.0} ms"));
@@ -162,6 +171,7 @@ fn MenuRows(menu: Menu, room: Room, volume: Volume, page: MutableState<Page>) {
         vec![("Limit 2x".into(), Press::Host(Action::Msaa(2)), menu.msaa == 2), ("No limit".into(), Press::Host(Action::Msaa(0)), menu.msaa == 0)],
     );
     ClientSettings(room, volume);
+    ModelsSetting(models);
     Text(
         "Refresh and game size restart the stream",
         Modifier::empty().height(size::TEXT),
@@ -176,6 +186,31 @@ fn MenuRows(menu: Menu, room: Room, volume: Volume, page: MutableState<Page>) {
 fn ClientSettings(room: Room, volume: Volume) {
     Setting("Room", Room::ALL.iter().map(|&choice| (choice.label().into(), Press::Room(choice), room == choice)).collect());
     Setting("Volume", Volume::ALL.iter().map(|&choice| (choice.label(), Press::Volume(choice), volume == choice)).collect());
+}
+
+/// When the controllers' models show in a game. The Mac keeps the choice with the controls. The
+/// long middle choice takes the most room.
+#[composable]
+fn ModelsSetting(current: ModelsInGame) {
+    Text("Controller models during a game", Modifier::empty().height(size::TEXT), text_style(22.0, TEXT_COLOR, None));
+    Row(
+        Modifier::empty().fill_max_width(),
+        RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(size::GAP)),
+        move || {
+            for choice in ModelsInGame::ALL {
+                let share = if choice == ModelsInGame::WhilePointing { 3.0 } else { 1.0 };
+                let color = if choice == current { ACCENT_COLOR } else { KEY_COLOR };
+                Button(
+                    Modifier::empty().height(size::BUTTON).background(color).rounded_corners(12.0).weight(share),
+                    ButtonSpec::default(),
+                    move || run(&Press::Models(choice)),
+                    move || {
+                        Text(choice.label(), Modifier::empty(), bold(18.0));
+                    },
+                );
+            }
+        },
+    );
 }
 
 #[composable]
@@ -234,6 +269,7 @@ fn run(press: &Press) {
         Press::Host(action) => hub().press(action),
         Press::Room(room) => hub().choose_room(*room),
         Press::Volume(volume) => hub().choose_volume(*volume),
+        Press::Models(choice) => hub().choose_models(*choice),
     }
 }
 

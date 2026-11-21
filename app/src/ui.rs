@@ -9,7 +9,7 @@ use crate::{
 };
 use cranpose::prelude::*;
 use cranpose::text::{FontWeight, TextUnit};
-use cranvr_common::controls::{Action as ControlAction, Control, Controls, Hand};
+use cranvr_common::controls::{Action as ControlAction, Control, Controls, Hand, ModelsInGame};
 use cranpose::widgets::{FlowRow, FlowSpec};
 use std::{
     thread,
@@ -1108,6 +1108,13 @@ fn set_control(settings: MutableState<Settings>, hand: Hand, control: Control, a
     settings.with(Settings::save);
 }
 
+/// Changes when the headset draws its models of the controllers in a game. The headset gets the
+/// choice with the mapping, through `vr-menu.json`.
+fn set_models(settings: MutableState<Settings>, choice: ModelsInGame) {
+    settings.update(|s| s.controls.models_in_game = choice);
+    settings.with(Settings::save);
+}
+
 fn reset_controls(settings: MutableState<Settings>) {
     settings.update(|s| s.controls = Controls::default());
     settings.with(Settings::save);
@@ -1136,6 +1143,16 @@ fn ControlsPage(settings: MutableState<Settings>) {
         }
         FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
             Action("Use the standard controls".into(), move || reset_controls(settings));
+        });
+    });
+    let models = controls.models_in_game;
+    Card(move || {
+        Heading("Controller models during a game".into());
+        Hint("The headset draws a model of each controller. A game draws its own controllers, so a second model can stand at the same place. This choice decides when the headset draws its models while a game runs. The console in the headset has the same choice.".into());
+        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+            for choice in ModelsInGame::ALL {
+                Choice(choice.label().into(), models == choice, move || set_models(settings, choice));
+            }
         });
     });
     Card(move || {
