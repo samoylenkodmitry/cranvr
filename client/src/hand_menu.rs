@@ -95,6 +95,11 @@ pub const ON_CONTROLLER: HandFrame = HandFrame { base: [0.0; 3], menu: "hand-men
 /// left hand lies 30 cm left of the nose, 35 cm below it and 40 cm ahead of it.
 pub const ON_VIEW: HandFrame = HandFrame { base: [-300.0, -350.0, 600.0], menu: "hand-menu-view", display: "hand-display-view" };
 
+/// The frame of the hand's panels in this launch.
+pub fn frame() -> HandFrame {
+    anchor().1
+}
+
 /// Where the hand's panels ride: the left controller, which they follow in all six dimensions, or the
 /// head for a test on a desk (see the file's notes).
 fn anchor() -> (FollowTarget, HandFrame) {

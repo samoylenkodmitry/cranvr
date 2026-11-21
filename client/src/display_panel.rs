@@ -45,6 +45,12 @@ const WIDTH_RANGE: [f32; 2] = [0.4, 8.0];
 const HAND_START_WIDTH: f32 = 0.42;
 const HAND_WIDTH: [f32; 2] = [0.28, 0.70];
 
+/// The width in meters of the hand's display: the one that the user gave it last, or the width that
+/// it starts with.
+pub fn hand_display_width() -> f32 {
+    place::saved_width(hand_menu::frame().display).map_or(HAND_START_WIDTH, |width| width.clamp(HAND_WIDTH[0], HAND_WIDTH[1]))
+}
+
 /// The name under which `place.rs` keeps the pose and width of a display's panel
 pub fn panel_name(stream: u8) -> &'static str {
     match stream - DESKTOP_STREAM {

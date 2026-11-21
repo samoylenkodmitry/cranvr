@@ -663,8 +663,8 @@ fn encode_loop(jobs: mpsc::Receiver<EncodeJob>) {
             job.encoder.set_bitrate(b);
         }
         // The eye stream's frames stand 1 ms apart on the encoder's time line, as they always did. The
-        // rate control then gives each frame the bits of 1 ms. The displays use the real time
-        // (see `headset/native/desktop.rs`).
+        // rate control then gives each frame the bits of 1 ms (issue #90). The displays use the real
+        // time (see `headset/native/desktop.rs`).
         if let Err(e) = job.encoder.encode(&job.buffer, Duration::from_millis(job.index as u64), job.sample, job.idr) {
             error!("Encode: {e}");
         }
