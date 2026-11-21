@@ -27,8 +27,8 @@ pub const LITTLE_TIP: usize = 25;
 /// The distance between the thumb tip and the index tip at which the trigger is fully pulled, and
 /// the one at which it is released, in meters. Touching tips lie about 18 mm apart because each
 /// joint sits in the middle of its fingertip.
-const PINCH_CLOSED: f32 = 0.018;
-const PINCH_OPEN: f32 = 0.060;
+pub const PINCH_CLOSED: f32 = 0.018;
+pub const PINCH_OPEN: f32 = 0.060;
 /// The distance between a fingertip and the palm's center at which the finger is curled into a fist,
 /// and the one at which it is stretched, in meters.
 const CURLED: f32 = 0.050;
@@ -81,19 +81,33 @@ fn looking_along(forward: Vec3, fallback: Quat) -> Quat {
     Quat::from_mat3(&glam::Mat3::from_cols(x, z.cross(x), z)).normalize()
 }
 
+/// The pose `pose` of a point of the hand, with the velocities that it has as a part of the hand: the wrist's
+/// velocities plus the turn about the wrist.
+pub fn on_hand(root: &DeviceMotion, pose: Pose) -> DeviceMotion {
+    DeviceMotion {
+        pose,
+        linear_velocity: root.linear_velocity + root.angular_velocity.cross(pose.position - root.pose.position),
+        angular_velocity: root.angular_velocity,
+    }
+}
+
+/// The palm joint's pose
+pub fn palm(joints: &[Joint; HAND_JOINTS]) -> Pose {
+    Pose { orientation: Quat::from_array(joints[PALM].pose.orientation).normalize(), position: position(&joints[PALM]) }
+}
+
 /// The controller that `hand` stands for. `root` is the wrist's pose with its velocities, `joints`
 /// are in the same room, `left` says which hand it is, and `head` is the head's pose when known. The
 /// aim pose needs the head for the shoulder. Without it the aim pose follows the palm's direction.
 pub fn controller(left: bool, root: &DeviceMotion, joints: &[Joint; HAND_JOINTS], head: Option<&Pose>) -> HandController {
-    let palm = Pose { orientation: Quat::from_array(joints[PALM].pose.orientation).normalize(), position: position(&joints[PALM]) };
-    // A point on the palm moves with the wrist's velocities plus the turn about the wrist
-    let moving = |at: Vec3| DeviceMotion {
-        pose: Pose { orientation: Quat::IDENTITY, position: at },
-        linear_velocity: root.linear_velocity + root.angular_velocity.cross(at - root.pose.position),
-        angular_velocity: root.angular_velocity,
-    };
-    let grip = DeviceMotion { pose: palm, ..moving(palm.position) };
+    let grip = on_hand(root, palm(joints));
+    HandController { grip, aim: aim(left, root, joints, head), trigger: pinch(joints), squeeze: squeeze(joints) }
+}
 
+/// The aim pose of a hand: it points from the shoulder through the pinching fingers, and it starts
+/// between them. Without the head it points along the palm.
+pub fn aim(left: bool, root: &DeviceMotion, joints: &[Joint; HAND_JOINTS], head: Option<&Pose>) -> DeviceMotion {
+    let palm = palm(joints);
     // The pointing ray starts between the pinching fingertips
     let target = (position(&joints[THUMB_TIP]) + position(&joints[INDEX_TIP])) * 0.5;
     let forward = match head {
@@ -108,9 +122,7 @@ pub fn controller(left: bool, root: &DeviceMotion, joints: &[Joint; HAND_JOINTS]
         None => None,
     }
     .unwrap_or_else(|| palm.orientation * Vec3::NEG_Z);
-    let aim = DeviceMotion { pose: Pose { orientation: looking_along(forward, palm.orientation), position: target }, ..moving(target) };
-
-    HandController { grip, aim, trigger: pinch(joints), squeeze: squeeze(joints) }
+    on_hand(root, Pose { orientation: looking_along(forward, palm.orientation), position: target })
 }
 
 #[cfg(test)]

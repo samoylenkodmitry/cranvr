@@ -532,6 +532,13 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
             session.history.lock().unwrap().push(t);
             session.lock.lock().unwrap().on_tracking(t.display_time);
             shared.emit(Event::Tracking { sample_ns: t.sample_time });
+            // A test hand that the headset tracks comes with each sample, as a headset's hands do
+            if let Some(hands) = crate::test_input::hands(&t) {
+                if let Some(mut tracked) = sanitized(Tracked::Hands(hands)) {
+                    raise_to_host_room(&mut tracked, session.floor.lock().unwrap().unwrap_or(0.0));
+                    shared.emit(Event::Tracked(tracked));
+                }
+            }
         }
         Incoming::Datagram(ClientDatagram::InputHold(InputHold { mut input, held })) => {
             crate::test_input::input(&mut input);
@@ -556,7 +563,9 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
                 ClientDatagram::Eyes(e) => Tracked::Eyes(e),
                 _ => return,
             };
-            if session.wished(&tracked) {
+            // A tracked test hand stands in for the client's hands
+            let replaced = matches!(tracked, Tracked::Hands(_)) && crate::test_input::replaces_hands();
+            if session.wished(&tracked) && !replaced {
                 if let Some(mut tracked) = sanitized(tracked) {
                     raise_to_host_room(&mut tracked, session.floor.lock().unwrap().unwrap_or(0.0));
                     shared.emit(Event::Tracked(tracked));

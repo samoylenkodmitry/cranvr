@@ -424,7 +424,14 @@ A game without hand code binds the Oculus Touch controller profile and knows not
 - A game that creates a hand tracker has hand code of its own and gets no controller made of a hand. The host also waits for 3 seconds after the game connected before it makes any, because a game with hand code creates its tracker soon after it starts. Neither follows the game's name. `--no-hand-controllers` turns the controllers off.
 - While no controller is tracked for 0.3 s, the host asks the headset for hands. It stops asking when both controllers have been back for 3 s.
 
-`XR_EXT_hand_interaction` is not offered. A game that binds only its interaction profile finds no input. The grip and aim poses of the Touch profile cover a game that has no hand code.
+### The hand interaction profile
+
+Runtime patch 0012 offers `XR_EXT_hand_interaction`, for a game that binds `/interaction_profiles/ext/hand_interaction_ext`, alone or beside the Touch controller's profile. The runtime lists the extension with its graphics extension. It needs no headset feature, because a controller serves the profile too.
+
+- The profile has the paths of the extension: the aim, grip, pinch and poke poses, and a value and a `ready_ext` flag for each of `pinch_ext`, `aim_activate_ext` and `grasp_ext`. With the extension enabled, every profile of the hands also takes `pinch_ext/pose` and `poke_ext/pose`. The extension asks for that.
+- A game that attaches an action with a binding for the profile makes the runtime ask the host for it (the bit `HAND_INTERACTION` of `TRACKING_REQUEST`). The host then asks the headset for hands and makes no controller of them, because the game has hand code. It sends each hand's poses and gestures (message 24), which it makes from the joints (`host/src/hand_interaction.rs`). The grip pose sits at the palm joint, turned to the extension's axes: -Z runs from the little finger to the index finger, +X enters the palm of the right hand and leaves the back of the left hand. The aim pose is the one of a controller made of a hand. The pinch pose sits between the tips of thumb and index finger, and the poke pose on the skin of the index fingertip. The pinch and the grasp use the distances of "Controllers made of hands". The aim activation is the pinch. A gesture is ready while the headset tracks the joints that it reads. A pinch at a panel of the headset's app reads 0 for the game, as a held trigger does.
+- A Touch controller serves the profile too, as the extension asks of a runtime with controllers: its trigger is the pinch and the aim activation, its squeeze is the grasp, and every gesture is ready. Its pinch and poke poses lie 3 and 4 cm ahead of its aim pose.
+- Each hand takes the profile of what the user holds, in `xrSyncActions` only. A tracked controller gets the Touch profile when the game bound it, else the hand interaction profile. A tracked hand without a tracked controller gets the hand interaction profile. While neither is tracked the hand keeps its profile, so a hand that leaves the cameras' view for a moment changes nothing. Each change of a profile queues `XrEventDataInteractionProfileChanged`, and `xrGetCurrentInteractionProfile` returns the new profile. The choice follows the bindings of the game, never its name.
 
 ### Tests
 
@@ -438,6 +445,10 @@ scripts/e2e.sh --native-port 9961 --tracking
 scripts/e2e.sh --native-port 9961 --hand-controllers
 # The real runtime: tracking_smoke.exe reads everything through OpenXR in Wine.
 CRANVR_HOME=/path/to/a/test/stack scripts/e2e.sh --native-port 9961 --tracking-wine
+# The hand interaction profile: hand_interaction_smoke.exe binds it alone and drives the host's test hand
+# (pinch, fist, a move, a roll, a loss). "both" binds the Touch profile too and checks the switch of profiles.
+CRANVR_HOME=/path/to/a/test/stack scripts/e2e.sh --native-port 9961 --hand-interaction
+CRANVR_HOME=/path/to/a/test/stack scripts/e2e.sh --native-port 9961 --hand-interaction both
 CRANVR_HOME=/path/to/a/test/stack scripts/e2e.sh --native-port 9961 --tracking-wine --face-source visual
 ```
 

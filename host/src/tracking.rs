@@ -7,9 +7,11 @@
 //! - It forwards the data that comes back to the runtime.
 //! - It makes controllers from hands (see `hand_controller.rs`) for a game without hand code, while the
 //!   headset tracks a hand and no controller.
+//! - It makes the hand interaction profile of `XR_EXT_hand_interaction` from the hands (see
+//!   `hand_interaction.rs`) for a game that binds that profile. Such a game has hand code too.
 
 use crate::{
-    hand_controller,
+    hand_controller, hand_interaction,
     hand_mask::PinchMask,
     headset::{Device, Headset},
     pose::{DeviceMotion, Pose, Quat, Vec3},
@@ -92,6 +94,11 @@ pub struct Hub {
     /// panel's press, not the game's trigger
     held: [bool; 2],
     pinch_mask: PinchMask,
+    /// The same mask for the pinch and the grasp of the hand interaction profile
+    interaction_mask: PinchMask,
+    /// The sample time of the newest hand interaction sent to the runtime: a pause sends the hands'
+    /// loss with it, as the runtime takes no older sample
+    interaction_ns: Nanos,
 }
 
 impl Hub {
@@ -109,6 +116,8 @@ impl Hub {
             made: [None, None],
             held: [false; 2],
             pinch_mask: PinchMask::default(),
+            interaction_mask: PinchMask::default(),
+            interaction_ns: 0,
         }
     }
 
@@ -121,10 +130,21 @@ impl Hub {
     /// hand made go back to 0 (Meta's rule: an app without the focus shows no controllers).
     pub fn pause(&mut self) {
         self.pinch_mask.reset();
+        self.interaction_mask.reset();
         self.seen = [None, None];
         for hand in 0..2 {
             self.release(hand);
         }
+        if self.link.wants_hand_interaction() {
+            for hand in 0..2 {
+                self.link.hand_interaction(self.interaction_ns, hand, None);
+            }
+        }
+    }
+
+    /// The game has hand code: it creates a hand tracker or binds the hand interaction profile
+    fn game_has_hand_code(&self) -> bool {
+        self.link.requested_tracking().contains(Features::HANDS) || self.link.wants_hand_interaction()
     }
 
     /// The headset says which features it offers. An empty set means that it is gone.
@@ -144,7 +164,7 @@ impl Hub {
     /// grace time without hand code, and the user did not turn it off.
     fn making_controllers(&self, ns: Nanos) -> bool {
         self.hand_controllers
-            && !self.link.requested_tracking().contains(Features::HANDS)
+            && !self.game_has_hand_code()
             && self.connected_since.is_some_and(|since| ns.saturating_sub(since) >= GRACE)
     }
 
@@ -163,7 +183,9 @@ impl Hub {
         if !making {
             self.need = HandNeed::default();
         }
-        let wish = self.link.requested_tracking().union(if need { Features::HANDS } else { Features::NONE });
+        // The hand interaction profile is made of the hands
+        let hands = need || self.link.wants_hand_interaction();
+        let wish = self.link.requested_tracking().union(if hands { Features::HANDS } else { Features::NONE });
         if wish != self.wished {
             self.wished = wish;
             self.headset.set_tracking_wish(wish);
@@ -186,11 +208,15 @@ impl Hub {
         match tracked {
             Tracked::Hands(hands) => {
                 let ns = hands.sample_time;
+                let interaction = self.link.wants_hand_interaction();
                 for (index, hand) in [hands.left, hands.right].into_iter().enumerate() {
                     let hand = hand.and_then(|hand| hand.joints().ok().map(|joints| (hand, joints)));
                     if requested.contains(Features::HANDS) {
                         let root = hand.as_ref().map(|(hand, _)| motion(&hand.root));
                         self.link.hand(ns, index as u32, root.as_ref().zip(hand.as_ref().map(|(_, joints)| joints)));
+                    }
+                    if interaction {
+                        self.on_hand_interaction(ns, index, hand.as_ref());
                     }
                     self.on_hand(ns, index, hand.as_ref());
                 }
@@ -217,6 +243,29 @@ impl Hub {
                 }
             }
         }
+    }
+
+    /// A hand sample for a game that binds the hand interaction profile. A pinch or a grasp at a
+    /// panel of the headset's app reads 0 for the game, as the trigger of a controller made of a
+    /// hand does.
+    fn on_hand_interaction(&mut self, ns: Nanos, index: usize, hand: Option<&(Hand, [Joint; HAND_JOINTS])>) {
+        self.interaction_ns = self.interaction_ns.max(ns);
+        let Some((hand, joints)) = hand else {
+            self.link.hand_interaction(ns, index as u32, None);
+            return;
+        };
+        let head = self.headset.motion(Device::Head, ns).map(|m| m.pose);
+        let mut interaction = hand_interaction::interaction(index == 0, &motion(&hand.root), joints, head.as_ref());
+        let (pinch, grasp) = self.interaction_mask.apply(
+            index,
+            self.held[index],
+            interaction.values[hand_interaction::PINCH],
+            interaction.values[hand_interaction::GRASP],
+        );
+        interaction.values[hand_interaction::PINCH] = pinch;
+        interaction.values[hand_interaction::AIM_ACTIVATE] = pinch;
+        interaction.values[hand_interaction::GRASP] = grasp;
+        self.link.hand_interaction(ns, index as u32, Some(&interaction));
     }
 
     /// A hand sample: it may make the controller of that hand.

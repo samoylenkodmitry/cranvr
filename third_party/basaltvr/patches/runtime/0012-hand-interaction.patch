@@ -1,0 +1,2131 @@
+diff --git c/runtime/pe/basalt_control_protocol.h w/runtime/pe/basalt_control_protocol.h
+index 120ec2a..6126c89 100644
+--- c/runtime/pe/basalt_control_protocol.h
++++ w/runtime/pe/basalt_control_protocol.h
+@@ -119,6 +119,20 @@
+  *   EYE_GAZE (daemon -> runtime; latest sample wins)
+  *     u64 target_timestamp_ns, u32 flags (bit 0: tracked),
+  *     f32 orientation[4], f32 position[3]; the gaze runs along -Z
++ *
++ * cranvr: XR_EXT_hand_interaction (message 24). The runtime asks for it with the bit
++ * HAND_INTERACTION of TRACKING_REQUEST while the game has bindings for
++ * /interaction_profiles/ext/hand_interaction_ext. The daemon makes the values and the poses
++ * from the hand's joints, and it sends 0 for a pinch that the user makes at a panel of the
++ * headset's app. A runtime without this message closes the connection at it, as at 18 to 23.
++ *   HAND_INTERACTION (daemon -> runtime; latest sample wins per hand)
++ *     u64 target_timestamp_ns, u32 hand (0 left, 1 right), u32 flags (bit 0: tracked,
++ *     bit 1: pinch ready, bit 2: aim_activate ready, bit 3: grasp ready),
++ *     only for a tracked hand:
++ *       f32 pinch, f32 aim_activate, f32 grasp, each from 0 to 1,
++ *       then four poses in this order: grip, aim, pinch, poke, each
++ *         f32 orientation[4] (xyzw), f32 position[3],
++ *         f32 linear_velocity[3], f32 angular_velocity[3]
+  */
+ 
+ #define BASALT_CONTROL_PROTOCOL_VERSION 9u
+@@ -157,10 +171,12 @@ enum {
+     BASALT_MSG_BODY_TRACKING = 21,
+     BASALT_MSG_FACE_TRACKING = 22,
+     BASALT_MSG_EYE_GAZE = 23,
++    BASALT_MSG_HAND_INTERACTION = 24,
+ };
+ 
+-/* Bits of TRACKING_REQUEST and of tracking-features.txt's words. The last two are
+- * words of the file only: a TRACKING_REQUEST never carries them. */
++/* Bits of TRACKING_REQUEST and of tracking-features.txt's words. FACE_VISUAL and FACE_AUDIO
++ * are words of the file only: a TRACKING_REQUEST never carries them. HAND_INTERACTION is a bit
++ * of TRACKING_REQUEST only. */
+ enum {
+     BASALT_TRACKING_HANDS = 1,
+     BASALT_TRACKING_BODY = 2,
+@@ -169,6 +185,8 @@ enum {
+     BASALT_TRACKING_EYES = 16,
+     BASALT_TRACKING_FACE_VISUAL = 32,
+     BASALT_TRACKING_FACE_AUDIO = 64,
++    /* A bit of TRACKING_REQUEST only: the game has bindings for the hand interaction profile */
++    BASALT_TRACKING_HAND_INTERACTION = 128,
+ };
+ 
+ enum {
+diff --git c/runtime/pe/control.cpp w/runtime/pe/control.cpp
+index 8b06a75..76cb3ec 100644
+--- c/runtime/pe/control.cpp
++++ w/runtime/pe/control.cpp
+@@ -114,6 +114,13 @@ constexpr size_t kBodyHeaderLength = 8 + 4 + 4 + 4 + 13 * sizeof(float);
+ constexpr size_t kFacePayloadLength =
+     8 + 4 + (basalt::kTrackedFaceConfidences + basalt::kTrackedFaceWeights) * sizeof(float);
+ constexpr size_t kEyeGazePayloadLength = 8 + 4 + 7 * sizeof(float);
++// cranvr: XR_EXT_hand_interaction: three values and four poses with their velocities
++constexpr size_t kHandInteractionInactivePayloadLength = 16;
++constexpr size_t kHandInteractionActivePayloadLength =
++    16 + basalt::kHandGestureCount * sizeof(float) + basalt::kHandPoseCount * 13 * sizeof(float);
++// cranvr: how far ahead of a controller's aim pose its pinch and poke poses lie, in meters
++constexpr float kControllerPinchAhead = 0.03f;
++constexpr float kControllerPokeAhead = 0.04f;
+ constexpr XrDuration kTrackedPoseFreshness = 500'000'000;
+ constexpr XrDuration kExtrapolationLimit = 50'000'000;
+ 
+@@ -162,6 +169,17 @@ struct EyeGazeRecord {
+     XrPosef pose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+ };
+ 
++// cranvr: XR_EXT_hand_interaction as cranvr-host made it from one hand's joints
++struct HandInteractionRecord {
++    bool active = false;
++    uint64_t questTimestamp = 0;
++    XrTime arrival = 0;
++    // bit 1 pinch ready, bit 2 aim_activate ready, bit 3 grasp ready
++    uint32_t flags = 0;
++    float values[basalt::kHandGestureCount]{};
++    TrackedRootRecord poses[basalt::kHandPoseCount];
++};
++
+ // gControlLock guards every field below. gSendLock keeps complete framed
+ // messages atomic across the frame waiter, teardown path, and request path.
+ // gRequestLock permits only one ACK-requiring request at a time while the
+@@ -209,6 +227,7 @@ HandRecord gHands[2]{};
+ BodyRecord gBody{};
+ FaceRecord gFace{};
+ EyeGazeRecord gEyeGaze{};
++HandInteractionRecord gHandInteractions[2]{};
+ bool gViewConfigValid = false;
+ float gViewConfigIpdMeters = 0.0f;
+ XrFovf gViewConfigFov[2]{};
+@@ -241,6 +260,8 @@ void resetTrackedLocked() {
+     gBody = {};
+     gFace = {};
+     gEyeGaze = {};
++    gHandInteractions[0] = {};
++    gHandInteractions[1] = {};
+ }
+ 
+ void resetInputsLocked() {
+@@ -958,6 +979,47 @@ bool parseEyeGaze(const uint8_t* payload, size_t payloadLength) {
+     return true;
+ }
+ 
++// cranvr: XR_EXT_hand_interaction for one hand (BASALT_MSG_HAND_INTERACTION)
++bool parseHandInteraction(const uint8_t* payload, size_t payloadLength) {
++    if (payloadLength < kHandInteractionInactivePayloadLength) {
++        return false;
++    }
++    PayloadReader reader(payload, payloadLength);
++    const uint64_t timestamp = reader.u64();
++    const uint32_t hand = reader.u32();
++    const uint32_t flags = reader.u32();
++    const bool tracked = (flags & 1u) != 0;
++    if (hand > 1 || (flags & ~15u) != 0 ||
++        payloadLength != (tracked ? kHandInteractionActivePayloadLength : kHandInteractionInactivePayloadLength)) {
++        return false;
++    }
++    HandInteractionRecord next{};
++    if (tracked) {
++        for (float& value : next.values) {
++            value = reader.f32();
++            if (!reader.ok() || !std::isfinite(value)) {
++                return false;
++            }
++            value = value < 0.0f ? 0.0f : (value > 1.0f ? 1.0f : value);
++        }
++        for (TrackedRootRecord& pose : next.poses) {
++            if (!readRoot(reader, &pose)) {
++                return false;
++            }
++        }
++    }
++    HandInteractionRecord& record = gHandInteractions[hand];
++    if (timestamp < record.questTimestamp || !gLocalOriginValid) {
++        return true;
++    }
++    record = next;
++    record.active = tracked;
++    record.flags = tracked ? flags : 0;
++    record.questTimestamp = timestamp;
++    record.arrival = monotonicTime();
++    return true;
++}
++
+ void markReceiverFailedLocked() {
+     gReceiverFailed = true;
+     gHeadPoseValid = false;
+@@ -1019,6 +1081,8 @@ DWORD WINAPI receiverThreadProc(LPVOID) {
+             accepted = parseFaceTracking(payload, payloadLength);
+         } else if (type == BASALT_MSG_EYE_GAZE) {
+             accepted = parseEyeGaze(payload, payloadLength);
++        } else if (type == BASALT_MSG_HAND_INTERACTION) {
++            accepted = parseHandInteraction(payload, payloadLength);
+         } else if (type == BASALT_MSG_FRAME_CONSUMED && payloadLength == 8) {
+             uint64_t frameNumber = 0;
+             std::memcpy(&frameNumber, payload, sizeof(frameNumber));
+@@ -1711,6 +1775,13 @@ bool controlHeadPose(
+     return fresh;
+ }
+ 
++namespace {
++// cranvr: defined with the tracking helpers below
++ControlControllerState aheadOfAim(const ControlControllerState& aim, float meters);
++void fillHandInteractionsLocked(
++    ControlInputSnapshot* snapshot, const XrPosef& localFromQuest, XrTime locateTime, XrTime now);
++}  // namespace
++
+ bool controlInputSnapshot(
+     XrSession session,
+     ControlInputSnapshot* snapshot,
+@@ -1747,7 +1818,10 @@ bool controlInputSnapshot(
+                 aimDestination.angularVelocity = quaternionRotate(
+                     localFromQuest.orientation, source.rawAimAngularVelocity);
+             }
++            snapshot->pinchControllers[hand] = aheadOfAim(aimDestination, kControllerPinchAhead);
++            snapshot->pokeControllers[hand] = aheadOfAim(aimDestination, kControllerPokeAhead);
+         }
++        fillHandInteractionsLocked(snapshot, localFromQuest, locateTime, now);
+         snapshot->eyeGaze.active = trackedFresh(gEyeGaze.active, gEyeGaze.arrival, now);
+         snapshot->eyeGaze.poseInLocal = poseCompose(localFromQuest, gEyeGaze.pose);
+         for (const ButtonInputRecord& source : gButtonInputs) {
+@@ -2083,6 +2157,52 @@ ControlTrackedJoint trackedJointInLocal(
+     return out;
+ }
+ 
++
++// cranvr: a pose `meters` ahead of a controller's aim pose, along its -Z, with the
++// velocity of that point of the controller.
++ControlControllerState aheadOfAim(const ControlControllerState& aim, float meters) {
++    ControlControllerState out = aim;
++    const XrVector3f offset = quaternionRotate(aim.poseInLocal.orientation, {0.0f, 0.0f, -meters});
++    out.poseInLocal.position = vectorSum(aim.poseInLocal.position, offset);
++    out.linearVelocity = vectorSum(aim.linearVelocity, vectorCrossProduct(aim.angularVelocity, offset));
++    return out;
++}
++
++// cranvr: XR_EXT_hand_interaction of both hands in LOCAL. Each pose moves forward by
++// its own velocity from the sample's arrival to `locateTime`, as the joints of a hand do.
++void fillHandInteractionsLocked(
++    ControlInputSnapshot* snapshot, const XrPosef& localFromQuest, XrTime locateTime, XrTime now) {
++    for (uint32_t hand = 0; hand < 2; ++hand) {
++        const HandInteractionRecord& record = gHandInteractions[hand];
++        ControlHandInteractionState& state = snapshot->handInteractions[hand];
++        state = {};
++        // These poses are the game's controllers, so they keep the controllers' freshness (patch
++        // 0011). The host says at once when a hand is lost or the headset's app pauses, and an
++        // INPUT_RESET clears them, so the limit only catches a link that died.
++        state.active = record.active && arrivedWithin(record.arrival, now, kControllerPoseFreshness);
++        if (!state.active) {
++            continue;
++        }
++        const float seconds = extrapolationSeconds(record.arrival, locateTime);
++        for (uint32_t gesture = 0; gesture < kHandGestureCount; ++gesture) {
++            state.ready[gesture] = (record.flags & (2u << gesture)) != 0;
++            // The extension's rule: a gesture that is not ready has the value 0
++            state.values[gesture] = state.ready[gesture] ? record.values[gesture] : 0.0f;
++        }
++        for (uint32_t pose = 0; pose < kHandPoseCount; ++pose) {
++            const TrackedRootRecord& motion = record.poses[pose];
++            const ControlTrackedJoint moved =
++                trackedJointInLocal(TrackedJointRecord{15, motion.pose}, motion, localFromQuest, seconds);
++            ControlControllerState& out = state.poses[pose];
++            out.poseActive = true;
++            out.profileActive = true;
++            out.questTimestampNanoseconds = record.questTimestamp;
++            out.poseInLocal = moved.pose;
++            out.linearVelocity = moved.linearVelocity;
++            out.angularVelocity = moved.angularVelocity;
++        }
++    }
++}
+ }  // namespace
+ 
+ void controlRequestTracking(XrSession session, uint32_t features) {
+diff --git c/runtime/pe/control.hpp w/runtime/pe/control.hpp
+index 41ace48..f0201d3 100644
+--- c/runtime/pe/control.hpp
++++ w/runtime/pe/control.hpp
+@@ -99,6 +99,35 @@ struct ControlEyeGazeState {
+     XrPosef poseInLocal;
+ };
+ 
++// cranvr: the four action poses of XR_EXT_hand_interaction, in the order of the
++// HAND_INTERACTION message.
++enum ControlHandPose : uint32_t {
++    kHandPoseGrip = 0,
++    kHandPoseAim = 1,
++    kHandPosePinch = 2,
++    kHandPosePoke = 3,
++};
++constexpr uint32_t kHandPoseCount = 4;
++
++// cranvr: the three gestures of XR_EXT_hand_interaction, in the order of the
++// HAND_INTERACTION message.
++enum ControlHandGesture : uint32_t {
++    kGesturePinch = 0,
++    kGestureAimActivate = 1,
++    kGestureGrasp = 2,
++};
++constexpr uint32_t kHandGestureCount = 3;
++
++// cranvr: what cranvr-host made of a tracked hand for XR_EXT_hand_interaction. A
++// gesture's value is 0 while the gesture is not ready. Each pose's poseActive is
++// `active`.
++struct ControlHandInteractionState {
++    bool active;
++    bool ready[kHandGestureCount];
++    float values[kHandGestureCount];
++    ControlControllerState poses[kHandPoseCount];
++};
++
+ struct ControlInputSnapshot {
+     ControlControllerState controllers[2];
+     ControlEyeGazeState eyeGaze;
+@@ -106,15 +135,46 @@ struct ControlInputSnapshot {
+     // of the grip pose's. Equal to `controllers` for a hand whose daemon sent no
+     // aim pose, so an aim action space then lies at the grip pose.
+     ControlControllerState aimControllers[2];
++    // cranvr: XR_EXT_hand_interaction's pinch and poke poses of each controller:
++    // fixed points ahead of its aim pose, with the aim pose's orientation.
++    ControlControllerState pinchControllers[2];
++    ControlControllerState pokeControllers[2];
++    // cranvr: XR_EXT_hand_interaction for a tracked hand
++    ControlHandInteractionState handInteractions[2];
+     uint32_t buttonCount;
+     ControlButtonState buttons[kControlButtonCapacity];
+ };
+ 
+-// cranvr: the state that an action space reads: the aim pose for an
+-// /input/aim/pose binding, the grip pose for a /input/grip/pose binding.
+-inline const ControlControllerState& controlControllerFor(
+-    const ControlInputSnapshot& snapshot, uint32_t hand, bool aim) {
+-    return aim ? snapshot.aimControllers[hand] : snapshot.controllers[hand];
++// cranvr: where the pose of a pose action comes from. Hand 2 is the eyes' gaze
++// (XR_EXT_eye_gaze_interaction), which has a state of its own.
++struct ControlPoseSource {
++    uint32_t hand;
++    ControlHandPose pose;
++    // The pose comes from the tracked hand (XR_EXT_hand_interaction), not from a controller
++    bool trackedHand;
++};
++
++inline bool operator==(const ControlPoseSource& a, const ControlPoseSource& b) {
++    return a.hand == b.hand && a.pose == b.pose && a.trackedHand == b.trackedHand;
++}
++
++// cranvr: the state that an action space of a hand reads.
++inline const ControlControllerState& controlPoseFor(
++    const ControlInputSnapshot& snapshot, const ControlPoseSource& source) {
++    if (source.trackedHand) {
++        return snapshot.handInteractions[source.hand].poses[source.pose];
++    }
++    switch (source.pose) {
++    case kHandPoseAim:
++        return snapshot.aimControllers[source.hand];
++    case kHandPosePinch:
++        return snapshot.pinchControllers[source.hand];
++    case kHandPosePoke:
++        return snapshot.pokeControllers[source.hand];
++    case kHandPoseGrip:
++    default:
++        return snapshot.controllers[source.hand];
++    }
+ }
+ 
+ // Returns the latest calibrated Quest eye geometry. False means the daemon
+diff --git c/runtime/pe/input.cpp w/runtime/pe/input.cpp
+index 20f363e..06c5d53 100644
+--- c/runtime/pe/input.cpp
++++ w/runtime/pe/input.cpp
+@@ -49,6 +49,9 @@ constexpr const char* kGamepadUser[] = {"/user/gamepad"};
+ // cranvr: XR_EXT_eye_gaze_interaction
+ constexpr const char* kEyesUser[] = {"/user/eyes_ext"};
+ constexpr const char* kEyeGazeProfilePath = "/interaction_profiles/ext/eye_gaze_interaction";
++// cranvr: XR_EXT_hand_interaction
++constexpr const char* kHandInteractionProfilePath = "/interaction_profiles/ext/hand_interaction_ext";
++constexpr const char* kTouchProfilePath = "/interaction_profiles/oculus/touch_controller";
+ 
+ #define PROFILE_COMPONENT(path, type) {path, type, 0}
+ constexpr ProfileComponentDefinition kSimpleComponents[] = {
+@@ -199,6 +202,24 @@ constexpr ProfileComponentDefinition kIndexComponents[] = {
+ constexpr ProfileComponentDefinition kEyeGazeComponents[] = {
+     PROFILE_COMPONENT("/input/gaze_ext/pose", XR_ACTION_TYPE_POSE_INPUT),
+ };
++// cranvr: the paths of the hand interaction profile, as XR_EXT_hand_interaction lists them
++constexpr ProfileComponentDefinition kHandInteractionComponents[] = {
++    PROFILE_COMPONENT("/input/aim/pose", XR_ACTION_TYPE_POSE_INPUT),
++    PROFILE_COMPONENT("/input/grip/pose", XR_ACTION_TYPE_POSE_INPUT),
++    PROFILE_COMPONENT("/input/pinch_ext/pose", XR_ACTION_TYPE_POSE_INPUT),
++    PROFILE_COMPONENT("/input/poke_ext/pose", XR_ACTION_TYPE_POSE_INPUT),
++    PROFILE_COMPONENT("/input/pinch_ext/value", XR_ACTION_TYPE_FLOAT_INPUT),
++    PROFILE_COMPONENT("/input/pinch_ext/ready_ext", XR_ACTION_TYPE_BOOLEAN_INPUT),
++    PROFILE_COMPONENT("/input/aim_activate_ext/value", XR_ACTION_TYPE_FLOAT_INPUT),
++    PROFILE_COMPONENT("/input/aim_activate_ext/ready_ext", XR_ACTION_TYPE_BOOLEAN_INPUT),
++    PROFILE_COMPONENT("/input/grasp_ext/value", XR_ACTION_TYPE_FLOAT_INPUT),
++    PROFILE_COMPONENT("/input/grasp_ext/ready_ext", XR_ACTION_TYPE_BOOLEAN_INPUT),
++};
++// cranvr: with XR_EXT_hand_interaction enabled, every profile of the hands has these poses too
++constexpr const char* kHandInteractionPoseSubpaths[] = {
++    "/input/pinch_ext/pose",
++    "/input/poke_ext/pose",
++};
+ #undef PROFILE_COMPONENT
+ 
+ #define PROFILE(path, title, users, components) \
+@@ -224,6 +245,8 @@ constexpr InteractionProfileDefinition kInteractionProfiles[] = {
+             kHandUsers, kIndexComponents),
+     PROFILE("/interaction_profiles/ext/eye_gaze_interaction", "EXT Eye Gaze Interaction",
+             kEyesUser, kEyeGazeComponents),
++    PROFILE("/interaction_profiles/ext/hand_interaction_ext", "EXT Hand Interaction",
++            kHandUsers, kHandInteractionComponents),
+ };
+ #undef PROFILE
+ 
+@@ -247,6 +270,18 @@ enum class BindingKind : uint32_t {
+     kAimPose,
+     kHaptic,
+     kEyeGazePose,
++    // cranvr: XR_EXT_hand_interaction
++    kPinchPose,
++    kPokePose,
++};
++
++// cranvr: which device a hand's current interaction profile reads. The hand interaction profile
++// reads a tracked hand, or a controller that the extension asks a runtime to map onto it.
++enum class HandCurrent : uint32_t {
++    kNone,
++    kTouch,
++    kHandFromController,
++    kHandFromTrackedHand,
+ };
+ 
+ struct SyncedActionState {
+@@ -260,6 +295,8 @@ struct SyncedActionState {
+     XrTime lastChangeTime = 0;
+     uint32_t poseHand = UINT32_MAX;
+     BindingKind poseKind = BindingKind::kUnknown;
++    // cranvr: the pose comes from the tracked hand (XR_EXT_hand_interaction)
++    bool poseFromTrackedHand = false;
+     // cranvr: how often the log told that the action became active and changed (see logActionState)
+     bool loggedActive = false;
+     uint8_t loggedChanges = 0;
+@@ -287,6 +324,8 @@ struct TouchBindingRecord {
+     uint64_t inputIdY = 0;
+     uint32_t sourceGroup = 0;
+     bool enabledAfterSync = false;
++    // cranvr: the binding belongs to the hand interaction profile, not to the Touch controller
++    bool handProfile = false;
+ };
+ 
+ struct TouchSourceDefinition {
+@@ -313,6 +352,12 @@ enum TouchSourceGroup : uint32_t {
+     kSourceGrip,
+     kSourceAim,
+     kSourceHaptic,
++    // cranvr: XR_EXT_hand_interaction
++    kSourcePinchPose,
++    kSourcePokePose,
++    kSourcePinch,
++    kSourceAimActivate,
++    kSourceGrasp,
+ };
+ 
+ constexpr TouchSourceDefinition kTouchSources[] = {
+@@ -350,8 +395,46 @@ constexpr TouchSourceDefinition kTouchSources[] = {
+     {"/user/hand/right/input/aim/pose", 1, BindingKind::kAimPose, 0, 0, kSourceAim, "Aim Pose"},
+     {"/user/hand/left/output/haptic", 0, BindingKind::kHaptic, 0, 0, kSourceHaptic, "Haptic"},
+     {"/user/hand/right/output/haptic", 1, BindingKind::kHaptic, 0, 0, kSourceHaptic, "Haptic"},
++    // cranvr: only with XR_EXT_hand_interaction enabled (profileAllowsBinding)
++    {"/user/hand/left/input/pinch_ext/pose", 0, BindingKind::kPinchPose, 0, 0, kSourcePinchPose, "Pinch Pose"},
++    {"/user/hand/right/input/pinch_ext/pose", 1, BindingKind::kPinchPose, 0, 0, kSourcePinchPose, "Pinch Pose"},
++    {"/user/hand/left/input/poke_ext/pose", 0, BindingKind::kPokePose, 0, 0, kSourcePokePose, "Poke Pose"},
++    {"/user/hand/right/input/poke_ext/pose", 1, BindingKind::kPokePose, 0, 0, kSourcePokePose, "Poke Pose"},
+ };
+ 
++// cranvr: the sources of the hand interaction profile. inputIdX holds the gesture
++// (basalt::ControlHandGesture) of a value or a ready path.
++constexpr TouchSourceDefinition kHandSources[] = {
++    {"/user/hand/left/input/aim/pose", 0, BindingKind::kAimPose, 0, 0, kSourceAim, "Aim Pose"},
++    {"/user/hand/right/input/aim/pose", 1, BindingKind::kAimPose, 0, 0, kSourceAim, "Aim Pose"},
++    {"/user/hand/left/input/grip/pose", 0, BindingKind::kGripPose, 0, 0, kSourceGrip, "Grip Pose"},
++    {"/user/hand/right/input/grip/pose", 1, BindingKind::kGripPose, 0, 0, kSourceGrip, "Grip Pose"},
++    {"/user/hand/left/input/pinch_ext/pose", 0, BindingKind::kPinchPose, 0, 0, kSourcePinchPose, "Pinch Pose"},
++    {"/user/hand/right/input/pinch_ext/pose", 1, BindingKind::kPinchPose, 0, 0, kSourcePinchPose, "Pinch Pose"},
++    {"/user/hand/left/input/poke_ext/pose", 0, BindingKind::kPokePose, 0, 0, kSourcePokePose, "Poke Pose"},
++    {"/user/hand/right/input/poke_ext/pose", 1, BindingKind::kPokePose, 0, 0, kSourcePokePose, "Poke Pose"},
++    {"/user/hand/left/input/pinch_ext/value", 0, BindingKind::kScalar, basalt::kGesturePinch, 0, kSourcePinch, "Pinch"},
++    {"/user/hand/right/input/pinch_ext/value", 1, BindingKind::kScalar, basalt::kGesturePinch, 0, kSourcePinch, "Pinch"},
++    {"/user/hand/left/input/pinch_ext/ready_ext", 0, BindingKind::kBinary, basalt::kGesturePinch, 0, kSourcePinch, "Pinch"},
++    {"/user/hand/right/input/pinch_ext/ready_ext", 1, BindingKind::kBinary, basalt::kGesturePinch, 0, kSourcePinch, "Pinch"},
++    {"/user/hand/left/input/aim_activate_ext/value", 0, BindingKind::kScalar, basalt::kGestureAimActivate, 0, kSourceAimActivate, "Aim Activate"},
++    {"/user/hand/right/input/aim_activate_ext/value", 1, BindingKind::kScalar, basalt::kGestureAimActivate, 0, kSourceAimActivate, "Aim Activate"},
++    {"/user/hand/left/input/aim_activate_ext/ready_ext", 0, BindingKind::kBinary, basalt::kGestureAimActivate, 0, kSourceAimActivate, "Aim Activate"},
++    {"/user/hand/right/input/aim_activate_ext/ready_ext", 1, BindingKind::kBinary, basalt::kGestureAimActivate, 0, kSourceAimActivate, "Aim Activate"},
++    {"/user/hand/left/input/grasp_ext/value", 0, BindingKind::kScalar, basalt::kGestureGrasp, 0, kSourceGrasp, "Grasp"},
++    {"/user/hand/right/input/grasp_ext/value", 1, BindingKind::kScalar, basalt::kGestureGrasp, 0, kSourceGrasp, "Grasp"},
++    {"/user/hand/left/input/grasp_ext/ready_ext", 0, BindingKind::kBinary, basalt::kGestureGrasp, 0, kSourceGrasp, "Grasp"},
++    {"/user/hand/right/input/grasp_ext/ready_ext", 1, BindingKind::kBinary, basalt::kGestureGrasp, 0, kSourceGrasp, "Grasp"},
++};
++
++// cranvr: the Touch inputs that a controller maps onto the hand interaction profile: the trigger
++// is the pinch and the aim activation, the squeeze is the grasp. Left hand first.
++constexpr uint64_t kTriggerValueIds[2] = {0x0b66bbe3dc2dc49fULL, 0xede7e982d5eedf21ULL};
++constexpr uint64_t kSqueezeValueIds[2] = {0x01f1b9c689804b82ULL, 0xdd5935cc005136f1ULL};
++// cranvr: a pinch or a grasp of a hand is a press at this value, and stays one down to the lower value
++constexpr float kHandPressValue = 0.6f;
++constexpr float kHandReleaseValue = 0.4f;
++
+ SRWLOCK gInputLock = SRWLOCK_INIT;
+ uintptr_t gNextActionSetHandle = kFirstActionSetHandle;
+ uintptr_t gNextActionHandle = kFirstActionHandle;
+@@ -360,6 +443,10 @@ std::array<ActionRecord, kMaxActions> gActions{};
+ std::array<TouchBindingRecord, kMaxTouchBindings> gTouchBindings{};
+ size_t gTouchBindingCount = 0;
+ XrPath gTouchProfilePath = XR_NULL_PATH;
++// cranvr: XR_EXT_hand_interaction: the profile's path once the game suggested bindings for it,
++// and what each hand's current profile reads
++XrPath gHandProfilePath = XR_NULL_PATH;
++HandCurrent gHandCurrent[2]{};
+ XrPath gCurrentInteractionProfiles[2]{};
+ XrSession gAttachedSession = XR_NULL_HANDLE;
+ 
+@@ -393,6 +480,15 @@ const TouchSourceDefinition* findTouchSource(XrPath path) {
+     return nullptr;
+ }
+ 
++const TouchSourceDefinition* findHandSource(XrPath path) {
++    for (const TouchSourceDefinition& source : kHandSources) {
++        if (basalt::pathStringEquals(path, source.path)) {
++            return &source;
++        }
++    }
++    return nullptr;
++}
++
+ const InteractionProfileDefinition* findInteractionProfile(XrPath path) {
+     for (const InteractionProfileDefinition& profile : kInteractionProfiles) {
+         if (basalt::pathStringEquals(path, profile.path)) {
+@@ -404,8 +500,22 @@ const InteractionProfileDefinition* findInteractionProfile(XrPath path) {
+ 
+ bool profileAllowsBinding(
+     const InteractionProfileDefinition& profile,
+-    XrPath bindingPath) {
++    XrPath bindingPath,
++    bool handInteraction) {
+     char fullPath[XR_MAX_PATH_LENGTH]{};
++    // cranvr: XR_EXT_hand_interaction adds the pinch and the poke pose to every profile of the hands
++    if (handInteraction && profile.userPaths == kHandUsers) {
++        for (size_t userIndex = 0; userIndex < profile.userPathCount; ++userIndex) {
++            for (const char* subpath : kHandInteractionPoseSubpaths) {
++                const int length = std::snprintf(
++                    fullPath, sizeof(fullPath), "%s%s", profile.userPaths[userIndex], subpath);
++                if (length > 0 && static_cast<size_t>(length) < sizeof(fullPath) &&
++                    basalt::pathStringEquals(bindingPath, fullPath)) {
++                    return true;
++                }
++            }
++        }
++    }
+     for (size_t userIndex = 0; userIndex < profile.userPathCount; ++userIndex) {
+         for (size_t componentIndex = 0;
+              componentIndex < profile.componentCount;
+@@ -595,7 +705,8 @@ bool bindingCompatible(XrActionType actionType, BindingKind kind) {
+     case XR_ACTION_TYPE_VECTOR2F_INPUT:
+         return kind == BindingKind::kVector2;
+     case XR_ACTION_TYPE_POSE_INPUT:
+-        return kind == BindingKind::kGripPose || kind == BindingKind::kAimPose;
++        return kind == BindingKind::kGripPose || kind == BindingKind::kAimPose ||
++               kind == BindingKind::kPinchPose || kind == BindingKind::kPokePose;
+     case XR_ACTION_TYPE_VIBRATION_OUTPUT:
+         return kind == BindingKind::kHaptic;
+     default:
+@@ -637,6 +748,7 @@ void resolveBindingPrioritiesLocked() {
+             const TouchBindingRecord& other = gTouchBindings[otherIndex];
+             if (other.hand != binding.hand ||
+                 other.sourceGroup != binding.sourceGroup ||
++                other.handProfile != binding.handProfile ||
+                 !bindingSelectedLocked(other)) {
+                 continue;
+             }
+@@ -649,6 +761,31 @@ void resolveBindingPrioritiesLocked() {
+     }
+ }
+ 
++// cranvr: whether a binding belongs to its hand's current interaction profile
++bool bindingCurrentLocked(const TouchBindingRecord& binding) {
++    if (binding.hand >= 2) {
++        return false;
++    }
++    const HandCurrent current = gHandCurrent[binding.hand];
++    return binding.handProfile
++               ? current == HandCurrent::kHandFromController || current == HandCurrent::kHandFromTrackedHand
++               : current == HandCurrent::kTouch;
++}
++
++// cranvr: the pose that a pose binding reads
++basalt::ControlHandPose handPoseOf(BindingKind kind) {
++    switch (kind) {
++    case BindingKind::kAimPose:
++        return basalt::kHandPoseAim;
++    case BindingKind::kPinchPose:
++        return basalt::kHandPosePinch;
++    case BindingKind::kPokePose:
++        return basalt::kHandPosePoke;
++    default:
++        return basalt::kHandPoseGrip;
++    }
++}
++
+ // cranvr: the game's log (stderr, which the cranvr app keeps as the game's log) tells what reached the
+ // game: the first time that each action of each hand is active and its first two changes. A game
+ // that binds no action, or binds one that no controller input reaches, shows nothing here. The
+@@ -705,6 +842,7 @@ void syncOneState(
+     state.vectorValue = {0.0f, 0.0f};
+     state.poseHand = UINT32_MAX;
+     state.poseKind = BindingKind::kUnknown;
++    state.poseFromTrackedHand = false;
+     if (!selected || !focused) {
+         state.lastChangeTime = 0;
+         return;
+@@ -712,6 +850,8 @@ void syncOneState(
+ 
+     bool resolved = false;
+     XrTime physicalChangeTime = state.lastChangeTime;
++    // cranvr: a value of a tracked hand, which has no time of change of its own
++    bool computedValue = false;
+     for (size_t index = 0; index < gTouchBindingCount; ++index) {
+         const TouchBindingRecord& binding = gTouchBindings[index];
+         if (!binding.enabledAfterSync || binding.action != action.handle ||
+@@ -723,25 +863,72 @@ void syncOneState(
+         }
+         const basalt::ControlControllerState& controller =
+             snapshot.controllers[binding.hand];
+-        if (!controller.profileActive || controller.profileId != kQuestTouchProfileId) {
++        // cranvr: a binding counts while its profile is the current profile of its hand, which
++        // xrSyncActions picks from what the user holds (a Touch binding needs a Touch controller)
++        if (!bindingCurrentLocked(binding)) {
+             continue;
+         }
++        const bool fromTrackedHand =
++            binding.handProfile && gHandCurrent[binding.hand] == HandCurrent::kHandFromTrackedHand;
++        const basalt::ControlHandInteractionState& handState = snapshot.handInteractions[binding.hand];
++        const bool sourceActive = fromTrackedHand ? handState.active : controller.poseActive;
+ 
+         if (action.actionType == XR_ACTION_TYPE_POSE_INPUT) {
+             // Aggregate actions choose the first currently tracked source.
+             // A profile-only stale left hand must not mask a live right hand.
+-            if (controller.poseActive && !state.isActive) {
++            if (sourceActive && !state.isActive) {
+                 state.poseHand = binding.hand;
+                 state.poseKind = binding.kind;
++                state.poseFromTrackedHand = fromTrackedHand;
+             }
+             resolved = true;
+-            state.isActive = state.isActive || controller.poseActive;
++            state.isActive = state.isActive || sourceActive;
+             continue;
+         }
+ 
+         // ALVR button/profile state is retained, but it is only actionable
+         // while the corresponding controller motion remains fresh.
+-        if (!controller.poseActive) {
++        if (!sourceActive) {
++            continue;
++        }
++
++        // cranvr: a value or a ready path of the hand interaction profile. A tracked hand gives
++        // the values that cranvr-host made of its fingers. A controller gives its trigger for the
++        // pinch and the aim activation and its squeeze for the grasp, and is always ready.
++        if (binding.handProfile) {
++            const uint32_t gesture = static_cast<uint32_t>(binding.inputIdX);
++            bool ready = true;
++            float value = 0.0f;
++            const basalt::ControlButtonState* button = nullptr;
++            if (fromTrackedHand) {
++                ready = handState.ready[gesture];
++                value = handState.values[gesture];
++            } else {
++                button = findButton(snapshot, gesture == basalt::kGestureGrasp
++                                                  ? kSqueezeValueIds[binding.hand]
++                                                  : kTriggerValueIds[binding.hand]);
++                value = button == nullptr ? 0.0f : button->value;
++            }
++            if (binding.kind == BindingKind::kBinary) {
++                value = ready ? 1.0f : 0.0f;
++            }
++            if (action.actionType == XR_ACTION_TYPE_BOOLEAN_INPUT) {
++                // A value presses with hysteresis, so a hand that shakes at the threshold does not flicker
++                const bool pressed = binding.kind == BindingKind::kBinary
++                                         ? ready
++                                         : value >= (oldBoolean ? kHandReleaseValue : kHandPressValue);
++                state.booleanValue = state.booleanValue || pressed;
++            } else if (action.actionType == XR_ACTION_TYPE_FLOAT_INPUT) {
++                if (!resolved || std::fabs(value) > std::fabs(state.floatValue)) {
++                    state.floatValue = value;
++                }
++            }
++            if (button != nullptr) {
++                physicalChangeTime = (std::max)(physicalChangeTime, button->lastChangeTime);
++            } else {
++                computedValue = true;
++            }
++            resolved = true;
+             continue;
+         }
+ 
+@@ -798,7 +985,7 @@ void syncOneState(
+         logActionState(action, state, "is active:", gActiveLogLines);
+     }
+     if (!wasActive) {
+-        state.lastChangeTime = physicalChangeTime;
++        state.lastChangeTime = computedValue ? inputTimeNow() : physicalChangeTime;
+         return;
+     }
+     switch (action.actionType) {
+@@ -816,7 +1003,7 @@ void syncOneState(
+         break;
+     }
+     if (state.changed) {
+-        state.lastChangeTime = physicalChangeTime > 0
++        state.lastChangeTime = physicalChangeTime > 0 && !computedValue
+             ? physicalChangeTime : inputTimeNow();
+         if (state.loggedChanges < 2 && requestedHand >= 0) {
+             ++state.loggedChanges;
+@@ -1078,6 +1265,14 @@ XrResult XRAPI_CALL suggestInteractionProfileBindings(
+     if (eyeGazeProfile && !isTrackingExtensionEnabled(kExtensionEyeGaze)) {
+         return XR_ERROR_PATH_UNSUPPORTED;
+     }
++    // cranvr: the hand interaction profile and the pinch and poke poses of every hand profile
++    // belong to XR_EXT_hand_interaction, which the game must have enabled
++    const bool handInteraction = isHandInteractionEnabled(instance);
++    const bool handProfile =
++        pathStringEquals(suggestedBindings->interactionProfile, kHandInteractionProfilePath);
++    if (handProfile && !handInteraction) {
++        return XR_ERROR_PATH_UNSUPPORTED;
++    }
+ 
+     AcquireSRWLockShared(&gInputLock);
+     XrResult result = XR_SUCCESS;
+@@ -1098,7 +1293,7 @@ XrResult XRAPI_CALL suggestInteractionProfileBindings(
+         }
+         if (!isKnownPath(binding.binding)) {
+             result = XR_ERROR_PATH_INVALID;
+-        } else if (!profileAllowsBinding(*profile, binding.binding)) {
++        } else if (!profileAllowsBinding(*profile, binding.binding, handInteraction)) {
+             result = XR_ERROR_PATH_UNSUPPORTED;
+         }
+     }
+@@ -1131,25 +1326,31 @@ XrResult XRAPI_CALL suggestInteractionProfileBindings(
+         ReleaseSRWLockExclusive(&gInputLock);
+         return result;
+     }
+-    if (XR_FAILED(result) ||
+-        !pathStringEquals(
+-            suggestedBindings->interactionProfile,
+-            "/interaction_profiles/oculus/touch_controller")) {
++    const bool touchProfile =
++        pathStringEquals(suggestedBindings->interactionProfile, kTouchProfilePath);
++    if (XR_FAILED(result) || (!touchProfile && !handProfile)) {
+         return result;
+     }
+     if (suggestedBindings->countSuggestedBindings > kMaxTouchBindings) {
+         return XR_ERROR_LIMIT_REACHED;
+     }
+ 
+-    std::array<TouchBindingRecord, kMaxTouchBindings> replacements{};
++    // cranvr: the Touch profile and the hand interaction profile keep their bindings in one
++    // table. A suggestion replaces the bindings of its own profile only. The two tables of the
++    // merge are too large for a game thread's stack; the lock guards them.
++    static std::array<TouchBindingRecord, kMaxTouchBindings> suggested{};
++    static std::array<TouchBindingRecord, kMaxTouchBindings> replacements{};
++    AcquireSRWLockExclusive(&gInputLock);
+     for (uint32_t index = 0; index < suggestedBindings->countSuggestedBindings; ++index) {
+         const XrActionSuggestedBinding& suggestion =
+             suggestedBindings->suggestedBindings[index];
+-        const TouchSourceDefinition* source = findTouchSource(suggestion.binding);
++        const TouchSourceDefinition* source = handProfile ? findHandSource(suggestion.binding)
++                                                          : findTouchSource(suggestion.binding);
+         if (source == nullptr) {
++            ReleaseSRWLockExclusive(&gInputLock);
+             return XR_ERROR_PATH_UNSUPPORTED;
+         }
+-        replacements[index] = {
++        suggested[index] = {
+             suggestion.action,
+             suggestion.binding,
+             source->hand,
+@@ -1158,12 +1359,12 @@ XrResult XRAPI_CALL suggestInteractionProfileBindings(
+             source->inputIdY,
+             source->sourceGroup,
+             false,
++            handProfile,
+         };
+     }
+ 
+-    AcquireSRWLockExclusive(&gInputLock);
+     for (uint32_t index = 0; index < suggestedBindings->countSuggestedBindings; ++index) {
+-        const ActionRecord* action = findActionLocked(replacements[index].action);
++        const ActionRecord* action = findActionLocked(suggested[index].action);
+         const ActionSetRecord* set =
+             action == nullptr ? nullptr : findActionSetLocked(action->actionSet);
+         if (action == nullptr || set == nullptr) {
+@@ -1175,10 +1376,28 @@ XrResult XRAPI_CALL suggestInteractionProfileBindings(
+             break;
+         }
+     }
++    size_t count = 0;
+     if (XR_SUCCEEDED(result)) {
++        for (size_t index = 0; index < gTouchBindingCount; ++index) {
++            if (gTouchBindings[index].handProfile != handProfile) {
++                replacements[count++] = gTouchBindings[index];
++            }
++        }
++        if (count + suggestedBindings->countSuggestedBindings > kMaxTouchBindings) {
++            result = XR_ERROR_LIMIT_REACHED;
++        }
++    }
++    if (XR_SUCCEEDED(result)) {
++        for (uint32_t index = 0; index < suggestedBindings->countSuggestedBindings; ++index) {
++            replacements[count++] = suggested[index];
++        }
+         gTouchBindings = replacements;
+-        gTouchBindingCount = suggestedBindings->countSuggestedBindings;
+-        gTouchProfilePath = suggestedBindings->interactionProfile;
++        gTouchBindingCount = count;
++        if (handProfile) {
++            gHandProfilePath = suggestedBindings->interactionProfile;
++        } else {
++            gTouchProfilePath = suggestedBindings->interactionProfile;
++        }
+     }
+     ReleaseSRWLockExclusive(&gInputLock);
+     return result;
+@@ -1243,30 +1462,47 @@ XrResult XRAPI_CALL attachSessionActionSets(
+         eyesBound = action != nullptr && findActionSetLocked(action->actionSet) != nullptr &&
+                     findActionSetLocked(action->actionSet)->attachedSession == session;
+     }
+-    // cranvr: what the game bound, for the game's log
++    // cranvr: what the game bound, for the game's log. An action with a binding for the hand
++    // interaction profile makes the host send the profile's values and poses of the hands.
+     uint32_t attachedActions = 0;
+     uint32_t boundActions = 0;
++    uint32_t handBoundActions = 0;
++    size_t touchBindings = 0;
++    for (size_t index = 0; index < gTouchBindingCount; ++index) {
++        touchBindings += gTouchBindings[index].handProfile ? 0 : 1;
++    }
+     for (const ActionRecord& action : gActions) {
+         const ActionSetRecord* set = action.handleAlive ? findActionSetLocked(action.actionSet) : nullptr;
+         if (set == nullptr || set->attachedSession != session) {
+             continue;
+         }
+         ++attachedActions;
++        bool touch = false;
++        bool hand = false;
+         for (size_t index = 0; index < gTouchBindingCount; ++index) {
+             if (gTouchBindings[index].action == action.handle) {
+-                ++boundActions;
+-                break;
++                (gTouchBindings[index].handProfile ? hand : touch) = true;
+             }
+         }
++        boundActions += touch ? 1 : 0;
++        handBoundActions += hand ? 1 : 0;
+     }
+     basalt::note(
+         "Basalt OpenXR: %u action sets with %u actions are attached; %u of the actions have a "
+         "binding for the Touch controllers (%zu bindings)\n",
+-        attachInfo->countActionSets, attachedActions, boundActions, gTouchBindingCount);
++        attachInfo->countActionSets, attachedActions, boundActions, touchBindings);
++    if (handBoundActions > 0) {
++        basalt::note(
++            "Basalt OpenXR: %u of the actions have a binding for the hand interaction profile (%zu bindings)\n",
++            handBoundActions, gTouchBindingCount - touchBindings);
++    }
+     ReleaseSRWLockExclusive(&gInputLock);
+     if (eyesBound) {
+         trackingEyeGazeBound(session, true);
+     }
++    if (handBoundActions > 0) {
++        trackingHandInteractionBound(session, true);
++    }
+     return XR_SUCCESS;
+ }
+ 
+@@ -1407,6 +1643,67 @@ XrResult XRAPI_CALL syncActions(
+         }
+     }
+ 
++    // cranvr: the current interaction profile of each hand, before the actions read it (the
++    // profile may change only in xrSyncActions). A tracked controller wins: the user holds it.
++    // A tracked hand without a tracked controller takes the hand interaction profile. While
++    // neither is tracked, the hand keeps its profile, so that a hand that leaves the cameras'
++    // view for a moment brings the game no change of profile. A game that bound only the Touch
++    // controller gets it exactly while the headset has a Touch controller on that side.
++    bool interactionProfileChanged = false;
++    for (uint32_t handIndex = 0; handIndex < 2; ++handIndex) {
++        const basalt::ControlControllerState& controller = snapshot.controllers[handIndex];
++        const bool controllerUsable =
++            controller.profileActive && controller.profileId == kQuestTouchProfileId;
++        const bool controllerTracked = controllerUsable && controller.poseActive;
++        const bool handTracked = snapshot.handInteractions[handIndex].active;
++        const bool touchBound = gTouchProfilePath != XR_NULL_PATH;
++        const bool handBound = gHandProfilePath != XR_NULL_PATH;
++        const HandCurrent last = gHandCurrent[handIndex];
++        HandCurrent next = HandCurrent::kNone;
++        if (controllerTracked && touchBound) {
++            next = HandCurrent::kTouch;
++        } else if (controllerTracked && handBound) {
++            next = HandCurrent::kHandFromController;
++        } else if (handTracked && handBound) {
++            next = HandCurrent::kHandFromTrackedHand;
++        } else if (last == HandCurrent::kTouch && touchBound && controllerUsable) {
++            next = HandCurrent::kTouch;
++        } else if (last == HandCurrent::kHandFromController && handBound && controllerUsable) {
++            next = HandCurrent::kHandFromController;
++        } else if (last == HandCurrent::kHandFromTrackedHand && handBound) {
++            next = HandCurrent::kHandFromTrackedHand;
++        } else if (touchBound && controllerUsable) {
++            next = HandCurrent::kTouch;
++        } else if (handBound && controllerUsable) {
++            next = HandCurrent::kHandFromController;
++        }
++        const XrPath nextProfile = next == HandCurrent::kTouch  ? gTouchProfilePath
++                                   : next == HandCurrent::kNone ? XR_NULL_PATH
++                                                                : gHandProfilePath;
++        interactionProfileChanged =
++            interactionProfileChanged || gCurrentInteractionProfiles[handIndex] != nextProfile;
++        if (next != last) {
++            // cranvr: the game's log tells when a controller or a hand joins or leaves
++            const char* side = handIndex == 0 ? "left" : "right";
++            switch (next) {
++            case HandCurrent::kTouch:
++                basalt::note("Basalt OpenXR: the %s controller is tracked and uses the Touch controller profile\n", side);
++                break;
++            case HandCurrent::kHandFromController:
++                basalt::note("Basalt OpenXR: the %s controller serves the hand interaction profile\n", side);
++                break;
++            case HandCurrent::kHandFromTrackedHand:
++                basalt::note("Basalt OpenXR: the %s hand is tracked and uses the hand interaction profile\n", side);
++                break;
++            case HandCurrent::kNone:
++                basalt::note("Basalt OpenXR: the %s controller is gone\n", side);
++                break;
++            }
++        }
++        gHandCurrent[handIndex] = next;
++        gCurrentInteractionProfiles[handIndex] = nextProfile;
++    }
++
+     resolveBindingPrioritiesLocked();
+ 
+     for (ActionRecord& action : gActions) {
+@@ -1424,24 +1721,9 @@ XrResult XRAPI_CALL syncActions(
+         syncEyeGaze(action, action.synced[0], snapshot, focused);
+         syncEyeGaze(action, action.synced[3], snapshot, focused);
+     }
+-    bool interactionProfileChanged = false;
+     for (uint32_t handIndex = 0; handIndex < 2; ++handIndex) {
+         const basalt::ControlControllerState& controller =
+             snapshot.controllers[handIndex];
+-        const XrPath nextProfile =
+-            gTouchProfilePath != XR_NULL_PATH && controller.profileActive &&
+-                    controller.profileId == kQuestTouchProfileId
+-                ? gTouchProfilePath
+-                : XR_NULL_PATH;
+-        if (gCurrentInteractionProfiles[handIndex] != nextProfile) {
+-            interactionProfileChanged = true;
+-            // cranvr: the game's log tells when a controller joins or leaves
+-            basalt::note(
+-                "Basalt OpenXR: the %s controller %s\n", handIndex == 0 ? "left" : "right",
+-                nextProfile != XR_NULL_PATH ? "is tracked and uses the Touch controller profile"
+-                                            : "is gone");
+-        }
+-        gCurrentInteractionProfiles[handIndex] = nextProfile;
+         // cranvr: the game's log tells when a controller's pose stops arriving or comes back. A pose that is
+         // not fresh makes the pose actions inactive, and a game then has no place for the controller.
+         static bool poseWasActive[2] = {false, false};
+@@ -1634,7 +1916,7 @@ XrResult XRAPI_CALL enumerateBoundSourcesForAction(
+                 const TouchBindingRecord& binding = gTouchBindings[index];
+                 if (!binding.enabledAfterSync || binding.action != action->handle ||
+                     !bindingCompatible(action->actionType, binding.kind) ||
+-                    gCurrentInteractionProfiles[binding.hand] == XR_NULL_PATH) {
++                    !bindingCurrentLocked(binding)) {
+                     continue;
+                 }
+                 bool duplicate = false;
+@@ -1695,24 +1977,29 @@ XrResult XRAPI_CALL getInputSourceLocalizedName(
+     if (!isKnownPath(getInfo->sourcePath)) {
+         return XR_ERROR_PATH_INVALID;
+     }
+-    const TouchSourceDefinition* source = findTouchSource(getInfo->sourcePath);
++    const TouchSourceDefinition* touchSource = findTouchSource(getInfo->sourcePath);
++    const TouchSourceDefinition* handSource = findHandSource(getInfo->sourcePath);
+ 
++    // cranvr: the source belongs to the profile of a current binding: the Touch controller's or
++    // the hand interaction profile's
+     AcquireSRWLockShared(&gInputLock);
+     const bool attached = gAttachedSession == session;
+     bool resolved = false;
+-    if (attached && source != nullptr &&
+-        gCurrentInteractionProfiles[source->hand] != XR_NULL_PATH) {
++    bool handProfile = false;
++    if (attached) {
+         for (size_t index = 0; index < gTouchBindingCount; ++index) {
+             const TouchBindingRecord& binding = gTouchBindings[index];
+-            if (binding.enabledAfterSync &&
+-                binding.sourcePath == getInfo->sourcePath &&
+-                binding.hand == source->hand) {
++            if (binding.enabledAfterSync && binding.sourcePath == getInfo->sourcePath &&
++                bindingCurrentLocked(binding) &&
++                (binding.handProfile ? handSource != nullptr : touchSource != nullptr)) {
+                 resolved = true;
++                handProfile = binding.handProfile;
+                 break;
+             }
+         }
+     }
+     ReleaseSRWLockShared(&gInputLock);
++    const TouchSourceDefinition* source = handProfile ? handSource : touchSource;
+     if (!attached) {
+         return XR_ERROR_ACTIONSET_NOT_ATTACHED;
+     }
+@@ -1729,7 +2016,7 @@ XrResult XRAPI_CALL getInputSourceLocalizedName(
+     }
+     if ((getInfo->whichComponents &
+          XR_INPUT_SOURCE_LOCALIZED_NAME_INTERACTION_PROFILE_BIT) != 0) {
+-        parts[partCount++] = "Oculus Touch Controller";
++        parts[partCount++] = handProfile ? "Hand Interaction" : "Oculus Touch Controller";
+     }
+     if ((getInfo->whichComponents &
+          XR_INPUT_SOURCE_LOCALIZED_NAME_COMPONENT_BIT) != 0) {
+@@ -1798,7 +2085,7 @@ XrResult XRAPI_CALL applyHapticFeedback(
+                 (requestedHand == -1 ||
+                  (requestedHand >= 0 &&
+                   binding.hand == static_cast<uint32_t>(requestedHand))) &&
+-                gCurrentInteractionProfiles[binding.hand] != XR_NULL_PATH &&
++                !binding.handProfile && bindingCurrentLocked(binding) &&
+                 input.controllers[binding.hand].profileActive &&
+                 input.controllers[binding.hand].profileId == kQuestTouchProfileId) {
+                 hands[binding.hand] = true;
+@@ -1855,7 +2142,7 @@ XrResult XRAPI_CALL stopHapticFeedback(
+                 (requestedHand == -1 ||
+                  (requestedHand >= 0 &&
+                   binding.hand == static_cast<uint32_t>(requestedHand))) &&
+-                gCurrentInteractionProfiles[binding.hand] != XR_NULL_PATH &&
++                !binding.handProfile && bindingCurrentLocked(binding) &&
+                 input.controllers[binding.hand].profileActive &&
+                 input.controllers[binding.hand].profileId == kQuestTouchProfileId) {
+                 hands[binding.hand] = true;
+@@ -1910,9 +2197,8 @@ bool getActionPoseSource(
+     XrSession session,
+     XrAction action,
+     XrPath subactionPath,
+-    uint32_t* hand,
+-    bool* aimPose) {
+-    if (hand == nullptr || aimPose == nullptr) {
++    ControlPoseSource* source) {
++    if (source == nullptr) {
+         return false;
+     }
+     AcquireSRWLockShared(&gInputLock);
+@@ -1924,12 +2210,11 @@ bool getActionPoseSource(
+         const SyncedActionState* state = stateForPath(mutableRecord, subactionPath);
+         if (set != nullptr && set->attachedSession == session && state != nullptr &&
+             state->selected && state->isActive &&
+-            ((state->poseHand < 2 &&
+-              (state->poseKind == BindingKind::kGripPose ||
+-               state->poseKind == BindingKind::kAimPose)) ||
++            ((state->poseHand < 2 && bindingCompatible(XR_ACTION_TYPE_POSE_INPUT, state->poseKind)) ||
+              (state->poseHand == 2 && state->poseKind == BindingKind::kEyeGazePose))) {
+-            *hand = state->poseHand;
+-            *aimPose = state->poseKind == BindingKind::kAimPose;
++            source->hand = state->poseHand;
++            source->pose = handPoseOf(state->poseKind);
++            source->trackedHand = state->poseHand < 2 && state->poseFromTrackedHand;
+             available = true;
+         }
+     }
+@@ -1941,10 +2226,10 @@ bool getActionPoseSource(
+     if (!basalt::controlInputSnapshot(session, &snapshot)) {
+         return false;
+     }
+-    if (*hand == 2) {
++    if (source->hand == 2) {
+         return snapshot.eyeGaze.active;
+     }
+-    return *hand < 2 && snapshot.controllers[*hand].poseActive;
++    return source->hand < 2 && controlPoseFor(snapshot, *source).poseActive;
+ }
+ 
+ void invalidateInputForSession(XrSession session) {
+@@ -1953,6 +2238,8 @@ void invalidateInputForSession(XrSession session) {
+         gAttachedSession = XR_NULL_HANDLE;
+         gCurrentInteractionProfiles[0] = XR_NULL_PATH;
+         gCurrentInteractionProfiles[1] = XR_NULL_PATH;
++        gHandCurrent[0] = HandCurrent::kNone;
++        gHandCurrent[1] = HandCurrent::kNone;
+         gCurrentEyeProfile = XR_NULL_PATH;
+     }
+     for (ActionSetRecord& record : gActionSets) {
+@@ -1973,6 +2260,9 @@ void invalidateInputForInstance(XrInstance instance) {
+     gAttachedSession = XR_NULL_HANDLE;
+     gTouchBindingCount = 0;
+     gTouchProfilePath = XR_NULL_PATH;
++    gHandProfilePath = XR_NULL_PATH;
++    gHandCurrent[0] = HandCurrent::kNone;
++    gHandCurrent[1] = HandCurrent::kNone;
+     gCurrentInteractionProfiles[0] = XR_NULL_PATH;
+     gCurrentInteractionProfiles[1] = XR_NULL_PATH;
+     gTouchBindings = {};
+diff --git c/runtime/pe/runtime.cpp w/runtime/pe/runtime.cpp
+index 49baa10..e947ac7 100644
+--- c/runtime/pe/runtime.cpp
++++ w/runtime/pe/runtime.cpp
+@@ -17,6 +17,7 @@ uintptr_t gNextInstanceHandle = kFirstInstanceHandle;
+ XrInstance gLiveInstance = XR_NULL_HANDLE;
+ bool gD3D11ExtensionEnabled = false;
+ bool gDisplayRefreshRateEnabled = false;
++bool gHandInteractionEnabled = false;
+ 
+ XrResult XRAPI_CALL basaltEnumerateInstanceExtensionProperties(
+     const char* layerName,
+@@ -37,7 +38,12 @@ XrResult XRAPI_CALL basaltEnumerateInstanceExtensionProperties(
+     // cranvr: XR_FB_display_refresh_rate tells a game the rate that cranvr-host runs at. It is offered
+     // with the graphics extension: a runtime that offers no graphics offers nothing (negotiation_smoke).
+     const uint32_t displayCount = d3d11Available ? 1u : 0u;
+-    const uint32_t total = (d3d11Available ? 1u : 0u) + trackingCount + displayCount;
++    // cranvr: XR_EXT_hand_interaction is served by a tracked hand and by a controller alike (the
++    // extension asks a runtime with controllers to map them), so it needs no headset feature. It
++    // comes with the graphics extension, as the refresh rate does.
++    const uint32_t handInteractionCount = d3d11Available ? 1u : 0u;
++    const uint32_t total =
++        (d3d11Available ? 1u : 0u) + trackingCount + displayCount + handInteractionCount;
+     *propertyCountOutput = total;
+     if (propertyCapacityInput == 0) {
+         return XR_SUCCESS;
+@@ -86,6 +92,15 @@ XrResult XRAPI_CALL basaltEnumerateInstanceExtensionProperties(
+         properties[next].extensionVersion = XR_FB_display_refresh_rate_SPEC_VERSION;
+         ++next;
+     }
++    if (handInteractionCount != 0) {
++        std::strncpy(
++            properties[next].extensionName,
++            XR_EXT_HAND_INTERACTION_EXTENSION_NAME,
++            XR_MAX_EXTENSION_NAME_SIZE - 1);
++        properties[next].extensionName[XR_MAX_EXTENSION_NAME_SIZE - 1] = '\0';
++        properties[next].extensionVersion = XR_EXT_hand_interaction_SPEC_VERSION;
++        ++next;
++    }
+     return XR_SUCCESS;
+ }
+ 
+@@ -139,6 +154,7 @@ XrResult XRAPI_CALL basaltCreateInstance(
+     }
+     bool enableD3D11 = false;
+     bool enableDisplayRefreshRate = false;
++    bool enableHandInteraction = false;
+     uint32_t enabledTracking = 0;
+     for (uint32_t index = 0; index < createInfo->enabledExtensionCount; ++index) {
+         const char* extensionName = createInfo->enabledExtensionNames[index];
+@@ -156,6 +172,11 @@ XrResult XRAPI_CALL basaltCreateInstance(
+             enableDisplayRefreshRate = true;
+             continue;
+         }
++        if (std::strcmp(extensionName, XR_EXT_HAND_INTERACTION_EXTENSION_NAME) == 0 &&
++            basalt::isD3D11RuntimeAvailable()) {
++            enableHandInteraction = true;
++            continue;
++        }
+         if (std::strcmp(extensionName, XR_KHR_D3D11_ENABLE_EXTENSION_NAME) != 0) {
+             std::fprintf(stderr, "Basalt OpenXR: unsupported enabled extension '%s'\n", extensionName);
+             return XR_ERROR_EXTENSION_NOT_PRESENT;
+@@ -179,6 +200,7 @@ XrResult XRAPI_CALL basaltCreateInstance(
+     gLiveInstance = reinterpret_cast<XrInstance>(gNextInstanceHandle);
+     gD3D11ExtensionEnabled = enableD3D11;
+     gDisplayRefreshRateEnabled = enableDisplayRefreshRate;
++    gHandInteractionEnabled = enableHandInteraction;
+     gNextInstanceHandle += kInstanceHandleStride;
+     *instance = gLiveInstance;
+     ReleaseSRWLockExclusive(&gInstanceLock);
+@@ -198,6 +220,7 @@ XrResult XRAPI_CALL basaltDestroyInstance(XrInstance instance) {
+     }
+     gLiveInstance = XR_NULL_HANDLE;
+     gD3D11ExtensionEnabled = false;
++    gHandInteractionEnabled = false;
+     gDisplayRefreshRateEnabled = false;
+     ReleaseSRWLockExclusive(&gInstanceLock);
+     basalt::setEnabledTrackingExtensions(0);
+@@ -318,6 +341,16 @@ bool isDisplayRefreshRateEnabled(XrInstance instance) {
+     return enabled;
+ }
+ 
++bool isHandInteractionEnabled(XrInstance instance) {
++    if (instance == XR_NULL_HANDLE) {
++        return false;
++    }
++    AcquireSRWLockShared(&gInstanceLock);
++    const bool enabled = instance == gLiveInstance && gHandInteractionEnabled;
++    ReleaseSRWLockShared(&gInstanceLock);
++    return enabled;
++}
++
+ bool isD3D11ExtensionEnabled(XrInstance instance) {
+     if (instance == XR_NULL_HANDLE) {
+         return false;
+diff --git c/runtime/pe/runtime.hpp w/runtime/pe/runtime.hpp
+index 9389ff9..f44d6b5 100644
+--- c/runtime/pe/runtime.hpp
++++ w/runtime/pe/runtime.hpp
+@@ -13,6 +13,8 @@
+ 
+ namespace basalt {
+ 
++struct ControlPoseSource;
++
+ constexpr XrVersion kRuntimeApiVersion = XR_MAKE_VERSION(1, 0, 0);
+ constexpr XrVersion kRuntimeVersion = XR_MAKE_VERSION(0, 1, 0);
+ constexpr XrSystemId kSystemId = 1;
+@@ -46,6 +48,9 @@ void setEnabledTrackingExtensions(uint32_t bits);
+ bool isTrackingExtensionEnabled(uint32_t bit);
+ // An eye gaze action is attached: the game uses the eyes.
+ void trackingEyeGazeBound(XrSession session, bool bound);
++// An action with a binding for the hand interaction profile is attached: the host makes the
++// profile's values and poses from the hands (HAND_INTERACTION).
++void trackingHandInteractionBound(XrSession session, bool bound);
+ void invalidateTrackersForSession(XrSession session);
+ // Answers the chained support structures of xrGetSystemProperties.
+ void fillTrackingSystemProperties(void* next);
+@@ -57,6 +62,8 @@ bool getSpacePoseInLocal(XrSpace space, XrTime time, XrSession* session, XrPosef
+ bool isValidInstance(XrInstance instance);
+ bool isD3D11ExtensionEnabled(XrInstance instance);
+ bool isDisplayRefreshRateEnabled(XrInstance instance);
++// cranvr: XR_EXT_hand_interaction, which input.cpp serves
++bool isHandInteractionEnabled(XrInstance instance);
+ // XR_FB_display_refresh_rate (frame.cpp): the rate of cranvr-host's headset is the only rate
+ XrResult XRAPI_CALL enumerateDisplayRefreshRates(
+     XrSession session, uint32_t capacityInput, uint32_t* countOutput, float* rates);
+@@ -77,12 +84,12 @@ bool getActionForSpace(
+     XrActionType* actionType,
+     bool* allowsSubactionPath,
+     XrPath subactionPath);
++// cranvr: the hand (2: the eyes), the pose and its source that a pose action reads now
+ bool getActionPoseSource(
+     XrSession session,
+     XrAction action,
+     XrPath subactionPath,
+-    uint32_t* hand,
+-    bool* aimPose);
++    ControlPoseSource* source);
+ void invalidateInputForSession(XrSession session);
+ void invalidateInputForInstance(XrInstance instance);
+ 
+diff --git c/runtime/pe/space.cpp w/runtime/pe/space.cpp
+index 599987a..a20bb9d 100644
+--- c/runtime/pe/space.cpp
++++ w/runtime/pe/space.cpp
+@@ -341,23 +341,19 @@ XrResult XRAPI_CALL locateSpace(
+         return XR_ERROR_HANDLE_INVALID;
+     }
+ 
+-    uint32_t targetHand = UINT32_MAX;
+-    uint32_t baseHand = UINT32_MAX;
+-    bool targetAim = false;
+-    bool baseAim = false;
++    // cranvr: a pose source names the hand (2: the eyes), the pose and whether a tracked hand gives it
++    ControlPoseSource targetSource{UINT32_MAX, kHandPoseGrip, false};
++    ControlPoseSource baseSource{UINT32_MAX, kHandPoseGrip, false};
+     const bool targetActionResolved = target.kind == SpaceKind::kAction &&
+-        getActionPoseSource(target.session, target.action, target.subactionPath,
+-                            &targetHand, &targetAim);
++        getActionPoseSource(target.session, target.action, target.subactionPath, &targetSource);
+     const bool baseActionResolved = base.kind == SpaceKind::kAction &&
+-        getActionPoseSource(base.session, base.action, base.subactionPath,
+-                            &baseHand, &baseAim);
++        getActionPoseSource(base.session, base.action, base.subactionPath, &baseSource);
+     XrSpaceVelocityFlags velocityFlags = 0;
+     XrVector3f linearVelocity{};
+     XrVector3f angularVelocity{};
+ 
+     if (target.kind == SpaceKind::kAction && base.kind == SpaceKind::kAction &&
+-        targetActionResolved && baseActionResolved && targetHand == baseHand &&
+-        targetAim == baseAim) {
++        targetActionResolved && baseActionResolved && targetSource == baseSource) {
+         // The natural controller entity cancels even during a tracking gap.
+         location->locationFlags =
+             XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
+@@ -386,22 +382,22 @@ XrResult XRAPI_CALL locateSpace(
+         controlInputSnapshot(target.session, &input, time);
+ 
+         auto localFromSpace = [&](const SpaceRecord& record, bool actionResolved,
+-                                  uint32_t hand, bool aim, XrPosef* pose) -> bool {
++                                  const ControlPoseSource& source, XrPosef* pose) -> bool {
+             if (record.kind == SpaceKind::kAction) {
+                 // cranvr: the pose of an eye gaze action is the gaze, hand 2
+-                if (actionResolved && hand == 2) {
++                if (actionResolved && source.hand == 2) {
+                     if (!input.eyeGaze.active) {
+                         return false;
+                     }
+                     *pose = poseCompose(input.eyeGaze.poseInLocal, record.pose);
+                     return true;
+                 }
+-                if (!actionResolved || hand >= 2 || !input.controllers[hand].poseActive) {
++                if (!actionResolved || source.hand >= 2 || !controlPoseFor(input, source).poseActive) {
+                     return false;
+                 }
+-                // cranvr: an aim space follows the aim pose, a grip space the grip pose
+-                *pose = poseCompose(
+-                    controlControllerFor(input, hand, aim).poseInLocal, record.pose);
++                // cranvr: an aim space follows the aim pose, a grip space the grip pose, a pinch
++                // or poke space its pose, of a controller or of a tracked hand
++                *pose = poseCompose(controlPoseFor(input, source).poseInLocal, record.pose);
+                 return true;
+             }
+             if (record.referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL) {
+@@ -417,8 +413,8 @@ XrResult XRAPI_CALL locateSpace(
+ 
+         XrPosef targetInLocal{};
+         XrPosef baseInLocal{};
+-        if (!localFromSpace(target, targetActionResolved, targetHand, targetAim, &targetInLocal) ||
+-            !localFromSpace(base, baseActionResolved, baseHand, baseAim, &baseInLocal)) {
++        if (!localFromSpace(target, targetActionResolved, targetSource, &targetInLocal) ||
++            !localFromSpace(base, baseActionResolved, baseSource, &baseInLocal)) {
+             location->locationFlags = 0;
+             location->pose = identityPose();
+             setChainedSpaceVelocity(
+@@ -437,11 +433,10 @@ XrResult XRAPI_CALL locateSpace(
+         // extrapolating the pose a second time. The action-space origin may
+         // be offset from the controller origin, adding omega cross radius.
+         if (target.kind == SpaceKind::kAction && targetActionResolved &&
+-            targetHand < 2 && input.controllers[targetHand].poseActive &&
++            targetSource.hand < 2 && controlPoseFor(input, targetSource).poseActive &&
+             base.kind == SpaceKind::kReference &&
+             base.referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL) {
+-            const ControlControllerState& controller =
+-                controlControllerFor(input, targetHand, targetAim);
++            const ControlControllerState& controller = controlPoseFor(input, targetSource);
+             const XrVector3f radiusInLocal{
+                 targetInLocal.position.x - controller.poseInLocal.position.x,
+                 targetInLocal.position.y - controller.poseInLocal.position.y,
+@@ -490,24 +485,23 @@ bool getSpacePoseInLocal(
+         *poseInLocal = poseCompose(headInLocal, record.pose);
+         return true;
+     }
+-    uint32_t hand = UINT32_MAX;
+-    bool aim = false;
+-    if (!getActionPoseSource(record.session, record.action, record.subactionPath, &hand, &aim)) {
++    ControlPoseSource source{UINT32_MAX, kHandPoseGrip, false};
++    if (!getActionPoseSource(record.session, record.action, record.subactionPath, &source)) {
+         return false;
+     }
+     ControlInputSnapshot input{};
+     controlInputSnapshot(record.session, &input, time);
+-    if (hand == 2) {
++    if (source.hand == 2) {
+         if (!input.eyeGaze.active) {
+             return false;
+         }
+         *poseInLocal = poseCompose(input.eyeGaze.poseInLocal, record.pose);
+         return true;
+     }
+-    if (hand >= 2 || !input.controllers[hand].poseActive) {
++    if (source.hand >= 2 || !controlPoseFor(input, source).poseActive) {
+         return false;
+     }
+-    *poseInLocal = poseCompose(controlControllerFor(input, hand, aim).poseInLocal, record.pose);
++    *poseInLocal = poseCompose(controlPoseFor(input, source).poseInLocal, record.pose);
+     return true;
+ }
+ 
+@@ -560,16 +554,14 @@ XrResult XRAPI_CALL locateViews(
+             baseTracked = true;
+         }
+     } else {
+-        uint32_t hand = UINT32_MAX;
+-        bool aim = false;
++        ControlPoseSource source{UINT32_MAX, kHandPoseGrip, false};
+         ControlInputSnapshot input{};
+         controlInputSnapshot(session, &input, viewLocateInfo->displayTime);
+-        if (getActionPoseSource(session, base.action, base.subactionPath, &hand, &aim) &&
+-            hand < 2 && input.controllers[hand].poseActive) {
+-            baseInLocal = poseCompose(
+-                controlControllerFor(input, hand, aim).poseInLocal, base.pose);
++        const bool resolved = getActionPoseSource(session, base.action, base.subactionPath, &source);
++        if (resolved && source.hand < 2 && controlPoseFor(input, source).poseActive) {
++            baseInLocal = poseCompose(controlPoseFor(input, source).poseInLocal, base.pose);
+             baseTracked = true;
+-        } else if (hand == 2 && input.eyeGaze.active) {
++        } else if (resolved && source.hand == 2 && input.eyeGaze.active) {
+             // cranvr: views relative to the gaze
+             baseInLocal = poseCompose(input.eyeGaze.poseInLocal, base.pose);
+             baseTracked = true;
+diff --git c/runtime/pe/tracking.cpp w/runtime/pe/tracking.cpp
+index 2873417..24a85e8 100644
+--- c/runtime/pe/tracking.cpp
++++ w/runtime/pe/tracking.cpp
+@@ -80,9 +80,14 @@ uintptr_t gNextTrackerHandle = kFirstTrackerHandle;
+ // The features that the game last asked cranvr-host for, and whether an eye gaze action is attached.
+ uint32_t gLastRequest = 0;
+ bool gEyeGazeBound = false;
++// Whether an action of the session has a binding for the hand interaction profile
++bool gHandInteractionBound = false;
+ 
+ uint32_t requestedFeaturesLocked(XrSession session) {
+     uint32_t features = gEyeGazeBound ? BASALT_TRACKING_EYES : 0;
++    if (gHandInteractionBound) {
++        features |= BASALT_TRACKING_HAND_INTERACTION;
++    }
+     for (const TrackerRecord& tracker : gTrackers) {
+         if (tracker.handle == 0 || tracker.session != session) {
+             continue;
+@@ -403,6 +408,13 @@ void trackingEyeGazeBound(XrSession session, bool bound) {
+     announceRequest(session);
+ }
+ 
++void trackingHandInteractionBound(XrSession session, bool bound) {
++    AcquireSRWLockExclusive(&gTrackingLock);
++    gHandInteractionBound = bound;
++    ReleaseSRWLockExclusive(&gTrackingLock);
++    announceRequest(session);
++}
++
+ void invalidateTrackersForSession(XrSession session) {
+     AcquireSRWLockExclusive(&gTrackingLock);
+     for (TrackerRecord& record : gTrackers) {
+@@ -411,6 +423,7 @@ void invalidateTrackersForSession(XrSession session) {
+         }
+     }
+     gEyeGazeBound = false;
++    gHandInteractionBound = false;
+     gLastRequest = 0;
+     ReleaseSRWLockExclusive(&gTrackingLock);
+ }
+diff --git c/runtime/tests/CMakeLists.txt w/runtime/tests/CMakeLists.txt
+index 7e0738a..abf542e 100644
+--- c/runtime/tests/CMakeLists.txt
++++ w/runtime/tests/CMakeLists.txt
+@@ -70,6 +70,20 @@ target_compile_definitions(tracking_smoke PRIVATE XR_USE_GRAPHICS_API_D3D11)
+ target_compile_options(tracking_smoke PRIVATE -Wall -Wextra -Wpedantic)
+ target_link_options(tracking_smoke PRIVATE -static -static-libgcc -static-libstdc++)
+ 
++# cranvr: reads the hand interaction profile of XR_EXT_hand_interaction while it drives cranvr-host's test hand
++add_executable(hand_interaction_smoke hand_interaction_smoke.cpp)
++target_link_libraries(
++    hand_interaction_smoke
++    PRIVATE
++        OpenXR::openxr_loader
++        d3d11
++        dxgi
++        dxguid
++)
++target_compile_definitions(hand_interaction_smoke PRIVATE XR_USE_GRAPHICS_API_D3D11)
++target_compile_options(hand_interaction_smoke PRIVATE -Wall -Wextra -Wpedantic)
++target_link_options(hand_interaction_smoke PRIVATE -static -static-libgcc -static-libstdc++)
++
+ add_executable(frame_timer_probe frame_timer_probe.cpp)
+ target_compile_options(frame_timer_probe PRIVATE -Wall -Wextra -Wpedantic)
+ target_link_options(frame_timer_probe PRIVATE -static -static-libgcc -static-libstdc++)
+diff --git c/runtime/tests/hand_interaction_smoke.cpp w/runtime/tests/hand_interaction_smoke.cpp
+new file mode 100644
+index 0000000..e106fb1
+--- /dev/null
++++ w/runtime/tests/hand_interaction_smoke.cpp
+@@ -0,0 +1,703 @@
++// cranvr: reads the hand interaction profile of XR_EXT_hand_interaction while it drives cranvr-host's
++// test hand (host/src/test_input.rs) through the host's words file. The program binds that profile
++// alone, as a game with hand code and no controller bindings does, or with the Touch controller's
++// profile (--profiles both). It creates no hand tracker. The probe's head stands still, so the
++// expected poses come from the head's pose and the words.
++//
++// Usage: hand_interaction_smoke.exe --words FILE [--profiles hand|both] [--seconds N]
++//   --words     the file that the host reads its test hand from (CRANVR_TEST_INPUT), as a Windows
++//               path (Z:\... in Wine). The program writes it at each step.
++//   --profiles  hand (default): only /interaction_profiles/ext/hand_interaction_ext. The right hand
++//               is the test hand, the left hand is the probe's controller, which the runtime maps
++//               onto the profile. both: the Touch controller's profile as well. The right hand
++//               then switches between the two profiles when the test hand comes and goes.
++//   --seconds   the longest time for each step (default 6)
++//
++// The axes that the checks expect come from the extension's text for the test hand's pose, not from
++// the formulas of the host. It prints one line for each check and ends with
++// "hand_interaction_smoke: PASS" or "hand_interaction_smoke: FAIL". scripts/e2e.sh --hand-interaction
++// runs it.
++
++#include <windows.h>
++
++#include <d3d11_1.h>
++#include <dxgi1_2.h>
++
++#include <openxr/openxr.h>
++#include <openxr/openxr_platform.h>
++
++#include <algorithm>
++#include <cmath>
++#include <cstdarg>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <functional>
++#include <string>
++#include <vector>
++
++namespace {
++
++int gProblems = 0;
++
++template <typename T>
++T make(XrStructureType type) {
++    T value{};
++    value.type = type;
++    return value;
++}
++
++void report(bool ok, const char* format, ...) {
++    char text[640];
++    va_list arguments;
++    va_start(arguments, format);
++    std::vsnprintf(text, sizeof(text), format, arguments);
++    va_end(arguments);
++    std::printf("hand_interaction_smoke: %s %s\n", ok ? "ok  " : "FAIL", text);
++    std::fflush(stdout);
++    if (!ok) {
++        ++gProblems;
++    }
++}
++
++int finish(const char* reason) {
++    std::printf("hand_interaction_smoke: %s\n", reason);
++    std::printf("hand_interaction_smoke: FAIL\n");
++    std::fflush(stdout);
++    return 1;
++}
++
++uint64_t unixMilliseconds() {
++    FILETIME time{};
++    GetSystemTimeAsFileTime(&time);
++    const uint64_t ticks = (static_cast<uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
++    return (ticks - 116444736000000000ULL) / 10000ULL;
++}
++
++XrVector3f rotate(const XrQuaternionf& q, const XrVector3f& v) {
++    const XrVector3f u{q.x, q.y, q.z};
++    const XrVector3f t{2.0f * (u.y * v.z - u.z * v.y), 2.0f * (u.z * v.x - u.x * v.z), 2.0f * (u.x * v.y - u.y * v.x)};
++    return {v.x + q.w * t.x + (u.y * t.z - u.z * t.y), v.y + q.w * t.y + (u.z * t.x - u.x * t.z),
++            v.z + q.w * t.z + (u.x * t.y - u.y * t.x)};
++}
++
++XrVector3f add(const XrVector3f& a, const XrVector3f& b) {
++    return {a.x + b.x, a.y + b.y, a.z + b.z};
++}
++
++XrVector3f subtract(const XrVector3f& a, const XrVector3f& b) {
++    return {a.x - b.x, a.y - b.y, a.z - b.z};
++}
++
++float dot(const XrVector3f& a, const XrVector3f& b) {
++    return a.x * b.x + a.y * b.y + a.z * b.z;
++}
++
++float length(const XrVector3f& a) {
++    return std::sqrt(dot(a, a));
++}
++
++// The direction of one axis of a pose
++XrVector3f axis(const XrPosef& pose, float x, float y, float z) {
++    return rotate(pose.orientation, {x, y, z});
++}
++
++bool writeWords(const std::string& path, const char* words) {
++    const std::string temporary = path + ".new";
++    FILE* file = std::fopen(temporary.c_str(), "w");
++    if (file == nullptr) {
++        return false;
++    }
++    std::fputs(words, file);
++    std::fputs("\n", file);
++    std::fclose(file);
++    // The host reads the file every 30 ms: a rename gives it the whole words at once
++    return MoveFileExA(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
++}
++
++template <typename F>
++F procedure(XrInstance instance, const char* name) {
++    PFN_xrVoidFunction function = nullptr;
++    if (XR_FAILED(xrGetInstanceProcAddr(instance, name, &function))) {
++        return nullptr;
++    }
++    return reinterpret_cast<F>(function);
++}
++
++#define CHECK_XR(call)                                                                                 \
++    do {                                                                                               \
++        const XrResult checked = (call);                                                               \
++        if (XR_FAILED(checked)) {                                                                      \
++            std::printf("hand_interaction_smoke: %s returned %d\n", #call, static_cast<int>(checked)); \
++            return finish("an OpenXR call failed");                                                    \
++        }                                                                                              \
++    } while (false)
++
++// The poses of the profile, in the order of the actions
++enum PoseIndex { kGrip = 0, kAim = 1, kPinch = 2, kPoke = 3, kPoseCount = 4 };
++const char* const kPoseNames[kPoseCount] = {"grip", "aim", "pinch", "poke"};
++const char* const kPosePaths[kPoseCount] = {"/input/grip/pose", "/input/aim/pose", "/input/pinch_ext/pose",
++                                           "/input/poke_ext/pose"};
++// The gestures: a value and its ready path each
++enum GestureIndex { kPinchGesture = 0, kAimActivate = 1, kGrasp = 2, kGestureCount = 3 };
++const char* const kGestureNames[kGestureCount] = {"pinch", "aim_activate", "grasp"};
++
++struct HandReading {
++    XrPath profile = XR_NULL_PATH;
++    bool valueActive[kGestureCount]{};
++    float value[kGestureCount]{};
++    bool readyActive[kGestureCount]{};
++    bool ready[kGestureCount]{};
++    bool poseValid[kPoseCount]{};
++    XrPosef pose[kPoseCount]{};
++
++    bool allReady() const {
++        return ready[0] && ready[1] && ready[2];
++    }
++    bool allPoses() const {
++        return poseValid[0] && poseValid[1] && poseValid[2] && poseValid[3];
++    }
++};
++
++struct Reading {
++    bool focused = false;
++    bool headValid = false;
++    XrPosef head{};
++    HandReading hands[2];
++};
++
++}  // namespace
++
++int main(int argc, char** argv) {
++    std::string wordsPath;
++    bool both = false;
++    double stepSeconds = 6.0;
++    for (int index = 1; index < argc; ++index) {
++        if (std::strcmp(argv[index], "--words") == 0 && index + 1 < argc) {
++            wordsPath = argv[++index];
++        } else if (std::strcmp(argv[index], "--profiles") == 0 && index + 1 < argc) {
++            const char* value = argv[++index];
++            if (std::strcmp(value, "both") == 0) {
++                both = true;
++            } else if (std::strcmp(value, "hand") != 0) {
++                std::fputs("hand_interaction_smoke: --profiles takes hand or both\n", stderr);
++                return 2;
++            }
++        } else if (std::strcmp(argv[index], "--seconds") == 0 && index + 1 < argc) {
++            stepSeconds = std::atof(argv[++index]);
++        } else {
++            std::fputs("usage: hand_interaction_smoke --words FILE [--profiles hand|both] [--seconds N]\n", stderr);
++            return 2;
++        }
++    }
++    if (wordsPath.empty()) {
++        std::fputs("hand_interaction_smoke: --words FILE is required\n", stderr);
++        return 2;
++    }
++    // No test hand at the start: both hands are the probe's controllers
++    if (!writeWords(wordsPath, both ? "hand=0" : "")) {
++        return finish("the words file cannot be written");
++    }
++
++    // The runtime lists the extension with its graphics extension
++    uint32_t count = 0;
++    CHECK_XR(xrEnumerateInstanceExtensionProperties(nullptr, 0, &count, nullptr));
++    std::vector<XrExtensionProperties> properties(count, make<XrExtensionProperties>(XR_TYPE_EXTENSION_PROPERTIES));
++    CHECK_XR(xrEnumerateInstanceExtensionProperties(nullptr, count, &count, properties.data()));
++    uint32_t listedVersion = 0;
++    for (const XrExtensionProperties& property : properties) {
++        if (std::strcmp(property.extensionName, XR_EXT_HAND_INTERACTION_EXTENSION_NAME) == 0) {
++            listedVersion = property.extensionVersion;
++        }
++    }
++    report(listedVersion == XR_EXT_hand_interaction_SPEC_VERSION, "the runtime lists %s version %u",
++           XR_EXT_HAND_INTERACTION_EXTENSION_NAME, listedVersion);
++    if (listedVersion == 0) {
++        return finish("the extension is not listed");
++    }
++
++    const char* enabled[] = {XR_KHR_D3D11_ENABLE_EXTENSION_NAME, XR_EXT_HAND_INTERACTION_EXTENSION_NAME};
++    XrInstanceCreateInfo instanceInfo = make<XrInstanceCreateInfo>(XR_TYPE_INSTANCE_CREATE_INFO);
++    instanceInfo.enabledExtensionCount = 2;
++    instanceInfo.enabledExtensionNames = enabled;
++    instanceInfo.applicationInfo.apiVersion = XR_API_VERSION_1_0;
++    std::strncpy(instanceInfo.applicationInfo.applicationName, "cranvr hand interaction smoke",
++                 XR_MAX_APPLICATION_NAME_SIZE - 1);
++    XrInstance instance = XR_NULL_HANDLE;
++    CHECK_XR(xrCreateInstance(&instanceInfo, &instance));
++    XrSystemGetInfo systemInfo = make<XrSystemGetInfo>(XR_TYPE_SYSTEM_GET_INFO);
++    systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
++    XrSystemId systemId = XR_NULL_SYSTEM_ID;
++    CHECK_XR(xrGetSystem(instance, &systemInfo, &systemId));
++
++    auto getRequirements = procedure<PFN_xrGetD3D11GraphicsRequirementsKHR>(instance, "xrGetD3D11GraphicsRequirementsKHR");
++    if (getRequirements == nullptr) {
++        return finish("no D3D11 requirements function");
++    }
++    XrGraphicsRequirementsD3D11KHR requirements = make<XrGraphicsRequirementsD3D11KHR>(XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR);
++    CHECK_XR(getRequirements(instance, systemId, &requirements));
++    IDXGIFactory1* factory = nullptr;
++    IDXGIAdapter1* adapter = nullptr;
++    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) ||
++        FAILED(factory->EnumAdapters1(0, &adapter))) {
++        return finish("no DXGI adapter");
++    }
++    const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0};
++    ID3D11Device* device = nullptr;
++    ID3D11DeviceContext* context = nullptr;
++    D3D_FEATURE_LEVEL level{};
++    if (FAILED(D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, 1,
++                                 D3D11_SDK_VERSION, &device, &level, &context))) {
++        return finish("no D3D11 device");
++    }
++    XrGraphicsBindingD3D11KHR binding = make<XrGraphicsBindingD3D11KHR>(XR_TYPE_GRAPHICS_BINDING_D3D11_KHR);
++    binding.device = device;
++    XrSessionCreateInfo sessionInfo = make<XrSessionCreateInfo>(XR_TYPE_SESSION_CREATE_INFO);
++    sessionInfo.next = &binding;
++    sessionInfo.systemId = systemId;
++    XrSession session = XR_NULL_HANDLE;
++    CHECK_XR(xrCreateSession(instance, &sessionInfo, &session));
++
++    XrReferenceSpaceCreateInfo spaceInfo = make<XrReferenceSpaceCreateInfo>(XR_TYPE_REFERENCE_SPACE_CREATE_INFO);
++    spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
++    spaceInfo.poseInReferenceSpace = {{0, 0, 0, 1}, {0, 0, 0}};
++    XrSpace localSpace = XR_NULL_HANDLE;
++    CHECK_XR(xrCreateReferenceSpace(session, &spaceInfo, &localSpace));
++    spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
++    XrSpace viewSpace = XR_NULL_HANDLE;
++    CHECK_XR(xrCreateReferenceSpace(session, &spaceInfo, &viewSpace));
++
++    // The paths
++    auto path = [&](const char* text) {
++        XrPath out = XR_NULL_PATH;
++        xrStringToPath(instance, text, &out);
++        return out;
++    };
++    const XrPath handPaths[2] = {path("/user/hand/left"), path("/user/hand/right")};
++    const char* const handNames[2] = {"/user/hand/left", "/user/hand/right"};
++    const XrPath handProfile = path("/interaction_profiles/ext/hand_interaction_ext");
++    const XrPath touchProfile = path("/interaction_profiles/oculus/touch_controller");
++    auto full = [&](int hand, const char* subpath) {
++        return path((std::string(handNames[hand]) + subpath).c_str());
++    };
++
++    // The actions: a value and a ready flag for each gesture, and the four poses
++    XrActionSetCreateInfo setInfo = make<XrActionSetCreateInfo>(XR_TYPE_ACTION_SET_CREATE_INFO);
++    std::strcpy(setInfo.actionSetName, "hands");
++    std::strcpy(setInfo.localizedActionSetName, "Hands");
++    XrActionSet actionSet = XR_NULL_HANDLE;
++    CHECK_XR(xrCreateActionSet(instance, &setInfo, &actionSet));
++    auto createAction = [&](const char* name, XrActionType type, XrAction* action) {
++        XrActionCreateInfo info = make<XrActionCreateInfo>(XR_TYPE_ACTION_CREATE_INFO);
++        std::strncpy(info.actionName, name, XR_MAX_ACTION_NAME_SIZE - 1);
++        std::strncpy(info.localizedActionName, name, XR_MAX_LOCALIZED_ACTION_NAME_SIZE - 1);
++        info.actionType = type;
++        info.countSubactionPaths = 2;
++        info.subactionPaths = handPaths;
++        return xrCreateAction(actionSet, &info, action);
++    };
++    XrAction valueActions[kGestureCount]{};
++    XrAction readyActions[kGestureCount]{};
++    XrAction poseActions[kPoseCount]{};
++    for (int gesture = 0; gesture < kGestureCount; ++gesture) {
++        CHECK_XR(createAction((std::string(kGestureNames[gesture]) + "_value").c_str(), XR_ACTION_TYPE_FLOAT_INPUT,
++                              &valueActions[gesture]));
++        CHECK_XR(createAction((std::string(kGestureNames[gesture]) + "_ready").c_str(), XR_ACTION_TYPE_BOOLEAN_INPUT,
++                              &readyActions[gesture]));
++    }
++    for (int pose = 0; pose < kPoseCount; ++pose) {
++        CHECK_XR(createAction((std::string(kPoseNames[pose]) + "_pose").c_str(), XR_ACTION_TYPE_POSE_INPUT,
++                              &poseActions[pose]));
++    }
++
++    // The bindings of the hand interaction profile: every path that the extension lists
++    std::vector<XrActionSuggestedBinding> handBindings;
++    const char* const gesturePaths[kGestureCount] = {"/input/pinch_ext", "/input/aim_activate_ext", "/input/grasp_ext"};
++    for (int hand = 0; hand < 2; ++hand) {
++        for (int gesture = 0; gesture < kGestureCount; ++gesture) {
++            handBindings.push_back({valueActions[gesture], full(hand, (std::string(gesturePaths[gesture]) + "/value").c_str())});
++            handBindings.push_back({readyActions[gesture], full(hand, (std::string(gesturePaths[gesture]) + "/ready_ext").c_str())});
++        }
++        for (int pose = 0; pose < kPoseCount; ++pose) {
++            handBindings.push_back({poseActions[pose], full(hand, kPosePaths[pose])});
++        }
++    }
++    XrInteractionProfileSuggestedBinding suggestion = make<XrInteractionProfileSuggestedBinding>(XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING);
++    suggestion.interactionProfile = handProfile;
++    suggestion.countSuggestedBindings = static_cast<uint32_t>(handBindings.size());
++    suggestion.suggestedBindings = handBindings.data();
++    report(xrSuggestInteractionProfileBindings(instance, &suggestion) == XR_SUCCESS,
++           "the runtime takes %zu bindings of the hand interaction profile", handBindings.size());
++
++    // A value path of the extension belongs to its own profile only; the pinch and poke poses
++    // belong to every profile of the hands
++    XrActionSuggestedBinding wrong{valueActions[kPinchGesture], full(0, "/input/pinch_ext/value")};
++    suggestion.interactionProfile = touchProfile;
++    suggestion.countSuggestedBindings = 1;
++    suggestion.suggestedBindings = &wrong;
++    report(xrSuggestInteractionProfileBindings(instance, &suggestion) == XR_ERROR_PATH_UNSUPPORTED,
++           "the Touch controller's profile refuses pinch_ext/value");
++    if (both) {
++        std::vector<XrActionSuggestedBinding> touchBindings;
++        for (int hand = 0; hand < 2; ++hand) {
++            touchBindings.push_back({valueActions[kPinchGesture], full(hand, "/input/trigger/value")});
++            touchBindings.push_back({valueActions[kAimActivate], full(hand, "/input/trigger/value")});
++            touchBindings.push_back({valueActions[kGrasp], full(hand, "/input/squeeze/value")});
++            for (int pose = 0; pose < kPoseCount; ++pose) {
++                touchBindings.push_back({poseActions[pose], full(hand, kPosePaths[pose])});
++            }
++        }
++        suggestion.countSuggestedBindings = static_cast<uint32_t>(touchBindings.size());
++        suggestion.suggestedBindings = touchBindings.data();
++        report(xrSuggestInteractionProfileBindings(instance, &suggestion) == XR_SUCCESS,
++               "the Touch controller's profile takes pinch_ext/pose and poke_ext/pose");
++    }
++    XrSessionActionSetsAttachInfo attach = make<XrSessionActionSetsAttachInfo>(XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO);
++    attach.countActionSets = 1;
++    attach.actionSets = &actionSet;
++    CHECK_XR(xrAttachSessionActionSets(session, &attach));
++
++    XrSpace poseSpaces[2][kPoseCount]{};
++    for (int hand = 0; hand < 2; ++hand) {
++        for (int pose = 0; pose < kPoseCount; ++pose) {
++            XrActionSpaceCreateInfo info = make<XrActionSpaceCreateInfo>(XR_TYPE_ACTION_SPACE_CREATE_INFO);
++            info.action = poseActions[pose];
++            info.subactionPath = handPaths[hand];
++            info.poseInActionSpace = {{0, 0, 0, 1}, {0, 0, 0}};
++            CHECK_XR(xrCreateActionSpace(session, &info, &poseSpaces[hand][pose]));
++        }
++    }
++
++    // The session runs: ready, begin, frames until it is focused
++    XrSessionState state = XR_SESSION_STATE_UNKNOWN;
++    int profileEvents = 0;
++    auto pollEvents = [&]() {
++        XrEventDataBuffer event = make<XrEventDataBuffer>(XR_TYPE_EVENT_DATA_BUFFER);
++        while (xrPollEvent(instance, &event) == XR_SUCCESS) {
++            if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
++                state = reinterpret_cast<XrEventDataSessionStateChanged*>(&event)->state;
++            } else if (event.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
++                ++profileEvents;
++            }
++            event = make<XrEventDataBuffer>(XR_TYPE_EVENT_DATA_BUFFER);
++        }
++    };
++    for (int attempt = 0; attempt < 500 && state != XR_SESSION_STATE_READY; ++attempt) {
++        pollEvents();
++        Sleep(10);
++    }
++    if (state != XR_SESSION_STATE_READY) {
++        return finish("the session did not become ready");
++    }
++    XrSessionBeginInfo beginInfo = make<XrSessionBeginInfo>(XR_TYPE_SESSION_BEGIN_INFO);
++    beginInfo.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
++    CHECK_XR(xrBeginSession(session, &beginInfo));
++
++    // One frame: sync, read every action and locate every pose at the frame's display time
++    XrResult frameResult = XR_SUCCESS;
++    auto frame = [&]() {
++        Reading reading;
++        XrFrameState frameState = make<XrFrameState>(XR_TYPE_FRAME_STATE);
++        frameResult = xrWaitFrame(session, nullptr, &frameState);
++        if (XR_FAILED(frameResult) || XR_FAILED(frameResult = xrBeginFrame(session, nullptr))) {
++            return reading;
++        }
++        const XrTime time = frameState.predictedDisplayTime;
++        pollEvents();
++        reading.focused = state == XR_SESSION_STATE_FOCUSED;
++        XrActiveActionSet active{actionSet, XR_NULL_PATH};
++        XrActionsSyncInfo sync = make<XrActionsSyncInfo>(XR_TYPE_ACTIONS_SYNC_INFO);
++        sync.countActiveActionSets = 1;
++        sync.activeActionSets = &active;
++        xrSyncActions(session, &sync);
++        XrSpaceLocation head = make<XrSpaceLocation>(XR_TYPE_SPACE_LOCATION);
++        xrLocateSpace(viewSpace, localSpace, time, &head);
++        reading.headValid = (head.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0;
++        reading.head = head.pose;
++        for (int hand = 0; hand < 2; ++hand) {
++            HandReading& out = reading.hands[hand];
++            XrInteractionProfileState profile = make<XrInteractionProfileState>(XR_TYPE_INTERACTION_PROFILE_STATE);
++            if (XR_SUCCEEDED(xrGetCurrentInteractionProfile(session, handPaths[hand], &profile))) {
++                out.profile = profile.interactionProfile;
++            }
++            for (int gesture = 0; gesture < kGestureCount; ++gesture) {
++                XrActionStateGetInfo get = make<XrActionStateGetInfo>(XR_TYPE_ACTION_STATE_GET_INFO);
++                get.subactionPath = handPaths[hand];
++                get.action = valueActions[gesture];
++                XrActionStateFloat value = make<XrActionStateFloat>(XR_TYPE_ACTION_STATE_FLOAT);
++                xrGetActionStateFloat(session, &get, &value);
++                out.valueActive[gesture] = value.isActive == XR_TRUE;
++                out.value[gesture] = value.currentState;
++                get.action = readyActions[gesture];
++                XrActionStateBoolean ready = make<XrActionStateBoolean>(XR_TYPE_ACTION_STATE_BOOLEAN);
++                xrGetActionStateBoolean(session, &get, &ready);
++                out.readyActive[gesture] = ready.isActive == XR_TRUE;
++                out.ready[gesture] = ready.currentState == XR_TRUE;
++            }
++            for (int pose = 0; pose < kPoseCount; ++pose) {
++                XrSpaceLocation location = make<XrSpaceLocation>(XR_TYPE_SPACE_LOCATION);
++                xrLocateSpace(poseSpaces[hand][pose], localSpace, time, &location);
++                out.poseValid[pose] = (location.locationFlags & (XR_SPACE_LOCATION_POSITION_VALID_BIT |
++                                                                  XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) ==
++                                      (XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
++                out.pose[pose] = location.pose;
++            }
++        }
++        XrFrameEndInfo endInfo = make<XrFrameEndInfo>(XR_TYPE_FRAME_END_INFO);
++        endInfo.displayTime = time;
++        endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
++        frameResult = xrEndFrame(session, &endInfo);
++        return reading;
++    };
++
++    // The left hand is the probe's controller through the whole run: what it showed
++    bool leftReadySeen = false;
++    bool leftGraspSeen = false;
++    bool leftPinchAheadOk = false;
++    float leftPinchAhead = -1.0f;
++    auto watchLeft = [&](const Reading& reading) {
++        const HandReading& left = reading.hands[0];
++        leftReadySeen = leftReadySeen || left.allReady();
++        leftGraspSeen = leftGraspSeen || left.value[kGrasp] > 0.98f;
++        if (left.poseValid[kPinch] && left.poseValid[kAim]) {
++            // A controller's pinch pose lies 3 cm ahead of its aim pose, with the aim's orientation
++            const XrVector3f ahead = subtract(left.pose[kPinch].position, left.pose[kAim].position);
++            leftPinchAhead = dot(ahead, axis(left.pose[kAim], 0, 0, -1));
++            leftPinchAheadOk = std::fabs(leftPinchAhead - 0.03f) < 1e-3f && std::fabs(length(ahead) - 0.03f) < 1e-3f;
++        }
++    };
++    // Frames until `done` holds or the step's time runs out. The host reads the words every 30 ms
++    // and the next hand sample follows, so a reading of the first 200 ms may still show the words
++    // before: the wait takes none of them.
++    auto waitFor = [&](const char* what, const std::function<bool(const Reading&)>& done, double seconds = -1.0) {
++        constexpr uint64_t kSettleMilliseconds = 200;
++        const uint64_t start = unixMilliseconds();
++        const double limit = seconds > 0.0 ? seconds : stepSeconds;
++        Reading reading;
++        for (;;) {
++            reading = frame();
++            if (XR_FAILED(frameResult)) {
++                report(false, "a frame failed with %d while waiting for %s", static_cast<int>(frameResult), what);
++                return reading;
++            }
++            watchLeft(reading);
++            if (reading.focused && unixMilliseconds() - start >= kSettleMilliseconds && done(reading)) {
++                std::printf("hand_interaction_smoke: %s after %llu ms\n", what,
++                            static_cast<unsigned long long>(unixMilliseconds() - start));
++                std::fflush(stdout);
++                return reading;
++            }
++            if ((unixMilliseconds() - start) / 1000.0 > limit) {
++                report(false, "%s did not happen in %.0f s", what, limit);
++                return reading;
++            }
++        }
++    };
++    auto setWords = [&](const char* words) {
++        std::printf("hand_interaction_smoke: words \"%s\" at unix %llu ms\n", words,
++                    static_cast<unsigned long long>(unixMilliseconds()));
++        std::fflush(stdout);
++        if (!writeWords(wordsPath, words)) {
++            report(false, "the words file cannot be written");
++        }
++    };
++    // Where a point of the test hand lies: `offset` in the head's axes from the head (right, up, back)
++    auto fromHead = [](const Reading& reading, float x, float y, float z) {
++        return add(reading.head.position, rotate(reading.head.orientation, {x, y, z}));
++    };
++    auto inHead = [](const Reading& reading, float x, float y, float z) {
++        return rotate(reading.head.orientation, {x, y, z});
++    };
++    auto within = [](const XrVector3f& a, const XrVector3f& b, float meters) {
++        return length(subtract(a, b)) < meters;
++    };
++    auto describe = [](const XrVector3f& v) {
++        static char text[4][64];
++        static int next = 0;
++        char* out = text[next++ % 4];
++        std::snprintf(out, 64, "(%.3f %.3f %.3f)", v.x, v.y, v.z);
++        return out;
++    };
++
++    {
++        const Reading focused = waitFor("the session is focused", [](const Reading& r) { return r.focused; }, 15.0);
++        if (!focused.focused) {
++            return finish("the session did not become focused");
++        }
++    }
++
++    if (both) {
++        // Both controllers: the Touch profile on both sides
++        Reading reading = waitFor("both hands use the Touch controller's profile", [&](const Reading& r) {
++            return r.hands[0].profile == touchProfile && r.hands[1].profile == touchProfile;
++        });
++        report(reading.hands[1].profile == touchProfile && reading.hands[0].profile == touchProfile,
++               "with both controllers held, both hands use the Touch controller's profile");
++        const int eventsBefore = profileEvents;
++        setWords("hand=1 x=0.2 y=-0.35 z=0.3");
++        reading = waitFor("the right hand takes the hand interaction profile", [&](const Reading& r) {
++            return r.hands[1].profile == handProfile && profileEvents > eventsBefore && r.hands[1].allReady();
++        });
++        report(reading.hands[1].profile == handProfile && profileEvents > eventsBefore,
++               "the tracked right hand uses the hand interaction profile (%d profile events)", profileEvents - eventsBefore);
++        report(reading.hands[0].profile == touchProfile, "the left hand keeps the Touch controller's profile");
++        setWords("hand=1 x=0.2 y=-0.35 z=0.3 pinch=1");
++        reading = waitFor("the right hand pinches", [&](const Reading& r) { return r.hands[1].value[kPinchGesture] > 0.98f; });
++        report(reading.hands[1].value[kPinchGesture] > 0.98f, "the action bound to both profiles reads the hand's pinch: %.3f",
++               reading.hands[1].value[kPinchGesture]);
++        const int eventsAtHand = profileEvents;
++        setWords("hand=0");
++        reading = waitFor("the right hand takes the Touch controller's profile again", [&](const Reading& r) {
++            return r.hands[1].profile == touchProfile && profileEvents > eventsAtHand;
++        });
++        report(reading.hands[1].profile == touchProfile && profileEvents > eventsAtHand,
++               "the right controller takes the Touch controller's profile again (%d profile events)",
++               profileEvents - eventsAtHand);
++        report(reading.hands[1].allPoses(), "the right controller's four poses are valid in the Touch controller's profile");
++        report(leftPinchAheadOk, "the left controller's pinch pose lies 3 cm ahead of its aim pose (%.4f m)", leftPinchAhead);
++    } else {
++        // The test hand, open, palm down, fingers forward
++        setWords("hand=1 x=0.2 y=-0.35 z=0.3");
++        // The probe's right controller serves the profile until the test hand comes: the wait ends
++        // when the grip pose is near the palm of the words, and the checks below measure it
++        Reading open = waitFor("the right hand is tracked and ready", [&](const Reading& r) {
++            return r.hands[1].allReady() && r.hands[1].allPoses() && r.headValid &&
++                   within(r.hands[1].pose[kGrip].position, fromHead(r, 0.2f, -0.35f, -0.3f), 0.01f);
++        });
++        const HandReading& right = open.hands[1];
++        report(right.profile == handProfile, "the tracked right hand uses the hand interaction profile");
++        report(open.hands[0].profile == handProfile, "the left controller serves the hand interaction profile");
++        report(right.allReady(), "pinch_ext, aim_activate_ext and grasp_ext are ready while the hand is tracked");
++        report(right.value[kPinchGesture] < 0.02f && right.value[kAimActivate] < 0.02f && right.value[kGrasp] < 0.02f,
++               "an open hand reads pinch %.3f, aim_activate %.3f, grasp %.3f", right.value[kPinchGesture],
++               right.value[kAimActivate], right.value[kGrasp]);
++        // The palm joint lies where the words put it. The extension: the grip's -Z goes from the
++        // little finger to the index finger, which is to the left for a right palm facing down, and
++        // its +X enters the right palm, which is up.
++        const XrVector3f palm = fromHead(open, 0.2f, -0.35f, -0.3f);
++        report(within(right.pose[kGrip].position, palm, 0.003f), "the grip pose lies at the palm: %s, expected %s",
++               describe(right.pose[kGrip].position), describe(palm));
++        report(dot(axis(right.pose[kGrip], 0, 0, -1), inHead(open, -1, 0, 0)) > 0.99f &&
++                   dot(axis(right.pose[kGrip], 1, 0, 0), inHead(open, 0, 1, 0)) > 0.99f,
++               "the grip pose's -Z points from the little finger to the index finger %s and its +X into the palm %s",
++               describe(axis(right.pose[kGrip], 0, 0, -1)), describe(axis(right.pose[kGrip], 1, 0, 0)));
++        // The index fingertip is 2 cm to the left of the palm joint and 11.5 cm ahead (test_input.rs);
++        // the poke pose lies on its skin, 6 mm further, +Y up for a palm facing down, +Z to the knuckle
++        const XrVector3f poke = fromHead(open, 0.18f, -0.35f, -0.3f - 0.115f - 0.006f);
++        report(within(right.pose[kPoke].position, poke, 0.003f) &&
++                   dot(axis(right.pose[kPoke], 0, 1, 0), inHead(open, 0, 1, 0)) > 0.99f &&
++                   dot(axis(right.pose[kPoke], 0, 0, 1), inHead(open, 0, 0, 1)) > 0.99f,
++               "the poke pose lies on the index fingertip at %s (expected %s), +Y up, +Z to the knuckle",
++               describe(right.pose[kPoke].position), describe(poke));
++        // The pinch pose lies between the tips (6 cm apart when open): +Z back toward the proximal
++        // joints, +Y toward the thumb, which points up when the palms face each other
++        const XrVector3f pinchPlace = fromHead(open, 0.18f, -0.35f - 0.03f, -0.3f - 0.115f);
++        report(within(right.pose[kPinch].position, pinchPlace, 0.003f) &&
++                   dot(axis(right.pose[kPinch], 0, 0, 1), inHead(open, 0, 0, 1)) > 0.95f,
++               "the pinch pose lies between the tips at %s (expected %s), +Z back %s",
++               describe(right.pose[kPinch].position), describe(pinchPlace), describe(axis(right.pose[kPinch], 0, 0, 1)));
++        // The aim pose starts at the pinch and points ahead, away from the shoulder
++        report(within(right.pose[kAim].position, right.pose[kPinch].position, 0.003f) &&
++                   dot(axis(right.pose[kAim], 0, 0, -1), inHead(open, 0, 0, -1)) > 0.5f &&
++                   dot(axis(right.pose[kAim], 0, 1, 0), inHead(open, 0, 1, 0)) > 0.5f,
++               "the aim pose starts at the pinch and points ahead %s with +Y up", describe(axis(right.pose[kAim], 0, 0, -1)));
++
++        // The pinch from 0 to 1 and back, in the value and in the aim activation
++        std::string pinches;
++        auto pinchTo = [&](const char* words, float target) {
++            setWords(words);
++            char what[96];
++            std::snprintf(what, sizeof(what), "the pinch reads %.1f", target);
++            const Reading r = waitFor(what, [&](const Reading& x) {
++                return std::fabs(x.hands[1].value[kPinchGesture] - target) < 0.02f &&
++                       std::fabs(x.hands[1].value[kAimActivate] - target) < 0.02f;
++            });
++            char value[24];
++            std::snprintf(value, sizeof(value), "%s%.3f", pinches.empty() ? "" : " -> ", r.hands[1].value[kPinchGesture]);
++            pinches += value;
++            report(std::fabs(r.hands[1].value[kPinchGesture] - target) < 0.02f && r.hands[1].allReady(),
++                   "pinch %.1f reads pinch_ext/value %.3f and aim_activate_ext/value %.3f, ready %d", target,
++                   r.hands[1].value[kPinchGesture], r.hands[1].value[kAimActivate], r.hands[1].allReady());
++            return r;
++        };
++        pinchTo("hand=1 x=0.2 y=-0.35 z=0.3 pinch=0.5", 0.5f);
++        const Reading pinched = pinchTo("hand=1 x=0.2 y=-0.35 z=0.3 pinch=1", 1.0f);
++        report(within(pinched.hands[1].pose[kPinch].position, fromHead(pinched, 0.18f, -0.35f - 0.009f, -0.415f), 0.003f),
++               "a closed pinch moves the pinch pose to the touching tips: %s", describe(pinched.hands[1].pose[kPinch].position));
++        pinchTo("hand=1 x=0.2 y=-0.35 z=0.3 pinch=0", 0.0f);
++        report(true, "pinch_ext/value went %s", pinches.c_str());
++
++        // The fist
++        setWords("hand=1 x=0.2 y=-0.35 z=0.3 grip=1");
++        Reading fist = waitFor("the grasp reads 1", [](const Reading& r) { return r.hands[1].value[kGrasp] > 0.98f; });
++        report(fist.hands[1].value[kGrasp] > 0.98f, "a fist reads grasp_ext/value %.3f", fist.hands[1].value[kGrasp]);
++        setWords("hand=1 x=0.2 y=-0.35 z=0.3 grip=0");
++        fist = waitFor("the grasp reads 0", [](const Reading& r) { return r.hands[1].value[kGrasp] < 0.02f; });
++        report(fist.hands[1].value[kGrasp] < 0.02f, "an open hand reads grasp_ext/value %.3f again", fist.hands[1].value[kGrasp]);
++
++        // The hand moves 10 cm to the right: every pose follows
++        setWords("hand=1 x=0.3 y=-0.35 z=0.3");
++        const Reading moved = waitFor("the hand moved", [&](const Reading& r) {
++            return within(r.hands[1].pose[kGrip].position, fromHead(r, 0.3f, -0.35f, -0.3f), 0.003f);
++        });
++        for (int pose = 0; pose < kPoseCount; ++pose) {
++            const XrVector3f shift = subtract(moved.hands[1].pose[pose].position, right.pose[pose].position);
++            // The aim pose turns about the shoulder as the hand moves; its start moves with the fingers
++            report(within(shift, inHead(moved, 0.1f, 0.0f, 0.0f), 0.003f), "the %s pose moved with the hand by %s",
++                   kPoseNames[pose], describe(shift));
++        }
++
++        // The extension's own example: palms facing each other, fingers forward. The right palm
++        // faces left, the thumb is up: the grip's +X points to the right, its -Z from the little
++        // finger up to the index finger, and the pinch's +Y points up.
++        setWords("hand=1 x=0.3 y=-0.35 z=0.3 roll=90");
++        const Reading rolled = waitFor("the hand rolled", [&](const Reading& r) {
++            return dot(axis(r.hands[1].pose[kGrip], 1, 0, 0), inHead(r, 1, 0, 0)) > 0.99f;
++        });
++        const HandReading& turned = rolled.hands[1];
++        report(dot(axis(turned.pose[kGrip], 1, 0, 0), inHead(rolled, 1, 0, 0)) > 0.99f &&
++                   dot(axis(turned.pose[kGrip], 0, 0, -1), inHead(rolled, 0, 1, 0)) > 0.99f,
++               "with the palm facing left the grip's +X points right %s and its -Z up %s",
++               describe(axis(turned.pose[kGrip], 1, 0, 0)), describe(axis(turned.pose[kGrip], 0, 0, -1)));
++        report(dot(axis(turned.pose[kPinch], 0, 1, 0), inHead(rolled, 0, 1, 0)) > 0.95f,
++               "with the palms facing each other the pinch's +Y points up %s", describe(axis(turned.pose[kPinch], 0, 1, 0)));
++
++        // The cameras lose the hand: not ready, value 0, and no change of profile
++        const int eventsBefore = profileEvents;
++        setWords("hand=1 x=0.3 y=-0.35 z=0.3 lost=1");
++        const Reading lost = waitFor("the lost hand is not ready", [](const Reading& r) {
++            return !r.hands[1].ready[kPinchGesture] && !r.hands[1].ready[kAimActivate] && !r.hands[1].ready[kGrasp];
++        });
++        report(!lost.hands[1].ready[kPinchGesture] && lost.hands[1].value[kPinchGesture] == 0.0f &&
++                   !lost.hands[1].poseValid[kGrip],
++               "a lost hand reads ready false, pinch %.1f and no grip pose", lost.hands[1].value[kPinchGesture]);
++        report(lost.hands[1].profile == handProfile && profileEvents == eventsBefore,
++               "a lost hand keeps the hand interaction profile with no profile event (%d events)", profileEvents - eventsBefore);
++        setWords("hand=1 x=0.3 y=-0.35 z=0.3");
++        const Reading back = waitFor("the hand is back", [](const Reading& r) { return r.hands[1].allReady(); });
++        report(back.hands[1].allReady() && back.hands[1].allPoses(), "the hand is ready again when the cameras see it");
++
++        // The probe squeezes the left grip for half a second in every three
++        waitFor("the left controller squeezes", [](const Reading& r) { return r.hands[0].value[kGrasp] > 0.98f; }, 4.0);
++        report(leftReadySeen, "the left controller's gestures are ready");
++        report(leftGraspSeen, "the left controller's squeeze reads as grasp_ext/value 1");
++        report(leftPinchAheadOk, "the left controller's pinch pose lies 3 cm ahead of its aim pose (%.4f m)", leftPinchAhead);
++    }
++
++    // The controller comes back for the next test
++    writeWords(wordsPath, "");
++    for (XrSpace* row : poseSpaces) {
++        for (int pose = 0; pose < kPoseCount; ++pose) {
++            xrDestroySpace(row[pose]);
++        }
++    }
++    xrDestroySession(session);
++    xrDestroyInstance(instance);
++    context->Release();
++    device->Release();
++    adapter->Release();
++    factory->Release();
++    std::printf("hand_interaction_smoke: %s\n", gProblems == 0 ? "PASS" : "FAIL");
++    return gProblems == 0 ? 0 : 1;
++}
