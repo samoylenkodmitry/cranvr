@@ -20,7 +20,7 @@ use cranpose::{CropRect, DecodedFrames};
 use cranpose_xr::{
     FieldOfView, FoveatedEncoding, Haptics, HeadsetProperties, Pose as XrPose, StreamStats, StreamedView, StreamedViews,
 };
-use cranvr_common::controls::{Action as ControlAction, Control, Controls, Hand};
+use cranvr_common::controls::{Action as ControlAction, Control, Controls, Hand, ModelsInGame};
 use cranvr_common::foveation::{Foveation, FoveationConfig};
 use cranvr_proto::{
     clock::now_ns,
@@ -714,6 +714,13 @@ impl Hub {
     /// the mapping, so the change goes to it. Without a link nothing changes.
     pub fn step_control(&self, hand: Hand, control: Control, step: i32) {
         let sent = self.console.lock().unwrap().step_control(hand, control, step, Instant::now());
+        self.send_controls(sent);
+    }
+
+    /// The user picked when the controllers' models show in a game. The Mac keeps the choice with the
+    /// mapping, so the change goes to it. Without a link nothing changes.
+    pub fn choose_models(&self, choice: ModelsInGame) {
+        let sent = self.console.lock().unwrap().pick_models(choice, Instant::now());
         self.send_controls(sent);
     }
 

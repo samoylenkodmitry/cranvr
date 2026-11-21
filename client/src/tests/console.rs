@@ -200,6 +200,21 @@ fn stepping_through_the_actions_of_an_input_visits_each_one_it_offers_and_comes_
 }
 
 #[test]
+fn the_choice_of_the_controller_models_goes_to_the_mac_with_the_controls_and_needs_a_link() {
+    let mut console = Console::default();
+    let now = Instant::now();
+    assert_eq!(console.pick_models(ModelsInGame::Never, now), None);
+    assert_eq!(console.controls().models_in_game, ModelsInGame::WhilePointing);
+    console.on_menu_at(with_controls(&Controls::default()), now);
+    let sent = console.pick_models(ModelsInGame::Always, now).unwrap();
+    assert_eq!(sent, Controls { models_in_game: ModelsInGame::Always, ..Controls::default() });
+    assert_eq!(console.view().controls.models_in_game, ModelsInGame::Always);
+    // The Mac sends the mapping that it had before it saw the change: the choice stays
+    assert_eq!(console.on_menu_at(with_controls(&Controls::default()), now + Duration::from_millis(500)), None);
+    assert_eq!(console.controls().models_in_game, ModelsInGame::Always);
+}
+
+#[test]
 fn the_standard_button_gives_the_standard_mapping_back() {
     let mut console = Console::default();
     let now = Instant::now();
@@ -304,7 +319,7 @@ fn the_new_settings_fit_the_consoles_height() {
     let mut menu = menu(None);
     menu.games.extend((0..10).map(|i| Game { name: format!("Game {i}"), program: format!("g{i}.exe") }));
     assert_eq!(menu.listed().len(), MAX_GAMES);
-    // Five games, five settings, the note and the buttons: about 940 dp, a little under a meter
+    // Five games, six settings, the note and the buttons: about 990 dp, a little under a meter
     let tall = height(Some(&menu));
     assert!(tall > 900.0 && tall < 1000.0, "{tall}");
 }

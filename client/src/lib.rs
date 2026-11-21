@@ -29,6 +29,7 @@ mod hands;
 mod hold;
 mod hover;
 mod menu_model;
+mod models;
 mod hub;
 mod panel_layout;
 mod phone;

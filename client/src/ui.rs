@@ -107,7 +107,8 @@ pub fn ClientApp() {
     let address = address_field();
     // Cranpose's pointer: the buttons of the controllers and the beams. `None` outside a headset.
     let pointer_settings = local_pointer_settings().current();
-    // The models of the controllers. A game draws its own controllers, so they show with the beams.
+    // The models of the controllers. A game draws its own controllers, so the Controls setting decides
+    // what shows in a game (see `models.rs`).
     let controller_models = local_controller_models().current();
     LaunchedEffect((), async move |_| {
         for address in settings::host_keys_to_forget_on_launch() {
@@ -159,8 +160,15 @@ pub fn ClientApp() {
                 // With the models off the headset draws no projection layer for them, so a game with
                 // every panel hidden costs what it cost before the models
                 if let Some(models) = &controller_models {
-                    if models.is_enabled() != beams {
-                        models.set_enabled(beams);
+                    let hands = [XrHand::Left, XrHand::Right].map(|hand| models.hand(hand));
+                    let before = hands.map(|hand| hand.is_enabled());
+                    let scene = crate::models::Scene { game_runs: now.game_runs, beams, pointing: crate::hover::hands(), carrying: crate::hover::handle_held() };
+                    let wanted = crate::models::shown(hub().controls().models_in_game, scene, before);
+                    for (((name, hand), want), had) in ["left", "right"].into_iter().zip(hands).zip(wanted).zip(before) {
+                        if want != had {
+                            log::info!("the {name} controller's model {}", if want { "shows" } else { "hides" });
+                            hand.set_enabled(want);
+                        }
                     }
                 }
             }

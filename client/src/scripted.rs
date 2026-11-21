@@ -21,6 +21,15 @@
 //!   ahead for 4 seconds, turns it 35 degrees to the right and 25 degrees up in 1 second, holds that
 //!   for 4 seconds and turns back in 1 second, again and again. With `hand_menu=open` the menu at the
 //!   left hand shows that the hand's panels move and turn with the controller.
+//! - `scripted_pointer=models` holds both controllers still in front of the head, their rays away
+//!   from the panels. The right controller presses its inputs in turn, each for 3 seconds with 3
+//!   seconds of rest between: the trigger, A, the grip, the thumbstick forward and the thumbstick to
+//!   the right. The log says each change of the right controller's inputs ("scripted models:"), so a
+//!   screen capture can be matched with the press that it shows.
+//! - `scripted_pointer=console` holds the left controller still. The right controller points at the
+//!   console for 4 seconds and away from every panel for 4 seconds, again and again. Once a game runs
+//!   the script opens the console, which a game's start closes. The log then shows the right
+//!   controller's model as it shows and hides (see `models.rs`).
 
 use crate::{place, ui};
 use cranpose::launch_args;
@@ -50,6 +59,14 @@ pub fn install_once() {
         }
         if args.string("scripted_pointer") == Some("hand") {
             turning_left_hand();
+            return;
+        }
+        if args.string("scripted_pointer") == Some("models") {
+            pressing_right_hand();
+            return;
+        }
+        if args.string("scripted_pointer") == Some("console") {
+            pointing_at_console();
             return;
         }
         let hand = if args.string("scripted_hand") == Some("left") { Hand::Left } else { Hand::Right };
@@ -88,6 +105,92 @@ fn turning_left_hand() {
         .repeating();
     log::info!("a scripted left controller turns from {LEFT_AT:?} toward {LEVEL_TO:?} to {TURNED_AT:?} toward {TURNED_TO:?} and back every 10 s");
     script_controller(left);
+}
+
+/// Where the left controller of `scripted_pointer=models` and `console` stands, in meters from the
+/// head's start, with its ray straight down, away from the panels
+const LEFT_STILL: [f32; 3] = [-0.2, -0.3, -0.35];
+const LEFT_DOWN: [f32; 3] = [-0.2, -1.3, -0.35];
+/// Where the right controller of `scripted_pointer=models` stands, with its ray to the right and down,
+/// away from the panels. The head sees the controller from its side, so the trigger turns in view.
+const RIGHT_AT: [f32; 3] = [0.1, -0.15, -0.3];
+const RIGHT_AWAY: [f32; 3] = [1.1, -0.45, -0.3];
+/// The console's middle: its subspace's origin lies a meter ahead of the head, and the console
+/// starts 0.6 m ahead of the head and 0.4 m below it (see `console_panel.rs`)
+const CONSOLE_AT: [f32; 3] = [0.0, -0.4, -0.6];
+
+/// Plays `scripted_pointer=models`: both controllers stand still, and the right one presses its inputs
+/// in turn, in a cycle of 30 seconds that repeats.
+fn pressing_right_hand() {
+    let rest = ScriptedButtons::default();
+    let left = ScriptedController::new(Hand::Left, LEFT_STILL, LEFT_DOWN).holding(Duration::from_secs(30), rest).repeating();
+    let presses = [
+        ScriptedButtons { trigger: 1.0, ..rest },
+        ScriptedButtons { primary: true, ..rest },
+        ScriptedButtons { squeeze: 1.0, ..rest },
+        ScriptedButtons { thumbstick: [0.0, 1.0], ..rest },
+        ScriptedButtons { thumbstick: [1.0, 0.0], ..rest },
+    ];
+    let right = presses
+        .iter()
+        .fold(ScriptedController::new(Hand::Right, RIGHT_AT, RIGHT_AWAY), |script, press| script.holding(Duration::from_secs(3), rest).holding(Duration::from_secs(3), *press))
+        .repeating();
+    log::info!("scripted models: the right controller at {RIGHT_AT:?} presses the trigger, A, the grip and the thumbstick in turn, 3 s each with 3 s of rest");
+    script_controller(left);
+    script_controller(right);
+}
+
+/// Plays `scripted_pointer=console`: the right controller points at the console and away from it, in
+/// a cycle of 8 seconds that repeats. Once a game runs, the script opens the console.
+fn pointing_at_console() {
+    let rest = ScriptedButtons::default();
+    let left = ScriptedController::new(Hand::Left, LEFT_STILL, LEFT_DOWN).holding(Duration::from_secs(8), rest).repeating();
+    let at = [0.15, -0.3, -0.3];
+    let right = ScriptedController::new(Hand::Right, at, CONSOLE_AT)
+        .holding(Duration::from_millis(4000), rest)
+        .moving_to(Duration::from_millis(200), (at, RIGHT_AWAY), rest)
+        .holding(Duration::from_millis(3800), rest)
+        .moving_to(Duration::from_millis(200), (at, CONSOLE_AT), rest)
+        .repeating();
+    log::info!("scripted console: the right controller points at the console's middle {CONSOLE_AT:?} and away from it, 4 s each");
+    script_controller(left);
+    script_controller(right);
+    std::thread::spawn(|| loop {
+        std::thread::sleep(Duration::from_millis(250));
+        if crate::hub::hub().backdrop().game_runs {
+            if !crate::hub::hub().console().open {
+                log::info!("scripted console: a game runs, the script opens the console");
+                crate::hub::hub().open_console();
+            }
+            return;
+        }
+    });
+}
+
+/// Logs each change of the right controller's inputs in a run of `scripted_pointer=models`, so that a
+/// screen capture can be matched with the press that it shows.
+pub fn note_input(input: &cranvr_proto::message::Input) {
+    use cranvr_proto::message::buttons;
+    use std::sync::{Mutex, OnceLock};
+    static LAST: Mutex<Option<String>> = Mutex::new(None);
+    static PRESSING: OnceLock<bool> = OnceLock::new();
+    if !*PRESSING.get_or_init(|| launch_args().string("scripted_pointer") == Some("models")) {
+        return;
+    }
+    let hand = &input.hands[1];
+    let state = format!(
+        "trigger {:.1}, A {}, grip {:.1}, thumbstick ({:.1}, {:.1})",
+        hand.trigger,
+        hand.buttons & buttons::PRIMARY != 0,
+        hand.grip,
+        hand.stick[0],
+        hand.stick[1]
+    );
+    let mut last = LAST.lock().unwrap();
+    if last.as_deref() != Some(state.as_str()) {
+        log::info!("scripted models: right {state}");
+        *last = Some(state);
+    }
 }
 
 /// One step of a controller's script: how long it lasts, and the buttons that are down.

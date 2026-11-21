@@ -1135,6 +1135,13 @@ mod tests {
         // The other settings travel in the same request
         let both = apply_set_request(settings.clone(), &serde_json::json!({"fps": 72, "controls": changed}));
         assert_eq!((both.fps, both.controls), (72, changed));
+        // The choice of the controller models in a game travels with the mapping both ways
+        assert_eq!(menu["controls"]["models_in_game"], "while_pointing");
+        let never = Controls { models_in_game: cranvr_common::controls::ModelsInGame::Never, ..changed };
+        let after = apply_set_request(settings.clone(), &serde_json::json!({"action": "set", "controls": never}));
+        assert_eq!(after.controls, never);
+        let menu: Value = serde_json::from_str(&vr_menu(&after, &[], None)).unwrap();
+        assert_eq!(menu["controls"]["models_in_game"], "never");
     }
 
     #[test]
