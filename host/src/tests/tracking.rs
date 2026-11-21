@@ -37,7 +37,7 @@ impl Headset for FakeHeadset {
     fn set_decoder_config(&self, _config: Vec<u8>) {}
     fn send_frame(&self, _frame: crate::headset::OutFrame) {}
     fn frame_submitted(&self, _sample_ns: u64) {}
-    fn bitrate_bps(&self) -> Option<u64> {
+    fn link_frame_bits(&self) -> Option<f64> {
         None
     }
     fn send_haptics(&self, _haptic: Haptic) {}

@@ -428,7 +428,7 @@ fn start_session(config: &Config, shared: &Arc<Shared>, pending: Pending, name: 
     } else {
         (MediaMode::Udp, DEFAULT_SHARD_LEN)
     };
-    let (peer, caps_views) = (pending.peer, pending.caps.views);
+    let (peer, caps_views, cable) = (pending.peer, pending.caps.views, pending.caps.tcp_only);
     let link = match pending.accept(stream.clone(), mode, shard_len) {
         Ok(link) => link,
         Err(e) => {
@@ -437,7 +437,7 @@ fn start_session(config: &Config, shared: &Arc<Shared>, pending: Pending, name: 
         }
     };
     info!("Native protocol: {name} at {peer} connected, {} media, sealed", if link.duplex.has_udp() { "UDP" } else { "TCP" });
-    let session = Arc::new(Session::new(link, &stream, config.display_lock));
+    let session = Arc::new(Session::new(link, &stream, config.display_lock, cable));
     session.displays.set(displays::Displays::start(config.desktop.clone(), Arc::clone(&session))).ok();
     if config.audio {
         audio::attach(&session);
@@ -984,8 +984,22 @@ struct FocusState {
 }
 
 /// The host's end of a connected client.
+/// What one frame of the eye stream may carry on average over a cable to a Quest 3, in bits: 40 Mbps
+/// at 120 Hz. On the cable (`adb reverse`) a frame moved at about 150 Mbps. With a moving game and a
+/// target of 100 Mbps (70 sent) 3 to 7 percent of the frames came too late in bursts of 15 to 20 s,
+/// against 0.05 percent with frames 1 ms apart on the encoder's time line. At 40 (28 sent) 0.2
+/// percent came late, the same as at 30. The time from the pose to the display stayed at 43 ms.
+const CABLE_FRAME_BITS: f64 = 40e6 / 120.0;
+/// The same over a network, in bits: 12 Mbps at 120 Hz, which sends about the 8.5 Mbps that the eye
+/// stream sent before. On a Wi-Fi 6 network the share of late frames rose with every step: 4 percent
+/// at 8.5 Mbps sent, 8 at 14, 18 at 28 and 57 to 86 at 70. Issue #97 asks the host to adapt instead.
+const NETWORK_FRAME_BITS: f64 = 12e6 / 120.0;
+
 struct Session {
     link: HostLink,
+    /// The client reaches the host over a cable (`adb reverse`): the eye stream's limit is
+    /// `CABLE_FRAME_BITS`, else `NETWORK_FRAME_BITS`
+    cable: bool,
     clock: Mutex<ClockSync>,
     history: Mutex<History>,
     input: Mutex<InputState>,
@@ -1017,11 +1031,12 @@ struct Session {
 }
 
 impl Session {
-    fn new(link: HostLink, stream: &cranvr_proto::message::StreamParams, lock_on: bool) -> Self {
+    fn new(link: HostLink, stream: &cranvr_proto::message::StreamParams, lock_on: bool, cable: bool) -> Self {
         let period = (1e9 / stream.refresh_hz.max(1.0) as f64) as Nanos;
         let udp = link.duplex.has_udp();
         Self {
             link,
+            cable,
             clock: Mutex::new(ClockSync::new()),
             history: Mutex::new(History::default()),
             input: Mutex::new(InputState::default()),
@@ -1394,8 +1409,9 @@ impl Headset for Native {
 
     fn frame_submitted(&self, _sample_ns: u64) {}
 
-    fn bitrate_bps(&self) -> Option<u64> {
-        None
+    fn link_frame_bits(&self) -> Option<f64> {
+        let session = self.shared.session()?;
+        Some(if session.cable { CABLE_FRAME_BITS } else { NETWORK_FRAME_BITS })
     }
 
     fn send_haptics(&self, haptic: Haptic) {

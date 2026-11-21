@@ -399,7 +399,12 @@ pub struct Stats {
     pub game_frames: u64,
     pub render_ms: f64,
     pub encode_ms: f64,
+    /// The eye stream's bitrate: the one that the user set, at most what the link carries
     pub mbps: u64,
+    /// The bitrate that the user set
+    pub mbps_set: u64,
+    /// What the eye stream sent
+    pub sent_mbps: f64,
     /// From the pose to the display, as the headset reports it
     pub latency_ms: Option<f64>,
 }
@@ -569,6 +574,8 @@ impl Model {
                     render_ms: v["render_ms"].as_f64().unwrap_or(0.0),
                     encode_ms: v["encode_ms"].as_f64().unwrap_or(0.0),
                     mbps: v["mbps"].as_u64().unwrap_or(0),
+                    mbps_set: v["mbps_set"].as_u64().unwrap_or(0),
+                    sent_mbps: v["sent_mbps"].as_f64().unwrap_or(0.0),
                     latency_ms: v["latency"]["total_ms"].as_f64(),
                 });
             }
@@ -1185,13 +1192,13 @@ mod tests {
         let mut model = Model::default();
         model.apply_status(&serde_json::json!({"type": "headset", "connected": true, "eye": [2064, 2208], "fps": 120.0, "foveated": true}));
         model.apply_status(&serde_json::json!({
-            "type": "stats", "fps": 119.6, "game_frames": 0, "render_ms": 3.1, "encode_ms": 4.2, "mbps": 100,
-            "latency": {"frames": 590, "total_ms": 21.5, "rtt_ms": 2.0, "decode_ms": 3.0}
+            "type": "stats", "fps": 119.6, "game_frames": 0, "render_ms": 3.1, "encode_ms": 4.2, "mbps": 40, "mbps_set": 100,
+            "sent_mbps": 28.2, "latency": {"frames": 590, "total_ms": 21.5, "rtt_ms": 2.0, "decode_ms": 3.0}
         }));
         let headset = model.headset.clone().unwrap();
         assert_eq!((headset.eye, headset.fps, headset.foveated), ((2064, 2208), 120.0, true));
         let stats = model.stats.clone().unwrap();
-        assert_eq!((stats.fps, stats.mbps, stats.latency_ms), (119.6, 100, Some(21.5)));
+        assert_eq!((stats.fps, stats.mbps, stats.mbps_set, stats.sent_mbps, stats.latency_ms), (119.6, 40, 100, 28.2, Some(21.5)));
         model.apply_status(&serde_json::json!({"type": "headset", "connected": false}));
         assert!(model.headset.is_none() && model.stats.is_none());
     }
