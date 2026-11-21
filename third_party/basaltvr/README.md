@@ -41,10 +41,9 @@ applies these patches and builds both parts.
   hand with the velocities of both. An action space on `/input/aim/pose` follows the aim pose, one
   on `/input/grip/pose` the grip pose, in `xrLocateSpace` and `xrLocateViews`. A hand that the daemon
   fed with the plain `CONTROLLER_MOTION` has no aim pose, and its aim space follows the grip pose.
-- A runtime without the patch closes the connection at a message that it does not know. The runtime
-  therefore writes `runtime-features.txt` (the word `aim`) next to the control file at session
-  creation, as it writes `game-program.txt`. cranvr-host sends the message only to a runtime that
-  wrote the file. The control protocol keeps its version 9.
+- A runtime without the patch closes the connection at a message that it does not know. cranvr-host
+  sends the message to every runtime, because the cranvr app starts no game with a runtime older than
+  its game support. The control protocol keeps its version 9.
 - The test daemon sends the new message for the left hand and a plain one when the controller comes
   back. The smoke test locates the aim space and the grip space of that hand and checks both.
 
@@ -58,9 +57,8 @@ applies these patches and builds both parts.
   it listed before, and the gate `DXMT_BASALT_IOSURFACE=1` must be on.
 - New control messages: `TRACKING_REQUEST` (19, to the host: the features that the game uses),
   `HAND_TRACKING` (20), `BODY_TRACKING` (21), `FACE_TRACKING` (22) and `EYE_GAZE` (23). They are
-  documented in `basalt_control_protocol.h`. The runtime writes the word `tracking` to
-  `runtime-features.txt`, and cranvr-host sends 20 to 23 only to a runtime that wrote it. The
-  control protocol keeps its version 9.
+  documented in `basalt_control_protocol.h`. cranvr-host sends 20 to 23 to every runtime, as it
+  sends 18. The control protocol keeps its version 9.
 - A hand and a body arrive as a root pose with velocities and joints in the headset's tracking
   space. The runtime moves them into LOCAL like the head and the controllers, and moves them forward
   by their velocity from the sample's arrival to the game's locate time, at most 50 ms. A sample older

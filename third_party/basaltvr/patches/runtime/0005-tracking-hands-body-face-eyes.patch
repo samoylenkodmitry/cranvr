@@ -10,9 +10,8 @@ the list is the one of the runtime without the patch.
 
 New control messages: TRACKING_REQUEST (19, runtime to host: the features that
 the game uses), HAND_TRACKING (20), BODY_TRACKING (21), FACE_TRACKING (22) and
-EYE_GAZE (23). The runtime writes the word "tracking" to runtime-features.txt.
-cranvr-host sends 20 to 23 only to a runtime that wrote it. The protocol keeps
-its version 9.
+EYE_GAZE (23). cranvr-host sends 20 to 23 to every runtime, as it sends 18.
+The protocol keeps its version 9.
 
 A hand and a body arrive as a root pose with velocities and joints in the
 headset's tracking space. The runtime moves them into LOCAL like the head and
@@ -38,19 +37,19 @@ index fa58663..744ab8b 100644
  
  target_include_directories(basalt_openxr PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 diff --git a/runtime/pe/basalt_control_protocol.h b/runtime/pe/basalt_control_protocol.h
-index ced3878..95c4480 100644
+index b91b80a..a3f1759 100644
 --- a/runtime/pe/basalt_control_protocol.h
 +++ b/runtime/pe/basalt_control_protocol.h
-@@ -80,6 +80,40 @@
+@@ -79,6 +79,40 @@
   *     u32 reserved (zero)
   *   TEARDOWN (either direction)
   *     u32 reason (BASALT_TEARDOWN_*)
 + *
-+ * cranvr: tracking of hands, body, face and eyes (messages 19 to 23). The runtime
-+ * says that it takes them by writing the word "tracking" to runtime-features.txt
-+ * next to the control file, as it does for "aim". A daemon must not send
-+ * messages 20 to 23 to a runtime that did not: it closes the connection at a
-+ * message that it does not know. The daemon also writes tracking-features.txt
++ * cranvr: tracking of hands, body, face and eyes (messages 19 to 23). A runtime
++ * without these messages closes the connection at 20 to 23, as at
++ * CONTROLLER_MOTION_AIM. cranvr-host sends them to every runtime: the cranvr
++ * app starts no game with a runtime older than its game support.
++ * The daemon also writes tracking-features.txt
 + * next to the control file: the features of the connected headset, as words
 + * (hands body full_body face eyes). The runtime reads it before a game lists its
 + * OpenXR extensions, and lists the extensions of those features only. A feature
@@ -82,7 +81,7 @@ index ced3878..95c4480 100644
   */
  
  #define BASALT_CONTROL_PROTOCOL_VERSION 9u
-@@ -113,6 +147,20 @@ enum {
+@@ -112,6 +146,20 @@ enum {
      BASALT_MSG_CONTROLLER_MASK = 16,
      BASALT_MSG_FRAME_CONSUMED = 17,
      BASALT_MSG_CONTROLLER_MOTION_AIM = 18,
@@ -104,7 +103,7 @@ index ced3878..95c4480 100644
  
  enum {
 diff --git a/runtime/pe/control.cpp b/runtime/pe/control.cpp
-index 3b802f4..9444aca 100644
+index 20e2fa8..867d581 100644
 --- a/runtime/pe/control.cpp
 +++ b/runtime/pe/control.cpp
 @@ -100,6 +100,63 @@ struct ButtonInputRecord {
@@ -427,7 +426,7 @@ index 3b802f4..9444aca 100644
          } else if (type == BASALT_MSG_FRAME_CONSUMED && payloadLength == 8) {
              uint64_t frameNumber = 0;
              std::memcpy(&frameNumber, payload, sizeof(frameNumber));
-@@ -1392,6 +1676,8 @@ bool controlInputSnapshot(
+@@ -1391,6 +1675,8 @@ bool controlInputSnapshot(
                      localFromQuest.orientation, source.rawAimAngularVelocity);
              }
          }
@@ -436,7 +435,7 @@ index 3b802f4..9444aca 100644
          for (const ButtonInputRecord& source : gButtonInputs) {
              if (!source.valid || snapshot->buttonCount >= kControlButtonCapacity) {
                  continue;
-@@ -1648,6 +1934,177 @@ void controlFrameReady(
+@@ -1647,6 +1933,177 @@ void controlFrameReady(
      ReleaseSRWLockExclusive(&gControlLock);
  }
  
@@ -614,27 +613,7 @@ index 3b802f4..9444aca 100644
  // cranvr: the share of the configured view size for this game, from
  // game-sizes.txt next to the control file. cranvr-host writes a line
  // "<share> <program path>" when a game stays below the headset's rate. The
-@@ -1721,9 +2178,10 @@ void writeGameProgram() {
-     }
- }
- 
--// cranvr: this runtime takes CONTROLLER_MOTION_AIM. cranvr-host reads the file
--// when the game connects, as it reads game-program.txt, and sends the message
--// to a runtime that wrote it. A runtime without this patch writes no file.
-+// cranvr: this runtime takes CONTROLLER_MOTION_AIM ("aim") and the tracking
-+// messages 19 to 23 ("tracking"). cranvr-host reads the file when the game
-+// connects, as it reads game-program.txt, and sends a message only to a
-+// runtime that named it. A runtime without the patch writes no file.
- void writeRuntimeFeatures() {
-     char path[MAX_PATH]{};
-     char program[MAX_PATH]{};
-@@ -1731,11 +2189,46 @@ void writeRuntimeFeatures() {
-         return;
-     }
-     if (FILE* file = std::fopen(path, "w")) {
--        std::fputs("aim\n", file);
-+        std::fputs("aim tracking\n", file);
-         std::fclose(file);
+@@ -1720,6 +2177,41 @@ void writeGameProgram() {
      }
  }
  
@@ -677,7 +656,7 @@ index 3b802f4..9444aca 100644
      InitOnceExecuteOnce(&gGameViewScaleOnce, initGameViewScale, nullptr, nullptr);
      return gGameViewScale;
 diff --git a/runtime/pe/control.hpp b/runtime/pe/control.hpp
-index 174219a..a18b708 100644
+index 7bda9db..7d2d55b 100644
 --- a/runtime/pe/control.hpp
 +++ b/runtime/pe/control.hpp
 @@ -88,8 +88,15 @@ inline bool controlButtonPressed(uint32_t valueType, float value) {
@@ -696,15 +675,9 @@ index 174219a..a18b708 100644
      // cranvr: the same controllers with the aim pose and its velocities in place
      // of the grip pose's. Equal to `controllers` for a hand whose daemon sent no
      // aim pose, so an aim action space then lies at the grip pose.
-@@ -179,8 +186,64 @@ float controlGameViewScale();
+@@ -178,4 +185,60 @@ float controlGameViewScale();
+ // file, so cranvr-host can keep a render size per game.
  void writeGameProgram();
- 
- // cranvr: writes runtime-features.txt next to the control file. It names the
--// optional control messages that this runtime takes ("aim"), so cranvr-host
--// sends them only to a runtime that does.
-+// optional control messages that this runtime takes ("aim", "tracking"), so
-+// cranvr-host sends them only to a runtime that does.
- void writeRuntimeFeatures();
  
 +// cranvr: tracking of hands, body, face and eyes.
 +constexpr uint32_t kTrackedHandJoints = 26;
