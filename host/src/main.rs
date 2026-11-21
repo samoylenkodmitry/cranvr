@@ -647,7 +647,8 @@ impl ConsoleMenu {
 struct EncodeJob {
     encoder: Arc<Encoder>,
     buffer: PixelBuffer,
-    index: i64,
+    /// Where the frame stands on the encoder's time line (see [`TimeLine`])
+    presentation: Duration,
     sample: u64,
     idr: bool,
     bitrate: Option<u64>,
@@ -662,12 +663,45 @@ fn encode_loop(jobs: mpsc::Receiver<EncodeJob>) {
         if let Some(b) = job.bitrate {
             job.encoder.set_bitrate(b);
         }
-        // The eye stream's frames stand 1 ms apart on the encoder's time line, as they always did. The
-        // rate control then gives each frame the bits of 1 ms (issue #90). The displays use the real
-        // time (see `headset/native/desktop.rs`).
-        if let Err(e) = job.encoder.encode(&job.buffer, Duration::from_millis(job.index as u64), job.sample, job.idr) {
+        if let Err(e) = job.encoder.encode(&job.buffer, job.presentation, job.sample, job.idr) {
             error!("Encode: {e}");
         }
+    }
+}
+
+/// The encoder of the eye stream: frames of `width` x `height` at `fps` and `bitrate_bps` on average,
+/// a key frame at least every 10 s.
+fn eye_encoder_config([width, height]: [u32; 2], fps: f32, full_range: bool, bitrate_bps: u64, strict_rate: bool) -> EncoderConfig {
+    EncoderConfig { width, height, fps, bitrate_bps, full_range, strict_rate, key_every: Some(cranvr_vt::KEY_EVERY), max_qp: None }
+}
+
+/// Where the eye stream's frames stand on the encoder's time line: each frame stands after the one
+/// before by the real time between them, at which they left the render. VideoToolbox's rate control
+/// gives a frame the bits of that time: at 120 Hz and 100 Mbps, 104 KB. Before, the frames stood 1 ms
+/// apart, so a frame got 12.5 KB and the stream sent 5 to 8 percent of its bitrate (issue #90).
+struct TimeLine {
+    /// The longest step: two frames at the stream's rate
+    longest: Duration,
+    /// The last frame: when it left the render and where it stands
+    last: Option<(Instant, Duration)>,
+}
+
+impl TimeLine {
+    fn new(fps: f32) -> Self {
+        Self { longest: Duration::from_secs_f64(2.0 / f64::from(fps.max(1.0))), last: None }
+    }
+
+    /// The place of a frame that leaves the render at `now`. A frame after a pause, such as a game's
+    /// load, stands two frames after the last: the pause saves up no bits for it, which made the
+    /// first frame after a pause of 1 s 1.5 times the largest of the others. The time line grows by a
+    /// microsecond at least.
+    fn at(&mut self, now: Instant) -> Duration {
+        let at = match self.last {
+            None => Duration::ZERO,
+            Some((then, at)) => at + now.saturating_duration_since(then).clamp(Duration::from_micros(1), self.longest),
+        };
+        self.last = Some((now, at));
+        at
     }
 }
 
@@ -900,6 +934,8 @@ fn frame_loop(
     // Encoder time of the frames encoded since the last stats line, and their count
     let encoder_time_us = Arc::new(AtomicU64::new(0));
     let encoded_frames = Arc::new(AtomicU64::new(0));
+    // The bytes of the encoded frames since the last stats line, for the bitrate that the stream sends
+    let encoded_bytes = Arc::new(AtomicU64::new(0));
     // What the video-send thread needs to know about each frame besides the encoder's output. The
     // frame loop notes it when it hands the frame to the encoder. The thread takes it by the
     // frame's tracking sample.
@@ -907,7 +943,7 @@ fn frame_loop(
     {
         let headset = Arc::clone(&headset);
         let notes = Arc::clone(&notes);
-        let (encoder_time_us, encoded_frames) = (Arc::clone(&encoder_time_us), Arc::clone(&encoded_frames));
+        let (encoder_time_us, encoded_frames, encoded_bytes) = (Arc::clone(&encoder_time_us), Arc::clone(&encoded_frames), Arc::clone(&encoded_bytes));
         thread::Builder::new()
             .name("video-send".into())
             .spawn(move || {
@@ -916,6 +952,7 @@ fn frame_loop(
                 for frame in receiver {
                     encoder_time_us.fetch_add(frame.encode_time.as_micros() as u64, Ordering::Relaxed);
                     encoded_frames.fetch_add(1, Ordering::Relaxed);
+                    encoded_bytes.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
                     if let Some(config) = frame.config_nals {
                         if last_config.as_ref() != Some(&config) {
                             headset.set_decoder_config(config.clone());
@@ -940,13 +977,13 @@ fn frame_loop(
     thread::Builder::new().name("encode".into()).spawn(move || encode_loop(job_receiver)).unwrap();
 
     let mut encoder: Option<(Arc<Encoder>, Negotiated, Option<Foveation>)> = None;
+    let mut time_line = TimeLine::new(120.0);
     let mut game = Game { unscale: unscale_displays, ..Game::default() };
     let mut last_sample = 0;
     // How many frames in a row rendered again for `last_sample`
     let mut repeats = 0u64;
     // The stream's rate replaces this when the encoder starts
     let mut pacer = pacer::Pacer::new(120.0).with_ready(headset.pacer_ready());
-    let mut frame_index = 0i64;
     // The display lock's plan that the loop waits for, with the instant at which its start is due
     let mut pending_plan: Option<(headset::FramePlan, Instant)> = None;
     let mut bitrate = mbps * 1_000_000;
@@ -1058,16 +1095,8 @@ fn frame_loop(
                 .foveated
                 .then(|| Foveation::new([stream.eye_width, stream.eye_height], &stream.foveation));
             let (eye_w, eye_h) = foveation.map_or((stream.eye_width, stream.eye_height), |f| (f.optimized[0], f.optimized[1]));
-            let config = EncoderConfig {
-                width: eye_w * 2,
-                height: eye_h,
-                fps: stream.fps,
-                bitrate_bps: bitrate,
-                full_range: stream.full_range,
-                strict_rate,
-                key_every: Some(cranvr_vt::KEY_EVERY),
-                max_qp: None,
-            };
+            let config = eye_encoder_config([eye_w * 2, eye_h], stream.fps, stream.full_range, bitrate, strict_rate);
+            time_line = TimeLine::new(stream.fps);
             encoder = match Encoder::new(&config, sender.clone()) {
                 Ok(e) => {
                     info!(
@@ -1146,6 +1175,7 @@ fn frame_loop(
                 (count, game_count, gpu_ms, gpu_exec_ms, since) = (0, 0, 0.0, 0.0, Instant::now());
                 encoded_frames.store(0, Ordering::Relaxed);
                 encoder_time_us.store(0, Ordering::Relaxed);
+                encoded_bytes.store(0, Ordering::Relaxed);
                 paused_frames = 0;
             }
             // Nothing is due until the focus returns: the loop turns slowly
@@ -1321,7 +1351,7 @@ fn frame_loop(
         let job = EncodeJob {
             encoder: Arc::clone(enc),
             buffer,
-            index: frame_index,
+            presentation: time_line.at(Instant::now()),
             sample: sample_id,
             idr: shared.force_idr.swap(false, Ordering::Relaxed),
             bitrate: new_bitrate.take(),
@@ -1336,7 +1366,6 @@ fn frame_loop(
         match jobs.try_send(job) {
             Ok(()) => {
                 headset.frame_submitted(sample_id);
-                frame_index += 1;
                 count += 1;
                 game_count += game_frame.is_some() as u32;
             }
@@ -1364,6 +1393,7 @@ fn frame_loop(
             let n = count.max(1) as f64;
             let encoded = encoded_frames.swap(0, Ordering::Relaxed).max(1) as f64;
             let encode_ms = encoder_time_us.swap(0, Ordering::Relaxed) as f64 / 1000.0 / encoded;
+            let sent_mbps = encoded_bytes.swap(0, Ordering::Relaxed) as f64 * 8.0 / secs / 1e6;
             let latency = headset.take_stats();
             if let Some(l) = &latency {
                 info!("Headset latency (ms, average of {} reports): {}", l["frames"], l);
@@ -1406,11 +1436,12 @@ fn frame_loop(
                 "render_ms": gpu_ms / n,
                 "encode_ms": encode_ms,
                 "mbps": bitrate / 1_000_000,
+                "sent_mbps": sent_mbps,
                 "audio_s": audio_s,
                 "latency": latency,
             }));
             info!(
-                "{:.1} fps ({game_count} game frames), render {:.2} ms (GPU {:.2} ms), encode {:.2} ms, {} Mbps target, skipped: {no_sample} no new pose, {paused_frames} loop turns while the headset's app had no focus, {no_buffer} no buffer, {busy} encoder busy, {dropped} game frames replaced, {missing} unknown images; desktop layer {layer_fps:.1} fps; poses {poses}",
+                "{:.1} fps ({game_count} game frames), render {:.2} ms (GPU {:.2} ms), encode {:.2} ms, {sent_mbps:.1} Mbps of {} Mbps target, skipped: {no_sample} no new pose, {paused_frames} loop turns while the headset's app had no focus, {no_buffer} no buffer, {busy} encoder busy, {dropped} game frames replaced, {missing} unknown images; desktop layer {layer_fps:.1} fps; poses {poses}",
                 count as f64 / secs,
                 gpu_ms / n,
                 gpu_exec_ms / n,
@@ -1451,6 +1482,10 @@ fn frame_loop(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests/eye_quality.rs"]
+mod eye_quality;
 
 #[cfg(test)]
 mod tests {
