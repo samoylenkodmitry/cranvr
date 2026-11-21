@@ -153,6 +153,7 @@ set -euo pipefail
 unsetopt BG_NICE
 
 root=${0:A:h:h}
+source "${root}/scripts/guardian.sh"
 seconds=20 fps=120 fps_given=0 game=0 desktop=0 client=mac serial="" report=""
 displays=1 hold=0 hand_hold=0 displays_in_game=0 display_test=0
 tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 hand_interaction="" openvr_wine=0 openvr_actions="" openvr_overlay=0 openvr_gl=0 face_source=audio
@@ -317,7 +318,7 @@ host_args+=("${more_host_args[@]}")
 
 pids=()
 adb_cmd=()
-package="" guardian_before=""
+package=""
 # The port of the cranvr app's host, where the headset goes back after a run
 readonly owner_port=9950
 
@@ -346,6 +347,8 @@ give_back() {
 }
 
 cleanup() {
+    # Guardian first: nothing below may keep it paused
+    guardian_restore || true
     for pid in "${pids[@]}"; do
         kill "${pid}" 2>/dev/null || true
     done
@@ -356,12 +359,12 @@ cleanup() {
     if [[ -n ${package} ]]; then
         "${adb_cmd[@]}" shell am force-stop "${package}" >/dev/null 2>&1 || true
     fi
-    if [[ ${client} == quest ]]; then
-        "${adb_cmd[@]}" shell setprop debug.oculus.guardian_pause "${guardian_before:-0}" >/dev/null 2>&1 || true
-        [[ -z ${package} ]] || give_back
+    if [[ ${client} == quest && -n ${package} ]]; then
+        give_back
     fi
 }
 trap cleanup EXIT
+guardian_traps
 
 # The host's status line for a connected headset
 headset_connected() {
@@ -412,10 +415,8 @@ if [[ ${client} == quest ]]; then
     "${adb_cmd[@]}" shell input keyevent KEYCODE_WAKEUP
     # Keeps the display on without a face in the headset
     "${adb_cmd[@]}" shell am broadcast -a com.oculus.vrpowermanager.prox_close >/dev/null
-    # A headset that lies still loses its place in the room. The boundary then covers the app
-    # with a dialog. The pause lasts for the run; cleanup sets the old value again.
-    guardian_before=$("${adb_cmd[@]}" shell getprop debug.oculus.guardian_pause | tr -d '\r')
-    "${adb_cmd[@]}" shell setprop debug.oculus.guardian_pause 1
+    # The pause lasts for the run. Cleanup sets the exact old value again (see guardian.sh).
+    guardian_pause "${adb_cmd[@]}" || { print -u2 "Cannot read Guardian's value on the Quest"; exit 1; }
 fi
 
 # A fresh config folder gives the host a new key. A headset refuses a known address with a new
@@ -519,7 +520,8 @@ case ${client} in
             client_exit=1
         else
             print "Streaming for ${seconds} seconds"
-            sleep "${seconds}"
+            # A signal ends the wait at once, so cleanup gives Guardian back without delay
+            sleep "${seconds}" & wait $!
             # What the headset shows, both eyes after its compositor
             "${adb_cmd[@]}" exec-out screencap -p > "${work}/quest.png" || true
         fi

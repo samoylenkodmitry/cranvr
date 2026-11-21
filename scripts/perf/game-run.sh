@@ -10,8 +10,8 @@
 # must be paired with it already (see "Pairing" in the README). The script wakes the headset
 # without a wearer (proximity sensor and guardian off), starts the Cranpose client
 # (dev.cranvr.client) and the game without sound, records the host's stats and the Mac's GPU
-# use, then stops the game and gives the headset its guardian back. The proximity sensor stays
-# closed, so the headset stays awake.
+# use, then stops the game and sets Guardian back to its exact old value, on a failure or a kill too
+# (see scripts/guardian.sh). The proximity sensor stays closed, so the headset stays awake.
 #
 # Environment:
 #   ANDROID_SERIAL   the Quest, when adb sees more than one device
@@ -28,6 +28,7 @@ label=$1 secs=$2
 program=${3:-'C:\Program Files (x86)\Steam\steamapps\common\Beat Saber\Beat Saber.exe'}
 [[ -n $label && -n $secs ]] || { sed -n '4,8p' $0; exit 2; }
 repo=${0:A:h:h:h}
+source "$repo/scripts/guardian.sh"
 out=${CRANVR_PERF_DIR:-$repo/target/perf}
 config="$HOME/Library/Application Support/cranvr"
 log="$config/host.log"
@@ -41,17 +42,20 @@ set_pacing() {
 }
 
 restore() {
+    # Guardian first: nothing below may keep it paused
+    guardian_restore || true
     [[ -n $paced_hz ]] && set_pacing $paced_hz
     pkill -f "$(basename "${program//\\//}")" || true
     pkill -f UnityCrashHandler64 || true
-    adb shell setprop debug.oculus.guardian_pause 0
 }
+paced_hz=""
 trap restore EXIT
+guardian_traps
 
 skip=$(grep -c "" "$log")
 adb shell input keyevent KEYCODE_WAKEUP
 adb shell am broadcast -a com.oculus.vrpowermanager.prox_close > /dev/null
-adb shell setprop debug.oculus.guardian_pause 1
+guardian_pause adb || { echo "cannot read Guardian's value"; exit 1; }
 # The Cranpose client takes the host's address and the start of the connection from the extras
 # of its launch
 launch_extras=(--ez connect true)
@@ -68,7 +72,7 @@ fi
 (cd $repo && scripts/run-game.sh --mute "$program" > $out/game-$label.log 2>&1 &)
 for i in {1..90}; do tail -n +$skip "$log" | grep -q "Game connected" && break; sleep 1; done
 tail -n +$skip "$log" | grep -q "Game connected" || { echo "no game"; exit 1; }
-sleep 25
+sleep 25 & wait $!
 for i in $(seq 1 $((secs / 2))); do
     ioreg -r -d 1 -c IOAccelerator | grep -oE '"Device Utilization %"=[0-9]+' | cut -d= -f2
     sleep 2

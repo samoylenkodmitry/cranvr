@@ -155,7 +155,10 @@ pub fn HandPanels(state: HandState, console_open: bool) {
     }
     let (target, frame) = anchor();
     let layout = state.layout.get();
-    let pinned_shown = layout.pinned().filter(|stream| layout.shown(PanelId::Display(*stream)));
+    // The display on the hand while the host offers it. The strip has no button for a display that the
+    // host does not offer.
+    let on_hand = layout.hand_display();
+    let pinned_shown = on_hand.filter(|stream| layout.shown(PanelId::Display(*stream)));
     let open = state.menu_open.get();
     // The menu closes itself after a while without a pointer over a panel. A test launch that opens it
     // keeps it open: no hand keeps a ray over it on a desk.
@@ -175,7 +178,7 @@ pub fn HandPanels(state: HandState, console_open: bool) {
         }
     });
     FollowingSubspace(target, move || {
-        Strip(state, frame.base, layout.pinned());
+        Strip(state, frame.base, on_hand);
         if open {
             Menu(state, console_open, frame);
         }
@@ -359,7 +362,14 @@ fn perform(action: MenuAction, state: HandState) {
             log::info!("the hand menu puts display {} {}", stream - cranvr_proto::message::DESKTOP_STREAM + 1, if layout.pinned() == Some(stream) { "on the left hand" } else { "back in the room" });
             commit(state, layout);
         }
-        MenuAction::RemoveDisplay(stream) => displays().request_remove(stream),
+        MenuAction::RemoveDisplay(stream) => {
+            // The display's place goes with it, in a game too
+            displays().request_remove(stream);
+            layout.forget(stream);
+            log::info!("the hand menu removes display {}", stream - cranvr_proto::message::DESKTOP_STREAM + 1);
+            layout.save();
+            state.layout.set(layout);
+        }
         MenuAction::AddDisplay => displays().request_add(),
         MenuAction::Recenter => {
             log::info!("the hand menu puts the panels in front of the user again");
