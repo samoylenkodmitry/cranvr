@@ -278,6 +278,8 @@ struct Run {
     frames: Vec<(f64, usize, bool)>,
     /// Pictures that the encoder dropped
     dropped: usize,
+    /// The encode times of the frames, in ms
+    encode_ms: Vec<f64>,
 }
 
 /// The display's pictures: `tiles` copies of the made-up desktop across and down, at up to `fps` a
@@ -309,7 +311,7 @@ fn measure(script: &[(Motion, Duration)], format: Format, mbps: u64, spacing: Sp
     let mut decoder: Option<Decoder> = None;
     let start = Instant::now();
     let mut feed = Feed::new(start);
-    let mut run = Run { points: Vec::new(), frames: Vec::new(), dropped: 0 };
+    let mut run = Run { points: Vec::new(), frames: Vec::new(), dropped: 0, encode_ms: Vec::new() };
     let (mut state, mut rng) = (State::default(), Rng(11));
     let mut capture: Option<(u64, PixelBuffer)> = None;
     let mut source = vec![0u8; WIDTH * HEIGHT];
@@ -397,6 +399,7 @@ fn measure(script: &[(Motion, Duration)], format: Format, mbps: u64, spacing: Sp
                                 (0..HEIGHT).flat_map(|row| picture.luma[row * picture.width..row * picture.width + WIDTH].to_vec()).collect()
                             });
                             run.frames.push((t.as_secs_f64(), frame.data.len(), frame.is_idr));
+                            run.encode_ms.push(frame.encode_time.as_secs_f64() * 1000.0);
                         }
                         None => run.dropped += 1,
                     }
@@ -497,7 +500,16 @@ fn display_quality_curve() {
         }
     }
     let keys: Vec<String> = run.frames.iter().filter(|f| f.2).map(|f| format!("{:.1} s ({} KB)", f.0, f.1 / 1000)).collect();
-    println!("{} frames, {} dropped, key frames at {}", run.frames.len(), run.dropped, keys.join(", "));
+    let mut encode = run.encode_ms.clone();
+    encode.sort_by(f64::total_cmp);
+    println!(
+        "{} frames, {} dropped, encode {:.1} ms (median), {:.1} ms (p95), key frames at {}",
+        run.frames.len(),
+        run.dropped,
+        encode.get(encode.len() / 2).copied().unwrap_or(0.0),
+        encode.get(encode.len() * 95 / 100).copied().unwrap_or(0.0),
+        keys.join(", ")
+    );
     for second in 0..66 {
         let inside: Vec<&Point> = between(&run.points, f64::from(second), f64::from(second + 1)).collect();
         let bytes: usize = run.frames.iter().filter(|f| f.0 as u32 == second).map(|f| f.1).sum();
