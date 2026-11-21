@@ -196,7 +196,7 @@ pub struct EncoderConfig {
     /// only first and when the caller forces one.
     pub key_every: Option<Duration>,
     /// The highest quantizer that a frame may use, for a floor under the quality. `None` leaves it to
-    /// the rate control.
+    /// the rate control. It holds for the whole session.
     pub max_qp: Option<u8>,
 }
 
@@ -293,8 +293,9 @@ impl Encoder {
             // 0 means no interval: key frames come only when the host asks.
             let key_interval = config.key_every.map_or(f64::from(i32::MAX), |every| (config.fps * every.as_secs_f32()).round() as f64);
             encoder.set_number(kVTCompressionPropertyKey_MaxKeyFrameInterval, key_interval)?;
-            // A cap on the quantizer is a floor under the quality. The encoder spends more bits on a hard
-            // picture, or drops it, instead of blurring it. macOS 12 and later.
+            // A cap on the quantizer is a floor under the quality: the encoder spends what a frame needs
+            // and passes the average bitrate on a hard picture. VideoToolbox reads it once, here: a
+            // change later in the session had no effect. macOS 12 and later; an older one keeps no cap.
             if let Some(qp) = config.max_qp {
                 encoder.set_number(kVTCompressionPropertyKey_MaxAllowedFrameQP, f64::from(qp)).ok();
             }
