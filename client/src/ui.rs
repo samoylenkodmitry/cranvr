@@ -169,28 +169,11 @@ pub fn ClientApp() {
     });
     // The client asks the host for the displays that show and for no other: a display that is not shown
     // costs the Mac and the headset nothing. The list of displays also shows a display that the user
-    // adds at once, and forgets a display that left.
+    // adds at once. A display that the host does not offer keeps its place (see `panel_layout.rs`).
     LaunchedEffect((), async move |_| {
-        let mut known: Option<Vec<u8>> = None;
         loop {
             let mut current = layout.get_non_reactive();
-            let mut changed = false;
-            if let Some(listed) = displays().listed_streams() {
-                if known.as_ref() != Some(&listed) {
-                    if let Some(before) = &known {
-                        for stream in listed.iter().filter(|stream| !before.contains(stream)) {
-                            current.set_shown(PanelId::Display(*stream), true);
-                        }
-                    }
-                    current.forget_missing(&listed);
-                    known = Some(listed);
-                    changed = true;
-                }
-            }
-            if changed {
-                if !current.in_game() {
-                    current.save();
-                }
+            if current.follow_host(displays().listed_streams()) {
                 layout.set(current.clone());
             }
             let focused = crate::focus::current().is_focused();

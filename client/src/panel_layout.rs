@@ -12,6 +12,12 @@
 //! One display can ride on the left hand instead of standing in the room (see `hand_menu.rs`). The
 //! choice to show it is the same as for any display, and it is saved.
 //!
+//! Each display keeps its place by its stream: shown or hidden, in the room or on the hand. Its pose
+//! and its width stay in `place.rs`. A host that offers fewer displays, such as a test host, changes
+//! none of it: a display that the host does not offer only shows nothing. The place comes back when
+//! a host offers that display again. A display goes away from the layout only when the user removes
+//! it in the hand menu.
+//!
 //! The console's own state is the hub's (see `console.rs`): its opening follows the host's menu and
 //! the hold of the left menu button. This file only names it, so the menu can list it.
 //!
@@ -73,11 +79,14 @@ pub struct Layout {
     /// A test's panels (the launch extra `shown`): they show in the room and in each game, and nothing
     /// is saved
     test: Option<BTreeSet<PanelId>>,
+    /// The displays that the host offers now and the number of the session that offers them. `None`
+    /// while no session lists displays. It is not saved.
+    offered: Option<(u64, BTreeSet<u8>)>,
 }
 
 impl Default for Layout {
     fn default() -> Self {
-        Self { room: [PanelId::Connection, PanelId::Stats, PanelId::Display(DESKTOP_STREAM)].into(), game: BTreeSet::new(), in_game: false, pinned: None, test: None }
+        Self { room: [PanelId::Connection, PanelId::Stats, PanelId::Display(DESKTOP_STREAM)].into(), game: BTreeSet::new(), in_game: false, pinned: None, test: None, offered: None }
     }
 }
 
@@ -126,6 +135,7 @@ impl Layout {
     pub fn load() -> Self {
         let get = |key: &str| preferences().get(key);
         let mut layout = Self::from_saved(get(ROOM_KEY).as_deref(), get(PINNED_KEY).as_deref());
+        log::info!("the panels' saved layout: {}", layout.saved_text());
         // A test chooses the panels and the pinned display with launch extras and saves nothing:
         // `shown` is a list such as `display1,stats` and `pinned` a display's number
         let args = cranpose::launch_args();
@@ -158,7 +168,14 @@ impl Layout {
                 log::warn!("the panels' layout was not saved: {e}");
             }
         }
+        log::info!("the panels' layout is saved: {}", self.saved_text());
     }
+
+    /// The saved choice in words, for the log
+    fn saved_text(&self) -> String {
+        format!("room [{}], hand [{}]", self.room_text(), self.pinned_text())
+    }
+
 
     fn set(&self) -> &BTreeSet<PanelId> {
         if self.in_game {
@@ -208,13 +225,23 @@ impl Layout {
         self.in_game
     }
 
-    /// The displays that show now, in the order of their streams.
+    /// The displays that show now, in the order of their streams: the shown ones that the host offers.
     pub fn displays_shown(&self) -> Vec<u8> {
-        self.set().iter().filter_map(|id| if let PanelId::Display(stream) = id { Some(*stream) } else { None }).collect()
+        self.set().iter().filter_map(|id| if let PanelId::Display(stream) = id { Some(*stream) } else { None }).filter(|stream| self.offers(*stream)).collect()
     }
 
+    /// The display that the user put on the left hand, offered by the host or not
     pub fn pinned(&self) -> Option<u8> {
         self.pinned
+    }
+
+    /// The display on the left hand while the host offers it
+    pub fn hand_display(&self) -> Option<u8> {
+        self.pinned.filter(|stream| self.offers(*stream))
+    }
+
+    fn offers(&self, stream: u8) -> bool {
+        self.offered.as_ref().is_some_and(|(_, streams)| streams.contains(&stream))
     }
 
     /// Puts the display on the left hand, or back in the room when it is on the hand already.
@@ -222,13 +249,35 @@ impl Layout {
         self.pinned = if self.pinned == Some(stream) { None } else { Some(stream) };
     }
 
-    /// The host's list of displays: a display that left it is forgotten, so a new display on its
-    /// stream starts hidden and in the room.
-    pub fn forget_missing(&mut self, streams: &[u8]) {
-        let gone = |id: &PanelId| matches!(id, PanelId::Display(stream) if !streams.contains(stream));
-        self.room.retain(|id| !gone(id));
-        self.game.retain(|id| !gone(id));
-        if self.pinned.is_some_and(|stream| !streams.contains(&stream)) {
+    /// Follows the host's list of displays in a session, given as `(session, streams)`, or `None`
+    /// while no session lists any. Each display keeps its place whether the host offers it or not,
+    /// and nothing is saved for it. A display that a later list of the same session adds, such as
+    /// one that the user asked for, shows at once: the room's choice is then saved. The first list of
+    /// a session shows nothing new. Returns whether the layout changed.
+    pub fn follow_host(&mut self, offer: Option<(u64, Vec<u8>)>) -> bool {
+        let next = offer.map(|(session, streams)| (session, streams.into_iter().collect::<BTreeSet<u8>>()));
+        if next == self.offered {
+            return false;
+        }
+        let added: Vec<u8> = match (&self.offered, &next) {
+            (Some((was, before)), Some((session, now))) if was == session => now.difference(before).copied().collect(),
+            _ => Vec::new(),
+        };
+        self.offered = next;
+        for stream in &added {
+            self.set_shown(PanelId::Display(*stream), true);
+        }
+        if !added.is_empty() && !self.in_game {
+            self.save();
+        }
+        true
+    }
+
+    /// The user removed the display: its place goes from the room, the game and the hand.
+    pub fn forget(&mut self, stream: u8) {
+        self.room.remove(&PanelId::Display(stream));
+        self.game.remove(&PanelId::Display(stream));
+        if self.pinned == Some(stream) {
             self.pinned = None;
         }
     }
@@ -270,9 +319,16 @@ pub fn layers(layout: &Layout, connected: bool, console_open: bool, menu_open: b
 mod tests {
     use super::*;
 
+    /// The layout of the first start in a session in which the host offers `streams`
+    fn offering(streams: &[u8]) -> Layout {
+        let mut layout = Layout::default();
+        assert!(layout.follow_host(Some((1, streams.to_vec()))));
+        layout
+    }
+
     #[test]
     fn a_game_with_nothing_shown_carries_the_ball_and_nothing_else() {
-        let mut layout = Layout::default();
+        let mut layout = offering(&[1, 2]);
         layout.set_in_game(true);
         // The same count as the earlier ball: one panel and no surface
         assert_eq!(layers(&layout, true, false, false, true, &[1, 2]), Layers { panels: 1, surfaces: 0 });
@@ -286,7 +342,7 @@ mod tests {
 
     #[test]
     fn the_room_shows_the_connection_the_stats_and_the_first_display() {
-        let layout = Layout::default();
+        let layout = offering(&[1]);
         assert_eq!(layers(&layout, true, true, false, true, &[1]), Layers { panels: 4, surfaces: 1 });
         // Before the link streams the connection panel shows even when the user hid it
         let mut hidden = Layout::default();
@@ -297,7 +353,7 @@ mod tests {
 
     #[test]
     fn the_first_start_shows_the_connection_the_stats_and_the_first_display() {
-        let layout = Layout::default();
+        let layout = offering(&[1, 2]);
         assert!(layout.shown(PanelId::Connection) && layout.shown(PanelId::Stats) && layout.shown(PanelId::Display(1)));
         assert!(!layout.shown(PanelId::Display(2)));
         assert_eq!(layout.displays_shown(), vec![1]);
@@ -306,7 +362,7 @@ mod tests {
 
     #[test]
     fn a_game_starts_with_nothing_shown_and_the_room_comes_back_when_it_ends() {
-        let mut layout = Layout::default();
+        let mut layout = offering(&[1, 2]);
         layout.set_in_game(true);
         assert!(!layout.shown(PanelId::Connection) && layout.displays_shown().is_empty());
         layout.set_shown(PanelId::Display(2), true);
@@ -320,7 +376,7 @@ mod tests {
 
     #[test]
     fn a_game_that_is_reported_twice_keeps_the_panels_that_the_user_picked() {
-        let mut layout = Layout::default();
+        let mut layout = offering(&[1]);
         layout.set_in_game(true);
         layout.set_shown(PanelId::Display(1), true);
         layout.set_in_game(true);
@@ -349,17 +405,93 @@ mod tests {
     }
 
     #[test]
-    fn a_display_that_leaves_the_list_is_forgotten_everywhere() {
-        let mut layout = Layout::default();
+    fn a_host_without_the_display_keeps_its_place_and_the_place_comes_back() {
+        // The user's room: display 1 on the left hand, display 2 in the room
+        let mut layout = offering(&[1, 2]);
+        layout.set_shown(PanelId::Display(2), true);
+        layout.toggle_pinned(1);
+        let saved = (layout.room_text(), layout.pinned_text());
+        assert_eq!(saved, ("connection,stats,display1,display2".to_string(), "1".to_string()));
+        assert_eq!((layout.hand_display(), layout.displays_shown()), (Some(1), vec![1, 2]));
+        // A test host with no displays: nothing shows, and nothing of the place changes
+        assert!(layout.follow_host(Some((2, vec![]))));
+        assert_eq!((layout.hand_display(), layout.displays_shown()), (None, vec![]));
+        assert_eq!(layout.pinned(), Some(1));
+        assert_eq!((layout.room_text(), layout.pinned_text()), saved);
+        // A host with only display 2, and no session at all
+        assert!(layout.follow_host(Some((3, vec![2]))));
+        assert_eq!((layout.hand_display(), layout.displays_shown()), (None, vec![2]));
+        assert!(layout.follow_host(None));
+        assert!(!layout.follow_host(None));
+        assert_eq!((layout.room_text(), layout.pinned_text()), saved);
+        // The user's host offers both again: display 1 is back on the hand
+        assert!(layout.follow_host(Some((4, vec![1, 2]))));
+        assert_eq!((layout.hand_display(), layout.displays_shown()), (Some(1), vec![1, 2]));
+        assert_eq!((layout.room_text(), layout.pinned_text()), saved);
+        // A start that reads the saved text gets the same place
+        let mut back = Layout::from_saved(Some(&saved.0), Some(&saved.1));
+        back.follow_host(Some((1, vec![1, 2])));
+        assert_eq!((back.hand_display(), back.displays_shown()), (Some(1), vec![1, 2]));
+    }
+
+    #[test]
+    fn a_hidden_display_stays_hidden_when_a_host_offers_it_again() {
+        let mut layout = offering(&[1, 2]);
+        layout.set_shown(PanelId::Display(1), false);
+        layout.follow_host(Some((2, vec![])));
+        // The first list of a session shows nothing new, though the session before had no display 1
+        layout.follow_host(Some((3, vec![1, 2])));
+        assert!(layout.displays_shown().is_empty());
+        assert_eq!(layout.room_text(), "connection,stats");
+    }
+
+    /// The only test that saves: the preferences are one store for the whole test process.
+    #[test]
+    fn the_saved_layout_changes_only_by_the_user_or_by_a_display_that_the_session_adds() {
+        let path = std::env::temp_dir().join(format!("cranvr-client-layout-{}", std::process::id()));
+        // The order of the keys differs from the order that a save writes, so any save changes the bytes
+        std::fs::write(&path, "panels:room=connection,stats,display1,display2\npanels:pinned=1\n").unwrap();
+        cranpose::set_platform_preferences(std::sync::Arc::new(cranpose::FilePreferences::at_path(&path)));
+        let bytes = || std::fs::read_to_string(&path).unwrap();
+        let before = bytes();
+        let mut layout = Layout::load();
+        // Hosts with fewer displays or none, as the client's loop follows the host's lists
+        for offer in [Some((1, vec![])), None, Some((2, vec![2])), Some((3, vec![])), Some((4, vec![1, 2]))] {
+            layout.follow_host(offer);
+            assert_eq!(bytes(), before);
+        }
+        assert_eq!((layout.hand_display(), layout.displays_shown()), (Some(1), vec![1, 2]));
+        // A display that the user adds in the session shows at once. The room's choice is saved.
+        assert!(layout.follow_host(Some((4, vec![1, 2, 3]))));
+        assert_eq!(layout.displays_shown(), vec![1, 2, 3]);
+        assert_eq!(bytes(), "panels:pinned=1\npanels:room=connection,stats,display1,display2,display3\n");
+        // In a game the added display shows in the game's pick only, and nothing is saved
+        layout.set_in_game(true);
+        let before = bytes();
+        assert!(layout.follow_host(Some((4, vec![1, 2, 3, 4]))));
+        assert_eq!(layout.displays_shown(), vec![4]);
+        assert_eq!(bytes(), before);
+        // The user removes display 1 in the hand menu: its place goes and the choice is saved
+        layout.forget(1);
+        layout.save();
+        assert_eq!(bytes(), "panels:pinned=\npanels:room=connection,stats,display2,display3\n");
+        cranpose::clear_platform_preferences();
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_display_that_the_user_removes_leaves_the_room_the_game_and_the_hand() {
+        let mut layout = offering(&[1, 2]);
         layout.set_shown(PanelId::Display(2), true);
         layout.toggle_pinned(2);
         layout.set_in_game(true);
         layout.set_shown(PanelId::Display(2), true);
-        layout.forget_missing(&[1]);
+        layout.forget(2);
         assert_eq!(layout.pinned(), None);
         assert!(layout.displays_shown().is_empty());
         layout.set_in_game(false);
         assert_eq!(layout.displays_shown(), vec![1]);
+        assert_eq!((layout.room_text(), layout.pinned_text()), ("connection,stats,display1".to_string(), String::new()));
     }
 
     #[test]

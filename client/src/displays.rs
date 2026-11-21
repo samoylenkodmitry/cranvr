@@ -47,7 +47,7 @@ use cranvr_proto::{
 };
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
         mpsc::{self, RecvTimeoutError, Sender},
         Condvar, Mutex, OnceLock,
     },
@@ -329,6 +329,8 @@ pub struct Displays {
     wake: Condvar,
     /// Whether a game runs, as the host said it with `HostMsg::GameRuns`, or `GAME_UNKNOWN`
     game_message: AtomicU8,
+    /// The number of the session, which counts up at each start
+    session: AtomicU64,
 }
 
 /// The displays of the process. The activity may rebuild the composition. The link outlives it.
@@ -363,6 +365,7 @@ impl Displays {
             uplink: Mutex::new(Uplink::default()),
             wake: Condvar::new(),
             game_message: AtomicU8::new(GAME_UNKNOWN),
+            session: AtomicU64::new(0),
         }
     }
 
@@ -370,7 +373,11 @@ impl Displays {
     /// each display's pictures, for its decode thread.
     pub fn session_start(&self, in_headset: bool) -> Vec<mpsc::Receiver<Received>> {
         self.game_message.store(GAME_UNKNOWN, Ordering::Relaxed);
-        *self.state.lock().unwrap() = State::default();
+        // The number changes under the state's lock, so a list never carries the number of another session
+        let mut state = self.state.lock().unwrap();
+        self.session.fetch_add(1, Ordering::Relaxed);
+        *state = State::default();
+        drop(state);
         *self.uplink.lock().unwrap() = Uplink::default();
         self.slots
             .iter()
@@ -662,9 +669,11 @@ impl Displays {
         self.wake.notify_all();
     }
 
-    /// The streams that the host lists, for the layout to forget the ones that left.
-    pub fn listed_streams(&self) -> Option<Vec<u8>> {
-        self.state.lock().unwrap().list.as_ref().map(|list| list.displays.iter().map(|d| d.stream).collect())
+    /// The streams that the host lists and the number of the session, for the layout: `None` before
+    /// the session's first list.
+    pub fn listed_streams(&self) -> Option<(u64, Vec<u8>)> {
+        let state = self.state.lock().unwrap();
+        state.list.as_ref().map(|list| (self.session.load(Ordering::Relaxed), list.displays.iter().map(|d| d.stream).collect()))
     }
 
     /// The lines of the stats panel: a label and a value for each display that has a stream.
@@ -1122,7 +1131,14 @@ mod tests {
         assert_eq!(view.displays.iter().map(|d| d.info.stream).collect::<Vec<_>>(), vec![1, 2]);
         assert!(view.can_add);
         assert_eq!(view.notice.as_deref(), Some("one"));
-        assert_eq!(owner.listed_streams(), Some(vec![1, 2]));
+        let (session, streams) = owner.listed_streams().unwrap();
+        assert_eq!(streams, vec![1, 2]);
+        // The next session lists nothing until its host does, and its lists carry a new number
+        owner.session_end();
+        let _units = owner.session_start(false);
+        assert_eq!(owner.listed_streams(), None);
+        owner.on_message(&HostMsg::Displays(DisplayList { displays: vec![info(1, false)], can_add: false, notice: None }));
+        assert_eq!(owner.listed_streams(), Some((session + 1, vec![1])));
     }
 
     #[test]
@@ -1330,6 +1346,9 @@ mod tests {
     #[test]
     fn the_wish_of_the_layout_follows_the_displays_that_show() {
         let mut layout = Layout::default();
+        // Before the host lists displays the layout asks for none
+        assert!(wishes_of(&layout).iter().all(Option::is_none));
+        layout.follow_host(Some((1, vec![1, 2])));
         let wishes = wishes_of(&layout);
         assert!(wishes[0].is_some() && wishes[1..].iter().all(Option::is_none));
         layout.set_shown(crate::panel_layout::PanelId::Display(2), true);
