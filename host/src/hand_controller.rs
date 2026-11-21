@@ -3,7 +3,8 @@
 //! A game that uses only the Oculus Touch controller profile knows nothing of hands. When the
 //! headset tracks a hand and no controller, the host turns the hand into what a controller of that
 //! hand would report:
-//! - the grip pose is the palm's pose, which the game puts its controller model at;
+//! - the grip pose sits at the palm joint with the axes of OpenXR's grip pose, which the game puts its
+//!   controller model at (see `grip`);
 //! - the aim pose points from the shoulder through the pinching fingers, which is how a hand points
 //!   at a menu on headsets that offer hand tracking;
 //! - pinching thumb and index finger pulls the trigger;
@@ -96,11 +97,34 @@ pub fn palm(joints: &[Joint; HAND_JOINTS]) -> Pose {
     Pose { orientation: Quat::from_array(joints[PALM].pose.orientation).normalize(), position: position(&joints[PALM]) }
 }
 
+/// The grip pose's turn from the palm joint's. XR_EXT_hand_tracking gives the palm joint a +Y out
+/// of the back of the hand and a +Z along the middle finger's metacarpal toward the wrist. Its +X
+/// then points to the little finger of the right hand and to the thumb of the left hand. OpenXR's
+/// grip pose has its +X out of the back of the left hand and into the palm of the right hand, and
+/// its -Z from the little finger to the index finger. So the grip's +X is the palm's +Y for the
+/// right hand and the palm's -Y for the left hand. The grip's -Z is the palm's -X for the right hand
+/// and its +X for the left hand.
+fn grip_turn(left: bool) -> Quat {
+    let side = if left { -1.0 } else { 1.0 };
+    let x = Vec3::new(0.0, side, 0.0);
+    let z = Vec3::new(side, 0.0, 0.0);
+    Quat::from_mat3(&glam::Mat3::from_cols(x, z.cross(x), z)).normalize()
+}
+
+/// The grip pose of a tracked hand: at the palm joint, turned to the axes of OpenXR's grip pose.
+/// A game puts the model of a controller there. With the palm joint's own axes the model's front
+/// would point along the fingers, not across the hand. The controller made of a hand and the hand
+/// interaction profile (`hand_interaction.rs`) both give a game this pose.
+pub fn grip(left: bool, joints: &[Joint; HAND_JOINTS]) -> Pose {
+    let palm = palm(joints);
+    Pose { orientation: (palm.orientation * grip_turn(left)).normalize(), position: palm.position }
+}
+
 /// The controller that `hand` stands for. `root` is the wrist's pose with its velocities, `joints`
 /// are in the same room, `left` says which hand it is, and `head` is the head's pose when known. The
 /// aim pose needs the head for the shoulder. Without it the aim pose follows the palm's direction.
 pub fn controller(left: bool, root: &DeviceMotion, joints: &[Joint; HAND_JOINTS], head: Option<&Pose>) -> HandController {
-    let grip = on_hand(root, palm(joints));
+    let grip = on_hand(root, grip(left, joints));
     HandController { grip, aim: aim(left, root, joints, head), trigger: pinch(joints), squeeze: squeeze(joints) }
 }
 
@@ -181,8 +205,43 @@ mod tests {
         assert!(squeeze(&half) > 0.4 && squeeze(&half) < 0.6, "{}", squeeze(&half));
     }
 
+    fn close(a: Vec3, b: Vec3) -> bool {
+        (a - b).length() < 1e-5
+    }
+
     #[test]
-    fn the_grip_pose_is_the_palm_and_it_moves_with_the_wrist() {
+    fn the_grip_pose_has_the_axes_of_openxr_for_a_palm_facing_down() {
+        // The test hand's joints have no turn: the palm faces down and the fingers point along -Z,
+        // so the palm joint's +X points to the right. The ray that enters the right palm and the
+        // ray that leaves the left palm both point up. The little finger of the right hand lies on
+        // the right, so its grip's -Z points to the left. The left hand's grip's -Z points to the
+        // right.
+        let wrist = Vec3::new(0.2, 1.2, -0.4);
+        let joints = hand(wrist, 0.10, 0.08);
+        let right = controller(false, &at(wrist), &joints, None).grip.pose.orientation;
+        assert!(close(right * Vec3::X, Vec3::Y), "{:?}", right * Vec3::X);
+        assert!(close(right * Vec3::NEG_Z, Vec3::NEG_X), "{:?}", right * Vec3::NEG_Z);
+        let left = controller(true, &at(wrist), &joints, None).grip.pose.orientation;
+        assert!(close(left * Vec3::X, Vec3::NEG_Y), "{:?}", left * Vec3::X);
+        assert!(close(left * Vec3::NEG_Z, Vec3::X), "{:?}", left * Vec3::NEG_Z);
+        // +Y follows from the right hand rule: toward the wrist for both hands
+        assert!(close(right * Vec3::Y, Vec3::Z) && close(left * Vec3::Y, Vec3::Z));
+    }
+
+    #[test]
+    fn the_grip_pose_turns_with_the_palm() {
+        // A right palm turned to face left, as it holds a stick that points up: the grip's +X
+        // points to the right and its -Z, from the little finger to the index finger, points up
+        let turn = Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2);
+        let mut joints = hand(Vec3::ZERO, 0.10, 0.08);
+        joints[PALM].pose.orientation = turn.to_array();
+        let grip = grip(false, &joints).orientation;
+        assert!(close(grip * Vec3::X, Vec3::X), "{:?}", grip * Vec3::X);
+        assert!(close(grip * Vec3::NEG_Z, Vec3::Y), "{:?}", grip * Vec3::NEG_Z);
+    }
+
+    #[test]
+    fn the_grip_pose_is_at_the_palm_and_it_moves_with_the_wrist() {
         let wrist = Vec3::new(0.2, 1.2, -0.4);
         let joints = hand(wrist, 0.10, 0.08);
         let root = DeviceMotion {

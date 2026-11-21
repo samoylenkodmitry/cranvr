@@ -427,9 +427,29 @@ fn u32_at(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
 }
 
+/// The +X and the -Z axis that the OpenXR grip pose of a tracked hand must have, in the room, for a
+/// palm joint turned by `palm`. The words of the specification decide them:
+/// - XR_EXT_hand_tracking: the palm joint's +Y is "perpendicular to palm surface and pointing
+///   towards the back of the hand", its +Z points along the middle finger's metacarpal "away from
+///   the finger tips", and its X follows the right hand rule. For a right hand with the palm down
+///   and the fingers forward, +Y is up, +Z is back and +X is to the right, where the little finger
+///   lies. For a left hand +X points to the thumb.
+/// - The grip pose (the standard pose identifiers, and XR_EXT_hand_interaction): its +X is the
+///   palm's normal "away from the palm of the left hand and into the palm of the right hand", and
+///   its -Z "goes from the little finger to the index finger".
+///
+/// So the right hand's grip has the palm's +Y as its +X and the palm's -X as its -Z. The left hand's
+/// grip has the palm's -Y as its +X and the palm's +X as its -Z.
+fn grip_axes(left: bool, palm: [f32; 4]) -> (glam::Vec3, glam::Vec3) {
+    let palm = glam::Quat::from_array(palm).normalize();
+    let side = if left { -1.0 } else { 1.0 };
+    (palm * glam::Vec3::Y * side, palm * glam::Vec3::NEG_X * side)
+}
+
 impl Input {
     /// What a game without hand code must have got from the probe's hands: a controller for each
-    /// hand, at the palm, with the trigger of a half-open pinch and the aim pose through the fingers
+    /// hand, with the grip pose of the OpenXR specification at the palm joint, the trigger of a
+    /// half-open pinch and the aim pose through the fingers
     fn hand_controller_problems(&self, held: bool) -> Vec<String> {
         let mut out = Vec::new();
         if self.mask != Some(3) {
@@ -440,11 +460,17 @@ impl Input {
                 out.push(format!("hand {side} made no controller with an aim pose"));
                 continue;
             }
-            let (root, joints) = tracked::hand_joints(side);
-            let mut palm = root.pose.position;
+            let (_, joints) = tracked::hand_joints(side);
+            let mut palm = joints[0].pose.position;
             palm[1] += FLOOR_LIFT;
-            if !near(self.grip[side].pose.position, palm) || !same_turn_within(self.grip[side].pose.orientation, root.pose.orientation, 1e-5) {
-                out.push(format!("hand {side}: grip at {:?} turned {:?}, expected the palm at {palm:?}", self.grip[side].pose.position, self.grip[side].pose.orientation));
+            if !near(self.grip[side].pose.position, palm) {
+                out.push(format!("hand {side}: grip at {:?}, expected the palm joint at {palm:?}", self.grip[side].pose.position));
+            }
+            let (x, minus_z) = grip_axes(side == 0, joints[0].pose.orientation);
+            let grip = glam::Quat::from_array(self.grip[side].pose.orientation).normalize();
+            let (got_x, got_minus_z) = (grip * glam::Vec3::X, grip * glam::Vec3::NEG_Z);
+            if got_x.dot(x) < 0.9999 || got_minus_z.dot(minus_z) < 0.9999 {
+                out.push(format!("hand {side}: grip +X {got_x:?} and -Z {got_minus_z:?}, expected +X {x:?} and -Z {minus_z:?} of the OpenXR grip pose"));
             }
             // The thumb tip and the index tip: 0.0418 m apart in the script. The trigger runs from 1
             // at 18 mm to 0 at 60 mm.

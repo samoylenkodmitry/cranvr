@@ -29,7 +29,10 @@
 #                 game created its trackers. Implies --game.
 #   --hand-controllers  a game without hand code: the probe tracks hands and no controller, and the
 #                 fake game checks that the host made controllers of the hands (a pinch is the
-#                 trigger, the aim pose points from the shoulder through the fingers). Implies --game.
+#                 trigger, the aim pose points from the shoulder through the fingers, the grip pose
+#                 sits at the palm joint with the axes of OpenXR's grip pose: +X into the right palm
+#                 and out of the back of the left hand, -Z from the little finger to the index
+#                 finger). Implies --game.
 #   --tracking-wine  the same through the real runtime: C:\basalt\runtime\tracking_smoke.exe runs in
 #                 Wine, creates a hand tracker for each hand, a body tracker for each joint set, a
 #                 face tracker and an eye gaze action, and compares what it reads with the script.

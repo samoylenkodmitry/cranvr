@@ -4,9 +4,10 @@
 //! poses and three gestures. The game's runtime asks for them (the hand interaction bit of
 //! `TRACKING_REQUEST`), and the host makes them from the 26 joints of `XR_EXT_hand_tracking` that
 //! the headset sends. The axes follow the extension's text:
-//! - The grip pose sits at the palm joint. Its -Z runs from the little finger to the index finger,
-//!   and its +X leaves the back of the left hand and enters the palm of the right hand. The palm
-//!   joint has other axes (its +Z points to the wrist), so the grip pose turns it.
+//! - The grip pose is the one of a controller made of a hand (`hand_controller::grip`): it sits at
+//!   the palm joint. Its -Z runs from the little finger to the index finger, and its +X leaves the
+//!   back of the left hand and enters the palm of the right hand. The palm joint has other axes (its
+//!   +Z points to the wrist), so the grip pose turns it.
 //! - The aim pose is the one of a controller made of a hand (`hand_controller.rs`): it points from
 //!   the shoulder through the pinching fingertips.
 //! - The pinch pose sits between the tips of thumb and index finger. Its +Z points back to the
@@ -63,17 +64,6 @@ fn placed(joint: &Joint) -> bool {
     joint.flags & wanted == wanted
 }
 
-/// The grip pose's turn from the palm joint's. In the palm joint's axes the grip's +X is the
-/// palm's +Y for the right hand (out of the back of the hand, which is into the palm from the
-/// other side) and the palm's -Y for the left hand. The grip's -Z, from the little finger to the
-/// index finger, is the palm's -X for the right hand and its +X for the left hand.
-fn grip_turn(left: bool) -> Quat {
-    let side = if left { -1.0 } else { 1.0 };
-    let x = Vec3::new(0.0, side, 0.0);
-    let z = Vec3::new(side, 0.0, 0.0);
-    Quat::from_mat3(&glam::Mat3::from_cols(x, z.cross(x), z)).normalize()
-}
-
 /// The orientation with this +Z and the +Y closest to `up`, or `fallback` when they are parallel
 fn with_z_and_up(z: Vec3, up: Vec3, fallback: Quat) -> Quat {
     let Some(z) = z.try_normalize() else { return fallback };
@@ -86,7 +76,7 @@ fn with_z_and_up(z: Vec3, up: Vec3, fallback: Quat) -> Quat {
 /// known (the aim pose needs it for the shoulder).
 pub fn interaction(left: bool, root: &DeviceMotion, joints: &[Joint; HAND_JOINTS], head: Option<&Pose>) -> HandInteraction {
     let palm = hand_controller::palm(joints);
-    let grip = Pose { orientation: (palm.orientation * grip_turn(left)).normalize(), position: palm.position };
+    let grip = hand_controller::grip(left, joints);
 
     let thumb = position(&joints[THUMB_TIP]);
     let index = position(&joints[INDEX_TIP]);
@@ -166,6 +156,17 @@ mod tests {
             assert!(close(grip.orientation * Vec3::X, Vec3::X), "left {left}: {:?}", grip.orientation * Vec3::X);
             assert!(close(grip.orientation * Vec3::NEG_Z, Vec3::Y), "left {left}: {:?}", grip.orientation * Vec3::NEG_Z);
             assert_eq!(grip.position, position(&joints[PALM]));
+        }
+    }
+
+    #[test]
+    fn the_profile_and_a_controller_made_of_the_hand_give_one_grip_pose() {
+        for left in [false, true] {
+            let turn = Quat::from_rotation_y(0.4) * Quat::from_rotation_z(0.7);
+            let joints = hand(left, Vec3::new(0.2, 1.2, -0.3), turn, 0.08);
+            let profile = interaction(left, &still(Vec3::ZERO), &joints, None).poses[GRIP];
+            let controller = hand_controller::controller(left, &still(Vec3::ZERO), &joints, None).grip;
+            assert_eq!(profile, controller, "left {left}");
         }
     }
 
