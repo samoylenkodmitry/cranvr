@@ -9,7 +9,8 @@
 //     WaitGetPoses, Submit and PostPresentHandoff for the time that --seconds says.
 //   - It reads the head pose and, with --expect-input, the legacy controller state, which the
 //     scripted controllers of cranvr-probe move (a pull of the left grip, the right trigger at 0.75,
-//     the A button), and the controllers' poses in the array that WaitGetPoses fills, as a game with no
+//     the A button), the button events of the left grip and of A (VREvent_ButtonPress and
+//     VREvent_ButtonUnpress), and the controllers' poses in the array that WaitGetPoses fills, as a game with no
 //     action manifest reads them (valid in 90 percent of the frames before the last 8 seconds, the left
 //     one where the probe holds it, the right one swinging). The probe's head must stand still for
 //     this (cranvr-probe --still-head): the game's room is then the probe's room.
@@ -1035,6 +1036,8 @@ int main(int argc, char** argv)
 	float eye_distance = 0.0f;
 	Clock::time_point last_eye_read = begin;
 	bool left_connected = false, right_connected = false, left_grip_pressed = false, a_pressed = false;
+	// The button events of the legacy input: presses and releases of the left grip and of A, as SteamVR sends them
+	int grip_events[2] = {}, a_events[2] = {};
 	// A game that tells its controllers apart by their serial numbers (Serious Sam VR does) takes two controllers with one
 	// number for a single controller: the second stays where it has no pose. The head and the two controllers must differ.
 	// They are read once, while both controllers are there.
@@ -1213,6 +1216,13 @@ int main(int argc, char** argv)
 				say("the runtime asks the program to quit");
 				seconds = 0;
 			}
+			const bool press = event.eventType == vr::VREvent_ButtonPress, release = event.eventType == vr::VREvent_ButtonUnpress;
+			if ((press || release) && event.trackedDeviceIndex == left && event.data.controller.button == vr::k_EButton_Grip) {
+				grip_events[press ? 0 : 1]++;
+			}
+			if ((press || release) && event.trackedDeviceIndex == right && event.data.controller.button == vr::k_EButton_A) {
+				a_events[press ? 0 : 1]++;
+			}
 		}
 		input_time += since(mark);
 	}
@@ -1264,6 +1274,7 @@ int main(int argc, char** argv)
 	say("controllers: left %s, right %s, right trigger up to %.2f, left grip %s (axis up to %.2f), A %s", left_connected ? "tracked" : "missing",
 	    right_connected ? "tracked" : "missing", max_right_trigger, left_grip_pressed ? "pressed" : "not pressed", max_left_grip_pulled,
 	    a_pressed ? "pressed" : "not pressed");
+	say("button events: left grip %d presses and %d releases, A %d presses and %d releases", grip_events[0], grip_events[1], a_events[0], a_events[1]);
 
 	// The frames up to the last valid head pose count for the verdict
 	size_t judged = head_ok.size();
@@ -1343,6 +1354,9 @@ int main(int argc, char** argv)
 		}
 		if (!a_pressed) {
 			return fail("the A button was never pressed");
+		}
+		if (grip_events[0] == 0 || grip_events[1] == 0 || a_events[0] == 0 || a_events[1] == 0) {
+			return fail("a press of the left grip or of A came without its button events");
 		}
 		// A game with no action manifest takes its controllers' places from these poses. The probe's left grip stays
 		// at x -0.2 and its right grip swings 10 cm to each side of x 0.25, at heights near 1.2 and 1.1 (plus the floor).

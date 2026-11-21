@@ -57,3 +57,10 @@ cranvr runs Windows OpenVR games under Wine with [OpenComposite](https://gitlab.
 - With a wait for the game's frame in each copy, Earth VR at 1444x1546 per eye made 45 frames a second at 72 Hz: the copy of the first eye took 13.3 ms (most of it the wait), the second 2.6 ms. With the two buffers it makes 72 frames a second at 72 Hz. A copy takes 0.7 to 0.95 ms on average per eye (the read 0.1 ms, the wait 0.01 to 0.04 ms, the copy into the swapchain image 0.5 to 0.7 ms). `openvr_smoke.exe --gl` makes 72.0 at 72 Hz. The log of OpenComposite gives the times of every 600 copies.
 - `Compositor::Invoke` is virtual, so the copy can take the rectangle of the bounds itself and give the frame the whole image.
 - `IVRCompositor::GetFrameTimeRemaining` was a stub that stops the game. Earth VR calls it in its first seconds. It answers the frame period of the last `xrWaitFrame` less the time since that call returned.
+
+`0010-legacy-button-events.patch`
+
+- A game without an action manifest reads the legacy controller state (`GetControllerState`) and the button events of it: `VREvent_ButtonPress`, `VREvent_ButtonUnpress`, `VREvent_ButtonTouch` and `VREvent_ButtonUntouch`. OpenComposite had the code that makes the events from the state (`BaseSystem::CheckControllerEvents`). The OpenXR port stopped calling it, so no such event reached a game.
+- Google Earth VR takes a click from these events. A trigger press on "Click to start welcome tour" reached the runtime and the legacy state, and the game did nothing: 13 presses on the caption in 4 minutes. With the patch the welcome tour starts 4 seconds after the press.
+- After each frame, once the game's legacy input is loaded, OpenComposite compares the state of each hand with the state at the frame before and queues an event for each button that changed. A game with its own action manifest gets none: the check would load the empty manifest before a game that sets its manifest a few frames late.
+- `openvr_smoke.exe --expect-input` counts the press and the release events of the probe's left grip and A, and fails without them.
