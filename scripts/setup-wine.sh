@@ -10,7 +10,8 @@
 #     (vkd3d-shader) a game that compiles its shaders at run time uses through d3dcompiler_47.dll;
 #     winemac.so and opengl32.so, which give an OpenGL game that asks for the compatibility profile a core
 #     context and compile its legacy GLSL; wininet.dll, whose handles a game with requests on several
-#     threads closed in a race
+#     threads closed in a race; ntdll.so, which gives a program with high-entropy addresses its memory above
+#     4 GB as Windows does, so MonoMod's detours in Unity mods find free pages near their code
 #
 # The BasaltVR checkout must have run, in this order:
 #   runtime/scripts/test-dxmt.zsh          (downloads Wine 11.10 and stock DXMT)
@@ -107,13 +108,14 @@ if [[ -f ${wine_bin}/wined3d.dll ]]; then
         cp "${wine_bin}/${dll}" "${wine_root}/lib/wine/x86_64-windows/${dll}"
         cp "${wine_bin}/${dll}" "${prefix}/drive_c/windows/system32/${dll}"
     done
-    for lib in winemac.so opengl32.so; do
+    for lib in winemac.so opengl32.so ntdll.so; do
         cp "${wine_bin}/${lib}" "${wine_root}/lib/wine/x86_64-unix/${lib}"
     done
     mkdir -p "${prefix}/drive_c/wine-patched"
-    cp "${wine_bin}/hlsl_compile.exe" "${wine_bin}/isnan.hlsl" "${wine_bin}/gl_compat_check.exe" "${prefix}/drive_c/wine-patched/"
+    cp "${wine_bin}/hlsl_compile.exe" "${wine_bin}/isnan.hlsl" "${wine_bin}/gl_compat_check.exe" \
+        "${wine_bin}/far_jump_check.exe" "${wine_bin}/stack_sample_check.exe" "${prefix}/drive_c/wine-patched/"
 else
-    print "No patched Wine files in ${wine_bin}: Wine's HLSL compiler lacks isnan, and OpenGL games get no compatibility profile."
+    print "No patched Wine files in ${wine_bin}: Wine's HLSL compiler lacks isnan, OpenGL games get no compatibility profile, and MonoMod's far detours can miss."
 fi
 
 runtime_dir=${prefix}/drive_c/basalt/runtime
@@ -163,6 +165,24 @@ if [[ -f ${prefix}/drive_c/wine-patched/gl_compat_check.exe ]]; then
     if [[ ${gl_out} != *"gl_compat_check: PASS"* ]]; then
         print -u2 "FAIL: gl_compat_check.exe (run it by hand for details):"
         print -u2 -r -- "${gl_out}"
+        exit 1
+    fi
+fi
+if [[ -f ${prefix}/drive_c/wine-patched/far_jump_check.exe ]]; then
+    print "Checking that a program with high-entropy addresses gets them above 4 GB (MonoMod's far jump)"
+    far_out=$(cd "${prefix}/drive_c/wine-patched" && "${wine_root}/bin/wine" ./far_jump_check.exe 2>&1 || true)
+    if [[ ${far_out} != *"far_jump_check: PASS"* ]]; then
+        print -u2 "FAIL: far_jump_check.exe (run it by hand for details):"
+        print -u2 -r -- "${far_out}"
+        exit 1
+    fi
+fi
+if [[ -f ${prefix}/drive_c/wine-patched/stack_sample_check.exe ]]; then
+    print "Checking that a profiler's copy of a suspended thread's stack stays readable"
+    sample_out=$(cd "${prefix}/drive_c/wine-patched" && "${wine_root}/bin/wine" ./stack_sample_check.exe 2>&1 || true)
+    if [[ ${sample_out} != *"stack_sample_check: PASS"* ]]; then
+        print -u2 "FAIL: stack_sample_check.exe (run it by hand for details):"
+        print -u2 -r -- "${sample_out}"
         exit 1
     fi
 fi
