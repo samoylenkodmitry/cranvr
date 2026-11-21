@@ -17,7 +17,7 @@ use crate::{
 };
 use cranpose::prelude::*;
 use cranpose::text::FontWeight;
-use cranpose_xr::{FollowMode, FollowTarget, FollowingSubspace, Hand, Pose, SpatialPanel, SubspaceModifier, Vibration};
+use cranpose_xr::{FollowMode, FollowTarget, TrackedDimensions, FollowingSubspace, Hand, Pose, SpatialPanel, SubspaceModifier, Vibration};
 use cranvr_common::controls::{Control, Controls, Hand as ControlHand};
 use cranvr_proto::wire::Nanos;
 use std::time::Duration;
@@ -58,7 +58,7 @@ pub fn ConsolePanel(view: MutableState<View>, snapshot: MutableState<Snapshot>) 
     if view.open {
         // The subspace leaves the composition with the console, so the next opening snaps it to the
         // head again
-        FollowingSubspace(FollowTarget::View(FollowMode::Snap), move || OpenConsole(view.clone(), state.clone()));
+        FollowingSubspace(FollowTarget::View(FollowMode::Snap(TrackedDimensions::TranslationAndYaw)), move || OpenConsole(view.clone(), state.clone()));
     }
 }
 

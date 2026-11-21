@@ -11,11 +11,20 @@
 //! pill with a second round button, which shows or hides that display with one press. This works
 //! inside a game, for quick actions on the Mac.
 //!
+//! The ball, the menu and the hand's display hold their place against the left controller: they
+//! move and turn with it in every frame (`TrackedDimensions::All`). Cranpose hands their layers to
+//! the compositor in the space of the controller's aim, so the compositor places them with its
+//! newest pose of the controller. The menu and the hand's display have a sphere under them that the
+//! right controller carries. A carry sets the panel's offset from the controller, which `place.rs`
+//! keeps for the next start. After the carry the panel follows the hand at the new offset.
+//!
 //! What the user sees, in a Quest 3:
 //! - the ball is 5 cm wide and 11 cm above the controller's grip, as the earlier ball was;
 //! - the menu is 47 cm wide, with text 22 to 26 mm tall, and its bottom edge 3 cm above the ball. It
 //!   stands 21 cm to the right of the hand, toward the user's body, and 7 cm nearer to the face than
-//!   the ball, so the right controller reaches it without crossing the left arm;
+//!   the ball, so the right controller reaches it without crossing the left arm. These places hold
+//!   in the controller's own frame: right of the controller, above its top and back along its ray.
+//!   With the ray level and ahead they are right, up and toward the face;
 //! - the hand's display is 42 cm wide by default. A 1920 point wide Mac display then shows 13 point
 //!   text 3 mm tall, which a Quest 3 resolves at the 45 cm that a hand holds it from the eyes. The user
 //!   can resize it with the corner sphere;
@@ -27,7 +36,9 @@
 //! A launch can change where the panels ride, for a headset on a desk that tracks no controller (the
 //! controller's subspace shows nothing then): the extra `hand_anchor` with the value `view` puts the
 //! strip, the menu and the hand's display in a subspace that follows the head, at the place where a
-//! left hand would hold them. The extra `hand_menu` with the value `open` opens the menu at the start.
+//! left hand would hold them. Their carried places there have names of their own, so they never move
+//! the panels on the controller. The extra `hand_menu` with the value `open` opens the menu at the
+//! start.
 
 use crate::{
     displays::displays,
@@ -37,10 +48,11 @@ use crate::{
     panel_layout::{layer_rank, Layout, PanelId},
     ui::{text_style, ACCENT_COLOR, KEY_COLOR, MUTED_COLOR, PANEL_COLOR, STOP_COLOR, TEXT_COLOR},
 };
+use crate::place;
 use cranpose::launch_args;
 use cranpose::prelude::*;
 use cranpose::text::FontWeight;
-use cranpose_xr::{local_spatial_capabilities, FollowMode, FollowTarget, FollowingSubspace, Hand, SpatialPanel, SubspaceModifier, Vibration};
+use cranpose_xr::{local_spatial_capabilities, FollowMode, FollowTarget, FollowingSubspace, Hand, Pose, SpatialPanel, SubspaceModifier, TrackedDimensions, Vibration};
 use std::time::Duration;
 
 /// The ball's diameter in dp, a millimeter each
@@ -62,16 +74,40 @@ const MENU_IDLE: Duration = Duration::from_secs(20);
 /// How often the menu looks at the displays' list while it is open
 const MENU_POLL: Duration = Duration::from_millis(250);
 
-/// Where the hand's panels ride: the left controller, or the head for a test on a desk. The offset
-/// moves the panels from the target's origin to where a hand would hold them.
-fn anchor() -> (FollowTarget, [f32; 3]) {
+/// Where the hand's panels stand in the subspace that holds them, and the names under which
+/// `place.rs` keeps the places that the user carried the menu and the hand's display to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HandFrame {
+    /// The offset in dp from the subspace's origin to where a hand holds the panels
+    pub base: [f32; 3],
+    pub menu: &'static str,
+    pub display: &'static str,
+}
+
+/// The frame of the panels on the left controller: its origin is the controller's grip, turned as
+/// its aim is turned.
+pub const ON_CONTROLLER: HandFrame = HandFrame { base: [0.0; 3], menu: "hand-menu", display: "hand-display" };
+
+/// The frame of the test on a desk: the head's subspace has its origin a meter ahead of the head. A
+/// left hand lies 30 cm left of the nose, 35 cm below it and 40 cm ahead of it.
+pub const ON_VIEW: HandFrame = HandFrame { base: [-300.0, -350.0, 600.0], menu: "hand-menu-view", display: "hand-display-view" };
+
+/// Where the hand's panels ride: the left controller, which they follow in all six dimensions, or the
+/// head for a test on a desk.
+fn anchor() -> (FollowTarget, HandFrame) {
     if launch_args().string("hand_anchor") == Some("view") {
-        // The head's subspace has its origin a meter ahead of the head. A left hand lies 30 cm left of
-        // the nose, 35 cm below it and 40 cm ahead of it.
-        (FollowTarget::View(FollowMode::Snap), [-300.0, -350.0, 600.0])
+        (FollowTarget::View(FollowMode::Snap(TrackedDimensions::TranslationAndYaw)), ON_VIEW)
     } else {
-        (FollowTarget::Controller(Hand::Left, FollowMode::Tight), [0.0; 3])
+        (FollowTarget::Controller(Hand::Left, FollowMode::Tight(TrackedDimensions::All)), ON_CONTROLLER)
     }
+}
+
+/// The menu's pose before the user carries it: its bottom edge above the ball, to the right of the
+/// hand and nearer to the face. `height` is the menu's height in dp.
+pub fn menu_start(frame: HandFrame, height: f32) -> Pose {
+    let base = frame.base;
+    let y = base[1] + LIFT + BALL / 2.0 + CLEARANCE + height / 2.0;
+    SubspaceModifier::new().offset(base[0] + MENU_X, y, base[2] + MENU_Z).pose()
 }
 
 /// Whether the launch opens the menu at the start (the extra `hand_menu` with the value `open`).
@@ -109,7 +145,7 @@ pub fn HandPanels(state: HandState, console_open: bool) {
     if !local_spatial_capabilities().current().is_spatial_ui_enabled() {
         return;
     }
-    let (target, base) = anchor();
+    let (target, frame) = anchor();
     let layout = state.layout.get();
     let pinned_shown = layout.pinned().filter(|stream| layout.shown(PanelId::Display(*stream)));
     let open = state.menu_open.get();
@@ -129,12 +165,12 @@ pub fn HandPanels(state: HandState, console_open: bool) {
         }
     });
     FollowingSubspace(target, move || {
-        Strip(state, base, layout.pinned());
+        Strip(state, frame.base, layout.pinned());
         if open {
-            Menu(state, console_open, base);
+            Menu(state, console_open, frame);
         }
         if let Some(stream) = pinned_shown {
-            key(stream, move || crate::display_panel::HandDisplay(stream, base));
+            key(stream, move || crate::display_panel::HandDisplay(stream, frame));
         }
     });
 }
@@ -213,9 +249,9 @@ fn commit(state: HandState, layout: Layout) {
     state.layout.set(layout);
 }
 
-/// The menu panel.
+/// The menu panel. It stands where the user last carried it in `frame`, else at `menu_start`.
 #[composable]
-pub fn Menu(state: HandState, console_open: bool, base: [f32; 3]) {
+pub fn Menu(state: HandState, console_open: bool, frame: HandFrame) {
     let view = rememberMutableStateOf(|| displays().menu_view());
     LaunchedEffect((), async move |_| loop {
         let now = displays().menu_view();
@@ -230,9 +266,12 @@ pub fn Menu(state: HandState, console_open: bool, base: [f32; 3]) {
     let input = MenuInput { layout: &layout, console_open, displays: &displays_view, wishes };
     let rows = menu_model::rows(&input);
     let height = menu_model::height(&rows);
-    let y = base[1] + LIFT + BALL / 2.0 + CLEARANCE + height / 2.0;
-    let modifier = SubspaceModifier::new().size(menu_model::size::WIDTH, height).offset(base[0] + MENU_X, y, base[2] + MENU_Z).layer_priority(layer_rank::HAND_MENU);
-    SpatialPanel(modifier, move || {
+    // The place that the user carried the menu to is read once for each opening. Cranpose keeps the
+    // place of a carry while the menu stays open.
+    let saved = remember(move || place::saved_pose(frame.menu)).with(|pose: &Option<Pose>| *pose);
+    let pose = saved.unwrap_or_else(|| menu_start(frame, height));
+    let modifier = SubspaceModifier::new().size(menu_model::size::WIDTH, height).layer_priority(layer_rank::HAND_MENU);
+    SpatialPanel(place::movable(frame.menu, modifier, pose, |_| {}), move || {
         let hovered = hover::hover_modifier(hover::MENU);
         let rows = rows.clone();
         Column(
@@ -320,3 +359,43 @@ fn perform(action: MenuAction, state: HandState) {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A left controller 20 cm left of the head, 30 cm below it and 40 cm ahead, with its ray level
+    /// and straight ahead, as a hand holds it to look at the menu
+    const LEFT: Pose = Pose::at([-0.2, -0.3, -0.4]);
+
+    /// How straight the panel at `pose` faces the head at the room's origin: 1 when its front points
+    /// right at the head
+    fn facing_the_head(pose: &Pose) -> f32 {
+        let normal = pose.rotate([0.0, 0.0, 1.0]);
+        let to_head = pose.position.map(|v| -v);
+        let length = to_head.iter().map(|v| v * v).sum::<f32>().sqrt();
+        normal.iter().zip(to_head).map(|(n, t)| n * t / length).sum()
+    }
+
+    #[test]
+    fn the_menu_and_the_hands_display_face_the_head_above_the_hand() {
+        let height = 400.0;
+        let menu = LEFT.then(&menu_start(ON_CONTROLLER, height));
+        assert!(facing_the_head(&menu) > 0.8, "{menu:?}");
+        // Its bottom edge is above the ball, and its middle is right of the hand
+        let bottom = menu.position[1] - height / 2000.0;
+        assert!(bottom > LEFT.position[1] + (LIFT + BALL / 2.0) / 1000.0, "{menu:?}");
+        assert!(menu.position[0] > LEFT.position[0] + 0.15, "{menu:?}");
+        let display = LEFT.then(&crate::display_panel::hand_display_start(ON_CONTROLLER, 280.0));
+        assert!(facing_the_head(&display) > 0.8, "{display:?}");
+    }
+
+    #[test]
+    fn the_places_on_the_controller_and_on_the_head_have_names_of_their_own() {
+        let names = [ON_CONTROLLER.menu, ON_CONTROLLER.display, ON_VIEW.menu, ON_VIEW.display];
+        for (i, name) in names.iter().enumerate() {
+            assert!(!names[..i].contains(name), "{name}");
+            assert!(!["desktop", "display2", "display3", "display4", "connect", "stats", "console"].contains(name), "{name}");
+        }
+    }
+}
