@@ -31,7 +31,7 @@ index ec49740..3dc029d 100644
  	# On Windows this isn't a problem since the linker knows how to figure this stuff out
  	target_link_libraries(OCOVR OCCore DrvOpenXR)
 diff --git a/DrvOpenXR/XrBackend.cpp b/DrvOpenXR/XrBackend.cpp
-index 0de2a55..bbbe580 100644
+index 0de2a55..79cb97a 100644
 --- a/DrvOpenXR/XrBackend.cpp
 +++ b/DrvOpenXR/XrBackend.cpp
 @@ -50,6 +50,7 @@ using namespace vr;
@@ -76,7 +76,18 @@ index 0de2a55..bbbe580 100644
  
  		// FIXME loop until this returns true?
  		// OOVR_FALSE_ABORT(state.shouldRender);
-@@ -597,6 +611,8 @@ IBackend::openvr_enum_t XrBackend::SetSkyboxOverride(const vr::Texture_t* pTextu
+@@ -471,7 +485,10 @@ void XrBackend::StoreEyeTexture(
+ 
+ 	// If the session is inactive, we may be unable to write to the surface
+ 	if (sessionActive && renderingFrame)
++	{
+ 		comp.Invoke(texture, bounds, layer.subImage, (XruEye)eye, submitFlags);
++		comp.AdjustView(layer);
++	}
+ 
+ 	submittedEyeTextures = true;
+ 
+@@ -597,6 +614,8 @@ IBackend::openvr_enum_t XrBackend::SetSkyboxOverride(const vr::Texture_t* pTextu
  
  		OOVR_FAILED_XR_ABORT(xrWaitFrame(xr_session.get(), &waitInfo, &state));
  		xr_gbl->nextPredictedFrameTime = state.predictedDisplayTime;
@@ -97,10 +108,10 @@ index 775c088..64bbbd8 100644
 +	static std::unique_ptr<class TemporaryGraphics> glD3D11Graphics;
  };
 diff --git a/OpenOVR/Compositor/compositor.h b/OpenOVR/Compositor/compositor.h
-index e83a16a..c3e469a 100644
+index e83a16a..5277aef 100644
 --- a/OpenOVR/Compositor/compositor.h
 +++ b/OpenOVR/Compositor/compositor.h
-@@ -24,7 +24,7 @@ class Compositor {
+@@ -24,10 +24,16 @@ class Compositor {
  public:
  	virtual ~Compositor();
  
@@ -109,6 +120,15 @@ index e83a16a..c3e469a 100644
  	bool CalculateViewport(const vr::VRTextureBounds_t* bounds, int32_t width, int32_t height, bool supportsInvert, XrRect2Di& viewport);
  
  	virtual void InvokeCubemap(const vr::Texture_t* textures) = 0;
++
++	/**
++	 * cranvr: lets a compositor change the view of the frame after Invoke: one that shows the picture of the frame
++	 * before gives that frame's pose and field of view.
++	 */
++	virtual void AdjustView(XrCompositionLayerProjectionView& view) {}
+ 	virtual bool SupportsCubemap() { return false; }
+ 
+ 	virtual XrSwapchain GetSwapChain() { return chain; };
 diff --git a/OpenOVR/Compositor/compositor_backend.h b/OpenOVR/Compositor/compositor_backend.h
 index 01bfe59..fdbea12 100644
 --- a/OpenOVR/Compositor/compositor_backend.h
@@ -122,10 +142,10 @@ index 01bfe59..fdbea12 100644
 +#endif
 diff --git a/OpenOVR/Compositor/gld3d11compositor.cpp b/OpenOVR/Compositor/gld3d11compositor.cpp
 new file mode 100644
-index 0000000..9b7bf4f
+index 0000000..689a2f5
 --- /dev/null
 +++ b/OpenOVR/Compositor/gld3d11compositor.cpp
-@@ -0,0 +1,391 @@
+@@ -0,0 +1,484 @@
 +#include "stdafx.h"
 +
 +#if defined(SUPPORT_GL_D3D11)
@@ -158,6 +178,16 @@ index 0000000..9b7bf4f
 +#define GL_SRGB_ALPHA 0x8C42
 +#define GL_FRAMEBUFFER_SRGB 0x8DB9
 +#define GL_RASTERIZER_DISCARD 0x8C89
++#define GL_STREAM_READ 0x88E1
++#define GL_MAP_READ_BIT 0x0001
++#define GL_SYNC_GPU_COMMANDS_COMPLETE 0x9117
++#define GL_SYNC_FLUSH_COMMANDS_BIT 0x00000001
++#define GL_TIMEOUT_EXPIRED 0x911B
++#define GL_WAIT_FAILED 0x911D
++
++typedef struct __GLsync* GLsync;
++typedef ptrdiff_t GLsizeiptr;
++typedef ptrdiff_t GLintptr;
 +
 +typedef void(APIENTRY* PFN_glGenFramebuffers)(GLsizei n, GLuint* framebuffers);
 +typedef void(APIENTRY* PFN_glDeleteFramebuffers)(GLsizei n, const GLuint* framebuffers);
@@ -166,6 +196,14 @@ index 0000000..9b7bf4f
 +typedef GLenum(APIENTRY* PFN_glCheckFramebufferStatus)(GLenum target);
 +typedef void(APIENTRY* PFN_glBlitFramebuffer)(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter);
 +typedef void(APIENTRY* PFN_glBindBuffer)(GLenum target, GLuint buffer);
++typedef void(APIENTRY* PFN_glGenBuffers)(GLsizei n, GLuint* buffers);
++typedef void(APIENTRY* PFN_glDeleteBuffers)(GLsizei n, const GLuint* buffers);
++typedef void(APIENTRY* PFN_glBufferData)(GLenum target, GLsizeiptr size, const void* data, GLenum usage);
++typedef void*(APIENTRY* PFN_glMapBufferRange)(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access);
++typedef GLboolean(APIENTRY* PFN_glUnmapBuffer)(GLenum target);
++typedef GLsync(APIENTRY* PFN_glFenceSync)(GLenum condition, GLbitfield flags);
++typedef GLenum(APIENTRY* PFN_glClientWaitSync)(GLsync sync, GLbitfield flags, uint64_t timeout);
++typedef void(APIENTRY* PFN_glDeleteSync)(GLsync sync);
 +
 +namespace {
 +
@@ -177,6 +215,14 @@ index 0000000..9b7bf4f
 +	PFN_glCheckFramebufferStatus CheckFramebufferStatus = nullptr;
 +	PFN_glBlitFramebuffer BlitFramebuffer = nullptr;
 +	PFN_glBindBuffer BindBuffer = nullptr;
++	PFN_glGenBuffers GenBuffers = nullptr;
++	PFN_glDeleteBuffers DeleteBuffers = nullptr;
++	PFN_glBufferData BufferData = nullptr;
++	PFN_glMapBufferRange MapBufferRange = nullptr;
++	PFN_glUnmapBuffer UnmapBuffer = nullptr;
++	PFN_glFenceSync FenceSync = nullptr;
++	PFN_glClientWaitSync ClientWaitSync = nullptr;
++	PFN_glDeleteSync DeleteSync = nullptr;
 +};
 +
 +GLFunctions gl;
@@ -195,6 +241,14 @@ index 0000000..9b7bf4f
 +	LOAD("glCheckFramebufferStatus", CheckFramebufferStatus);
 +	LOAD("glBlitFramebuffer", BlitFramebuffer);
 +	LOAD("glBindBuffer", BindBuffer);
++	LOAD("glGenBuffers", GenBuffers);
++	LOAD("glDeleteBuffers", DeleteBuffers);
++	LOAD("glBufferData", BufferData);
++	LOAD("glMapBufferRange", MapBufferRange);
++	LOAD("glUnmapBuffer", UnmapBuffer);
++	LOAD("glFenceSync", FenceSync);
++	LOAD("glClientWaitSync", ClientWaitSync);
++	LOAD("glDeleteSync", DeleteSync);
 +#undef LOAD
 +}
 +
@@ -291,6 +345,11 @@ index 0000000..9b7bf4f
 +		gl.DeleteFramebuffers(2, framebuffers);
 +		if (resolveTexture)
 +			glDeleteTextures(1, &resolveTexture);
++		gl.DeleteBuffers(2, packBuffers);
++		for (void* fence : packFences) {
++			if (fence)
++				gl.DeleteSync((GLsync)fence);
++		}
 +	}
 +	ReleaseImages();
 +	if (chain) {
@@ -323,6 +382,20 @@ index 0000000..9b7bf4f
 +	subImage.imageArrayIndex = 0;
 +	subImage.imageRect.offset = { 0, 0 };
 +	subImage.imageRect.extent = { static_cast<int32_t>(createInfo.width), static_cast<int32_t>(createInfo.height) };
++}
++
++void GLD3D11Compositor::AdjustView(XrCompositionLayerProjectionView& view)
++{
++	const XrPosef pose = view.pose;
++	const XrFovf fov = view.fov;
++	if (showsPrevious && heldValid) {
++		view.pose = heldPose;
++		view.fov = heldFov;
++	}
++	// The picture that this frame read is shown by the next frame, with this frame's view
++	heldPose = pose;
++	heldFov = fov;
++	heldValid = true;
 +}
 +
 +void GLD3D11Compositor::CheckCreateSwapChain(uint32_t width, uint32_t height, DXGI_FORMAT wanted)
@@ -383,6 +456,7 @@ index 0000000..9b7bf4f
 +		glContext = current;
 +		gl.GenFramebuffers(1, &readFramebuffer);
 +		gl.GenFramebuffers(1, &resolveFramebuffer);
++		gl.GenBuffers(2, packBuffers);
 +	} else if (glContext != current) {
 +		OOVR_ABORT("The game submitted OpenGL textures from two contexts");
 +	}
@@ -473,29 +547,67 @@ index 0000000..9b7bf4f
 +	if (status != GL_FRAMEBUFFER_COMPLETE)
 +		OOVR_LOG_ONCEF("OpenGL copy: the game's texture cannot be read (framebuffer status 0x%x)", status);
 +
++	// The GPU reads this frame's rectangle into one buffer while the game goes on. The buffer of the frame before holds a
++	// picture that the GPU has read by now, so the frame shows that one, and its view (AdjustView). The first frame, or
++	// one of another size, waits for its own read.
 +	const size_t rowBytes = size_t(rect.extent.width) * 4;
-+	pixels.resize(rowBytes * rect.extent.height);
-+	gl.BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++	const size_t bytes = rowBytes * rect.extent.height;
++	const int fill = packNext, last = packNext ^ 1;
++	packNext = last;
++	gl.BindBuffer(GL_PIXEL_PACK_BUFFER, packBuffers[fill]);
++	if (packSizes[fill] != bytes) {
++		gl.BufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)bytes, nullptr, GL_STREAM_READ);
++		packSizes[fill] = bytes;
++	}
 +	glPixelStorei(GL_PACK_ALIGNMENT, 4);
 +	glPixelStorei(GL_PACK_ROW_LENGTH, 0);
 +	glPixelStorei(GL_PACK_SKIP_ROWS, 0);
 +	glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
-+	glReadPixels(readX, readY, rect.extent.width, rect.extent.height, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, pixels.data());
++	const auto readStart = std::chrono::steady_clock::now();
++	glReadPixels(readX, readY, rect.extent.width, rect.extent.height, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, nullptr);
++	const auto readEnd = std::chrono::steady_clock::now();
++	if (packFences[fill])
++		gl.DeleteSync((GLsync)packFences[fill]);
++	packFences[fill] = gl.FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++	packFull[fill] = true;
++	packWidth[fill] = rect.extent.width;
++	packHeight[fill] = rect.extent.height;
++	packTopFirst[fill] = storedTopFirst;
++	packFormat[fill] = format;
++
++	showsPrevious = packFull[last] && packWidth[last] == rect.extent.width && packHeight[last] == rect.extent.height
++	    && packFormat[last] == format;
++	const int shown = showsPrevious ? last : fill;
++	const GLenum waited = gl.ClientWaitSync((GLsync)packFences[shown], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
++	const auto waitEnd = std::chrono::steady_clock::now();
++	if (waited == GL_TIMEOUT_EXPIRED || waited == GL_WAIT_FAILED)
++		OOVR_LOG_ONCEF("OpenGL copy: the read of the game's texture did not end (0x%x)", waited);
++	gl.BindBuffer(GL_PIXEL_PACK_BUFFER, packBuffers[shown]);
++	const auto* pixels = (const uint8_t*)gl.MapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)bytes, GL_MAP_READ_BIT);
++	if (pixels) {
++		// Direct3D's rows go down from the top
++		D3D11_MAPPED_SUBRESOURCE mapped{};
++		OOVR_FAILED_DX_ABORT(context->Map(staging, 0, D3D11_MAP_WRITE, 0, &mapped));
++		for (int row = 0; row < rect.extent.height; row++) {
++			const int from = packTopFirst[shown] ? row : rect.extent.height - 1 - row;
++			memcpy((uint8_t*)mapped.pData + size_t(row) * mapped.RowPitch, pixels + size_t(from) * rowBytes, rowBytes);
++		}
++		context->Unmap(staging, 0);
++		gl.UnmapBuffer(GL_PIXEL_PACK_BUFFER);
++		context->CopyResource(images.at(index), staging);
++	}
++	const auto mapEnd = std::chrono::steady_clock::now();
++	windowRead += std::chrono::duration<double>(readEnd - readStart).count();
++	windowWait += std::chrono::duration<double>(waitEnd - readEnd).count();
++	windowMap += std::chrono::duration<double>(mapEnd - waitEnd).count();
++	// A picture that a frame showed is not shown again; the first frame's stays for the next frame
++	if (showsPrevious)
++		packFull[last] = false;
 +
 +	GLenum firstCopyError = GL_NO_ERROR;
 +	if (DrainErrors(&firstCopyError))
 +		OOVR_LOG_ONCEF("OpenGL copy: GL error 0x%x while reading the game's texture", firstCopyError);
 +	saved.Restore();
-+
-+	// Direct3D's rows go down from the top
-+	D3D11_MAPPED_SUBRESOURCE mapped{};
-+	OOVR_FAILED_DX_ABORT(context->Map(staging, 0, D3D11_MAP_WRITE, 0, &mapped));
-+	for (int row = 0; row < rect.extent.height; row++) {
-+		const int from = storedTopFirst ? row : rect.extent.height - 1 - row;
-+		memcpy((uint8_t*)mapped.pData + size_t(row) * mapped.RowPitch, pixels.data() + size_t(from) * rowBytes, rowBytes);
-+	}
-+	context->Unmap(staging, 0);
-+	context->CopyResource(images.at(index), staging);
 +
 +	XrSwapchainImageReleaseInfo releaseInfo{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
 +	OOVR_FAILED_XR_ABORT(xrReleaseSwapchainImage(chain, &releaseInfo));
@@ -508,26 +620,28 @@ index 0000000..9b7bf4f
 +		windowFirstError = firstGameError;
 +	windowErrors += gameErrors;
 +	if (windowCopies == 600) {
-+		OOVR_LOGF("OpenGL copy: 600 copies of %ux%u took %.2f ms on average, %.2f ms at most; %d GL errors of the game waited at them (first 0x%x)",
-+		    createInfo.width, createInfo.height, windowSeconds / windowCopies * 1000.0, windowLongest * 1000.0, windowErrors, windowFirstError);
++		OOVR_LOGF("OpenGL copy: 600 copies of %ux%u took %.2f ms on average (read %.2f, wait %.2f, copy %.2f), %.2f ms at most; %d GL errors of the game waited at them (first 0x%x)",
++		    createInfo.width, createInfo.height, windowSeconds / windowCopies * 1000.0, windowRead / windowCopies * 1000.0,
++		    windowWait / windowCopies * 1000.0, windowMap / windowCopies * 1000.0, windowLongest * 1000.0, windowErrors, windowFirstError);
 +		windowCopies = windowErrors = 0;
 +		windowFirstError = 0;
-+		windowSeconds = windowLongest = 0.0;
++		windowSeconds = windowLongest = windowRead = windowWait = windowMap = 0.0;
 +	}
 +}
 +
 +#endif
 diff --git a/OpenOVR/Compositor/gld3d11compositor.h b/OpenOVR/Compositor/gld3d11compositor.h
 new file mode 100644
-index 0000000..196de55
+index 0000000..45df75d
 --- /dev/null
 +++ b/OpenOVR/Compositor/gld3d11compositor.h
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,80 @@
 +#pragma once
 +
 +// cranvr: an OpenGL game on a runtime that takes Direct3D 11 images only. The session runs on a Direct3D 11
 +// device of OpenComposite's own, and this compositor copies each OpenGL texture of the game into the
-+// runtime's image through the CPU.
++// runtime's image through the CPU. The read of a frame's texture runs on the GPU while the game makes its next frame:
++// a frame shows the picture of the frame before, with that frame's view.
 +
 +#if defined(SUPPORT_GL_D3D11)
 +
@@ -551,6 +665,8 @@ index 0000000..196de55
 +
 +	void InvokeCubemap(const vr::Texture_t* textures) override;
 +
++	void AdjustView(XrCompositionLayerProjectionView& view) override;
++
 +protected:
 +	void CopyToSwapchain(const vr::Texture_t* texture, const vr::VRTextureBounds_t* bounds, std::optional<XruEye> eye, vr::EVRSubmitFlags submitFlags) override;
 +
@@ -572,12 +688,27 @@ index 0000000..196de55
 +	int resolveWidth = 0;
 +	int resolveHeight = 0;
 +
-+	std::vector<uint8_t> pixels;
++	// Two buffers that the GPU reads the game's texture into, in turn, with a fence each. A full buffer holds the
++	// picture of a frame that no frame has shown yet.
++	unsigned int packBuffers[2] = {};
++	void* packFences[2] = {};
++	size_t packSizes[2] = {};
++	bool packFull[2] = {};
++	int packWidth[2] = {}, packHeight[2] = {};
++	bool packTopFirst[2] = {};
++	DXGI_FORMAT packFormat[2] = {};
++	int packNext = 0;
++
++	// The frame shows the picture of the frame before: the view of that frame replaces the frame's own
++	bool showsPrevious = false;
++	bool heldValid = false;
++	XrPosef heldPose{};
++	XrFovf heldFov{};
 +
 +	// Counts for a log line every 600 copies: the game's GL errors that waited at a copy, and the time of the copies
 +	int windowCopies = 0, windowErrors = 0;
 +	GLenumValue windowFirstError = 0;
-+	double windowSeconds = 0.0, windowLongest = 0.0;
++	double windowSeconds = 0.0, windowLongest = 0.0, windowRead = 0.0, windowWait = 0.0, windowMap = 0.0;
 +
 +	// What the log has said about the game's textures, so it says it once
 +	unsigned int loggedTexture = 0;
