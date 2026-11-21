@@ -992,7 +992,7 @@ struct FocusState {
 const CABLE_FRAME_BITS: f64 = 40e6 / 120.0;
 /// The same over a network, in bits: 12 Mbps at 120 Hz, which sends about the 8.5 Mbps that the eye
 /// stream sent before. On a Wi-Fi 6 network the share of late frames rose with every step: 4 percent
-/// at 8.5 Mbps sent, 8 at 14, 18 at 28 and 57 to 86 at 70.
+/// at 8.5 Mbps sent, 8 at 14, 18 at 28 and 57 to 86 at 70. Issue #97 asks the host to adapt instead.
 const NETWORK_FRAME_BITS: f64 = 12e6 / 120.0;
 
 struct Session {
