@@ -73,7 +73,7 @@ cmake --build "${build}" --parallel
 # The OpenVR test program of cranvr: it needs only OpenComposite's copy of Valve's OpenVR headers
 print "Building openvr_smoke.exe"
 x86_64-w64-mingw32-g++ -std=c++20 -O2 -Wall -s -static -static-libgcc -static-libstdc++ \
-    -I"${dir}/OpenVRHeaders" -o "${build}/bin/openvr_smoke.exe" "${support}/tests/openvr_smoke.cpp" -ld3d11 -ldxgi
+    -I"${dir}/OpenVRHeaders" -o "${build}/bin/openvr_smoke.exe" "${support}/tests/openvr_smoke.cpp" -ld3d11 -ldxgi -lopengl32 -lgdi32
 
 print "Done: ${build}/bin/vrclient_x64.dll and openvr_smoke.exe"
 print "Next: scripts/package-game-support.sh"

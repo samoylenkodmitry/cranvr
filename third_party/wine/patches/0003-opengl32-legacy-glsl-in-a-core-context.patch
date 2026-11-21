@@ -1,0 +1,477 @@
+diff --git a/dlls/opengl32/make_opengl b/dlls/opengl32/make_opengl
+index 3dec39c..e3ee427 100755
+--- a/dlls/opengl32/make_opengl
++++ b/dlls/opengl32/make_opengl
+@@ -197,6 +197,10 @@ sub manual_unix_thunks($)
+     return "glFenceSync"                    if $name =~ /^glFenceSync/;
+     return "glImportSyncEXT"                if $name =~ /^glImportSync/;
+ 
++    return "glCompileShader"                if $name =~ /^glCompileShader$/;
++    return "glLinkProgram"                  if $name =~ /^glLinkProgram$/;
++    return "glShaderSource"                 if $name =~ /^glShaderSource$/;
++
+     return 0                                if $name =~ /^glDrawBufferRegion/;
+     return "glDrawBuffers"                  if $name =~ /^glDrawBuffers/;
+     return "glDrawBuffer"                   if $name =~ /^glDrawBuffer/;
+diff --git a/dlls/opengl32/unix_thunks.c b/dlls/opengl32/unix_thunks.c
+index ad93a86..4a556c0 100644
+--- a/dlls/opengl32/unix_thunks.c
++++ b/dlls/opengl32/unix_thunks.c
+@@ -5804,7 +5804,7 @@ static NTSTATUS ext_glCompileShader( void *args )
+     struct glCompileShader_params *params = args;
+     const struct opengl_funcs *funcs = params->teb->glTable;
+     if (!funcs->p_glCompileShader) return STATUS_NOT_IMPLEMENTED;
+-    funcs->p_glCompileShader( params->shader );
++    wrap_glCompileShader( params->teb, params->shader, funcs->p_glCompileShader );
+     set_context_attribute( params->teb, -1 /* unsupported */, NULL, 0 );
+     return STATUS_SUCCESS;
+ }
+@@ -14611,7 +14611,7 @@ static NTSTATUS ext_glLinkProgram( void *args )
+     struct glLinkProgram_params *params = args;
+     const struct opengl_funcs *funcs = params->teb->glTable;
+     if (!funcs->p_glLinkProgram) return STATUS_NOT_IMPLEMENTED;
+-    funcs->p_glLinkProgram( params->program );
++    wrap_glLinkProgram( params->teb, params->program, funcs->p_glLinkProgram );
+     set_context_attribute( params->teb, -1 /* unsupported */, NULL, 0 );
+     return STATUS_SUCCESS;
+ }
+@@ -22493,7 +22493,7 @@ static NTSTATUS ext_glShaderSource( void *args )
+     struct glShaderSource_params *params = args;
+     const struct opengl_funcs *funcs = params->teb->glTable;
+     if (!funcs->p_glShaderSource) return STATUS_NOT_IMPLEMENTED;
+-    funcs->p_glShaderSource( params->shader, params->count, params->string, params->length );
++    wrap_glShaderSource( params->teb, params->shader, params->count, params->string, params->length, funcs->p_glShaderSource );
+     set_context_attribute( params->teb, -1 /* unsupported */, NULL, 0 );
+     return STATUS_SUCCESS;
+ }
+@@ -43429,7 +43429,7 @@ static NTSTATUS wow64_ext_glCompileShader( void *args )
+     TEB *teb = get_teb64( params->teb );
+     const struct opengl_funcs *funcs = teb->glTable;
+     if (!funcs->p_glCompileShader) return STATUS_NOT_IMPLEMENTED;
+-    funcs->p_glCompileShader( params->shader );
++    wrap_glCompileShader( teb, params->shader, funcs->p_glCompileShader );
+     set_context_attribute( teb, -1 /* unsupported */, NULL, 0 );
+     return STATUS_SUCCESS;
+ }
+@@ -59131,7 +59131,7 @@ static NTSTATUS wow64_ext_glLinkProgram( void *args )
+     TEB *teb = get_teb64( params->teb );
+     const struct opengl_funcs *funcs = teb->glTable;
+     if (!funcs->p_glLinkProgram) return STATUS_NOT_IMPLEMENTED;
+-    funcs->p_glLinkProgram( params->program );
++    wrap_glLinkProgram( teb, params->program, funcs->p_glLinkProgram );
+     set_context_attribute( teb, -1 /* unsupported */, NULL, 0 );
+     return STATUS_SUCCESS;
+ }
+@@ -72989,7 +72989,7 @@ static NTSTATUS wow64_ext_glShaderSource( void *args )
+     const struct opengl_funcs *funcs = teb->glTable;
+     if (!funcs->p_glShaderSource) return STATUS_NOT_IMPLEMENTED;
+     string = copy_wow64_ptr32s( params->string, params->count );
+-    funcs->p_glShaderSource( params->shader, params->count, string, ULongToPtr(params->length) );
++    wrap_glShaderSource( teb, params->shader, params->count, string, ULongToPtr(params->length), funcs->p_glShaderSource );
+     set_context_attribute( teb, -1 /* unsupported */, NULL, 0 );
+     free( string );
+     return STATUS_SUCCESS;
+diff --git a/dlls/opengl32/unix_thunks.h b/dlls/opengl32/unix_thunks.h
+index 77c5b81..19889b8 100644
+--- a/dlls/opengl32/unix_thunks.h
++++ b/dlls/opengl32/unix_thunks.h
+@@ -23,6 +23,7 @@ extern void wrap_glViewport( TEB *teb, GLint x, GLint y, GLsizei width, GLsizei
+ extern GLsync wrap_glCreateSyncFromCLeventARB( TEB *teb, struct _cl_context *context, struct _cl_event *event, GLbitfield flags, GLsync handle, PFN_glCreateSyncFromCLeventARB func );
+ extern void wrap_glDebugMessageCallback( TEB *teb, GLDEBUGPROC callback, const void *userParam, PFN_glDebugMessageCallback func );
+ extern void wrap_glDebugMessageCallbackAMD( TEB *teb, GLDEBUGPROCAMD callback, void *userParam, PFN_glDebugMessageCallbackAMD func );
++extern void wrap_glCompileShader( TEB *teb, GLuint shader, PFN_glCompileShader func );
+ extern void wrap_glDrawBuffers( TEB *teb, GLsizei n, const GLenum *bufs, PFN_glDrawBuffers func );
+ extern GLsync wrap_glFenceSync( TEB *teb, GLenum condition, GLbitfield flags, GLsync handle, PFN_glFenceSync func );
+ extern void wrap_glFramebufferDrawBufferEXT( TEB *teb, GLuint framebuffer, GLenum mode, PFN_glFramebufferDrawBufferEXT func );
+@@ -31,10 +32,12 @@ extern void wrap_glFramebufferReadBufferEXT( TEB *teb, GLuint framebuffer, GLenu
+ extern void wrap_glGetFramebufferParameteriv( TEB *teb, GLenum target, GLenum pname, GLint *params, PFN_glGetFramebufferParameteriv func );
+ extern void wrap_glGetInteger64v( TEB *teb, GLenum pname, GLint64 *data, PFN_glGetInteger64v func );
+ extern void wrap_glGetUnsignedBytevEXT( TEB *teb, GLenum pname, GLubyte *data, PFN_glGetUnsignedBytevEXT func );
++extern void wrap_glLinkProgram( TEB *teb, GLuint program, PFN_glLinkProgram func );
+ extern GLsync wrap_glImportSyncEXT( TEB *teb, GLenum external_sync_type, GLintptr external_sync, GLbitfield flags, GLsync handle, PFN_glImportSyncEXT func );
+ extern void wrap_glNamedFramebufferDrawBuffer( TEB *teb, GLuint framebuffer, GLenum buf, PFN_glNamedFramebufferDrawBuffer func );
+ extern void wrap_glNamedFramebufferDrawBuffers( TEB *teb, GLuint framebuffer, GLsizei n, const GLenum *bufs, PFN_glNamedFramebufferDrawBuffers func );
+ extern void wrap_glNamedFramebufferReadBuffer( TEB *teb, GLuint framebuffer, GLenum src, PFN_glNamedFramebufferReadBuffer func );
++extern void wrap_glShaderSource( TEB *teb, GLuint shader, GLsizei count, const GLchar *const*string, const GLint *length, PFN_glShaderSource func );
+ extern HGLRC wrap_wglCreateContextAttribsARB( TEB *teb, HDC hDC, HGLRC hShareContext, const int *attribList, HGLRC handle );
+ extern HPBUFFERARB wrap_wglCreatePbufferARB( TEB *teb, HDC hDC, int iPixelFormat, int iWidth, int iHeight, const int *piAttribList, HPBUFFERARB handle );
+ extern BOOL wrap_wglMakeContextCurrentARB( TEB *teb, HDC hDrawDC, HDC hReadDC, HGLRC hglrc );
+diff --git a/dlls/opengl32/unix_wgl.c b/dlls/opengl32/unix_wgl.c
+index 762c315..18f1afb 100644
+--- a/dlls/opengl32/unix_wgl.c
++++ b/dlls/opengl32/unix_wgl.c
+@@ -26,6 +26,8 @@
+ 
+ #include <stdarg.h>
+ #include <stdlib.h>
++#include <string.h>
++#include <stdio.h>
+ #include <assert.h>
+ 
+ #include <pthread.h>
+@@ -1244,6 +1246,365 @@ static void flush_context( TEB *teb, void (*flush)(void) )
+     }
+ }
+ 
++/* macOS has no compatibility profile of OpenGL 3.2 or newer, so winemac makes a core context when a program asks
++ * for one. The core context of macOS compiles GLSL 1.40, 1.50 and 3.30 to 4.10; it also takes "#version 100" of
++ * OpenGL ES, without its extensions. A program that asked for the compatibility profile may still pass GLSL 1.10 to
++ * 1.30 or GLSL ES 1.00, or GLSL 1.40 or 1.50 with names that only the compatibility profile keeps. Such a shader
++ * gets a preamble that maps the names to GLSL 1.50: attribute and varying become in and out, texture2D and its kin
++ * become texture, and gl_FragColor or gl_FragData become an output of the shader. GLSL ES 3.00 becomes GLSL 3.30.
++ * Built-in variables of the fixed-function pipeline have no mapping: such a shader still fails. */
++
++static const char *skip_glsl_space( const char *p, const char *end )
++{
++    while (p < end)
++    {
++        if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
++        else if (end - p >= 2 && p[0] == '/' && p[1] == '/')
++        {
++            while (p < end && *p != '\n') p++;
++        }
++        else if (end - p >= 2 && p[0] == '/' && p[1] == '*')
++        {
++            p += 2;
++            while (end - p >= 2 && !(p[0] == '*' && p[1] == '/')) p++;
++            p = end - p >= 2 ? p + 2 : end;
++        }
++        else break;
++    }
++    return p;
++}
++
++/* The #version directive at the start of the source: its version, whether it is of OpenGL ES and where it ends */
++static BOOL parse_glsl_version( const char *src, const char *end, int *version, BOOL *es,
++                                const char **start, const char **after )
++{
++    const char *p = skip_glsl_space( src, end );
++
++    *version = 110;
++    *es = FALSE;
++    *start = *after = NULL;
++    if (p >= end || *p != '#') return TRUE;
++    *start = p++;
++    while (p < end && (*p == ' ' || *p == '\t')) p++;
++    if (end - p < 7 || strncmp( p, "version", 7 )) { *start = NULL; return TRUE; }
++    p += 7;
++    while (p < end && (*p == ' ' || *p == '\t')) p++;
++    if (p >= end || *p < '0' || *p > '9') return FALSE;
++    for (*version = 0; p < end && *p >= '0' && *p <= '9'; p++) *version = *version * 10 + *p - '0';
++    while (p < end && (*p == ' ' || *p == '\t')) p++;
++    if (end - p >= 2 && !strncmp( p, "es", 2 )) *es = TRUE;
++    while (p < end && *p != '\n') p++;
++    *after = p;
++    return TRUE;
++}
++
++static BOOL is_glsl_name_char( char c )
++{
++    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
++}
++
++static BOOL glsl_uses_name( const char *src, const char *end, const char *name )
++{
++    size_t len = strlen( name );
++    const char *p;
++
++    for (p = src; end - p >= len; p++)
++    {
++        if (strncmp( p, name, len )) continue;
++        if (p > src && is_glsl_name_char( p[-1] )) continue;
++        if (end - p > len && is_glsl_name_char( p[len] )) continue;
++        return TRUE;
++    }
++    return FALSE;
++}
++
++/* Blanks the #extension lines of OpenGL ES extensions that desktop GLSL has built in */
++static void drop_glsl_es_extensions( char *src, char *end )
++{
++    static const char *names[] = { "GL_OES_standard_derivatives", "GL_EXT_shader_texture_lod",
++                                   "GL_EXT_frag_depth", "GL_EXT_draw_buffers" };
++    char *line, *p;
++    unsigned int i;
++
++    for (line = src; line < end; line = p + 1)
++    {
++        const char *q = line;
++
++        p = line;
++        while (p < end && *p != '\n') p++;
++        while (q < p && (*q == ' ' || *q == '\t')) q++;
++        if (q >= p || *q != '#') continue;
++        q++;
++        while (q < p && (*q == ' ' || *q == '\t')) q++;
++        if (p - q < 9 || strncmp( q, "extension", 9 )) continue;
++        for (i = 0; i < ARRAY_SIZE(names); i++)
++            if (glsl_uses_name( q, p, names[i] )) memset( line, ' ', p - line );
++    }
++}
++
++/* The end of the line at p, after the lines that a backslash continues */
++static char *glsl_line_end( char *p, char *end )
++{
++    while (p < end && *p != '\n')
++    {
++        if (*p == '\\' && p + 1 < end && p[1] == '\n') p++;
++        p++;
++    }
++    return p;
++}
++
++/* GLSL ES 1.00 and the compilers of other systems take a semicolon after the body of a function, which GLSL 1.50
++ * refuses: "void main() { ... };". Such a semicolon at the outer level becomes a blank, also one after a call of a
++ * function-like macro whose replacement ends with a body ("MACRO(a, b);"). The semicolon after a struct stays. */
++static void drop_glsl_stray_semicolons( char *src, char *end )
++{
++    struct { const char *name; size_t len; } macros[64];
++    unsigned int macro_count = 0, i;
++    BOOL line_start = TRUE, body_closed = FALSE, open_is_body = FALSE;
++    char last = 0, *p;
++    int depth = 0;
++
++    /* Function-like macros whose replacement ends with a closing brace */
++    for (p = src; p < end; p++)
++    {
++        char *line = p, *q, *name, *stop = glsl_line_end( p, end );
++        while (line < stop && (*line == ' ' || *line == '\t')) line++;
++        if (line < stop && *line == '#')
++        {
++            q = line + 1;
++            while (q < stop && (*q == ' ' || *q == '\t')) q++;
++            if (stop - q > 7 && !strncmp( q, "define", 6 ) && (q[6] == ' ' || q[6] == '\t'))
++            {
++                q += 6;
++                while (q < stop && (*q == ' ' || *q == '\t')) q++;
++                name = q;
++                while (q < stop && is_glsl_name_char( *q )) q++;
++                if (q < stop && *q == '(' && q > name && macro_count < ARRAY_SIZE(macros))
++                {
++                    char *tail = stop;
++                    while (tail > q && (tail[-1] == ' ' || tail[-1] == '\t' || tail[-1] == '\\'
++                                        || tail[-1] == '\r' || tail[-1] == '\n')) tail--;
++                    if (tail > q && tail[-1] == '}')
++                    {
++                        macros[macro_count].name = name;
++                        macros[macro_count++].len = q - name;
++                    }
++                }
++            }
++        }
++        p = stop;
++    }
++
++    for (p = src; p < end; p++)
++    {
++        if (*p == '\n') { line_start = TRUE; continue; }
++        if (*p == ' ' || *p == '\t' || *p == '\r') continue;
++        if (end - p >= 2 && p[0] == '/' && p[1] == '/')
++        {
++            while (p + 1 < end && p[1] != '\n') p++;
++            continue;
++        }
++        if (end - p >= 2 && p[0] == '/' && p[1] == '*')
++        {
++            p += 2;
++            while (end - p >= 2 && !(p[0] == '*' && p[1] == '/')) p++;
++            p++;
++            continue;
++        }
++        if (line_start && *p == '#')
++        {
++            p = glsl_line_end( p, end ) - 1;
++            continue;
++        }
++        line_start = FALSE;
++
++        if (*p == '{')
++        {
++            if (!depth) open_is_body = last == ')';
++            depth++;
++            body_closed = FALSE;
++        }
++        else if (*p == '}')
++        {
++            if (depth) depth--;
++            body_closed = !depth && open_is_body;
++        }
++        else if (*p == ';' && !depth && body_closed)
++        {
++            *p = ' ';
++            body_closed = FALSE;
++            continue;
++        }
++        else if (!depth && is_glsl_name_char( *p ) && (p == src || !is_glsl_name_char( p[-1] )))
++        {
++            char *name = p, *q;
++            body_closed = FALSE;
++            while (p + 1 < end && is_glsl_name_char( p[1] )) p++;
++            for (i = 0; i < macro_count; i++)
++                if (macros[i].len == p + 1 - name && !strncmp( macros[i].name, name, macros[i].len )) break;
++            if (i < macro_count)
++            {
++                int parens = 0;
++                q = p + 1;
++                while (q < end && (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n')) q++;
++                if (q < end && *q == '(')
++                {
++                    for (; q < end; q++)
++                    {
++                        if (*q == '(') parens++;
++                        else if (*q == ')' && !--parens) break;
++                    }
++                    if (q < end)
++                    {
++                        p = q;
++                        last = ')';
++                        body_closed = TRUE;
++                        continue;
++                    }
++                }
++            }
++        }
++        else body_closed = FALSE;
++        last = *p;
++    }
++}
++
++static char *translate_legacy_glsl( GLenum type, const char *src, size_t len )
++{
++    static const char texture_names[] =
++        "#define texture2D texture\n"
++        "#define texture2DProj textureProj\n"
++        "#define texture2DLod textureLod\n"
++        "#define texture2DProjLod textureProjLod\n"
++        "#define textureCube texture\n"
++        "#define textureCubeLod textureLod\n"
++        "#define texture2DLodEXT textureLod\n"
++        "#define texture2DProjLodEXT textureProjLod\n"
++        "#define texture2DGradEXT textureGrad\n"
++        "#define textureCubeLodEXT textureLod\n"
++        "#define gl_FragDepthEXT gl_FragDepth\n";
++    const char *end = src + len, *start, *after, *stage = "", *output = "";
++    int version, size;
++    char *ret, *body;
++    BOOL es;
++
++    if (!parse_glsl_version( src, end, &version, &es, &start, &after )) return NULL;
++    if (es && version >= 300)
++    {
++        /* GLSL ES 3.00 already has the names of GLSL 3.30 */
++        size = asprintf( &ret, "%.*s#version 330%.*s", (int)(start - src), src, (int)(end - after), after );
++        if (size < 0) return NULL;
++        drop_glsl_stray_semicolons( ret, ret + size );
++        return ret;
++    }
++    if (!es && version >= 330) return NULL;
++    if (!es && version >= 140 && !glsl_uses_name( src, end, "attribute" ) && !glsl_uses_name( src, end, "varying" )
++        && !glsl_uses_name( src, end, "gl_FragColor" ) && !glsl_uses_name( src, end, "gl_FragData" )
++        && !glsl_uses_name( src, end, "texture2D" ) && !glsl_uses_name( src, end, "textureCube" ))
++        return NULL;
++
++    if (type == GL_VERTEX_SHADER)
++        stage = "#define attribute in\n#define varying out\n";
++    else if (type == GL_FRAGMENT_SHADER)
++    {
++        stage = "#define varying in\n";
++        if (glsl_uses_name( src, end, "gl_FragData" ))
++            output = "out vec4 wine_FragData[8];\n#define gl_FragData wine_FragData\n";
++        else if (glsl_uses_name( src, end, "gl_FragColor" ))
++            output = "out vec4 wine_FragColor;\n#define gl_FragColor wine_FragColor\n";
++    }
++    else
++        return NULL;
++
++    /* The #version line becomes a blank one, so the lines of the source keep their numbers after #line 1 */
++    size = asprintf( &ret, "#version %d\n%s%s%s#line 1\n%.*s%*s%.*s", !es && version >= 140 ? version : 150,
++                     stage, output, texture_names,
++                     (int)(start ? start - src : 0), src, (int)(start ? after - start : 0), "",
++                     (int)(start ? end - after : len), start ? after : src );
++    if (size < 0) return NULL;
++    body = ret + size - len;
++    drop_glsl_es_extensions( body, ret + size );
++    drop_glsl_stray_semicolons( body, ret + size );
++    return ret;
++}
++
++void wrap_glShaderSource( TEB *teb, GLuint shader, GLsizei count, const GLchar *const*string, const GLint *length,
++                          PFN_glShaderSource p_glShaderSource )
++{
++    const struct opengl_funcs *funcs = teb->glTable;
++    struct opengl_client_context *client;
++    struct context *ctx;
++    GLint profile = 0, type = 0;
++    char *src, *translated;
++    size_t len = 0, pos = 0;
++    GLsizei i;
++
++    if (!(ctx = get_current_context( teb, NULL, NULL )) || count <= 0 || !string)
++        goto plain;
++    client = opengl_client_context_from_client( ctx->base.client_context );
++    if (client->major_version < 3 || (client->major_version == 3 && client->minor_version < 2)) goto plain;
++    funcs->p_glGetIntegerv( GL_CONTEXT_PROFILE_MASK, &profile );
++    if (!(profile & GL_CONTEXT_CORE_PROFILE_BIT)) goto plain;
++
++    for (i = 0; i < count; i++)
++        if (string[i]) len += length && length[i] >= 0 ? length[i] : strlen( string[i] );
++    if (!(src = malloc( len + 1 ))) goto plain;
++    for (i = 0; i < count; i++)
++    {
++        size_t n;
++        if (!string[i]) continue;
++        n = length && length[i] >= 0 ? length[i] : strlen( string[i] );
++        memcpy( src + pos, string[i], n );
++        pos += n;
++    }
++    src[len] = 0;
++
++    funcs->p_glGetShaderiv( shader, GL_SHADER_TYPE, &type );
++    if ((translated = translate_legacy_glsl( type, src, len )))
++    {
++        const GLchar *one = translated;
++        WARN( "shader %u: legacy GLSL in a core profile context, compiling it as GLSL 1.50 or 3.30\n", shader );
++        p_glShaderSource( shader, 1, &one, NULL );
++        free( translated );
++        free( src );
++        return;
++    }
++    free( src );
++
++plain:
++    p_glShaderSource( shader, count, string, length );
++}
++
++void wrap_glCompileShader( TEB *teb, GLuint shader, PFN_glCompileShader p_glCompileShader )
++{
++    const struct opengl_funcs *funcs = teb->glTable;
++    GLint status = GL_TRUE;
++    char log[1024];
++
++    p_glCompileShader( shader );
++    if (!WARN_ON(opengl)) return;
++    funcs->p_glGetShaderiv( shader, GL_COMPILE_STATUS, &status );
++    if (status) return;
++    log[0] = 0;
++    funcs->p_glGetShaderInfoLog( shader, sizeof(log), NULL, log );
++    WARN( "shader %u does not compile: %s\n", shader, debugstr_a(log) );
++}
++
++void wrap_glLinkProgram( TEB *teb, GLuint program, PFN_glLinkProgram p_glLinkProgram )
++{
++    const struct opengl_funcs *funcs = teb->glTable;
++    GLint status = GL_TRUE;
++    char log[1024];
++
++    p_glLinkProgram( program );
++    if (!WARN_ON(opengl)) return;
++    funcs->p_glGetProgramiv( program, GL_LINK_STATUS, &status );
++    if (status) return;
++    log[0] = 0;
++    funcs->p_glGetProgramInfoLog( program, sizeof(log), NULL, log );
++    WARN( "program %u does not link: %s\n", program, debugstr_a(log) );
++}
++
+ void wrap_glFinish( TEB *teb, PFN_glFinish p_glFinish )
+ {
+     resolve_default_fbo( teb, FALSE );

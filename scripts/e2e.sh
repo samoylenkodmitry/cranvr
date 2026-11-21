@@ -6,7 +6,7 @@
 # Usage: scripts/e2e.sh [--seconds N] [--fps HZ] [--game | --wine PROGRAM [--wine-arg ARG]...] [--desktop]
 #                       [--quest [SERIAL] | --native-tcp] [--native-drop PERCENT] [--native-port PORT]
 #                       [--host-arg ARG]... [--probe-arg ARG]... [--report FILE]
-#                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine | --openvr-wine | --openvr-actions MODE | --openvr-overlay]
+#                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine | --openvr-wine | --openvr-actions MODE | --openvr-overlay | --openvr-gl]
 #                       [--displays N] [--hold] [--hand-hold] [--displays-in-game]
 #                       [--game-stall AT:FOR]
 #                       [--pause AT:FOR] [--left-trigger AT:FOR] [--right-trigger AT:FOR]
@@ -50,6 +50,10 @@
 #   --openvr-overlay  the same program with an overlay up for the whole run (a loading screen's). The runtime takes
 #                 no quad layer, so OpenComposite leaves the overlay out; the run fails when the host counts fewer
 #                 game frames than half of the rate. Implies --openvr-wine.
+#   --openvr-gl   the same program with OpenGL, as Google Earth VR draws: it asks Wine for an OpenGL 3.2 context with the
+#                 compatibility profile, draws with a shader of GLSL 1.10 and submits one OpenGL texture with both eyes
+#                 side by side. OpenComposite copies it into the runtime's Direct3D 11 images. The run checks the
+#                 picture of each eye in the host the same way. Implies --openvr-wine.
 #   --face-source SOURCE  with --tracking and --tracking-wine: where the probe's face comes from.
 #                 audio (the default) is a Quest 3's microphone face, visual is a face from cameras,
 #                 and unknown is an offer that names no source, as a headset's offer before its face gives data. The
@@ -135,7 +139,7 @@ unsetopt BG_NICE
 root=${0:A:h:h}
 seconds=20 fps=120 fps_given=0 game=0 desktop=0 client=mac serial="" report=""
 displays=1 hold=0 hand_hold=0 displays_in_game=0 display_test=0
-tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 openvr_wine=0 openvr_actions="" openvr_overlay=0 face_source=audio
+tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 openvr_wine=0 openvr_actions="" openvr_overlay=0 openvr_gl=0 face_source=audio
 game_stall=""
 wine="" wine_args=()
 native_tcp=0 native_drop=0 native_port=9950 pause="" left_trigger="" right_trigger=""
@@ -153,6 +157,7 @@ while (( $# )); do
         --tracking-wine) tracking_wine=1; shift ;;
         --openvr-wine) openvr_wine=1; shift ;;
         --openvr-overlay) openvr_wine=1 openvr_overlay=1; shift ;;
+        --openvr-gl) openvr_wine=1 openvr_gl=1; shift ;;
         --openvr-actions)
             openvr_wine=1 openvr_actions=$2; shift 2
             [[ ${openvr_actions} == (touch|vive|both) ]] || { print -u2 "--openvr-actions takes touch, vive or both"; exit 2; } ;;
@@ -204,6 +209,7 @@ if (( openvr_wine )); then
     wine_args=(--seconds $(( seconds - 6 )) --expect-input)
     [[ -z ${openvr_actions} ]] || wine_args+=(--actions "${openvr_actions}")
     (( ! openvr_overlay )) || wine_args+=(--overlay)
+    (( ! openvr_gl )) || wine_args+=(--gl)
     export CRANVR_OPENCOMPOSITE=1
     # The run tests the path of an OpenVR program, not the rate. On a Mac that other builds keep busy (a
     # load average above 20) the program loses frames to the scheduler: the report of its second-by-second

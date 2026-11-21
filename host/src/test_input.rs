@@ -8,7 +8,9 @@
 //! - `yaw`, `pitch`: where the controller points, in degrees from the direction that the head faces. A positive
 //!   yaw turns to the left and a positive pitch turns up. The default is 0.
 //! - `trigger`: the trigger's pull from 0 to 1 (a pull of 0.7 or more clicks it). The default is 0.
-//! - `primary`, `secondary`: 1 presses A or B. `stick_x`, `stick_y`: the stick from -1 to 1.
+//! - `primary`, `secondary`: 1 presses A or B. `stick_x`, `stick_y`: the stick from -1 to 1. `stick_click`: 1 presses
+//!   the stick down, the click that a game written for the Vive wand's trackpad reads.
+//! - `grip`: the grip's pull from 0 to 1 (a pull of 0.7 or more clicks it). The default is 0.
 //! - `turn`: the game's room turns by this many degrees about the vertical axis through the head (a positive turn
 //!   to the left): the game sees the head and both controllers turned, and the picture that the headset shows is the
 //!   one for the headset's real pose. A game that puts its panels at the side of a headset that lies on a desk then
@@ -43,15 +45,28 @@ pub struct Hand {
     yaw: f32,
     pitch: f32,
     trigger: f32,
+    grip: f32,
     primary: bool,
     secondary: bool,
+    stick_click: bool,
     stick: [f32; 2],
     at: [f32; 3],
 }
 
 impl Default for Hand {
     fn default() -> Self {
-        Self { turn: 0.0, yaw: 0.0, pitch: 0.0, trigger: 0.0, primary: false, secondary: false, stick: [0.0; 2], at: [0.2, -0.35, -0.3] }
+        Self {
+            turn: 0.0,
+            yaw: 0.0,
+            pitch: 0.0,
+            trigger: 0.0,
+            grip: 0.0,
+            primary: false,
+            secondary: false,
+            stick_click: false,
+            stick: [0.0; 2],
+            at: [0.2, -0.35, -0.3],
+        }
     }
 }
 
@@ -67,8 +82,10 @@ impl Hand {
                 "yaw" => hand.yaw = value,
                 "pitch" => hand.pitch = value,
                 "trigger" => hand.trigger = value.clamp(0.0, 1.0),
+                "grip" => hand.grip = value.clamp(0.0, 1.0),
                 "primary" => hand.primary = value != 0.0,
                 "secondary" => hand.secondary = value != 0.0,
+                "stick_click" => hand.stick_click = value != 0.0,
                 "stick_x" => hand.stick[0] = value.clamp(-1.0, 1.0),
                 "stick_y" => hand.stick[1] = value.clamp(-1.0, 1.0),
                 // The right of the head is +x, up is +y and forward is -z, as in the poses of the protocol
@@ -105,14 +122,18 @@ impl Hand {
 
     /// Replaces the right hand of an input sample.
     pub fn apply_input(&self, input: &mut Input) {
-        let clicked = self.trigger >= CLICK;
         let hand = &mut input.hands[1];
         hand.trigger = self.trigger;
+        hand.grip = self.grip;
         hand.stick = self.stick;
-        hand.buttons = (buttons::TRIGGER_CLICK * u32::from(clicked))
+        hand.buttons = (buttons::TRIGGER_CLICK * u32::from(self.trigger >= CLICK))
+            | (buttons::GRIP_CLICK * u32::from(self.grip >= CLICK))
             | (buttons::PRIMARY * u32::from(self.primary))
-            | (buttons::SECONDARY * u32::from(self.secondary));
-        hand.touches = (buttons::TRIGGER_CLICK * u32::from(self.trigger > 0.0)) | (buttons::PRIMARY * u32::from(self.primary));
+            | (buttons::SECONDARY * u32::from(self.secondary))
+            | (buttons::STICK_CLICK * u32::from(self.stick_click));
+        hand.touches = (buttons::TRIGGER_CLICK * u32::from(self.trigger > 0.0))
+            | (buttons::PRIMARY * u32::from(self.primary))
+            | (buttons::STICK_CLICK * u32::from(self.stick_click));
     }
 }
 
@@ -194,12 +215,13 @@ mod tests {
 
     #[test]
     fn the_words_of_a_file_set_the_hand_and_unknown_words_are_left_out() {
-        let hand = Hand::parse("yaw=-10 pitch=5.5 trigger=2 primary=1 junk nothing=3 stick_x=-4 z=0.5\n");
+        let hand = Hand::parse("yaw=-10 pitch=5.5 trigger=2 primary=1 junk nothing=3 stick_x=-4 z=0.5 grip=0.8 stick_click=1\n");
         assert_eq!((hand.yaw, hand.pitch), (-10.0, 5.5));
         // The pull stays between 0 and 1, the stick between -1 and 1
         assert_eq!(hand.trigger, 1.0);
+        assert_eq!(hand.grip, 0.8);
         assert_eq!(hand.stick, [-1.0, 0.0]);
-        assert!(hand.primary && !hand.secondary);
+        assert!(hand.primary && !hand.secondary && hand.stick_click);
         assert_eq!(hand.at, [0.2, -0.35, -0.5]);
         assert_eq!(Hand::parse(""), Hand::default());
         assert_eq!(Hand::parse("turn=40").turn, 40.0);
