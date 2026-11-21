@@ -37,8 +37,11 @@
 //! controller's subspace shows nothing then): the extra `hand_anchor` with the value `view` puts the
 //! strip, the menu and the hand's display in a subspace that follows the head, at the place where a
 //! left hand would hold them. Their carried places there have names of their own, so they never move
-//! the panels on the controller. The extra `hand_menu` with the value `open` opens the menu at the
-//! start.
+//! the panels on the controller. The value `head` puts them at the same place in a subspace that
+//! follows every move of the head (`TrackedDimensions::All`), so Cranpose hands their layers to the
+//! compositor in the head's space, as it does with the controller's aim. A headset on a desk tracks
+//! the head, so this runs that path. The extra `hand_menu` with the value `open` opens the menu at the
+//! start and keeps it open, for a test with no hand that would keep a ray over it.
 
 use crate::{
     displays::displays,
@@ -93,12 +96,12 @@ pub const ON_CONTROLLER: HandFrame = HandFrame { base: [0.0; 3], menu: "hand-men
 pub const ON_VIEW: HandFrame = HandFrame { base: [-300.0, -350.0, 600.0], menu: "hand-menu-view", display: "hand-display-view" };
 
 /// Where the hand's panels ride: the left controller, which they follow in all six dimensions, or the
-/// head for a test on a desk.
+/// head for a test on a desk (see the file's notes).
 fn anchor() -> (FollowTarget, HandFrame) {
-    if launch_args().string("hand_anchor") == Some("view") {
-        (FollowTarget::View(FollowMode::Snap(TrackedDimensions::TranslationAndYaw)), ON_VIEW)
-    } else {
-        (FollowTarget::Controller(Hand::Left, FollowMode::Tight(TrackedDimensions::All)), ON_CONTROLLER)
+    match launch_args().string("hand_anchor") {
+        Some("view") => (FollowTarget::View(FollowMode::Snap(TrackedDimensions::TranslationAndYaw)), ON_VIEW),
+        Some("head") => (FollowTarget::View(FollowMode::Tight(TrackedDimensions::All)), ON_VIEW),
+        _ => (FollowTarget::Controller(Hand::Left, FollowMode::Tight(TrackedDimensions::All)), ON_CONTROLLER),
     }
 }
 
@@ -149,11 +152,13 @@ pub fn HandPanels(state: HandState, console_open: bool) {
     let layout = state.layout.get();
     let pinned_shown = layout.pinned().filter(|stream| layout.shown(PanelId::Display(*stream)));
     let open = state.menu_open.get();
-    // The menu closes itself after a while without a pointer over a panel
+    // The menu closes itself after a while without a pointer over a panel. A test launch that opens it
+    // keeps it open: no hand keeps a ray over it on a desk.
+    let closes_itself = !open_on_launch();
     LaunchedEffect(open, async move |_| {
         // The time counts from the last pointer over a panel, or from the opening
         let opened_ms = cranvr_proto::clock::now_ns() / 1_000_000;
-        while open {
+        while open && closes_itself {
             delay(Duration::from_secs(1)).await;
             let now_ms = cranvr_proto::clock::now_ns() / 1_000_000;
             let since_opened = Duration::from_millis(now_ms.saturating_sub(opened_ms));
