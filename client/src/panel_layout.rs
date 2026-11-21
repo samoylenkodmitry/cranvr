@@ -31,7 +31,8 @@ use std::collections::BTreeSet;
 /// - The Mac's displays rank first. Their pictures are surfaces, which Cranpose keeps on layers of
 ///   their own before every panel, so the rank does nothing to them. The Mac's cursor ring over a
 ///   display is a panel. It takes the displays' rank: on a runtime with no depth test, a ring in the
-///   projection layer can draw under the layer of its display.
+///   projection layer can draw under the layer of its display. The host draws the cursor into the
+///   pictures by default, so the ring shows only with `CRANVR_DESKTOP_CURSOR_IN_VIDEO=0`.
 /// - The console and the connect panel rank next. Most of their text is 20 to 22 mm tall, and it
 ///   stands 0.6 to 1 m from the head: 1.3 to 2 degrees.
 /// - The hand menu ranks after them: its ball and its panel. The text of the menu is 20 to 26 mm

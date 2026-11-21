@@ -154,7 +154,7 @@ The client ranks its panels with `SubspaceModifier::layer_priority` (`panel_layo
 | 1 | the hand menu: the ball and the menu | Its text is 20 to 26 mm tall at 45 cm, which is 2.5 to 3.3 degrees. It stays readable when it shows softer. |
 | 0 | the stream numbers | The user reads them only to check the link. |
 
-Panels of one rank keep their layers by Cranpose's own order: the panel that a hand points at first, then the nearer one. The client's log names each change of the plan (`cranpose xr: the frame needs N layers and gets M of the 16 that the runtime takes: the projection layer draws P of them, Q are left out`).
+The host draws the Mac's cursor into the pictures by default, so a display has no ring unless the host runs with `CRANVR_DESKTOP_CURSOR_IN_VIDEO=0`. Panels of one rank keep their layers by Cranpose's own order: the panel that a hand points at first, then the nearer one. The client's log names each change of the plan (`cranpose xr: the frame needs N layers and gets M of the 16 that the runtime takes: the projection layer draws P of them, Q are left out`).
 
 ### Panels in a game and the hands
 
