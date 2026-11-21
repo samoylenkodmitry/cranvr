@@ -192,7 +192,16 @@ pub struct EncoderConfig {
     /// frame took 3.6 to 5.0 ms instead of 6.1 to 6.3 ms, and the encoder kept up with 232 frames a
     /// second instead of 170. A keyframe then may come out larger.
     pub strict_rate: bool,
+    /// The longest run of frames without a key frame, as time at `fps`. `None`: a key frame comes
+    /// only first and when the caller forces one.
+    pub key_every: Option<Duration>,
+    /// The highest quantizer that a frame may use, for a floor under the quality. `None` leaves it to
+    /// the rate control.
+    pub max_qp: Option<u8>,
 }
+
+/// The key frame interval of the eye stream
+pub const KEY_EVERY: Duration = Duration::from_secs(10);
 
 /// Hard limits on the data that the encoder sends without strict rate control: for each window,
 /// the share of the average bitrate and the window's length in seconds.
@@ -280,8 +289,15 @@ impl Encoder {
             encoder.set(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue).ok();
             encoder.set(kVTCompressionPropertyKey_MaximizePowerEfficiency, kCFBooleanFalse).ok();
             encoder.set_number(kVTCompressionPropertyKey_ExpectedFrameRate, config.fps as f64)?;
-            // The host asks for an IDR frame when a client needs one; a long interval avoids bitrate spikes
-            encoder.set_number(kVTCompressionPropertyKey_MaxKeyFrameInterval, (config.fps * 10.0) as f64)?;
+            // The host asks for an IDR frame when a client needs one; a long interval avoids bitrate spikes.
+            // 0 means no interval: key frames come only when the host asks.
+            let key_interval = config.key_every.map_or(f64::from(i32::MAX), |every| (config.fps * every.as_secs_f32()).round() as f64);
+            encoder.set_number(kVTCompressionPropertyKey_MaxKeyFrameInterval, key_interval)?;
+            // A cap on the quantizer is a floor under the quality. The encoder spends more bits on a hard
+            // picture, or drops it, instead of blurring it. macOS 12 and later.
+            if let Some(qp) = config.max_qp {
+                encoder.set_number(kVTCompressionPropertyKey_MaxAllowedFrameQP, f64::from(qp)).ok();
+            }
             encoder.set_bitrate(config.bitrate_bps);
             VTCompressionSessionPrepareToEncodeFrames(session);
             Ok(encoder)
@@ -352,20 +368,23 @@ impl Encoder {
         }
     }
 
-    /// Queues one frame. `frame_index` only orders frames; `timestamp_ns` comes back with the output.
     /// Frames handed to the encoder whose output has not come yet.
     pub fn in_flight(&self) -> usize {
         unsafe { (*self.output).submitted.lock().unwrap().len() }
     }
 
-    pub fn encode(&self, buffer: &PixelBuffer, frame_index: i64, timestamp_ns: u64, force_idr: bool) -> Result<(), String> {
+    /// Queues one frame. `presentation` places the frame on the encoder's time line and must grow from
+    /// frame to frame. The rate control spreads the average bitrate over that time line: frames that
+    /// stand 1 ms apart on it get the bits of 1 ms each, whatever time passes between the calls.
+    /// `timestamp_ns` comes back with the output.
+    pub fn encode(&self, buffer: &PixelBuffer, presentation: Duration, timestamp_ns: u64, force_idr: bool) -> Result<(), String> {
         unsafe {
             (*self.output).submitted.lock().unwrap().push_back((timestamp_ns, Instant::now()));
             let props = force_idr.then(|| dictionary(&[(kVTEncodeFrameOptionKey_ForceKeyFrame, kCFBooleanTrue)]));
             let status = VTCompressionSessionEncodeFrame(
                 self.session,
                 buffer.0,
-                CMTime::new(frame_index, 1000),
+                CMTime::new(presentation.as_micros() as i64, 1_000_000),
                 CMTime::INVALID,
                 props.unwrap_or(ptr::null()),
                 timestamp_ns as *mut c_void,
@@ -558,12 +577,17 @@ pub struct DecodedFrame {
     pub width: usize,
     pub height: usize,
     pub samples: Vec<Sample>,
+    /// The whole Y plane, `width` bytes a row, when the decoder was made with [`Decoder::with_luma`].
+    /// It is empty otherwise.
+    pub luma: Vec<u8>,
 }
 
 struct DecoderOutput {
     sender: Sender<DecodedFrame>,
     /// Points to read, as fractions of the frame width and height
     points: Vec<(f32, f32)>,
+    /// Copy the whole Y plane of each frame
+    luma: bool,
 }
 
 /// An HEVC decoder for tests: it reads a few points from each frame instead of copying it.
@@ -577,6 +601,16 @@ unsafe impl Send for Decoder {}
 
 impl Decoder {
     pub fn new(config_nals: &[u8], points: Vec<(f32, f32)>, sender: Sender<DecodedFrame>) -> Result<Self, String> {
+        Self::open(config_nals, points, false, sender)
+    }
+
+    /// A decoder that also copies the whole Y plane of each frame, so that a test can compare the
+    /// decoded picture with the one that went into the encoder.
+    pub fn with_luma(config_nals: &[u8], sender: Sender<DecodedFrame>) -> Result<Self, String> {
+        Self::open(config_nals, Vec::new(), true, sender)
+    }
+
+    fn open(config_nals: &[u8], points: Vec<(f32, f32)>, luma: bool, sender: Sender<DecodedFrame>) -> Result<Self, String> {
         unsafe {
             let nals = split_annex_b(config_nals);
             if nals.len() < 3 {
@@ -600,7 +634,7 @@ impl Decoder {
 
             let pixel_format = number_i64(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange as i64);
             let attrs = dictionary(&[(kCVPixelBufferPixelFormatTypeKey, pixel_format)]);
-            let output = Box::into_raw(Box::new(DecoderOutput { sender, points }));
+            let output = Box::into_raw(Box::new(DecoderOutput { sender, points, luma }));
             let record = VTDecompressionOutputCallbackRecord { callback: decode_callback, refcon: output as *mut c_void };
             let mut session = ptr::null_mut();
             let status = VTDecompressionSessionCreate(kCFAllocatorDefault, format, ptr::null(), attrs, &record, &mut session);
@@ -700,10 +734,15 @@ extern "C" fn decode_callback(
                 Sample { y: *y_plane.add(y * y_stride + x), cb: *uv, cr: *uv.add(1) }
             })
             .collect();
+        let luma = if output.luma {
+            (0..height).flat_map(|row| std::slice::from_raw_parts(y_plane.add(row * y_stride), width)).copied().collect()
+        } else {
+            Vec::new()
+        };
         CVPixelBufferUnlockBaseAddress(image, 1);
         output
             .sender
-            .send(DecodedFrame { timestamp_ns: source_frame_refcon as u64, width, height, samples })
+            .send(DecodedFrame { timestamp_ns: source_frame_refcon as u64, width, height, samples, luma })
             .ok();
     }
 }
@@ -731,7 +770,8 @@ mod tests {
     #[test]
     fn encode_then_decode_keeps_left_and_right_colors() {
         let (tx, rx) = mpsc::channel();
-        let config = EncoderConfig { width: 1024, height: 512, fps: 90.0, bitrate_bps: 30_000_000, full_range: true, strict_rate: false };
+        let config =
+            EncoderConfig { width: 1024, height: 512, fps: 90.0, bitrate_bps: 30_000_000, full_range: true, strict_rate: false, key_every: Some(KEY_EVERY), max_qp: None };
         let encoder = Encoder::new(&config, tx).expect("encoder");
         for i in 0..5 {
             let mut buffer = encoder.pixel_buffer().expect("pixel buffer");
@@ -749,7 +789,7 @@ mod tests {
                     }
                 }
             });
-            encoder.encode(&buffer, i, 1000 + i as u64, i == 0).expect("encode");
+            encoder.encode(&buffer, Duration::from_millis(i as u64 * 11), 1000 + i as u64, i == 0).expect("encode");
         }
         drop(encoder);
         let frames: Vec<EncodedFrame> = rx.try_iter().collect();

@@ -33,7 +33,7 @@ use cranvr_proto::{
     message::{Cursor, DesktopParams, DesktopWish, HostDatagram, HostMsg, Mouse, DESKTOP_STREAM},
     wire::{Codec, Pose, Rect},
 };
-use cranvr_vt::{EncodedFrame, Encoder, EncoderConfig, Flipper};
+use cranvr_vt::{EncodedFrame, Encoder, EncoderConfig, Flipper, PixelBuffer};
 use std::{
     ffi::c_void,
     sync::{
@@ -249,12 +249,92 @@ struct Running {
     params: DesktopParams,
     wish: DesktopWish,
     flipper: Option<Flipper>,
-    last_seq: u64,
-    index: i64,
-    /// The next frame is a key frame
-    key: bool,
+    feed: Feed,
     /// The parameter sets that the client has
     config: Option<Vec<u8>>,
+}
+
+/// A display that stopped changing gets its last picture again after this time, so that the encoder
+/// sharpens what the motion left blurred
+const REFRESH_AFTER: Duration = Duration::from_millis(250);
+/// How often a still picture goes in again
+const REFRESHES: u8 = 2;
+
+/// Decides which picture goes to a display's encoder, when and where it stands on the encoder's time
+/// line. ScreenCaptureKit hands over a picture only when the display changes, so the pictures come
+/// at uneven times.
+pub(super) struct Feed {
+    started: Instant,
+    /// The number of the capture that went in last
+    last_seq: u64,
+    last_presentation: Option<Duration>,
+    /// The next picture is a key frame
+    key: bool,
+    /// When the last picture went in
+    sent_at: Instant,
+    /// How often the last capture still goes in again while the display stays still
+    refreshes: u8,
+}
+
+/// One picture for the encoder.
+pub(super) struct Picture {
+    pub image: PixelBuffer,
+    seq: u64,
+    /// Where the picture stands on the encoder's time line
+    pub presentation: Duration,
+    pub key: bool,
+}
+
+impl Feed {
+    /// A feed whose first picture is a key frame.
+    pub(super) fn new(now: Instant) -> Self {
+        Self { started: now, last_seq: 0, last_presentation: None, key: true, sent_at: now, refreshes: 0 }
+    }
+
+    /// The client lost a picture: the next one is a key frame.
+    pub(super) fn request_key(&mut self) {
+        self.key = true;
+    }
+
+    /// The picture to encode at `now`, if any. `latest` is the newest capture and its number. A new
+    /// capture goes in at once. The last capture goes in again for a key frame, and twice more after
+    /// the display stays still for `REFRESH_AFTER`.
+    pub(super) fn next(&self, latest: Option<(u64, PixelBuffer)>, now: Instant) -> Option<Picture> {
+        let (seq, image) = latest?;
+        let refresh = self.refreshes > 0 && now.duration_since(self.sent_at) >= REFRESH_AFTER;
+        if seq == self.last_seq && !self.key && !refresh {
+            return None;
+        }
+        // The time line is the real time since the capture started. VideoToolbox's rate control
+        // reads the bitrate against it, so a picture gets the bits of the time since the one before.
+        // The time line must grow, so a picture in the same microsecond as the last moves on by one.
+        let elapsed = now.duration_since(self.started);
+        let presentation = self.last_presentation.map_or(elapsed, |last| elapsed.max(last + Duration::from_micros(1)));
+        Some(Picture { image, seq, presentation, key: self.key })
+    }
+
+    /// The encoder took `picture` at `now`.
+    pub(super) fn took(&mut self, picture: &Picture, now: Instant) {
+        self.refreshes = if picture.seq != self.last_seq || picture.key { REFRESHES } else { self.refreshes.saturating_sub(1) };
+        (self.last_seq, self.last_presentation, self.key, self.sent_at) = (picture.seq, Some(picture.presentation), false, now);
+    }
+
+    /// Whether `picture` is a capture that did not go in before.
+    pub(super) fn is_new(&self, picture: &Picture) -> bool {
+        picture.seq != self.last_seq
+    }
+}
+
+/// Hands `picture` to the encoder, mirrored first when `flipper` is set.
+pub(super) fn encode_picture(encoder: &Encoder, flipper: Option<&Flipper>, picture: &Picture, timestamp: u64) -> Result<(), String> {
+    match flipper {
+        Some(flipper) => {
+            let flipped = encoder.pixel_buffer().ok_or("the encoder has no buffer pool".to_string())?;
+            flipper.flip(&picture.image, &flipped)?;
+            encoder.encode(&flipped, picture.presentation, timestamp, picture.key)
+        }
+        None => encoder.encode(&picture.image, picture.presentation, timestamp, picture.key),
+    }
 }
 
 /// The desktop's pictures are mirrored for a compositor that reads a surface bottom row first:
@@ -287,10 +367,7 @@ impl Running {
         let (width, height) = capture.size;
         let (sender, encoded) = mpsc::channel();
         let mbps = scaled_mbps(options.mbps, [width, height], fps);
-        let encoder = Encoder::new(
-            &EncoderConfig { width, height, fps: fps as f32, bitrate_bps: mbps * 1_000_000, full_range: true, strict_rate: false },
-            sender,
-        )?;
+        let encoder = display_encoder([width, height], fps, mbps, sender)?;
         let flipper = if flip_pictures() { Some(Flipper::new()?) } else { None };
         let params = DesktopParams {
             stream: options.stream,
@@ -303,8 +380,24 @@ impl Running {
             flipped: flipper.is_some(),
             cursor_in_video: cursor_in_video(),
         };
-        Ok(Self { capture, encoder, encoded, params, wish, flipper, last_seq: 0, index: 0, key: true, config: None })
+        Ok(Self { capture, encoder, encoded, params, wish, flipper, feed: Feed::new(Instant::now()), config: None })
     }
+}
+
+/// The encoder of a display's pictures: HEVC at `fps` pictures a second at most and `mbps` on average.
+/// The highest quantizer of a display's frames. In `display_quality.rs` it held the made-up text of the
+/// hand's display at 39 dB in every scene, against 31 to 37 dB without it. A hard picture costs more
+/// bits instead: 13 Mbps instead of 11 Mbps for a video at a target of 6 Mbps.
+const DISPLAY_MAX_QP: u8 = 18;
+
+/// The encoder of a display's pictures: HEVC at `fps` pictures a second at most and `mbps` on average.
+/// A key frame comes first and when the client lost a picture, never on a timer: the rate control gave
+/// a key frame of a busy desktop less sharpness than the pictures before it, so a timer would blur the
+/// text every few seconds.
+fn display_encoder([width, height]: [u32; 2], fps: i32, mbps: u64, sender: Sender<EncodedFrame>) -> Result<Encoder, String> {
+    let bitrate_bps = mbps * 1_000_000;
+    let config = EncoderConfig { width, height, fps: fps as f32, bitrate_bps, full_range: true, strict_rate: false, key_every: None, max_qp: Some(DISPLAY_MAX_QP) };
+    Encoder::new(&config, sender)
 }
 
 /// Runs the capture, the encoder and the send for the client's wish until the session ends.
@@ -375,24 +468,16 @@ fn step(inner: &Inner, session: &Session, run: &mut Running, next_frame: &mut u3
     let live = !session.paused();
     run.capture.set_running(live);
     if inner.key.swap(false, Ordering::Relaxed) {
-        run.key = true;
+        run.feed.request_key();
     }
     if live && run.encoder.in_flight() < 2 {
-        if let Some((seq, image)) = run.capture.latest().filter(|(seq, _)| *seq != run.last_seq || run.key) {
-            inner.counters.captured.fetch_add(1, Ordering::Relaxed);
-            let timestamp = now_ns();
-            let result = match &run.flipper {
-                Some(flipper) => run.encoder.pixel_buffer().ok_or("the encoder has no buffer pool".to_string()).and_then(|flipped| {
-                    flipper.flip(&image, &flipped)?;
-                    run.encoder.encode(&flipped, run.index, timestamp, run.key)
-                }),
-                None => run.encoder.encode(&image, run.index, timestamp, run.key),
-            };
-            match result {
-                Ok(()) => {
-                    (run.last_seq, run.key) = (seq, false);
-                    run.index += 1;
-                }
+        let now = Instant::now();
+        if let Some(picture) = run.feed.next(run.capture.latest(), now) {
+            if run.feed.is_new(&picture) {
+                inner.counters.captured.fetch_add(1, Ordering::Relaxed);
+            }
+            match encode_picture(&run.encoder, run.flipper.as_ref(), &picture, now_ns()) {
+                Ok(()) => run.feed.took(&picture, now),
                 Err(e) => warn!("{}: the encoder refused a picture: {e}", inner.label()),
             }
         }
@@ -629,3 +714,7 @@ fn cursor_loop(inner: &Inner, session: &Session) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/display_quality.rs"]
+mod quality_tests;
