@@ -25,9 +25,14 @@
 //! seconds from AT seconds after its start, and logs the stall's wall-clock times, so that a test can
 //! look at what the headset showed in the meantime (the host must keep the game's last picture).
 //!
+//! `--moving` plays a game whose picture moves all the time, as a game's does while the head turns: a
+//! landscape with fine detail pans across both eyes at up to 1500 pixels a second, so a test can measure
+//! what the eye stream sends for a moving picture with a headset that lies still. The eyes then show
+//! no badges.
+//!
 //! Usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input] [--expect-held]
 //!        [--use-tracking FEATURES] [--release-tracking] [--expect-tracking] [--expect-hand-controllers]
-//!        [--expect-no-controllers] [--stall AT:FOR]
+//!        [--expect-no-controllers] [--stall AT:FOR] [--moving]
 
 use cranvr_common::inputs::{LEFT_SQUEEZE_VALUE_ID, LEFT_TRIGGER_VALUE_ID, RIGHT_A_CLICK_ID, RIGHT_B_CLICK_ID, RIGHT_SQUEEZE_VALUE_ID, RIGHT_THUMBSTICK_X_ID, RIGHT_TRIGGER_VALUE_ID};
 use cranvr_proto::wire::Motion;
@@ -537,8 +542,75 @@ fn paint(image: &mut PixelBuffer, eye: usize) {
     });
 }
 
+/// A landscape for `--moving`: sky with clouds, grass with fine detail and posts with hard edges, in
+/// BGRA rows of `width` pixels.
+struct Landscape {
+    data: Vec<u8>,
+    width: usize,
+    height: usize,
+}
+
+impl Landscape {
+    fn new(width: usize, height: usize) -> Self {
+        // A grid of random values, mixed at three scales
+        const GRID: usize = 256;
+        let mut seed = 5u64;
+        let mut random = move || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as u32
+        };
+        let grid: Vec<f32> = (0..GRID * GRID).map(|_| (random() % 1000) as f32 / 1000.0).collect();
+        let noise = |x: f32, y: f32| {
+            let (x0, y0) = (x.floor(), y.floor());
+            let (fx, fy) = (x - x0, y - y0);
+            let at = |i: f32, j: f32| grid[(j as usize % GRID) * GRID + (i as usize % GRID)];
+            let top = at(x0, y0) * (1.0 - fx) + at(x0 + 1.0, y0) * fx;
+            let bottom = at(x0, y0 + 1.0) * (1.0 - fx) + at(x0 + 1.0, y0 + 1.0) * fx;
+            top * (1.0 - fy) + bottom * fy
+        };
+        let mut data = vec![0u8; width * height * 4];
+        for y in 0..height {
+            let v = y as f32 / height as f32;
+            for x in 0..width {
+                let u = x as f32 / width as f32;
+                let detail = noise(u * 40.0, v * 20.0) * 0.5 + noise(u * 160.0, v * 80.0) * 0.3 + noise(u * 640.0, v * 320.0) * 0.2;
+                let (r, g, b) = if v < 0.45 + 0.08 * (noise(u * 6.0, 3.0) - 0.5) {
+                    let cloud = (noise(u * 12.0, v * 8.0) - 0.4).max(0.0) * 1.5;
+                    (0.45 + cloud, 0.6 + cloud, 0.9 + cloud * 0.3)
+                } else {
+                    (0.25 + 0.35 * detail, 0.35 + 0.4 * detail, 0.15 + 0.2 * detail)
+                };
+                let byte = |c: f32| (c.clamp(0.0, 1.0) * 255.0) as u8;
+                data[(y * width + x) * 4..(y * width + x) * 4 + 4].copy_from_slice(&[byte(b), byte(g), byte(r), 255]);
+            }
+        }
+        for _ in 0..60 {
+            let (x0, w) = (random() as usize % width, 4 + random() as usize % 12);
+            for y in height / 3..height {
+                let shade = if (y / 6) % 2 == 0 { 30 } else { 220 };
+                for x in x0..(x0 + w).min(width) {
+                    data[(y * width + x) * 4..(y * width + x) * 4 + 4].copy_from_slice(&[shade, shade, shade, 255]);
+                }
+            }
+        }
+        Self { data, width, height }
+    }
+
+    /// Copies the part of the landscape from `(x, y)` into `image`.
+    fn paint(&self, image: &mut PixelBuffer, x: usize, y: usize) {
+        let (w, h) = (image.width(), image.height());
+        image.with_bgra_mut(|data, stride| {
+            for row in 0..h.min(self.height - y) {
+                let from = ((y + row) * self.width + x) * 4;
+                data[row * stride..row * stride + w * 4].copy_from_slice(&self.data[from..from + w * 4]);
+            }
+        });
+    }
+}
+
 fn main() {
     let (mut control, mut fps, mut seconds, mut expect_input, mut expect_held) = (None, 72.0f64, 10.0f64, false, false);
+    let mut moving = false;
     let (mut use_tracking, mut expect_tracking, mut expect_hand_controllers, mut expect_no_controllers) = (String::new(), false, false, false);
     let mut expect_hand_held = false;
     let mut release_tracking = false;
@@ -564,8 +636,9 @@ fn main() {
                 assert!(stall.is_some(), "--stall AT:FOR takes two numbers of seconds");
             }
             "--face-source" => face_source = args.next().as_deref().and_then(tracked::FaceSource::parse).expect("--face-source visual|audio|unknown"),
+            "--moving" => moving = true,
             _ => {
-                eprintln!("usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input] [--expect-held] [--use-tracking FEATURES] [--expect-tracking] [--face-source visual|audio|unknown] [--expect-hand-controllers] [--expect-hand-held] [--expect-no-controllers] [--release-tracking] [--stall AT:FOR]");
+                eprintln!("usage: cranvr-fake-game --control FILE [--fps N] [--seconds N] [--expect-input] [--expect-held] [--use-tracking FEATURES] [--expect-tracking] [--face-source visual|audio|unknown] [--expect-hand-controllers] [--expect-hand-held] [--expect-no-controllers] [--release-tracking] [--stall AT:FOR] [--moving]");
                 std::process::exit(2);
             }
         }
@@ -704,7 +777,9 @@ fn main() {
         wait_ack(SWAPCHAIN_ACK);
         swapchains.push(images);
     }
-    println!("fake-game: {IMAGES} images of {w}x{h} per eye, {fps} fps");
+    println!("fake-game: {IMAGES} images of {w}x{h} per eye, {fps} fps{}", if moving { ", a moving landscape" } else { "" });
+    // Twice as wide as an eye and an eighth higher: the view pans across it
+    let land = moving.then(|| Landscape::new(w as usize * 2, h as usize * 9 / 8));
 
     let period = Duration::from_secs_f64(1.0 / fps);
     let start = Instant::now();
@@ -770,6 +845,16 @@ fn main() {
         }
         number += 1;
         in_flight[image] = Some(number);
+        if let Some(land) = &land {
+            // The view pans to each side once in 4 s and bobs once in 3 s; the right eye sees 8 pixels
+            // further
+            let t = start.elapsed().as_secs_f64();
+            let (w, h) = (w as f64, h as f64);
+            let x = (w * 0.5 + w * 0.45 * (t * std::f64::consts::TAU / 4.0).sin()) as usize;
+            let y = (h / 16.0 + h / 16.0 * (t * std::f64::consts::TAU / 3.0).sin()) as usize;
+            land.paint(&mut swapchains[0][image], x, y);
+            land.paint(&mut swapchains[1][image], (x + 8).min(land.width - w as usize), y);
+        }
         let f = *fov.lock().unwrap();
         let mut frame = number.to_le_bytes().to_vec();
         frame.extend_from_slice(&0i64.to_le_bytes());

@@ -12,7 +12,8 @@
 //! `cargo test --release -p cranvr-host eye_quality_curve -- --ignored --nocapture`. The environment
 //! sets the run: `CRANVR_EYE_FPS` (default 120), `CRANVR_EYE_MBPS` (default 100), `CRANVR_EYE_SCENE`
 //! (`game` or `pattern`), `CRANVR_EYE_SPACING=1ms` for the time line that the host had before,
-//! `CRANVR_EYE_STRICT=1` for the low-latency rate control and `CRANVR_EYE_SECONDS`.
+//! `CRANVR_EYE_STRICT=1` for the low-latency rate control, `CRANVR_EYE_MAX_QP` for a cap on the
+//! quantizer, `CRANVR_EYE_PAUSE=1` for a pause of a second at 4 s and `CRANVR_EYE_SECONDS`.
 
 use super::*;
 use crate::render::{ComposeParams, Params, Renderer};
@@ -118,6 +119,9 @@ struct Measure {
     busy: usize,
     /// The largest frame other than key frames, in bytes
     largest: usize,
+    /// Each key frame: its size, the gap from the frame before it in ms, and the PSNR of the frame
+    /// before it and its own
+    key_frames: Vec<(usize, f64, f64, f64)>,
     keys: usize,
 }
 
@@ -164,7 +168,10 @@ fn measure(setup: Setup) -> Measure {
     let foveation = Foveation::new(EYE, &FoveationConfig::default());
     let [eye_w, eye_h] = foveation.optimized;
     let (sender, encoded) = mpsc::channel();
-    let encoder = Encoder::new(&eye_encoder_config([eye_w * 2, eye_h], fps, true, mbps * 1_000_000, strict), sender).expect("encoder");
+    let mut config = eye_encoder_config([eye_w * 2, eye_h], fps, true, mbps * 1_000_000, strict);
+    // The curve may try a cap on the quantizer: `CRANVR_EYE_MAX_QP`
+    config.max_qp = std::env::var("CRANVR_EYE_MAX_QP").ok().and_then(|v| v.parse().ok());
+    let encoder = Encoder::new(&config, sender).expect("encoder");
     let mut renderer = Renderer::new().expect("renderer");
     let land = (scene == Scene::Game).then(|| landscape(if paced { 4096 } else { 2048 }, if paced { 2048 } else { 1024 }));
     // The decoder and the comparison run on a thread of their own, as the headset's decoder does
@@ -197,6 +204,10 @@ fn measure(setup: Setup) -> Measure {
             sources.extend(source_rx.try_iter());
             let source = sources.remove(&picture.timestamp_ns).expect("the source of the frame");
             m.psnr.push(psnr(&source, &picture.luma));
+            if frame.is_idr {
+                let before = m.psnr.len().checked_sub(2).map_or(0.0, |i| m.psnr[i]);
+                m.key_frames.push((frame.data.len(), m.interval_ms.last().copied().unwrap_or(0.0), before, m.psnr[m.psnr.len() - 1]));
+            }
         }
         m
     });
@@ -286,7 +297,7 @@ fn mean(values: &[f64]) -> f64 {
 fn report(label: &str, m: &Measure, mbps: u64) -> String {
     let sent = m.bytes as f64 * 8.0 / m.seconds / 1e6;
     format!(
-        "{label}: {} frames, {} key; PSNR mean {:.1} dB, lowest {:.1} dB; {:.1} Mbps of {mbps} ({:.0} percent), {:.1} KB a frame, {:.0} KB the largest; encode {:.2} ms median, {:.2} ms p95, {:.2} ms max; between frames {:.2} ms median, {:.2} ms p95, {:.2} ms max; {} turns found the encoder full",
+        "{label}: {} frames, {} key; PSNR mean {:.1} dB, lowest {:.1} dB; {:.1} Mbps of {mbps} ({:.0} percent), {:.1} KB a frame, {:.0} KB the largest; encode {:.2} ms median, {:.2} ms p95, {:.2} ms max; between frames {:.2} ms median, {:.2} ms p95, {:.2} ms max; {} turns found the encoder full; key frames (KB, gap ms, PSNR before and of the key): {}",
         m.frames,
         m.keys,
         mean(&m.psnr),
@@ -301,7 +312,8 @@ fn report(label: &str, m: &Measure, mbps: u64) -> String {
         percentile(&m.interval_ms, 0.5),
         percentile(&m.interval_ms, 0.95),
         percentile(&m.interval_ms, 1.0),
-        m.busy
+        m.busy,
+        m.key_frames.iter().map(|(bytes, gap, before, own)| format!("{:.0} KB, {gap:.1} ms, {before:.1} to {own:.1} dB", *bytes as f64 / 1000.0)).collect::<Vec<_>>().join("; ")
     )
 }
 
@@ -335,4 +347,24 @@ fn eye_quality_curve() {
     let pause = std::env::var("CRANVR_EYE_PAUSE").is_ok_and(|v| v == "1").then_some((4.0, 5.0));
     let m = measure(Setup { scene, spacing, fps, mbps, strict, frames: (seconds * f64::from(fps)) as usize, paced: true, pause });
     println!("{}", report(&format!("{scene:?}, {spacing:?}, {fps} Hz{}", if strict { ", strict" } else { "" }), &m, mbps));
+}
+
+/// The time line follows the real gaps between frames, two frames at most, and always grows.
+#[test]
+fn the_time_line_follows_the_frames_and_a_pause_saves_up_no_bits() {
+    let start = Instant::now();
+    let ms = |n: f64| Duration::from_secs_f64(n / 1000.0);
+    let mut line = TimeLine::new(120.0);
+    assert_eq!(line.at(start), Duration::ZERO);
+    assert_eq!(line.at(start + ms(8.0)), ms(8.0));
+    // A frame late by one frame keeps its real gap
+    assert_eq!(line.at(start + ms(24.0)), ms(24.0));
+    // A pause of a second counts as two frames, 16.7 ms
+    let after_pause = line.at(start + ms(1024.0));
+    assert!((after_pause.as_secs_f64() * 1000.0 - (24.0 + 2000.0 / 120.0)).abs() < 0.01, "{after_pause:?}");
+    // The next frame stands at its real gap after that one
+    assert_eq!(line.at(start + ms(1032.0)), after_pause + ms(8.0));
+    // Two frames at the same instant still stand apart
+    let at = line.at(start + ms(1032.0));
+    assert_eq!(at, after_pause + ms(8.0) + Duration::from_micros(1));
 }
