@@ -617,7 +617,7 @@ if [[ -n ${hand_interaction} ]]; then
     done
     grep -h "hand_interaction_smoke:" "${work}/game.log" || true
     grep -q "hand_interaction_smoke: PASS" "${work}/game.log" || { print -u2 "The hand interaction program did not pass; see ${work}/game.log"; hand_interaction_exit=1; }
-    grep -h "the game uses" "${work}/host.log" | tail -2 || true
+    grep -h "the game uses" "${work}/host.out" | tail -2 || true
 fi
 if (( tracking || tracking_wine )); then
     # The host asks the headset for tracking only after the game created its trackers

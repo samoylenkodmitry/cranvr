@@ -1419,10 +1419,10 @@ index 7e0738a..abf542e 100644
  target_link_options(frame_timer_probe PRIVATE -static -static-libgcc -static-libstdc++)
 diff --git c/runtime/tests/hand_interaction_smoke.cpp w/runtime/tests/hand_interaction_smoke.cpp
 new file mode 100644
-index 0000000..a3f308a
+index 0000000..4352a38
 --- /dev/null
 +++ w/runtime/tests/hand_interaction_smoke.cpp
-@@ -0,0 +1,695 @@
+@@ -0,0 +1,700 @@
 +// cranvr: reads the hand interaction profile of XR_EXT_hand_interaction while it drives cranvr-host's
 +// test hand (host/src/test_input.rs) through the host's words file. The program binds that profile
 +// alone, as a game with hand code and no controller bindings does, or with the Touch controller's
@@ -1892,8 +1892,11 @@ index 0000000..a3f308a
 +            leftPinchAheadOk = std::fabs(leftPinchAhead - 0.03f) < 1e-3f && std::fabs(length(ahead) - 0.03f) < 1e-3f;
 +        }
 +    };
-+    // Frames until `done` holds or the step's time runs out
++    // Frames until `done` holds or the step's time runs out. The host reads the words every 30 ms
++    // and the next hand sample follows, so a reading of the first 200 ms may still show the words
++    // before: the wait takes none of them.
 +    auto waitFor = [&](const char* what, const std::function<bool(const Reading&)>& done, double seconds = -1.0) {
++        constexpr uint64_t kSettleMilliseconds = 200;
 +        const uint64_t start = unixMilliseconds();
 +        const double limit = seconds > 0.0 ? seconds : stepSeconds;
 +        Reading reading;
@@ -1904,7 +1907,7 @@ index 0000000..a3f308a
 +                return reading;
 +            }
 +            watchLeft(reading);
-+            if (reading.focused && done(reading)) {
++            if (reading.focused && unixMilliseconds() - start >= kSettleMilliseconds && done(reading)) {
 +                std::printf("hand_interaction_smoke: %s after %llu ms\n", what,
 +                            static_cast<unsigned long long>(unixMilliseconds() - start));
 +                std::fflush(stdout);
@@ -2097,6 +2100,8 @@ index 0000000..a3f308a
 +        const Reading back = waitFor("the hand is back", [](const Reading& r) { return r.hands[1].allReady(); });
 +        report(back.hands[1].allReady() && back.hands[1].allPoses(), "the hand is ready again when the cameras see it");
 +
++        // The probe squeezes the left grip for half a second in every three
++        waitFor("the left controller squeezes", [](const Reading& r) { return r.hands[0].value[kGrasp] > 0.98f; }, 4.0);
 +        report(leftReadySeen, "the left controller's gestures are ready");
 +        report(leftGraspSeen, "the left controller's squeeze reads as grasp_ext/value 1");
 +        report(leftPinchAheadOk, "the left controller's pinch pose lies 3 cm ahead of its aim pose (%.4f m)", leftPinchAhead);
