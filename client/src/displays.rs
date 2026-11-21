@@ -373,8 +373,11 @@ impl Displays {
     /// each display's pictures, for its decode thread.
     pub fn session_start(&self, in_headset: bool) -> Vec<mpsc::Receiver<Received>> {
         self.game_message.store(GAME_UNKNOWN, Ordering::Relaxed);
+        // The number changes under the state's lock, so a list never carries the number of another session
+        let mut state = self.state.lock().unwrap();
         self.session.fetch_add(1, Ordering::Relaxed);
-        *self.state.lock().unwrap() = State::default();
+        *state = State::default();
+        drop(state);
         *self.uplink.lock().unwrap() = Uplink::default();
         self.slots
             .iter()
