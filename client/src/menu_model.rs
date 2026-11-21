@@ -125,7 +125,7 @@ pub fn rows(input: &MenuInput<'_>) -> Vec<MenuRow> {
 /// Where a display's panel stands, for the wish that it asks for.
 pub fn place_of(layout: &Layout, stream: u8) -> Place {
     if layout.pinned() == Some(stream) {
-        Place::Hand
+        Place::Hand { width_mm: (crate::display_panel::hand_display_width() * 1000.0).round() as u32 }
     } else {
         Place::Room
     }

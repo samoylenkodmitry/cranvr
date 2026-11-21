@@ -324,7 +324,7 @@ impl Drop for Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cranvr_vt::{Encoder, EncoderConfig};
+    use cranvr_vt::{Encoder, EncoderConfig, KEY_EVERY};
     use std::sync::mpsc;
 
     fn identity_params(eye_w: u32, eye_h: u32) -> Params {
@@ -348,7 +348,7 @@ mod tests {
         let f = Foveation::new([1024, 1088], &FoveationConfig::default());
         let (eye_w, eye_h) = (f.optimized[0], f.optimized[1]);
         let (tx, _rx) = mpsc::channel();
-        let config = EncoderConfig { width: eye_w * 2, height: eye_h, fps: 90.0, bitrate_bps: 10_000_000, full_range: true, strict_rate: false };
+        let config = EncoderConfig { width: eye_w * 2, height: eye_h, fps: 90.0, bitrate_bps: 10_000_000, full_range: true, strict_rate: false, key_every: Some(KEY_EVERY), max_qp: None };
         let encoder = Encoder::new(&config, tx).expect("encoder");
         let mut buffer = encoder.pixel_buffer().expect("buffer");
         let mut params = identity_params(eye_w, eye_h);
@@ -400,7 +400,7 @@ mod tests {
         paint(&mut left);
         paint(&mut right);
         let (tx, _rx) = mpsc::channel();
-        let config = EncoderConfig { width: ow as u32 * 2, height: oh as u32, fps: 90.0, bitrate_bps: 10_000_000, full_range: true, strict_rate: false };
+        let config = EncoderConfig { width: ow as u32 * 2, height: oh as u32, fps: 90.0, bitrate_bps: 10_000_000, full_range: true, strict_rate: false, key_every: Some(KEY_EVERY), max_qp: None };
         let encoder = Encoder::new(&config, tx).expect("encoder");
         let mut buffer = encoder.pixel_buffer().expect("buffer");
         let mut params = ComposeParams {
@@ -444,7 +444,7 @@ mod tests {
     fn renders_badges_and_floor() {
         let (eye_w, eye_h) = (256u32, 256u32);
         let (tx, _rx) = mpsc::channel();
-        let config = EncoderConfig { width: eye_w * 2, height: eye_h, fps: 90.0, bitrate_bps: 10_000_000, full_range: true, strict_rate: false };
+        let config = EncoderConfig { width: eye_w * 2, height: eye_h, fps: 90.0, bitrate_bps: 10_000_000, full_range: true, strict_rate: false, key_every: Some(KEY_EVERY), max_qp: None };
         let encoder = Encoder::new(&config, tx).expect("encoder");
         let mut buffer = encoder.pixel_buffer().expect("buffer");
         let mut renderer = Renderer::new().expect("renderer");
@@ -470,7 +470,7 @@ mod tests {
     fn renders_desktop_screen() {
         let (eye_w, eye_h) = (256u32, 256u32);
         let (tx, _rx) = mpsc::channel();
-        let config = EncoderConfig { width: eye_w * 2, height: eye_h, fps: 90.0, bitrate_bps: 10_000_000, full_range: true, strict_rate: false };
+        let config = EncoderConfig { width: eye_w * 2, height: eye_h, fps: 90.0, bitrate_bps: 10_000_000, full_range: true, strict_rate: false, key_every: Some(KEY_EVERY), max_qp: None };
         let encoder = Encoder::new(&config, tx).expect("encoder");
         let mut buffer = encoder.pixel_buffer().expect("buffer");
         let mut desktop = PixelBuffer::new_bgra(64, 40).expect("desktop");
@@ -506,7 +506,7 @@ mod tests {
 mod compose_tests {
     use super::*;
     use cranvr_common::foveation::{view_to_frame, FoveationConfig};
-    use cranvr_vt::{Encoder, EncoderConfig};
+    use cranvr_vt::{Encoder, EncoderConfig, KEY_EVERY};
     use std::sync::mpsc;
 
     fn solid(w: usize, h: usize, bgra: [u8; 4]) -> PixelBuffer {
@@ -527,7 +527,7 @@ mod compose_tests {
     fn composes_game_eyes_with_foveation_and_fov_remap() {
         let f = Foveation::new([1024, 1088], &FoveationConfig::default());
         let (tx, _rx) = mpsc::channel();
-        let config = EncoderConfig { width: f.optimized[0] * 2, height: f.optimized[1], fps: 90.0, bitrate_bps: 10_000_000, full_range: true, strict_rate: false };
+        let config = EncoderConfig { width: f.optimized[0] * 2, height: f.optimized[1], fps: 90.0, bitrate_bps: 10_000_000, full_range: true, strict_rate: false, key_every: Some(KEY_EVERY), max_qp: None };
         let encoder = Encoder::new(&config, tx).expect("encoder");
         let mut out = encoder.pixel_buffer().expect("out");
         // left eye: red with a green right half, so the test can see where the remap samples

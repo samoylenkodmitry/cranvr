@@ -662,7 +662,10 @@ fn encode_loop(jobs: mpsc::Receiver<EncodeJob>) {
         if let Some(b) = job.bitrate {
             job.encoder.set_bitrate(b);
         }
-        if let Err(e) = job.encoder.encode(&job.buffer, job.index, job.sample, job.idr) {
+        // The eye stream's frames stand 1 ms apart on the encoder's time line, as they always did. The
+        // rate control then gives each frame the bits of 1 ms (issue #90). The displays use the real
+        // time (see `headset/native/desktop.rs`).
+        if let Err(e) = job.encoder.encode(&job.buffer, Duration::from_millis(job.index as u64), job.sample, job.idr) {
             error!("Encode: {e}");
         }
     }
@@ -1062,6 +1065,8 @@ fn frame_loop(
                 bitrate_bps: bitrate,
                 full_range: stream.full_range,
                 strict_rate,
+                key_every: Some(cranvr_vt::KEY_EVERY),
+                max_qp: None,
             };
             encoder = match Encoder::new(&config, sender.clone()) {
                 Ok(e) => {

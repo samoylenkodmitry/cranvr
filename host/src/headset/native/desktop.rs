@@ -33,8 +33,9 @@ use cranvr_proto::{
     message::{Cursor, DesktopParams, DesktopWish, HostDatagram, HostMsg, Mouse, DESKTOP_STREAM},
     wire::{Codec, Pose, Rect},
 };
-use cranvr_vt::{EncodedFrame, Encoder, EncoderConfig, Flipper};
+use cranvr_vt::{EncodedFrame, Encoder, EncoderConfig, Flipper, PixelBuffer};
 use std::{
+    collections::VecDeque,
     ffi::c_void,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -244,17 +245,196 @@ fn busy(mouse: &Mouse) -> bool {
 /// A running capture, its encoder and what the stream has sent so far.
 struct Running {
     capture: Capture,
-    encoder: Encoder,
+    encoder: DisplayEncoder,
     encoded: Receiver<EncodedFrame>,
     params: DesktopParams,
     wish: DesktopWish,
     flipper: Option<Flipper>,
-    last_seq: u64,
-    index: i64,
-    /// The next frame is a key frame
-    key: bool,
+    feed: Feed,
     /// The parameter sets that the client has
     config: Option<Vec<u8>>,
+}
+
+/// The highest quantizer of a display's frames while its stream stays under its bitrate. In
+/// `display_quality.rs` it held the made-up text of the hand's display at 39 dB in every scene, against
+/// 33 to 37 dB without it.
+const DISPLAY_MAX_QP: u8 = 18;
+/// The cap holds while the frames of the last second stay under `CAP_OFF` halves of the bitrate.
+/// VideoToolbox passes the bitrate on a hard picture with the cap and without it: a video in a part of
+/// the hand's display sent 13 Mbps at a target of 6 with the cap, and 11 Mbps without it. A video
+/// that fills the display sent ten times the bitrate with the cap. VideoToolbox reads the cap only
+/// when a session starts, so the display then changes to a session without the cap. It changes back,
+/// with a key frame of the newest picture, once the last second's frames fall under the bitrate
+/// divided by `CAP_BACK`.
+const RATE_WINDOW: Duration = Duration::from_secs(1);
+const CAP_OFF: u64 = 5;
+/// The session without the cap stayed at a third to a half of the bitrate during a video, so a higher
+/// share made the display change sessions every second.
+const CAP_BACK: u64 = 8;
+/// The shortest time between two changes of the session: each change costs a key frame
+const SWAP_GAP: Duration = Duration::from_secs(1);
+/// A display that stopped changing gets its last picture again after this time, so a picture that the
+/// encoder dropped does not stay missing
+const REFRESH_AFTER: Duration = Duration::from_millis(250);
+
+/// The encoder of a display: a session with the cap on the quantizer or one without it.
+pub(super) struct DisplayEncoder {
+    encoder: Encoder,
+    capped: bool,
+    size: [u32; 2],
+    fps: i32,
+    mbps: u64,
+    sender: Sender<EncodedFrame>,
+}
+
+impl DisplayEncoder {
+    /// A capped session of HEVC at `fps` pictures a second at most and `mbps` on average. Its frames
+    /// go to `sender`. A key frame comes first and when the client lost a picture, never on a timer:
+    /// a key frame costs 680 KB at 1920 x 1080 and 2.7 MB at 3840 x 2160 in `display_quality.rs`, and
+    /// the client asks for one after each loss and each new decoder.
+    pub(super) fn new(size: [u32; 2], fps: i32, mbps: u64, sender: Sender<EncodedFrame>) -> Result<Self, String> {
+        Ok(Self { encoder: Self::session(size, fps, mbps, &sender, true)?, capped: true, size, fps, mbps, sender })
+    }
+
+    fn session([width, height]: [u32; 2], fps: i32, mbps: u64, sender: &Sender<EncodedFrame>, capped: bool) -> Result<Encoder, String> {
+        let max_qp = capped.then_some(DISPLAY_MAX_QP);
+        let config = EncoderConfig { width, height, fps: fps as f32, bitrate_bps: mbps * 1_000_000, full_range: true, strict_rate: false, key_every: None, max_qp };
+        Encoder::new(&config, sender.clone())
+    }
+
+    pub(super) fn in_flight(&self) -> usize {
+        self.encoder.in_flight()
+    }
+
+    /// Whether the session has the cap on the quantizer.
+    pub(super) fn capped(&self) -> bool {
+        self.capped
+    }
+
+    /// Hands `picture` to the encoder, mirrored first when `flipper` is set. A picture that wants the
+    /// other session starts it: the old session hands over its last frames, and the picture becomes
+    /// the new session's key frame.
+    pub(super) fn encode(&mut self, flipper: Option<&Flipper>, picture: &Picture, timestamp: u64) -> Result<(), String> {
+        let mut key = picture.key;
+        if picture.cap != self.capped {
+            self.encoder = Self::session(self.size, self.fps, self.mbps, &self.sender, picture.cap)?;
+            self.capped = picture.cap;
+            key = true;
+        }
+        match flipper {
+            Some(flipper) => {
+                let flipped = self.encoder.pixel_buffer().ok_or("the encoder has no buffer pool".to_string())?;
+                flipper.flip(&picture.image, &flipped)?;
+                self.encoder.encode(&flipped, picture.presentation, timestamp, key)
+            }
+            None => self.encoder.encode(&picture.image, picture.presentation, timestamp, key),
+        }
+    }
+}
+
+/// Decides which picture goes to a display's encoder, when, where it stands on the encoder's time line
+/// and whether the cap on the quantizer holds. ScreenCaptureKit hands over a picture only when the
+/// display changes, so the pictures come at uneven times.
+pub(super) struct Feed {
+    started: Instant,
+    /// The bytes that the stream may send in a second
+    budget: u64,
+    /// The number of the capture that went in last
+    last_seq: u64,
+    last_presentation: Option<Duration>,
+    /// The next picture is a key frame
+    key: bool,
+    /// When the last picture went in
+    sent_at: Instant,
+    /// The last capture goes in again once the display stays still
+    refresh: bool,
+    /// The cap holds, and when it changed last
+    cap: bool,
+    cap_changed: Option<Instant>,
+    /// The frames other than key frames that came out of the encoder in the last `RATE_WINDOW`: when
+    /// and how many bytes
+    out: VecDeque<(Instant, u64)>,
+}
+
+/// One picture for the encoder.
+pub(super) struct Picture {
+    pub image: PixelBuffer,
+    seq: u64,
+    /// Where the picture stands on the encoder's time line
+    pub presentation: Duration,
+    pub key: bool,
+    /// The picture goes to the session with the cap on the quantizer
+    pub cap: bool,
+}
+
+impl Feed {
+    /// A feed for a stream of `bitrate_bps`. Its first picture is a key frame.
+    pub(super) fn new(now: Instant, bitrate_bps: u64) -> Self {
+        Self {
+            started: now,
+            budget: bitrate_bps / 8,
+            last_seq: 0,
+            last_presentation: None,
+            key: true,
+            sent_at: now,
+            refresh: false,
+            cap: true,
+            cap_changed: None,
+            out: VecDeque::new(),
+        }
+    }
+
+    /// The client lost a picture: the next one is a key frame.
+    pub(super) fn request_key(&mut self) {
+        self.key = true;
+    }
+
+    /// A frame of `bytes` came out of the encoder at `now`. A key frame does not count: it comes once,
+    /// and a sharp key frame of a rich desktop may be larger than a second's bitrate on its own.
+    pub(super) fn sent(&mut self, bytes: usize, key: bool, now: Instant) {
+        if !key {
+            self.out.push_back((now, bytes as u64));
+        }
+    }
+
+    /// The picture to encode at `now`, if any. `latest` is the newest capture and its number. A new
+    /// capture goes in at once. The last capture goes in again for a key frame, when the cap comes
+    /// back and once more after the display stays still for `REFRESH_AFTER`.
+    pub(super) fn next(&mut self, latest: Option<(u64, PixelBuffer)>, now: Instant) -> Option<Picture> {
+        while self.out.front().is_some_and(|(at, _)| now.duration_since(*at) > RATE_WINDOW) {
+            self.out.pop_front();
+        }
+        let last_second: u64 = self.out.iter().map(|(_, bytes)| bytes).sum();
+        let cap = if self.cap { last_second <= self.budget * CAP_OFF / 2 } else { last_second < self.budget / CAP_BACK };
+        let swap = cap != self.cap && self.cap_changed.is_none_or(|at| now.duration_since(at) >= SWAP_GAP);
+        if swap {
+            (self.cap, self.cap_changed) = (cap, Some(now));
+        }
+        let (seq, image) = latest?;
+        let back = swap && self.cap;
+        let refresh = self.refresh && now.duration_since(self.sent_at) >= REFRESH_AFTER;
+        if seq == self.last_seq && !self.key && !refresh && !back {
+            return None;
+        }
+        // The time line is the real time since the capture started. VideoToolbox's rate control
+        // reads the bitrate against it, so a picture gets the bits of the time since the one before.
+        // The time line must grow, so a picture in the same microsecond as the last moves on by one.
+        let elapsed = now.duration_since(self.started);
+        let presentation = self.last_presentation.map_or(elapsed, |last| elapsed.max(last + Duration::from_micros(1)));
+        Some(Picture { image, seq, presentation, key: self.key, cap: self.cap })
+    }
+
+    /// The encoder took `picture` at `now`, the time of the `next` call that gave it.
+    pub(super) fn took(&mut self, picture: &Picture, now: Instant) {
+        // A new capture may need a refresh later; a refresh needs no second one
+        self.refresh = picture.seq != self.last_seq;
+        (self.last_seq, self.last_presentation, self.key, self.sent_at) = (picture.seq, Some(picture.presentation), false, now);
+    }
+
+    /// Whether `picture` is a capture that did not go in before.
+    pub(super) fn is_new(&self, picture: &Picture) -> bool {
+        picture.seq != self.last_seq
+    }
 }
 
 /// The desktop's pictures are mirrored for a compositor that reads a surface bottom row first:
@@ -287,10 +467,7 @@ impl Running {
         let (width, height) = capture.size;
         let (sender, encoded) = mpsc::channel();
         let mbps = scaled_mbps(options.mbps, [width, height], fps);
-        let encoder = Encoder::new(
-            &EncoderConfig { width, height, fps: fps as f32, bitrate_bps: mbps * 1_000_000, full_range: true, strict_rate: false },
-            sender,
-        )?;
+        let encoder = DisplayEncoder::new([width, height], fps, mbps, sender)?;
         let flipper = if flip_pictures() { Some(Flipper::new()?) } else { None };
         let params = DesktopParams {
             stream: options.stream,
@@ -303,7 +480,7 @@ impl Running {
             flipped: flipper.is_some(),
             cursor_in_video: cursor_in_video(),
         };
-        Ok(Self { capture, encoder, encoded, params, wish, flipper, last_seq: 0, index: 0, key: true, config: None })
+        Ok(Self { capture, encoder, encoded, params, wish, flipper, feed: Feed::new(Instant::now(), mbps * 1_000_000), config: None })
     }
 }
 
@@ -375,30 +552,35 @@ fn step(inner: &Inner, session: &Session, run: &mut Running, next_frame: &mut u3
     let live = !session.paused();
     run.capture.set_running(live);
     if inner.key.swap(false, Ordering::Relaxed) {
-        run.key = true;
+        run.feed.request_key();
     }
     if live && run.encoder.in_flight() < 2 {
-        if let Some((seq, image)) = run.capture.latest().filter(|(seq, _)| *seq != run.last_seq || run.key) {
-            inner.counters.captured.fetch_add(1, Ordering::Relaxed);
-            let timestamp = now_ns();
-            let result = match &run.flipper {
-                Some(flipper) => run.encoder.pixel_buffer().ok_or("the encoder has no buffer pool".to_string()).and_then(|flipped| {
-                    flipper.flip(&image, &flipped)?;
-                    run.encoder.encode(&flipped, run.index, timestamp, run.key)
-                }),
-                None => run.encoder.encode(&image, run.index, timestamp, run.key),
-            };
-            match result {
-                Ok(()) => {
-                    (run.last_seq, run.key) = (seq, false);
-                    run.index += 1;
-                }
+        let now = Instant::now();
+        if let Some(picture) = run.feed.next(run.capture.latest(), now) {
+            if run.feed.is_new(&picture) {
+                inner.counters.captured.fetch_add(1, Ordering::Relaxed);
+            }
+            let capped = run.encoder.capped();
+            match run.encoder.encode(run.flipper.as_ref(), &picture, now_ns()) {
+                Ok(()) => run.feed.took(&picture, now),
                 Err(e) => warn!("{}: the encoder refused a picture: {e}", inner.label()),
+            }
+            if capped != run.encoder.capped() {
+                info!(
+                    "{}: {}",
+                    inner.label(),
+                    if picture.cap {
+                        "the stream calmed: a session with the cap on the quantizer starts"
+                    } else {
+                        "the stream passed 2.5 times its bitrate: a session without the cap on the quantizer starts"
+                    }
+                );
             }
         }
     }
     while let Ok(frame) = run.encoded.try_recv() {
         inner.counters.encoded.fetch_add(1, Ordering::Relaxed);
+        run.feed.sent(frame.data.len(), frame.is_idr, Instant::now());
         send_frame(inner, session, run, &frame, next_frame);
     }
 }
@@ -629,3 +811,7 @@ fn cursor_loop(inner: &Inner, session: &Session) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/display_quality.rs"]
+mod quality_tests;
