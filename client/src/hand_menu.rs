@@ -34,7 +34,7 @@ use crate::{
     hover,
     hub::hub,
     menu_model::{self, ButtonKind, MenuAction, MenuInput, MenuRow},
-    panel_layout::{Layout, PanelId},
+    panel_layout::{layer_rank, Layout, PanelId},
     ui::{text_style, ACCENT_COLOR, KEY_COLOR, MUTED_COLOR, PANEL_COLOR, STOP_COLOR, TEXT_COLOR},
 };
 use cranpose::launch_args;
@@ -147,7 +147,7 @@ fn Strip(state: HandState, base: [f32; 3], pinned: Option<u8>) {
     let open = state.menu_open.get();
     // The pill's middle lies half a button to the right of the ball's
     let x = base[0] + if pinned.is_some() { (BALL + 12.0) / 2.0 } else { 0.0 };
-    SpatialPanel(SubspaceModifier::new().size(width, BALL).offset(x, base[1] + LIFT, base[2]), move || {
+    SpatialPanel(SubspaceModifier::new().size(width, BALL).offset(x, base[1] + LIFT, base[2]).layer_priority(layer_rank::HAND_MENU), move || {
         let hovered = hover::hover_modifier(hover::STRIP);
         Row(
             Modifier::empty().fill_max_size().then(hovered),
@@ -231,7 +231,8 @@ pub fn Menu(state: HandState, console_open: bool, base: [f32; 3]) {
     let rows = menu_model::rows(&input);
     let height = menu_model::height(&rows);
     let y = base[1] + LIFT + BALL / 2.0 + CLEARANCE + height / 2.0;
-    SpatialPanel(SubspaceModifier::new().size(menu_model::size::WIDTH, height).offset(base[0] + MENU_X, y, base[2] + MENU_Z), move || {
+    let modifier = SubspaceModifier::new().size(menu_model::size::WIDTH, height).offset(base[0] + MENU_X, y, base[2] + MENU_Z).layer_priority(layer_rank::HAND_MENU);
+    SpatialPanel(modifier, move || {
         let hovered = hover::hover_modifier(hover::MENU);
         let rows = rows.clone();
         Column(

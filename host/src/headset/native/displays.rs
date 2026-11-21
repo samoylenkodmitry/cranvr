@@ -325,7 +325,21 @@ impl Slot {
 
 /// The manager's loop: the game's state and the list go to the client when they change, the added
 /// displays are checked and the counts go to the log.
+/// How many displays a session of a test host starts with, the first included. A headset on a desk
+/// has no hand to press Add display, so a test of several displays sets `CRANVR_DISPLAY_TEST_COUNT`.
+/// It counts only beside `CRANVR_DISPLAY_TEST=main`, whose displays show the main display again: a
+/// test never makes a real display this way.
+fn test_display_count() -> usize {
+    if !std::env::var("CRANVR_DISPLAY_TEST").is_ok_and(|v| v == "main") {
+        return 1;
+    }
+    std::env::var("CRANVR_DISPLAY_TEST_COUNT").ok().and_then(|v| v.parse().ok()).map_or(1, |count: usize| count.clamp(1, usize::from(MAX_DISPLAYS)))
+}
+
 fn manage(displays: &Displays, session: &Session) {
+    for _ in 1..test_display_count() {
+        displays.add();
+    }
     let mut game_sent: Option<bool> = None;
     let mut list_sent: Option<DisplayList> = None;
     let (mut alive_at, mut log_at) = (Instant::now(), Instant::now());

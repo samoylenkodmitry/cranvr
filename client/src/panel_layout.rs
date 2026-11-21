@@ -14,10 +14,42 @@
 //!
 //! The console's own state is the hub's (see `console.rs`): its opening follows the host's menu and
 //! the hold of the left menu button. This file only names it, so the menu can list it.
+//!
+//! The ranks of the panels for the headset's layers are here too (`layer_rank`).
 
 use cranpose::preferences;
 use cranvr_proto::message::DESKTOP_STREAM;
 use std::collections::BTreeSet;
+
+/// Which panels keep a layer of the headset's compositor of their own when a frame needs more
+/// layers than the headset takes (`SubspaceModifier::layer_priority`).
+///
+/// A Quest 3 takes 16 layers in a frame. Four displays with their handles, the console, the connect
+/// panel and the hand menu need more. Cranpose then draws the panels of the lowest rank into the
+/// projection layer of the 3D content, where their text shows softer. The handles go there first.
+/// The rule: a panel ranks higher when the user reads more text on it, and smaller text.
+/// - The Mac's displays rank first. Their pictures are surfaces, which Cranpose keeps on layers of
+///   their own before every panel, so the rank does nothing to them. The Mac's cursor ring over a
+///   display is a panel. It takes the displays' rank: on a runtime with no depth test, a ring in the
+///   projection layer can draw under the layer of its display.
+/// - The console and the connect panel rank next. Most of their text is 20 to 22 mm tall, and it
+///   stands 0.6 to 1 m from the head: 1.3 to 2 degrees.
+/// - The hand menu ranks after them: its ball and its panel. The text of the menu is 20 to 26 mm
+///   tall at the 45 cm from which a hand holds it: 2.5 to 3.3 degrees. It stays readable when it
+///   shows softer.
+/// - Every other panel keeps Cranpose's default of 0: the stream's numbers, which the user reads only
+///   to check the link.
+///
+/// Panels of one rank keep their layers by Cranpose's own order: the panel that a hand points at
+/// first, then the nearer one.
+pub mod layer_rank {
+    /// The cursor ring over a display of the Mac
+    pub const DISPLAY: i32 = 3;
+    /// The console and the connect panel
+    pub const TEXT: i32 = 2;
+    /// The hand menu's ball and its panel
+    pub const HAND_MENU: i32 = 1;
+}
 
 /// A panel that the menu lists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
