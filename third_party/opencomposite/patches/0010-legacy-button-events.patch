@@ -1,0 +1,34 @@
+diff --git a/OpenOVR/Reimpl/BaseSystem.cpp b/OpenOVR/Reimpl/BaseSystem.cpp
+index 60b5264..3c7edcb 100644
+--- a/OpenOVR/Reimpl/BaseSystem.cpp
++++ b/OpenOVR/Reimpl/BaseSystem.cpp
+@@ -548,6 +548,15 @@ void BaseSystem::_OnPostFrame()
+ 	if (inputSystem) {
+ 		inputSystem->InternalUpdate();
+ 	}
++
++	// cranvr: a game that reads the legacy controller state gets the button events of it, as SteamVR sends
++	// them. The OpenXR port stopped sending them, and a game that waits for VREvent_ButtonPress saw no press.
++	// Only a game whose legacy input is loaded gets them: a check before would load the empty manifest for a
++	// game that sets its own manifest a few frames in.
++	if (inputSystem && inputSystem->IsUsingLegacyInput()) {
++		CheckControllerEvents(leftHandIndex, lastLegacyState[0]);
++		CheckControllerEvents(rightHandIndex, lastLegacyState[1]);
++	}
+ }
+ 
+ void BaseSystem::_EnqueueEvent(const VREvent_t& e)
+diff --git a/OpenOVR/Reimpl/BaseSystem.h b/OpenOVR/Reimpl/BaseSystem.h
+index 53ec201..3f9d7c7 100644
+--- a/OpenOVR/Reimpl/BaseSystem.h
++++ b/OpenOVR/Reimpl/BaseSystem.h
+@@ -32,6 +32,9 @@ private:
+ 
+ 	uint64_t frameNumber = 0;
+ 
++	// cranvr: the legacy controller state of each hand at the last frame, for its button events
++	vr::VRControllerState_t lastLegacyState[2] = {};
++
+ public:
+ 	// To be called by other base classes
+ 	void _OnPostFrame();
