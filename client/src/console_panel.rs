@@ -82,7 +82,8 @@ fn OpenConsole(view: View, state: LinkState) {
         place::start_pose("console", default)
     })
     .with(|pose: &Pose| *pose);
-    SpatialPanel(place::movable("console", SubspaceModifier::new().size(size::WIDTH, height), start, |_| {}), move || {
+    let modifier = SubspaceModifier::new().size(size::WIDTH, height).layer_priority(crate::panel_layout::layer_rank::TEXT);
+    SpatialPanel(place::movable("console", modifier, start, |_| {}), move || {
         // The pointer over the console holds the pointing hand back from the game (see `hold.rs`)
         let hovered = crate::hover::hover_modifier(crate::hover::CONSOLE);
         let menu = view.menu.clone();

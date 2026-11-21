@@ -575,7 +575,8 @@ fn address_field() -> TextFieldState {
 fn ConnectPanel(snapshot: MutableState<Snapshot>, address: TextFieldState, typing: MutableState<bool>) {
     let pose = remember(|| place::start_pose("connect", side_pose(-1.0))).with(|pose| *pose);
     let size = rememberMutableStateOf(|| place::start_size("connect", CONNECT_SIZE));
-    SpatialPanel(place::movable("connect", place::resizable("connect", size, CONNECT_SIZE), pose, |_| {}), move || {
+    let modifier = place::resizable("connect", size, CONNECT_SIZE).layer_priority(crate::panel_layout::layer_rank::TEXT);
+    SpatialPanel(place::movable("connect", modifier, pose, |_| {}), move || {
         // The pointer over the panel holds the pointing hand back from the game (see `hold.rs`)
         let hovered = hover::hover_modifier(hover::CONNECTION);
         ConnectBody(snapshot, address, Modifier::empty().fill_max_size().then(hovered), true, typing);

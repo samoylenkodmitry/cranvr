@@ -16,7 +16,9 @@
 
 use crate::{
     displays::{displays, PointerNow},
-    hover, place,
+    hover,
+    panel_layout::layer_rank,
+    place,
 };
 use cranpose::{launch_args, prelude::*};
 use cranpose_xr::{
@@ -304,7 +306,8 @@ fn ring_pose(panel: &Pose, [width, height]: [f32; 2], [u, v]: [f32; 2]) -> Pose 
 fn CursorRing(pose: MutableState<Pose>, width: MutableState<f32>, cursor: MutableState<Option<[f32; 2]>>, aspect: f32) {
     let Some(at) = cursor.get() else { return };
     let size = surface_size(width.get(), aspect).map(|dp| dp * METERS_PER_DP);
-    SpatialPanel(SubspaceModifier::new().size(CURSOR_SIZE, CURSOR_SIZE).with_pose(ring_pose(&pose.get(), size, at)), || {
+    let modifier = SubspaceModifier::new().size(CURSOR_SIZE, CURSOR_SIZE).with_pose(ring_pose(&pose.get(), size, at)).layer_priority(layer_rank::DISPLAY);
+    SpatialPanel(modifier, || {
         Box(
             Modifier::empty()
                 .fill_max_size()
