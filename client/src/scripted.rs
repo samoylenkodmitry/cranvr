@@ -17,6 +17,10 @@
 //!   buttons: it shows that both hands point at once and that right clicks, middle clicks and scroll
 //!   reach the host as mouse events. `scripted_pitch` (degrees, default 0) tilts the head that the
 //!   panel's place follows from, because a headset on a desk looks down.
+//! - `scripted_pointer=hand` plays the left controller alone. It holds its ray level and straight
+//!   ahead for 4 seconds, turns it 35 degrees to the right and 25 degrees up in 1 second, holds that
+//!   for 4 seconds and turns back in 1 second, again and again. With `hand_menu=open` the menu at the
+//!   left hand shows that the hand's panels move and turn with the controller.
 
 use crate::{place, ui};
 use cranpose::launch_args;
@@ -44,6 +48,10 @@ pub fn install_once() {
             desktop_pointers(pitch);
             return;
         }
+        if args.string("scripted_pointer") == Some("hand") {
+            turning_left_hand();
+            return;
+        }
         let hand = if args.string("scripted_hand") == Some("left") { Hand::Left } else { Hand::Right };
         let cycle = PinchCycle { rest: Duration::from_millis(1500), closing: Duration::from_millis(150), held: Duration::from_millis(250), opening: Duration::from_millis(150) };
         if let Some(text) = args.string("scripted_text").map(str::to_owned) {
@@ -59,6 +67,27 @@ pub fn install_once() {
             script_hand(ScriptedHand::pointing(hand, HAND_AT, BALL_AT, cycle));
         }
     });
+}
+
+/// Where the left controller of `scripted_pointer=hand` stands, in meters from the head's start, and
+/// where its ray points in the turn's two halves: level and straight ahead, then 35 degrees to the
+/// right and 25 degrees up.
+const LEFT_AT: [f32; 3] = [-0.15, -0.3, -0.45];
+const LEVEL_TO: [f32; 3] = [-0.15, -0.3, -1.45];
+const TURNED_AT: [f32; 3] = [-0.05, -0.25, -0.45];
+const TURNED_TO: [f32; 3] = [-0.05 + 0.520, -0.25 + 0.423, -0.45 - 0.742];
+
+/// Plays the left controller of `scripted_pointer=hand`, in a turn of 10 seconds that repeats.
+fn turning_left_hand() {
+    let rest = ScriptedButtons::default();
+    let left = ScriptedController::new(Hand::Left, LEFT_AT, LEVEL_TO)
+        .holding(Duration::from_secs(4), rest)
+        .moving_to(Duration::from_secs(1), (TURNED_AT, TURNED_TO), rest)
+        .holding(Duration::from_secs(4), rest)
+        .moving_to(Duration::from_secs(1), (LEFT_AT, LEVEL_TO), rest)
+        .repeating();
+    log::info!("a scripted left controller turns from {LEFT_AT:?} toward {LEVEL_TO:?} to {TURNED_AT:?} toward {TURNED_TO:?} and back every 10 s");
+    script_controller(left);
 }
 
 /// One step of a controller's script: how long it lasts, and the buttons that are down.

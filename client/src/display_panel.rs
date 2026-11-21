@@ -16,6 +16,7 @@
 
 use crate::{
     displays::{displays, PointerNow},
+    hand_menu::{self, HandFrame},
     hover,
     panel_layout::layer_rank,
     place,
@@ -255,13 +256,23 @@ fn Surface(stream: u8, modifier: SubspaceModifier, width: MutableState<f32>) {
     });
 }
 
-/// The display that rides on the left hand. `base` is where the hand's panels stand (see
-/// `hand_menu.rs`). The panel is small, so it asks for a smaller picture (see `display_wish.rs`).
-/// The user can resize it with the corner sphere. It has no handle to carry it: it rides on the hand.
+/// The pose of the hand's display before the user carries it: above the ball and a little to the
+/// right of the hand, with its bottom edge above the ball. `height` is the surface's height in dp.
+pub fn hand_display_start(frame: HandFrame, height: f32) -> Pose {
+    let base = frame.base;
+    let y = base[1] + hand_menu::LIFT + hand_menu::BALL / 2.0 + hand_menu::CLEARANCE + height / 2.0;
+    SubspaceModifier::new().offset(base[0] + hand_menu::HAND_DISPLAY_X, y, base[2]).pose()
+}
+
+/// The display that rides on the left hand, in the hand's `frame` (see `hand_menu.rs`). The panel is
+/// small, so it asks for a smaller picture (see `display_wish.rs`). The user can resize it with the
+/// corner sphere. The sphere under it carries it: the carry sets its offset from the controller,
+/// which `place.rs` keeps under the frame's name for the display.
 #[composable]
-pub fn HandDisplay(stream: u8, base: [f32; 3]) {
+pub fn HandDisplay(stream: u8, frame: HandFrame) {
     let view = watch(stream);
-    let width = rememberMutableStateOf(|| place::saved_width("hand-display").map_or(HAND_START_WIDTH, |width| width.clamp(HAND_WIDTH[0], HAND_WIDTH[1])));
+    let name = frame.display;
+    let width = rememberMutableStateOf(move || place::saved_width(name).map_or(HAND_START_WIDTH, |width| width.clamp(HAND_WIDTH[0], HAND_WIDTH[1])));
     SpatialFrameEffect(move |frame: &XrFrame| {
         if !displays().view(stream).visible {
             displays().reset_pointers(stream);
@@ -285,12 +296,12 @@ pub fn HandDisplay(stream: u8, base: [f32; 3]) {
         hover::set_handle(event.event_type != SpatialResizeEventType::End);
         width.set((event.size[0] * METERS_PER_DP).clamp(HAND_WIDTH[0], HAND_WIDTH[1]));
         if event.event_type == SpatialResizeEventType::End {
-            place::save_width("hand-display", width.get_non_reactive());
+            place::save_width(name, width.get_non_reactive());
         }
     });
-    // Above the ball and a little to the right of the hand, with its bottom edge above the ball
-    let y = base[1] + crate::hand_menu::LIFT + crate::hand_menu::BALL / 2.0 + crate::hand_menu::CLEARANCE + surface_height / 2.0;
-    let modifier = SubspaceModifier::new().size(surface_width, surface_height).offset(base[0] + crate::hand_menu::HAND_DISPLAY_X, y, base[2]).resizable_with(limits, resize);
+    let saved = remember(move || place::saved_pose(name)).with(|pose: &Option<Pose>| *pose);
+    let pose = saved.unwrap_or_else(|| hand_display_start(frame, surface_height));
+    let modifier = place::movable(name, SubspaceModifier::new().size(surface_width, surface_height).resizable_with(limits, resize), pose, |_| {});
     Surface(stream, modifier, width);
 }
 

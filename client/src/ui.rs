@@ -30,7 +30,7 @@ use cranpose::prelude::*;
 use cranpose::text::{FontWeight, TextUnit};
 use cranpose::DecodedFrames;
 use cranpose_xr::{
-    local_controller_models, local_haptics, local_headset_properties, local_pointer_settings, local_spatial_capabilities, local_spatial_environment, FollowMode, FollowTarget,
+    local_controller_models, local_haptics, local_headset_properties, local_pointer_settings, local_spatial_capabilities, local_spatial_environment, FollowMode, FollowTarget, TrackedDimensions,
     FollowingSubspace, Hand as XrHand, InputSource, Pose, SpatialFrameEffect, SpatialPanel, StreamedScene, SubspaceModifier,
 };
 use cranvr_common::controls::Action as ControlAction;
@@ -213,7 +213,7 @@ pub fn ClientApp() {
     // It moves there again after each recenter. A panel that the user never carried starts at its
     // default pose in that frame, so the first start opens in front of the user. A saved pose is in
     // the same frame (see `place.rs`).
-    FollowingSubspace(FollowTarget::View(FollowMode::Snap), move || {
+    FollowingSubspace(FollowTarget::View(FollowMode::Snap(TrackedDimensions::TranslationAndYaw)), move || {
         HeadsetFrames(menu_open);
         // A flat window shows the panels in this order, side by side. In a headset each panel has
         // its own place. The hand menu shows and hides them. While no link runs the connect panel
@@ -226,7 +226,7 @@ pub fn ClientApp() {
         // and snaps in front of the head again when it comes back. The game's picture and the
         // frame effect stay in the outer one, so a recenter does not touch the stream.
         key(recenters.get(), move || {
-            FollowingSubspace(FollowTarget::View(FollowMode::Snap), move || {
+            FollowingSubspace(FollowTarget::View(FollowMode::Snap(TrackedDimensions::TranslationAndYaw)), move || {
                 if room_for_panels && (layout.shown(PanelId::Connection) || !streaming) {
                     ConnectPanel(snapshot, address, typing);
                 }
@@ -243,7 +243,7 @@ pub fn ClientApp() {
         });
         ConsolePanel(console, snapshot);
         if hand_menu::flat_menu() {
-            hand_menu::Menu(hand, console.get().open, [0.0; 3]);
+            hand_menu::Menu(hand, console.get().open, hand_menu::ON_CONTROLLER);
         }
         Behind(backdrop, frames);
     });
