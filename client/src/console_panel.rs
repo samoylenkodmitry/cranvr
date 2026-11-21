@@ -40,7 +40,12 @@ const START_TILT_DEGREES: f32 = 34.0;
 pub fn on_frame(read: &Read, now: Nanos) {
     let input = read.frame.as_ref().map_or_else(Default::default, |frame| frame.input);
     #[cfg(all(feature = "scripted-hand", target_os = "android"))]
-    crate::scripted::note_input(&input);
+    {
+        crate::scripted::note_input(&input);
+        if let Some(frame) = &read.frame {
+            crate::scripted::note_poses(frame);
+        }
+    }
     for fire in hub().controls_frame(&input, now) {
         if let Some(haptics) = hub().headset().and_then(|headset| headset.haptics) {
             let hand = match fire.hand {
@@ -50,6 +55,12 @@ pub fn on_frame(read: &Read, now: Nanos) {
             haptics.vibrate(hand, Vibration::new(0.4, Duration::from_millis(40)));
         }
     }
+}
+
+/// Where the console starts in its subspace: the place of the user's last carry, else the default.
+pub fn start_place() -> Pose {
+    let default = SubspaceModifier::new().offset(START_OFFSET[0], START_OFFSET[1], START_OFFSET[2]).rotate(-START_TILT_DEGREES, 0.0, 0.0).pose();
+    place::start_pose("console", default)
 }
 
 /// The console, while it is open.
@@ -79,11 +90,7 @@ fn OpenConsole(view: View, state: LinkState) {
         Page::Main => console::height(view.menu.as_ref()),
         Page::Controls(_) => console::controls_height(),
     };
-    let start = remember(|| {
-        let default = SubspaceModifier::new().offset(START_OFFSET[0], START_OFFSET[1], START_OFFSET[2]).rotate(-START_TILT_DEGREES, 0.0, 0.0).pose();
-        place::start_pose("console", default)
-    })
-    .with(|pose: &Pose| *pose);
+    let start = remember(start_place).with(|pose: &Pose| *pose);
     let modifier = SubspaceModifier::new().size(size::WIDTH, height).layer_priority(crate::panel_layout::layer_rank::TEXT);
     SpatialPanel(place::movable("console", modifier, start, |_| {}), move || {
         // The pointer over the console holds the pointing hand back from the game (see `hold.rs`)

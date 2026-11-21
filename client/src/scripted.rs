@@ -22,7 +22,7 @@
 //!   for 4 seconds and turns back in 1 second, again and again. With `hand_menu=open` the menu at the
 //!   left hand shows that the hand's panels move and turn with the controller.
 //! - `scripted_pointer=models` holds both controllers still in front of the head, their rays away
-//!   from the panels. The right controller presses its inputs in turn, each for 3 seconds with 3
+//!   from the panels. The right controller presses its inputs in turn, each for 4 seconds with 5
 //!   seconds of rest between: the trigger, A, the grip, the thumbstick forward and the thumbstick to
 //!   the right. The log says each change of the right controller's inputs ("scripted models:"), so a
 //!   screen capture can be matched with the press that it shows.
@@ -108,22 +108,22 @@ fn turning_left_hand() {
 }
 
 /// Where the left controller of `scripted_pointer=models` and `console` stands, in meters from the
-/// head's start, with its ray straight down, away from the panels
+/// head's start, with its ray down and ahead, away from the panels. A ray straight down has no
+/// heading, which gives the scripted controller no pose.
 const LEFT_STILL: [f32; 3] = [-0.2, -0.3, -0.35];
-const LEFT_DOWN: [f32; 3] = [-0.2, -1.3, -0.35];
-/// Where the right controller of `scripted_pointer=models` stands, with its ray to the right and down,
-/// away from the panels. The head sees the controller from its side, so the trigger turns in view.
-const RIGHT_AT: [f32; 3] = [0.1, -0.15, -0.3];
-const RIGHT_AWAY: [f32; 3] = [1.1, -0.45, -0.3];
-/// The console's middle: its subspace's origin lies a meter ahead of the head, and the console
-/// starts 0.6 m ahead of the head and 0.4 m below it (see `console_panel.rs`)
-const CONSOLE_AT: [f32; 3] = [0.0, -0.4, -0.6];
+const LEFT_DOWN: [f32; 3] = [-0.4, -1.3, -0.85];
+/// Where the right controller of `scripted_pointer=models` stands: at the height of the eyes, a
+/// quarter meter ahead, with its ray level to the right, away from the panels. The head then sees the
+/// controller's top face edge on, so the trigger, the face buttons and the thumbstick move in its
+/// outline.
+const RIGHT_AT: [f32; 3] = [0.0, 0.0, -0.25];
+const RIGHT_AWAY: [f32; 3] = [1.0, 0.0, -0.25];
 
 /// Plays `scripted_pointer=models`: both controllers stand still, and the right one presses its inputs
-/// in turn, in a cycle of 30 seconds that repeats.
+/// in turn, in a cycle of 45 seconds that repeats.
 fn pressing_right_hand() {
     let rest = ScriptedButtons::default();
-    let left = ScriptedController::new(Hand::Left, LEFT_STILL, LEFT_DOWN).holding(Duration::from_secs(30), rest).repeating();
+    let left = ScriptedController::new(Hand::Left, LEFT_STILL, LEFT_DOWN).holding(Duration::from_secs(45), rest).repeating();
     let presses = [
         ScriptedButtons { trigger: 1.0, ..rest },
         ScriptedButtons { primary: true, ..rest },
@@ -133,9 +133,9 @@ fn pressing_right_hand() {
     ];
     let right = presses
         .iter()
-        .fold(ScriptedController::new(Hand::Right, RIGHT_AT, RIGHT_AWAY), |script, press| script.holding(Duration::from_secs(3), rest).holding(Duration::from_secs(3), *press))
+        .fold(ScriptedController::new(Hand::Right, RIGHT_AT, RIGHT_AWAY), |script, press| script.holding(Duration::from_secs(5), rest).holding(Duration::from_secs(4), *press))
         .repeating();
-    log::info!("scripted models: the right controller at {RIGHT_AT:?} presses the trigger, A, the grip and the thumbstick in turn, 3 s each with 3 s of rest");
+    log::info!("scripted models: the right controller at {RIGHT_AT:?} presses the trigger, A, the grip and the thumbstick in turn, 4 s each with 5 s of rest");
     script_controller(left);
     script_controller(right);
 }
@@ -146,13 +146,16 @@ fn pointing_at_console() {
     let rest = ScriptedButtons::default();
     let left = ScriptedController::new(Hand::Left, LEFT_STILL, LEFT_DOWN).holding(Duration::from_secs(8), rest).repeating();
     let at = [0.15, -0.3, -0.3];
-    let right = ScriptedController::new(Hand::Right, at, CONSOLE_AT)
+    // The console's subspace has its origin a meter ahead of the head when it opens, and the head on a
+    // desk stays where it started
+    let console = Pose::at([0.0, 0.0, -1.0]).then(&crate::console_panel::start_place()).position;
+    let right = ScriptedController::new(Hand::Right, at, console)
         .holding(Duration::from_millis(4000), rest)
         .moving_to(Duration::from_millis(200), (at, RIGHT_AWAY), rest)
         .holding(Duration::from_millis(3800), rest)
-        .moving_to(Duration::from_millis(200), (at, CONSOLE_AT), rest)
+        .moving_to(Duration::from_millis(200), (at, console), rest)
         .repeating();
-    log::info!("scripted console: the right controller points at the console's middle {CONSOLE_AT:?} and away from it, 4 s each");
+    log::info!("scripted console: the right controller points at the console's middle {console:?} and away from it, 4 s each");
     script_controller(left);
     script_controller(right);
     std::thread::spawn(|| loop {
@@ -191,6 +194,38 @@ pub fn note_input(input: &cranvr_proto::message::Input) {
         log::info!("scripted models: right {state}");
         *last = Some(state);
     }
+}
+
+/// Logs the grip and aim poses of the controllers every 2 seconds, with the launch argument
+/// `log_poses`, so a run with the real controllers lying on a desk shows where the runtime puts
+/// them ("scripted poses:").
+pub fn note_poses(frame: &crate::tracking::HeadsetFrame) {
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    };
+    static LOGGING: OnceLock<bool> = OnceLock::new();
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    if !*LOGGING.get_or_init(|| launch_args().boolean("log_poses").unwrap_or(false)) {
+        return;
+    }
+    let now = frame.sample_time;
+    if now.saturating_sub(LAST.load(Ordering::Relaxed)) < 2_000_000_000 {
+        return;
+    }
+    LAST.store(now, Ordering::Relaxed);
+    let show = |motion: &Option<cranvr_proto::wire::Motion>| match motion {
+        Some(motion) => format!("{:?} {:?}", motion.pose.position, motion.pose.orientation),
+        None => "none".to_string(),
+    };
+    log::info!(
+        "scripted poses: head {}; left grip {}; left aim {}; right grip {}; right aim {}",
+        show(&Some(frame.head)),
+        show(&frame.left_grip),
+        show(&frame.left_aim),
+        show(&frame.right_grip),
+        show(&frame.right_aim)
+    );
 }
 
 /// One step of a controller's script: how long it lasts, and the buttons that are down.
