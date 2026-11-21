@@ -125,6 +125,8 @@ applies these patches and builds both parts.
   `HAND_INTERACTION` (128) of `TRACKING_REQUEST` while an attached action has a binding for the profile. The poses
   move forward by their velocity from the sample's arrival to the locate time, at most 50 ms, as a hand's joints do.
   A gesture that is not ready has the value 0. A value bound to a boolean action presses at 0.6 and lets go below 0.4.
+  The data stays fresh for 1.5 seconds, as a controller's pose does (patch 0011): for a game that binds only this
+  profile the hands are its controllers. The host sends a hand's loss at once, also when the headset's app pauses.
 - Action spaces read a pose source (the hand, the pose and whether a tracked hand gives it) in `xrLocateSpace`,
   `xrLocateViews` and the base space of a tracker's locate call. The haptics go to a Touch binding only.
 - `tests/hand_interaction_smoke.cpp` binds the profile alone or with the Touch profile, drives cranvr-host's test hand

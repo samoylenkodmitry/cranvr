@@ -48,7 +48,7 @@ index 120ec2a..6126c89 100644
  
  enum {
 diff --git c/runtime/pe/control.cpp w/runtime/pe/control.cpp
-index 8b06a75..c11fa99 100644
+index 8b06a75..76cb3ec 100644
 --- c/runtime/pe/control.cpp
 +++ w/runtime/pe/control.cpp
 @@ -114,6 +114,13 @@ constexpr size_t kBodyHeaderLength = 8 + 4 + 4 + 4 + 13 * sizeof(float);
@@ -182,7 +182,7 @@ index 8b06a75..c11fa99 100644
          snapshot->eyeGaze.active = trackedFresh(gEyeGaze.active, gEyeGaze.arrival, now);
          snapshot->eyeGaze.poseInLocal = poseCompose(localFromQuest, gEyeGaze.pose);
          for (const ButtonInputRecord& source : gButtonInputs) {
-@@ -2083,6 +2157,49 @@ ControlTrackedJoint trackedJointInLocal(
+@@ -2083,6 +2157,52 @@ ControlTrackedJoint trackedJointInLocal(
      return out;
  }
  
@@ -205,7 +205,10 @@ index 8b06a75..c11fa99 100644
 +        const HandInteractionRecord& record = gHandInteractions[hand];
 +        ControlHandInteractionState& state = snapshot->handInteractions[hand];
 +        state = {};
-+        state.active = trackedFresh(record.active, record.arrival, now);
++        // These poses are the game's controllers, so they keep the controllers' freshness (patch
++        // 0011). The host says at once when a hand is lost or the headset's app pauses, and an
++        // INPUT_RESET clears them, so the limit only catches a link that died.
++        state.active = record.active && arrivedWithin(record.arrival, now, kControllerPoseFreshness);
 +        if (!state.active) {
 +            continue;
 +        }
@@ -1419,10 +1422,10 @@ index 7e0738a..abf542e 100644
  target_link_options(frame_timer_probe PRIVATE -static -static-libgcc -static-libstdc++)
 diff --git c/runtime/tests/hand_interaction_smoke.cpp w/runtime/tests/hand_interaction_smoke.cpp
 new file mode 100644
-index 0000000..4352a38
+index 0000000..e106fb1
 --- /dev/null
 +++ w/runtime/tests/hand_interaction_smoke.cpp
-@@ -0,0 +1,700 @@
+@@ -0,0 +1,703 @@
 +// cranvr: reads the hand interaction profile of XR_EXT_hand_interaction while it drives cranvr-host's
 +// test hand (host/src/test_input.rs) through the host's words file. The program binds that profile
 +// alone, as a game with hand code and no controller bindings does, or with the Touch controller's
@@ -1984,8 +1987,11 @@ index 0000000..4352a38
 +    } else {
 +        // The test hand, open, palm down, fingers forward
 +        setWords("hand=1 x=0.2 y=-0.35 z=0.3");
++        // The probe's right controller serves the profile until the test hand comes: the wait ends
++        // when the grip pose is near the palm of the words, and the checks below measure it
 +        Reading open = waitFor("the right hand is tracked and ready", [&](const Reading& r) {
-+            return r.hands[1].allReady() && r.hands[1].allPoses() && r.headValid;
++            return r.hands[1].allReady() && r.hands[1].allPoses() && r.headValid &&
++                   within(r.hands[1].pose[kGrip].position, fromHead(r, 0.2f, -0.35f, -0.3f), 0.01f);
 +        });
 +        const HandReading& right = open.hands[1];
 +        report(right.profile == handProfile, "the tracked right hand uses the hand interaction profile");
