@@ -161,8 +161,8 @@ pub fn steam_appid_file(folder: &Path) -> Option<String> {
 /// steam.rs): the ID is then that game's. The user can change the value, and a change clears its reason.
 ///
 /// cranvr sets no Wine DLL override. A DLL of a mod loader in the folder (`winhttp.dll` of a loader that
-/// patches the game's own files, such as BSIPA) starts the loader twice when an override names it: the
-/// game's menus then lost their text. A loader that needs the override gets it from the user.
+/// patches the game's own files, such as BSIPA) starts the loader twice when an override names it. A loader
+/// that needs the override gets it from the user.
 pub fn detect(program: &Path, copy_of: Option<(&str, &str)>) -> GameOptions {
     let mut options = GameOptions::default();
     let Some(folder) = program.parent() else { return options };
