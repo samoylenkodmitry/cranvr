@@ -17,9 +17,6 @@
 //! instance, because the game asks for the instance's extensions first, and lists the extensions of
 //! those features only.
 //!
-//! The runtime still writes `runtime-features.txt` next to the control file when it connects, as it
-//! did for hosts that asked. This host has no use for the file and takes it away.
-//!
 //! The runtime finds the host through a control file: "<port> <token> <eye width> <eye height>".
 //! The launcher passes the file's Windows path to the game in the `BASALT_CONTROL` variable.
 
@@ -320,8 +317,6 @@ impl RuntimeLink {
         let program_file = self.control_dir().join("game-program.txt");
         let program = fs::read_to_string(&program_file).ok().map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
         fs::remove_file(&program_file).ok();
-        // The file belongs to this game: the host has no use for it and takes it away
-        fs::remove_file(self.control_dir().join("runtime-features.txt")).ok();
         self.requested.store(0, Ordering::Relaxed);
         info!("Game runtime connected: {renderer}, {}", program.as_deref().unwrap_or("program not named"));
 
@@ -819,11 +814,10 @@ mod tests {
     }
 
     /// A fake runtime that connected to `link`'s control file and got the hello reply and the two
-    /// controller profiles. The runtime writes runtime-features.txt before it connects.
+    /// controller profiles.
     fn connected_runtime(link: &RuntimeLink) -> TcpStream {
         let text = fs::read_to_string(link.control_file()).unwrap();
         let fields: Vec<&str> = text.split_whitespace().collect();
-        fs::write(link.control_dir().join("runtime-features.txt"), "aim\ntracking\n").unwrap();
         let mut runtime = TcpStream::connect(("127.0.0.1", fields[0].parse::<u16>().unwrap())).unwrap();
         let mut hello = PROTOCOL_VERSION.to_le_bytes().to_vec();
         hello.extend_from_slice(fields[1].as_bytes());
@@ -848,7 +842,6 @@ mod tests {
         let (link, events) = RuntimeLink::start(&dir.join("control.txt"), (1600, 1700), 120, |_| ()).unwrap();
         let mut runtime = connected_runtime(&link);
         assert!(matches!(events.recv_timeout(Duration::from_secs(2)).unwrap(), GameEvent::Connected { .. }));
-        assert!(!dir.join("runtime-features.txt").exists(), "the host takes the file away");
 
         let motion = |x: f32, angle: f32, v: f32| DeviceMotion {
             pose: Pose { orientation: Quat::from_rotation_x(angle), position: Vec3::new(x, 1.2, -0.4) },

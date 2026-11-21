@@ -8,9 +8,8 @@ plain CONTROLLER_MOTION has no aim pose, and its aim space follows the grip
 pose as before.
 
 A runtime without the patch closes the connection at a message that it does
-not know. This runtime therefore writes runtime-features.txt ("aim") next to
-the control file when it creates its session, as it writes game-program.txt.
-The daemon sends the new message only to a runtime that wrote the file. The
+not know. cranvr-host sends the new message to every runtime, because the
+cranvr app starts no game with a runtime older than its game support. The
 protocol version stays 9.
 
 The test daemon sends the new message for the left hand and a plain one when
@@ -18,10 +17,10 @@ the controller comes back. The smoke test locates an aim space and a grip
 space of the left hand and checks both.
 ---
 diff --git a/runtime/pe/basalt_control_protocol.h b/runtime/pe/basalt_control_protocol.h
-index 9bf4d10..ced3878 100644
+index 9bf4d10..b91b80a 100644
 --- a/runtime/pe/basalt_control_protocol.h
 +++ b/runtime/pe/basalt_control_protocol.h
-@@ -54,6 +54,16 @@
+@@ -54,6 +54,15 @@
   *     u64 target_timestamp_ns, u32 hand (0 left, 1 right), u32 reserved,
   *     f32 orientation[4] (xyzw), f32 position[3],
   *     f32 linear_velocity[3], f32 angular_velocity[3]
@@ -31,14 +30,13 @@ index 9bf4d10..ced3878 100644
 + *       f32 orientation[4] (xyzw), f32 position[3],
 + *       f32 linear_velocity[3], f32 angular_velocity[3]
 + *     Replaces CONTROLLER_MOTION for a headset that reports a separate aim
-+ *     pose. The runtime says that it takes the message by writing the word
-+ *     "aim" to runtime-features.txt next to the control file before it
-+ *     connects. A daemon must not send the message to a runtime that did
-+ *     not: the runtime closes the connection at a message it does not know.
++ *     pose. A runtime without this message closes the connection at it.
++ *     cranvr-host sends it to every runtime: the cranvr app starts no game
++ *     with a runtime older than its game support.
   *   BUTTON_STATE (daemon → runtime; retained until replaced/disconnect)
   *     u64 ALVR path_id, u32 value_type (0 binary, 1 scalar), f32 value
   *   HAPTIC (runtime → daemon)
-@@ -102,6 +112,7 @@ enum {
+@@ -102,6 +111,7 @@ enum {
      BASALT_MSG_VIEW_CONFIG = 15,
      BASALT_MSG_CONTROLLER_MASK = 16,
      BASALT_MSG_FRAME_CONSUMED = 17,
@@ -47,7 +45,7 @@ index 9bf4d10..ced3878 100644
  
  enum {
 diff --git a/runtime/pe/control.cpp b/runtime/pe/control.cpp
-index 14de261..3b802f4 100644
+index 14de261..20e2fa8 100644
 --- a/runtime/pe/control.cpp
 +++ b/runtime/pe/control.cpp
 @@ -49,6 +49,8 @@ constexpr uint32_t kMaxFrameViews = 2;
@@ -171,15 +169,7 @@ index 14de261..3b802f4 100644
          } else if (type == BASALT_MSG_BUTTON_STATE) {
              accepted = parseButtonState(payload, payloadLength);
          } else if (type == BASALT_MSG_INTERACTION_PROFILE) {
-@@ -1151,6 +1177,7 @@ void controlSessionCreated(XrSession session, ID3D11Device* device) {
- 
-     // cranvr: name the game for cranvr-host before the Hello reaches it
-     writeGameProgram();
-+    writeRuntimeFeatures();
- 
-     char renderer[kMaxRendererLength]{};
-     adapterDescription(device, renderer, sizeof(renderer));
-@@ -1354,6 +1381,16 @@ bool controlInputSnapshot(
+@@ -1354,6 +1380,16 @@ bool controlInputSnapshot(
                  localFromQuest.orientation, source.rawLinearVelocity);
              destination.angularVelocity = quaternionRotate(
                  localFromQuest.orientation, source.rawAngularVelocity);
@@ -196,30 +186,8 @@ index 14de261..3b802f4 100644
          }
          for (const ButtonInputRecord& source : gButtonInputs) {
              if (!source.valid || snapshot->buttonCount >= kControlButtonCapacity) {
-@@ -1684,6 +1721,21 @@ void writeGameProgram() {
-     }
- }
- 
-+// cranvr: this runtime takes CONTROLLER_MOTION_AIM. cranvr-host reads the file
-+// when the game connects, as it reads game-program.txt, and sends the message
-+// to a runtime that wrote it. A runtime without this patch writes no file.
-+void writeRuntimeFeatures() {
-+    char path[MAX_PATH]{};
-+    char program[MAX_PATH]{};
-+    if (!siblingAndProgram("runtime-features.txt", path, program)) {
-+        return;
-+    }
-+    if (FILE* file = std::fopen(path, "w")) {
-+        std::fputs("aim\n", file);
-+        std::fclose(file);
-+    }
-+}
-+
- float controlGameViewScale() {
-     InitOnceExecuteOnce(&gGameViewScaleOnce, initGameViewScale, nullptr, nullptr);
-     return gGameViewScale;
 diff --git a/runtime/pe/control.hpp b/runtime/pe/control.hpp
-index 3431f07..174219a 100644
+index 3431f07..7bda9db 100644
 --- a/runtime/pe/control.hpp
 +++ b/runtime/pe/control.hpp
 @@ -90,10 +90,21 @@ inline bool controlButtonPressed(uint32_t valueType, float value) {
@@ -244,16 +212,6 @@ index 3431f07..174219a 100644
  // Returns the latest calibrated Quest eye geometry. False means the daemon
  // has not supplied it yet; callers retain conservative prototype defaults.
  bool controlViewConfig(
-@@ -167,4 +178,9 @@ float controlGameViewScale();
- // file, so cranvr-host can keep a render size per game.
- void writeGameProgram();
- 
-+// cranvr: writes runtime-features.txt next to the control file. It names the
-+// optional control messages that this runtime takes ("aim"), so cranvr-host
-+// sends them only to a runtime that does.
-+void writeRuntimeFeatures();
-+
- }  // namespace basalt
 diff --git a/runtime/pe/space.cpp b/runtime/pe/space.cpp
 index 93dd067..40b0767 100644
 --- a/runtime/pe/space.cpp

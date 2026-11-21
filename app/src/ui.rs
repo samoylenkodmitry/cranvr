@@ -158,6 +158,7 @@ fn connection_of(settings: MutableState<Settings>) -> Connection {
 fn refresh(settings: MutableState<Settings>, model: MutableState<Model>, slow: bool) {
     let mut next = model.with(Clone::clone);
     backend::pump(&mut next);
+    next.settings_problem = backend::settings_problem();
     usb::set_choice(connection_of(settings));
     next.usb = usb::status();
     let requests = std::mem::take(&mut next.vr_requests);
@@ -373,6 +374,9 @@ pub fn CranvrApp() {
             PermissionCard(model);
             PairingCard(model);
             HeadsetCard(settings, model);
+            if let Some(problem) = model.with(|m| m.settings_problem.clone()) {
+                Text(problem, Modifier::empty(), colored(240, 170, 90));
+            }
             if let Some(message) = model.with(|m| m.message.clone()) {
                 Text(message, Modifier::empty(), colored(240, 170, 90));
             }

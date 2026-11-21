@@ -110,7 +110,10 @@
 #                 latency block would stay empty. The run keeps the host's key in
 #                 target/e2e/host-identity.txt: a headset refuses a known address and port with
 #                 a new key. Give a --native-port that the headset has not used with another host
-#                 at this Mac's address, such as 9961.
+#                 at this Mac's address, such as 9961. At the end the run gives the headset back to
+#                 the cranvr app's host on port 9950: over the cable when the app linked that port
+#                 with `adb reverse`, else at this Mac's address. On a port other than 9950 that
+#                 launch also makes the headset forget the key that it keeps for the run's address.
 #                 Without --quest the client is cranvr-probe on this Mac, over loopback with UDP
 #                 media and parity packets. It simulates a headset's display: it reports the
 #                 frame timing and the loss, and it checks the eye badges of the host's scene.
@@ -284,6 +287,33 @@ host_args+=("${more_host_args[@]}")
 pids=()
 adb_cmd=()
 package="" guardian_before=""
+# The port of the cranvr app's host, where the headset goes back after a run
+readonly owner_port=9950
+
+# Starts the client again for the cranvr app's host. The run's host left its key on the headset, and
+# the next test host at this address has another key, which the headset would refuse. So the launch
+# also makes the headset forget the key that it keeps for the run's address. The key may come from a
+# test host of another checkout: the headset then refused the run, and the forget clears the way for
+# the next one. Port 9950 is the app's own: its address may hold the key of the user's host, which
+# stays.
+give_back() {
+    local owner="" test_host=${mac_ip}:${native_port}
+    local extras=()
+    if "${adb_cmd[@]}" reverse --list 2>/dev/null | grep -q "tcp:${owner_port} tcp:${owner_port}"; then
+        owner=127.0.0.1:${owner_port}
+    elif [[ -n ${mac_ip} ]]; then
+        owner=${mac_ip}:${owner_port}
+    fi
+    [[ -n ${owner} ]] || return 0
+    if [[ -n ${mac_ip} ]] && (( native_port != owner_port )); then
+        extras=(--es forget_host_key "${test_host}")
+    fi
+    if "${adb_cmd[@]}" shell am start -n "${package}/dev.cranpose.android.CranposeActivity" \
+        --es host "${owner}" --ez connect true "${extras[@]}" >/dev/null 2>&1; then
+        print "The headset connects to ${owner} again${extras:+ and forgets the key of ${test_host}}"
+    fi
+}
+
 cleanup() {
     for pid in "${pids[@]}"; do
         kill "${pid}" 2>/dev/null || true
@@ -297,6 +327,7 @@ cleanup() {
     fi
     if [[ ${client} == quest ]]; then
         "${adb_cmd[@]}" shell setprop debug.oculus.guardian_pause "${guardian_before:-0}" >/dev/null 2>&1 || true
+        [[ -z ${package} ]] || give_back
     fi
 }
 trap cleanup EXIT

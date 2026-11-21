@@ -65,14 +65,13 @@ struct Rig {
     events: std::sync::mpsc::Receiver<GameEvent>,
 }
 
-/// A hub with a game's runtime attached. The runtime writes runtime-features.txt before it connects.
+/// A hub with a game's runtime attached.
 fn rig(name: &str, hand_controllers: bool) -> Rig {
     let dir = std::env::temp_dir().join(format!("cranvr-tracking-test-{name}-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     let (link, events) = RuntimeLink::start(&dir.join("control.txt"), (1600, 1700), 120, |_| ()).unwrap();
     let text = fs::read_to_string(link.control_file()).unwrap();
     let fields: Vec<&str> = text.split_whitespace().collect();
-    fs::write(dir.join("runtime-features.txt"), "aim tracking\n").unwrap();
     let mut runtime = TcpStream::connect(("127.0.0.1", fields[0].parse::<u16>().unwrap())).unwrap();
     let mut hello = PROTOCOL_VERSION.to_le_bytes().to_vec();
     hello.extend_from_slice(fields[1].as_bytes());

@@ -130,16 +130,242 @@ impl Settings {
         config_dir().join("app.json")
     }
 
+    /// The settings in `app.json`. An entry that cranvr cannot read keeps its standard value, and
+    /// `settings_problem` names it. A missing file gives the standard settings.
     pub fn load() -> Self {
-        fs::read(Self::path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+        let reading = Self::load_from(&Self::path());
+        set_settings_problem(reading.problem(&Self::path()));
+        reading.settings
+    }
+
+    fn load_from(path: &Path) -> Reading {
+        match fs::read_to_string(path) {
+            Ok(text) => Self::read(&text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Reading::default(),
+            Err(e) => Reading { broken: Some(e.to_string()), ..Default::default() },
+        }
+    }
+
+    /// Reads the text of `app.json` entry by entry. A wrong entry, such as an action name that no
+    /// action has, costs only that entry: the rest of the file still counts.
+    pub fn read(text: &str) -> Reading {
+        let entries = match serde_json::from_str::<Value>(text) {
+            Ok(Value::Object(entries)) => entries,
+            Ok(_) => return Reading { broken: Some("it holds no settings".into()), ..Default::default() },
+            Err(e) => return Reading { broken: Some(e.to_string()), ..Default::default() },
+        };
+        let mut doc = as_value(&Settings::default()).unwrap_or_default();
+        let mut unreadable = Vec::new();
+        for (key, value) in &entries {
+            take(&mut doc, std::slice::from_ref(key), value, &mut unreadable);
+        }
+        // `take` keeps only what reads, so the document reads as a whole
+        let settings = serde_json::from_value(doc).unwrap_or_default();
+        Reading { settings, unreadable, broken: None }
+    }
+
+    /// The text that a save writes in place of `file`, the text that `app.json` holds now. An entry
+    /// of `file` that cranvr cannot read stays as it is, while its setting keeps the value that the
+    /// read gave it. A file that cranvr cannot read at all gives an error: the save would replace
+    /// every setting in it with a standard value.
+    pub fn file_text(&self, file: Option<&str>) -> Result<String, String> {
+        let reading = file.map(Self::read).unwrap_or_default();
+        if let Some(reason) = reading.broken {
+            return Err(format!("cranvr cannot read the settings file ({reason}), so it does not save over it"));
+        }
+        // A file with no wrong entry gets the settings in the order of their fields
+        if reading.unreadable.is_empty() {
+            return serde_json::to_string_pretty(self).map_err(|e| e.to_string());
+        }
+        let mut doc = as_value(self)?;
+        let read = as_value(&reading.settings)?;
+        let original: Value = serde_json::from_str(file.unwrap_or_default()).map_err(|e| e.to_string())?;
+        for entry in &reading.unreadable {
+            let unchanged = lookup(&doc, &entry.keep) == lookup(&read, &entry.keep);
+            if let (true, Some(value)) = (unchanged, lookup(&original, &entry.keep)) {
+                put(&mut doc, &entry.keep, value.clone());
+            }
+        }
+        serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())
     }
 
     pub fn save(&self) {
-        fs::create_dir_all(config_dir()).ok();
-        if let Ok(text) = serde_json::to_vec_pretty(self) {
-            fs::write(Self::path(), text).ok();
+        let path = Self::path();
+        if let Err(e) = self.save_to(&path) {
+            log(format!("Settings not saved: {e}"));
+        }
+        set_settings_problem(Self::load_from(&path).problem(&path));
+    }
+
+    /// Writes the settings to `path` through a new file, so a crash leaves the old file or the new
+    /// one and never a part of either.
+    fn save_to(&self, path: &Path) -> Result<(), String> {
+        let file = match fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.to_string()),
+        };
+        let text = self.file_text(file.as_deref())?;
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let new = path.with_extension("json.new");
+        fs::write(&new, text).map_err(|e| e.to_string())?;
+        fs::rename(&new, path).map_err(|e| e.to_string())
+    }
+}
+
+/// What a read of `app.json` gave.
+#[derive(Debug, Default)]
+pub struct Reading {
+    pub settings: Settings,
+    /// The entries that cranvr could not read. Each setting keeps its standard value.
+    pub unreadable: Vec<Unreadable>,
+    /// Why cranvr could read nothing of the file, when it could not
+    pub broken: Option<String>,
+}
+
+/// An entry of `app.json` that cranvr could not read.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Unreadable {
+    /// Where it is, such as `controls.right.grip`
+    pub entry: String,
+    /// Why it does not read, such as "no action is named grab"
+    pub reason: String,
+    /// The entry that a save keeps as the file has it: the entry itself, or the whole list that
+    /// holds it, because a list has no names for its items
+    keep: Vec<String>,
+}
+
+impl Reading {
+    /// The window's error for this read of the file at `path`, if there is one.
+    pub fn problem(&self, path: &Path) -> Option<String> {
+        let file = path.display();
+        if let Some(reason) = &self.broken {
+            return Some(format!(
+                "cranvr cannot read its settings file {file} ({reason}). The app runs with the standard settings and saves no change. Fix the file or remove it, then open cranvr again."
+            ));
+        }
+        let entries: Vec<String> = self.unreadable.iter().map(|u| format!("{} ({})", u.entry, u.reason)).collect();
+        match entries.len() {
+            0 => None,
+            1 => Some(format!(
+                "cranvr cannot read one entry of its settings file {file}: {}. The app uses the standard value for it. The file keeps the entry until you change that setting.",
+                entries[0]
+            )),
+            n => Some(format!(
+                "cranvr cannot read {n} entries of its settings file {file}: {}. The app uses the standard value for each. The file keeps each entry until you change its setting.",
+                entries.join("; ")
+            )),
         }
     }
+}
+
+static SETTINGS_PROBLEM: Mutex<Option<String>> = Mutex::new(None);
+
+fn set_settings_problem(problem: Option<String>) {
+    *SETTINGS_PROBLEM.lock().unwrap() = problem;
+}
+
+/// What the last read or save of `app.json` found wrong in it, for the window.
+pub fn settings_problem() -> Option<String> {
+    SETTINGS_PROBLEM.lock().unwrap().clone()
+}
+
+/// Puts the file's `value` at `path` of `doc` when the settings still read with it. An object or a
+/// list that does not read whole goes in part by part, so one wrong entry inside it costs only that
+/// entry. A part that does not read keeps what `doc` held and joins `unreadable`.
+fn take(doc: &mut Value, path: &[String], value: &Value, unreadable: &mut Vec<Unreadable>) {
+    let before = lookup(doc, path).cloned();
+    put(doc, path, value.clone());
+    let Err(reason) = reads(doc) else { return };
+    match value {
+        Value::Object(fields) => {
+            let base = before.clone().filter(Value::is_object).unwrap_or_else(|| Value::Object(Default::default()));
+            put(doc, path, base);
+            if reads(doc).is_ok() {
+                for (key, field) in fields {
+                    take(doc, &[path, std::slice::from_ref(key)].concat(), field, unreadable);
+                }
+                return;
+            }
+        }
+        Value::Array(items) => {
+            put(doc, path, Value::Array(Vec::new()));
+            if reads(doc).is_ok() {
+                for (index, item) in items.iter().enumerate() {
+                    let mut list = lookup(doc, path).cloned().unwrap_or_default();
+                    let kept = list.clone();
+                    if let Value::Array(list) = &mut list {
+                        list.push(item.clone());
+                    }
+                    put(doc, path, list);
+                    if let Err(reason) = reads(doc) {
+                        put(doc, path, kept);
+                        unreadable.push(Unreadable { entry: format!("{}[{index}]", entry_name(path)), reason, keep: path.to_vec() });
+                    }
+                }
+                return;
+            }
+        }
+        _ => {}
+    }
+    match before {
+        Some(before) => put(doc, path, before),
+        None => remove(doc, path),
+    }
+    unreadable.push(Unreadable { entry: entry_name(path), reason, keep: path.to_vec() });
+}
+
+/// The settings as JSON values. The way through the text keeps a number such as 0.7 as the file
+/// shows it: a direct conversion turns the f32 into 0.699999988079071.
+fn as_value(settings: &Settings) -> Result<Value, String> {
+    serde_json::to_string(settings).and_then(|text| serde_json::from_str(&text)).map_err(|e| e.to_string())
+}
+
+fn reads(doc: &Value) -> Result<(), String> {
+    serde_json::from_value::<Settings>(doc.clone()).map(drop).map_err(|e| e.to_string())
+}
+
+fn lookup<'a>(doc: &'a Value, path: &[String]) -> Option<&'a Value> {
+    path.iter().try_fold(doc, |value, key| value.get(key))
+}
+
+/// Sets the entry at `path`, with the objects on the way to it
+fn put(doc: &mut Value, path: &[String], value: Value) {
+    let Some((last, parents)) = path.split_last() else { return };
+    let mut parent = doc;
+    for key in parents {
+        let Value::Object(map) = parent else { return };
+        parent = map.entry(key.clone()).or_insert_with(|| Value::Object(Default::default()));
+    }
+    if let Value::Object(map) = parent {
+        map.insert(last.clone(), value);
+    }
+}
+
+fn remove(doc: &mut Value, path: &[String]) {
+    let Some((last, parents)) = path.split_last() else { return };
+    if let Some(Value::Object(map)) = parents.iter().try_fold(doc, |value, key| value.get_mut(key)) {
+        map.remove(last);
+    }
+}
+
+/// The entry as a user finds it in the file: `controls.right.grip`, or `launch["C:\game.exe"].args`
+/// for a name that is no plain word
+fn entry_name(path: &[String]) -> String {
+    let mut name = String::new();
+    for key in path {
+        if !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            if !name.is_empty() {
+                name.push('.');
+            }
+            name.push_str(key);
+        } else {
+            name.push_str(&format!("[{key:?}]"));
+        }
+    }
+    name
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -224,6 +450,9 @@ pub struct Model {
     pub usb: crate::usb::Status,
     pub log: VecDeque<String>,
     pub message: Option<String>,
+    /// What cranvr cannot read in `app.json`. It has its own place: the host's messages replace
+    /// `message`.
+    pub settings_problem: Option<String>,
     /// Screen Recording and Accessibility
     pub permissions: [bool; 2],
     pub steam: crate::steam::SteamState,
@@ -718,6 +947,119 @@ pub fn steam_app_id(dir: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cranvr_common::controls::{Action, Control, Hand};
+
+    /// A file with changed settings and one wrong action name, as a hand edit leaves it
+    const WRONG_ACTION: &str = r#"{
+        "fps": 72,
+        "mbps": 60,
+        "game_scale": 0.5,
+        "controls": {
+            "left": {"trigger": "right_click", "menu": "recenter"},
+            "right": {"grip": "grab", "secondary": "keyboard"}
+        },
+        "launch": {"C:\\Games\\game.exe": {"args": "-vr", "opencomposite": false}},
+        "wine": {"mac_window": true},
+        "added_games": [{"name": "Mods", "program": "/Games/Mods/game.exe"}]
+    }"#;
+
+    #[test]
+    fn a_wrong_action_name_costs_only_its_entry() {
+        let reading = Settings::read(WRONG_ACTION);
+        let s = &reading.settings;
+        assert_eq!((s.fps, s.mbps, s.game_scale), (72, 60, 0.5));
+        assert_eq!(s.controls.action(Hand::Left, Control::Trigger), Action::RightClick);
+        assert_eq!(s.controls.action(Hand::Left, Control::Menu), Action::Recenter);
+        assert_eq!(s.controls.action(Hand::Right, Control::Secondary), Action::Keyboard);
+        // The wrong entry keeps the standard action
+        assert_eq!(s.controls.action(Hand::Right, Control::Grip), Action::Nothing);
+        assert_eq!(s.launch["C:\\Games\\game.exe"].args, "-vr");
+        assert_eq!(s.launch["C:\\Games\\game.exe"].opencomposite, Some(false));
+        assert!(s.wine.mac_window);
+        assert_eq!(s.added_games.len(), 1);
+        assert_eq!(reading.unreadable.len(), 1, "{:?}", reading.unreadable);
+        assert_eq!(reading.unreadable[0].entry, "controls.right.grip");
+        assert_eq!(reading.unreadable[0].reason, "no action is named grab");
+        let problem = reading.problem(Path::new("/cfg/app.json")).unwrap();
+        assert!(problem.contains("controls.right.grip (no action is named grab)") && problem.contains("/cfg/app.json"), "{problem}");
+    }
+
+    #[test]
+    fn a_save_keeps_the_wrong_entry_until_the_user_changes_that_setting() {
+        let mut settings = Settings::read(WRONG_ACTION).settings;
+        settings.fps = 90;
+        let text = settings.file_text(Some(WRONG_ACTION)).unwrap();
+        assert!(text.contains("\"game_scale\": 0.5,"), "{text}");
+        let saved: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(saved["controls"]["right"]["grip"], "grab");
+        assert_eq!(saved["fps"], 90);
+        assert_eq!(saved["controls"]["left"]["trigger"], "right_click");
+        assert_eq!(saved["launch"]["C:\\Games\\game.exe"]["args"], "-vr");
+        // The next read finds the same settings and the same wrong entry
+        let again = Settings::read(&text);
+        assert_eq!(again.settings, settings);
+        assert_eq!(again.unreadable.len(), 1);
+
+        // The user picks an action for the grip: the file takes it, and the error goes away
+        settings.controls.set(Hand::Right, Control::Grip, Action::Console);
+        let text = settings.file_text(Some(&text)).unwrap();
+        let fixed = Settings::read(&text);
+        assert!(fixed.unreadable.is_empty() && fixed.problem(Path::new("app.json")).is_none());
+        assert_eq!(fixed.settings, settings);
+    }
+
+    #[test]
+    fn wrong_parts_of_a_list_and_of_a_game_s_options_cost_only_themselves() {
+        let text = r#"{
+            "added_games": [{"name": "Good", "program": "/a.exe"}, {"name": 7}],
+            "launch": {"C:\\a.exe": {"args": "-x", "eye_per_pass": "yes"}},
+            "fps": "fast"
+        }"#;
+        let reading = Settings::read(text);
+        let entries: Vec<&str> = reading.unreadable.iter().map(|u| u.entry.as_str()).collect();
+        assert_eq!(entries, ["added_games[1]", "fps", r#"launch["C:\\a.exe"].eye_per_pass"#]);
+        assert_eq!(reading.settings.added_games.len(), 1);
+        assert_eq!(reading.settings.launch["C:\\a.exe"].args, "-x");
+        assert_eq!(reading.settings.fps, Settings::default().fps);
+        // A save keeps the list as the file has it while the list stays as read
+        let saved: Value = serde_json::from_str(&reading.settings.file_text(Some(text)).unwrap()).unwrap();
+        assert_eq!(saved["added_games"][1]["name"], 7);
+        assert_eq!(saved["fps"], "fast");
+        assert_eq!(saved["launch"]["C:\\a.exe"]["eye_per_pass"], "yes");
+        assert!(reading.problem(Path::new("app.json")).unwrap().contains("3 entries"));
+    }
+
+    #[test]
+    fn a_file_that_does_not_read_at_all_is_never_saved_over() {
+        let dir = env::temp_dir().join(format!("cranvr-app-json-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("app.json");
+        let broken = "{\"fps\": 72,";
+        fs::write(&path, broken).unwrap();
+        let reading = Settings::load_from(&path);
+        assert!(reading.broken.is_some());
+        assert_eq!(reading.settings, Settings::default());
+        assert!(reading.problem(&path).unwrap().contains("saves no change"));
+        assert!(reading.settings.save_to(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), broken);
+
+        // A file with no wrong entry gets the same text as before, with its fields in their order
+        let good = Settings { game_scale: 0.7, ..Default::default() };
+        let text = good.file_text(Some(&serde_json::to_string(&good).unwrap())).unwrap();
+        assert_eq!(text, serde_json::to_string_pretty(&good).unwrap());
+        assert!(text.contains("\"game_scale\": 0.7,"), "{text}");
+
+        // A readable file takes the save, through a new file that replaces it
+        fs::write(&path, WRONG_ACTION).unwrap();
+        let mut settings = Settings::load_from(&path).settings;
+        settings.mbps = 80;
+        settings.save_to(&path).unwrap();
+        let saved = Settings::load_from(&path);
+        assert_eq!(saved.settings.mbps, 80);
+        assert_eq!(saved.unreadable.len(), 1);
+        assert!(!path.with_extension("json.new").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn each_network_problem_shows_once() {
