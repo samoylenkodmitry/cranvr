@@ -669,6 +669,12 @@ fn encode_loop(jobs: mpsc::Receiver<EncodeJob>) {
     }
 }
 
+/// The eye stream's bitrate: the user's `setting_bps`, at most the link's limit of `frame_bits` a frame
+/// at `fps`.
+fn eye_bitrate(setting_bps: u64, frame_bits: Option<f64>, fps: f32) -> u64 {
+    frame_bits.map_or(setting_bps, |bits| setting_bps.min((bits * f64::from(fps)).round() as u64))
+}
+
 /// The encoder of the eye stream: frames of `width` x `height` at `fps` and `bitrate_bps` on average,
 /// a key frame at least every 10 s.
 fn eye_encoder_config([width, height]: [u32; 2], fps: f32, full_range: bool, bitrate_bps: u64, strict_rate: bool) -> EncoderConfig {
@@ -1095,6 +1101,9 @@ fn frame_loop(
                 .foveated
                 .then(|| Foveation::new([stream.eye_width, stream.eye_height], &stream.foveation));
             let (eye_w, eye_h) = foveation.map_or((stream.eye_width, stream.eye_height), |f| (f.optimized[0], f.optimized[1]));
+            bitrate = eye_bitrate(mbps * 1_000_000, headset.link_frame_bits(), stream.fps);
+            info!("Eye stream: {} Mbps of the {mbps} Mbps set", bitrate / 1_000_000);
+            new_bitrate = None;
             let config = eye_encoder_config([eye_w * 2, eye_h], stream.fps, stream.full_range, bitrate, strict_rate);
             time_line = TimeLine::new(stream.fps);
             encoder = match Encoder::new(&config, sender.clone()) {
@@ -1342,11 +1351,12 @@ fn frame_loop(
             pacer.spend();
         }
 
-        if let Some(b) = headset.bitrate_bps() {
-            if b > 0 && b != bitrate {
-                bitrate = b;
-                new_bitrate = Some(b);
-            }
+        // A new session with the same stream keeps the encoder: its link may have another limit
+        let wanted = eye_bitrate(mbps * 1_000_000, headset.link_frame_bits(), stream.fps);
+        if wanted != bitrate {
+            info!("Eye stream: {} Mbps of the {mbps} Mbps set", wanted / 1_000_000);
+            bitrate = wanted;
+            new_bitrate = Some(wanted);
         }
         let job = EncodeJob {
             encoder: Arc::clone(enc),
@@ -1436,6 +1446,7 @@ fn frame_loop(
                 "render_ms": gpu_ms / n,
                 "encode_ms": encode_ms,
                 "mbps": bitrate / 1_000_000,
+                "mbps_set": mbps,
                 "sent_mbps": sent_mbps,
                 "audio_s": audio_s,
                 "latency": latency,

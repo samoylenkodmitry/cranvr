@@ -122,6 +122,8 @@ struct Measure {
     /// Each key frame: its size, the gap from the frame before it in ms, and the PSNR of the frame
     /// before it and its own
     key_frames: Vec<(usize, f64, f64, f64)>,
+    /// Each frame's size
+    sizes: Vec<usize>,
     keys: usize,
 }
 
@@ -161,10 +163,12 @@ struct Setup {
     frames: usize,
     paced: bool,
     pause: Option<(f64, f64)>,
+    /// From this frame on the encoder takes this bitrate in Mbps, as the frame loop's `set_bitrate`
+    rate_change: Option<(usize, u64)>,
 }
 
 fn measure(setup: Setup) -> Measure {
-    let Setup { scene, spacing, fps, mbps, strict, frames, paced, pause } = setup;
+    let Setup { scene, spacing, fps, mbps, strict, frames, paced, pause, rate_change } = setup;
     let foveation = Foveation::new(EYE, &FoveationConfig::default());
     let [eye_w, eye_h] = foveation.optimized;
     let (sender, encoded) = mpsc::channel();
@@ -191,6 +195,7 @@ fn measure(setup: Setup) -> Measure {
             last_out = Some(now);
             m.frames += 1;
             m.bytes += frame.data.len();
+            m.sizes.push(frame.data.len());
             m.keys += usize::from(frame.is_idr);
             if !frame.is_idr {
                 m.largest = m.largest.max(frame.data.len());
@@ -277,6 +282,9 @@ fn measure(setup: Setup) -> Measure {
             Spacing::Real => time_line.at(now),
             Spacing::OneMs => Duration::from_millis(n as u64),
         };
+        if rate_change.is_some_and(|(at, _)| at == n) {
+            encoder.set_bitrate(rate_change.unwrap().1 * 1_000_000);
+        }
         let stamp = n as u64 + 1;
         source_tx.send((stamp, luma_of(&mut buffer))).unwrap();
         encoder.encode(&buffer, presentation, stamp, n == 0).expect("encode");
@@ -322,7 +330,7 @@ fn report(label: &str, m: &Measure, mbps: u64) -> String {
 #[test]
 fn the_eye_stream_spends_its_bitrate_on_a_moving_picture() {
     let (fps, mbps, frames) = (120.0, 100, 120);
-    let setup = Setup { scene: Scene::Game, spacing: Spacing::Real, fps, mbps, strict: false, frames, paced: false, pause: None };
+    let setup = Setup { scene: Scene::Game, spacing: Spacing::Real, fps, mbps, strict: false, frames, paced: false, pause: None, rate_change: None };
     let real = measure(setup);
     let old = measure(Setup { spacing: Spacing::OneMs, ..setup });
     let sent = |m: &Measure| m.bytes as f64 * 8.0 / m.seconds / 1e6;
@@ -345,7 +353,7 @@ fn eye_quality_curve() {
     let spacing = if std::env::var("CRANVR_EYE_SPACING").is_ok_and(|v| v == "1ms") { Spacing::OneMs } else { Spacing::Real };
     let strict = std::env::var("CRANVR_EYE_STRICT").is_ok_and(|v| v == "1");
     let pause = std::env::var("CRANVR_EYE_PAUSE").is_ok_and(|v| v == "1").then_some((4.0, 5.0));
-    let m = measure(Setup { scene, spacing, fps, mbps, strict, frames: (seconds * f64::from(fps)) as usize, paced: true, pause });
+    let m = measure(Setup { scene, spacing, fps, mbps, strict, frames: (seconds * f64::from(fps)) as usize, paced: true, pause, rate_change: None });
     println!("{}", report(&format!("{scene:?}, {spacing:?}, {fps} Hz{}", if strict { ", strict" } else { "" }), &m, mbps));
 }
 
@@ -367,4 +375,32 @@ fn the_time_line_follows_the_frames_and_a_pause_saves_up_no_bits() {
     // Two frames at the same instant still stand apart
     let at = line.at(start + ms(1032.0));
     assert_eq!(at, after_pause + ms(8.0) + Duration::from_micros(1));
+}
+
+/// The eye stream takes the bitrate that the user set, at most the link's limit at the stream's rate.
+#[test]
+fn the_link_limits_the_bitrate_that_the_user_set() {
+    let set = 100_000_000;
+    assert_eq!(eye_bitrate(set, None, 120.0), set);
+    // The cable's limit: 40 Mbps at 120 Hz, the same bits a frame at 72 Hz
+    let cable = 40e6 / 120.0;
+    assert_eq!(eye_bitrate(set, Some(cable), 120.0), 40_000_000);
+    assert_eq!(eye_bitrate(set, Some(cable), 72.0), 24_000_000);
+    // A setting under the limit stays
+    assert_eq!(eye_bitrate(20_000_000, Some(cable), 120.0), 20_000_000);
+    // A link without a limit gives the setting back
+    assert_eq!(eye_bitrate(set, None, 72.0), set);
+}
+
+/// A new session with the same stream keeps its encoder, and the frame loop lowers its bitrate to the
+/// new link's limit. The encoder follows within a second.
+#[test]
+fn the_encoder_follows_a_lower_bitrate_in_its_session() {
+    let (fps, frames) = (120.0, 360);
+    let setup = Setup { scene: Scene::Game, spacing: Spacing::Real, fps, mbps: 100, strict: false, frames, paced: false, pause: None, rate_change: Some((120, 20)) };
+    let m = measure(setup);
+    let mbps = |from: usize, to: usize| m.sizes[from..to].iter().sum::<usize>() as f64 * 8.0 * f64::from(fps) / (to - from) as f64 / 1e6;
+    let (first, last) = (mbps(10, 120), mbps(240, 360));
+    println!("{first:.1} Mbps at a target of 100, {last:.1} Mbps a second after the change to 20");
+    assert!(first > 50.0 && last < 20.0, "{first:.1} Mbps, then {last:.1} Mbps");
 }

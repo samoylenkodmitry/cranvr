@@ -178,8 +178,10 @@ pub trait Headset: Send + Sync {
     /// The frame loop handed the frame for this sample to the encoder.
     fn frame_submitted(&self, sample_ns: u64);
 
-    /// The bitrate that the link wants from the encoder, when it has an opinion.
-    fn bitrate_bps(&self) -> Option<u64>;
+    /// The bits that one frame of the eye stream may carry on average over the link, when the link has
+    /// a limit. The frame loop multiplies it by the refresh rate and takes the smaller of that and the
+    /// bitrate that the user set.
+    fn link_frame_bits(&self) -> Option<f64>;
 
     fn send_haptics(&self, haptic: Haptic);
 

@@ -501,10 +501,7 @@ fn HeadsetCard(settings: MutableState<Settings>, model: MutableState<Model>) {
                 }
                 if let Some(st) = model.with(|m| m.stats.clone()) {
                     let latency = st.latency_ms.map(|ms| format!(", {ms:.0} ms from motion to display")).unwrap_or_default();
-                    Hint(format!(
-                        "{:.0} fps, render {:.1} ms, encode {:.1} ms, {} Mbps{latency}",
-                        st.fps, st.render_ms, st.encode_ms, st.mbps
-                    ));
+                    Hint(format!("{:.0} fps, render {:.1} ms, encode {:.1} ms, {}{latency}", st.fps, st.render_ms, st.encode_ms, bitrate_text(&st)));
                 }
             }
             None => {
@@ -1314,4 +1311,26 @@ fn LogTab(model: MutableState<Model>) {
             Text(line, Modifier::empty(), dim_style());
         }
     });
+}
+
+/// What the eye stream sends against its bitrate. The link may carry less than the user set: the host
+/// then names its limit.
+fn bitrate_text(stats: &backend::Stats) -> String {
+    if stats.mbps_set > stats.mbps {
+        format!("{:.0} Mbps sent, at most {} Mbps on this link", stats.sent_mbps, stats.mbps)
+    } else {
+        format!("{:.0} Mbps sent of {}", stats.sent_mbps, stats.mbps)
+    }
+}
+
+#[cfg(test)]
+mod bitrate_tests {
+    use super::*;
+
+    #[test]
+    fn the_hint_names_what_the_eye_stream_sends_and_the_links_limit() {
+        let stats = |mbps, mbps_set| backend::Stats { mbps, mbps_set, sent_mbps: 27.6, ..Default::default() };
+        assert_eq!(bitrate_text(&stats(40, 100)), "28 Mbps sent, at most 40 Mbps on this link");
+        assert_eq!(bitrate_text(&stats(50, 50)), "28 Mbps sent of 50");
+    }
 }
