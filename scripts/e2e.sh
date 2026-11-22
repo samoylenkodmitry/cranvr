@@ -72,6 +72,8 @@
 #                 VR_Init starts SteamVR from the prefix's Steam library. The checks are those of --openvr-wine. The
 #                 run lasts at least 60 seconds, because SteamVR takes 10 to 20 seconds to start. SteamVR ends with
 #                 the program. Set CRANVR_HOME to a stack with SteamVR in its Steam library and the driver.
+#                 The probe offers a Quest 3's view (44 degrees up, 55 down), and the eye check also fails on
+#                 black rows at the bottom of an eye: a runtime that swaps the up and down angles leaves them.
 #   --face-source SOURCE  with --tracking and --tracking-wine: where the probe's face comes from.
 #                 audio (the default) is a Quest 3's microphone face, visual is a face from cameras,
 #                 and unknown is an offer that names no source, as a headset's offer before its face gives data. The
@@ -503,6 +505,7 @@ fi
 probe_args=(--seconds "${seconds}" --connect "127.0.0.1:${native_port}" --drop-percent "${native_drop}")
 (( native_tcp )) && probe_args+=(--tcp)
 (( game )) && probe_args+=(--game)
+(( steamvr )) && probe_args+=(--quest-view)
 # A real program and the desktop scene draw no eye badges
 if [[ -n ${wine} ]] || (( desktop )); then
     probe_args+=(--any-picture)
@@ -599,7 +602,7 @@ PYTHON
     # The picture of each eye reaches the host the right way up: the program's upper half is bright, its lower half nearly black
     eyes=${work}/eyes
     (( steamvr )) && eyes=${work}/eyes-game
-    python3 -I - "${eyes}" <<'PYTHON' || { print -u2 "The picture of the OpenVR program is not the right way up in the host; see ${eyes}"; openvr_exit=1; }
+    python3 -I - "${eyes}" <<'PYTHON' || { print -u2 "The picture of the OpenVR program is upside down or leaves black rows in the host; see ${eyes}"; openvr_exit=1; }
 import struct, sys, zlib
 def read_png(path):
     data = open(path, "rb").read()
@@ -623,8 +626,14 @@ for eye in ("left", "right"):
     width, height, rows = read_png("%s/eye-%s.png" % (sys.argv[1], eye))
     quarter = max(1, height // 4)
     top, bottom = brightness(rows[:quarter]), brightness(rows[-quarter:])
-    print("eyes: the %s eye's upper quarter has brightness %.0f, its lower quarter %.0f" % (eye, top, bottom))
-    if not top > 2 * bottom:
+    # The program's lower half is dark, not black: rows of exact black at the bottom are a part of the view that
+    # the picture does not cover
+    black = 0
+    while black < height and not any(rows[height - 1 - black]):
+        black += 1
+    print("eyes: the %s eye's upper quarter has brightness %.0f, its lower quarter %.0f, %d black rows at the bottom of %d"
+          % (eye, top, bottom, black, height))
+    if not top > 2 * bottom or black > height // 50:
         bad = True
 sys.exit(1 if bad else 0)
 PYTHON

@@ -78,6 +78,9 @@ pub struct Options {
     /// The head stands still, as it does with `tracking`, so that a game's room is the probe's room
     /// and its controller poses can be compared with the script's numbers
     pub still_head: bool,
+    /// The view of a Quest 3's eyes: 54 degrees out, 40 in, 44 up and 55 down (default: 45 degrees each way). A
+    /// runtime that swaps the up and down angles then leaves the lower part of each eye black.
+    pub quest_view: bool,
     /// Both hands play their script this many meters higher. The hands of the script lie below the view of a
     /// headset with a 45 degree field, so a game's picture does not show them; raised by 0.4 m they lie in front
     /// of the chest and a test run can see their models in the host's copy of the eyes.
@@ -232,13 +235,20 @@ impl Shared {
 /// The height of the probe's floor in its room, in meters
 const PROBE_FLOOR: f32 = -0.3;
 
-fn caps(tcp: bool) -> ClientCaps {
-    let fov = Fov { left: -FRAC_PI_4, right: FRAC_PI_4, up: FRAC_PI_4, down: -FRAC_PI_4 };
+fn caps(tcp: bool, quest_view: bool) -> ClientCaps {
+    let fov = if quest_view {
+        let degrees = |d: f32| d.to_radians();
+        let left = Fov { left: degrees(-54.0), right: degrees(40.0), up: degrees(44.0), down: degrees(-55.0) };
+        [left, Fov { left: -left.right, right: -left.left, ..left }]
+    } else {
+        let fov = Fov { left: -FRAC_PI_4, right: FRAC_PI_4, up: FRAC_PI_4, down: -FRAC_PI_4 };
+        [fov, fov]
+    };
     let eye = |x: f32| Pose { position: [x, 0.0, 0.0], ..Pose::IDENTITY };
     ClientCaps {
         name: "cranvr-probe".into(),
         eye_size: [2064, 2208], // Quest 3
-        views: Views { fov: [fov, fov], eye_pose: [eye(-EYE_X), eye(EYE_X)] },
+        views: Views { fov, eye_pose: [eye(-EYE_X), eye(EYE_X)] },
         // A Quest 3's rates. The higher ones measure how much room the stream leaves
         refresh_rates: vec![72.0, 80.0, 90.0, 120.0, 144.0, 165.0, 180.0, 240.0],
         codecs: vec![Codec::Hevc],
@@ -257,7 +267,7 @@ pub fn run(o: Options) -> i32 {
     // pairing
     let identity = cranvr_proto::identity::Identity::generate().expect("random numbers for the probe's key");
     let link = loop {
-        match ClientLink::connect(o.connect, &caps(o.tcp), &identity, None, Duration::from_secs(5)) {
+        match ClientLink::connect(o.connect, &caps(o.tcp, o.quest_view), &identity, None, Duration::from_secs(5)) {
             Ok(link) => break link,
             // The host is not up yet, or not ready
             Err(Error::Io(_) | Error::Timeout | Error::Closed) if started.elapsed() < Duration::from_secs(60) => {

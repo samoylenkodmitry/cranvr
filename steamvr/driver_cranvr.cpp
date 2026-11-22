@@ -285,6 +285,17 @@ struct EyeFov {
     float left, right, up, down;
 };
 
+// An eye's view as SteamVR takes it, at the start (GetProjectionRaw) and after a change (SetDisplayProjectionRaw).
+// SteamVR builds its projection with the top as the lower edge of the view. The top therefore takes the tangent of
+// the down angle and the bottom the tangent of the up angle, as in OpenComposite. With the other order on the Quest 3
+// (44 degrees up, 55 down), SteamVR drew 55 degrees up and 44 down. The lower fifth of each eye then stayed black.
+HmdRect2_t RawProjection(const EyeFov &fov) {
+    HmdRect2_t rect;
+    rect.vTopLeft = {{fov.left, fov.down}};
+    rect.vBottomRight = {{fov.right, fov.up}};
+    return rect;
+}
+
 struct Motion {
     Pose pose;
     Vec3 linear, angular;
@@ -957,15 +968,11 @@ public:
         *height = g_driver->Height();
     }
     void GetProjectionRaw(EVREye eye, float *left, float *right, float *top, float *bottom) override {
-        // SteamVR builds its projection with the top as the lower edge of the view. The top therefore takes the
-        // tangent of the down angle and the bottom the tangent of the up angle, as in OpenComposite. With the other
-        // order on the Quest 3 (44 degrees up, 55 down), SteamVR drew 55 degrees up and 44 down. The lower fifth of
-        // each eye then stayed black.
-        EyeFov fov = g_driver->Fov(eye == Eye_Left ? 0 : 1);
-        *left = fov.left;
-        *right = fov.right;
-        *top = fov.down;
-        *bottom = fov.up;
+        HmdRect2_t rect = RawProjection(g_driver->Fov(eye == Eye_Left ? 0 : 1));
+        *left = rect.vTopLeft.v[0];
+        *top = rect.vTopLeft.v[1];
+        *right = rect.vBottomRight.v[0];
+        *bottom = rect.vBottomRight.v[1];
     }
     DistortionCoordinates_t *ComputeDistortion(DistortionCoordinates_t *result, EVREye, float u, float v) override {
         // No lens here: the headset corrects its own
@@ -1548,12 +1555,7 @@ void Driver::OnMessage(uint16_t type, Reader &r) {
             angles[0] * 57.2958f, angles[1] * 57.2958f, angles[2] * 57.2958f, angles[3] * 57.2958f, angles[4] * 57.2958f,
             angles[5] * 57.2958f, angles[6] * 57.2958f, angles[7] * 57.2958f);
         if (hmd_ && hmd_->Id() != k_unTrackedDeviceIndexInvalid) {
-            HmdRect2_t rect[2];
-            for (int e = 0; e < 2; e++) {
-                rect[e].vTopLeft = {{fov[e].left, -fov[e].up}};
-                rect[e].vBottomRight = {{fov[e].right, -fov[e].down}};
-            }
-            VRServerDriverHost()->SetDisplayProjectionRaw(hmd_->Id(), rect[0], rect[1]);
+            VRServerDriverHost()->SetDisplayProjectionRaw(hmd_->Id(), RawProjection(fov[0]), RawProjection(fov[1]));
             VRServerDriverHost()->SetDisplayEyeToHead(hmd_->Id(), Translation(-ipd / 2), Translation(ipd / 2));
             VRProperties()->SetFloatProperty(VRProperties()->TrackedDeviceToPropertyContainer(hmd_->Id()), Prop_UserIpdMeters_Float, ipd);
         }
