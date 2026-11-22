@@ -1029,6 +1029,7 @@ mod tests {
         let smoke_back = path_file_becomes(&before, Duration::from_secs(10));
         println!("openvr_smoke: {smoke_frames} game frames in a stats window; path file during it: {smoke_during:?}");
         probe.kill().ok();
+        probe.wait().ok();
         backend::stop_host();
         assert!(during.as_deref().is_some_and(|text| text.contains("opencomposite")), "the game's run names OpenComposite");
         assert!(frames > 100, "the game's frames reach the host: {frames}");
