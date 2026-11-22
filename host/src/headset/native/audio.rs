@@ -105,8 +105,9 @@ pub fn send(pcm: &[u8]) {
 }
 
 fn log_loop(session: &Arc<Session>) {
-    let mut seen = (0u64, 0u64, 0u64);
-    let mut seen_buffers = 0u64;
+    // The counters run since the host started: a later session counts from its own start
+    let mut seen = (DATAGRAMS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed), FRAMES.load(Ordering::Relaxed));
+    let mut seen_buffers = BUFFERS.load(Ordering::Relaxed);
     let mut at = std::time::Instant::now();
     loop {
         thread::sleep(LOG_EVERY);
