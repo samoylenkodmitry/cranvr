@@ -111,6 +111,18 @@ fn OpenConsole(view: View, state: LinkState) {
         Shown::Controls(_) => console::controls_height(),
         _ => page_model::height(&rows),
     };
+    // The log says each page that shows, with its size, so a test reads what the console drew
+    let said = match &shown {
+        Shown::Main => "the main page".to_string(),
+        Shown::Host(id) => format!("the page {id}"),
+        Shown::Controls(hand) => format!("the controls of the {}", hand.label()),
+    };
+    let keys = rows.iter().map(|row| match &row.line {
+        Line::Keys { keys, .. } => keys.len(),
+        _ => 0,
+    });
+    let summary = format!("{said}: {} rows, {} keys, {height:.0} dp tall", rows.len(), keys.sum::<usize>());
+    LaunchedEffect(said, async move |_| log::info!("the console shows {summary}"));
     let start = remember(start_place).with(|pose: &Pose| *pose);
     let modifier = SubspaceModifier::new().size(size::WIDTH, height).layer_priority(crate::panel_layout::layer_rank::TEXT);
     let (controls, editable) = (view.controls, view.controls_editable);

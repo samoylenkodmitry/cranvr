@@ -1240,7 +1240,8 @@ mod tests {
             backend::pump(&mut model);
             for request in std::mem::take(&mut model.vr_requests) {
                 let Some(request) = cranvr_common::menu::Request::from_json(&request) else { continue };
-                for effect in pages::apply(&mut Settings::load(), &games(), &request).effects {
+                let state = Model { games: games(), ..Default::default() };
+                for effect in pages::apply(&mut Settings::load(), &state, &request).effects {
                     if let pages::Effect::Play(game) = effect {
                         play(&game).expect("the console's game starts");
                         console_started = true;

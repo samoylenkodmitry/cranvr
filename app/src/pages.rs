@@ -9,11 +9,14 @@
 //! game. Nothing here holds Cranpose state, so the tests run it directly.
 
 use crate::{
-    backend::{Model, Settings},
+    backend::{Model, Settings, StreamPath},
     launch::{self, GameOptions, OpenVr},
+    microphone::MicrophoneSource,
     pending,
     setup::{self, Progress, Setup},
     steam::{self, Game, SteamState},
+    system::Permission,
+    usb::{Connection, Download},
 };
 use cranvr_common::{
     foveation::FoveationLevel,
@@ -25,6 +28,11 @@ use std::time::Instant;
 pub const PLAY: &str = "play";
 pub const STEAM: &str = "steam";
 pub const STREAM: &str = "stream";
+pub const CONNECTION: &str = "connection";
+pub const DESKTOP: &str = "desktop";
+pub const SOUND: &str = "sound";
+pub const WINE: &str = "wine";
+pub const MAC: &str = "mac";
 /// The id of a game's page: this prefix and the game's program
 pub const GAME_PAGE: &str = "game:";
 
@@ -33,7 +41,7 @@ pub fn game_page(program: &str) -> String {
     format!("{GAME_PAGE}{program}")
 }
 
-/// A setting of the stream and of games for every program, as it stands in the pages.
+/// A setting of the app, as it stands in the pages.
 struct Setting {
     id: &'static str,
     label: &'static str,
@@ -44,29 +52,30 @@ struct Setting {
 }
 
 enum Kind {
-    Choice { options: fn() -> Vec<Opt>, get: fn(&Settings) -> String, set: fn(&mut Settings, &str) },
+    /// The options can depend on the Mac, such as its input devices
+    Choice { options: fn(&Settings, &Model) -> Vec<Opt>, get: fn(&Settings) -> String, set: fn(&mut Settings, &Model, &str) },
     Toggle { get: fn(&Settings) -> bool, set: fn(&mut Settings, bool) },
 }
 
 impl Setting {
-    fn item(&self, settings: &Settings) -> Item {
+    fn item(&self, settings: &Settings, model: &Model) -> Item {
         let hint = (self.hint)(settings).to_string();
         match &self.kind {
             Kind::Choice { options, get, .. } => {
-                Item::Choice(Choice { id: self.id.into(), subject: None, label: self.label.into(), options: options(), value: get(settings), hint, restarts: self.restarts })
+                Item::Choice(Choice { id: self.id.into(), subject: None, label: self.label.into(), options: options(settings, model), value: get(settings), hint, restarts: self.restarts })
             }
             Kind::Toggle { get, .. } => Item::Toggle(Toggle { id: self.id.into(), subject: None, label: self.label.into(), on: get(settings), hint, restarts: self.restarts }),
         }
     }
 
     /// Sets the value. False for a value that the setting does not offer.
-    fn set(&self, settings: &mut Settings, value: &str) -> bool {
+    fn set(&self, settings: &mut Settings, model: &Model, value: &str) -> bool {
         match &self.kind {
             Kind::Choice { options, set, .. } => {
-                if !options().iter().any(|option| option.value == value) {
+                if !options(settings, model).iter().any(|option| option.value == value) {
                     return false;
                 }
-                set(settings, value);
+                set(settings, model, value);
                 true
             }
             Kind::Toggle { set, .. } => match value {
@@ -107,8 +116,7 @@ fn foveation_hint(settings: &Settings) -> &'static str {
 }
 
 /// The settings of the stream page, in the order of the page. Each one restarts the host but the
-/// anti-aliasing limit, which a game reads when it starts, and the OpenVR choice, which counts at a
-/// game's next start.
+/// anti-aliasing limit, which a game reads when it starts, and the host's start.
 const STREAM_SETTINGS: &[Setting] = &[
     Setting {
         id: "fps",
@@ -116,9 +124,9 @@ const STREAM_SETTINGS: &[Setting] = &[
         restarts: true,
         hint: no_hint,
         kind: Kind::Choice {
-            options: || numbers(&FPS_CHOICES, " Hz"),
+            options: |_, _| numbers(&FPS_CHOICES, " Hz"),
             get: |s| s.fps.to_string(),
-            set: |s, v| s.fps = v.parse().unwrap_or(s.fps),
+            set: |s, _, v| s.fps = v.parse().unwrap_or(s.fps),
         },
     },
     Setting {
@@ -127,9 +135,9 @@ const STREAM_SETTINGS: &[Setting] = &[
         restarts: true,
         hint: no_hint,
         kind: Kind::Choice {
-            options: || numbers(&MBPS_CHOICES, " Mbps"),
+            options: |_, _| numbers(&MBPS_CHOICES, " Mbps"),
             get: |s| s.mbps.to_string(),
-            set: |s, v| s.mbps = v.parse().unwrap_or(s.mbps),
+            set: |s, _, v| s.mbps = v.parse().unwrap_or(s.mbps),
         },
     },
     Setting {
@@ -138,9 +146,9 @@ const STREAM_SETTINGS: &[Setting] = &[
         restarts: true,
         hint: foveation_hint,
         kind: Kind::Choice {
-            options: || FoveationLevel::ALL.iter().map(|level| Opt::new(level.name(), level_label(*level))).collect(),
+            options: |_, _| FoveationLevel::ALL.iter().map(|level| Opt::new(level.name(), level_label(*level))).collect(),
             get: |s| s.foveation_level.name().to_string(),
-            set: |s, v| s.foveation_level = FoveationLevel::parse(v).unwrap_or(s.foveation_level),
+            set: |s, _, v| s.foveation_level = FoveationLevel::parse(v).unwrap_or(s.foveation_level),
         },
     },
     Setting {
@@ -149,9 +157,9 @@ const STREAM_SETTINGS: &[Setting] = &[
         restarts: true,
         hint: |_| "A game that makes fewer frames than the refresh rate adds 10 to 18 ms of latency. The Log tab then names the game's rate. A smaller size or lower anti-aliasing in the game helps.",
         kind: Kind::Choice {
-            options: || GAME_SCALE_CHOICES.iter().map(|scale| Opt::new(scale_value(*scale), format!("{}%", scale_value(*scale)))).collect(),
+            options: |_, _| GAME_SCALE_CHOICES.iter().map(|scale| Opt::new(scale_value(*scale), format!("{}%", scale_value(*scale)))).collect(),
             get: |s| GAME_SCALE_CHOICES.iter().find(|scale| (s.game_scale - **scale).abs() < 0.01).map_or_else(|| scale_value(s.game_scale), |scale| scale_value(*scale)),
-            set: |s, v| s.game_scale = v.parse::<f32>().map_or(s.game_scale, |percent| percent / 100.0),
+            set: |s, _, v| s.game_scale = v.parse::<f32>().map_or(s.game_scale, |percent| percent / 100.0),
         },
     },
     Setting {
@@ -160,17 +168,10 @@ const STREAM_SETTINGS: &[Setting] = &[
         restarts: false,
         hint: |_| "Anti-aliasing costs a Windows game far more on the Mac: Beat Saber made 91 frames a second at 4x and 119 at 2x. With the limit, cranvr tells each game that more than 2x does not exist. It applies when a game starts. A game started from the Steam window gets it after a restart of Steam.",
         kind: Kind::Choice {
-            options: || vec![Opt::new("2", "At most 2x"), Opt::new("0", "As the game sets it")],
+            options: |_, _| vec![Opt::new("2", "At most 2x"), Opt::new("0", "As the game sets it")],
             get: |s| s.game_msaa_limit.to_string(),
-            set: |s, v| s.game_msaa_limit = v.parse().unwrap_or(s.game_msaa_limit),
+            set: |s, _, v| s.game_msaa_limit = v.parse().unwrap_or(s.game_msaa_limit),
         },
-    },
-    Setting {
-        id: "game_audio",
-        label: "Game sound in the headset",
-        restarts: true,
-        hint: |_| "The headset plays what this Mac plays. The capture takes the sound before the Mac's volume, so you can turn the Mac down. It needs Screen Recording.",
-        kind: Kind::Toggle { get: |s| s.game_audio, set: |s, on| s.game_audio = on },
     },
     Setting {
         id: "unscale_displays",
@@ -187,17 +188,6 @@ const STREAM_SETTINGS: &[Setting] = &[
         kind: Kind::Toggle { get: |s| s.hand_controllers, set: |s, on| s.hand_controllers = on },
     },
     Setting {
-        id: "wine.openvr",
-        label: "OpenVR games",
-        restarts: false,
-        hint: |_| OPENVR_EVERY_HINT,
-        kind: Kind::Choice {
-            options: || OpenVr::ALL.iter().map(|choice| Opt::new(choice.key(), choice.label())).collect(),
-            get: |s| s.wine.openvr.key().to_string(),
-            set: |s, v| s.wine.openvr = OpenVr::from_key(v).unwrap_or(s.wine.openvr),
-        },
-    },
-    Setting {
         id: "autostart",
         label: "Start the host when cranvr opens",
         restarts: false,
@@ -205,6 +195,176 @@ const STREAM_SETTINGS: &[Setting] = &[
         kind: Kind::Toggle { get: |s| s.autostart, set: |s, on| s.autostart = on },
     },
 ];
+
+/// The Connection choice: it reaches a running host at once and counts from the headset's next
+/// connection, so the host keeps running.
+const CONNECTION_SETTINGS: &[Setting] = &[Setting {
+    id: "connection",
+    label: "Stream by",
+    restarts: false,
+    hint: |s| match s.connection {
+        Connection::Automatic => "The stream uses the USB cable while the headset is plugged into this Mac. Otherwise it uses Wi-Fi. A change counts from the next connection of the headset.",
+        Connection::WiFi => "The stream always uses Wi-Fi. This Mac gives the headset no link over the cable. A change counts from the next connection of the headset.",
+        Connection::Usb => "The stream uses the USB cable. The window says when the headset is not on it. A change counts from the next connection of the headset.",
+    },
+    kind: Kind::Choice {
+        options: |_, _| vec![Opt::new("automatic", "Automatic"), Opt::new("wifi", "Wi-Fi"), Opt::new("usb", "USB cable")],
+        get: |s| connection_key(s.connection).into(),
+        set: |s, _, v| {
+            s.connection = match v {
+                "wifi" => Connection::WiFi,
+                "usb" => Connection::Usb,
+                _ => Connection::Automatic,
+            }
+        },
+    },
+}];
+
+fn connection_key(connection: Connection) -> &'static str {
+    match connection {
+        Connection::Automatic => "automatic",
+        Connection::WiFi => "wifi",
+        Connection::Usb => "usb",
+    }
+}
+
+/// A choice of the display for the desktop view: its value in a request, its words and the size of
+/// the display that the host adds, or none for the main display
+type VirtualDisplay = (&'static str, &'static str, Option<(u32, u32)>);
+
+/// The sizes of the display that the host adds for the desktop view
+const VIRTUAL_DISPLAYS: [VirtualDisplay; 3] =
+    [("main", "The main display", None), ("1920x1080", "Add a display 1920 x 1080", Some((1920, 1080))), ("2560x1440", "Add a display 2560 x 1440", Some((2560, 1440)))];
+
+/// The desktop view. Each one restarts the host but the window's move into VR, which the window does.
+const DESKTOP_SETTINGS: &[Setting] = &[
+    Setting {
+        id: "desktop",
+        label: "Desktop view",
+        restarts: true,
+        hint: |_| "A screen in front of you shows the Mac while no game runs.",
+        kind: Kind::Toggle { get: |s| s.desktop, set: |s, on| s.desktop = on },
+    },
+    Setting {
+        id: "virtual_display",
+        label: "Screen in VR",
+        restarts: true,
+        hint: |_| "The headset shows your main display as it is. An added display is one more monitor that only the headset shows: drag windows onto it.",
+        kind: Kind::Choice {
+            options: |_, _| VIRTUAL_DISPLAYS.iter().map(|(value, label, _)| Opt::new(*value, *label)).collect(),
+            get: |s| VIRTUAL_DISPLAYS.iter().find(|(_, _, size)| *size == s.virtual_display).map_or("main", |(value, _, _)| value).into(),
+            set: |s, _, v| s.virtual_display = VIRTUAL_DISPLAYS.iter().find(|(value, _, _)| *value == v).and_then(|(_, _, size)| *size),
+        },
+    },
+    Setting {
+        id: "vr_main_display",
+        label: "Main display while the headset is on",
+        restarts: true,
+        hint: |_| "As the main display it gets the menu bar, the Dock and new windows, Steam's too. Your other displays go back when the headset leaves.",
+        kind: Kind::Toggle { get: |s| s.vr_main_display, set: |s, on| s.vr_main_display = on },
+    },
+    Setting {
+        id: "window_in_vr",
+        label: "Bring the cranvr window into VR",
+        restarts: false,
+        hint: no_hint,
+        kind: Kind::Toggle { get: |s| s.window_in_vr, set: |s, on| s.window_in_vr = on },
+    },
+    Setting {
+        id: "desktop_fps",
+        label: "Screen updates",
+        restarts: true,
+        hint: |_| "60 updates per second move the cursor smoother, but cost frames: each capture of a large display takes GPU time.",
+        kind: Kind::Choice { options: |_, _| numbers(&[30, 60], " a second"), get: |s| s.desktop_fps.to_string(), set: |s, _, v| s.desktop_fps = v.parse().unwrap_or(s.desktop_fps) },
+    },
+];
+
+/// The value of the microphone's choice in a request: "headset", "off" or "mac:" and a device's UID
+fn microphone_key(source: &MicrophoneSource) -> String {
+    match source {
+        MicrophoneSource::Headset => "headset".into(),
+        MicrophoneSource::Off => "off".into(),
+        MicrophoneSource::Mac { uid, .. } => format!("mac:{uid}"),
+    }
+}
+
+/// The game sound and the microphone. The microphone needs no restart: a game's stream reads the
+/// choice when it opens.
+const SOUND_SETTINGS: &[Setting] = &[
+    Setting {
+        id: "game_audio",
+        label: "Game sound in the headset",
+        restarts: true,
+        hint: |_| "The headset plays what this Mac plays. The capture takes the sound before the Mac's volume, so you can turn the Mac down. It needs Screen Recording.",
+        kind: Kind::Toggle { get: |s| s.game_audio, set: |s, on| s.game_audio = on },
+    },
+    Setting {
+        id: "microphone",
+        label: "Microphone in games",
+        restarts: false,
+        hint: |_| "Games under Wine record from the device \"cranvr microphone\". It takes the sound of this choice. The headset records only while a game does. A game hears a change when it opens its microphone again. With a Mac input device, macOS asks once whether cranvr may use the microphone.",
+        kind: Kind::Choice {
+            options: |s, m| {
+                let mut options = vec![Opt::new("headset", "Headset")];
+                options.extend(m.input_devices.iter().map(|device| Opt::new(format!("mac:{}", device.uid), device.name.clone())));
+                // A chosen device that is not connected stays a choice, so the setting shows it
+                if let MicrophoneSource::Mac { uid, name } = &s.microphone {
+                    if !m.input_devices.iter().any(|device| device.uid == *uid) {
+                        options.push(Opt::new(format!("mac:{uid}"), format!("{name} (not connected)")));
+                    }
+                }
+                options.push(Opt::new("off", "Off"));
+                options
+            },
+            get: |s| microphone_key(&s.microphone),
+            set: |s, m, v| {
+                s.microphone = match v.strip_prefix("mac:") {
+                    Some(uid) => {
+                        let name = m.input_devices.iter().find(|device| device.uid == uid).map(|device| device.name.clone());
+                        let kept = match &s.microphone {
+                            MicrophoneSource::Mac { uid: own, name } if own == uid => Some(name.clone()),
+                            _ => None,
+                        };
+                        MicrophoneSource::Mac { uid: uid.into(), name: name.or(kept).unwrap_or_else(|| uid.into()) }
+                    }
+                    None if v == "off" => MicrophoneSource::Off,
+                    None => MicrophoneSource::Headset,
+                }
+            },
+        },
+    },
+];
+
+/// The options of every Windows program that cranvr starts. They count at a program's next start.
+const WINE_SETTINGS: &[Setting] = &[
+    Setting {
+        id: "wine.mac_window",
+        label: "Game window on the Mac shows the picture",
+        restarts: false,
+        hint: |_| "Off: a game's own window on the Mac stays empty and costs no GPU time. The headset shows the game either way.",
+        kind: Kind::Toggle { get: |s| s.wine.mac_window, set: |s, on| s.wine.mac_window = on },
+    },
+    Setting {
+        id: "wine.openvr",
+        label: "OpenVR games",
+        restarts: false,
+        hint: |_| OPENVR_EVERY_HINT,
+        kind: Kind::Choice {
+            options: |_, _| OpenVr::ALL.iter().map(|choice| Opt::new(choice.key(), choice.label())).collect(),
+            get: |s| s.wine.openvr.key().to_string(),
+            set: |s, _, v| s.wine.openvr = OpenVr::from_key(v).unwrap_or(s.wine.openvr),
+        },
+    },
+];
+
+/// Every setting of the app, of every page.
+fn settings_table() -> impl Iterator<Item = &'static Setting> {
+    STREAM_SETTINGS.iter().chain(CONNECTION_SETTINGS).chain(DESKTOP_SETTINGS).chain(SOUND_SETTINGS).chain(WINE_SETTINGS)
+}
+
+fn setting(id: &str) -> Option<&'static Setting> {
+    settings_table().find(|setting| setting.id == id)
+}
 
 fn level_label(level: FoveationLevel) -> &'static str {
     match level {
@@ -296,7 +456,16 @@ fn busy(model: &Model, request: &pending::Request) -> bool {
 
 /// Every page, in the order of the console's list. The first one is the console's main page.
 pub fn pages(settings: &Settings, model: &Model) -> Vec<Page> {
-    let mut pages = vec![play_page(settings, model), steam_page(model), stream_page(settings, model)];
+    let mut pages = vec![
+        play_page(settings, model),
+        steam_page(model),
+        stream_page(settings, model),
+        connection_page(settings, model),
+        desktop_page(settings, model),
+        sound_page(settings, model),
+        wine_page(settings, model),
+        mac_page(model),
+    ];
     for game in &model.games {
         if let Some(page) = game_page_of(settings, model, game) {
             pages.push(page);
@@ -447,7 +616,7 @@ fn runs(model: &Model, program: &str) -> bool {
 
 fn stream_page(settings: &Settings, model: &Model) -> Page {
     let mut items = vec![Item::Heading { text: "Stream".into() }];
-    items.extend(STREAM_SETTINGS.iter().map(|setting| setting.item(settings)));
+    items.extend(STREAM_SETTINGS.iter().map(|setting| setting.item(settings, model)));
     // The sizes that the host learned for games that stayed below the refresh rate
     let sizes = model.learned_sizes.iter().map(|(name, share)| format!("{name} {:.0}%", share * 100.0)).collect::<Vec<_>>();
     items.push(Item::Buttons(Buttons {
@@ -457,6 +626,137 @@ fn stream_page(settings: &Settings, model: &Model) -> Page {
         hint: "A game that stays below the refresh rate for a minute renders smaller at its next start, as a share of the size above. A game reads its size only when it starts.".into(),
     }));
     Page { id: STREAM.into(), title: "Stream".into(), short: "Stream".into(), listed: true, items }
+}
+
+/// How the stream reaches the headset: the choice, the path that it takes now, the cable's state and
+/// the download of the tool that the cable needs.
+fn connection_page(settings: &Settings, model: &Model) -> Page {
+    let mut items = vec![Item::Heading { text: "Connection".into() }];
+    items.extend(CONNECTION_SETTINGS.iter().map(|setting| setting.item(settings, model)));
+    if let Some(path) = model.headset.as_ref().and_then(|headset| headset.path) {
+        let words = match path {
+            StreamPath::Usb => "The headset is connected by USB cable",
+            StreamPath::WiFi => "The headset is connected over Wi-Fi",
+        };
+        items.push(Item::Text { text: words.into(), tone: Tone::Good });
+        if settings.connection == Connection::Usb && path == StreamPath::WiFi {
+            items.push(Item::Text { text: "The USB cable is chosen, but this headset is not on it. Plug it into this Mac.".into(), tone: Tone::Warn });
+        }
+    }
+    let usb = &model.usb;
+    if settings.connection.allows_usb() {
+        if let Some(blocked) = &usb.blocked {
+            items.push(Item::Text { text: blocked.clone(), tone: Tone::Warn });
+        }
+        if usb.unauthorized {
+            items.push(Item::Text { text: "Put on the headset and allow USB debugging.".into(), tone: Tone::Warn });
+        }
+        if usb.adb.is_none() && usb.looked {
+            items.push(Item::Text { text: "The USB cable needs a tool from Google that this Mac does not have.".into(), tone: Tone::Warn });
+            let hint = format!("The button downloads Google's Android platform-tools for macOS ({}) from dl.google.com into {}.", crate::usb::TOOLS_SIZE, crate::backend::config_dir().display());
+            match &usb.download {
+                Download::Working(text) => items.push(Item::Text { text: text.clone(), tone: Tone::Normal }),
+                Download::Failed(text) => {
+                    items.push(Item::Text { text: text.clone(), tone: Tone::Warn });
+                    items.push(Item::Buttons(Buttons { buttons: vec![Button::run("Try again", "usb.download").styled(Style::Primary)], hint, ..Default::default() }));
+                }
+                Download::Idle => items.push(Item::Buttons(Buttons { buttons: vec![Button::run("Add USB support", "usb.download").styled(Style::Primary)], hint, ..Default::default() })),
+            }
+        }
+    }
+    items.push(Item::Text { text: "The cable needs developer mode on the headset. Turn it on in the Meta Horizon app on your phone.".into(), tone: Tone::Muted });
+    for note in &model.network {
+        items.push(Item::Text { text: note.clone(), tone: Tone::Warn });
+    }
+    Page { id: CONNECTION.into(), title: "Connection".into(), short: "Connection".into(), listed: true, items }
+}
+
+/// The Mac's desktop in the headset, and the permissions that it needs.
+fn desktop_page(settings: &Settings, model: &Model) -> Page {
+    let mut items = vec![Item::Heading { text: "Mac desktop in VR".into() }];
+    for setting in DESKTOP_SETTINGS {
+        // The added display's own settings show while there is one
+        if matches!(setting.id, "vr_main_display" | "window_in_vr") && settings.virtual_display.is_none() {
+            continue;
+        }
+        items.push(setting.item(settings, model));
+    }
+    if let Some((ok, message)) = &model.desktop {
+        if !ok && !message.is_empty() {
+            items.push(Item::Text { text: message.clone(), tone: Tone::Warn });
+        }
+    }
+    items.push(Item::Heading { text: "Permissions".into() });
+    for (permission, granted) in crate::run::PERMISSIONS.into_iter().zip(model.permissions) {
+        let state = if granted { "allowed" } else { "not allowed" };
+        let mut row = Buttons { title: format!("{}: {state}", permission.title()), detail: permission.reason().into(), ..Default::default() };
+        if !granted {
+            let key = permission_key(permission);
+            row.buttons = vec![Button::run("Ask", "permission.ask").of(key).styled(Style::Primary), Button::run("Open Settings", "permission.settings").of(key)];
+            row.hint = "macOS asks on the Mac's screen. In System Settings, turn on the switch next to cranvr. After that macOS may ask to quit and reopen cranvr.".into();
+        }
+        items.push(Item::Buttons(row));
+    }
+    Page { id: DESKTOP.into(), title: "Mac desktop".into(), short: "Desktop".into(), listed: true, items }
+}
+
+fn sound_page(settings: &Settings, model: &Model) -> Page {
+    let mut items = vec![Item::Heading { text: "Sound".into() }];
+    items.extend(SOUND_SETTINGS.iter().map(|setting| setting.item(settings, model)));
+    if let Some((false, why)) = &model.audio {
+        items.push(Item::Text { text: format!("No game sound in the headset: {why}"), tone: Tone::Warn });
+    }
+    if let MicrophoneSource::Mac { uid, name } = &settings.microphone {
+        if !model.input_devices.iter().any(|device| device.uid == *uid) {
+            items.push(Item::Text { text: format!("{name} is not connected. Games hear silence until it is."), tone: Tone::Warn });
+        }
+    }
+    Page { id: SOUND.into(), title: "Sound".into(), short: "Sound".into(), listed: true, items }
+}
+
+/// The Wine that runs the games and the options of every program that cranvr starts. The text
+/// fields stay in the window: the page shows what they hold.
+fn wine_page(settings: &Settings, model: &Model) -> Page {
+    let mut items = vec![Item::Heading { text: "Wine".into() }];
+    items.push(Item::Text { text: format!("Wine: {}", steam::engine().display()), tone: Tone::Muted });
+    items.push(Item::Text { text: format!("Prefix: {}", steam::prefix().display()), tone: Tone::Muted });
+    items.extend(WINE_SETTINGS.iter().map(|setting| setting.item(settings, model)));
+    for (name, value) in [("DLL overrides for every program", &settings.wine.dll_overrides), ("Environment for every program", &settings.wine.env)] {
+        if !value.is_empty() {
+            items.push(Item::Text { text: format!("{name}: {value}"), tone: Tone::Muted });
+        }
+    }
+    Page { id: WINE.into(), title: "Wine".into(), short: "Wine".into(), listed: true, items }
+}
+
+/// The host, the settings file, the paired headsets and the Mac's addresses.
+fn mac_page(model: &Model) -> Page {
+    let mut items = vec![Item::Heading { text: "This Mac".into() }];
+    items.push(Item::Buttons(Buttons {
+        title: if model.running { "The host runs".into() } else { "The host is stopped".into() },
+        buttons: vec![Button::run(if model.running { "Restart the host" } else { "Start the host" }, "host.restart")],
+        hint: "A new start of the host stops the stream for a moment. The headset reconnects by itself.".into(),
+        ..Default::default()
+    }));
+    if let Some(problem) = &model.settings_problem {
+        items.push(Item::Text { text: problem.clone(), tone: Tone::Warn });
+    }
+    let paired = match &model.native {
+        None => "The host tells which headsets are paired while it runs.".to_string(),
+        Some(native) if native.paired.is_empty() => "No headset is paired yet.".to_string(),
+        Some(native) => format!("Paired headsets: {}", native.paired.join(", ")),
+    };
+    items.push(Item::Text { text: paired, tone: Tone::Normal });
+    if model.native.as_ref().is_some_and(|native| !native.paired.is_empty()) {
+        items.push(Item::Text { text: format!("To forget a headset, delete its line in paired-headsets.txt in {} and restart the host.", crate::backend::config_dir().display()), tone: Tone::Muted });
+    }
+    let port = model.native.as_ref().map_or(crate::backend::native_port(), |native| native.port);
+    let addresses: Vec<String> = model.lan.iter().map(|ip| format!("{ip}:{port}")).collect();
+    items.push(Item::Text {
+        text: if addresses.is_empty() { "This Mac has no address on a local network.".into() } else { format!("Addresses of this Mac: {}", addresses.join(", ")) },
+        tone: Tone::Muted,
+    });
+    Page { id: MAC.into(), title: "This Mac".into(), short: "Mac".into(), listed: true, items }
 }
 
 /// A game's page: its VR system, the eye options and what it starts with. `None` for a game whose
@@ -545,6 +845,16 @@ pub enum Effect {
     Setup,
     /// Starts Steam
     OpenSteam,
+    /// Tells a running host the Connection choice
+    TellConnection(Connection),
+    /// Downloads Google's platform-tools for the USB cable
+    DownloadUsb,
+    /// Starts the host again with the saved settings: the headset reconnects by itself
+    RestartHost,
+    /// Shows macOS's prompt for a permission on the Mac's screen
+    AskPermission(Permission),
+    /// Opens System Settings at a permission's pane on the Mac's screen
+    PermissionSettings(Permission),
 }
 
 /// What a request did.
@@ -567,9 +877,11 @@ impl Outcome {
     }
 }
 
-/// Applies a press of either app to `settings`. `games` is the list of games. The caller saves the
-/// settings when the outcome says that they changed, and does its effects.
-pub fn apply(settings: &mut Settings, games: &[Game], request: &Request) -> Outcome {
+/// Applies a press of either app to `settings`. `model` is the app's state: its games and the Mac's
+/// devices. The caller saves the settings when the outcome says that they changed, and does its
+/// effects.
+pub fn apply(settings: &mut Settings, model: &Model, request: &Request) -> Outcome {
+    let games = &model.games;
     match request {
         Request::Set { id, subject: None, value } if id == "controls" => match cranvr_common::controls::Controls::from_json(value) {
             Some(controls) => {
@@ -580,15 +892,17 @@ pub fn apply(settings: &mut Settings, games: &[Game], request: &Request) -> Outc
             None => Outcome::refused("The headset sent controls that cranvr cannot read".into()),
         },
         Request::Set { id, subject: None, value } => {
-            let Some(setting) = STREAM_SETTINGS.iter().find(|setting| setting.id == id) else {
+            let Some(setting) = setting(id) else {
                 return Outcome::refused(format!("cranvr has no setting {id}"));
             };
             let before = settings.clone();
-            if !setting.set(settings, value) {
+            if !setting.set(settings, model, value) {
                 return Outcome::refused(format!("{} has no choice {value}", setting.label));
             }
             let changed = *settings != before;
-            Outcome { changed, restart: changed && setting.restarts, ..Default::default() }
+            // The host keeps running: the Connection choice counts from the headset's next connection
+            let effects = if changed && setting.id == "connection" { vec![Effect::TellConnection(settings.connection)] } else { Vec::new() };
+            Outcome { changed, restart: changed && setting.restarts, effects, ..Default::default() }
         }
         Request::Set { id, subject: Some(program), value } => {
             let Some(setting) = GAME_SETTINGS.iter().find(|setting| setting.id == id) else {
@@ -630,6 +944,19 @@ pub fn apply(settings: &mut Settings, games: &[Game], request: &Request) -> Outc
     }
 }
 
+/// The permission that a request names by its key
+fn permission_of(key: Option<&str>) -> Option<Permission> {
+    crate::run::PERMISSIONS.into_iter().find(|permission| Some(permission_key(*permission)) == key)
+}
+
+fn permission_key(permission: Permission) -> &'static str {
+    match permission {
+        Permission::ScreenRecording => "screen_recording",
+        Permission::SystemAudio => "system_audio",
+        Permission::Accessibility => "accessibility",
+    }
+}
+
 fn run(settings: &mut Settings, games: &[Game], id: &str, subject: Option<&str>) -> Outcome {
     let game = || subject.and_then(|program| games.iter().find(|game| steam::program(game).as_deref() == Some(program)));
     match id {
@@ -644,6 +971,13 @@ fn run(settings: &mut Settings, games: &[Game], id: &str, subject: Option<&str>)
         "sizes.forget" => Outcome { effects: vec![Effect::ForgetSizes], ..Default::default() },
         "setup.start" => Outcome { effects: vec![Effect::Setup], ..Default::default() },
         "steam.open" => Outcome { effects: vec![Effect::OpenSteam], pending: Some(pending::Request::OpenSteam), ..Default::default() },
+        "usb.download" => Outcome { effects: vec![Effect::DownloadUsb], ..Default::default() },
+        "host.restart" => Outcome { effects: vec![Effect::RestartHost], ..Default::default() },
+        "permission.ask" | "permission.settings" => match permission_of(subject) {
+            Some(permission) if id == "permission.ask" => Outcome { effects: vec![Effect::AskPermission(permission)], ..Default::default() },
+            Some(permission) => Outcome { effects: vec![Effect::PermissionSettings(permission)], ..Default::default() },
+            None => Outcome::refused(format!("cranvr has no permission {}", subject.unwrap_or("without a name"))),
+        },
         "game.remove" => match game() {
             Some(game) if game.app_id.is_empty() => {
                 let exe = game.exe.clone().unwrap_or_default();
