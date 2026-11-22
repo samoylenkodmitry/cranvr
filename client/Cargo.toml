@@ -50,6 +50,10 @@ log = "0.4"
 serde_json = "1"
 env_logger = { version = "0.11", optional = true }
 
+[dev-dependencies]
+# A test composes the console's rows in a headless shell and reads the words on the screen
+cranpose-testing = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "bab0e9893cdfc45f85fcf9d291e05568f96a9ead" }
+
 [build-dependencies]
 cranpose-capabilities = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "bab0e9893cdfc45f85fcf9d291e05568f96a9ead" }
 

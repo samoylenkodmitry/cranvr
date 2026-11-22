@@ -26,8 +26,9 @@
 //!   eye stayed black for several seconds while its left eye showed a picture. Eye "both": both
 //!   eyes stayed black for 90 seconds while the game delivered frames (see eye_check.rs). The host
 //!   sends it once for each game run.
-//! - `vr_request`: a button of the console in VR (see desktop_layer.rs): action "play" with game,
-//!   "stop", or "set" with one of fps, game_scale, msaa
+//! - `vr_request`: a button of the console in VR (see desktop_layer.rs): action "set" with id and
+//!   value, or "run" with id, each with the game's program as subject when the item names a game
+//!   (`cranvr_common::menu::Request`)
 //!
 //! The host keeps the newest line of each type for the console, also without `--status`.
 
@@ -115,9 +116,9 @@ mod tests {
 
     #[test]
     fn a_console_request_becomes_a_status_line() {
-        assert!(console_request(r#"{"action":"set","fps":90}"#));
+        assert!(console_request(r#"{"action":"set","id":"fps","value":"90"}"#));
         let line = latest("vr_request").unwrap();
-        assert_eq!((line["action"].as_str(), line["fps"].as_u64()), (Some("set"), Some(90)));
+        assert_eq!((line["action"].as_str(), line["id"].as_str(), line["value"].as_str()), (Some("set"), Some("fps"), Some("90")));
         // Anything but an object is no request
         assert!(!console_request("not json") && !console_request("[1]"));
     }

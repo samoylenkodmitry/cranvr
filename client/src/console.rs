@@ -1,9 +1,11 @@
-//! The console: the menu that the host offers in the headset (its games and settings), the
-//! requests that the user sends back, and the rules for when the console shows and where.
+//! The console: the menu that the host offers in the headset (the pages of settings and actions of
+//! `cranvr_common::menu`), the requests that the user sends back, and the rules for when the console
+//! shows and where.
 //!
-//! The cranvr app on the Mac writes the games and the settings into `vr-menu.json`. The host adds
-//! the stream's state and sends the text as `HostMsg::Menu`. A press on a button sends a request
-//! as `ClientMsg::Console`. The host hands it to the app as a `vr_request` status line.
+//! The cranvr app on the Mac writes the pages into `vr-menu.json`. The host adds the stream's state
+//! and sends the text as `HostMsg::Menu`. A press on a button sends a request as
+//! `ClientMsg::Console`. The host hands it to the app as a `vr_request` status line. The console
+//! knows no setting by its meaning: it draws what the pages say and sends what an item names.
 //!
 //! The console also holds two settings of the client itself: the room behind the panels and the
 //! sound's volume. They never go to the host. `settings.rs` saves them.
@@ -11,37 +13,34 @@
 //! This file holds the data and the rules, with no Cranpose state. `console_panel.rs` draws them
 //! and places the panel.
 
-use cranvr_common::controls::{Action as ControlAction, Control, Controls, Hand, MenuHand, ModelsInGame};
-use serde_json::{json, Value};
+use cranvr_common::{
+    controls::{Action as ControlAction, Control, Controls, Hand, MenuHand, ModelsInGame},
+    menu::{Item, Page, Request},
+};
+use serde_json::Value;
 use std::{
-    sync::atomic::{AtomicU8, Ordering},
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
-/// The hand menu asks for the console on its page of the controls (see `hand_menu.rs`). The console
-/// takes the request when it opens, or while it is open: 0 is none, 1 the left controller's tab and 2
-/// the right controller's.
-static CONTROLS_REQUEST: AtomicU8 = AtomicU8::new(0);
+/// The hand menu asks for the console on one of its pages (see `hand_menu.rs`): the page of the
+/// controls or a page of the host. The console takes the request when it opens, or while it is open.
+static PAGE_REQUEST: Mutex<Option<Shown>> = Mutex::new(None);
 
 /// Asks for the console on its page of the controls, on the tab of the right controller.
 pub fn request_controls_page() {
-    CONTROLS_REQUEST.store(2, Ordering::Relaxed);
+    request_page(Shown::Controls(Hand::Right));
 }
 
-/// The tab that the hand menu asked for, once.
-pub fn take_controls_request() -> Option<Hand> {
-    match CONTROLS_REQUEST.swap(0, Ordering::Relaxed) {
-        1 => Some(Hand::Left),
-        2 => Some(Hand::Right),
-        _ => None,
-    }
+/// Asks for the console on the page `shown`.
+pub fn request_page(shown: Shown) {
+    *PAGE_REQUEST.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(shown);
 }
 
-/// The refresh rates and the render sizes that the console offers. The app accepts any value.
-pub const RATES: [u32; 3] = [72, 90, 120];
-pub const SCALES: [f32; 5] = [0.5, 0.6, 0.7, 0.85, 1.0];
-/// The most games that the console lists
-pub const MAX_GAMES: usize = 5;
+/// The page that the hand menu asked for, once.
+pub fn take_page_request() -> Option<Shown> {
+    PAGE_REQUEST.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+}
 
 /// The stream's state, from the host.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -57,67 +56,11 @@ pub struct Status {
     pub game: Option<String>,
 }
 
-/// The VR system of a game on the Mac: the runtime that its OpenVR calls reach. The cranvr app keeps it in the
-/// game's launch options and sends it with the menu. An OpenXR game ignores it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum VrSystem {
-    /// OpenComposite turns the game's OpenVR calls into OpenXR calls to cranvr's runtime
-    #[default]
-    OpenComposite,
-    /// The game runs in SteamVR on the Mac, with cranvr's driver
-    SteamVr,
-    /// No OpenVR runtime: a game with an OpenXR mode takes that
-    Off,
-}
-
-impl VrSystem {
-    pub const ALL: [VrSystem; 3] = [VrSystem::OpenComposite, VrSystem::SteamVr, VrSystem::Off];
-
-    /// The word of the menu and of the request, as the app's app.json has it
-    pub fn key(self) -> &'static str {
-        match self {
-            VrSystem::OpenComposite => "opencomposite",
-            VrSystem::SteamVr => "steamvr",
-            VrSystem::Off => "off",
-        }
-    }
-
-    pub fn from_key(key: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|system| system.key() == key)
-    }
-
-    /// The button's text
-    pub fn label(self) -> &'static str {
-        match self {
-            VrSystem::OpenComposite => "OpenComposite",
-            VrSystem::SteamVr => "SteamVR",
-            VrSystem::Off => "No OpenVR",
-        }
-    }
-
-    /// The choice after this one, for a press on the button
-    pub fn next(self) -> Self {
-        let at = Self::ALL.iter().position(|system| *system == self).unwrap_or(0);
-        Self::ALL[(at + 1) % Self::ALL.len()]
-    }
-}
-
-/// An installed game: its name, its program's file name and its VR system.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Game {
-    pub name: String,
-    pub program: String,
-    pub vr: VrSystem,
-}
-
-/// What the console shows: the app's games and settings and the host's state.
+/// What the console shows: the app's pages and the host's state.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Menu {
-    pub games: Vec<Game>,
-    pub fps: u32,
-    pub game_scale: f32,
-    /// The most MSAA samples a game may use; 0 lets the game choose
-    pub msaa: u32,
+    /// The pages of settings and actions. The first is the console's main page.
+    pub pages: Vec<Page>,
     pub status: Status,
     /// One short line from the app about something that happens now, such as a game that restarts.
     /// The app writes it into vr-menu.json while it applies.
@@ -127,28 +70,15 @@ pub struct Menu {
 }
 
 impl Menu {
-    /// The menu from the host's text. `None` for a text that is no menu: it lacks the games, a game's
-    /// name or VR system, a setting or the controls. The status is the host's own and is missing while no
-    /// headset streams.
+    /// The menu from the host's text. `None` for a text that is no menu: it lacks the pages, a page
+    /// does not read, or the controls are missing. The status is the host's own and is missing while
+    /// no headset streams.
     pub fn parse(text: &str) -> Option<Self> {
         let v: Value = serde_json::from_str(text).ok()?;
         let s = &v["status"];
         let number = |v: &Value| v.as_f64().map(|n| n as f32);
         Some(Self {
-            games: v["games"]
-                .as_array()?
-                .iter()
-                .map(|g| {
-                    Some(Game {
-                        name: g["name"].as_str()?.to_string(),
-                        program: g["program"].as_str().unwrap_or_default().to_string(),
-                        vr: VrSystem::from_key(g["vr"].as_str()?)?,
-                    })
-                })
-                .collect::<Option<Vec<Game>>>()?,
-            fps: v["fps"].as_u64()? as u32,
-            game_scale: number(&v["game_scale"])?,
-            msaa: v["msaa"].as_u64()? as u32,
+            pages: serde_json::from_value(v.get("pages")?.clone()).ok()?,
             status: Status {
                 refresh: number(&s["refresh"]).unwrap_or(0.0),
                 fps: number(&s["fps"]).unwrap_or(0.0),
@@ -161,26 +91,39 @@ impl Menu {
         })
     }
 
-    /// Whether `game` is the game that runs.
-    pub fn runs(&self, game: &Game) -> bool {
-        self.status.game.as_deref().is_some_and(|program| !game.program.is_empty() && program.eq_ignore_ascii_case(&game.program))
+    /// The page of `id`.
+    pub fn page(&self, id: &str) -> Option<&Page> {
+        self.pages.iter().find(|page| page.id == id)
     }
 
-    /// The games that the console lists
-    pub fn listed(&self) -> &[Game] {
-        &self.games[..self.games.len().min(MAX_GAMES)]
+    /// The console's main page: the first.
+    pub fn main(&self) -> Option<&Page> {
+        self.pages.first()
+    }
+
+    /// The pages that the menus list, after the main page: their ids and the words of their buttons.
+    pub fn listed(&self) -> Vec<(String, String)> {
+        self.pages.iter().skip(1).filter(|page| page.listed).map(|page| (page.id.clone(), page.short.clone())).collect()
+    }
+
+    /// The item that `request` names, on any page.
+    pub fn item(&self, request: &Request) -> Option<&Item> {
+        self.pages.iter().find_map(|page| page.find(request.id(), request.subject()))
     }
 }
 
 /// How long a request to the Mac may run before the console says that it got no answer. A game's
 /// start waits for Steam and for Wine, which can take a minute.
 pub const ANSWER_TIME: Duration = Duration::from_secs(90);
+/// How long an action shows its words of a running action before the Mac says that it runs. The
+/// host sends the menu at most once a second, and the app writes it within 150 ms.
+pub const ECHO_TIME: Duration = Duration::from_millis(2500);
 
-/// A request to the Mac that takes a while, such as a game's start. The console shows that it runs
-/// from the press until the host's menu shows its result or a new notice.
+/// A request to the Mac that takes a while, such as a game's start or a new refresh rate. The console
+/// shows that it runs from the press until the host's menu shows its result or a new notice.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pending {
-    pub action: Action,
+    pub request: Request,
     since: Instant,
     /// The notice that the menu showed at the press: a new notice answers the request
     notice: Option<String>,
@@ -198,69 +141,38 @@ pub enum Progress {
 }
 
 impl Pending {
-    /// The request of `action` at `now`, while the menu shows `notice`.
-    pub fn new(action: Action, notice: Option<String>, now: Instant) -> Self {
-        Self { action, since: now, notice }
+    /// The request of `request` at `now`, while the menu shows `notice`.
+    pub fn new(request: Request, notice: Option<String>, now: Instant) -> Self {
+        Self { request, since: now, notice }
     }
 
-    /// Where the request stands in the host's `menu` at `now`.
+    /// Where the request stands in the host's `menu` at `now`. A change is done when the menu shows
+    /// the new value. An action runs while the Mac marks its button busy, and for `ECHO_TIME` after
+    /// the press before the Mac's menu can say so.
     pub fn progress(&self, menu: &Menu, now: Instant) -> Progress {
         if menu.notice.is_some() && menu.notice != self.notice {
             return Progress::Done;
         }
-        let done = match &self.action {
-            Action::Play(name) => menu.games.iter().any(|game| &game.name == name && menu.runs(game)),
-            Action::Stop => menu.status.game.is_none(),
-            Action::Fps(fps) => menu.fps == *fps,
-            Action::Scale(scale) => (menu.game_scale - scale).abs() < 0.01,
-            Action::Msaa(samples) => menu.msaa == *samples,
-            Action::VrSystem(game, system) => menu.games.iter().any(|g| &g.name == game && g.vr == *system),
+        let waited = now.saturating_duration_since(self.since);
+        let running = match &self.request {
+            Request::Set { value, .. } => menu.item(&self.request).and_then(Item::value) != Some(value.as_str()),
+            Request::Run { id, subject } => {
+                let busy = menu.item(&self.request).and_then(|item| item.button(id, subject.as_deref())).is_some_and(|button| button.busy);
+                busy || waited < ECHO_TIME
+            }
         };
-        if done {
+        if !running {
             Progress::Done
-        } else if now.saturating_duration_since(self.since) > ANSWER_TIME {
+        } else if waited > ANSWER_TIME {
             Progress::NoAnswer
         } else {
             Progress::Running
         }
     }
-}
 
-impl Action {
-    /// The words of the button while the Mac works on the request
-    pub fn running_label(&self) -> &'static str {
-        match self {
-            Action::Play(_) => "Starting...",
-            Action::Stop => "Stopping...",
-            Action::Fps(_) | Action::Scale(_) | Action::Msaa(_) | Action::VrSystem(..) => "Changing...",
-        }
-    }
-}
-
-/// What a console button asks for.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Action {
-    Play(String),
-    Stop,
-    Fps(u32),
-    Scale(f32),
-    Msaa(u32),
-    /// A game's VR system, by the game's name
-    VrSystem(String, VrSystem),
-}
-
-impl Action {
-    /// The request for the host, as JSON.
-    pub fn request(&self) -> String {
-        match self {
-            Action::Play(name) => json!({"action": "play", "game": name}),
-            Action::Stop => json!({"action": "stop"}),
-            Action::Fps(fps) => json!({"action": "set", "fps": fps}),
-            Action::Scale(scale) => json!({"action": "set", "game_scale": scale}),
-            Action::Msaa(samples) => json!({"action": "set", "msaa": samples}),
-            Action::VrSystem(game, system) => json!({"action": "set", "game": game, "openvr": system.key()}),
-        }
-        .to_string()
+    /// Whether this request is the press of the option `value` of `id`, or of the action `id`.
+    pub fn is(&self, request: &Request) -> bool {
+        self.request == *request
     }
 }
 
@@ -340,15 +252,23 @@ impl Volume {
     }
 }
 
-/// What a console button does. Most of them ask the host. The room and the volume are the client's
-/// own settings. The controller models in a game and the menu hand go to the Mac with the controls.
+/// What a key of the console does. Most of them ask the host or open a page. The room and the volume
+/// are the client's own settings.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Press {
-    Host(Action),
+    /// A request to the Mac: a change of a setting or an action
+    Host(Request),
+    /// Opens a page of the host, by its id
+    Open(String),
+    /// Back to the main page
+    Back,
+    Close,
+    /// Opens the page of the controls
+    Controls,
+    Disconnect,
+    Exit,
     Room(Room),
     Volume(Volume),
-    Models(ModelsInGame),
-    MenuHand(MenuHand),
 }
 
 /// What decides whether the room shows behind the panels.
@@ -389,35 +309,13 @@ pub mod size {
 }
 
 /// The height of the Controls page in dp: the title, the two tabs for the controllers, one row for
-/// each of the eight inputs, two lines of notes and the buttons at the bottom. A controller with no
-/// menu button leaves its row empty, so both pages have one height.
+/// each of the eight inputs, the menu hand, the controller models, two lines of notes and the buttons
+/// at the bottom. A controller with no menu button leaves its row empty, so both pages have one
+/// height.
 pub fn controls_height() -> f32 {
     use size::*;
     let rows = |heights: &[f32]| heights.iter().map(|h| h + GAP).sum::<f32>();
-    // The title, the tabs, a row for each input, the name and the choices of the menu hand, two lines
-    // and the buttons
-    2.0 * PADDING + rows(&[TITLE, BUTTON]) + Control::ALL.len() as f32 * (BUTTON + GAP) + rows(&[TEXT, BUTTON, TEXT, TEXT, BUTTON])
-}
-
-/// The console's height in dp for a menu: the rows that `console_panel.rs` draws, with their gaps.
-pub fn height(menu: Option<&Menu>) -> f32 {
-    use size::*;
-    let rows = |heights: &[f32]| heights.iter().map(|h| h + GAP).sum::<f32>();
-    let Some(menu) = menu else {
-        // The title, a line of text, the heading with the two settings of the client and the buttons
-        return 2.0 * PADDING + rows(&[TITLE, TEXT, HEADING, BUTTON, BUTTON, BUTTON]);
-    };
-    let games = menu.listed().len().max(1) as f32;
-    // The notice has a line of its own
-    let notice = if menu.notice.is_some() { TEXT + GAP } else { 0.0 };
-    // The title, the game's state, the heading and the games, the heading and a row for each of the
-    // five settings, the name and the choices of the controller models, the note and the buttons at
-    // the bottom
-    2.0 * PADDING
-        + notice
-        + rows(&[TITLE, TEXT, HEADING])
-        + games * (BUTTON + GAP)
-        + rows(&[HEADING, BUTTON, BUTTON, BUTTON, BUTTON, BUTTON, TEXT, BUTTON, TEXT, BUTTON])
+    2.0 * PADDING + rows(&[TITLE, BUTTON]) + Control::ALL.len() as f32 * (BUTTON + GAP) + rows(&[TEXT, BUTTON, TEXT, BUTTON, TEXT, TEXT, BUTTON])
 }
 
 /// How long the headset waits for the Mac to repeat a change of the controls that the user made in
@@ -425,10 +323,13 @@ pub fn height(menu: Option<&Menu>) -> f32 {
 const ECHO_WAIT: Duration = Duration::from_secs(3);
 
 /// The page of the console that shows.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Page {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Shown {
+    /// The host's main page, with the links to the others
     #[default]
     Main,
+    /// A page of the host, by its id
+    Host(String),
     /// The buttons of one controller
     Controls(Hand),
 }
@@ -478,6 +379,11 @@ impl Console {
             controls: self.controls,
             controls_editable: self.menu.is_some(),
         }
+    }
+
+    /// The pages of the host's menu that the menus list (see `Menu::listed`)
+    pub fn listed_pages(&self) -> Vec<(String, String)> {
+        self.menu.as_ref().map(Menu::listed).unwrap_or_default()
     }
 
     /// The mapping that the headset uses now.

@@ -4,8 +4,10 @@
 //! The menu lists every panel of the app with a button to show or hide it: the console, the
 //! connection panel, the stream's numbers and each display of the Mac. A display has a second
 //! button that puts it on the left hand or back in the room, and a third that removes it when the
-//! user added it. Under a display stands the cost of showing it. At the bottom the menu adds a
-//! display, puts the panels in front of the user again and opens the page of the controls.
+//! user added it. Under a display stands the cost of showing it. Below the displays stand the pages of
+//! the Mac's settings, three buttons to a row, each of which opens the console on its page. At the
+//! bottom the menu adds a display, puts the panels in front of the user again and opens the page of
+//! the controls.
 
 use crate::{
     display_wish::{cost_lines, Place},
@@ -29,6 +31,8 @@ pub enum MenuAction {
     Recenter,
     /// Opens the console on its page of the controls
     OpenControls,
+    /// Opens the console on a page of the Mac's settings: its place in `MenuInput::pages`
+    OpenPage(u8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,7 +69,12 @@ pub struct MenuInput<'a> {
     pub place: MenuPlace,
     /// The Mac works on a display that the user added and has not listed it yet
     pub adding: bool,
+    /// The pages of the Mac's settings that the menus list: their ids and the words of their buttons
+    pub pages: &'a [(String, String)],
 }
+
+/// The page buttons stand three in a row
+const PAGES_IN_ROW: usize = 3;
 
 /// The sizes of the menu's parts in dp. A dp is a millimeter in the room. The text is 22 dp tall or
 /// more: at the 45 cm that a hand holds the menu from the eyes, 22 mm is 2.8 degrees, which reads
@@ -116,6 +125,15 @@ pub fn rows(input: &MenuInput<'_>) -> Vec<MenuRow> {
             _ => details.insert(0, place),
         }
         rows.push(MenuRow { title: display.info.name.clone(), details, buttons });
+    }
+    let listed: Vec<MenuButton> = input
+        .pages
+        .iter()
+        .enumerate()
+        .map(|(index, (_, short))| MenuButton { label: short.clone(), action: MenuAction::OpenPage(index as u8), kind: ButtonKind::Normal })
+        .collect();
+    for chunk in listed.chunks(PAGES_IN_ROW) {
+        rows.push(MenuRow { title: String::new(), details: Vec::new(), buttons: chunk.to_vec() });
     }
     let mut actions = Vec::new();
     if input.displays.can_add {
@@ -168,7 +186,7 @@ mod tests {
     }
 
     fn input<'a>(layout: &'a Layout, displays: &'a DisplaysView) -> MenuInput<'a> {
-        MenuInput { layout, console_open: false, displays, wishes: Default::default(), place: MenuPlace::Hand(cranvr_common::controls::Hand::Left), adding: false }
+        MenuInput { layout, console_open: false, displays, wishes: Default::default(), place: MenuPlace::Hand(cranvr_common::controls::Hand::Left), adding: false, pages: &[] }
     }
 
     #[test]
@@ -185,6 +203,23 @@ mod tests {
         // The last row adds a display, puts the panels back and opens the controls
         let actions: Vec<MenuAction> = rows[5].buttons.iter().map(|b| b.action).collect();
         assert_eq!(actions, vec![MenuAction::AddDisplay, MenuAction::Recenter, MenuAction::OpenControls]);
+    }
+
+    #[test]
+    fn the_pages_of_the_mac_stand_three_in_a_row_above_the_actions() {
+        let layout = Layout::default();
+        let displays = view(vec![info(1, "Mac display", false)], true);
+        let pages: Vec<(String, String)> = ["Stream", "Steam", "Connection", "Desktop"].iter().map(|short| (short.to_lowercase(), short.to_string())).collect();
+        let mut input = input(&layout, &displays);
+        input.pages = &pages;
+        let rows = rows(&input);
+        let titles: Vec<&str> = rows.iter().map(|r| r.title.as_str()).collect();
+        assert_eq!(titles, vec!["Console", "Connection", "Stream numbers", "Mac display", "", "", ""]);
+        let words = |row: &MenuRow| row.buttons.iter().map(|b| b.label.clone()).collect::<Vec<_>>();
+        assert_eq!(words(&rows[4]), ["Stream", "Steam", "Connection"]);
+        assert_eq!(words(&rows[5]), ["Desktop"]);
+        assert_eq!(rows[5].buttons[0].action, MenuAction::OpenPage(3));
+        assert_eq!(rows[6].buttons.last().unwrap().action, MenuAction::OpenControls);
     }
 
     #[test]

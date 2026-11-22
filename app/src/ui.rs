@@ -1,18 +1,19 @@
 use crate::{
     backend::{self, Model, Settings, StreamPath},
+    pages,
     pending::{self, Pending, Request},
-    black_eye,
-    launch::{self, GameOptions, OpenVr},
+    run::{self, PERMISSIONS},
+    launch::GameOptions,
     setup::{self, Progress, Setup},
     steam::{self, SteamState},
-    system::{self, Permission},
+    system,
     usb::{self, Connection, Download},
 };
 use cranpose::prelude::*;
 use cranpose::text::{FontWeight, TextUnit};
 use cranvr_common::{
     controls::{Action as ControlAction, Control, Controls, Hand, MenuHand, ModelsInGame},
-    foveation::FoveationLevel,
+    menu::{self, Item, Press, Style, Tone},
 };
 use cranpose::widgets::{FlowRow, FlowSpec};
 use std::{
@@ -20,10 +21,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-const FPS_CHOICES: [u32; 3] = [72, 90, 120];
-const MBPS_CHOICES: [u32; 4] = [50, 100, 150, 200];
-const GAME_SCALE_CHOICES: [f32; 5] = [0.5, 0.6, 0.7, 0.85, 1.0];
-const PERMISSIONS: [Permission; 3] = [Permission::ScreenRecording, Permission::SystemAudio, Permission::Accessibility];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
@@ -74,6 +71,7 @@ fn Heading(text: String) {
 const BUTTON: (u8, u8, u8) = (52, 58, 70);
 const SELECTED: (u8, u8, u8) = (38, 98, 190);
 const PRIMARY: (u8, u8, u8) = (30, 130, 80);
+const DANGER: (u8, u8, u8) = (150, 60, 60);
 
 #[composable]
 fn Action(label: String, on_click: impl Fn() + 'static) {
@@ -145,130 +143,50 @@ fn start_host(settings: MutableState<Settings>, model: MutableState<Model>) {
     });
 }
 
-/// Games see the headset only while the host runs.
-fn ensure_host(settings: MutableState<Settings>, model: MutableState<Model>) {
-    if !backend::host_running() {
-        start_host(settings, model);
-    }
-}
-
 /// What the cable thread works to: the Connection setting. It does not depend on the headset app
 /// or the stream protocol.
 fn connection_of(settings: MutableState<Settings>) -> Connection {
     settings.with(|s| s.connection)
 }
 
-/// Reads what changes outside the window: host output every 150 ms, the rest every 2 s.
+/// Reads what changes outside the window: host output every 150 ms, the rest every 2 s. The work
+/// is `run::tick`, which the app with no window runs too. The window adds what only a window does:
+/// it comes to the front for a headset that asks to connect, and it follows the headset into VR.
 fn refresh(settings: MutableState<Settings>, model: MutableState<Model>, slow: bool) {
+    let mut now = settings.with(Clone::clone);
     let mut next = model.with(Clone::clone);
-    backend::pump(&mut next);
-    next.settings_problem = backend::settings_problem();
-    usb::set_choice(connection_of(settings));
-    next.usb = usb::status();
-    let requests = std::mem::take(&mut next.vr_requests);
-    vr_requests(settings, &mut next, requests);
-    let reports = std::mem::take(&mut next.black_eyes);
-    black_eye_reports(settings, &mut next, reports);
-    vr_system_verdicts(settings, &mut next, crate::game_run::take_verdicts());
-    for chosen in backend::take_chosen() {
-        chosen_program(settings, &mut next, chosen);
-    }
+    run::tick(&mut now, &mut next, slow);
     // A headset that asks to connect has a user who may not look at the Mac: the window comes up
     let waiting = |m: &Model| m.native.iter().flat_map(|n| n.pending.iter().map(|r| r.key.clone())).collect::<Vec<_>>();
     let known = model.with(|m| waiting(m));
     if waiting(&next).iter().any(|key| !known.contains(key)) {
         crate::vr_window::bring_to_front();
     }
-    // A finished setup changed what the Play tab shows: read the state now, not in 2 s
-    let setup_ended = model.with(|m| m.setup.as_ref().is_some_and(Setup::running)) && !next.setup.as_ref().is_some_and(Setup::running);
-    if slow || setup_ended {
-        next.lan = system::lan_addresses();
-        next.permissions = PERMISSIONS.map(Permission::granted);
-        next.input_devices = crate::microphone::input_devices();
-        next.steam = steam::state();
-        next.rosetta = steam::rosetta_ready();
-        next.game_support = steam::game_support_installed();
-        next.game_support_outdated = steam::game_support_outdated();
-        next.steam_running = next.steam == SteamState::Ready && steam::running();
-        next.steam_signed_in = steam::signed_in();
-        next.games = steam::games();
-    }
-    // The window follows the headset into VR and back
     // The window follows a streaming headset into VR and back. With the main display switch the
     // host's report of the switch decides; without it, the first stats of a stream do.
-    let switch = settings.with(|s| s.vr_main_display);
+    let switch = now.vr_main_display;
     let in_vr = |m: &Model| if switch { m.vr_main } else { m.headset.is_some() && m.stats.is_some() };
     let (was_in_vr, had_display) = model.with(|m| (in_vr(m), m.vr_display));
     if let Some(display) = next.vr_display {
         match (was_in_vr, in_vr(&next)) {
-            (false, true) if settings.with(|s| s.window_in_vr) => crate::vr_window::move_into_vr(display),
+            (false, true) if now.window_in_vr => crate::vr_window::move_into_vr(display),
             (true, false) => crate::vr_window::move_out_of_vr(display),
             // A new virtual display without a headset: the window must not sit on it
             (false, false) if had_display != Some(display) => crate::vr_window::move_out_of_vr(display),
             _ => (),
         }
     }
-    if next.notice.as_ref().is_some_and(|(_, until)| *until <= Instant::now()) {
-        next.notice = None;
+    if settings.with(|s| *s != now) {
+        settings.set(now);
     }
-    backend::write_vr_menu(&settings.with(Clone::clone), &next.games, next.notice.as_ref().map(|(notice, _)| notice.headset.as_str()));
     if model.with(|m| *m != next) {
         model.set(next);
     }
 }
 
-/// Answers the host's reports of a black picture (see black_eye.rs): the program's option "Each
-/// eye in its own pass" turns on once, and the game starts again with it. A report with the option
-/// on already only shows a notice.
-fn black_eye_reports(settings: MutableState<Settings>, next: &mut Model, reports: Vec<serde_json::Value>) {
-    for report in reports {
-        let mut response = None;
-        settings.update(|s| {
-            response = Some(black_eye::respond(&mut s.launch, &next.games, report["program"].as_str(), report["eye"].as_str().unwrap_or("right")))
-        });
-        let Some(black_eye::Response { notice, restart }) = response else { continue };
-        next.notice = Some((notice, Instant::now() + black_eye::NOTICE_TIME));
-        if let Some(program) = restart {
-            // The new start reads the saved options
-            settings.with(Settings::save);
-            thread::spawn(move || {
-                if let Err(e) = steam::restart(&program) {
-                    backend::notify(e);
-                }
-            });
-        }
-    }
-}
-
-/// Answers the verdicts of game runs that drew nothing through OpenComposite (see vr_system.rs): a game that
-/// follows the setting gets SteamVR and starts again with it.
-fn vr_system_verdicts(settings: MutableState<Settings>, next: &mut Model, verdicts: Vec<crate::game_run::Verdict>) {
-    if verdicts.is_empty() {
-        return;
-    }
-    let steamvr = steam::steamvr().is_some();
-    for verdict in verdicts {
-        let games = if next.games.is_empty() { steam::games() } else { next.games.clone() };
-        let mut response = None;
-        settings.update(|s| response = Some(crate::vr_system::respond(&mut s.launch, &games, &verdict.program, verdict.why, steamvr)));
-        let Some(crate::vr_system::Response { notice, restart }) = response else { continue };
-        next.log(notice.window.clone());
-        next.notice = Some((notice, Instant::now() + black_eye::NOTICE_TIME));
-        if let Some(program) = restart {
-            // The new start reads the saved options
-            settings.with(Settings::save);
-            thread::spawn(move || {
-                if let Err(e) = steam::restart(&program) {
-                    backend::notify(e);
-                }
-            });
-        }
-    }
-}
-
 /// Opens the file chooser for a program on a thread of its own. A chooser that runs inside the
 /// window's event handler makes winit panic ("tried to handle event while another event is currently
-/// being handled") and the app ends. The window takes the choice on its next refresh (`chosen_program`).
+/// being handled") and the app ends. The window takes the choice on its next refresh (`run::tick`).
 fn choose_program(title: &'static str, start: std::path::PathBuf, add: bool) {
     thread::spawn(move || {
         let picked = rfd::FileDialog::new().set_title(title).add_filter("Windows program", &["exe"]).set_directory(&start).pick_file();
@@ -278,69 +196,111 @@ fn choose_program(title: &'static str, start: std::path::PathBuf, add: bool) {
     });
 }
 
-/// Uses a program that the user chose: adds it to the list of games, or starts it once.
-fn chosen_program(settings: MutableState<Settings>, next: &mut Model, chosen: backend::Chosen) {
-    match chosen {
-        backend::Chosen::Add(path) => {
-            let mut result = Ok(());
-            settings.update(|s| result = steam::add_game(s, &path, &steam::steam_games()));
-            if result.is_ok() {
-                settings.with(Settings::save);
-                // The list shows the game now, with its options open: they hold what cranvr filled in
-                next.games = steam::games();
-                next.open_options = Some(steam::mac_to_windows(&path));
-            }
-            next.message = result.err();
-        }
-        backend::Chosen::Run(path) => {
-            // Games see the headset only while the host runs
-            if !backend::host_running() {
-                match backend::start_host(&settings.with(Clone::clone)) {
-                    Ok(()) => next.running = true,
-                    Err(e) => next.message = Some(e),
-                }
-            }
-            let result = steam::run_program(&path);
-            let shown = path.display().to_string();
-            settings.update(|s| s.game = shown);
-            settings.with(Settings::save);
-            next.message = result.err();
-        }
+/// Does what a press of the window asks, as a press in the headset does (`run::act`).
+fn press(settings: MutableState<Settings>, model: MutableState<Model>, request: menu::Request) {
+    let mut now = settings.with(Clone::clone);
+    let mut next = model.with(Clone::clone);
+    run::act(&mut now, &mut next, &request);
+    if settings.with(|s| *s != now) {
+        settings.set(now);
+    }
+    if model.with(|m| *m != next) {
+        model.set(next);
     }
 }
 
-/// Runs the requests of the console in VR, as the window's own buttons would.
-fn vr_requests(settings: MutableState<Settings>, next: &mut Model, requests: Vec<serde_json::Value>) {
-    for request in requests {
-        let games = if next.games.is_empty() { steam::games() } else { next.games.clone() };
-        let before = settings.with(Clone::clone);
-        match backend::console_request(&before, &games, &request) {
-            backend::ConsoleRequest::Play(game) => {
-                // Steam may need seconds to start: keep the window responsive
-                thread::spawn(move || {
-                    if let Err(e) = steam::play(&game) {
-                        backend::notify(e);
-                    }
-                });
-            }
-            backend::ConsoleRequest::Stop => {
-                thread::spawn(steam::stop_all);
-            }
-            backend::ConsoleRequest::Refused(why) => next.message = Some(why),
-            backend::ConsoleRequest::Set(after) => {
-                let after = *after;
-                if after == before {
-                    continue;
+/// Opens a page that a button of the model links to. The window shows the pages in its tabs, so only
+/// a game's page has to open: its options show under its row.
+fn open_page(model: MutableState<Model>, page: &str) {
+    if let Some(program) = page.strip_prefix(pages::GAME_PAGE) {
+        let program = program.to_string();
+        model.update(move |m| m.open_options = if m.open_options.as_ref() == Some(&program) { None } else { Some(program) });
+    }
+}
+
+/// The page of `id` as the model gives it now.
+fn page_of(settings: MutableState<Settings>, model: MutableState<Model>, id: &str) -> Option<menu::Page> {
+    let pages = settings.with(|s| model.with(|m| pages::pages(s, m)));
+    pages.into_iter().find(|page| page.id == id)
+}
+
+fn tone_style(tone: Tone) -> TextStyle {
+    match tone {
+        Tone::Normal => TextStyle::default(),
+        Tone::Muted => dim_style(),
+        Tone::Good => colored(110, 200, 140),
+        Tone::Warn => colored(240, 170, 90),
+    }
+}
+
+/// The items of a page of the model (see pages.rs), as the window draws them. The headset's console
+/// draws the same items from `vr-menu.json`.
+#[composable]
+fn PageItems(items: Vec<Item>, settings: MutableState<Settings>, model: MutableState<Model>) {
+    for item in items {
+        ItemView(item, settings, model);
+    }
+}
+
+#[composable]
+fn ItemView(item: Item, settings: MutableState<Settings>, model: MutableState<Model>) {
+    match item {
+        Item::Heading { text } => Heading(text),
+        Item::Text { text, tone } => {
+            Text(text, Modifier::empty(), tone_style(tone));
+        }
+        Item::Choice(choice) => {
+            let hint = choice.hint.clone();
+            FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+                Text(choice.label.clone(), Modifier::empty().padding(8.0), TextStyle::default());
+                for option in choice.options.clone() {
+                    let request = menu::Request::Set { id: choice.id.clone(), subject: choice.subject.clone(), value: option.value.clone() };
+                    Choice(option.label.clone(), option.value == choice.value, move || press(settings, model, request.clone()));
                 }
-                after.save();
-                settings.set(after.clone());
-                // The anti-aliasing limit applies at a game's start; the rest are the host's options
-                let host_options = |s: &Settings| (s.fps, s.game_scale.to_bits());
-                if host_options(&before) != host_options(&after) && backend::host_running() {
-                    if let Err(e) = backend::start_host(&after) {
-                        next.message = Some(e);
-                    }
+            });
+            if !hint.is_empty() {
+                Hint(hint);
+            }
+        }
+        Item::Toggle(toggle) => {
+            let hint = toggle.hint.clone();
+            FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+                let value = if toggle.on { menu::OFF } else { menu::ON };
+                let request = menu::Request::Set { id: toggle.id.clone(), subject: toggle.subject.clone(), value: value.into() };
+                Choice(toggle.label.clone(), toggle.on, move || press(settings, model, request.clone()));
+            });
+            if !hint.is_empty() {
+                Hint(hint);
+            }
+        }
+        Item::Buttons(row) => {
+            let hint = row.hint.clone();
+            FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+                if !row.title.is_empty() {
+                    Text(row.title.clone(), Modifier::empty().padding(8.0), TextStyle::default());
                 }
+                for button in row.buttons.clone() {
+                    let color = match button.style {
+                        Style::Normal => BUTTON,
+                        Style::Primary => PRIMARY,
+                        Style::Danger => DANGER,
+                    };
+                    let press_of = button.press.clone();
+                    Styled(button.words().to_string(), color, move || match &press_of {
+                        Press::Run { .. } => {
+                            if let Some(request) = press_of.request() {
+                                press(settings, model, request);
+                            }
+                        }
+                        Press::Open { page } => open_page(model, page),
+                    });
+                }
+                if !row.detail.is_empty() {
+                    Text(row.detail.clone(), Modifier::empty().padding(8.0), dim_style());
+                }
+            });
+            if !hint.is_empty() {
+                Hint(hint);
             }
         }
     }
@@ -690,7 +650,7 @@ fn PlayTab(settings: MutableState<Settings>, model: MutableState<Model>) {
                 Choice(format!("Options of {name}{}", if own { " (own)" } else { "" }), shown, move || open_program.set(!shown));
             });
             if shown {
-                LaunchOptions(settings, program);
+                LaunchOptions(settings, model, program);
             }
         }
         match model.with(|m| m.game.clone()) {
@@ -702,7 +662,7 @@ fn PlayTab(settings: MutableState<Settings>, model: MutableState<Model>) {
             }
         }
     });
-    WineCard(settings);
+    WineCard(settings, model);
 }
 
 /// The steps of a setup, each with its progress line.
@@ -815,59 +775,34 @@ fn SteamLibrary(settings: MutableState<Settings>, model: MutableState<Model>, la
     }
 }
 
-/// One game of a list: its name, its options and its Play button. A game that the user added from a
-/// folder has a Remove button too. The model holds the program whose launch options are open.
+/// One game of a list: its row of the Play page (see pages.rs) with Play, Options and Stop. The
+/// model holds the program whose launch options are open.
 #[composable]
 fn GameRow(settings: MutableState<Settings>, model: MutableState<Model>, game: steam::Game) {
-    let g = game.clone();
-    let program = steam::program(&game);
-    let shown = program.as_ref().is_some_and(|program| model.with(|m| m.open_options.as_ref() == Some(program)));
-    let own = program.as_ref().is_some_and(|program| settings.with(|s| s.launch.contains_key(program)));
-    let toggled = program.clone();
-    FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-        Text(g.name.clone(), Modifier::empty().padding(8.0), TextStyle::default());
-        if let Some(program) = toggled.clone() {
-            Choice(if own { "Options (own)".into() } else { "Options".into() }, shown, move || {
-                let program = program.clone();
-                model.update(move |m| m.open_options = if m.open_options.as_ref() == Some(&program) { None } else { Some(program) });
-            });
-        }
-        if let (Some(_), Some(program)) = (g.exe.as_ref(), toggled.clone()) {
-            let game = g.clone();
-            let request = Request::Play(program);
-            Primary(label_of(model, &request, "Play"), move || {
-                note(model, request.clone());
-                ensure_host(settings, model);
-                let game = game.clone();
-                // Steam may need seconds to start: keep the window responsive
-                thread::spawn(move || {
-                    if let Err(e) = steam::play(&game) {
-                        backend::notify(e);
-                    }
-                });
-            });
-        } else {
+    let Some(program) = steam::program(&game) else {
+        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+            Text(game.name.clone(), Modifier::empty().padding(8.0), TextStyle::default());
             Hint("no program found in its folder".into());
-        }
-        // A game that the user added has no Steam manifest: only the list holds it
-        if let (true, Some(exe)) = (g.app_id.is_empty(), g.exe.clone()) {
-            Action("Remove".into(), move || {
-                settings.update(|s| steam::remove_game(s, &exe));
-                settings.with(Settings::save);
-            });
-        }
-    });
-    if let Some(program) = program.filter(|_| shown) {
-        LaunchOptions(settings, program);
+        });
+        return;
+    };
+    let shown = model.with(|m| m.open_options.as_ref() == Some(&program));
+    let row = page_of(settings, model, pages::PLAY).and_then(|page| page.items.into_iter().find(|item| item.names("game.play", Some(&program)) || matches!(item, Item::Buttons(row) if row.title == game.name)));
+    if let Some(row) = row {
+        ItemView(row, settings, model);
+    }
+    if shown {
+        LaunchOptions(settings, model, program);
     }
 }
 
 /// The launch options of one program, under its row: what cranvr adds when the program starts.
-/// The common switch is in view. The raw fields sit behind "Advanced", which starts open for a
-/// program that already has values in them.
+/// The model's page of the game gives the choices (see pages.rs), which the headset shows too. The
+/// raw fields sit behind "Advanced", which starts open for a program that already has values in
+/// them: the headset shows no text field.
 #[composable]
-fn LaunchOptions(settings: MutableState<Settings>, program: String) {
-    let (options, wine) = settings.with(|s| (s.launch.get(&program).cloned().unwrap_or_default(), s.wine.clone()));
+fn LaunchOptions(settings: MutableState<Settings>, model: MutableState<Model>, program: String) {
+    let options = settings.with(|s| s.launch.get(&program).cloned().unwrap_or_default());
     let raw_fields_set =
         !(options.dll_overrides.is_empty() && options.env.is_empty() && options.args.is_empty() && options.steam_app_id.is_empty());
     let advanced = rememberMutableStateOf(move || raw_fields_set);
@@ -875,70 +810,28 @@ fn LaunchOptions(settings: MutableState<Settings>, program: String) {
     let steam_id = cranpose_core::remember(|| TextFieldState::new(&options.steam_app_id)).with(|state| *state);
     let env = cranpose_core::remember(|| TextFieldState::new(&options.env)).with(|state| *state);
     let args = cranpose_core::remember(|| TextFieldState::new(&options.args)).with(|state| *state);
+    // The game's page without the buttons that its row in the list has already
+    let items: Vec<Item> = settings
+        .with(|s| model.with(|m| pages::options_page(s, m, &program)))
+        .items
+        .into_iter()
+        .filter_map(|item| match item {
+            Item::Buttons(mut row) => {
+                row.buttons.retain(|button| !button.runs("game.play", Some(&program)) && !button.runs("steam.stop", None));
+                (!row.buttons.is_empty()).then_some(Item::Buttons(row))
+            }
+            other => Some(other),
+        })
+        .collect();
     Column(
         Modifier::empty().fill_max_width().padding_symmetric(16.0, 0.0),
         ColumnSpec::default().vertical_arrangement(LinearArrangement::SpacedBy(6.0)),
         move || {
-            let key = program.clone();
+            PageItems(items.clone(), settings, model);
             let shown = advanced.get();
             FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-                let key = key.clone();
-                let one_key = key.clone();
-                Choice("Each eye in its own pass".into(), options.eye_per_pass, move || {
-                    edit_launch(settings, &key, |o| {
-                        o.eye_per_pass = !o.eye_per_pass;
-                        o.eye_per_pass_declined = !o.eye_per_pass;
-                        o.eye_per_pass_reason.clear();
-                        // The two options ask for opposite things
-                        if o.eye_per_pass {
-                            o.eye_one_pass = false;
-                            o.eye_one_pass_reason.clear();
-                        }
-                    })
-                });
-                Choice("Both eyes in one pass".into(), options.eye_one_pass, move || {
-                    edit_launch(settings, &one_key, |o| {
-                        o.eye_one_pass = !o.eye_one_pass;
-                        o.eye_one_pass_declined = !o.eye_one_pass;
-                        o.eye_one_pass_reason.clear();
-                        if o.eye_one_pass {
-                            o.eye_per_pass = false;
-                            o.eye_per_pass_reason.clear();
-                        }
-                    })
-                });
                 Choice("Advanced".into(), shown, move || advanced.set(!shown));
             });
-            if options.eye_per_pass && !options.eye_per_pass_reason.is_empty() {
-                Hint(options.eye_per_pass_reason.clone());
-            }
-            if options.eye_one_pass && !options.eye_one_pass_reason.is_empty() {
-                Hint(options.eye_one_pass_reason.clone());
-            }
-            Hint("For a game whose picture stays black, in the right eye or in both eyes. \"Each eye in its own pass\": the runtime refuses two-eye images, so the game draws each eye apart. This costs frames. \"Both eyes in one pass\": the runtime tells the game that a vertex shader may choose the eye, as a game that draws both eyes in one pass needs, or that draws both eyes into a picture of its own, as a Unity game with the OpenVR provider does.".into());
-            let (own, default_choice) = (options.openvr, wine.openvr);
-            let key = program.clone();
-            FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-                Text("OpenVR".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
-                for (label, choice) in [
-                    (format!("As in Settings ({})", default_choice.label()), None),
-                    (OpenVr::OpenComposite.label().to_owned(), Some(OpenVr::OpenComposite)),
-                    (OpenVr::SteamVr.label().to_owned(), Some(OpenVr::SteamVr)),
-                    (OpenVr::Off.label().to_owned(), Some(OpenVr::Off)),
-                ] {
-                    let key = key.clone();
-                    Choice(label, own == choice, move || {
-                        edit_launch(settings, &key, |o| {
-                            o.openvr = choice;
-                            o.openvr_reason.clear();
-                        })
-                    });
-                }
-            });
-            if options.openvr.is_some() && !options.openvr_reason.is_empty() {
-                Hint(options.openvr_reason.clone());
-            }
-            Hint(OPENVR_HINT.into());
             if shown {
                 OptionField("Wine DLL overrides", dll);
                 Hint("As WINEDLLOVERRIDES takes them, such as winhttp=n,b. The program then loads a winhttp.dll from its own folder before Wine's. Use it only for a mod loader that does not start without it: a loader that patched the game's files already starts twice with it.".into());
@@ -968,8 +861,6 @@ fn LaunchOptions(settings: MutableState<Settings>, program: String) {
                     });
                 });
             }
-            let summary = launch::summary(&wine, &options);
-            Hint(if summary.is_empty() { "The game starts with nothing added.".into() } else { format!("The game starts with: {summary}") });
         },
     );
 }
@@ -1005,30 +896,20 @@ fn edit_launch(settings: MutableState<Settings>, program: &str, edit: impl FnOnc
     settings.with(Settings::save);
 }
 
-/// What the OpenVR choice means, in the Play tab and in Settings
-const OPENVR_HINT: &str = "OpenComposite runs an OpenVR game through cranvr's runtime without SteamVR. SteamVR runs the game in SteamVR itself, for a game that needs SteamVR. Install SteamVR from your Steam library first. SteamVR starts with the game and closes after it. Off leaves the game no OpenVR runtime, so a game with an OpenXR mode takes that. An OpenXR game ignores the choice. It applies when the game starts.";
-
-/// The choice for every program: the OpenVR runtime of OpenVR games (see openvr.rs). A program can set
-/// its own in its options. The Wine card and the Settings tab both show it.
+/// The choice for every program: the OpenVR runtime of OpenVR games (see openvr.rs), from the model's
+/// stream page. A program can set its own in its options. The Wine card and the Settings tab both
+/// show it.
 #[composable]
-fn OpenVrSetting(settings: MutableState<Settings>) {
-    let now = settings.with(|s| s.wine.openvr);
-    FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-        Text("OpenVR games".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
-        for choice in [OpenVr::OpenComposite, OpenVr::SteamVr, OpenVr::Off] {
-            Choice(choice.label().into(), now == choice, move || {
-                settings.update(|s| s.wine.openvr = choice);
-                settings.with(Settings::save);
-            });
-        }
-    });
-    Hint(format!("{OPENVR_HINT} Each game can choose otherwise in its options."));
+fn OpenVrSetting(settings: MutableState<Settings>, model: MutableState<Model>) {
+    if let Some(item) = page_of(settings, model, pages::STREAM).and_then(|page| page.find("wine.openvr", None).cloned()) {
+        ItemView(item, settings, model);
+    }
 }
 
 /// The Wine that runs the games and the options of every program that cranvr starts. The raw
 /// fields sit behind "Advanced", which starts open when they hold values.
 #[composable]
-fn WineCard(settings: MutableState<Settings>) {
+fn WineCard(settings: MutableState<Settings>, model: MutableState<Model>) {
     let wine = settings.with(|s| s.wine.clone());
     let raw_fields_set = !(wine.dll_overrides.is_empty() && wine.env.is_empty());
     let advanced = rememberMutableStateOf(move || raw_fields_set);
@@ -1048,7 +929,7 @@ fn WineCard(settings: MutableState<Settings>) {
             Choice("Advanced".into(), shown, move || advanced.set(!shown));
         });
         Hint("Off: a game's own window on the Mac stays empty and costs no GPU time. The headset shows the game either way.".into());
-        OpenVrSetting(settings);
+        OpenVrSetting(settings, model);
         if shown {
             OptionField("DLL overrides", dll);
             OptionField("Environment", env);
@@ -1259,103 +1140,13 @@ fn ControlsPage(settings: MutableState<Settings>) {
 
 #[composable]
 fn GeneralSettings(settings: MutableState<Settings>, model: MutableState<Model>) {
-    let s = settings.with(Clone::clone);
-    let s1 = s.clone();
     // The way of the stream comes first: the cable is the choice that a user looks for
     ConnectionCard(settings, model);
+    // The stream's settings are the model's (see pages.rs): the headset's console shows the same page
+    let stream = page_of(settings, model, pages::STREAM).map(|page| page.items).unwrap_or_default();
     Card(move || {
-        Heading("Stream".into());
-        let current_fps = s1.fps;
-        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-            Text("Refresh rate".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
-            for fps in FPS_CHOICES {
-                Choice(format!("{fps} Hz"), current_fps == fps, move || change(settings, model, |s| s.fps = fps));
-            }
-        });
-        let current_mbps = s1.mbps;
-        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-            Text("Bitrate".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
-            for mbps in MBPS_CHOICES {
-                Choice(format!("{mbps} Mbps"), current_mbps == mbps, move || change(settings, model, |s| s.mbps = mbps));
-            }
-        });
-        let (foveation, autostart) = (s1.foveation_level, s1.autostart);
-        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-            Text("Foveated encoding".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
-            for (label, level) in [("Off", FoveationLevel::Off), ("Low", FoveationLevel::Low), ("Medium", FoveationLevel::Medium), ("High", FoveationLevel::High)] {
-                Choice(label.into(), foveation == level, move || change(settings, model, |s| s.foveation_level = level));
-            }
-        });
-        Hint(
-            match foveation {
-                FoveationLevel::Off => "Every pixel at the same detail. At 120 Hz the eye is smaller, so the center is less sharp.",
-                FoveationLevel::Low => "The center is sharp and the edges lose a little detail. Each frame takes about 2 ms longer to encode and decode than at Medium.",
-                FoveationLevel::Medium => "The center is sharp and the edges lose detail. This is the standard level.",
-                FoveationLevel::High => "The center gets the most bits and the edges lose the most detail. The sharp region around straight ahead is smaller.",
-            }
-            .into(),
-        );
-        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-            Choice("Start the host when cranvr opens".into(), autostart, move || {
-                change(settings, model, |s| s.autostart = !s.autostart)
-            });
-        });
-        let game_audio = s1.game_audio;
-        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-            Choice("Game sound in the headset".into(), game_audio, move || {
-                model.update(|m| m.audio = None);
-                change(settings, model, |s| s.game_audio = !s.game_audio)
-            });
-        });
-        Hint("The headset plays what this Mac plays. The capture takes the sound before the Mac's volume, so you can turn the Mac down. It needs Screen Recording.".into());
-        let game_scale = s1.game_scale;
-        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-            Text("Game render size".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
-            for scale in GAME_SCALE_CHOICES {
-                Choice(format!("{:.0}%", scale * 100.0), (game_scale - scale).abs() < 0.01, move || {
-                    change(settings, model, |s| s.game_scale = scale)
-                });
-            }
-        });
-        Hint("A game that makes fewer frames than the refresh rate adds 10 to 18 ms of latency. The Log tab then names the game's rate. A smaller size or lower anti-aliasing in the game helps.".into());
-        let msaa = s1.game_msaa_limit;
-        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-            Text("Game anti-aliasing".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
-            for (label, limit) in [("At most 2x", 2u32), ("As the game sets it", 0)] {
-                Choice(label.into(), msaa == limit, move || change(settings, model, |s| s.game_msaa_limit = limit));
-            }
-        });
-        Hint("Anti-aliasing costs a Windows game far more on the Mac: Beat Saber made 91 frames a second at 4x and 119 at 2x. With the limit, cranvr tells each game that more than 2x does not exist. It applies when a game starts. A game started from the Steam window gets it after a restart of Steam.".into());
-        let unscale = s1.unscale_displays;
-        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-            Choice("Panel pixels while a game runs".into(), unscale, move || {
-                change(settings, model, |s| s.unscale_displays = !s.unscale_displays)
-            });
-        });
-        Hint("A display in a scaled mode, such as 3008 x 1692 on a 4K TV, makes macOS draw every change at 6016 x 3384 pixels. While a game runs, cranvr gives such a display its panel's own pixels with at least as much room, so windows stay where they are. The mode comes back when the game ends. In a test the Mac's desktop then took about a third of the GPU time.".into());
-        let hand_controllers = s1.hand_controllers;
-        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-            Choice("Controllers from your hands".into(), hand_controllers, move || {
-                change(settings, model, |s| s.hand_controllers = !s.hand_controllers)
-            });
-        });
-        Hint("A game that has no hand tracking gets controllers made of your hands, while the headset tracks no controller. A pinch of thumb and index finger pulls the trigger. A fist presses the grip button. A game that tracks hands itself gets your hands and no controllers.".into());
-        OpenVrSetting(settings);
-        let _ = model.with(|m| m.sizes_version);
-        let learned = backend::learned_game_sizes();
-        if !learned.is_empty() {
-            FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-                for (name, share) in learned.clone() {
-                    Text(format!("{name}: {:.0}%", share * 100.0), Modifier::empty().padding(8.0), TextStyle::default());
-                }
-                Action("Forget learned sizes".into(), move || {
-                    backend::forget_game_sizes();
-                    model.update(|m| m.sizes_version += 1);
-                });
-            });
-        }
-        Hint("A game that stays below the refresh rate for a minute renders smaller at its next start, as a share of the size above. A game reads its size only when it starts.".into());
-        Hint("Changes restart the host; the headset reconnects by itself.".into());
+        PageItems(stream.clone(), settings, model);
+        Hint("A change of the refresh rate, the bitrate, the foveation, the game size, the sound, the panel pixels or the hand controllers restarts the host; the headset reconnects by itself.".into());
     });
     MicrophoneCard(settings, model);
     let paired = model.with(|m| m.native.as_ref().map(|n| n.paired.clone()));
@@ -1497,3 +1288,7 @@ mod bitrate_tests {
 #[cfg(test)]
 #[path = "hover_tests.rs"]
 mod hover_tests;
+
+#[cfg(test)]
+#[path = "pages_render_tests.rs"]
+mod pages_render_tests;

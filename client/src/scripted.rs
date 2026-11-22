@@ -51,6 +51,15 @@
 //!   the handle, pulls and moves 10 cm to the right: the menu moves. The log says each frame in
 //!   which the ray entered a button of the menu ("scripted press:"). `press_wait_ms` sets how long
 //!   the ray points beside the menu first (3000 by default).
+//! - `scripted_pointer=pages` walks the pages of the Mac's settings (launch it with `default_places`).
+//!   The left controller is missing, so the hand menu stands in front of the user. The script waits
+//!   for the host's menu and reads its pages. The right controller then holds B, which opens the hand
+//!   menu, and presses the first page's button there: the console opens on that page. It presses the
+//!   first option of the page's first choice that restarts nothing and does not hold now. It goes
+//!   Back to the main page, opens the first game's Options and presses an option of the game's first
+//!   choice in the same way. Each press waits 1 s with the ray at rest, as the pointer smooths the
+//!   ray. The log names each aim and each choice ("scripted pages:"), and the host's app saves each
+//!   change in its `app.json`.
 //! - `scripted_pointer=palm` plays two hands and no controller: the left hand holds its open palm
 //!   35 cm ahead of the eyes and 15 cm below them, turned to the eyes, and never pinches. The right
 //!   hand points at the ball that shows in front of that palm and pinches every 2 s, which opens and
@@ -106,6 +115,10 @@ pub fn install_once() {
         }
         if args.string("scripted_pointer") == Some("press") {
             press_check();
+            return;
+        }
+        if args.string("scripted_pointer") == Some("pages") {
+            pages_check();
             return;
         }
         if args.string("scripted_pointer") == Some("menu") {
@@ -363,7 +376,7 @@ fn empty_menu_height() -> f32 {
     use crate::{displays::DisplaysView, menu_place::MenuPlace, panel_layout::Layout};
     let layout = Layout::default();
     let displays = DisplaysView::default();
-    let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays, wishes: Default::default(), place: MenuPlace::View, adding: false };
+    let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays, wishes: Default::default(), place: MenuPlace::View, adding: false, pages: &[] };
     menu_model::height(&menu_model::rows(&input))
 }
 
@@ -449,6 +462,136 @@ fn menu_check(hands: &str) {
             script_controller(right);
         }
     }
+}
+
+/// The place in the room of the point `x`, `y` dp from the top left corner of the console, whose
+/// rows `rows` are. The console stands at its default place in a subspace a meter ahead of the head.
+fn on_console(rows: &[crate::page_model::Row], x: f32, y: f32) -> [f32; 3] {
+    use crate::console::size::WIDTH;
+    let height = crate::page_model::height(rows);
+    let console = Pose::at([0.0, 0.0, -1.0]).then(&crate::console_panel::start_place());
+    console.then(&Pose::at([(x - WIDTH / 2.0) / 1000.0, (height / 2.0 - y) / 1000.0, 0.0])).position
+}
+
+/// The first change of a page that restarts nothing: its first option, or toggle state, that does not
+/// hold now.
+fn first_change(page: &cranvr_common::menu::Page) -> Option<cranvr_common::menu::Request> {
+    use cranvr_common::menu::{Item, Request, OFF, ON};
+    page.items.iter().find_map(|item| match item {
+        Item::Choice(choice) if !choice.restarts => choice
+            .options
+            .iter()
+            .find(|option| option.value != choice.value)
+            .map(|option| Request::Set { id: choice.id.clone(), subject: choice.subject.clone(), value: option.value.clone() }),
+        Item::Toggle(toggle) if !toggle.restarts => Some(Request::Set { id: toggle.id.clone(), subject: toggle.subject.clone(), value: if toggle.on { OFF } else { ON }.into() }),
+        _ => None,
+    })
+}
+
+/// Plays `scripted_pointer=pages` (see the file's notes). The steps need the host's pages, so a thread
+/// waits for the menu and installs the right controller's script then.
+fn pages_check() {
+    script_controller(missing(Hand::Left));
+    std::thread::spawn(|| {
+        let since = std::time::Instant::now();
+        let menu = loop {
+            if let Some(menu) = crate::hub::hub().console().menu {
+                break menu;
+            }
+            if since.elapsed() > Duration::from_secs(30) {
+                log::warn!("scripted pages: no menu came from the host in 30 s");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        // The list of displays comes with the link too, and the hand menu lists them above the pages
+        std::thread::sleep(Duration::from_millis(1500));
+        match pages_script(&menu) {
+            Some(right) => script_controller(right),
+            None => log::warn!("scripted pages: the menu has no page with a change to press"),
+        }
+    });
+}
+
+fn pages_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
+    use crate::{
+        console::{Press, Shown},
+        displays::displays,
+        hub::hub,
+        menu_place::MenuPlace,
+        page_model::{console_rows, find_key, key_point, Local},
+        panel_layout::Layout,
+    };
+    use menu_model::size::{DETAIL, GAP, PADDING, ROW, TITLE, WIDTH};
+    let rest = ScriptedButtons::default();
+    let pull = ScriptedButtons { trigger: 1.0, ..rest };
+    let at = MENU_RIGHT_AT;
+    let view = hub().console();
+    let local = Local { room: view.room, volume: view.volume, link: true };
+    let now = std::time::Instant::now();
+    // The hand menu in front of the user: its rows, as `hand_menu.rs` lays them out
+    let pages = menu.listed();
+    let (first_id, first_short) = pages.first()?.clone();
+    let layout = Layout::default();
+    let displays_view = displays().menu_view();
+    let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays_view, wishes: Default::default(), place: MenuPlace::View, adding: false, pages: &pages };
+    let rows = menu_model::rows(&input);
+    let height = menu_model::height(&rows);
+    let mut top = PADDING + TITLE + GAP;
+    let mut page_button = None;
+    for row in &rows {
+        if let Some(index) = row.buttons.iter().position(|button| button.action == menu_model::MenuAction::OpenPage(0)) {
+            let n = row.buttons.len() as f32;
+            let each = (WIDTH - 2.0 * PADDING - (n - 1.0) * GAP) / n;
+            page_button = Some(on_view_menu(height, PADDING + index as f32 * (each + GAP) + each / 2.0, top + ROW / 2.0));
+            break;
+        }
+        top += ROW + GAP + row.details.len() as f32 * DETAIL;
+    }
+    let page_button = page_button?;
+    // A press: the ray rests on the point for 1 s, then the trigger goes down and up
+    let press = |script: ScriptedController, target: [f32; 3]| {
+        script.moving_to(Duration::from_millis(1), (at, target), rest).holding(Duration::from_millis(1000), rest).holding(Duration::from_millis(200), pull).holding(Duration::from_millis(600), rest)
+    };
+    let key_at = |shown: &Shown, wanted: &Press| {
+        let rows = console_rows(Some(menu), shown, local, "", None, now);
+        let (row, key) = find_key(&rows, wanted)?;
+        let [x, y] = key_point(&rows, row, key)?;
+        Some(on_console(&rows, x, y))
+    };
+    let mut right = ScriptedController::new(Hand::Right, at, away_from(at)).holding(Duration::from_millis(500), rest);
+    // The hand menu opens with a hold of B, and its first page's button opens the console there
+    right = right.holding(Duration::from_millis(1200), ScriptedButtons { secondary: true, ..rest }).holding(Duration::from_millis(800), rest);
+    log::info!("scripted pages: the hand menu {height:.0} dp tall; the page {first_short} ({first_id}) at {page_button:?}");
+    right = press(right, page_button);
+    let page = Shown::Host(first_id.clone());
+    if let Some(change) = menu.page(&first_id).and_then(first_change) {
+        let target = key_at(&page, &Press::Host(change.clone()))?;
+        log::info!("scripted pages: on {first_id} the change {} at {target:?}", change.to_json());
+        right = press(right, target);
+    }
+    // Back to the main page, and the first game's options there
+    right = press(right, key_at(&page, &Press::Back)?);
+    let options = menu.main().and_then(|main| {
+        main.items.iter().find_map(|item| match item {
+            cranvr_common::menu::Item::Buttons(row) => row.buttons.iter().find_map(|button| match &button.press {
+                cranvr_common::menu::Press::Open { page } => Some(page.clone()),
+                _ => None,
+            }),
+            _ => None,
+        })
+    });
+    if let Some(game) = options {
+        let target = key_at(&Shown::Main, &Press::Open(game.clone()))?;
+        log::info!("scripted pages: the options {game} at {target:?}");
+        right = press(right, target);
+        if let Some(change) = menu.page(&game).and_then(first_change) {
+            let target = key_at(&Shown::Host(game.clone()), &Press::Host(change.clone()))?;
+            log::info!("scripted pages: on {game} the change {} at {target:?}", change.to_json());
+            right = press(right, target);
+        }
+    }
+    Some(right.moving_to(Duration::from_millis(1), (at, away_from(at)), rest))
 }
 
 /// Where the right controller of the press check stands, in meters from the head's start: below the

@@ -1180,8 +1180,8 @@ mod tests {
     #[ignore]
     fn a_game_that_drew_nothing_through_opencomposite_starts_through_steamvr() {
         use crate::{
-            backend::{self, ConsoleRequest, Model, Settings},
-            game_run, vr_system,
+            backend::{self, Model, Settings},
+            game_run, pages, vr_system,
         };
         let home = PathBuf::from(std::env::var("CRANVR_HOME").expect("CRANVR_HOME names a scratch folder"));
         assert!(home.join("wine").is_symlink(), "the scratch folder's wine is a link to the user's");
@@ -1231,7 +1231,7 @@ mod tests {
         let first_back = run_ends(&folder, &before);
 
         // 3. The console's request
-        let request = format!(r#"3:{{"action": "play", "game": "{name}"}}"#);
+        let request = format!("3:{}", cranvr_common::menu::Request::run("game.play").of(program.clone()).to_json());
         probe = next_probe(&mut probe, &["--seconds", "200", "--console", &request]);
         let asked = Instant::now();
         let mut console_started = false;
@@ -1239,9 +1239,12 @@ mod tests {
             thread::sleep(Duration::from_millis(200));
             backend::pump(&mut model);
             for request in std::mem::take(&mut model.vr_requests) {
-                if let ConsoleRequest::Play(game) = backend::console_request(&Settings::load(), &games(), &request) {
-                    play(&game).expect("the console's game starts");
-                    console_started = true;
+                let Some(request) = cranvr_common::menu::Request::from_json(&request) else { continue };
+                for effect in pages::apply(&mut Settings::load(), &games(), &request).effects {
+                    if let pages::Effect::Play(game) = effect {
+                        play(&game).expect("the console's game starts");
+                        console_started = true;
+                    }
                 }
             }
         }
