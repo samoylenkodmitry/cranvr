@@ -1,15 +1,16 @@
 # Wine patches
 
-cranvr keeps Gcenx's macOS build of Wine 11.10 as its engine. It replaces six files of it with files built from the same Wine tag and cranvr's patches:
+cranvr keeps Gcenx's macOS build of Wine 11.10 as its engine. It replaces seven files of it with files built from the same Wine tag and cranvr's patches:
 
 - `wined3d.dll` holds vkd3d-shader, the HLSL compiler (LGPL 2.1 or later, like Wine). A game that compiles its shaders at run time calls `D3DCompile` in `d3dcompiler_47.dll`, which calls vkd3d-shader in `wined3d.dll`. A game ships its own `d3dcompiler_47.dll` too. Wine loads its own copy first, so every game's HLSL goes through vkd3d-shader.
 - `winemac.so` is the Mac side of Wine's Mac driver. It makes the OpenGL contexts of a Windows program.
 - `opengl32.so` is the Mac side of Wine's `opengl32.dll`. Every OpenGL call of a program goes through it.
 - `wininet.dll` is Wine's HTTP client of the WinINet API.
 - `wtsapi32.dll` answers questions about the Windows session, such as whether the screen is locked.
+- `user32.dll` holds the window functions of Windows.
 - `ntdll.so` is the Mac side of `ntdll.dll`. It manages the memory of a Windows program, among other things.
 
-`scripts/build-wine.sh` clones Wine at the tag `wine-11.10` (commit `2cac6ccf33c0807f374dc96f5a20e35a2da86157`) into `third_party/wine/src` (not committed), applies the patches in this folder and builds the six files into `third_party/wine/build/bin`: the DLLs with MinGW-w64, the Mac libraries with Xcode's clang for x86_64 and macOS 10.15 and newer, as Gcenx's build has. The build runs under Rosetta 2, because Wine's configure wants a 64-bit Intel host. `scripts/setup-wine.sh` copies the DLLs into the engine and into the prefix's `system32`, where the loader takes them, and the libraries into the engine. The wine tree is not used otherwise. `package-game-support.sh` packs the pinned source tree and the patches as `SOURCE/wine-source.tar.xz` and as `cranvr-wine-source.tar.xz` in the release.
+`scripts/build-wine.sh` clones Wine at the tag `wine-11.10` (commit `2cac6ccf33c0807f374dc96f5a20e35a2da86157`) into `third_party/wine/src` (not committed), applies the patches in this folder and builds the seven files into `third_party/wine/build/bin`: the DLLs with MinGW-w64, the Mac libraries with Xcode's clang for x86_64 and macOS 10.15 and newer, as Gcenx's build has. The build runs under Rosetta 2, because Wine's configure wants a 64-bit Intel host. `scripts/setup-wine.sh` copies the DLLs into the engine and into the prefix's `system32`, where the loader takes them, and the libraries into the engine. The wine tree is not used otherwise. `package-game-support.sh` packs the pinned source tree and the patches as `SOURCE/wine-source.tar.xz` and as `cranvr-wine-source.tar.xz` in the release.
 
 ## patches
 
@@ -52,6 +53,12 @@ cranvr keeps Gcenx's macOS build of Wine 11.10 as its engine. It replaces six fi
 - SteamVR's compositor asks `WTSQuerySessionInformationA` for `WTSSessionInfoEx` and `WTSIsRemoteSession`, to learn whether the screen of the computer is locked. Wine 11.10 answered neither class ("Unimplemented class 25" and "29"). The compositor took the session as locked. In that state SteamVR marks the headset's pose of each frame invalid (`TrackingResult_Uninitialized`) and fades the picture out to a plain color. The pose that `WaitGetPoses` returned to a game for the head was invalid in every frame, with SteamVR's own null driver too. The setting `steamvr.allowDisplayLockedMode` hid the symptom.
 - `WTSSessionInfoEx` now gives level 1 of `WTSINFOEX` with the console's session: active, `WTS_SESSIONSTATE_UNLOCK`, the station "Console", the user and the computer's name. `WTSIsRemoteSession` gives one byte, 0. The ANSI call converts the strings of the first one and passes the byte of the second. The patch adds the structures to `include/wtsapi32.h`.
 - With the patch, an OpenVR program under SteamVR got a valid head pose in 1056 of 1056 frames (none before), and SteamVR showed its room instead of the fade.
+
+`0007-user32-dwmgetdxsharedsurface-for-vrdesktop.patch`
+
+- SteamVR's dashboard (`vrdashboard.exe`) loads `vrdesktop.dll`, which shows the computer's desktop in the dashboard. The DLL imports `DwmGetDxSharedSurface` from `user32.dll`. Wine 11.10 lists the function as a comment only, so the import failed and the dashboard logged "Failed to initialize vrdesktop". Without the dashboard, the menu button of a controller opened nothing.
+- `user32.dll` now exports `DwmGetDxSharedSurface`. It fails with `ERROR_CALL_NOT_IMPLEMENTED`, because Wine has no DWM that composes windows from shared surfaces. `vrdesktop.dll` then takes the desktop's picture another way.
+- With the patch, vrdesktop initializes, and the menu button opens the dashboard over the game in the headset's picture.
 
 ## tests
 

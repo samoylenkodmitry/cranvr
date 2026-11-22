@@ -2,38 +2,252 @@ Subject: [PATCH] d3d11: a keyed mutex for shared textures (cranvr)
 
 SteamVR passes frames between its processes in textures made with SHARED_KEYEDMUTEX and orders the access with their
 keyed mutexes. Chromium's GPU process asks the textures that it shares for the mutex too. DXMT gave no such interface.
-A texture made with SHARED_KEYEDMUTEX now answers the query. ReleaseSync returns once the GPU has finished every
-command that the device sent before it, so the texture holds the writer's draws when the reader learns of them.
-AcquireSync then returns at once.
+A texture made with SHARED_KEYEDMUTEX now answers the query.
+
+The GPU keeps the order, as on Windows. The processes of one texture share a Metal shared event and a count of the
+releases in a small section of shared memory, both named after the texture's shared name. ReleaseSync has the GPU set
+the event to the next count after the caller's commands. AcquireSync has the GPU wait for the last count before the
+caller's next commands. Neither call waits for the GPU. A reader's process sets the event itself when a writer's GPU
+has not set it within a second, so a writer that ends early does not stop the reader's GPU for good.
+
+A first version waited in ReleaseSync until the GPU had finished. The Lab then waited 8.5 ms in each frame and
+SteamVR's compositor 8.7 ms, and SteamVR made about 50 frames a second at 72 Hz. With the event it made 65 in a run
+right after.
 ---
+diff --git a/src/d3d11/d3d11_fence.cpp b/src/d3d11/d3d11_fence.cpp
+index 5a88050..65146c0 100644
+--- a/src/d3d11/d3d11_fence.cpp
++++ b/src/d3d11/d3d11_fence.cpp
+@@ -135,6 +135,14 @@ CreateFence(MTLD3D11Device *pDevice, UINT64 InitialValue, D3D11_FENCE_FLAG Flags
+   return fence->QueryInterface(riid, ppFence);
+ }
+ 
++HRESULT
++CreateFenceOfEvent(MTLD3D11Device *pDevice, WMT::Reference<WMT::SharedEvent> event,
++                   REFIID riid, void **ppFence) {
++  InitReturnPtr(ppFence);
++  auto fence = new MTLD3D11FenceImpl(pDevice, std::move(event), 0);
++  return fence->QueryInterface(riid, ppFence);
++}
++
+ HRESULT
+ OpenSharedFence(MTLD3D11Device *pDevice, HANDLE hResource,
+                 REFIID riid, void **ppFence) {
+diff --git a/src/d3d11/d3d11_fence.hpp b/src/d3d11/d3d11_fence.hpp
+index 497123e..f98d37e 100644
+--- a/src/d3d11/d3d11_fence.hpp
++++ b/src/d3d11/d3d11_fence.hpp
+@@ -17,4 +17,9 @@ HRESULT
+ OpenSharedFence(MTLD3D11Device *pDevice, HANDLE hResource,
+                 REFIID riid, void **ppFence);
+ 
++/* cranvr: a fence of an existing shared event, for the keyed mutex (d3d11_keyed_mutex.hpp) */
++HRESULT
++CreateFenceOfEvent(MTLD3D11Device *pDevice, WMT::Reference<WMT::SharedEvent> event,
++                   REFIID riid, void **ppFence);
++
+ } // namespace dxmt
+\ No newline at end of file
 diff --git a/src/d3d11/d3d11_keyed_mutex.hpp b/src/d3d11/d3d11_keyed_mutex.hpp
 new file mode 100644
-index 0000000..a82e8cc
+index 0000000..aa748ba
 --- /dev/null
 +++ b/src/d3d11/d3d11_keyed_mutex.hpp
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,345 @@
 +#pragma once
 +/*
 + * cranvr: IDXGIKeyedMutex for a resource created with D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.
 + *
 + * SteamVR passes frames between its processes in shared textures and orders the access with their
 + * keyed mutexes: the writer releases the mutex after its draws, the reader acquires it before its
-+ * reads. DXMT gave no such interface. This one makes the order hold without shared state: ReleaseSync
-+ * returns once the GPU has finished every command that the device sent before it, so the texture
-+ * holds the writer's draws when the reader learns of them. AcquireSync then returns at once. The key
-+ * is not checked, so a reader that waits for one writer of several gets no wait.
++ * reads. Metal does not order the command buffers of two processes, so the reader's GPU must not
++ * read before the GPU has finished the writer's draws. On Windows the GPU's scheduler keeps that
++ * order, and neither call waits for the GPU. This one does the same with a Metal shared event.
++ *
++ * Every process that holds a shared texture maps one small section of shared memory. The name of the
++ * section comes from the texture's shared Metal name, so all processes find the same one. The process
++ * that makes the section also makes the event and registers it under a name of the same kind; the
++ * others look it up. The section counts the releases. ReleaseSync takes the next count and has the GPU
++ * set the event to it after the caller's commands. AcquireSync has the GPU wait until the event reaches
++ * the last count before the caller's next commands. Both return at once, and the key is not checked.
++ * If a writer's process ends before its GPU sets the event, the reader's process sets it after a
++ * second, so the reader's GPU does not wait for good.
++ *
++ * A texture without a shared Metal name (an NT handle, or a texture that was not shared) keeps the
++ * first way: ReleaseSync returns once the GPU has finished every command that the device sent before
++ * it, and AcquireSync returns at once.
 + */
 +#include "dxgi1_2.h"
 +#include "com/com_pointer.hpp"
 +#include "d3d11_1.h"
++#include "d3d11_4.h"
++#include "d3d11_device.hpp"
++#include "d3d11_fence.hpp"
 +#include "log/log.hpp"
++#include "thread.hpp"
++#include "util_win32_compat.h"
 +#include <windows.h>
++#include <cstring>
++#include <deque>
++#include <memory>
++#include <string>
++#include <utility>
 +
 +namespace dxmt {
 +
++/* The section that the processes of one shared texture map; a new section holds zeros */
++struct KeyedMutexCounts {
++  volatile LONG64 released; // the ReleaseSync calls of all processes, the last value of the event
++  volatile LONG ready;      // 1 once the event is registered, 2 if it cannot be
++};
++
++class KeyedMutexSection {
++public:
++  static std::shared_ptr<KeyedMutexSection> Open(MTLD3D11Device *device, const char *name) {
++    std::wstring section = L"Local\\dxmt_keyed_mutex_";
++    for (const char *c = name; *c; c++)
++      section += static_cast<wchar_t>(*c);
++    std::string event_name = std::string(name) + "_keyed_mutex";
++    auto opened = std::make_shared<KeyedMutexSection>();
++    opened->mapping_ =
++        CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(KeyedMutexCounts), section.c_str());
++    if (!opened->mapping_)
++      return nullptr;
++    bool created = GetLastError() != ERROR_ALREADY_EXISTS;
++    opened->counts_ = static_cast<KeyedMutexCounts *>(
++        MapViewOfFile(opened->mapping_, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(KeyedMutexCounts))
++    );
++    if (!opened->counts_)
++      return nullptr;
++    if (created) {
++      opened->event_ = device->GetMTLDevice().newSharedEvent();
++      mach_port_t port = opened->event_.createMachPort();
++      if (!port || !WMTBootstrapRegister(event_name.c_str(), port)) {
++        InterlockedExchange(&opened->counts_->ready, 2);
++        return nullptr;
++      }
++      InterlockedExchange(&opened->counts_->ready, 1);
++    } else {
++      // The process that made the section registers the event right after it
++      ULONGLONG until = GetTickCount64() + 1000;
++      while (InterlockedCompareExchange(&opened->counts_->ready, 0, 0) == 0 && GetTickCount64() < until)
++        Sleep(1);
++      mach_port_t port = 0;
++      if (InterlockedCompareExchange(&opened->counts_->ready, 0, 0) != 1 ||
++          !WMTBootstrapLookUp(event_name.c_str(), &port))
++        return nullptr;
++      opened->event_ = device->GetMTLDevice().newSharedEventWithMachPort(port);
++    }
++    if (FAILED(CreateFenceOfEvent(device, opened->event_, IID_PPV_ARGS(&opened->fence_))))
++      return nullptr;
++    return opened;
++  }
++
++  KeyedMutexSection() = default;
++  KeyedMutexSection(const KeyedMutexSection &) = delete;
++  KeyedMutexSection &operator=(const KeyedMutexSection &) = delete;
++
++  ~KeyedMutexSection() {
++    fence_ = nullptr;
++    if (counts_)
++      UnmapViewOfFile(counts_);
++    if (mapping_)
++      CloseHandle(mapping_);
++  }
++
++  LONG64 Release() { return InterlockedIncrement64(&counts_->released); }
++
++  LONG64 Released() { return InterlockedCompareExchange64(&counts_->released, 0, 0); }
++
++  ID3D11Fence *Fence() { return fence_.ptr(); }
++
++  /* The CPU sets the event when a writer's GPU does not */
++  void Signal(UINT64 value) {
++    if (event_.signaledValue() < value)
++      event_.signalValue(value);
++  }
++
++private:
++  HANDLE mapping_ = nullptr;
++  KeyedMutexCounts *counts_ = nullptr;
++  WMT::Reference<WMT::SharedEvent> event_;
++  Com<ID3D11Fence> fence_;
++};
++
++/* A thread of each process that sets an event that a writer's GPU did not set within a second; it lives
++ * until the process ends */
++class KeyedMutexWatch {
++public:
++  struct Job {
++    Com<ID3D11Device> device; // keeps the fence's device alive while the thread waits
++    std::shared_ptr<KeyedMutexSection> section;
++    UINT64 value = 0;
++  };
++
++  static KeyedMutexWatch &Get() {
++    static KeyedMutexWatch *watch = new KeyedMutexWatch();
++    return *watch;
++  }
++
++  void Push(Job &&job) {
++    std::unique_lock<dxmt::mutex> lock(lock_);
++    if (!thread_) {
++      gpu_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++      // The thread runs code of this DLL, so the DLL stays loaded
++      HMODULE self = nullptr;
++      GetModuleHandleExW(
++          GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
++          reinterpret_cast<LPCWSTR>(&KeyedMutexWatch::Run), &self
++      );
++      if (gpu_event_)
++        thread_ = CreateThread(nullptr, 0, &KeyedMutexWatch::Run, this, 0, nullptr);
++    }
++    if (!thread_)
++      return; // nobody watches: a writer that ends early leaves the reader's GPU waiting
++    jobs_.push_back(std::move(job));
++    ready_.notify_one();
++  }
++
++private:
++  static DWORD WINAPI Run(void *self) {
++    static_cast<KeyedMutexWatch *>(self)->Loop();
++    return 0;
++  }
++
++  void Loop() {
++    for (;;) {
++      Job job;
++      {
++        std::unique_lock<dxmt::mutex> lock(lock_);
++        ready_.wait(lock, [&] { return !jobs_.empty(); });
++        job = std::move(jobs_.front());
++        jobs_.pop_front();
++      }
++      // A wake that an earlier job's late signal caused is checked against the fence again
++      ID3D11Fence *fence = job.section->Fence();
++      ULONGLONG until = GetTickCount64() + 1000;
++      while (fence->GetCompletedValue() < job.value) {
++        if (GetTickCount64() > until) {
++          WARN("DXGIKeyedMutex: the writer's GPU did not finish within a second; the reader goes on");
++          job.section->Signal(job.value);
++          break;
++        }
++        fence->SetEventOnCompletion(job.value, gpu_event_);
++        WaitForSingleObject(gpu_event_, 100);
++      }
++    }
++  }
++
++  dxmt::mutex lock_;
++  dxmt::condition_variable ready_;
++  std::deque<Job> jobs_;
++  HANDLE thread_ = nullptr;
++  HANDLE gpu_event_ = nullptr;
++};
++
 +template <typename IResource> class MTLDXGIKeyedMutex : public IDXGIKeyedMutex {
 +public:
-+  MTLDXGIKeyedMutex(IResource *pResource) : resource_(pResource) {}
++  MTLDXGIKeyedMutex(IResource *pResource, MTLD3D11Device *pDevice) : resource_(pResource), device_(pDevice) {}
 +  virtual ~MTLDXGIKeyedMutex() {}
 +
 +  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) final {
@@ -57,19 +271,33 @@ index 0000000..a82e8cc
 +  }
 +
 +  HRESULT STDMETHODCALLTYPE AcquireSync(UINT64 Key, DWORD dwMilliseconds) final {
-+    // The writer's ReleaseSync waited for its GPU work
++    Com<ID3D11DeviceContext> context;
++    device_->GetImmediateContext(&context);
++    if (!Section() || !Context(context.ptr()))
++      return S_OK; // the writer's ReleaseSync waited for its GPU work
++    UINT64 value = static_cast<UINT64>(section_->Released());
++    ID3D11Fence *fence = section_->Fence();
++    if (fence->GetCompletedValue() >= value)
++      return S_OK;
++    context4_->Wait(fence, value);
++    KeyedMutexWatch::Job job;
++    job.device = device_;
++    job.section = section_;
++    job.value = value;
++    KeyedMutexWatch::Get().Push(std::move(job));
 +    return S_OK;
 +  }
 +
 +  HRESULT STDMETHODCALLTYPE ReleaseSync(UINT64 Key) final {
-+    Com<ID3D11Device> device;
-+    if (FAILED(resource_->GetDeviceInterface(__uuidof(ID3D11Device), reinterpret_cast<void **>(&device))))
-+      return S_OK;
 +    Com<ID3D11DeviceContext> context;
-+    device->GetImmediateContext(&context);
++    device_->GetImmediateContext(&context);
++    if (Section() && Context(context.ptr())) {
++      context4_->Signal(section_->Fence(), static_cast<UINT64>(section_->Release())); // flushes
++      return S_OK;
++    }
 +    if (!query_) {
 +      D3D11_QUERY_DESC desc = {D3D11_QUERY_EVENT, 0};
-+      if (FAILED(device->CreateQuery(&desc, &query_)))
++      if (FAILED(device_->CreateQuery(&desc, &query_)))
 +        return S_OK;
 +    }
 +    context->End(query_.ptr());
@@ -87,13 +315,92 @@ index 0000000..a82e8cc
 +  }
 +
 +private:
++  /* The section of the texture, from the shared Metal name that its runtime data holds */
++  KeyedMutexSection *Section() {
++    if (section_ || section_tried_)
++      return section_.get();
++    section_tried_ = true;
++    D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
++    resource_->GetType(&dimension);
++    if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER || dimension == D3D11_RESOURCE_DIMENSION_UNKNOWN)
++      return nullptr;
++    HANDLE global = nullptr;
++    if (FAILED(resource_->GetSharedHandle(&global)) || !global) {
++      Unshared("the texture has no shared handle");
++      return nullptr;
++    }
++    // The query gives the size of the runtime data, and opening the resource gives the data
++    D3DKMT_QUERYRESOURCEINFO query = {};
++    query.hDevice = device_->GetLocalD3DKMT();
++    query.hGlobalShare = static_cast<D3DKMT_HANDLE>(reinterpret_cast<uintptr_t>(global));
++    constexpr UINT name_size = 54; // SharedResourceData::mach_port_name
++    char data[512];
++    if (D3DKMTQueryResourceInfo(&query) || query.PrivateRuntimeDataSize < name_size ||
++        query.PrivateRuntimeDataSize > sizeof(data)) {
++      Unshared("the shared handle has no runtime data");
++      return nullptr;
++    }
++    D3DDDI_OPENALLOCATIONINFO2 allocation = {};
++    D3DKMT_OPENRESOURCE open = {};
++    open.hDevice = device_->GetLocalD3DKMT();
++    open.hGlobalShare = query.hGlobalShare;
++    open.NumAllocations = 1;
++    open.pOpenAllocationInfo2 = &allocation;
++    open.pPrivateRuntimeData = data;
++    open.PrivateRuntimeDataSize = query.PrivateRuntimeDataSize;
++    if (D3DKMTOpenResource2(&open)) {
++      Unshared("the shared handle does not open");
++      return nullptr;
++    }
++    D3DKMT_DESTROYALLOCATION destroy = {};
++    destroy.hDevice = device_->GetLocalD3DKMT();
++    destroy.hResource = open.hResource;
++    D3DKMTDestroyAllocation(&destroy);
++    char name[name_size];
++    memcpy(name, data, name_size);
++    name[name_size - 1] = 0;
++    if (!name[0]) {
++      Unshared("the texture has no shared name");
++      return nullptr;
++    }
++    section_ = KeyedMutexSection::Open(device_, name);
++    if (!section_) {
++      Unshared("the shared event cannot be made or found");
++      return nullptr;
++    }
++    static bool told = false;
++    if (!std::exchange(told, true))
++      Logger::info(str::format("DXGIKeyedMutex: the GPU orders the readers and writers of ", std::string(name)));
++    return section_.get();
++  }
++
++  static void Unshared(const char *why) {
++    static bool told = false;
++    if (!std::exchange(told, true))
++      WARN("DXGIKeyedMutex: ", why, ", so its ReleaseSync waits for the GPU");
++  }
++
++  bool Context(ID3D11DeviceContext *context) {
++    if (context4_)
++      return true;
++    if (context_tried_)
++      return false;
++    context_tried_ = true;
++    return SUCCEEDED(context->QueryInterface(IID_PPV_ARGS(&context4_)));
++  }
++
 +  IResource *resource_; // aggregated: the resource holds this object
++  MTLD3D11Device *device_;
 +  Com<ID3D11Query> query_;
++  std::shared_ptr<KeyedMutexSection> section_;
++  bool section_tried_ = false;
++  Com<ID3D11DeviceContext4> context4_;
++  bool context_tried_ = false;
 +};
 +
 +} // namespace dxmt
 diff --git a/src/d3d11/d3d11_resource.hpp b/src/d3d11/d3d11_resource.hpp
-index 80927e5..9ef6170 100644
+index 80927e5..074a942 100644
 --- a/src/d3d11/d3d11_resource.hpp
 +++ b/src/d3d11/d3d11_resource.hpp
 @@ -8,6 +8,7 @@
@@ -108,7 +415,7 @@ index 80927e5..9ef6170 100644
        MTLD3D11DeviceChild<D3D11ResourceCommon, Base...>(device),
        desc(desc),
        dxgi_resource(new MTLDXGIResource<TResourceBase<tag, Base...>>(this)),
-+      keyed_mutex(new MTLDXGIKeyedMutex<TResourceBase<tag, Base...>>(this)),
++      keyed_mutex(new MTLDXGIKeyedMutex<TResourceBase<tag, Base...>>(this, device)),
        d3d10(reinterpret_cast<tag::COM *>(this), device->GetImmediateContextPrivate()) {
      // D3D11ResourceCommonß::bind_flags_
      this->bind_flags_ = desc.BindFlags;

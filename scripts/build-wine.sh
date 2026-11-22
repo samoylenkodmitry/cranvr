@@ -10,6 +10,8 @@
 #   - wininet.dll: it closes the handles of a program with requests on several threads without a race.
 #   - wtsapi32.dll: it reports the program's session as the console, unlocked and local. SteamVR's compositor hides
 #     the headset's picture while it takes the session as locked.
+#   - user32.dll: it exports DwmGetDxSharedSurface, which SteamVR's dashboard imports through vrdesktop.dll. The
+#     function fails, because Wine has no DWM.
 #   - ntdll.so, the Mac side of ntdll: it gives a program with high-entropy addresses its memory above 4 GB, as
 #     Windows does. The detours of MonoMod (Harmony in Unity mods) need free pages near their code. Thread stacks
 #     stay below 4 GB, under the stacks of Wine's Mac side.
@@ -18,11 +20,11 @@
 # Then:  scripts/package-game-support.sh
 #
 # It clones Wine at the tag wine-11.10 (commit pinned below) into DIR, applies cranvr's patches from
-# third_party/wine/patches and builds the six files. Windows files are 64-bit PE files from the MinGW-w64 cross
+# third_party/wine/patches and builds the seven files. Windows files are 64-bit PE files from the MinGW-w64 cross
 # compiler that builds BasaltVR's runtime. Mac files are x86_64 libraries for Rosetta 2 with macOS 10.15 as the
 # oldest system, as Gcenx's build has. Wine's build needs a 64-bit Intel host to configure, so the script runs
 # configure and make under Rosetta 2 (arch -x86_64). The build goes to the build folder beside DIR. The results are
-# in build/bin: wined3d.dll, wininet.dll and wtsapi32.dll (stripped), winemac.so, opengl32.so, ntdll.so, and cranvr's
+# in build/bin: wined3d.dll, wininet.dll, wtsapi32.dll and user32.dll (stripped), winemac.so, opengl32.so, ntdll.so, and cranvr's
 # test programs hlsl_compile.exe (the HLSL compiler), gl_compat_check.exe (an OpenGL program like Google Earth VR),
 # far_jump_check.exe (MonoMod's far jump), stack_sample_check.exe (a sampling profiler's stack copy) and
 # session_check.exe (the session's state, as SteamVR asks for it).
@@ -105,14 +107,15 @@ if [[ ! -f ${build}/wine/Makefile || $(cat "${build}/wine/configure-line.txt" 2>
     print -r -- "${configure_line}" > "${build}/wine/configure-line.txt"
 fi
 
-print "Building wined3d.dll, wininet.dll, wtsapi32.dll, winemac.so, opengl32.so and ntdll.so (under Rosetta 2)"
-(cd "${build}/wine" && arch -x86_64 make -j"$(sysctl -n hw.ncpu)" dlls/wined3d/all dlls/wininet/all dlls/wtsapi32/all \
+print "Building wined3d.dll, wininet.dll, wtsapi32.dll, user32.dll, winemac.so, opengl32.so and ntdll.so (under Rosetta 2)"
+(cd "${build}/wine" && arch -x86_64 make -j"$(sysctl -n hw.ncpu)" dlls/wined3d/all dlls/wininet/all dlls/wtsapi32/all dlls/user32/all \
     dlls/winemac.drv/all dlls/opengl32/all dlls/ntdll/all > make.log 2>&1) || { tail -30 "${build}/wine/make.log" >&2; exit 1; }
 
 mkdir -p "${build}/bin"
 x86_64-w64-mingw32-strip -o "${build}/bin/wined3d.dll" "${build}/wine/dlls/wined3d/x86_64-windows/wined3d.dll"
 x86_64-w64-mingw32-strip -o "${build}/bin/wininet.dll" "${build}/wine/dlls/wininet/x86_64-windows/wininet.dll"
 x86_64-w64-mingw32-strip -o "${build}/bin/wtsapi32.dll" "${build}/wine/dlls/wtsapi32/x86_64-windows/wtsapi32.dll"
+x86_64-w64-mingw32-strip -o "${build}/bin/user32.dll" "${build}/wine/dlls/user32/x86_64-windows/user32.dll"
 cp "${build}/wine/dlls/winemac.drv/winemac.so" "${build}/wine/dlls/opengl32/opengl32.so" "${build}/wine/dlls/ntdll/ntdll.so" \
     "${build}/bin/"
 # ntdll.so unwinds through the Mac side with the system's unwinder, as the ntdll.so of Gcenx's build does

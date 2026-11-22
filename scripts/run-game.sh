@@ -187,6 +187,19 @@ for steamapps in libraries:
                  "jsonid": "vrpathreg", "log": [windows(os.path.join(steam, "logs"))], "runtime": [windows(folder)], "version": 1}
         open(vrpath, "w").write(json.dumps(paths))
         print("OpenVR games use SteamVR in " + windows(folder) + " (" + vrpath + ")")
+        # After a crash of its server SteamVR turns the drivers off ("blocked_by_safe_mode") and loads them no
+        # more. Without cranvr's driver SteamVR has no headset, so the driver is turned on again.
+        settings = os.path.join(steam, "config", "steamvr.vrsettings")
+        try:
+            values = json.load(open(settings, encoding="utf-8"))
+            driver = values.get("driver_cranvr")
+            if isinstance(driver, dict) and driver.pop("blocked_by_safe_mode", False):
+                if not driver:
+                    del values["driver_cranvr"]
+                open(settings, "w", encoding="utf-8").write(json.dumps(values, indent=3))
+                print("SteamVR had turned cranvr's driver off after a crash; it is on again (" + settings + ")")
+        except (OSError, ValueError):
+            pass
         sys.exit(0)
 print("SteamVR is not installed: install SteamVR from the Steam library of the prefix", file=sys.stderr)
 sys.exit(1)
@@ -198,5 +211,12 @@ PYTHON
                 print "OpenVR games find no runtime (OpenVR is off)"
             fi ;;
     esac
+fi
+# cranvr's SteamVR driver finds the game's render size in game-sizes.txt by the game's program. SteamVR, which
+# the game starts, inherits the variable.
+if [[ ${program} == [A-Za-z]:\\* ]]; then
+    export CRANVR_GAME=${program}
+else
+    export CRANVR_GAME=$("${wine_root}/bin/wine" winepath -w "${program:A}" 2>/dev/null)
 fi
 exec "${wine_root}/bin/wine" "${program}" "$@"

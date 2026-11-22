@@ -95,6 +95,8 @@ pub struct Options {
     /// the cycle (the left grip, the right trigger, A and the right stick) is off then, so the pulls
     /// are the only presses.
     pub left_trigger: Option<(f32, f32)>,
+    /// The left controller's menu button goes down at this many seconds for 0.3 s, once
+    pub menu: Option<f32>,
     /// Pulls the right trigger once, in the same way
     pub right_trigger: Option<(f32, f32)>,
 }
@@ -199,6 +201,7 @@ struct Shared {
     sent_tracking: [AtomicU64; 4],
     pause: Option<(f32, f32)>,
     left_trigger: Option<(f32, f32)>,
+    menu: Option<f32>,
     right_trigger: Option<(f32, f32)>,
     /// Frames of the eye stream that arrived, for the pause test
     units_seen: AtomicU64,
@@ -322,6 +325,7 @@ pub fn run(o: Options) -> i32 {
         sent_tracking: Default::default(),
         pause: o.pause,
         left_trigger: o.left_trigger,
+        menu: o.menu,
         right_trigger: o.right_trigger,
         units_seen: AtomicU64::new(0),
         pause_result: Mutex::new(None),
@@ -807,10 +811,11 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
             if controllers {
                 // The left trigger's pull, once, for a game that waits for the first press of that hand
                 let pulled = shared.left_trigger.is_some_and(|(at, length)| (at..at + length).contains(&t));
+                let menu = shared.menu.is_some_and(|at| (at..at + 0.3).contains(&t));
                 input.hands[0] = HandInput {
                     grip: on(1.0),
                     trigger: if pulled { 1.0 } else { 0.0 },
-                    buttons: (buttons::GRIP_CLICK * u32::from(held)) | (buttons::TRIGGER_CLICK * u32::from(pulled)),
+                    buttons: (buttons::GRIP_CLICK * u32::from(held)) | (buttons::TRIGGER_CLICK * u32::from(pulled)) | (buttons::MENU * u32::from(menu)),
                     touches: buttons::TRIGGER_CLICK * u32::from(pulled),
                     ..Default::default()
                 };

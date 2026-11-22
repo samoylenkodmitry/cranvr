@@ -69,7 +69,8 @@ fn usage() -> ! {
          \n                     of the cycle is off then, so the pulls are the only presses. A game that shows one\
          \n                     pointer at a time, such as a menu, then has its left controller pressed for the\
          \n                     first time at AT.\
-         \n  --right-trigger AT:FOR  the same for the right trigger"
+         \n  --right-trigger AT:FOR  the same for the right trigger\
+         \n  --menu AT          the left controller's menu button goes down at AT seconds for 0.3 s, once"
     );
     std::process::exit(2);
 }
@@ -109,6 +110,7 @@ fn main() {
         face_source: Default::default(),
         pause: None,
         left_trigger: None,
+        menu: None,
         right_trigger: None,
     };
     let mut args = env::args().skip(1);
@@ -132,6 +134,7 @@ fn main() {
             "--hands-lift" => options.hands_lift = value().parse().unwrap_or_else(|_| usage()),
             "--face-source" => options.face_source = tracked::FaceSource::parse(&value()).unwrap_or_else(|| usage()),
             "--left-trigger" => options.left_trigger = Some(parse_pull(&value()).unwrap_or_else(|| usage())),
+            "--menu" => options.menu = Some(value().parse().unwrap_or_else(|_| usage())),
             "--right-trigger" => options.right_trigger = Some(parse_pull(&value()).unwrap_or_else(|| usage())),
             "--pause" => options.pause = Some(parse_pause(&value()).unwrap_or_else(|| usage())),
             "--drop-percent" => options.drop_percent = value().parse().unwrap_or_else(|_| usage()),

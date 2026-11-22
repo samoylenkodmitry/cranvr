@@ -10,11 +10,12 @@
 //
 // Frames. SteamVR runs in its direct mode with this driver (IVRDriverDirectModeComponent). Its compositor draws
 // each layer of a frame (a game's eyes, then SteamVR's own panels such as the controller hints) into textures that
-// the driver made for it, and calls Present. The driver draws the layers into one of its three pairs of eye images
-// with one draw per layer and eye, waits for its GPU and tells the host which images hold the frame. The eye images are
-// IOSurfaces: DXMT backs a SHARED_NTHANDLE BGRA texture with one when DXMT_BASALT_IOSURFACE=1, as it does for the
-// OpenXR runtime. The pixels never leave the GPU. DXMT's keyed mutex (cranvr's DXMT patch 0014) returns from the
-// compositor's ReleaseSync only after its GPU work is done, so a layer is complete when Present arrives.
+// the driver made for it, and calls Present with its sync texture. The driver acquires the sync texture's keyed
+// mutex, so its GPU work waits until the GPU has finished the compositor's draws (cranvr's DXMT patch 0014). It
+// then draws the layers into one of its three pairs of eye images with one draw per layer and eye. A thread of the
+// driver waits for that GPU work and tells the host which images hold the frame, so Present returns while the GPU
+// still draws. The eye images are IOSurfaces: DXMT backs a SHARED_NTHANDLE BGRA texture with one when
+// DXMT_BASALT_IOSURFACE=1, as it does for the OpenXR runtime. The pixels never leave the GPU.
 //
 // Poses. The head pose goes to SteamVR without velocity, so the compositor draws with the very pose that the host
 // sent. The driver keeps the last poses with the host's timestamps and finds the one that a frame was drawn
@@ -35,6 +36,7 @@
 
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
+#include <d3d11_4.h>
 #include <dxgi1_2.h>
 
 #include <algorithm>
@@ -247,6 +249,37 @@ bool ReadControl(Control &out) {
     out.height = fields >= 4 && height >= 256 ? height & ~1u : 1920;
     out.fps = fields >= 5 && fps >= 60 && fps <= 240 ? fps : 72;
     return true;
+}
+
+// The game's share of the eye size, as the host learned it (host/src/game_sizes.rs): game-sizes.txt beside the
+// control file holds lines "<share> <program>", and the last line of the game wins. The OpenXR runtime reads the
+// same file in the game's own process (cranvr's runtime patch 0002). The driver runs in vrserver.exe, so it learns
+// the game's program from CRANVR_GAME, which cranvr sets for the game and SteamVR inherits from it. 1 without both.
+float GameShare(std::string *program_out) {
+    char program[1024];
+    DWORD n = GetEnvironmentVariableA("CRANVR_GAME", program, sizeof program);
+    std::string control = ControlPath();
+    size_t slash = control.find_last_of("\\/");
+    if (n == 0 || n >= sizeof program || slash == std::string::npos) {
+        return 1.0f;
+    }
+    *program_out = std::string(program, n);
+    FILE *file = fopen((control.substr(0, slash + 1) + "game-sizes.txt").c_str(), "rb");
+    if (!file) {
+        return 1.0f;
+    }
+    float found = 1.0f;
+    char line[1100];
+    while (fgets(line, sizeof line, file)) {
+        line[strcspn(line, "\r\n")] = 0;
+        char *rest = nullptr;
+        float share = strtof(line, &rest);
+        if (rest != line && *rest == ' ' && _stricmp(rest + 1, program_out->c_str()) == 0 && share >= 0.3f && share <= 1.0f) {
+            found = share;
+        }
+    }
+    fclose(file);
+    return found;
 }
 
 // ---- packets ----
@@ -647,6 +680,14 @@ public:
     }
 
     void Shutdown() {
+        {
+            std::lock_guard<std::mutex> jobs(jobLock_);
+            stopSender_ = true;
+        }
+        jobReady_.notify_all();
+        if (sender_.joinable()) {
+            sender_.join();
+        }
         std::lock_guard<std::mutex> lock(lock_);
         for (auto &set : sets_) {
             ReleaseSet(set);
@@ -666,7 +707,15 @@ public:
         release(opaque_);
         release(blend_);
         release(raster_);
-        release(query_);
+        release(syncMutex_);
+        release(syncTexture_);
+        syncHandle_ = 0;
+        release(done_);
+        release(context4_);
+        if (doneEvent_) {
+            CloseHandle(doneEvent_);
+            doneEvent_ = nullptr;
+        }
         release(context_);
         release(device_);
     }
@@ -855,7 +904,35 @@ private:
     ID3D11SamplerState *sampler_ = nullptr;
     ID3D11BlendState *opaque_ = nullptr, *blend_ = nullptr;
     ID3D11RasterizerState *raster_ = nullptr;
-    ID3D11Query *query_ = nullptr;
+    // A fence that the GPU sets to the frame's number after its draws. The sender thread waits for it with an
+    // event, so only Present's thread uses the device's context.
+    ID3D11Fence *done_ = nullptr;
+    ID3D11DeviceContext4 *context4_ = nullptr;
+    HANDLE doneEvent_ = nullptr;
+    // The compositor's sync texture. Present acquires its keyed mutex before the driver reads the layers, so the GPU
+    // reads them after it has finished the compositor's draws (cranvr's DXMT patch 0014).
+    bool AcquireSync(SharedTextureHandle_t handle);
+    void ReleaseSync();
+    SharedTextureHandle_t syncHandle_ = 0;
+    ID3D11Texture2D *syncTexture_ = nullptr;
+    IDXGIKeyedMutex *syncMutex_ = nullptr;
+    bool syncHeld_ = false;
+    double syncWaitMs_ = 0;
+    uint32_t syncTimeouts_ = 0;
+    // Present hands each frame to this thread, which waits for the frame's GPU work and then tells the host. The
+    // compositor's thread so returns from Present while the GPU still draws, as it does with a display.
+    struct Job {
+        int slot;
+        uint64_t number;
+        std::vector<uint8_t> message;
+    };
+    void Send();
+    std::thread sender_;
+    std::mutex jobLock_;
+    std::condition_variable jobReady_;
+    std::deque<Job> jobs_;
+    bool stopSender_ = false;
+    std::atomic<uint64_t> gpuWaitUs_{0}, gpuWaits_{0};
     bool deviceFailed_ = false;
 
     Slot slots_[kSlots];
@@ -877,6 +954,10 @@ private:
     // Which processes drew the layers of the last frame, as a log line when it changes
     std::string sources_;
     double waitMs_ = 0, composeMs_ = 0;
+    // The compositor's frame in three parts: its own work from PostPresent's return to Present, Present, and
+    // PostPresent's wait for the next vsync
+    double compositorMs_ = 0, presentMs_ = 0, vsyncWaitMs_ = 0;
+    std::chrono::steady_clock::time_point postPresentEnd_ = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point statsSince_ = std::chrono::steady_clock::now();
 };
 
@@ -912,6 +993,9 @@ public:
     }
     uint32_t Width() const { return control_.width; }
     uint32_t Height() const { return control_.height; }
+    // The size that a game renders an eye at: the eye's size at the game's share
+    uint32_t RenderWidth() const { return static_cast<uint32_t>(control_.width * share_ + 0.5f) & ~1u; }
+    uint32_t RenderHeight() const { return static_cast<uint32_t>(control_.height * share_ + 0.5f) & ~1u; }
     uint32_t Fps() const { return fps_; }
 
     // A process whose layers reach a frame. The first one that is not SteamVR's compositor is the game.
@@ -928,6 +1012,7 @@ private:
     void SendHaptic(uint32_t hand, float seconds, float frequency, float amplitude);
 
     Control control_;
+    float share_ = 1.0f;
     std::atomic<uint32_t> fps_{72};
     std::atomic<float> ipd_{0.063f};
     std::mutex fovLock_;
@@ -958,8 +1043,8 @@ public:
     bool IsDisplayOnDesktop() override { return false; }
     bool IsDisplayRealDisplay() override { return false; }
     void GetRecommendedRenderTargetSize(uint32_t *width, uint32_t *height) override {
-        *width = g_driver->Width();
-        *height = g_driver->Height();
+        *width = g_driver->RenderWidth();
+        *height = g_driver->RenderHeight();
     }
     void GetEyeOutputViewport(EVREye eye, uint32_t *x, uint32_t *y, uint32_t *width, uint32_t *height) override {
         *x = eye == Eye_Left ? 0 : g_driver->Width();
@@ -1060,7 +1145,8 @@ public:
         if (AdapterLuid(&luid)) {
             VRProperties()->SetUint64Property(c, Prop_GraphicsAdapterLuid_Uint64, luid);
         }
-        Log("headset active as device %u: %ux%u an eye at %u Hz", id, g_driver->Width(), g_driver->Height(), g_driver->Fps());
+        Log("headset active as device %u: %ux%u an eye at %u Hz, games render %ux%u", id, g_driver->Width(), g_driver->Height(),
+            g_driver->Fps(), g_driver->RenderWidth(), g_driver->RenderHeight());
         return VRInitError_None;
     }
     void Deactivate() override { id_ = k_unTrackedDeviceIndexInvalid; }
@@ -1402,6 +1488,11 @@ EVRInitError Driver::Init(IVRDriverContext *context) {
     } else {
         control_.width = 1832;
         control_.height = 1920;
+    }
+    std::string game;
+    share_ = GameShare(&game);
+    if (share_ < 1.0f) {
+        Log("the game renders at %.0f%% of the eye's size (game-sizes.txt): %s", share_ * 100, game.c_str());
     }
     frames.Configure(control_.width, control_.height);
     frames.SetPeriod(1.0 / fps_);
@@ -1773,8 +1864,22 @@ bool Frames::Device() {
     rd.CullMode = D3D11_CULL_NONE;
     rd.DepthClipEnable = TRUE;
     device_->CreateRasterizerState(&rd, &raster_);
-    D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
-    device_->CreateQuery(&qd, &query_);
+    if (!done_) {
+        ID3D11Device5 *device5 = nullptr;
+        if (SUCCEEDED(device_->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void **>(&device5)))) {
+            device5->CreateFence(0, D3D11_FENCE_FLAG_NONE, __uuidof(ID3D11Fence), reinterpret_cast<void **>(&done_));
+            device5->Release();
+        }
+        context_->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void **>(&context4_));
+        doneEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!done_ || !context4_ || !doneEvent_) {
+            Log("no Direct3D 11 fence: the frames cannot reach the host");
+            return false;
+        }
+    }
+    if (!sender_.joinable()) {
+        sender_ = std::thread([this] { Send(); });
+    }
     deviceFailed_ = false;
     Log("Direct3D 11 device ready, the layer shader compiled");
     return true;
@@ -1880,7 +1985,51 @@ void Frames::Draw(const Layer &layer, int eye, bool base, const EyeFov &fov) {
     context_->PSSetShaderResources(0, 1, &none);
 }
 
-void Frames::Present(SharedTextureHandle_t) {
+bool Frames::AcquireSync(SharedTextureHandle_t handle) {
+    if (handle != syncHandle_) {
+        if (syncMutex_) {
+            syncMutex_->Release();
+            syncMutex_ = nullptr;
+        }
+        if (syncTexture_) {
+            syncTexture_->Release();
+            syncTexture_ = nullptr;
+        }
+        syncHandle_ = handle;
+        if (handle) {
+            HRESULT hr = device_->OpenSharedResource(reinterpret_cast<HANDLE>(handle), __uuidof(ID3D11Texture2D),
+                                                     reinterpret_cast<void **>(&syncTexture_));
+            if (SUCCEEDED(hr)) {
+                hr = syncTexture_->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void **>(&syncMutex_));
+            }
+            if (FAILED(hr)) {
+                Log("the compositor's sync texture has no keyed mutex (0x%08lx); the layers are read without a wait",
+                    static_cast<unsigned long>(hr));
+            }
+        }
+    }
+    if (!syncMutex_) {
+        return true;
+    }
+    auto start = std::chrono::steady_clock::now();
+    HRESULT hr = syncMutex_->AcquireSync(0, 100);
+    syncWaitMs_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    if (hr != S_OK) {
+        syncTimeouts_++;
+        return false;
+    }
+    syncHeld_ = true;
+    return true;
+}
+
+void Frames::ReleaseSync() {
+    if (syncHeld_ && syncMutex_) {
+        syncMutex_->ReleaseSync(0);
+    }
+    syncHeld_ = false;
+}
+
+void Frames::Present(SharedTextureHandle_t syncTexture) {
     auto started = std::chrono::steady_clock::now();
     std::vector<Layer> layers;
     {
@@ -1956,6 +2105,10 @@ void Frames::Present(SharedTextureHandle_t) {
             }
             auto composeStart = std::chrono::steady_clock::now();
             waitMs_ += std::chrono::duration<double, std::milli>(composeStart - started).count();
+            // A compositor's frame whose GPU work does not finish in time is drawn all the same
+            if (free >= 0) {
+                AcquireSync(syncTexture);
+            }
             if (free >= 0) {
                 Slot &slot = slots_[free];
                 EyeFov fov[2];
@@ -1981,13 +2134,10 @@ void Frames::Present(SharedTextureHandle_t) {
                 }
                 ID3D11RenderTargetView *none = nullptr;
                 context_->OMSetRenderTargets(1, &none, nullptr);
-                context_->End(query_);
+                ReleaseSync();
+                // The frame takes the next number below
+                context4_->Signal(done_, frameNumber_ + 1);
                 context_->Flush();
-                // The host reads the images as soon as it hears of them: wait for this GPU work first
-                auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
-                while (context_->GetData(query_, nullptr, 0, 0) == S_FALSE && std::chrono::steady_clock::now() < until) {
-                    SwitchToThread();
-                }
                 composeMs_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - composeStart).count();
 
                 float meters = 0, radians = 0;
@@ -2045,13 +2195,13 @@ void Frames::Present(SharedTextureHandle_t) {
                     std::lock_guard<std::mutex> slotLock(slotLock_);
                     slot.pending = number;
                 }
-                if (g_driver->link.Send(MSG_FRAME_READY, w.bytes)) {
-                    sent = true;
-                    sent_++;
-                } else {
-                    std::lock_guard<std::mutex> slotLock(slotLock_);
-                    slot.pending = 0;
+                {
+                    std::lock_guard<std::mutex> jobs(jobLock_);
+                    jobs_.push_back(Job{free, number, std::move(w.bytes)});
                 }
+                jobReady_.notify_one();
+                sent = true;
+                sent_++;
             }
         }
     }
@@ -2059,15 +2209,52 @@ void Frames::Present(SharedTextureHandle_t) {
         dropped_++;
     }
     auto now = std::chrono::steady_clock::now();
+    compositorMs_ += std::chrono::duration<double, std::milli>(started - postPresentEnd_).count();
+    presentMs_ += std::chrono::duration<double, std::milli>(now - started).count();
     double seconds = std::chrono::duration<double>(now - statsSince_).count();
     if (seconds >= 5.0) {
+        uint64_t waits = gpuWaits_.exchange(0), waitUs = gpuWaitUs_.exchange(0);
         Log("in %.1f s: %u presents, %u frames sent, %u not sent, %.1f layers a frame, %u unknown textures, wait for a free image %.2f ms, "
-            "draw and GPU %.2f ms a frame",
+            "AcquireSync of the sync texture %.2f ms (%u timeouts), draw %.2f ms a frame, its GPU work done %.2f ms later; a frame: compositor %.2f ms, "
+            "Present %.2f ms, wait for vsync %.2f ms",
             seconds, presents_, sent_, dropped_, presents_ ? static_cast<double>(layerCount_) / presents_ : 0.0, unknown_,
-            presents_ ? waitMs_ / presents_ : 0.0, sent_ ? composeMs_ / sent_ : 0.0);
-        presents_ = sent_ = dropped_ = layerCount_ = unknown_ = 0;
-        waitMs_ = composeMs_ = 0;
+            presents_ ? waitMs_ / presents_ : 0.0, sent_ ? syncWaitMs_ / sent_ : 0.0, syncTimeouts_, sent_ ? composeMs_ / sent_ : 0.0, waits ? waitUs / 1000.0 / waits : 0.0,
+            presents_ ? compositorMs_ / presents_ : 0.0,
+            presents_ ? presentMs_ / presents_ : 0.0, presents_ ? vsyncWaitMs_ / presents_ : 0.0);
+        presents_ = sent_ = dropped_ = layerCount_ = unknown_ = syncTimeouts_ = 0;
+        waitMs_ = composeMs_ = compositorMs_ = presentMs_ = vsyncWaitMs_ = syncWaitMs_ = 0;
         statsSince_ = now;
+    }
+}
+
+void Frames::Send() {
+    for (;;) {
+        Job job;
+        {
+            std::unique_lock<std::mutex> jobs(jobLock_);
+            jobReady_.wait(jobs, [this] { return stopSender_ || !jobs_.empty(); });
+            if (stopSender_) {
+                return;
+            }
+            job = std::move(jobs_.front());
+            jobs_.pop_front();
+        }
+        // The host reads the images as soon as it hears of them, so the GPU must be done with them first
+        auto start = std::chrono::steady_clock::now();
+        // A late signal of a frame whose wait timed out wakes the event early, so the loop asks the fence again
+        while (done_->GetCompletedValue() < job.number && std::chrono::steady_clock::now() - start < std::chrono::milliseconds(200) &&
+               SUCCEEDED(done_->SetEventOnCompletion(job.number, doneEvent_))) {
+            WaitForSingleObject(doneEvent_, 100);
+        }
+        gpuWaitUs_ += static_cast<uint64_t>(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count());
+        gpuWaits_++;
+        if (!g_driver->link.Send(MSG_FRAME_READY, job.message)) {
+            std::lock_guard<std::mutex> slotLock(slotLock_);
+            if (slots_[job.slot].pending == job.number) {
+                slots_[job.slot].pending = 0;
+            }
+            slotFree_.notify_all();
+        }
     }
 }
 
@@ -2081,6 +2268,8 @@ void Frames::PostPresent(const Throttling_t *) {
     }
     std::this_thread::sleep_until(next);
     lastPresent_ = next;
+    postPresentEnd_ = std::chrono::steady_clock::now();
+    vsyncWaitMs_ += std::chrono::duration<double, std::milli>(postPresentEnd_ - now).count();
 }
 
 Driver g_instance;

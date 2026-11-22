@@ -3,7 +3,7 @@
 # optional game, then writes a JSON report: every 5-second stats line of the host (fps, render and
 # encode time, the client's latency split by stage) and the median and worst of each.
 #
-# Usage: scripts/e2e.sh [--seconds N] [--fps HZ] [--game | --wine PROGRAM [--wine-arg ARG]...] [--desktop]
+# Usage: scripts/e2e.sh [--seconds N] [--fps HZ] [--game | --wine PROGRAM [--wine-arg ARG]... [--sound]] [--desktop]
 #                       [--quest [SERIAL] | --native-tcp] [--native-drop PERCENT] [--native-port PORT]
 #                       [--host-arg ARG]... [--probe-arg ARG]... [--report FILE]
 #                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine | --hand-interaction [hand|both]
@@ -95,6 +95,9 @@
 #                 such as a menu, then has its controller pressed for the first time at AT. A host
 #                 started with CRANVR_EYE_DUMP=FOLDER writes what the game drew into FOLDER once a
 #                 second, so the run shows which pointer was up before and after.
+#   --sound       with --wine: the program plays its sound through Wine's default output (scripts/run-game.sh
+#                 without --mute). With --desktop the probe reports the sound's peak level, so the run shows
+#                 whether the program's sound reaches the stream.
 #   --desktop     the host shows this Mac's screen. The probe asks for the desktop stream, plays a
 #                 pointer script (the host only logs its mouse events: CRANVR_POINTER_DRY_RUN) and
 #                 counts the Mac's sound. The script presses the left, right and middle buttons and
@@ -161,7 +164,7 @@ unsetopt BG_NICE
 
 root=${0:A:h:h}
 source "${root}/scripts/guardian.sh"
-seconds=20 fps=120 fps_given=0 game=0 desktop=0 client=mac serial="" report=""
+seconds=20 fps=120 fps_given=0 game=0 desktop=0 sound=0 client=mac serial="" report=""
 displays=1 hold=0 hand_hold=0 displays_in_game=0 display_test=0
 tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 hand_interaction="" openvr_wine=0 openvr_actions="" openvr_overlay=0 openvr_gl=0 steamvr=0 face_source=audio
 game_stall=""
@@ -194,6 +197,7 @@ while (( $# )); do
             face_source=$2; shift 2
             [[ ${face_source} == (visual|audio|unknown) ]] || { print -u2 "--face-source takes visual, audio or unknown"; exit 2; } ;;
         --desktop) desktop=1; shift ;;
+        --sound) sound=1; shift ;;
         --displays) displays=$2; shift 2 ;;
         --display-test) display_test=1; shift ;;
         --hold) game=1 hold=1; shift ;;
@@ -483,7 +487,9 @@ fi
 
 if [[ -n ${wine} ]]; then
     print -r "Starting ${wine} in Wine (log: ${work}/game.log)"
-    CRANVR_CONTROL=${work}/config/runtime-control.txt "${root}/scripts/run-game.sh" --mute "${wine}" "${wine_args[@]}" \
+    mute=(--mute)
+    (( sound )) && mute=()
+    CRANVR_CONTROL=${work}/config/runtime-control.txt "${root}/scripts/run-game.sh" "${mute[@]}" "${wine}" "${wine_args[@]}" \
         > "${work}/game.log" 2>&1 &
     pids+=($!)
 fi

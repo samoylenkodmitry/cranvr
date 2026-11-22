@@ -1,0 +1,37 @@
+diff --git a/dlls/user32/misc.c b/dlls/user32/misc.c
+index 6333fcb..627775a 100644
+--- a/dlls/user32/misc.c
++++ b/dlls/user32/misc.c
+@@ -169,6 +169,19 @@ void WINAPI SetLastErrorEx(
+     SetLastError( error );
+ }
+ 
++/******************************************************************************
++ * DwmGetDxSharedSurface [USER32.@]
++ *
++ * Gives the shared surface that DWM composes a window from. Wine has no DWM, so no window has one.
++ */
++BOOL WINAPI DwmGetDxSharedSurface( HWND hwnd, HANDLE *surface, LUID *adapter_luid, ULONG *format,
++                                   ULONG *present_flags, ULONGLONG *update_id )
++{
++    FIXME( "(%p, %p, %p, %p, %p, %p) stub\n", hwnd, surface, adapter_luid, format, present_flags, update_id );
++    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
++    return FALSE;
++}
++
+ /******************************************************************************
+  * GetAltTabInfoA [USER32.@]
+  */
+diff --git a/dlls/user32/user32.spec b/dlls/user32/user32.spec
+index fe41f9c..ecb7492 100644
+--- a/dlls/user32/user32.spec
++++ b/dlls/user32/user32.spec
+@@ -442,7 +442,7 @@
+ @ stdcall DrawTextExA(long str long ptr long ptr)
+ @ stdcall DrawTextExW(long wstr long ptr long ptr)
+ @ stdcall DrawTextW(long wstr long ptr long)
+-# @ stub DwmGetDxSharedSurface
++@ stdcall DwmGetDxSharedSurface(ptr ptr ptr ptr ptr ptr)
+ # @ stub DwmGetRemoteSessionOcclusionEvent
+ # @ stub DwmGetRemoteSessionOcclusionState
+ # @ stub DwmKernelShutdown
