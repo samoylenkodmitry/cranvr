@@ -21,6 +21,12 @@
 // With --load-only --runtime DIR it only loads DIR\bin\vrclient_x64.dll and asks it for its core, as
 // scripts/setup-wine.sh does to check an install. The runtime is then not found by the path file.
 //
+// --app-type watchdog|background|utility|overlay|other starts the runtime as that application type, not as a scene,
+// and passes when VR_Init returns an init error within 10 seconds. Steam starts OpenVR as its watchdog when SteamVR is
+// installed. OpenComposite runs scenes only, and its message box for another type stopped Steam's main loop until
+// Steam ended itself (cranvr's OpenComposite patch 0011). A message box keeps VR_Init from returning, so the program
+// fails after 10 seconds and ends itself. scripts/setup-wine.sh runs it with --runtime after each install.
+//
 // --format rgba|bgra|bgra-typeless picks the format of the eye textures: R8G8B8A8_UNORM (the default; the runtime
 // of cranvr offers B8G8R8A8 only, so OpenComposite converts it with a draw), B8G8R8A8_UNORM (copied as it is) and
 // B8G8R8A8_TYPELESS with a UNORM view, which is the texture that a game such as Serious Sam VR submits.
@@ -50,7 +56,7 @@
 // OpenGL textures into the runtime's Direct3D 11 images. scripts/e2e.sh --openvr-gl runs it.
 //
 // Usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--trace-poses] [--actions MODE] [--expect-hz N] [--overlay] [--format F]
-//                         [--gl] [--load-only --runtime DIR]
+//                         [--gl] [--load-only --runtime DIR] [--app-type TYPE [--runtime DIR]]
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -793,6 +799,63 @@ struct GLGame {
 	}
 };
 
+// The application types that --app-type names
+bool app_type_named(const char* name, vr::EVRApplicationType* type)
+{
+	const std::pair<const char*, vr::EVRApplicationType> types[] = {
+		{ "watchdog", vr::VRApplication_SteamWatchdog },
+		{ "background", vr::VRApplication_Background },
+		{ "utility", vr::VRApplication_Utility },
+		{ "overlay", vr::VRApplication_Overlay },
+		{ "other", vr::VRApplication_Other },
+	};
+	for (const auto& [known, value] : types) {
+		if (!std::strcmp(name, known)) {
+			*type = value;
+			return true;
+		}
+	}
+	return false;
+}
+
+struct InitCall {
+	vr::EVRApplicationType type;
+	vr::EVRInitError error;
+	bool system;
+};
+
+DWORD WINAPI init_as(void* data)
+{
+	auto* call = static_cast<InitCall*>(data);
+	call->system = vr::VR_Init(&call->error, call->type) != nullptr;
+	return 0;
+}
+
+// VR_Init with a type that the runtime does not run: it must return an error, not a system, and not stop in a message
+// box. The call runs on a thread of its own, so a box on it cannot keep this thread from the verdict.
+int refused_type(vr::EVRApplicationType type)
+{
+	InitCall call{ type, vr::VRInitError_None, false };
+	HANDLE thread = CreateThread(nullptr, 0, init_as, &call, 0, nullptr);
+	if (!thread) {
+		return fail("no thread for VR_Init");
+	}
+	if (WaitForSingleObject(thread, 10000) != WAIT_OBJECT_0) {
+		say("FAIL VR_Init with application type %d did not return in 10 s: the runtime shows a message box", type);
+		std::fflush(stdout);
+		// The box holds the other thread: end the whole process, box and all
+		ExitProcess(1);
+	}
+	CloseHandle(thread);
+	if (call.system || call.error == vr::VRInitError_None) {
+		return fail("VR_Init started an application type that OpenComposite does not run");
+	}
+	say("VR_Init with application type %d returned error %d (%s)", type, call.error, vr::VR_GetVRInitErrorAsSymbol(call.error));
+	vr::VR_Shutdown();
+	say("PASS");
+	return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -801,6 +864,8 @@ int main(int argc, char** argv)
 	bool expect_input = false, load_only = false, no_input = false, trace_poses = false, with_overlay = false, with_gl = false;
 	std::string actions_mode;
 	float expect_hz = 0.0f;
+	bool other_type = false;
+	vr::EVRApplicationType app_type = vr::VRApplication_Scene;
 	DXGI_FORMAT texture_format = DXGI_FORMAT_R8G8B8A8_UNORM, view_format = DXGI_FORMAT_R8G8B8A8_UNORM;
 	for (int i = 1; i < argc; i++) {
 		if (!std::strcmp(argv[i], "--seconds") && i + 1 < argc) {
@@ -825,6 +890,12 @@ int main(int argc, char** argv)
 			with_gl = true;
 		} else if (!std::strcmp(argv[i], "--load-only")) {
 			load_only = true;
+		} else if (!std::strcmp(argv[i], "--app-type") && i + 1 < argc) {
+			if (!app_type_named(argv[++i], &app_type)) {
+				std::fprintf(stderr, "--app-type takes watchdog, background, utility, overlay or other\n");
+				return 2;
+			}
+			other_type = true;
 		} else if (!std::strcmp(argv[i], "--format") && i + 1 < argc) {
 			const char* name = argv[++i];
 			if (!std::strcmp(name, "rgba")) {
@@ -842,7 +913,7 @@ int main(int argc, char** argv)
 			g_runtime_path = argv[++i];
 			g_runtime_given = true;
 		} else {
-			std::fprintf(stderr, "usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--actions MODE] [--expect-hz N] [--overlay] [--format F] [--gl] [--load-only --runtime DIR]\n");
+			std::fprintf(stderr, "usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--actions MODE] [--expect-hz N] [--overlay] [--format F] [--gl] [--load-only --runtime DIR] [--app-type TYPE [--runtime DIR]]\n");
 			return 2;
 		}
 	}
@@ -861,6 +932,9 @@ int main(int argc, char** argv)
 		}
 		say("PASS");
 		return 0;
+	}
+	if (other_type) {
+		return refused_type(app_type);
 	}
 
 	if (!vr::VR_IsRuntimeInstalled()) {

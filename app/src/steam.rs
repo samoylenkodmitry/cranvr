@@ -2,7 +2,7 @@
 
 use crate::{
     backend::{self, config_dir},
-    launch, openvr,
+    game_run, launch, openvr,
 };
 use std::{
     fs,
@@ -386,16 +386,15 @@ pub fn wine(program: &str) -> Command {
 
 /// A game's Wine command: `wine` with the options for every program and the program's own, which
 /// the Play tab shows. Steam does not get them. The OpenVR choice goes into the prefix's OpenVR path
-/// file now, because the game reads that file when it starts.
-fn game_wine(program: &str) -> Command {
+/// file now, because the game reads that file when it starts: the game's run begins (game_run.rs), and
+/// its end puts the file back. Returns the command and the run's number, which [`spawn_game`] takes.
+fn game_wine(program: &str) -> (Command, Option<u64>) {
     let settings = backend::Settings::load();
     let options = settings.launch.get(program).cloned().unwrap_or_default();
     let choice = launch::openvr(&settings.wine, &options);
-    let steamvr = if choice == launch::OpenVr::SteamVr { steamvr() } else { None };
-    if let Err(e) = openvr::apply(&prefix(), choice, steamvr.as_ref()) {
-        backend::notify(format!("cranvr could not set the OpenVR runtime: {e}"));
-    }
-    if steamvr.is_some() {
+    let steamvr = steamvr();
+    let run = game_run::begin(&prefix(), choice, steamvr.as_ref()).map_err(backend::notify).ok();
+    if choice == launch::OpenVr::SteamVr && steamvr.is_some() {
         match openvr::unblock_driver(&steam_dir().join("config/steamvr.vrsettings")) {
             Ok(true) => backend::log("SteamVR had turned cranvr's driver off after a crash. cranvr turned it on again.".into()),
             Ok(false) => {}
@@ -407,7 +406,26 @@ fn game_wine(program: &str) -> Command {
     // cranvr's SteamVR driver finds the game's render size in game-sizes.txt by the game's program. SteamVR,
     // which the game starts, inherits the variable.
     command.env("CRANVR_GAME", program);
-    command
+    (command, run)
+}
+
+/// Starts a game's command and watches its run until the game ends (game_run.rs). A start that fails ends
+/// the run at once, so the path file goes back.
+fn spawn_game(mut command: Command, run: Option<u64>, program: &str) -> Result<(), String> {
+    let child = command.stdout(log_file("game.log")).stderr(log_file("game.err.log")).spawn();
+    match (child, run) {
+        (Ok(child), Some(run)) => {
+            game_run::watch(&prefix(), run, child, game_run::folder_of(program));
+            Ok(())
+        }
+        (Ok(_), None) => Ok(()),
+        (Err(e), run) => {
+            if let Some(run) = run {
+                game_run::end(&prefix(), run).ok();
+            }
+            Err(e.to_string())
+        }
+    }
 }
 
 /// The Steam app ID that a program's Steam check gets: the one in its launch options, else the one of
@@ -457,6 +475,15 @@ pub fn start() -> Result<(), String> {
     if running() {
         return Ok(());
     }
+    // Steam starts OpenVR as its watchdog when SteamVR is installed, from the runtime that the path file names.
+    // OpenComposite runs games only: a file that names it while no game runs gives way to SteamVR or to none.
+    if !game_run::active() {
+        match openvr::settle(&prefix(), steamvr().as_ref()) {
+            Ok(true) => backend::log("The OpenVR path file named OpenComposite with no game running. cranvr put SteamVR or no runtime in its place for Steam.".into()),
+            Ok(false) => {}
+            Err(e) => backend::notify(format!("cranvr could not check the OpenVR path file: {e}")),
+        }
+    }
     let dir = steam_dir();
     if let Some(helper) = web_helper(&dir) {
         if let Some(line) = repair_helper(&helper, &shim())? {
@@ -494,17 +521,12 @@ pub fn play(game: &Game) -> Result<(), String> {
     } else if !wine_ready() {
         return Err("Set up game support first".into());
     }
-    let mut command = game_wine(&program);
+    let (mut command, run) = game_wine(&program);
     if let Some(id) = &app_id {
         command.env("SteamAppId", id).env("SteamGameId", id);
     }
-    command
-        .current_dir(exe.parent().unwrap_or(Path::new("/")))
-        .stdout(log_file("game.log"))
-        .stderr(log_file("game.err.log"))
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    command.current_dir(exe.parent().unwrap_or(Path::new("/")));
+    spawn_game(command, run, &program)
 }
 
 /// Starts any Windows program (a Mac path) with cranvr's environment.
@@ -514,17 +536,12 @@ pub fn run_program(path: &Path) -> Result<(), String> {
     }
     require_current_game_support()?;
     let program = mac_to_windows(path);
-    let mut command = game_wine(&program);
+    let (mut command, run) = game_wine(&program);
     if let Some(id) = steam_id(&program, backend::steam_app_id(path.parent().unwrap_or(path)).as_deref()) {
         command.env("SteamAppId", &id).env("SteamGameId", &id);
     }
-    command
-        .current_dir(path.parent().unwrap_or(Path::new("/")))
-        .stdout(log_file("game.log"))
-        .stderr(log_file("game.err.log"))
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    command.current_dir(path.parent().unwrap_or(Path::new("/")));
+    spawn_game(command, run, &program)
 }
 
 /// Ends a running program and starts it again with the launch options that are saved now. The
@@ -558,7 +575,7 @@ fn program_running(name: &str) -> bool {
 }
 
 /// `text` for a regular expression that matches it as it is.
-fn regex_escaped(text: &str) -> String {
+pub fn regex_escaped(text: &str) -> String {
     text.chars().flat_map(|c| if "\\.+*?()[]{}|^$".contains(c) { vec!['\\', c] } else { vec![c] }).collect()
 }
 
@@ -905,6 +922,124 @@ mod tests {
         let lines: Vec<&String> = model.log.iter().filter(|line| line.contains("web helper")).collect();
         println!("log: {lines:?}");
         assert_eq!(lines.len(), 1, "one line in the log");
+    }
+
+    /// A test host of the app on port 9962 with the probe as the headset at 72 Hz, as the Play tab's host. The
+    /// user's host keeps port 9950, and the probe's pointer script moves no real mouse. Returns the probe.
+    fn test_host(seconds: u32) -> std::process::Child {
+        use crate::backend::{self, Settings};
+        let release = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/release");
+        std::env::set_var("CRANVR_HOST_BIN", release.join("cranvr-host"));
+        std::env::set_var("CRANVR_TEST_TRUST_ALL", "1");
+        std::env::set_var("CRANVR_NATIVE_PORT", "9962");
+        std::env::set_var("CRANVR_POINTER_DRY_RUN", "1");
+        let mut settings = Settings::load();
+        settings.fps = 72;
+        settings.desktop = false;
+        settings.virtual_display = None;
+        settings.unscale_displays = false;
+        settings.save();
+        backend::start_host(&settings).expect("host starts");
+        thread::sleep(Duration::from_secs(2));
+        Command::new(release.join("cranvr-probe"))
+            .args(["--seconds", &seconds.to_string(), "--tcp", "--connect", "127.0.0.1:9962", "--quest-view", "--any-picture"])
+            .stdout(log_file("probe.log"))
+            .spawn()
+            .expect("probe runs")
+    }
+
+    /// Pumps the host's lines into `model` until `done` says yes or `limit` passes. Returns the most game frames
+    /// of a stats window.
+    fn pump_until(model: &mut crate::backend::Model, limit: Duration, mut done: impl FnMut(&crate::backend::Model, u64) -> bool) -> u64 {
+        let since = Instant::now();
+        let mut most = 0;
+        while since.elapsed() < limit {
+            thread::sleep(Duration::from_millis(200));
+            crate::backend::pump(model);
+            most = most.max(model.stats.as_ref().map_or(0, |s| s.game_frames));
+            if done(model, most) {
+                break;
+            }
+        }
+        most
+    }
+
+    /// Waits up to `limit` for the path file to say `text`.
+    fn path_file_becomes(text: &Option<String>, limit: Duration) -> bool {
+        let file = openvr::path_file(&prefix()).unwrap();
+        let since = Instant::now();
+        while since.elapsed() < limit {
+            if &fs::read_to_string(&file).ok() == text {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        false
+    }
+
+    /// The Play button's path while Steam does not run (#115): [`play`] starts Steam with the app's flags, then the
+    /// game with the path file at OpenComposite, the default. Steam starts OpenVR as its watchdog about 8 s after
+    /// its start and finds OpenComposite. OpenComposite must refuse it with an error and no message box, so Steam
+    /// keeps running past its 15-second stall limit. The game's frames reach the host, and the game's end puts the
+    /// path file back. Then an OpenVR program through OpenComposite ([`run_program`] with openvr_smoke.exe) must
+    /// draw, and its end must put the file back too. CRANVR_HOME names a scratch folder whose `wine` is the user's
+    /// Wine folder (a link), so the user's app.json and host stay untouched. CRANVR_TEST_GAME names the Steam
+    /// game. Needs `cargo build --release`. Run with `cargo test --release -p cranvr-app -- --ignored
+    /// play_starts_steam`. Steam keeps running after the test, with the test's environment.
+    #[test]
+    #[ignore]
+    fn play_starts_steam_and_the_game_while_the_path_file_names_opencomposite() {
+        use crate::backend::{self, Model};
+        let home = PathBuf::from(std::env::var("CRANVR_HOME").expect("CRANVR_HOME names a scratch folder"));
+        assert!(home.join("wine").is_symlink(), "the scratch folder's wine is a link to the user's");
+        let name = std::env::var("CRANVR_TEST_GAME").expect("CRANVR_TEST_GAME names the Steam game");
+        assert!(!running(), "Steam must not run: the test starts it as the Play button does");
+        let file = openvr::path_file(&prefix()).unwrap();
+        let before = fs::read_to_string(&file).ok();
+        assert!(!before.as_deref().is_some_and(|text| text.contains("opencomposite")), "the file names no OpenComposite before");
+        let oc_log = file.parent().unwrap().parent().unwrap().join("OpenComposite/logs/opencomposite.log");
+        let steam_console = steam_dir().join("logs/console_log.txt");
+        let console_before = fs::metadata(&steam_console).map_or(0, |m| m.len());
+        let mut probe = test_host(150);
+        let game = games().into_iter().find(|game| game.name == name).expect("the game is installed");
+        let program = self::program(&game).unwrap();
+        let started = Instant::now();
+        play(&game).expect("Steam and the game start");
+        println!("play returned after {:.1} s", started.elapsed().as_secs_f64());
+        let during = fs::read_to_string(&file).ok();
+        let mut model = Model::default();
+        // Steam's stall limit is 15 s: it must run 25 s after its start with a game frame
+        let frames = pump_until(&mut model, Duration::from_secs(90), |_, most| most > 100 && started.elapsed() > Duration::from_secs(25));
+        let steam_alive = running();
+        let refused = fs::read_to_string(&oc_log).unwrap_or_default();
+        let console = fs::read(&steam_console).map(|bytes| String::from_utf8_lossy(&bytes[console_before as usize..]).into_owned()).unwrap_or_default();
+        end_program(program.rsplit('\\').next().unwrap());
+        let game_back = path_file_becomes(&before, Duration::from_secs(10));
+        println!("game frames in a stats window: {frames}; Steam runs {:.0} s after its start: {steam_alive}", started.elapsed().as_secs_f64());
+        println!("path file during the game: {during:?}");
+        println!("OpenComposite's log: {:?}", refused.lines().filter(|line| line.contains("refused") || line.contains("Steam")).collect::<Vec<_>>());
+        println!("Steam's console log: {:?}", console.lines().filter(|line| line.contains("VR") || line.contains("assert") || line.contains("stall")).collect::<Vec<_>>());
+        // An OpenVR program through OpenComposite, from the app's start path
+        let smoke = prefix().join("drive_c/opencomposite/openvr_smoke.exe");
+        run_program(&smoke).expect("the program starts");
+        let smoke_during = fs::read_to_string(&file).ok();
+        let smoke_frames = pump_until(&mut model, Duration::from_secs(30), |_, most| most > 100);
+        let smoke_log = fs::read_to_string(&oc_log).unwrap_or_default();
+        end_program("openvr_smoke.exe");
+        let smoke_back = path_file_becomes(&before, Duration::from_secs(10));
+        println!("openvr_smoke: {smoke_frames} game frames in a stats window; path file during it: {smoke_during:?}");
+        probe.kill().ok();
+        probe.wait().ok();
+        backend::stop_host();
+        assert!(during.as_deref().is_some_and(|text| text.contains("opencomposite")), "the game's run names OpenComposite");
+        assert!(frames > 100, "the game's frames reach the host: {frames}");
+        assert!(steam_alive, "Steam runs past its stall limit");
+        assert!(!console.contains("Fatal assert"), "Steam reports no fatal assert");
+        assert!(game_back, "the game's end puts the path file back");
+        assert!(smoke_during.as_deref().is_some_and(|text| text.contains("opencomposite")));
+        assert!(smoke_frames > 100, "the OpenVR program draws through OpenComposite: {smoke_frames}");
+        assert!(smoke_log.contains("C:\\opencomposite\\opencomposite.ini"), "OpenComposite ran the program");
+        assert!(smoke_back, "the program's end puts the path file back");
     }
 
     /// A start from the app with the launch option "OpenVR: SteamVR", as the Play tab does it: the app's

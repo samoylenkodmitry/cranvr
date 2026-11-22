@@ -3,6 +3,7 @@
 
 mod backend;
 mod black_eye;
+mod game_run;
 mod launch;
 mod microphone;
 mod openvr;
