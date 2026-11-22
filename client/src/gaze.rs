@@ -51,9 +51,9 @@ fn heading(head: &Pose) -> Option<[f32; 4]> {
     })
 }
 
-/// Whether no input is tracked, so the look's ball shows: no controller is present and the cameras
-/// track no hand (left, right). A tracked hand counts whether or not its palm joint is valid, since its
-/// pointer presses the ball in the view.
+/// Whether no input is tracked, so the look's ball shows: no controller is present and no hand is
+/// tracked (left, right). A hand counts while Cranpose's hand pointer points with it, since that
+/// pointer presses the ball in the view, or while its palm joint is located.
 pub fn no_input(controllers: [bool; 2], hands: [bool; 2]) -> bool {
     controllers == [false; 2] && hands == [false; 2]
 }

@@ -504,8 +504,10 @@ fn HeadsetFrames(hand: HandState) {
             }
             // The palms of the hands that the cameras track, while no controller is in them
             let palm_frames = [XrHand::Left, XrHand::Right].map(|side| palm_frame(frame.hand(side)));
-            // A hand that the cameras track counts whether or not its palm joint is valid
-            let tracked_hands = [XrHand::Left, XrHand::Right].map(|side| frame.hand(side).tracking_state == cranpose_xr::TrackingState::Tracking);
+            // A hand counts while Cranpose's hand pointer points with it or its palm is located. A
+            // Quest reports a hand as tracking with no located joint while no hand is in view.
+            let pointing = [XrHand::Left, XrHand::Right].map(|side| frame.pointer(side) == Some(InputSource::Hands));
+            let tracked_hands = [0, 1].map(|i| pointing[i] || palm_frames[i].palm.is_some());
             let tracked = tracked_hands.contains(&true);
             if tracked != hands.get_non_reactive() {
                 hands.set(tracked);
