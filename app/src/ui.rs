@@ -956,12 +956,12 @@ fn ControlsPage(settings: MutableState<Settings>) {
     });
 }
 
-/// The connection, the stream, the sound and the Mac: the model's pages (see pages.rs), which the
-/// headset shows too.
+/// The connection, the stream, the sound, the headset's room and volume, and the Mac: the model's
+/// pages (see pages.rs), which the headset shows too.
 #[composable]
 fn GeneralSettings(settings: MutableState<Settings>, model: MutableState<Model>) {
     // The way of the stream comes first: the cable is the choice that a user looks for
-    for id in [pages::CONNECTION, pages::STREAM, pages::SOUND, pages::MAC] {
+    for id in [pages::CONNECTION, pages::STREAM, pages::SOUND, pages::HEADSET, pages::MAC] {
         let items = page_of(settings, model, id).map(|page| page.items).unwrap_or_default();
         Card(move || {
             PageItems(items.clone(), settings, model);
