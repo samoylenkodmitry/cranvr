@@ -2,7 +2,7 @@
 
 use crate::{
     backend::{self, config_dir},
-    launch, openvr,
+    game_run, launch, openvr,
 };
 use std::{
     fs,
@@ -386,16 +386,15 @@ pub fn wine(program: &str) -> Command {
 
 /// A game's Wine command: `wine` with the options for every program and the program's own, which
 /// the Play tab shows. Steam does not get them. The OpenVR choice goes into the prefix's OpenVR path
-/// file now, because the game reads that file when it starts.
-fn game_wine(program: &str) -> Command {
+/// file now, because the game reads that file when it starts: the game's run begins (game_run.rs), and
+/// its end puts the file back. Returns the command and the run's number, which [`spawn_game`] takes.
+fn game_wine(program: &str) -> (Command, Option<u64>) {
     let settings = backend::Settings::load();
     let options = settings.launch.get(program).cloned().unwrap_or_default();
     let choice = launch::openvr(&settings.wine, &options);
-    let steamvr = if choice == launch::OpenVr::SteamVr { steamvr() } else { None };
-    if let Err(e) = openvr::apply(&prefix(), choice, steamvr.as_ref()) {
-        backend::notify(format!("cranvr could not set the OpenVR runtime: {e}"));
-    }
-    if steamvr.is_some() {
+    let steamvr = steamvr();
+    let run = game_run::begin(&prefix(), choice, steamvr.as_ref()).map_err(backend::notify).ok();
+    if choice == launch::OpenVr::SteamVr && steamvr.is_some() {
         match openvr::unblock_driver(&steam_dir().join("config/steamvr.vrsettings")) {
             Ok(true) => backend::log("SteamVR had turned cranvr's driver off after a crash. cranvr turned it on again.".into()),
             Ok(false) => {}
@@ -407,7 +406,26 @@ fn game_wine(program: &str) -> Command {
     // cranvr's SteamVR driver finds the game's render size in game-sizes.txt by the game's program. SteamVR,
     // which the game starts, inherits the variable.
     command.env("CRANVR_GAME", program);
-    command
+    (command, run)
+}
+
+/// Starts a game's command and watches its run until the game ends (game_run.rs). A start that fails ends
+/// the run at once, so the path file goes back.
+fn spawn_game(mut command: Command, run: Option<u64>, program: &str) -> Result<(), String> {
+    let child = command.stdout(log_file("game.log")).stderr(log_file("game.err.log")).spawn();
+    match (child, run) {
+        (Ok(child), Some(run)) => {
+            game_run::watch(&prefix(), run, child, game_run::folder_of(program));
+            Ok(())
+        }
+        (Ok(_), None) => Ok(()),
+        (Err(e), run) => {
+            if let Some(run) = run {
+                game_run::end(&prefix(), run).ok();
+            }
+            Err(e.to_string())
+        }
+    }
 }
 
 /// The Steam app ID that a program's Steam check gets: the one in its launch options, else the one of
@@ -457,6 +475,15 @@ pub fn start() -> Result<(), String> {
     if running() {
         return Ok(());
     }
+    // Steam starts OpenVR as its watchdog when SteamVR is installed, from the runtime that the path file names.
+    // OpenComposite runs games only: a file that names it while no game runs gives way to SteamVR or to none.
+    if !game_run::active() {
+        match openvr::settle(&prefix(), steamvr().as_ref()) {
+            Ok(true) => backend::log("The OpenVR path file named OpenComposite with no game running. cranvr put SteamVR or no runtime in its place for Steam.".into()),
+            Ok(false) => {}
+            Err(e) => backend::notify(format!("cranvr could not check the OpenVR path file: {e}")),
+        }
+    }
     let dir = steam_dir();
     if let Some(helper) = web_helper(&dir) {
         if let Some(line) = repair_helper(&helper, &shim())? {
@@ -494,17 +521,12 @@ pub fn play(game: &Game) -> Result<(), String> {
     } else if !wine_ready() {
         return Err("Set up game support first".into());
     }
-    let mut command = game_wine(&program);
+    let (mut command, run) = game_wine(&program);
     if let Some(id) = &app_id {
         command.env("SteamAppId", id).env("SteamGameId", id);
     }
-    command
-        .current_dir(exe.parent().unwrap_or(Path::new("/")))
-        .stdout(log_file("game.log"))
-        .stderr(log_file("game.err.log"))
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    command.current_dir(exe.parent().unwrap_or(Path::new("/")));
+    spawn_game(command, run, &program)
 }
 
 /// Starts any Windows program (a Mac path) with cranvr's environment.
@@ -514,17 +536,12 @@ pub fn run_program(path: &Path) -> Result<(), String> {
     }
     require_current_game_support()?;
     let program = mac_to_windows(path);
-    let mut command = game_wine(&program);
+    let (mut command, run) = game_wine(&program);
     if let Some(id) = steam_id(&program, backend::steam_app_id(path.parent().unwrap_or(path)).as_deref()) {
         command.env("SteamAppId", &id).env("SteamGameId", &id);
     }
-    command
-        .current_dir(path.parent().unwrap_or(Path::new("/")))
-        .stdout(log_file("game.log"))
-        .stderr(log_file("game.err.log"))
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    command.current_dir(path.parent().unwrap_or(Path::new("/")));
+    spawn_game(command, run, &program)
 }
 
 /// Ends a running program and starts it again with the launch options that are saved now. The
@@ -558,7 +575,7 @@ fn program_running(name: &str) -> bool {
 }
 
 /// `text` for a regular expression that matches it as it is.
-fn regex_escaped(text: &str) -> String {
+pub fn regex_escaped(text: &str) -> String {
     text.chars().flat_map(|c| if "\\.+*?()[]{}|^$".contains(c) { vec!['\\', c] } else { vec![c] }).collect()
 }
 

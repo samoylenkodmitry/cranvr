@@ -1,0 +1,87 @@
+diff --git a/OCOVR/openvr_api.cpp b/OCOVR/openvr_api.cpp
+index a49444a..2599d54 100644
+--- a/OCOVR/openvr_api.cpp
++++ b/OCOVR/openvr_api.cpp
+@@ -209,9 +209,27 @@ VR_INTERFACE const char* VR_CALLTYPE VR_GetVRInitErrorAsEnglishDescription(EVRIn
+ 	OOVR_ABORT(("Init desc: Unknown value " + to_string(error)).c_str());
+ }
+ 
++// cranvr: the symbols of the errors that OpenComposite returns. A caller that logs a refused VR_Init by its symbol
++// (Valve's openvr_api.dll asks the runtime for it) got a message box from the stub, which stopped it as the
++// refusal's box did.
+ VR_INTERFACE const char* VR_CALLTYPE VR_GetVRInitErrorAsSymbol(EVRInitError error)
+ {
+-	OOVR_ABORT("Stub");
++	switch (error) {
++	case VRInitError_None:
++		return "VRInitError_None";
++	case VRInitError_Init_InvalidApplicationType:
++		return "VRInitError_Init_InvalidApplicationType";
++	case VRInitError_Init_Internal:
++		return "VRInitError_Init_Internal";
++	case VRInitError_Init_NotInitialized:
++		return "VRInitError_Init_NotInitialized";
++	case VRInitError_Init_InvalidInterface:
++		return "VRInitError_Init_InvalidInterface";
++	case VRInitError_Init_InterfaceNotFound:
++		return "VRInitError_Init_InterfaceNotFound";
++	default:
++		return "VRInitError_Unknown";
++	}
+ }
+ 
+ VR_INTERFACE uint32_t VR_CALLTYPE VR_InitInternal(EVRInitError* peError, EVRApplicationType eApplicationType)
+@@ -227,38 +245,26 @@ VR_INTERFACE uint32_t VR_CALLTYPE VR_InitInternal2(EVRInitError* peError, EVRApp
+ 		*peError = VRInitError_None;
+ 	}
+ 
+-	oovr_install_crash_handler();
+-
+-	if (eApplicationType == VRApplication_Bootstrapper) {
++	// cranvr: OpenComposite runs scene applications only. Every other type gets a plain init error and one log line,
++	// never a message box. Steam starts OpenVR as its watchdog (type 6) when SteamVR is installed, and a box stopped
++	// Steam's main loop until Steam's own watchdog ended Steam. vrstartup.exe (the bootstrapper type) also ends at an
++	// error, as it did before. The check comes before the crash handler, so a refused program keeps its own handler.
+ #ifdef _WIN32
+-		char szFileName[MAX_PATH];
+-		GetModuleFileNameA(NULL, szFileName, MAX_PATH);
+-		string filename = szFileName;
+-
+-		filename.erase(0, filename.find_last_of('\\') + 1);
+-
+-		if (filename == "vrstartup.exe") {
+-			// AFAIK vrstartup is the only program that uses this mode, and returning an
+-			// error makes it exit immediately.
+-			*peError = VRInitError_Unknown;
+-			return 0;
+-		}
+-
+-		OOVR_ABORT("VRApplication_Bootstrapper currently only supported for vrstartup.exe");
++	const bool runs = eApplicationType == VRApplication_Scene;
+ #else
+-		LINUX_STUBBED();
++	// Proton starts its games with the background type
++	const bool runs = eApplicationType == VRApplication_Scene || eApplicationType == VRApplication_Background;
+ #endif
++	if (!runs) {
++		OOVR_LOGF("VR_Init refused: OpenComposite runs scene applications only, and this program asked for application type %d",
++		    (int)eApplicationType);
++		if (peError) {
++			*peError = VRInitError_Init_InvalidApplicationType;
++		}
++		return 0;
+ 	}
+ 
+-	if (eApplicationType == VRApplication_Utility) {
+-		return current_init_token;
+-	}
+-
+-	if (eApplicationType != VRApplication_Scene)
+-#ifndef _WIN32
+-		if (eApplicationType != VRApplication_Background) // Proton uses this
+-#endif
+-			ERR("Cannot init VR: unsupported apptype " + to_string(eApplicationType));
++	oovr_install_crash_handler();
+ 
+ 	if (running)
+ 		ERR("Cannot init VR: Already running!");

@@ -6,8 +6,8 @@
 #   - OpenComposite (C:\opencomposite), which turns a game's OpenVR calls into OpenXR calls to that
 #     runtime, and cranvr's SteamVR driver (C:\cranvr\steamvr, scripts/build-steamvr-driver.sh), which runs
 #     a game in SteamVR for Windows from the prefix's Steam library. A game finds either one through the
-#     prefix's OpenVR path file, which its launch options choose (see scripts/run-game.sh); this script
-#     writes no such file.
+#     prefix's OpenVR path file, which names a game's runtime while the game runs (see scripts/run-game.sh and
+#     app/src/openvr.rs); this script writes no such file.
 #   - Wine's files with cranvr's patches (scripts/build-wine.sh): wined3d.dll, whose HLSL compiler
 #     (vkd3d-shader) a game that compiles its shaders at run time uses through d3dcompiler_47.dll;
 #     winemac.so and opengl32.so, which give an OpenGL game that asks for the compatibility profile a core
@@ -169,6 +169,10 @@ print "Checking the OpenXR runtime through the Khronos loader"
 if [[ -f ${oc_dir}/bin/vrclient_x64.dll ]]; then
     print "Checking that OpenComposite loads"
     (cd "${oc_dir}" && DXMT_BASALT_IOSURFACE=1 "${wine_root}/bin/wine" ./openvr_smoke.exe --load-only --runtime 'C:\opencomposite' >/dev/null 2>&1) || { print -u2 "FAIL: openvr_smoke.exe --load-only (run it by hand for details)"; exit 1; }
+    # Steam starts OpenVR as its watchdog when SteamVR is installed. A message box of OpenComposite for that type
+    # stopped Steam (OpenComposite patch 0011). The program ends itself 10 s after a call that does not return.
+    print "Checking that OpenComposite refuses Steam's watchdog with an error and no message box"
+    (cd "${oc_dir}" && "${wine_root}/bin/wine" ./openvr_smoke.exe --app-type watchdog --runtime 'C:\opencomposite' >/dev/null 2>&1) || { print -u2 "FAIL: openvr_smoke.exe --app-type watchdog (run it by hand for details)"; exit 1; }
 fi
 if [[ -f ${prefix}/drive_c/wine-patched/hlsl_compile.exe ]]; then
     print "Checking that Wine's HLSL compiler knows isnan"

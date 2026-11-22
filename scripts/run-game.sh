@@ -8,11 +8,13 @@
 #
 # Environment: CRANVR_OPENVR=opencomposite, steamvr or off chooses the OpenVR runtime for this start
 # (default: the app's setting "OpenVR games" in app.json, which is OpenComposite until the user changes
-# it). The script writes the prefix's OpenVR path file (%LOCALAPPDATA%\\openvr\\openvrpaths.vrpath), as the
-# app does (app/src/openvr.rs). OpenComposite sends an OpenVR game's calls to the OpenXR runtime of cranvr.
-# SteamVR runs the game in SteamVR for Windows from the prefix's Steam library, with cranvr's driver in
-# C:\\cranvr\\steamvr: the game starts SteamVR, and SteamVR ends with the game. Off removes a file that
-# cranvr wrote. No file of a game changes. An OpenXR game ignores the file.
+# it). The script writes the prefix's OpenVR path file (%LOCALAPPDATA%\\openvr\\openvrpaths.vrpath) for the
+# program's run and puts the file from before back when the program ends, as the app does (app/src/openvr.rs).
+# OpenComposite sends an OpenVR game's calls to the OpenXR runtime of cranvr. SteamVR runs the game in SteamVR for
+# Windows from the prefix's Steam library, with cranvr's driver in C:\\cranvr\\steamvr: the game starts SteamVR,
+# and SteamVR ends with the game. Off leaves the program no runtime. No file of a game changes. An OpenXR game
+# ignores the file. --steam never names OpenComposite: Steam starts OpenVR as its watchdog when SteamVR is installed,
+# and OpenComposite runs games only, so Steam gets SteamVR or no runtime in place of OpenComposite.
 #
 # Environment: CRANVR_MAX_MSAA caps the MSAA samples a game may use (default: the app's setting, else
 # 2; 0 for no cap). The script applies no option of a particular game: set them yourself, as the
@@ -136,7 +138,10 @@ elif [[ ${dir} == */steamapps/common/* ]]; then
 fi
 export MVK_CONFIG_LOG_LEVEL=0
 
-# OpenVR runtime: the same choice as the app makes (app/src/openvr.rs)
+# OpenVR runtime: the same rule as the app's (app/src/openvr.rs). The path file names a game's runtime while the game
+# runs, and the file from before comes back at its end. Steam gets no OpenComposite: Steam starts OpenVR as its watchdog
+# when SteamVR is installed, and OpenComposite runs games only. So Steam gets SteamVR, when the library has it, or no
+# runtime in place of a file that names OpenComposite.
 openvr=${CRANVR_OPENVR:-}
 if [[ -z ${openvr} && -f ${home}/app.json ]]; then
     openvr=$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1])).get("wine", {}).get("openvr", "opencomposite"))' "${home}/app.json" 2>/dev/null || true)
@@ -146,21 +151,13 @@ openvr=${openvr:-opencomposite}
 prefix=${home}/wine/prefix
 user_dir=${prefix}/drive_c/users/$(id -un)
 [[ -d ${user_dir} ]] || user_dir=$(print -rl -- "${prefix}"/drive_c/users/*(/N) | grep -v '/Public$' | head -1)
-if [[ -n ${user_dir} ]]; then
-    vrpath=${user_dir}/AppData/Local/openvr/openvrpaths.vrpath
-    case ${openvr} in
-        opencomposite)
-            [[ -f ${prefix}/drive_c/opencomposite/bin/vrclient_x64.dll ]] || { print -u2 "The game support has no OpenComposite"; exit 1; }
-            mkdir -p "${vrpath:h}"
-            print -r -- '{"jsonid": "vrpathreg", "runtime": ["C:\\opencomposite"], "version": 1}' > "${vrpath}"
-            print "OpenVR games use OpenComposite (${vrpath})" ;;
-        steamvr)
-            [[ -f ${prefix}/drive_c/cranvr/steamvr/driver.vrdrivermanifest ]] || { print -u2 "The game support has no SteamVR driver"; exit 1; }
-            mkdir -p "${vrpath:h}"
-            # SteamVR's folder from its manifest (app 250820) in one of the Steam libraries of the prefix
-            python3 -I - "${prefix}" "${vrpath}" <<'PYTHON' || exit 1
+# The path file for SteamVR, with cranvr's driver among its drivers: SteamVR's folder comes from its manifest (app
+# 250820) in one of the Steam libraries of the prefix. It prints nothing when no library has SteamVR.
+steamvr_text() {
+    [[ -f ${prefix}/drive_c/cranvr/steamvr/driver.vrdrivermanifest ]] || return 0
+    python3 -I - "${prefix}" <<'PYTHON'
 import json, os, re, sys
-prefix, vrpath = sys.argv[1], sys.argv[2]
+prefix = sys.argv[1]
 steam = os.path.join(prefix, "drive_c", "Program Files (x86)", "Steam")
 def windows(path):
     rest = os.path.relpath(path, os.path.join(prefix, "drive_c"))
@@ -183,34 +180,73 @@ for steamapps in libraries:
     installdir = re.search(r'"installdir"\s+"([^"]+)"', manifest)
     folder = os.path.join(steamapps, "common", installdir.group(1)) if installdir else ""
     if folder and os.path.isfile(os.path.join(folder, "bin", "win64", "vrserver.exe")):
-        paths = {"config": [windows(os.path.join(steam, "config"))], "external_drivers": ["C:\\cranvr\\steamvr"],
-                 "jsonid": "vrpathreg", "log": [windows(os.path.join(steam, "logs"))], "runtime": [windows(folder)], "version": 1}
-        open(vrpath, "w").write(json.dumps(paths))
-        print("OpenVR games use SteamVR in " + windows(folder) + " (" + vrpath + ")")
-        # After a crash of its server SteamVR turns the drivers off ("blocked_by_safe_mode") and loads them no
-        # more. Without cranvr's driver SteamVR has no headset, so the driver is turned on again.
-        settings = os.path.join(steam, "config", "steamvr.vrsettings")
-        try:
-            values = json.load(open(settings, encoding="utf-8"))
-            driver = values.get("driver_cranvr")
-            if isinstance(driver, dict) and driver.pop("blocked_by_safe_mode", False):
-                if not driver:
-                    del values["driver_cranvr"]
-                open(settings, "w", encoding="utf-8").write(json.dumps(values, indent=3))
-                print("SteamVR had turned cranvr's driver off after a crash; it is on again (" + settings + ")")
-        except (OSError, ValueError):
-            pass
-        sys.exit(0)
-print("SteamVR is not installed: install SteamVR from the Steam library of the prefix", file=sys.stderr)
-sys.exit(1)
+        print(json.dumps({"config": [windows(os.path.join(steam, "config"))], "external_drivers": ["C:\\cranvr\\steamvr"],
+                          "jsonid": "vrpathreg", "log": [windows(os.path.join(steam, "logs"))], "runtime": [windows(folder)], "version": 1}))
+        break
 PYTHON
-            ;;
-        off)
-            if [[ -f ${vrpath} ]] && grep -qE 'C:\\\\(opencomposite|cranvr\\\\steamvr)' "${vrpath}"; then
-                rm -f "${vrpath}"
-                print "OpenVR games find no runtime (OpenVR is off)"
-            fi ;;
-    esac
+}
+# Writes the file that a game's choice or the time without a game asks for: its text, or none for an empty text
+put_vrpath() {
+    if [[ -n $1 ]]; then
+        mkdir -p "${vrpath:h}"
+        print -r -- "$1" > "${vrpath}"
+    elif [[ -f ${vrpath} ]]; then
+        rm -f "${vrpath}"
+    fi
+}
+names_opencomposite() { [[ -f ${vrpath} ]] && grep -qF 'C:\\opencomposite' "${vrpath}" }
+saved_vrpath=""
+had_vrpath=false
+if [[ -n ${user_dir} ]]; then
+    vrpath=${user_dir}/AppData/Local/openvr/openvrpaths.vrpath
+    # What goes back at the end: the file from before, or the file for the time without a game in place of
+    # OpenComposite that a run left over
+    if names_opencomposite; then
+        saved_vrpath=$(steamvr_text)
+        [[ -n ${saved_vrpath} ]] && had_vrpath=true
+    elif [[ -f ${vrpath} ]]; then
+        saved_vrpath=$(<"${vrpath}")
+        had_vrpath=true
+    fi
+    if ${steam}; then
+        if names_opencomposite; then
+            put_vrpath "${saved_vrpath}"
+            print "OpenVR: Steam gets ${${saved_vrpath:+SteamVR}:-no runtime} in place of OpenComposite (${vrpath})"
+        fi
+    else
+        case ${openvr} in
+            opencomposite)
+                [[ -f ${prefix}/drive_c/opencomposite/bin/vrclient_x64.dll ]] || { print -u2 "The game support has no OpenComposite"; exit 1; }
+                put_vrpath '{"jsonid": "vrpathreg", "runtime": ["C:\\opencomposite"], "version": 1}'
+                print "OpenVR games use OpenComposite (${vrpath})" ;;
+            steamvr)
+                [[ -f ${prefix}/drive_c/cranvr/steamvr/driver.vrdrivermanifest ]] || { print -u2 "The game support has no SteamVR driver"; exit 1; }
+                text=$(steamvr_text)
+                [[ -n ${text} ]] || { print -u2 "SteamVR is not installed: install SteamVR from the Steam library of the prefix"; exit 1; }
+                put_vrpath "${text}"
+                print "OpenVR games use SteamVR (${vrpath})"
+                # After a crash of its server SteamVR turns the drivers off ("blocked_by_safe_mode") and loads them no
+                # more. Without cranvr's driver SteamVR has no headset, so the driver is turned on again.
+                python3 -I - "${prefix}/drive_c/Program Files (x86)/Steam/config/steamvr.vrsettings" <<'PYTHON'
+import json, sys
+settings = sys.argv[1]
+try:
+    values = json.load(open(settings, encoding="utf-8"))
+    driver = values.get("driver_cranvr")
+    if isinstance(driver, dict) and driver.pop("blocked_by_safe_mode", False):
+        if not driver:
+            del values["driver_cranvr"]
+        open(settings, "w", encoding="utf-8").write(json.dumps(values, indent=3))
+        print("SteamVR had turned cranvr's driver off after a crash; it is on again (" + settings + ")")
+except (OSError, ValueError):
+    pass
+PYTHON
+                ;;
+            off)
+                put_vrpath ""
+                print "OpenVR games find no runtime (OpenVR is off)" ;;
+        esac
+    fi
 fi
 # cranvr's SteamVR driver finds the game's render size in game-sizes.txt by the game's program. SteamVR, which
 # the game starts, inherits the variable.
@@ -219,4 +255,17 @@ if [[ ${program} == [A-Za-z]:\\* ]]; then
 else
     export CRANVR_GAME=$("${wine_root}/bin/wine" winepath -w "${program:A}" 2>/dev/null)
 fi
-exec "${wine_root}/bin/wine" "${program}" "$@"
+# Steam keeps running after this script: its file stays as it is now
+if ${steam} || [[ -z ${user_dir} ]]; then
+    exec "${wine_root}/bin/wine" "${program}" "$@"
+fi
+# A game's end puts the file from before its start back
+restore_vrpath() {
+    if ${had_vrpath}; then put_vrpath "${saved_vrpath}"; else put_vrpath ""; fi
+}
+"${wine_root}/bin/wine" "${program}" "$@" &
+child=$!
+trap 'kill ${child} 2>/dev/null; wait ${child}; restore_vrpath; exit 143' TERM INT HUP
+wait ${child} && code=0 || code=$?
+restore_vrpath
+exit ${code}
