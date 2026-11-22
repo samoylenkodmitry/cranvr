@@ -1140,6 +1140,12 @@ fn frame_loop(
         let Some(stream) = shared.stream.lock().unwrap().clone() else {
             give_back(&game_frame);
             encoder = None;
+            // Without a headset nobody sees the desktop. A running capture would make WindowServer
+            // work on every change of the screen (issue #118): it ran from the host's start until
+            // the first headset came.
+            if let Some(c) = &capture {
+                c.set_running(false);
+            }
             continue;
         };
         if encoder.as_ref().is_none_or(|(_, n, _)| *n != stream) {
