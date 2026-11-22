@@ -475,17 +475,28 @@ fn a_native_client_connects_and_the_host_serves_it() {
         }
     }
 
-    // The console: the host's menu reaches the client and a button's request reaches the host
-    headset.send_menu(r#"{"games":[],"fps":120}"#);
-    loop {
-        if let Heard::Control(HostMsg::Menu(menu)) = from_client.recv_timeout(Duration::from_secs(10)).unwrap() {
-            assert_eq!(menu, r#"{"games":[],"fps":120}"#);
-            break;
+    // The console: the stream's state and the host's menu reach the client, and a button's request
+    // reaches the host
+    headset.send_menu_status(r#"{"refresh":120}"#);
+    headset.send_menu(r#"{"pages":[],"controls":{}}"#);
+    let mut heard = (false, false);
+    while heard != (true, true) {
+        match from_client.recv_timeout(Duration::from_secs(10)).unwrap() {
+            Heard::Control(HostMsg::MenuStatus(status)) => {
+                assert_eq!(status, r#"{"refresh":120}"#);
+                heard.0 = true;
+            }
+            Heard::Control(HostMsg::Menu(menu)) => {
+                assert!(heard.0, "the state comes before the menu");
+                assert_eq!(menu, r#"{"pages":[],"controls":{}}"#);
+                heard.1 = true;
+            }
+            _ => {}
         }
     }
-    client.duplex.send_control(&ClientMsg::Console(r#"{"action":"play","game":"Beat Saber"}"#.into())).unwrap();
+    client.duplex.send_control(&ClientMsg::Console(r#"{"action":"run","id":"steam.stop"}"#.into())).unwrap();
     let Event::Console(request) = wait_for(&mut *events, |e| matches!(e, Event::Console(_))) else { unreachable!() };
-    assert_eq!(request, r#"{"action":"play","game":"Beat Saber"}"#);
+    assert_eq!(request, r#"{"action":"run","id":"steam.stop"}"#);
 
     // A recenter of the headset reaches the frame loop as an event
     client.duplex.send_control(&ClientMsg::Recenter(Recenter { change_time: now_ns(), origin: None })).unwrap();

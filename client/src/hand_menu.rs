@@ -484,10 +484,16 @@ fn commit(state: HandState, layout: Layout) {
 #[composable]
 pub fn Menu(state: HandState, console_open: bool, frame: HandFrame) {
     let view = rememberMutableStateOf(|| displays().menu_view());
+    // The pages of the Mac's settings, as the host's menu lists them
+    let pages = rememberMutableStateOf(|| hub().listed_pages());
     LaunchedEffect((), async move |_| loop {
         let now = displays().menu_view();
         if view.get_non_reactive() != now {
             view.set(now);
+        }
+        let listed = hub().listed_pages();
+        if pages.get_non_reactive() != listed {
+            pages.set(listed);
         }
         delay(MENU_POLL).await;
     });
@@ -497,7 +503,8 @@ pub fn Menu(state: HandState, console_open: bool, frame: HandFrame) {
     let wishes = crate::displays::wishes_of(&layout);
     let displays_view = view.get();
     let busy = adding.get().is_some_and(|add| add.runs(&displays_view));
-    let input = MenuInput { layout: &layout, console_open, displays: &displays_view, wishes, place: state.place.get(), adding: busy };
+    let listed = pages.get();
+    let input = MenuInput { layout: &layout, console_open, displays: &displays_view, wishes, place: state.place.get(), adding: busy, pages: &listed };
     let rows = menu_model::rows(&input);
     let height = menu_model::height(&rows);
     // The place that the user carried the menu to is read once for each opening. Cranpose keeps the
@@ -622,6 +629,14 @@ fn perform(action: MenuAction, state: HandState, adding: MutableState<Option<Add
             state.recenter.set(state.recenter.get_non_reactive() + 1);
         }
         MenuAction::OpenControls => hub().open_controls(),
+        MenuAction::OpenPage(index) => {
+            // The console takes the place of the menu, which closes
+            if let Some((id, short)) = hub().listed_pages().into_iter().nth(usize::from(index)) {
+                log::info!("the hand menu opens the console on the page {short} ({id})");
+                hub().open_page(id);
+                state.menu_open.set(false);
+            }
+        }
     }
 }
 

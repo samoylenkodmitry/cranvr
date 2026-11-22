@@ -1,114 +1,136 @@
 use super::*;
+use cranvr_common::menu::{Button, Buttons, Choice, Opt, Style};
+use serde_json::json;
 
-const MENU: &str = r#"{"games":[{"name":"Beat Saber","program":"Beat Saber.exe","vr":"opencomposite"},{"name":"Half-Life: Alyx","program":"hlvr.exe","vr":"steamvr"}],
-    "fps":120,"game_scale":0.6,"msaa":2,"controls":{},
-    "status":{"refresh":120,"fps":119.4,"game_fps":117,"latency_ms":46.2,"game":"Beat Saber.exe"}}"#;
+/// The pages as the app writes them: the games first, then the stream's settings
+fn pages() -> Value {
+    json!([
+        {"id": "play", "title": "Play", "short": "Play", "listed": true, "items": [
+            {"kind": "buttons", "title": "Beat Saber", "detail": "OpenComposite", "buttons": [
+                {"label": "Play", "press": {"does": "run", "id": "game.play", "subject": "C:\\BS\\Beat Saber.exe"}, "style": "primary", "running": "Starting..."},
+                {"label": "Options", "press": {"does": "open", "page": "game:C:\\BS\\Beat Saber.exe"}}
+            ]}
+        ]},
+        {"id": "stream", "title": "Stream", "short": "Stream", "listed": true, "items": [
+            {"kind": "choice", "id": "fps", "label": "Refresh rate", "options": [{"value": "90", "label": "90 Hz"}, {"value": "120", "label": "120 Hz"}], "value": "120", "restarts": true}
+        ]},
+        {"id": "game:C:\\BS\\Beat Saber.exe", "title": "Beat Saber", "short": "Options", "items": []}
+    ])
+}
 
-/// A menu with the games and the settings only, as the app writes it before a headset streams
-const BARE: &str = r#"{"games":[],"fps":90,"game_scale":1.0,"msaa":0,"controls":{}}"#;
+fn menu_text() -> String {
+    json!({"pages": pages(), "controls": {}}).to_string()
+}
 
+/// A menu with the pages only, as the app writes it before a headset streams
+const BARE: &str = r#"{"pages":[],"controls":{}}"#;
+
+/// A menu that knows whether `game` runs, as the console's menu does once the stream's state came
 fn menu(game: Option<&str>) -> Menu {
-    let mut menu = Menu::parse(MENU).unwrap();
+    let mut menu = Menu::parse(&menu_text()).unwrap();
     menu.status.game = game.map(str::to_string);
     menu
 }
 
+/// The host's state with `game` and then its menu, as the host sends them
+fn show(console: &mut Console, game: Option<&str>) {
+    console.on_status(Status { game: game.map(str::to_string), ..Status::default() });
+    console.on_menu(menu(None));
+}
+
 #[test]
 fn the_menu_comes_from_the_hosts_json() {
-    let menu = Menu::parse(MENU).unwrap();
-    assert_eq!(
-        menu.games,
-        [
-            Game { name: "Beat Saber".into(), program: "Beat Saber.exe".into(), vr: VrSystem::OpenComposite },
-            Game { name: "Half-Life: Alyx".into(), program: "hlvr.exe".into(), vr: VrSystem::SteamVr }
-        ]
-    );
-    assert_eq!((menu.fps, menu.msaa), (120, 2));
-    assert!((menu.game_scale - 0.6).abs() < 1e-6);
-    assert_eq!(menu.status, Status { refresh: 120.0, fps: 119.4, game_fps: 117.0, latency_ms: Some(46.2), game: Some("Beat Saber.exe".into()) });
-    assert!(menu.runs(&menu.games[0]) && !menu.runs(&menu.games[1]));
-    // The host sends the file without a status while no headset streams
+    let menu = menu(None);
+    assert_eq!(menu.pages.len(), 3);
+    assert_eq!(menu.main().map(|page| page.id.as_str()), Some("play"));
+    // The stream's state comes apart
+    let status = Status::parse(r#"{"refresh":120,"fps":119.4,"game_fps":117,"latency_ms":46.2,"game":"Beat Saber.exe"}"#).unwrap();
+    assert_eq!(status, Status { refresh: 120.0, fps: 119.4, game_fps: 117.0, latency_ms: Some(46.2), game: Some("Beat Saber.exe".into()) });
+    assert_eq!(Status::parse(r#"{"refresh":null}"#).unwrap(), Status::default(), "no headset streams");
+    assert_eq!(Status::parse("[1]"), None);
+    // The menus list the pages after the main page that ask for it: a game's page is not listed
+    assert_eq!(menu.listed(), [("stream".to_string(), "Stream".to_string())]);
+    assert_eq!(menu.item(&Request::set("fps", "90")).and_then(Item::value), Some("120"));
     let bare = Menu::parse(BARE).unwrap();
-    assert_eq!((bare.fps, bare.game_scale, bare.status.game), (90, 1.0, None));
+    assert_eq!((bare.pages.len(), bare.status.game), (0, None));
     assert_eq!(Menu::parse("not json"), None);
-    assert_eq!(Menu::parse(r#"{"fps":90}"#), None, "a text without games is no menu");
-    // Every setting and the controls belong to the menu
-    for lacking in [r#"{"games":[],"game_scale":1.0,"msaa":0,"controls":{}}"#, r#"{"games":[],"fps":90,"msaa":0,"controls":{}}"#, r#"{"games":[],"fps":90,"game_scale":1.0,"controls":{}}"#, r#"{"games":[],"fps":90,"game_scale":1.0,"msaa":0}"#, r#"{"games":[],"fps":90,"game_scale":1.0,"msaa":0,"controls":5}"#] {
-        assert_eq!(Menu::parse(lacking), None, "{lacking}");
-    }
-    // Each game names its VR system with a word that the console knows
-    for game in [r#"{"name":"A","program":"a.exe"}"#, r#"{"name":"A","program":"a.exe","vr":"oculus"}"#] {
-        assert_eq!(Menu::parse(&format!(r#"{{"games":[{game}],"fps":90,"game_scale":1.0,"msaa":0,"controls":{{}}}}"#)), None, "{game}");
-    }
+    assert_eq!(Menu::parse(r#"{"games":[],"fps":90,"game_scale":1.0,"msaa":0,"controls":{}}"#), None, "the old menu is no menu");
+    assert_eq!(Menu::parse(r#"{"pages":[{"id":"x"}],"controls":{}}"#), None, "a page that does not read");
+    assert_eq!(Menu::parse(r#"{"pages":[]}"#), None, "the controls belong to the menu");
 }
 
 #[test]
-fn a_press_on_a_game_s_vr_system_asks_for_the_next_one() {
-    assert_eq!(VrSystem::OpenComposite.next(), VrSystem::SteamVr);
-    assert_eq!(VrSystem::SteamVr.next(), VrSystem::Off);
-    assert_eq!(VrSystem::Off.next(), VrSystem::OpenComposite);
-    for system in VrSystem::ALL {
-        assert_eq!(VrSystem::from_key(system.key()), Some(system));
-    }
-    let request = Action::VrSystem("The Lab".into(), VrSystem::SteamVr).request();
-    assert_eq!(serde_json::from_str::<Value>(&request).unwrap(), json!({"action": "set", "game": "The Lab", "openvr": "steamvr"}));
-}
-
-#[test]
-fn the_apps_notice_shows_in_the_menu_and_adds_a_line_to_the_height() {
-    let mut with = Menu::parse(r#"{"games":[],"fps":90,"game_scale":1.0,"msaa":0,"controls":{},"notice":"The right eye stayed black. The game restarts."}"#).unwrap();
+fn the_apps_notice_shows_in_the_menu_only_while_there_is_one() {
+    let with = Menu::parse(r#"{"pages":[],"controls":{},"notice":"The right eye stayed black. The game restarts."}"#).unwrap();
     assert_eq!(with.notice.as_deref(), Some("The right eye stayed black. The game restarts."));
-    let without = Menu::parse(r#"{"games":[],"fps":90,"game_scale":1.0,"msaa":0,"controls":{},"notice":""}"#).unwrap();
+    let without = Menu::parse(r#"{"pages":[],"controls":{},"notice":""}"#).unwrap();
     assert_eq!(without.notice, None);
-    assert_eq!(Menu::parse(BARE).unwrap().notice, None);
-    assert!((height(Some(&with)) - height(Some(&without)) - (size::TEXT + size::GAP)).abs() < 1e-3);
-    with.notice = None;
-    assert!((height(Some(&with)) - height(Some(&without))).abs() < 1e-3);
 }
 
 #[test]
-fn requests_are_the_json_that_the_app_reads() {
-    let json = |action: Action| serde_json::from_str::<Value>(&action.request()).unwrap();
-    assert_eq!(json(Action::Play("Beat Saber".into())), json!({"action": "play", "game": "Beat Saber"}));
-    assert_eq!(json(Action::Stop), json!({"action": "stop"}));
-    assert_eq!(json(Action::Fps(90)), json!({"action": "set", "fps": 90}));
-    assert_eq!(json(Action::Msaa(0)), json!({"action": "set", "msaa": 0}));
-    assert!((json(Action::Scale(0.7))["game_scale"].as_f64().unwrap() - 0.7).abs() < 1e-6);
+fn a_change_runs_until_the_menu_shows_its_value_or_a_new_notice() {
+    let start = Instant::now();
+    let menu = menu(None);
+    let pending = Pending::new(Request::set("fps", "90"), None, start);
+    assert_eq!(pending.progress(&menu, start + Duration::from_secs(10)), Progress::Running);
+    assert_eq!(pending.progress(&menu, start + ANSWER_TIME + Duration::from_secs(1)), Progress::NoAnswer);
+    // The Mac took it: the menu shows the new value
+    let mut taken = menu.clone();
+    if let Some(Item::Choice(choice)) = taken.pages[1].items.first_mut() {
+        choice.value = "90".into();
+    }
+    assert_eq!(pending.progress(&taken, start), Progress::Done);
+    // The Mac says why not
+    let mut refused = menu;
+    refused.notice = Some("cranvr has no setting fps".into());
+    assert_eq!(pending.progress(&refused, start), Progress::Done);
 }
 
 #[test]
-fn the_height_grows_with_the_games_up_to_the_limit() {
+fn an_action_runs_while_the_mac_marks_its_button_and_briefly_before_the_mac_can_say_so() {
+    let start = Instant::now();
+    let play = Request::run("game.play").of("C:\\BS\\Beat Saber.exe");
     let mut menu = menu(None);
-    let two = height(Some(&menu));
-    menu.games.push(Game { name: "Third".into(), program: "third.exe".into(), ..Default::default() });
-    assert!((height(Some(&menu)) - two - (size::BUTTON + size::GAP)).abs() < 1e-3);
-    menu.games.extend((0..10).map(|i| Game { name: format!("Game {i}"), program: format!("g{i}.exe"), ..Default::default() }));
-    assert_eq!(menu.listed().len(), MAX_GAMES);
-    assert!(height(Some(&menu)) < 1000.0, "{}", height(Some(&menu)));
-    // A console without a menu is short, and a menu without games keeps a line for the note
-    assert!(height(None) < 400.0);
-    menu.games.clear();
-    assert!(height(Some(&menu)) > two - (size::BUTTON + size::GAP) - 1e-3);
+    let pending = Pending::new(play.clone(), None, start);
+    assert_eq!(pending.progress(&menu, start + Duration::from_secs(1)), Progress::Running, "the Mac's menu is on its way");
+    assert_eq!(pending.progress(&menu, start + ECHO_TIME + Duration::from_millis(1)), Progress::Done, "a quick action is done");
+    let Some(Item::Buttons(row)) = menu.pages[0].items.first_mut() else { panic!() };
+    row.buttons[0].busy = true;
+    assert_eq!(pending.progress(&menu, start + Duration::from_secs(30)), Progress::Running, "the Mac starts the game");
+    assert_eq!(pending.progress(&menu, start + ANSWER_TIME + Duration::from_secs(1)), Progress::NoAnswer);
+    assert!(pending.is(&play) && !pending.is(&Request::run("steam.stop")));
+}
+
+#[test]
+fn a_request_is_the_json_that_the_app_reads() {
+    let request = Request::set("fps", "90");
+    assert_eq!(request.to_json(), json!({"action": "set", "id": "fps", "value": "90"}));
+    // The types that the app writes read back here
+    let row = Buttons { title: "A".into(), buttons: vec![Button::run("Play", "game.play").of("C:\\a.exe").styled(Style::Primary)], ..Default::default() };
+    let choice = Choice { id: "fps".into(), label: "Refresh".into(), options: vec![Opt::new("90", "90 Hz")], value: "90".into(), ..Default::default() };
+    let page = Page { id: "x".into(), title: "X".into(), items: vec![Item::Buttons(row), Item::Choice(choice)], ..Default::default() };
+    let text = json!({"pages": [page], "controls": {}}).to_string();
+    assert_eq!(Menu::parse(&text).unwrap().pages[0].items.len(), 2);
 }
 
 #[test]
 fn the_first_menu_opens_the_console_and_a_game_closes_it() {
     let mut console = Console::default();
     assert!(!console.view().open);
-    console.on_menu(menu(None));
+    show(&mut console, None);
     assert!(console.view().open);
     // The next menus change nothing while no game starts
-    console.on_menu(menu(None));
+    show(&mut console, None);
     assert!(console.view().open);
     // The user hides it. A menu without a change of the game keeps it hidden.
     console.close();
-    console.on_menu(menu(None));
+    show(&mut console, None);
     assert!(!console.view().open);
     // A game starts: hidden. The game ends: shown again
-    console.on_menu(menu(Some("Beat Saber.exe")));
+    show(&mut console, Some("Beat Saber.exe"));
     assert!(!console.view().open);
-    console.on_menu(menu(Some("Beat Saber.exe")));
-    console.on_menu(menu(None));
+    show(&mut console, Some("Beat Saber.exe"));
+    show(&mut console, None);
     assert!(console.view().open);
     // The link ends: no menu, no console
     console.clear();
@@ -135,7 +157,7 @@ fn with_controls(controls: &Controls) -> Menu {
 fn the_menu_carries_the_controls() {
     let mut mapped = Controls::default();
     mapped.set(Hand::Right, Control::Secondary, ControlAction::Keyboard);
-    let text = format!(r#"{{"games":[],"fps":90,"game_scale":1.0,"msaa":0,"controls":{}}}"#, mapped.to_json());
+    let text = format!(r#"{{"pages":[],"controls":{}}}"#, mapped.to_json());
     assert_eq!(Menu::parse(&text).unwrap().controls, mapped);
     assert_eq!(Menu::parse(BARE).unwrap().controls, Controls::default());
 }
@@ -249,9 +271,10 @@ fn the_standard_button_gives_the_standard_mapping_back() {
 
 #[test]
 fn the_controls_page_fits_a_panel_that_a_person_can_reach() {
-    // Two lines, the title, two tabs, eight inputs and the buttons: about 740 dp, under a meter
+    // The title, two tabs, eight inputs, the menu hand, the controller models, two lines and the
+    // buttons: about 930 dp, under a meter
     let tall = controls_height();
-    assert!(tall > 600.0 && tall < 900.0, "{tall}");
+    assert!(tall > 800.0 && tall < 1000.0, "{tall}");
 }
 
 #[test]
@@ -311,11 +334,11 @@ fn the_console_follows_the_game_and_the_setting_into_its_backdrop() {
     let mut console = Console::default();
     // No link and no menu: no game, so the room shows
     assert!(console.backdrop(None).shows_room(true));
-    console.on_menu(menu(None));
+    show(&mut console, None);
     assert!(console.backdrop(None).shows_room(true));
     // A game starts. The desktop's hiding tells it first, the menu later.
     assert!(!console.backdrop(Some(true)).shows_room(true));
-    console.on_menu(menu(Some("Beat Saber.exe")));
+    show(&mut console, Some("Beat Saber.exe"));
     assert!(!console.backdrop(Some(true)).shows_room(true));
     // The host has no desktop: the menu alone keeps the game on screen
     assert!(!console.backdrop(None).shows_room(true));
@@ -337,44 +360,29 @@ fn the_console_follows_the_game_and_the_setting_into_its_backdrop() {
 }
 
 #[test]
-fn the_new_settings_fit_the_consoles_height() {
-    let mut menu = menu(None);
-    menu.games.extend((0..10).map(|i| Game { name: format!("Game {i}"), program: format!("g{i}.exe"), ..Default::default() }));
-    assert_eq!(menu.listed().len(), MAX_GAMES);
-    // Five games, six settings, the note and the buttons: about 990 dp, a little under a meter
-    let tall = height(Some(&menu));
-    assert!(tall > 900.0 && tall < 1000.0, "{tall}");
+fn a_notice_from_before_the_press_does_not_answer_it() {
+    let start = Instant::now();
+    let mut old = menu(None);
+    old.notice = Some("An old notice".into());
+    let change = Pending::new(Request::set("fps", "90"), old.notice.clone(), start);
+    assert_eq!(change.progress(&old, start), Progress::Running);
+    let mut newer = old.clone();
+    newer.notice = Some("A new notice".into());
+    assert_eq!(change.progress(&newer, start), Progress::Done);
 }
 
 #[test]
-fn a_game_s_start_runs_until_the_menu_shows_the_game_or_a_new_notice() {
-    let start = Instant::now();
-    let idle = menu(None);
-    let pending = Pending::new(Action::Play("Beat Saber".into()), idle.notice.clone(), start);
-    assert_eq!(pending.action.running_label(), "Starting...");
-    assert_eq!(pending.progress(&idle, start + Duration::from_secs(30)), Progress::Running);
-    assert_eq!(pending.progress(&menu(Some("Beat Saber.exe")), start + Duration::from_secs(30)), Progress::Done);
-    // Another game that runs answers nothing
-    assert_eq!(pending.progress(&menu(Some("hlvr.exe")), start + Duration::from_secs(1)), Progress::Running);
-    // The app's notice says why the start failed
-    let mut failed = menu(None);
-    failed.notice = Some("Steam did not start".into());
-    assert_eq!(pending.progress(&failed, start + Duration::from_secs(1)), Progress::Done);
-    assert_eq!(pending.progress(&idle, start + ANSWER_TIME + Duration::from_secs(1)), Progress::NoAnswer);
-}
-
-#[test]
-fn a_notice_from_before_the_press_does_not_answer_it_and_a_stop_ends_with_the_game() {
-    let start = Instant::now();
-    let mut running = menu(Some("Beat Saber.exe"));
-    running.notice = Some("An old notice".into());
-    let stop = Pending::new(Action::Stop, running.notice.clone(), start);
-    assert_eq!(stop.action.running_label(), "Stopping...");
-    assert_eq!(stop.progress(&running, start), Progress::Running);
-    let mut stopped = menu(None);
-    stopped.notice = running.notice.clone();
-    assert_eq!(stop.progress(&stopped, start), Progress::Done);
-    let fps = Pending::new(Action::Fps(90), running.notice.clone(), start);
-    assert_eq!(fps.progress(&running, start), Progress::Running);
-    assert_eq!(fps.progress(&Menu { fps: 90, ..running.clone() }, start), Progress::Done);
+fn the_state_comes_apart_and_a_game_that_runs_at_the_connection_keeps_the_console_hidden() {
+    let mut console = Console::default();
+    // The host sends the state first
+    console.on_status(Status { game: Some("Beat Saber.exe".into()), ..Status::default() });
+    assert!(!console.view().open, "no menu yet");
+    console.on_menu(menu(None));
+    assert!(!console.view().open, "a game runs");
+    assert_eq!(console.view().menu.unwrap().status.game.as_deref(), Some("Beat Saber.exe"));
+    // A new menu keeps the state, and the game's end alone shows the console
+    console.on_menu(menu(None));
+    assert!(!console.view().open);
+    console.on_status(Status::default());
+    assert!(console.view().open, "the game ended");
 }

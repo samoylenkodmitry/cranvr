@@ -8,7 +8,7 @@
 use crate::{
     audio,
     connection::Connection,
-    console::{Action, Backdrop, Console, Menu, Room, View as ConsoleView, Volume},
+    console::{Backdrop, Console, Menu, Room, View as ConsoleView, Volume},
     controls::{Fire, Runner},
     displays::displays,
     discovery::FoundHost,
@@ -673,6 +673,17 @@ impl Hub {
         }
     }
 
+    /// The stream's state for the console from the host, for the connection `id`.
+    pub(crate) fn set_menu_status(&self, id: u64, text: &str) {
+        if self.current.load(Ordering::Acquire) != id {
+            return;
+        }
+        match crate::console::Status::parse(text) {
+            Some(status) => self.console.lock().unwrap().on_status(status),
+            None => log::warn!("the host sent a state of the stream that the console cannot read"),
+        }
+    }
+
     pub fn console(&self) -> ConsoleView {
         self.console.lock().unwrap().view()
     }
@@ -754,11 +765,8 @@ impl Hub {
     fn send_controls(&self, controls: Option<Controls>) {
         let Some(controls) = controls else { return };
         settings::remember_controls(&controls);
-        let request = serde_json::json!({"action": "set", "controls": controls}).to_string();
-        log::info!("the console sets the controls: {request}");
-        if let Some(connection) = self.connection.lock().unwrap().as_ref() {
-            connection.send_console(request);
-        }
+        let request = cranvr_common::menu::Request::set("controls", controls.to_json());
+        self.send_request(&request);
     }
 
     pub fn close_console(&self) {
@@ -775,6 +783,18 @@ impl Hub {
         log::info!("the hand menu asks for the page of the controls");
         crate::console::request_controls_page();
         self.console.lock().unwrap().open();
+    }
+
+    /// Opens the console on a page of the host, or turns an open console to it.
+    pub fn open_page(&self, id: String) {
+        crate::console::request_page(crate::console::Shown::Host(id));
+        self.console.lock().unwrap().open();
+    }
+
+    /// The pages of the host's menu that the menus list: their ids and the words of their buttons.
+    /// Empty without a menu.
+    pub fn listed_pages(&self) -> Vec<(String, String)> {
+        self.console.lock().unwrap().listed_pages()
     }
 
     /// Opens the console and keeps it open when the link ends (see `settings::console_on_launch`).
@@ -820,11 +840,12 @@ impl Hub {
         settings::remember_volume(volume);
     }
 
-    /// Sends a press of a console button to the host.
-    pub fn press(&self, action: &Action) {
-        log::info!("the console asks for {}", action.request());
+    /// Sends a press of a console button to the host: a change of a setting or an action.
+    pub fn send_request(&self, request: &cranvr_common::menu::Request) {
+        let text = request.to_json().to_string();
+        log::info!("the console asks for {text}");
         if let Some(connection) = self.connection.lock().unwrap().as_ref() {
-            connection.send_console(action.request());
+            connection.send_console(text);
         }
     }
 

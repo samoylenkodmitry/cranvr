@@ -71,7 +71,7 @@ impl Pending {
 
 /// Whether two names of a program name the same file. The runtime may name a game by its file name
 /// alone, and Windows does not tell the case of letters apart.
-fn same_program(a: &str, b: &str) -> bool {
+pub fn same_program(a: &str, b: &str) -> bool {
     let file = |path: &str| path.rsplit(['\\', '/']).next().unwrap_or(path).to_ascii_lowercase();
     file(a) == file(b)
 }

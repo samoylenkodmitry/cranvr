@@ -1532,6 +1532,14 @@ impl Headset for Native {
         }
     }
 
+    fn send_menu_status(&self, status: &str) {
+        if let Some(session) = self.shared.session() {
+            if let Err(e) = session.link.duplex.send_control(&HostMsg::MenuStatus(status.to_owned())) {
+                warn!("Native protocol: the console's state did not go out: {e}");
+            }
+        }
+    }
+
     fn open_menu(&self) -> bool {
         let Some(session) = self.shared.session() else { return false };
         match session.link.duplex.send_control(&HostMsg::OpenMenu) {

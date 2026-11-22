@@ -220,9 +220,10 @@ pub enum ClientMsg {
     /// app started. The client sends it again when it changes. The host puts its scenes' floor
     /// there.
     Floor(f32),
-    /// A press on a button of the console, as a JSON object (`{"action": "play", "game": "Beat
-    /// Saber"}`, `{"action": "stop"}`, `{"action": "set", "fps": 90}`). The host hands it to the
-    /// cranvr app as a `vr_request` status line.
+    /// A press on a button of the console, as a JSON object: a change of a setting (`{"action":
+    /// "set", "id": "fps", "value": "90"}`) or an action (`{"action": "run", "id": "game.play",
+    /// "subject": "C:\\Games\\game.exe"}`), see `cranvr_common::menu::Request`. The host hands it
+    /// to the cranvr app as a `vr_request` status line.
     Console(String),
     /// The client's half of the approval code (see [`crate::secure::approval_code`]): a random
     /// number that it sends after it saw the host's [`HostMsg::AwaitApproval`].
@@ -294,9 +295,10 @@ pub enum HostMsg {
     /// The host changed the stream, for example the foveation or the eye size
     StreamUpdate(StreamParams),
     Bye,
-    /// The console's menu as a JSON object: the games, each with its VR system (`vr`), and the settings
-    /// that the cranvr app offers (its `vr-menu.json`) and the stream's state as `status`. The host sends it
-    /// when the client connects and again when it changes, at most once a second.
+    /// The console's menu as a JSON object: the pages of settings and actions that the cranvr app
+    /// offers (`pages`, see `cranvr_common::menu`), the controls and the app's notice (its
+    /// `vr-menu.json`). The host sends it when the client connects and again when it changes, at most
+    /// once a second. The stream's state travels apart, in [`HostMsg::MenuStatus`].
     Menu(String),
     /// The host does not know this client. It holds the connection until its user allows or denies
     /// the client. `commit` is the hash of a random number that the host keeps secret until the
@@ -329,6 +331,12 @@ pub enum HostMsg {
     /// The host's user asks the headset to open its hand menu: a button of the cranvr app on the Mac.
     /// A user whose controllers do not reach the menu opens it this way.
     OpenMenu,
+    /// The stream's state for the console as a JSON object: the refresh rate, the frames a second that
+    /// the host sends and that the game makes, the latency and the game's program. It changes every
+    /// few seconds while the menu itself stays, so it travels apart and the pages go out only when
+    /// they change. The host sends it before the first menu and again when it changes, at most once
+    /// a second.
+    MenuStatus(String),
 }
 
 /// Datagram messages from the client to the host.

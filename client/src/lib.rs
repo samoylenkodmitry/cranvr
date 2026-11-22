@@ -32,6 +32,7 @@ mod hover;
 mod menu_hint;
 mod menu_model;
 mod menu_place;
+mod page_model;
 mod microphone;
 mod models;
 mod hub;
