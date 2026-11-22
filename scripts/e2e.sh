@@ -566,12 +566,15 @@ case ${client} in
             adb)
                 # A client that held the USB network leaves it up for about 30 s after its stop. The
                 # headset's change back to its old USB functions would cut `adb reverse` in the run,
-                # so the run waits for it. adb is gone for a moment during the change.
+                # so the run waits until the headset has no network on usb0, and then for adb, which
+                # is gone for a moment during the change.
                 for i in {1..90}; do
-                    usb_state=$("${adb_cmd[@]}" shell getprop sys.usb.state 2>/dev/null) || usb_state=""
-                    [[ -n ${usb_state} && ${usb_state} != *ncm* ]] && break
+                    networks=$("${adb_cmd[@]}" shell dumpsys connectivity 2>/dev/null) || networks="usb0 unknown"
+                    [[ ${networks} != *usb0* ]] && break
                     sleep 1
                 done
+                sleep 3
+                "${adb_cmd[@]}" wait-for-device
                 "${adb_cmd[@]}" reverse "tcp:${native_port}" "tcp:${native_port}" >/dev/null
                 launch=(--es host "127.0.0.1:${native_port}" --ei usb_port "${native_port}" --ez usb_network false) ;;
         esac

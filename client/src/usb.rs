@@ -245,7 +245,9 @@ fn port_of(address: &str) -> u16 {
 
 /// Where a connection to `aim` goes now, given what the cable and the Wi-Fi search show.
 ///
-/// An aim without a fingerprint goes where it says: nothing tells which Mac it means. With a
+/// An aim at this device's own address means the cable: the way that answers on the cable's port
+/// takes it, the USB network first. Any other aim without a fingerprint goes where it says: nothing
+/// tells which Mac it means. With a
 /// fingerprint, the cable wins when the Mac behind it has the same one. Otherwise the aim goes to
 /// the Wi-Fi entry with that fingerprint, which a USB link falls back to when the cable is out. When
 /// no such entry exists, the aim keeps its address.
