@@ -7,8 +7,10 @@
 //! `ClientMsg::Console`. The host hands it to the app as a `vr_request` status line. The console
 //! knows no setting by its meaning: it draws what the pages say and sends what an item names.
 //!
-//! The console also holds two settings of the client itself: the room behind the panels and the
-//! sound's volume. They never go to the host. `settings.rs` saves them.
+//! The console also holds the room behind the panels and the sound's volume, which the client applies.
+//! The Mac keeps them (its Headset page) and sends them with the menu. `settings.rs` saves the last
+//! ones for the time without a link, and the client tells the Mac its own choice while the Mac has
+//! none.
 //!
 //! This file holds the data and the rules, with no Cranpose state. `console_panel.rs` draws them
 //! and places the panel.
@@ -56,6 +58,14 @@ pub struct Status {
     pub game: Option<String>,
 }
 
+/// The headset's room and volume as the Mac keeps them. `None` until the Mac heard the headset's own
+/// choice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeadsetChoices {
+    pub room: Option<Room>,
+    pub volume: Option<Volume>,
+}
+
 /// What the console shows: the app's pages and the host's state.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Menu {
@@ -67,6 +77,8 @@ pub struct Menu {
     pub notice: Option<String>,
     /// What the buttons of the controllers do, as the cranvr app on the Mac keeps it
     pub controls: Controls,
+    /// The room and the volume, as the cranvr app on the Mac keeps them
+    pub headset: HeadsetChoices,
 }
 
 impl Status {
@@ -95,6 +107,10 @@ impl Menu {
             status: Status::default(),
             notice: v["notice"].as_str().filter(|notice| !notice.is_empty()).map(str::to_string),
             controls: Controls::from_json(&v["controls"].to_string())?,
+            headset: HeadsetChoices {
+                room: v["headset"]["room"].as_str().and_then(Room::from_key),
+                volume: v["headset"]["volume"].as_u64().and_then(|percent| Volume::from_key(&percent.to_string())),
+            },
         })
     }
 
@@ -207,14 +223,6 @@ impl Room {
     pub fn from_key(key: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|room| room.key() == key.trim())
     }
-
-    /// The button's text
-    pub fn label(self) -> &'static str {
-        match self {
-            Room::Passthrough => "Passthrough",
-            Room::Scene => "Scene",
-        }
-    }
 }
 
 /// How loud the host's sound plays, as a multiple of the level that the host sends.
@@ -259,8 +267,7 @@ impl Volume {
     }
 }
 
-/// What a key of the console does. Most of them ask the host or open a page. The room and the volume
-/// are the client's own settings.
+/// What a key of the console does: ask the host, open a page, or work the console and the link.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Press {
     /// A request to the Mac: a change of a setting or an action
@@ -274,8 +281,6 @@ pub enum Press {
     Controls,
     Disconnect,
     Exit,
-    Room(Room),
-    Volume(Volume),
 }
 
 /// What decides whether the room shows behind the panels.

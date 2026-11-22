@@ -17,6 +17,8 @@ use crate::{
     displays::displays,
     hand_menu::{self, HandPanels, HandState},
     hands,
+    headset_page::Remote,
+    menu_model::{self, MenuInput},
     hold::{HoldFrame, PanelHold},
     hover,
     menu_place::{self, PlaceFrame, Placer},
@@ -157,6 +159,8 @@ fn Client() {
         // What the pointer was last given, so a change of the mapping or of the panels is the only
         // thing that calls it
         let mut given = None;
+        // The headset's own page for the Mac is looked at once a second (`headset_page.rs`)
+        let mut turns = 0u32;
         loop {
             console.set(hub().console());
             let now = hub().backdrop();
@@ -176,6 +180,29 @@ fn Client() {
             if hub().take_menu_request() && !menu_open.get_non_reactive() {
                 log::info!("the Mac opens the hand menu {}", hand_menu::current_place().label());
                 menu_open.set(true);
+            }
+            // The Mac's presses on the headset's own page do what the hand menu's buttons do
+            for request in hub().take_headset_requests() {
+                match crate::headset_page::remote(&request) {
+                    Some(Remote::Menu(action)) => hand_menu::perform_remote(action, hand),
+                    Some(Remote::OpenMenu) => {
+                        log::info!("the Mac opens the hand menu {}", hand_menu::current_place().label());
+                        menu_open.set(true);
+                    }
+                    Some(Remote::Disconnect) => hub().disconnect(),
+                    Some(Remote::Exit) => {
+                        hub().disconnect();
+                        cranpose::request_exit();
+                    }
+                    None => log::warn!("the Mac asked the headset for {}, which it does not know", request.to_json()),
+                }
+            }
+            turns = turns.wrapping_add(1);
+            if turns.is_multiple_of(20) {
+                let shown = layout.get_non_reactive();
+                let listed = displays().menu_view();
+                let input = MenuInput { layout: &shown, console_open: console.get_non_reactive().open, displays: &listed, wishes: Default::default(), place: place.get_non_reactive(), adding: false, pages: &[], costs: false };
+                hub().send_headset_page(&crate::headset_page::page(&menu_model::rows(&input)));
             }
             if let Some(pointer) = &pointer_settings {
                 let streaming = snapshot.get_non_reactive().state == LinkState::Streaming;

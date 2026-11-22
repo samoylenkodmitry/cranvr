@@ -33,6 +33,7 @@ pub const DESKTOP: &str = "desktop";
 pub const SOUND: &str = "sound";
 pub const WINE: &str = "wine";
 pub const MAC: &str = "mac";
+pub const HEADSET: &str = "headset";
 /// The id of a game's page: this prefix and the game's program
 pub const GAME_PAGE: &str = "game:";
 
@@ -357,9 +358,36 @@ const WINE_SETTINGS: &[Setting] = &[
     },
 ];
 
+/// The headset's own two settings. The headset applies them, the Mac keeps them. A value that the
+/// headset has not told yet shows no option.
+const HEADSET_SETTINGS: &[Setting] = &[
+    Setting {
+        id: "headset_room",
+        label: "Room",
+        restarts: false,
+        hint: |_| "What the headset shows behind its panels while no game runs: your room through its cameras, or the host's scene.",
+        kind: Kind::Choice {
+            options: |_, _| vec![Opt::new("passthrough", "Passthrough"), Opt::new("scene", "Scene")],
+            get: |s| s.headset_room.clone().unwrap_or_default(),
+            set: |s, _, v| s.headset_room = Some(v.into()),
+        },
+    },
+    Setting {
+        id: "headset_volume",
+        label: "Volume",
+        restarts: false,
+        hint: |_| "How loud the headset plays the sound of the Mac and of games, against the level that the host sends. A soft limiter keeps loud parts clean.",
+        kind: Kind::Choice {
+            options: |_, _| numbers(&[100, 150, 200, 300], "%"),
+            get: |s| s.headset_volume.map(|v| v.to_string()).unwrap_or_default(),
+            set: |s, _, v| s.headset_volume = v.parse().ok(),
+        },
+    },
+];
+
 /// Every setting of the app, of every page.
 fn settings_table() -> impl Iterator<Item = &'static Setting> {
-    STREAM_SETTINGS.iter().chain(CONNECTION_SETTINGS).chain(DESKTOP_SETTINGS).chain(SOUND_SETTINGS).chain(WINE_SETTINGS)
+    STREAM_SETTINGS.iter().chain(CONNECTION_SETTINGS).chain(DESKTOP_SETTINGS).chain(SOUND_SETTINGS).chain(WINE_SETTINGS).chain(HEADSET_SETTINGS)
 }
 
 fn setting(id: &str) -> Option<&'static Setting> {
@@ -464,6 +492,7 @@ pub fn pages(settings: &Settings, model: &Model) -> Vec<Page> {
         desktop_page(settings, model),
         sound_page(settings, model),
         wine_page(settings, model),
+        headset_page(settings, model),
         mac_page(model),
     ];
     for game in &model.games {
@@ -729,6 +758,16 @@ fn wine_page(settings: &Settings, model: &Model) -> Page {
     Page { id: WINE.into(), title: "Wine".into(), short: "Wine".into(), listed: true, items }
 }
 
+/// The headset's room and volume, which the headset applies and the Mac keeps.
+fn headset_page(settings: &Settings, model: &Model) -> Page {
+    let mut items = vec![Item::Heading { text: "Headset".into() }];
+    items.extend(HEADSET_SETTINGS.iter().map(|setting| setting.item(settings, model)));
+    if settings.headset_room.is_none() || settings.headset_volume.is_none() {
+        items.push(Item::Text { text: "The headset tells its own choice when it connects.".into(), tone: Tone::Muted });
+    }
+    Page { id: HEADSET.into(), title: "Headset".into(), short: "Headset".into(), listed: true, items }
+}
+
 /// The host, the settings file, the paired headsets and the Mac's addresses.
 fn mac_page(model: &Model) -> Page {
     let mut items = vec![Item::Heading { text: "This Mac".into() }];
@@ -855,6 +894,8 @@ pub enum Effect {
     AskPermission(Permission),
     /// Opens System Settings at a permission's pane on the Mac's screen
     PermissionSettings(Permission),
+    /// Hands a press on the headset's own page to the headset
+    ToHeadset(Request),
 }
 
 /// What a request did.
@@ -882,6 +923,10 @@ impl Outcome {
 /// effects.
 pub fn apply(settings: &mut Settings, model: &Model, request: &Request) -> Outcome {
     let games = &model.games;
+    // The headset's own page belongs to the headset: the press goes there
+    if request.id().starts_with("headset.") {
+        return Outcome { effects: vec![Effect::ToHeadset(request.clone())], ..Default::default() };
+    }
     match request {
         Request::Set { id, subject: None, value } if id == "controls" => match cranvr_common::controls::Controls::from_json(value) {
             Some(controls) => {

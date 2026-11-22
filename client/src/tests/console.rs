@@ -295,7 +295,6 @@ fn the_room_and_the_volume_come_back_from_their_saved_text() {
     assert_eq!(Volume::ALL.map(Volume::percent), [100, 150, 200, 300]);
     assert_eq!(Volume::ALL.map(Volume::gain), [1.0, 1.5, 2.0, 3.0]);
     assert_eq!(Volume::P200.label(), "200%");
-    assert_eq!((Room::Passthrough.label(), Room::Scene.label()), ("Passthrough", "Scene"));
 }
 
 #[test]
@@ -385,4 +384,15 @@ fn the_state_comes_apart_and_a_game_that_runs_at_the_connection_keeps_the_consol
     assert!(!console.view().open);
     console.on_status(Status::default());
     assert!(console.view().open, "the game ended");
+}
+
+#[test]
+fn the_mac_keeps_the_room_and_the_volume_and_says_null_until_the_headset_told_its_own() {
+    let unknown = Menu::parse(r#"{"pages":[],"controls":{},"headset":{"room":null,"volume":null}}"#).unwrap();
+    assert_eq!(unknown.headset, HeadsetChoices::default());
+    let known = Menu::parse(r#"{"pages":[],"controls":{},"headset":{"room":"scene","volume":200}}"#).unwrap();
+    assert_eq!(known.headset, HeadsetChoices { room: Some(Room::Scene), volume: Some(Volume::P200) });
+    // A value that no choice has counts as none
+    let odd = Menu::parse(r#"{"pages":[],"controls":{},"headset":{"room":"sky","volume":175}}"#).unwrap();
+    assert_eq!(odd.headset, HeadsetChoices::default());
 }

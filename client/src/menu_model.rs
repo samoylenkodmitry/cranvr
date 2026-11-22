@@ -71,6 +71,9 @@ pub struct MenuInput<'a> {
     pub adding: bool,
     /// The pages of the Mac's settings that the menus list: their ids and the words of their buttons
     pub pages: &'a [(String, String)],
+    /// Each display says what showing it costs. Without, it says where it stands and whether it
+    /// shows, which changes only with the user's press (`headset_page.rs`).
+    pub costs: bool,
 }
 
 /// The page buttons stand three in a row
@@ -118,12 +121,17 @@ pub fn rows(input: &MenuInput<'_>) -> Vec<MenuRow> {
             buttons.push(MenuButton { label: "Remove".into(), action: MenuAction::RemoveDisplay(stream), kind: ButtonKind::Danger });
         }
         let place = if on_hand { with_menu(input.place) } else { "In the room".to_string() };
-        let mut details = cost_lines(shown, &display.measured, wish.as_ref());
-        // The place goes in front of the first line when it fits, else in a line of its own
-        match details.first_mut() {
-            Some(first) if first.len() + place.len() + 2 <= 40 => *first = format!("{place}. {first}"),
-            _ => details.insert(0, place),
-        }
+        let details = if input.costs {
+            let mut details = cost_lines(shown, &display.measured, wish.as_ref());
+            // The place goes in front of the first line when it fits, else in a line of its own
+            match details.first_mut() {
+                Some(first) if first.len() + place.len() + 2 <= 40 => *first = format!("{place}. {first}"),
+                _ => details.insert(0, place),
+            }
+            details
+        } else {
+            vec![format!("{place}. {}", if shown { "Shown" } else { "Hidden" })]
+        };
         rows.push(MenuRow { title: display.info.name.clone(), details, buttons });
     }
     let listed: Vec<MenuButton> = input
@@ -186,7 +194,7 @@ mod tests {
     }
 
     fn input<'a>(layout: &'a Layout, displays: &'a DisplaysView) -> MenuInput<'a> {
-        MenuInput { layout, console_open: false, displays, wishes: Default::default(), place: MenuPlace::Hand(cranvr_common::controls::Hand::Left), adding: false, pages: &[] }
+        MenuInput { layout, console_open: false, displays, wishes: Default::default(), place: MenuPlace::Hand(cranvr_common::controls::Hand::Left), adding: false, pages: &[], costs: true }
     }
 
     #[test]

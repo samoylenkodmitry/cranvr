@@ -277,7 +277,8 @@ fn start_discovery(port: u16, config: &Config) {
 /// Reads the cranvr app's lines from the host's input. `allow KEY` or `deny KEY` is the user's answer
 /// to a headset's request, with the key that the status line shows. `cable on` or `cable off` is the
 /// user's Connection choice: off for Wi-Fi. `menu open` opens the hand menu of the connected headset.
-/// A person who runs the host by hand may type them.
+/// `headset JSON` is a press of the app on the headset's own page (`HostMsg::HeadsetRequest`). A
+/// person who runs the host by hand may type them.
 pub fn read_input(pairings: Arc<Pairings>, cable: Arc<AtomicBool>, headset: Arc<dyn Headset>) {
     thread::Builder::new()
         .name("native-input".into())
@@ -301,6 +302,13 @@ pub fn read_input(pairings: Arc<Pairings>, cable: Arc<AtomicBool>, headset: Arc<
                             info!("Native protocol: no headset is connected to open its hand menu");
                         }
                     }
+                    Some(Command::Headset(request)) => {
+                        if headset.send_headset_request(&request) {
+                            info!("Native protocol: the app asks the headset for {request}");
+                        } else {
+                            info!("Native protocol: no headset is connected for {request}");
+                        }
+                    }
                 }
             }
         })
@@ -316,10 +324,17 @@ enum Command {
     Cable(bool),
     /// The user asks the headset to open its hand menu
     OpenMenu,
+    /// A press of the app on the headset's own page, as a JSON object
+    Headset(String),
 }
 
-/// `allow KEY`, `deny KEY` (the key is 64 hex digits), `cable on`, `cable off` or `menu open`.
+/// `allow KEY`, `deny KEY` (the key is 64 hex digits), `cable on`, `cable off`, `menu open` or
+/// `headset JSON`.
 fn parse_command(line: &str) -> Option<Command> {
+    if let Some(request) = line.strip_prefix("headset ") {
+        let request = request.trim();
+        return matches!(serde_json::from_str::<serde_json::Value>(request), Ok(serde_json::Value::Object(_))).then(|| Command::Headset(request.to_string()));
+    }
     let mut words = line.split_whitespace();
     let command = match words.next()? {
         word @ ("allow" | "deny") => Command::Answer { allow: word == "allow", key: from_hex(words.next()?)? },
@@ -703,6 +718,11 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
         }
         Incoming::Control(ClientMsg::Floor(_)) => {}
         Incoming::Control(ClientMsg::Console(request)) => shared.emit(Event::Console(request)),
+        Incoming::Control(ClientMsg::HeadsetPage(page)) => {
+            if !crate::status::headset_page(&page) {
+                warn!("Native protocol: the headset sent a page that is no JSON object");
+            }
+        }
         Incoming::Control(ClientMsg::Recenter(recenter)) => {
             let ahead_ms = session.clock.lock().unwrap().to_local(recenter.change_time).map(|at| (at as i64 - now as i64) as f64 / 1e6);
             info!(
@@ -1536,6 +1556,17 @@ impl Headset for Native {
         if let Some(session) = self.shared.session() {
             if let Err(e) = session.link.duplex.send_control(&HostMsg::MenuStatus(status.to_owned())) {
                 warn!("Native protocol: the console's state did not go out: {e}");
+            }
+        }
+    }
+
+    fn send_headset_request(&self, request: &str) -> bool {
+        let Some(session) = self.shared.session() else { return false };
+        match session.link.duplex.send_control(&HostMsg::HeadsetRequest(request.to_owned())) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("Native protocol: the app's request to the headset did not go out: {e}");
+                false
             }
         }
     }

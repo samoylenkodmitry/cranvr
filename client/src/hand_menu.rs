@@ -504,7 +504,7 @@ pub fn Menu(state: HandState, console_open: bool, frame: HandFrame) {
     let displays_view = view.get();
     let busy = adding.get().is_some_and(|add| add.runs(&displays_view));
     let listed = pages.get();
-    let input = MenuInput { layout: &layout, console_open, displays: &displays_view, wishes, place: state.place.get(), adding: busy, pages: &listed };
+    let input = MenuInput { layout: &layout, console_open, displays: &displays_view, wishes, place: state.place.get(), adding: busy, pages: &listed, costs: true };
     let rows = menu_model::rows(&input);
     let height = menu_model::height(&rows);
     // The place that the user carried the menu to is read once for each opening. Cranpose keeps the
@@ -575,7 +575,7 @@ fn RowView(row: MenuRow, state: HandState, adding: MutableState<Option<Adding>>)
                     Button(
                         modifier.height(ROW).background(fill).rounded_corners(12.0),
                         ButtonSpec::default(),
-                        move || perform(action, state, adding),
+                        move || perform(action, state, Some(adding)),
                         move || {
                             Text(button.label.clone(), Modifier::empty(), text_style(22.0, TEXT_COLOR, Some(FontWeight::BOLD)));
                         },
@@ -589,8 +589,15 @@ fn RowView(row: MenuRow, state: HandState, adding: MutableState<Option<Adding>>)
     });
 }
 
-/// Does what a button of the menu says.
-fn perform(action: MenuAction, state: HandState, adding: MutableState<Option<Adding>>) {
+/// Does what a press of the Mac on the headset's own page says (`headset_page.rs`), as the menu's
+/// button does.
+pub fn perform_remote(action: MenuAction, state: HandState) {
+    perform(action, state, None);
+}
+
+/// Does what a button of the menu says. `adding` is the menu's note of a display that the user
+/// added, when the menu is open.
+fn perform(action: MenuAction, state: HandState, adding: Option<MutableState<Option<Adding>>>) {
     let mut layout = state.layout.get_non_reactive();
     match action {
         MenuAction::TogglePanel(PanelId::Console) => {
@@ -621,7 +628,9 @@ fn perform(action: MenuAction, state: HandState, adding: MutableState<Option<Add
             state.layout.set(layout);
         }
         MenuAction::AddDisplay => {
-            adding.set(Some(Adding::new(&displays().menu_view())));
+            if let Some(adding) = adding {
+                adding.set(Some(Adding::new(&displays().menu_view())));
+            }
             displays().request_add();
         }
         MenuAction::Recenter => {

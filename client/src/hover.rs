@@ -144,17 +144,22 @@ pub fn hover_modifier(id: u32) -> Modifier {
                     if let Some(hovered) = hover_of(event.kind) {
                         set(id, event.id.0, hovered);
                     }
-                    // The log says where a ray enters the hand menu or its ball and where it presses
-                    // them, so a test reads the panel's place from the point that the ray was aimed at
+                    // The log says where a ray enters the hand menu, its ball or the console and where
+                    // it presses them, so a test reads the panel's place from the point that the ray
+                    // was aimed at
                     let verb = match event.kind {
                         PointerEventKind::Enter => Some("enters"),
                         PointerEventKind::Down => Some("presses"),
                         _ => None,
                     };
-                    if let Some(verb) = verb.filter(|_| [MENU, STRIP, PALM].contains(&id)) {
+                    if let Some(verb) = verb.filter(|_| [MENU, STRIP, PALM, CONSOLE].contains(&id)) {
                         let hand = ["the left", "the right", "a"][slot_of(event.id.0)];
-                        let what = if id == MENU { "menu" } else { "ball" };
-                        log::info!("{hand} pointer {verb} the hand {what} at {:.0}, {:.0} dp", event.position.x, event.position.y);
+                        let what = match id {
+                            MENU => "the hand menu",
+                            CONSOLE => "the console",
+                            _ => "the hand ball",
+                        };
+                        log::info!("{hand} pointer {verb} {what} at {:.0}, {:.0} dp", event.position.x, event.position.y);
                     }
                     #[cfg(all(feature = "scripted-hand", target_os = "android"))]
                     if id == MENU {

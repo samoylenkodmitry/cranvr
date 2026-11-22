@@ -98,7 +98,7 @@ fn OpenConsole(view: View, state: LinkState) {
     });
     let _ = tick.get();
     let shown = page.get();
-    let local = Local { room: view.room, volume: view.volume, link: matches!(state, LinkState::Streaming | LinkState::Connecting) };
+    let local = Local { link: matches!(state, LinkState::Streaming | LinkState::Connecting) };
     let no_menu = match state {
         LinkState::Streaming => "The host offers no menu. Start the cranvr app on the Mac.",
         _ => "Not connected to a host.",
@@ -250,8 +250,6 @@ fn run(press: &Press, page: MutableState<Shown>, pending: MutableState<Option<Pe
         Press::Controls => page.set(Shown::Controls(ControlHand::Right)),
         Press::Disconnect => hub().disconnect(),
         Press::Exit => exit_app(),
-        Press::Room(room) => hub().choose_room(*room),
-        Press::Volume(volume) => hub().choose_volume(*volume),
     }
 }
 

@@ -80,6 +80,7 @@ pub fn act(settings: &mut Settings, model: &mut Model, request: &Request) {
                 }
             }
             Effect::AskPermission(permission) => permission.request(),
+            Effect::ToHeadset(request) => backend::send_headset_request(&request),
             Effect::PermissionSettings(permission) => permission.open_settings(),
             Effect::OpenSteam => {
                 // Steam may need seconds to start: keep the window responsive
@@ -209,12 +210,22 @@ fn chosen_program(settings: &mut Settings, model: &mut Model, chosen: backend::C
 
 /// Runs the app with no window, for a test beside the user's app: `CRANVR_HOME` names its folder,
 /// `CRANVR_NATIVE_PORT` its port. It starts the host, answers the headset's requests as the window
-/// does and saves the settings in its own `app.json`. It watches no USB cable, asks macOS for no
-/// permission and moves no window, so the user's app keeps all of that. It ends with SIGTERM or
-/// when the host ends.
+/// does and saves the settings in its own `app.json`. Each line of its input is a request as the
+/// window's press makes it (`{"action": "run", "id": "headset.recenter"}`), so a test presses the
+/// window's buttons too. It watches no USB cable, asks macOS for no permission and moves no window,
+/// so the user's app keeps all of that. It ends with SIGTERM or when the host ends.
 pub fn headless() {
     let mut settings = Settings::load();
     let mut model = Model::default();
+    let (presses, pressed) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for line in std::io::stdin().lines().map_while(Result::ok) {
+            match serde_json::from_str(&line).ok().as_ref().and_then(Request::from_json) {
+                Some(request) => drop(presses.send(request)),
+                None => eprintln!("cranvr: no request: {line}"),
+            }
+        }
+    });
     if let Err(e) = backend::start_host(&settings) {
         eprintln!("cranvr: the host does not start: {e}");
         std::process::exit(1);
@@ -228,6 +239,10 @@ pub fn headless() {
             last_slow = Instant::now();
         }
         tick(&mut settings, &mut model, slow);
+        for request in pressed.try_iter() {
+            eprintln!("cranvr: the window's press {}", request.to_json());
+            act(&mut settings, &mut model, &request);
+        }
         if !model.running {
             eprintln!("cranvr: the host ended");
             return;

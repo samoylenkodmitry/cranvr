@@ -378,7 +378,7 @@ fn empty_menu_height() -> f32 {
     use crate::{displays::DisplaysView, menu_place::MenuPlace, panel_layout::Layout};
     let layout = Layout::default();
     let displays = DisplaysView::default();
-    let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays, wishes: Default::default(), place: MenuPlace::View, adding: false, pages: &[] };
+    let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays, wishes: Default::default(), place: MenuPlace::View, adding: false, pages: &[], costs: true };
     menu_model::height(&menu_model::rows(&input))
 }
 
@@ -519,7 +519,6 @@ fn pages_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
     use crate::{
         console::{Press, Shown},
         displays::displays,
-        hub::hub,
         menu_place::MenuPlace,
         page_model::{console_rows, find_key, key_point, Local},
         panel_layout::Layout,
@@ -528,14 +527,13 @@ fn pages_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
     let rest = ScriptedButtons::default();
     let pull = ScriptedButtons { trigger: 1.0, ..rest };
     let at = MENU_RIGHT_AT;
-    let view = hub().console();
-    let local = Local { room: view.room, volume: view.volume, link: true };
+    let local = Local { link: true };
     let now = std::time::Instant::now();
     // The hand menu in front of the user: its rows, as `hand_menu.rs` lays them out
     let pages = menu.listed();
     let layout = Layout::default();
     let displays_view = displays().menu_view();
-    let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays_view, wishes: Default::default(), place: MenuPlace::View, adding: false, pages: &pages };
+    let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays_view, wishes: Default::default(), place: MenuPlace::View, adding: false, pages: &pages, costs: true };
     let rows = menu_model::rows(&input);
     let height = menu_model::height(&rows);
     // The place of the button of the page `index` in the hand menu

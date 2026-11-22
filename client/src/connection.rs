@@ -218,6 +218,11 @@ impl Connection {
         }
     }
 
+    /// Sends the headset's own page to the host, for the cranvr app on the Mac. False without a link.
+    pub fn send_headset_page(&self, page: String) -> bool {
+        self.link.lock().unwrap().as_ref().is_some_and(|link| link.duplex.send_control(&ClientMsg::HeadsetPage(page)).is_ok())
+    }
+
     /// Tells the host goodbye and ends the threads. A handshake that still runs ends within its
     /// timeout.
     pub fn stop(&self) {
@@ -740,6 +745,7 @@ fn read_loop(s: &Shared<'_>, units: mpsc::Sender<Received>, udp: bool) -> Error 
         }
         Incoming::Control(HostMsg::Menu(text)) => s.hub.set_menu(s.id, &text),
         Incoming::Control(HostMsg::MenuStatus(text)) => s.hub.set_menu_status(s.id, &text),
+        Incoming::Control(HostMsg::HeadsetRequest(text)) => s.hub.ask_headset(&text),
         Incoming::Control(HostMsg::TrackingWish(wish)) => {
             log::info!("the host asks for {}", if wish.is_empty() { "no tracking".to_string() } else { wish.names().join(", ") });
             s.hub.feed.set_wish(wish);

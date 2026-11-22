@@ -48,7 +48,17 @@ pub fn room() -> Room {
     preferences().get(ROOM_KEY).and_then(|text| Room::from_key(&text)).unwrap_or_default()
 }
 
+/// Whether the choices that a Mac sends are saved for the time without a link. The launch extra
+/// `save_choices=false` keeps the saved ones as they are, for a test with a test host on the user's
+/// headset: the user's own host sends the user's own choices.
+fn saves_choices() -> bool {
+    launch_args().boolean("save_choices").unwrap_or(true)
+}
+
 pub fn remember_room(room: Room) {
+    if !saves_choices() {
+        return;
+    }
     if let Err(e) = preferences().set(ROOM_KEY, room.key()) {
         log::warn!("the room setting was not saved: {e}");
     }
@@ -61,6 +71,9 @@ pub fn volume() -> Volume {
 }
 
 pub fn remember_volume(volume: Volume) {
+    if !saves_choices() {
+        return;
+    }
     if let Err(e) = preferences().set(VOLUME_KEY, &volume.key()) {
         log::warn!("the volume setting was not saved: {e}");
     }
@@ -74,6 +87,9 @@ pub fn controls() -> Option<Controls> {
 }
 
 pub fn remember_controls(controls: &Controls) {
+    if !saves_choices() {
+        return;
+    }
     if let Err(e) = preferences().set(CONTROLS_KEY, &controls.to_json()) {
         log::warn!("the controls were not saved: {e}");
     }

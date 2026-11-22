@@ -27,6 +27,7 @@ mod focus;
 mod gaze;
 mod hand_menu;
 mod hands;
+mod headset_page;
 mod hold;
 mod hover;
 mod menu_hint;

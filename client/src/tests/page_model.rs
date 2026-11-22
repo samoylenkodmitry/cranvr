@@ -7,7 +7,7 @@ use cranvr_common::{
 use std::time::Duration;
 
 fn local() -> Local {
-    Local { room: Room::Passthrough, volume: Volume::P150, link: true }
+    Local { link: true }
 }
 
 fn stream() -> Page {
@@ -49,7 +49,7 @@ fn play() -> Page {
 }
 
 fn menu() -> Menu {
-    Menu { pages: vec![play(), stream()], status: Status::default(), notice: None, controls: Controls::default() }
+    Menu { pages: vec![play(), stream()], status: Status::default(), notice: None, controls: Controls::default(), headset: Default::default() }
 }
 
 #[test]
@@ -111,10 +111,9 @@ fn the_main_page_has_the_games_the_links_to_the_pages_the_clients_settings_and_t
     let (row, key) = find_key(&rows, &Press::Open("stream".into())).expect("a link to the stream page");
     assert_eq!(key, 0);
     assert!(matches!(&rows[row - 1].line, Line::Heading(text) if text == "Settings"));
-    assert!(find_key(&rows, &Press::Room(Room::Scene)).is_some());
     assert!(find_key(&rows, &Press::Disconnect).is_some());
     // Without a link the bottom has no Disconnect
-    let rows = console_rows(Some(&menu), &Shown::Main, Local { link: false, ..local() }, "", None, Instant::now());
+    let rows = console_rows(Some(&menu), &Shown::Main, Local { link: false }, "", None, Instant::now());
     assert!(find_key(&rows, &Press::Disconnect).is_none());
 }
 
@@ -155,11 +154,11 @@ fn the_height_and_the_place_of_each_key_follow_from_the_rows() {
 }
 
 #[test]
-fn the_console_without_a_menu_says_why_and_keeps_the_clients_settings() {
-    let rows = console_rows(None, &Shown::Main, Local { link: false, ..local() }, "Not connected to a host.", None, Instant::now());
+fn the_console_without_a_menu_says_why_and_keeps_its_buttons() {
+    let rows = console_rows(None, &Shown::Main, Local { link: false }, "Not connected to a host.", None, Instant::now());
     assert!(matches!(&rows[1].line, Line::Text { text, .. } if text == "Not connected to a host."));
-    assert!(find_key(&rows, &Press::Volume(Volume::P300)).is_some());
     assert!(find_key(&rows, &Press::Exit).is_some());
+    assert!(find_key(&rows, &Press::Disconnect).is_none());
     assert!(height(&rows) < 500.0);
 }
 

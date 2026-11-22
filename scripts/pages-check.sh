@@ -11,6 +11,10 @@
 #   PORT    the test app's port (9961 by default)
 #   PAGES   the ids of the pages to walk as a comma list, such as connection,desktop (all by default)
 #
+# At the end the run presses two buttons of the window on the headset's own page: Show or Hide of the
+# stream numbers and Recenter. The client starts with `save_choices=false`, so the test app's room,
+# volume and controls do not replace the headset's saved ones.
+#
 # The Quest must run a build from `scripts/build-client.sh --scripted-hand`, and `cargo build
 # --release` must have built cranvr and cranvr-host. The test app has its own folder in WORKDIR with a
 # made-up game whose program is an empty file, no desktop and no game sound, so the user's app, its
@@ -28,10 +32,14 @@ mkdir -p ${program:h}
 : > ${program}
 # The entries that the walk may change stand in the file, so the check shows their change. A save
 # writes every other entry too, with its standard value.
-print "{\"desktop\": false, \"game_audio\": false, \"game_msaa_limit\": 2, \"connection\": \"Automatic\", \"microphone\": \"Headset\", \"wine\": {\"mac_window\": false}, \"launch\": {}, \"added_games\": [{\"name\": \"Fake\", \"program\": \"${program}\"}]}" > ${home}/app.json
+print "{\"desktop\": false, \"game_audio\": false, \"game_msaa_limit\": 2, \"connection\": \"Automatic\", \"microphone\": \"Headset\", \"wine\": {\"mac_window\": false}, \"headset_room\": null, \"headset_volume\": null, \"launch\": {}, \"added_games\": [{\"name\": \"Fake\", \"program\": \"${program}\"}]}" > ${home}/app.json
 cp ${home}/app.json ${work}/app.before.json
+# The app's input stays open for the run, so the run presses the window's buttons too
+rm -f ${work}/input
+mkfifo ${work}/input
+exec 3<>${work}/input
 CRANVR_HOME=${home} CRANVR_NATIVE_PORT=${port} CRANVR_TEST_TRUST_ALL=1 CRANVR_HOST_BIN=${root}/target/release/cranvr-host \
-    ${root}/target/release/cranvr --headless > ${work}/app.log 2>&1 &
+    ${root}/target/release/cranvr --headless < ${work}/input > ${work}/app.log 2>&1 &
 app=$!
 ${adb_cmd} logcat -c
 ${adb_cmd} logcat -v time > ${work}/logcat.txt 2>&1 &
@@ -39,10 +47,15 @@ logcat=$!
 ${adb_cmd} reverse tcp:${port} tcp:${port} > /dev/null
 ${adb_cmd} shell am force-stop dev.cranvr.client
 ${adb_cmd} shell am broadcast -a com.oculus.vrpowermanager.prox_close > /dev/null
-extras=(--es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room scene --ez default_places true --es scripted_pointer pages --es forget_host_key 127.0.0.1:${port})
+extras=(--es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room scene --ez default_places true --ez save_choices false --es scripted_pointer pages --es forget_host_key 127.0.0.1:${port})
 [[ -n ${walk} ]] && extras+=(--es scripted_pages ${walk})
 ${adb_cmd} shell am start -n dev.cranvr.client/dev.cranpose.android.CranposeActivity ${extras} > /dev/null
 sleep ${seconds}
+# The window's presses on the headset's own page: the stream numbers show or hide, the panels recenter
+print '{"action":"run","id":"headset.panel","subject":"stats"}' >&3
+sleep 1
+print '{"action":"run","id":"headset.recenter"}' >&3
+sleep 2
 kill ${app} ${logcat} 2> /dev/null
 wait 2> /dev/null
 ${adb_cmd} reverse --remove tcp:${port} > /dev/null 2>&1
@@ -56,4 +69,4 @@ for key in sorted(before):
 print(f"  ({len(set(after) - set(before))} entries more, which the save wrote with their standard values)")
 EOF
 print "The client's walk:"
-grep -E "scripted pages:|the console asks for|the console shows|the hand menu opens the console|a button opens the hand menu" ${work}/logcat.txt | sed -E 's/^[0-9-]+ //'
+grep -E "scripted pages:|the console asks for|the console shows|the hand menu opens the console|a button opens the hand menu|the Mac sets|the Mac asks the headset|the hand menu (shows|hides|puts)|the headset's page goes|pointer presses the console" ${work}/logcat.txt | sed -E 's/^[0-9-]+ //'

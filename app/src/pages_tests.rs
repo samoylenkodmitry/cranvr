@@ -288,7 +288,7 @@ fn every_setting_stands_on_one_page_only() {
         assert!(seen.contains_key(&(setting.id.to_string(), None)), "{} has no page", setting.id);
     }
     let listed: Vec<&str> = pages.iter().filter(|page| page.listed).map(|page| page.short.as_str()).collect();
-    assert_eq!(listed, ["Play", "Steam", "Stream", "Connection", "Desktop", "Sound", "Wine", "Mac"]);
+    assert_eq!(listed, ["Play", "Steam", "Stream", "Connection", "Desktop", "Sound", "Wine", "Headset", "Mac"]);
 }
 
 #[test]
@@ -386,4 +386,40 @@ fn the_wine_page_has_the_options_of_every_program_and_the_mac_page_restarts_the_
     let mac = page(&pages, MAC);
     assert_eq!(mac.items.iter().find_map(|item| item.button("host.restart", None)).map(|b| b.label.as_str()), Some("Restart the host"));
     assert_eq!(apply(&mut settings, &model, &Request::run("host.restart")).effects, [Effect::RestartHost]);
+}
+
+#[test]
+fn the_headsets_room_and_volume_wait_for_the_headsets_own_choice_and_travel_with_the_menu() {
+    let mut settings = Settings::default();
+    let model = Model::default();
+    let read = |settings: &Settings| serde_json::from_str::<Value>(&vr_menu(settings, &Model::default())).unwrap();
+    // A Mac that never heard the headset's choice has none: the menu says null, and the page selects nothing
+    assert_eq!(read(&settings)["headset"], serde_json::json!({"room": null, "volume": null}));
+    assert_eq!(page(&pages(&settings, &model), HEADSET).find("headset_room", None).and_then(Item::value), Some(""));
+    // The headset tells its choice, and later the user changes it in either app
+    assert!(apply(&mut settings, &model, &Request::set("headset_room", "scene")).changed);
+    assert!(apply(&mut settings, &model, &Request::set("headset_volume", "200")).changed);
+    assert_eq!(read(&settings)["headset"], serde_json::json!({"room": "scene", "volume": 200}));
+    assert!(apply(&mut settings, &model, &Request::set("headset_volume", "175")).refused.is_some());
+    // The values read back from the file
+    let text = settings.file_text(None).unwrap();
+    let back = Settings::read(&text).settings;
+    assert_eq!((back.headset_room.as_deref(), back.headset_volume), (Some("scene"), Some(200)));
+}
+
+#[test]
+fn a_press_on_the_headsets_own_page_goes_to_the_headset() {
+    let mut settings = Settings::default();
+    let request = Request::run("headset.recenter");
+    let out = apply(&mut settings, &Model::default(), &request);
+    assert_eq!(out.effects, [Effect::ToHeadset(request)]);
+    assert!(!out.changed);
+    let toggle = Request::run("headset.panel").of("stats");
+    assert_eq!(apply(&mut settings, &Model::default(), &toggle).effects, [Effect::ToHeadset(toggle)]);
+    // The headset's page reaches the model with its status line, and goes with the headset
+    let mut model = Model::default();
+    model.apply_status_for_test(&serde_json::json!({"type": "headset_page", "page": {"id": "headset.own", "title": "In the headset", "items": [{"kind": "heading", "text": "Panels"}]}}));
+    assert_eq!(model.headset_page.as_ref().map(|page| page.title.as_str()), Some("In the headset"));
+    model.apply_status_for_test(&serde_json::json!({"type": "headset", "connected": false}));
+    assert!(model.headset_page.is_none());
 }
