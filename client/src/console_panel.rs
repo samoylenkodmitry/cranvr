@@ -10,7 +10,7 @@
 //! head.
 
 use crate::{
-    console::{self, size, Action, Game, Menu, Page, Press, Room, View, Volume, RATES, SCALES},
+    console::{self, size, Action, Game, Menu, Page, Pending, Press, Progress, Room, View, Volume, RATES, SCALES},
     hub::{hub, LinkState, Snapshot},
     place, settings,
     tracking::Read,
@@ -21,7 +21,7 @@ use cranpose::text::FontWeight;
 use cranpose_xr::{FollowMode, FollowTarget, TrackedDimensions, FollowingSubspace, Hand, Pose, SpatialPanel, SubspaceModifier, Vibration};
 use cranvr_common::controls::{Control, Controls, Hand as ControlHand, MenuHand, ModelsInGame};
 use cranvr_proto::wire::Nanos;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The width of a setting's name, in dp
 const LABEL: f32 = 150.0;
@@ -80,6 +80,8 @@ pub fn ConsolePanel(view: MutableState<View>, snapshot: MutableState<Snapshot>) 
 
 #[composable]
 fn OpenConsole(view: View, state: LinkState) {
+    // The request to the Mac that runs, from its press until the menu shows its result
+    let pending = rememberMutableStateOf(|| None::<Pending>);
     let page = rememberMutableStateOf(|| console::take_controls_request().or_else(settings::controls_page_on_launch).map_or(Page::Main, Page::Controls));
     // A press on Controls in the hand menu while the console is open turns the page
     LaunchedEffect((), async move |_| loop {
@@ -107,7 +109,7 @@ fn OpenConsole(view: View, state: LinkState) {
             ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(size::GAP)),
             move || match (shown, &menu) {
                 (Page::Controls(hand), _) => ControlsPage(page, hand, controls, editable),
-                (Page::Main, Some(menu)) => MenuRows(menu.clone(), room, volume, controls, page),
+                (Page::Main, Some(menu)) => MenuRows(menu.clone(), room, volume, controls, page, pending),
                 (Page::Main, None) => NoMenu(state.clone(), room, volume, page),
             },
         );
@@ -133,8 +135,43 @@ fn NoMenu(state: LinkState, room: Room, volume: Volume, page: MutableState<Page>
     CloseButtons(false, page);
 }
 
+/// The request to the Mac that runs now, as the console's buttons show it, and the state that a
+/// press of a host's button sets.
+#[derive(Clone, PartialEq)]
+struct Busy {
+    pending: MutableState<Option<Pending>>,
+    /// The running request and where it stands in this composition of the menu
+    now: Option<(Action, Progress)>,
+    /// The menu's notice: a new request answers to a newer one only
+    notice: Option<String>,
+}
+
+impl Busy {
+    fn of(pending: MutableState<Option<Pending>>, menu: &Menu) -> Self {
+        let now = pending.get().map(|request| (request.action.clone(), request.progress(menu, Instant::now())));
+        Self { pending, now, notice: menu.notice.clone() }
+    }
+
+    /// The words of the button of `press`: its label, or what the Mac does with its request.
+    fn label(&self, press: &Press, label: String) -> String {
+        match (&self.now, press) {
+            (Some((action, Progress::Running)), Press::Host(pressed)) if action == pressed => action.running_label().into(),
+            (Some((action, Progress::NoAnswer)), Press::Host(pressed)) if action == pressed => format!("{label}: no answer"),
+            _ => label,
+        }
+    }
+
+    /// Notes a press: a request to the Mac runs from now.
+    fn press(&self, press: &Press) {
+        if let Press::Host(action) = press {
+            self.pending.set(Some(Pending::new(action.clone(), self.notice.clone(), Instant::now())));
+        }
+    }
+}
+
 #[composable]
-fn MenuRows(menu: Menu, room: Room, volume: Volume, controls: Controls, page: MutableState<Page>) {
+fn MenuRows(menu: Menu, room: Room, volume: Volume, controls: Controls, page: MutableState<Page>, pending: MutableState<Option<Pending>>) {
+    let busy = Busy::of(pending, &menu);
     let status = menu.status.clone();
     let stream = if status.refresh > 0.0 {
         let latency = status.latency_ms.map_or(String::new(), |ms| format!(", {ms:.0} ms"));
@@ -161,17 +198,18 @@ fn MenuRows(menu: Menu, room: Room, volume: Volume, controls: Controls, page: Mu
         Text("No games installed in cranvr's Steam", Modifier::empty().height(size::BUTTON), text_style(22.0, MUTED_COLOR, None));
     }
     for game in menu.listed() {
-        GameRow(game.clone(), menu.runs(game));
+        GameRow(game.clone(), menu.runs(game), busy.clone());
     }
 
     Heading("Settings");
     let rates = RATES.iter().map(|&rate| (format!("{rate} Hz"), Press::Host(Action::Fps(rate)), menu.fps == rate)).collect();
-    Setting("Refresh", rates);
+    Setting("Refresh", rates, Some(busy.clone()));
     let sizes = SCALES.iter().map(|&scale| (format!("{:.0}%", scale * 100.0), Press::Host(Action::Scale(scale)), (menu.game_scale - scale).abs() < 0.01)).collect();
-    Setting("Game size", sizes);
+    Setting("Game size", sizes, Some(busy.clone()));
     Setting(
         "Anti-aliasing",
         vec![("Limit 2x".into(), Press::Host(Action::Msaa(2)), menu.msaa == 2), ("No limit".into(), Press::Host(Action::Msaa(0)), menu.msaa == 0)],
+        Some(busy),
     );
     ClientSettings(room, volume);
     ModelsSetting(controls.models_in_game);
@@ -187,8 +225,8 @@ fn MenuRows(menu: Menu, room: Room, volume: Volume, controls: Controls, page: Mu
 /// runs, and how loud the sound plays.
 #[composable]
 fn ClientSettings(room: Room, volume: Volume) {
-    Setting("Room", Room::ALL.iter().map(|&choice| (choice.label().into(), Press::Room(choice), room == choice)).collect());
-    Setting("Volume", Volume::ALL.iter().map(|&choice| (choice.label(), Press::Volume(choice), volume == choice)).collect());
+    Setting("Room", Room::ALL.iter().map(|&choice| (choice.label().into(), Press::Room(choice), room == choice)).collect(), None);
+    Setting("Volume", Volume::ALL.iter().map(|&choice| (choice.label(), Press::Volume(choice), volume == choice)).collect(), None);
 }
 
 /// The hand that carries the hand menu while both controllers are tracked. The Mac keeps the choice
@@ -205,7 +243,7 @@ fn MenuHandSetting(current: MenuHand) {
                 Button(
                     Modifier::empty().height(size::BUTTON).background(color).rounded_corners(12.0).weight(1.0),
                     ButtonSpec::default(),
-                    move || run(&Press::MenuHand(choice)),
+                    move || run(&Press::MenuHand(choice), None),
                     move || {
                         Text(choice.label(), Modifier::empty(), bold(18.0));
                     },
@@ -230,7 +268,7 @@ fn ModelsSetting(current: ModelsInGame) {
                 Button(
                     Modifier::empty().height(size::BUTTON).background(color).rounded_corners(12.0).weight(share),
                     ButtonSpec::default(),
-                    move || run(&Press::Models(choice)),
+                    move || run(&Press::Models(choice), None),
                     move || {
                         Text(choice.label(), Modifier::empty(), bold(18.0));
                     },
@@ -248,60 +286,72 @@ fn Heading(text: &'static str) {
 /// A game's button, its VR system and a Stop button beside it while it runs. A press on the VR system picks the
 /// next one: the cranvr app saves it for the game's next start.
 #[composable]
-fn GameRow(game: Game, running: bool) {
+fn GameRow(game: Game, running: bool, busy: Busy) {
     Row(
         Modifier::empty().fill_max_width(),
         RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(size::GAP)),
         move || {
-            Choice(game.name.clone(), running, Press::Host(Action::Play(game.name.clone())), ACCENT_COLOR, true);
+            Choice(game.name.clone(), running, Press::Host(Action::Play(game.name.clone())), ACCENT_COLOR, true, Some(busy.clone()));
             let next = Press::Host(Action::VrSystem(game.name.clone(), game.vr.next()));
+            let label = busy.label(&next, game.vr.label().into());
+            let pressed = busy.clone();
             Button(
                 Modifier::empty().width(VR_SYSTEM).height(size::BUTTON).background(KEY_COLOR).rounded_corners(12.0),
                 ButtonSpec::default(),
-                move || run(&next),
+                move || run(&next, Some(&pressed)),
                 move || {
-                    Text(game.vr.label(), Modifier::empty(), bold(18.0));
+                    Text(label.clone(), Modifier::empty(), bold(18.0));
                 },
             );
             if running {
-                Choice("Stop".into(), false, Press::Host(Action::Stop), STOP_COLOR, false);
+                Choice("Stop".into(), false, Press::Host(Action::Stop), STOP_COLOR, false, Some(busy.clone()));
             }
         },
     );
 }
 
-/// A setting's name and its choices, the current one marked.
+/// A setting's name and its choices, the current one marked. `busy` shows a request to the Mac
+/// that runs.
 #[composable]
-fn Setting(name: &'static str, choices: Vec<(String, Press, bool)>) {
+fn Setting(name: &'static str, choices: Vec<(String, Press, bool)>, busy: Option<Busy>) {
     Row(
         Modifier::empty().fill_max_width(),
         RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(size::GAP)),
         move || {
             Text(name, Modifier::empty().width(LABEL).padding_symmetric(0.0, 8.0), text_style(22.0, TEXT_COLOR, None));
             for (label, press, selected) in choices.clone() {
-                Choice(label, selected, press, ACCENT_COLOR, true);
+                Choice(label, selected, press, ACCENT_COLOR, true, busy.clone());
             }
         },
     );
 }
 
-/// A button that does `press`. `fill` makes it share the row's width with its neighbors.
+/// A button that does `press`. `fill` makes it share the row's width with its neighbors. While the
+/// Mac works on the button's request, the button says so.
 #[composable]
-fn Choice(label: String, selected: bool, press: Press, selected_color: Color, fill: bool) {
+fn Choice(label: String, selected: bool, press: Press, selected_color: Color, fill: bool, busy: Option<Busy>) {
     let mut modifier = Modifier::empty().height(size::BUTTON).background(if selected { selected_color } else { KEY_COLOR }).rounded_corners(12.0);
     modifier = if fill { modifier.weight(1.0) } else { modifier.padding_symmetric(24.0, 0.0) };
+    let label = match &busy {
+        Some(busy) => busy.label(&press, label),
+        None => label,
+    };
     Button(
         modifier,
         ButtonSpec::default(),
-        move || run(&press),
+        move || run(&press, busy.as_ref()),
         move || {
             Text(label.clone(), Modifier::empty(), bold(22.0));
         },
     );
 }
 
-/// Does what a button says: asks the host, or changes a setting of the client.
-fn run(press: &Press) {
+/// Does what a button says: asks the host, or changes a setting of the client. A request to the
+/// host shows on its button until the menu shows its result.
+fn run(press: &Press, busy: Option<&Busy>) {
+    if let Some(busy) = busy {
+        busy.press(press);
+    }
     match press {
         Press::Host(action) => hub().press(action),
         Press::Room(room) => hub().choose_room(*room),

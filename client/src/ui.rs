@@ -75,13 +75,24 @@ pub(crate) fn side_pose(side: f32) -> Pose {
     SubspaceModifier::new().offset(side * SIDE_OFFSET[0], SIDE_OFFSET[1], SIDE_OFFSET[2]).rotate(0.0, -side * SIDE_TURN, 0.0).pose()
 }
 
+/// What a control shows while a ray or the mouse rests on it and while a press holds it: a white veil
+/// over its face, which shows on the dark panels. Cranpose's clickables draw it, so every button, row
+/// and ball of the app gets it.
+const INDICATION: Indication = Indication::overlay(Color(1.0, 1.0, 1.0, 0.14), Color(1.0, 1.0, 1.0, 0.34));
+
+/// The app, with the look of its controls under a pointer.
+#[composable]
+pub fn ClientApp() {
+    CompositionLocalProvider([local_indication().provides(INDICATION)], Client);
+}
+
 /// The app. In a headset it shows the game's picture around the viewer while a game runs, and the
 /// room otherwise. The connect panel stands to the left and the stats panel to the right, and the
 /// displays of the Mac stand around the middle. The ball above the left controller opens the hand
 /// menu, which shows and hides each panel (see `hand_menu.rs`). While a game runs no panel shows
 /// until the user picks one.
 #[composable]
-pub fn ClientApp() {
+fn Client() {
     // The connection reads what the headset is from the hub. The values do not change in a
     // session, so this runs before any panel can start a connection.
     hub().attach(local_headset_properties().current(), local_haptics().current());
@@ -328,11 +339,17 @@ fn Behind(backdrop: MutableState<Backdrop>, frames: MutableState<Option<DecodedF
     }
 }
 
+/// The phone's app, with the look of its controls under a press.
+#[composable]
+pub fn PhoneApp() {
+    CompositionLocalProvider([local_indication().provides(INDICATION)], Phone);
+}
+
 /// The app on a phone or a tablet. The picture fills the screen. The device's motion sensors move
 /// the host's camera. A tap on the picture opens the connect and stats panels over it. The Hide
 /// panels button closes them. They open again when the stream ends.
 #[composable]
-pub fn PhoneApp() {
+fn Phone() {
     hub().attach_phone();
     let Link { snapshot, frames } = link();
     let address = address_field();

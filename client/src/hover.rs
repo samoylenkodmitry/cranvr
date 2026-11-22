@@ -156,6 +156,10 @@ pub fn hover_modifier(id: u32) -> Modifier {
                         let what = if id == MENU { "menu" } else { "ball" };
                         log::info!("{hand} pointer {verb} the hand {what} at {:.0}, {:.0} dp", event.position.x, event.position.y);
                     }
+                    #[cfg(all(feature = "scripted-hand", target_os = "android"))]
+                    if id == MENU {
+                        crate::scripted::note_menu_point(event.kind, event.position);
+                    }
                 }
             })
             .await
