@@ -14,9 +14,9 @@
 //!   (`default`, `none` or none at all), then the other choices that Steam offers in its dialog (`option1` to
 //!   `option3`, `othervr`). Servers, editors, tools and benchmarks never start.
 //!
-//! Steam starts the program in the entry's `workingdir` inside the game's folder, or in the game's folder itself.
-//! Steam's documentation does not say the second. A cache of 275 apps here has 24 entries that set the working
-//! folder to the executable's own folder, which they would not need if Steam started a program there.
+//! A program starts in the entry's `workingdir` inside the game's folder. An entry without one starts in the
+//! program's own folder, as cranvr started every game before. Steam's documentation does not say which folder
+//! Steam takes then, and it is not measured here.
 
 use std::{
     collections::HashMap,
@@ -160,14 +160,17 @@ pub fn parse(data: &[u8]) -> Option<HashMap<u32, Vec<Entry>>> {
             break;
         }
         let size = record.u32()? as usize;
-        let next = record.at.checked_add(size)?;
-        // info state 4, last change 4, access token 8, SHA-1 of the text 20, change number 4, SHA-1 of the binary 20
-        record.bytes(60)?;
-        let values = record.map(0)?;
-        let launch = values.get("appinfo").and_then(|v| v.get("config")).and_then(|v| v.get("launch"));
-        if let Some(Value::Map(items)) = launch {
-            let entries = items.iter().filter_map(|(key, entry)| entry_of(key, entry)).collect();
-            apps.insert(app, entries);
+        let next = record.at.checked_add(size).filter(|next| *next <= table)?;
+        // info state 4, last change 4, access token 8, SHA-1 of the text 20, change number 4, SHA-1 of the binary 20.
+        // A record that does not read costs only its own app: its size says where the next one starts.
+        let mut record = Reader { data: &data[..next], at: record.at, strings: &strings };
+        let values = record.bytes(60).is_some().then(|| record.map(0)).flatten();
+        if let Some(values) = values {
+            let launch = values.get("appinfo").and_then(|v| v.get("config")).and_then(|v| v.get("launch"));
+            if let Some(Value::Map(items)) = launch {
+                let entries = items.iter().filter_map(|(key, entry)| entry_of(key, entry)).collect();
+                apps.insert(app, entries);
+            }
         }
         at = next;
     }
@@ -223,8 +226,9 @@ pub fn choose(entries: &[Entry], folder: &Path) -> Option<Launch> {
         .collect();
     usable.sort_by_key(|(rank, number, _)| (*rank, *number));
     let (_, _, entry) = usable.first()?;
-    let working_dir = if entry.working_dir.trim().is_empty() { folder.to_owned() } else { inside(folder, entry.working_dir.trim()) };
-    Some(Launch { program: inside(folder, &entry.executable), arguments: split_arguments(&entry.arguments), working_dir })
+    let program = inside(folder, &entry.executable);
+    let working_dir = if entry.working_dir.trim().is_empty() { program.parent()?.to_owned() } else { inside(folder, entry.working_dir.trim()) };
+    Some(Launch { program, arguments: split_arguments(&entry.arguments), working_dir })
 }
 
 /// A command line's arguments, as Windows splits them for the common cases: spaces part them, and double quotes
@@ -382,7 +386,7 @@ mod tests {
         let launch = choose(&apps[&450390], &dir).unwrap();
         assert_eq!(launch.program, dir.join("TheLab/win64/TheLab.exe"));
         assert_eq!(launch.arguments, ["-popupwindow"]);
-        assert_eq!(launch.working_dir, dir, "no working folder: the game's folder");
+        assert_eq!(launch.working_dir, dir.join("TheLab/win64"), "no working folder: the program's folder");
         // A URL is no program
         assert_eq!(choose(&apps[&228980], &dir), None);
         fs::remove_dir_all(&dir).ok();
@@ -427,6 +431,21 @@ mod tests {
         fs::remove_file(dir.join("bin/GameVR.exe")).unwrap();
         assert_eq!(choose(&apps[&7], &dir).unwrap().program, dir.join("Game.exe"));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_record_that_does_not_read_costs_only_its_own_app() {
+        let mut data = Writer::default().file(&[
+            (1, app(vec![("0", entry("One.exe", "default", vec![]))])),
+            (2, app(vec![("0", entry("Two.exe", "default", vec![]))])),
+        ]);
+        // The first record's first value gets a type that KeyValues does not have
+        let first_value = 16 + 8 + 60;
+        assert_eq!(data[first_value], 0);
+        data[first_value] = 9;
+        let apps = parse(&data).unwrap();
+        assert!(!apps.contains_key(&1));
+        assert_eq!(apps[&2][0].executable, "Two.exe");
     }
 
     #[test]

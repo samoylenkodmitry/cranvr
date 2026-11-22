@@ -15,7 +15,9 @@
 //! - the game closed its last session and opened none for 10 s while it kept running,
 //! - the game ended by itself.
 //!
-//! A game that loads for minutes before its first frame keeps its session open, so it gives no verdict.
+//! The last two need a stats window of the host with no game frame while the game held a session: the host
+//! counts frames only while a headset streams, and without a count no frame is no evidence. A game that loads
+//! for minutes before its first frame keeps its session open, so it gives no verdict.
 
 use crate::{launch::OpenVr, openvr};
 use std::{
@@ -56,6 +58,8 @@ pub struct Watch {
     pub disconnected_at: Option<Instant>,
     /// A frame of the game reached the host
     pub frames: bool,
+    /// The host counted a stats window with no game frame while the game held a session
+    pub counted_none: bool,
     /// cranvr ended the game: a Stop from the console, a restart
     pub stopped: bool,
     /// The verdict came already, so the run gives no second one
@@ -120,7 +124,11 @@ impl Watch {
                 }
                 self.connected_now = false;
             }
-            Some("stats") if status["game_frames"].as_u64().is_some_and(|frames| frames > 0) => self.frames = true,
+            Some("stats") => match status["game_frames"].as_u64() {
+                Some(0) if self.connected_now => self.counted_none = true,
+                Some(frames) if frames > 0 => self.frames = true,
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -137,7 +145,7 @@ impl Watch {
         }
         let why = if log == LogSays::Aborted {
             Nothing::Aborted
-        } else if self.disconnected_at.is_some_and(|at| now.saturating_duration_since(at) >= NO_SESSION) {
+        } else if self.counted_none && self.disconnected_at.is_some_and(|at| now.saturating_duration_since(at) >= NO_SESSION) {
             Nothing::Closed
         } else {
             return None;
@@ -148,7 +156,7 @@ impl Watch {
 
     /// The verdict at the end of the game's processes
     pub fn ended(&mut self, log: LogSays) -> Option<Nothing> {
-        if !self.open() || log == LogSays::NotThisGame {
+        if !self.open() || log == LogSays::NotThisGame || (log == LogSays::Loaded && !self.counted_none) {
             return None;
         }
         self.decided = true;
@@ -310,11 +318,11 @@ mod tests {
         assert!(second > first);
         assert_eq!(end(&dir, first).unwrap(), None);
         assert!(file.exists(), "the newer run holds the file");
-        // OpenComposite's log of this run names the game, and the game ends with no frame: a verdict
+        // OpenComposite's log of this run names the game and shows its abort: a verdict at the end
         let log = openvr::opencomposite_log(&dir).unwrap();
         fs::create_dir_all(log.parent().unwrap()).unwrap();
-        fs::write(&log, "No config file found at C:\\Games\\opencomposite.ini\n").unwrap();
-        assert_eq!(end(&dir, second).unwrap(), Some(Verdict { program: r"C:\Games\game.exe".into(), why: Nothing::Ended }));
+        fs::write(&log, "No config file found at C:\\Games\\opencomposite.ini\noovr_abort_raw_va:306\t- Abort!\n").unwrap();
+        assert_eq!(end(&dir, second).unwrap(), Some(Verdict { program: r"C:\Games\game.exe".into(), why: Nothing::Aborted }));
         assert!(!file.exists(), "the file from before the first run: none");
         assert!(!active());
         // An end that comes twice changes nothing
@@ -353,6 +361,10 @@ mod tests {
         let mut run = watch(OpenVr::OpenComposite);
         run.note(&json!({"type": "game", "connected": true}), now);
         run.note(&json!({"type": "game", "connected": false}), now);
+        assert_eq!(run.check(LogSays::Loaded, now + Duration::from_secs(20)), None, "no headset counted the frames");
+        run.note(&json!({"type": "game", "connected": true}), now);
+        run.note(&json!({"type": "stats", "game_frames": 0}), now);
+        run.note(&json!({"type": "game", "connected": false}), now);
         assert_eq!(run.check(LogSays::Loaded, now + Duration::from_secs(9)), None);
         // OpenComposite restarts its session at a game's start: a new session ends the wait
         run.note(&json!({"type": "game", "connected": true}), now + Duration::from_secs(9));
@@ -366,7 +378,10 @@ mod tests {
         let now = Instant::now();
         let mut drew = watch(OpenVr::OpenComposite);
         drew.note(&json!({"type": "stats", "game_frames": 0}), now);
-        assert_eq!(drew.ended(LogSays::Loaded), Some(Nothing::Ended), "no frame: a verdict");
+        assert_eq!(drew.clone().ended(LogSays::Loaded), None, "a window without a session counts nothing");
+        drew.note(&json!({"type": "game", "connected": true}), now);
+        drew.note(&json!({"type": "stats", "game_frames": 0}), now);
+        assert_eq!(drew.ended(LogSays::Loaded), Some(Nothing::Ended), "no frame in a counted window: a verdict");
         let mut drew = watch(OpenVr::OpenComposite);
         drew.note(&json!({"type": "stats", "game_frames": 340}), now);
         assert_eq!(drew.ended(LogSays::Aborted), None);

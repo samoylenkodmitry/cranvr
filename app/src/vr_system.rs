@@ -1,7 +1,9 @@
 //! A game that drew nothing through OpenComposite (game_run.rs gives the verdict). Some OpenVR games need SteamVR
 //! itself: The Lab stops in OpenComposite before its first frame. The app answers the verdict as black_eye.rs
-//! answers a black picture: it sets the game's VR system to SteamVR, records why, shows a notice and starts the
-//! game again, now through SteamVR. That needs SteamVR in the Steam library. A game whose VR system the user chose
+//! answers a black picture: it sets the game's VR system to SteamVR for its next start, records why and shows a
+//! notice. That needs SteamVR in the Steam library. A game that OpenComposite stopped hangs in OpenComposite's
+//! message box, so the app ends it and starts it again through SteamVR at once. A game that closed its session or
+//! ended by itself waits for the user's next start. A game whose VR system the user chose
 //! keeps it: the notice only says what to try. The user can set the VR system back in the Play tab or in the
 //! console in VR, and that choice is then the user's.
 //!
@@ -54,9 +56,13 @@ pub fn notice(outcome: &Outcome, name: &str, why: Nothing) -> Notice {
         Nothing::Ended => format!("{name} ended without a picture through OpenComposite"),
     };
     match outcome {
-        Outcome::Switched { .. } => Notice {
+        Outcome::Switched { .. } if why == Nothing::Aborted => Notice {
             window: format!("{what}. cranvr set its VR system to SteamVR. The game starts again."),
             headset: "No picture. The game restarts in SteamVR.".to_owned(),
+        },
+        Outcome::Switched { .. } => Notice {
+            window: format!("{what}. cranvr set its VR system to SteamVR for its next start."),
+            headset: "No picture. Its next start uses SteamVR.".to_owned(),
         },
         Outcome::NoSteamVr { .. } => Notice {
             window: format!("{what}. It may need SteamVR: install SteamVR from your Steam library."),
@@ -73,7 +79,7 @@ pub fn notice(outcome: &Outcome, name: &str, why: Nothing) -> Notice {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Response {
     pub notice: Notice,
-    /// The program to start again: only when the verdict switched it to SteamVR
+    /// The program to start again: only when the verdict switched it to SteamVR and OpenComposite stopped it
     pub restart: Option<String>,
 }
 
@@ -84,7 +90,7 @@ pub fn respond(launch: &mut BTreeMap<String, GameOptions>, games: &[Game], progr
     let outcome = apply(launch, &known, program, steamvr);
     let notice = notice(&outcome, &crate::black_eye::name(games, program), why);
     let restart = match outcome {
-        Outcome::Switched { program } => Some(program),
+        Outcome::Switched { program } if why == Nothing::Aborted => Some(program),
         _ => None,
     };
     Response { notice, restart }
@@ -128,8 +134,14 @@ mod tests {
         assert_eq!(response.restart.as_deref(), Some(program), "the listed spelling");
         assert!(response.notice.window.starts_with("OpenComposite stopped The Lab"), "{}", response.notice.window);
         assert!(response.notice.window.contains("SteamVR"));
-        let again = respond(&mut launch, &[game], program, Nothing::Ended, true);
+        let again = respond(&mut launch, std::slice::from_ref(&game), program, Nothing::Ended, true);
         assert_eq!(again.restart, None);
+        // A game that ended or closed its session by itself waits for its next start
+        let mut launch = BTreeMap::new();
+        let ended = respond(&mut launch, &[game], program, Nothing::Ended, true);
+        assert_eq!(ended.restart, None);
+        assert!(ended.notice.window.contains("next start"), "{}", ended.notice.window);
+        assert_eq!(launch[program].openvr, Some(OpenVr::SteamVr));
         // The console in VR has one line of 45 characters or so
         for why in [Nothing::Aborted, Nothing::Closed, Nothing::Ended] {
             for outcome in [Outcome::Switched { program: "x".into() }, Outcome::NoSteamVr { program: "x".into() }, Outcome::Kept { program: "x".into() }] {

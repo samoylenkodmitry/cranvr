@@ -451,6 +451,8 @@ pub struct Model {
     pub running: bool,
     pub headset: Option<Headset>,
     pub game: Option<String>,
+    /// The program of the game that is connected, as the runtime or cranvr's SteamVR driver names it
+    pub game_program: Option<String>,
     pub desktop: Option<(bool, String)>,
     /// Whether the host captures this Mac's sound for the headset, and why not
     pub audio: Option<(bool, String)>,
@@ -543,7 +545,9 @@ impl Model {
                 }
             }
             Some("game") => {
-                self.game = v["connected"].as_bool().unwrap_or(false).then(|| v["name"].as_str().unwrap_or("game").to_string());
+                let connected = v["connected"].as_bool().unwrap_or(false);
+                self.game = connected.then(|| v["name"].as_str().unwrap_or("game").to_string());
+                self.game_program = v["program"].as_str().filter(|_| connected).map(str::to_string);
             }
             Some("desktop") => {
                 self.desktop = Some((v["ok"].as_bool().unwrap_or(false), v["message"].as_str().unwrap_or("").to_string()));
@@ -908,6 +912,7 @@ pub fn pump(model: &mut Model) {
             HostLine::Exited => {
                 model.headset = None;
                 model.game = None;
+                model.game_program = None;
                 model.stats = None;
                 // The line of an old host can arrive after the first line of its successor
                 if !host_running() {

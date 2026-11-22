@@ -228,7 +228,8 @@ pub struct Game {
     pub exe: Option<PathBuf>,
     /// The arguments of the launch entry. The program's launch options add their own after them.
     pub args: Vec<String>,
-    /// The folder that the launch entry starts the program in. None: the program's own folder.
+    /// The folder that the launch entry starts the program in: its `workingdir`, else the program's own folder.
+    /// None for a game that Steam's cache does not know: the program's own folder too.
     pub working_dir: Option<PathBuf>,
 }
 
@@ -1060,13 +1061,23 @@ mod tests {
         assert!(smoke_back, "the program's end puts the path file back");
     }
 
-    /// The lit samples of the host's last eye check line in the window's log, as (left, right) of 256
+    /// The lit samples of the host's last eye check line in the window's log, as (left, right)
     fn last_eye_check(model: &crate::backend::Model) -> Option<(u32, u32)> {
-        let line = model.log.iter().rev().find(|line| line.contains("Eye check:"))?;
-        let numbers: Vec<u32> = line.split(|c: char| !c.is_ascii_digit()).filter_map(|n| n.parse().ok()).collect();
-        // "Eye check: 88 of 256 samples lit in the left eye, 87 in the right eye", after the time of day
-        let at = numbers.iter().position(|n| *n == 256)?;
-        Some((numbers[at - 1], *numbers.get(at + 1)?))
+        model.log.iter().rev().find_map(|line| eye_check_of(line))
+    }
+
+    /// "Eye check: 2397 of 4096 samples lit in the left eye, 2392 in the right eye", after the time of day
+    fn eye_check_of(line: &str) -> Option<(u32, u32)> {
+        let (_, rest) = line.split_once("Eye check: ")?;
+        let numbers: Vec<u32> = rest.split(|c: char| !c.is_ascii_digit()).filter_map(|n| n.parse().ok()).collect();
+        rest.contains("samples lit").then_some(())?;
+        Some((*numbers.first()?, *numbers.get(2)?))
+    }
+
+    #[test]
+    fn the_host_s_eye_check_line_gives_both_eyes() {
+        assert_eq!(eye_check_of("14:43:16.650 [INFO] Eye check: 2397 of 4096 samples lit in the left eye, 2392 in the right eye"), Some((2397, 2392)));
+        assert_eq!(eye_check_of("14:43:16.650 [WARN] Eye check: cannot write the left eye to /tmp: denied"), None);
     }
 
     /// Starts the probe again for the next part of a test: the host takes one headset at a time.
@@ -1092,6 +1103,61 @@ mod tests {
         !crate::game_run::active() && path_file_becomes(text, Duration::from_secs(5)) && !program_running(folder)
     }
 
+    /// What a game drew in a phase of a test: the most game frames of a stats window and the lit samples of
+    /// both eyes, counted after the game connected under its own program, and that program.
+    #[derive(Debug, Default)]
+    struct Drawn {
+        frames: u64,
+        eyes: Option<(u32, u32)>,
+        program: Option<String>,
+    }
+
+    impl Drawn {
+        fn lit(&self) -> bool {
+            self.frames > 100 && self.eyes.is_some_and(|(l, r)| l >= 8 && r >= 8)
+        }
+    }
+
+    /// Waits until the game whose program ends in `suffix` draws: it connects under that program (cranvr's
+    /// SteamVR driver names the game after SteamVR's own room drew), and then a stats window counts over 100 of
+    /// its frames and the eye check lights both eyes. The stats and the log of the phase before do not count. The
+    /// wait goes on to 25 s after the connection, for a game that starts in the dark, and keeps the brightest
+    /// eyes. With CRANVR_EYE_DUMP the eyes of that check are kept as `<name>-left.png` and `<name>-right.png`.
+    fn draws(model: &mut crate::backend::Model, suffix: &str, limit: Duration, name: &str) -> Drawn {
+        let suffix = suffix.to_ascii_lowercase();
+        let since = Instant::now();
+        let mut connected: Option<Instant> = None;
+        let mut drawn = Drawn::default();
+        while since.elapsed() < limit {
+            thread::sleep(Duration::from_millis(200));
+            crate::backend::pump(model);
+            let ours = model.game_program.as_ref().filter(|program| program.to_ascii_lowercase().ends_with(&suffix)).cloned();
+            if ours.is_none() {
+                model.stats = None;
+                model.log.clear();
+                connected = None;
+                continue;
+            }
+            let at = *connected.get_or_insert_with(Instant::now);
+            drawn.program = ours;
+            drawn.frames = drawn.frames.max(model.stats.as_ref().map_or(0, |s| s.game_frames));
+            let now = last_eye_check(model);
+            let brighter = now.is_some_and(|(l, r)| drawn.eyes.is_none_or(|(bl, br)| l.min(r) > bl.min(br)));
+            if brighter {
+                drawn.eyes = now;
+                if let Some(dump) = std::env::var_os("CRANVR_EYE_DUMP").map(PathBuf::from) {
+                    for eye in ["left", "right"] {
+                        fs::copy(dump.join(format!("eye-{eye}.png")), dump.join(format!("{name}-{eye}.png"))).ok();
+                    }
+                }
+            }
+            if drawn.lit() && at.elapsed() >= Duration::from_secs(25) {
+                break;
+            }
+        }
+        drawn
+    }
+
     /// #113 from the app's own paths. A scratch `CRANVR_HOME` whose `wine` links to the user's, with no launch
     /// options for the game, the user's Steam running, a test host on port 9962 and the probe as the headset:
     /// 1. The game (CRANVR_TEST_GAME, The Lab) is listed with the program, the arguments and the folder of its
@@ -1101,7 +1167,9 @@ mod tests {
     ///    game again, as the window does. The game must then draw through SteamVR, both eyes lit.
     /// 3. A request of the console from the probe (`--console`), as the headset's console sends it: the game
     ///    starts through SteamVR at once and draws.
-    /// 4. A game added from a folder (CRANVR_TEST_ADDED, a Mac path of its program) starts and draws as before.
+    /// 4. A game added from a folder (CRANVR_TEST_ADDED, a path of its program through the scratch folder's
+    ///    `wine` link) starts and draws as before. CRANVR_TEST_ADDED_EYE_PER_PASS=1 gives it "Each eye in its own
+    ///    pass", as the user's options have it.
     ///
     /// A host started with CRANVR_EYE_DUMP=FOLDER keeps the eyes of the game's newest frame there. Needs `cargo
     /// build --release`. Run with `cargo test --release -p cranvr-app -- --ignored a_game_that_drew_nothing`.
@@ -1116,6 +1184,7 @@ mod tests {
         assert!(home.join("wine").is_symlink(), "the scratch folder's wine is a link to the user's");
         let name = std::env::var("CRANVR_TEST_GAME").expect("CRANVR_TEST_GAME names the Steam game");
         let added = PathBuf::from(std::env::var("CRANVR_TEST_ADDED").expect("CRANVR_TEST_ADDED names a program to add"));
+        assert!(added.starts_with(prefix()), "the added program's path goes through the scratch folder");
         assert!(running(), "the user's Steam runs: the game's Steam check needs it");
         assert!(steamvr().is_some(), "the Steam library has SteamVR");
         let mut settings = Settings::load();
@@ -1131,6 +1200,7 @@ mod tests {
         // 1. Steam's launch entry
         let game = games().into_iter().find(|game| game.name == name).expect("the game is installed");
         let program = self::program(&game).unwrap();
+        let exe_name = program.rsplit('\\').next().unwrap().to_owned();
         let folder = crate::game_run::folder_of(&program);
         println!("{name}: {program} {:?} in {:?}", game.args, game.working_dir.as_deref().map(mac_to_windows));
 
@@ -1144,19 +1214,17 @@ mod tests {
             verdict = game_run::take_verdicts().into_iter().next();
         }
         let verdict = verdict.expect("a verdict that the game drew nothing through OpenComposite");
-        println!("verdict after {:.1} s: {verdict:?}", started.elapsed().as_secs_f64());
+        println!("verdict {:.1} s after the start: {verdict:?}", started.elapsed().as_secs_f64());
         let mut settings = Settings::load();
         let response = vr_system::respond(&mut settings.launch, &games(), &verdict.program, verdict.why, true);
         settings.save();
         println!("notice: {}", response.notice.window);
         let restart_program = response.restart.clone().expect("the game starts again");
-        restart(&restart_program).expect("the game starts through SteamVR");
         let restarted = Instant::now();
-        let first = pump_until(&mut model, Duration::from_secs(120), |model, most| most > 100 && last_eye_check(model).is_some_and(|(l, r)| l >= 8 && r >= 8));
-        let first_eyes = last_eye_check(&model);
-        let first_game = model.game.clone();
-        println!("through SteamVR: {first} game frames in a stats window, eyes {first_eyes:?}, game {first_game:?}, {:.0} s after the restart", restarted.elapsed().as_secs_f64());
-        end_program(program.rsplit('\\').next().unwrap());
+        restart(&restart_program).expect("the game starts through SteamVR");
+        let first = draws(&mut model, &exe_name, Duration::from_secs(120), "steamvr-play");
+        println!("through SteamVR: {first:?}, {:.0} s after the restart", restarted.elapsed().as_secs_f64());
+        end_program(&exe_name);
         let first_back = run_ends(&folder, &before);
 
         // 3. The console's request
@@ -1174,41 +1242,42 @@ mod tests {
                 }
             }
         }
-        model.log.clear();
-        let second = pump_until(&mut model, Duration::from_secs(120), |model, most| most > 100 && last_eye_check(model).is_some_and(|(l, r)| l >= 8 && r >= 8));
-        let second_eyes = last_eye_check(&model);
-        println!("from the console: {second} game frames in a stats window, eyes {second_eyes:?}, {:.0} s after the request", asked.elapsed().as_secs_f64());
-        end_program(program.rsplit('\\').next().unwrap());
+        let second = draws(&mut model, &exe_name, Duration::from_secs(120), "steamvr-console");
+        println!("from the console: {second:?}, {:.0} s after the request", asked.elapsed().as_secs_f64());
+        end_program(&exe_name);
         let second_back = run_ends(&folder, &before);
 
         // 4. A game added from a folder
         let mut settings = Settings::load();
         add_game(&mut settings, &added, &steam_games()).expect("the program is added");
+        if std::env::var_os("CRANVR_TEST_ADDED_EYE_PER_PASS").is_some() {
+            settings.launch.entry(mac_to_windows(&added)).or_default().eye_per_pass = true;
+        }
         settings.save();
         let added_game = added_games(&settings).into_iter().next().unwrap();
+        let added_name = added.file_name().unwrap().to_string_lossy().into_owned();
         probe = next_probe(&mut probe, &["--seconds", "120"]);
         play(&added_game).expect("the added game starts");
-        model.log.clear();
-        let third = pump_until(&mut model, Duration::from_secs(90), |model, most| most > 100 && last_eye_check(model).is_some_and(|(l, r)| l >= 8 && r >= 8));
-        let third_eyes = last_eye_check(&model);
-        println!("added game: {third} game frames in a stats window, eyes {third_eyes:?}");
-        end_program(added.file_name().unwrap().to_str().unwrap());
+        let third = draws(&mut model, &added_name, Duration::from_secs(90), "added");
+        println!("added game {}: {third:?}", mac_to_windows(&added));
+        end_program(&added_name);
         let third_back = run_ends(&game_run::folder_of(&mac_to_windows(&added)), &before);
         probe.kill().ok();
         probe.wait().ok();
         backend::stop_host();
         let options = Settings::load().launch.get(&program).cloned().unwrap_or_default();
 
-        assert!(program.to_ascii_lowercase().ends_with(r"\thelab\win64\thelab.exe") || std::env::var_os("CRANVR_TEST_ANY_PROGRAM").is_some(), "Steam's program: {program}");
+        assert!(program.to_ascii_lowercase().ends_with(r"\thelab\win64\thelab.exe"), "Steam's program: {program}");
+        assert_eq!(game.args, ["-popupwindow"]);
         assert_eq!(verdict.program.to_ascii_lowercase(), program.to_ascii_lowercase());
         assert_eq!(options.openvr, Some(launch::OpenVr::SteamVr));
         assert_eq!(options.openvr_reason, vr_system::REASON);
-        assert!(first > 100 && first_eyes.is_some_and(|(l, r)| l >= 8 && r >= 8), "the game draws through SteamVR");
+        assert!(first.lit(), "the game draws through SteamVR: {first:?}");
         assert!(first_back, "the run's end puts the path file back");
         assert!(console_started, "the console's request starts the game");
-        assert!(second > 100 && second_eyes.is_some_and(|(l, r)| l >= 8 && r >= 8), "the console's start draws");
+        assert!(second.lit(), "the console's start draws: {second:?}");
         assert!(second_back);
-        assert!(third > 100, "the added game draws: {third}");
+        assert!(third.lit(), "the added game draws: {third:?}");
         assert!(third_back);
     }
 
