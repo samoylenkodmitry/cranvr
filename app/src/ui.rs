@@ -10,7 +10,7 @@ use crate::{
 use cranpose::prelude::*;
 use cranpose::text::{FontWeight, TextUnit};
 use cranvr_common::{
-    controls::{Action as ControlAction, Control, Controls, Hand, ModelsInGame},
+    controls::{Action as ControlAction, Control, Controls, Hand, MenuHand, ModelsInGame},
     foveation::FoveationLevel,
 };
 use cranpose::widgets::{FlowRow, FlowSpec};
@@ -1155,6 +1155,13 @@ fn set_models(settings: MutableState<Settings>, choice: ModelsInGame) {
     settings.with(Settings::save);
 }
 
+/// Changes the hand that carries the hand menu while the headset tracks both controllers. The headset
+/// gets the choice with the mapping, through `vr-menu.json`.
+fn set_menu_hand(settings: MutableState<Settings>, choice: MenuHand) {
+    settings.update(|s| s.controls.menu_hand = choice);
+    settings.with(Settings::save);
+}
+
 fn reset_controls(settings: MutableState<Settings>) {
     settings.update(|s| s.controls = Controls::default());
     settings.with(Settings::save);
@@ -1183,6 +1190,16 @@ fn ControlsPage(settings: MutableState<Settings>) {
         }
         FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
             Action("Use the standard controls".into(), move || reset_controls(settings));
+        });
+    });
+    let menu_hand = controls.menu_hand;
+    Card(move || {
+        Heading("Hand menu".into());
+        Hint("The hand menu shows and hides every panel and opens the console. A button opens it, as the controls above say, or a press on the ball. With both controllers the ball and the menu ride on one hand, and the other hand points at them. Auto puts them on the hand that did not last press a panel. With one controller, or none, they stand in front of you, and that controller points at them. A controller that stops tracking for 2 seconds gives them up.".into());
+        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+            for choice in MenuHand::ALL {
+                Choice(choice.label().into(), menu_hand == choice, move || set_menu_hand(settings, choice));
+            }
         });
     });
     let models = controls.models_in_game;

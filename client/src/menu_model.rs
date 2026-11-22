@@ -10,6 +10,7 @@
 use crate::{
     display_wish::{cost_lines, Place},
     displays::DisplaysView,
+    menu_place::MenuPlace,
     panel_layout::{Layout, PanelId},
 };
 use cranvr_proto::message::DesktopWish;
@@ -60,6 +61,8 @@ pub struct MenuInput<'a> {
     pub displays: &'a DisplaysView,
     /// What the client asks of each display that shows, by its index
     pub wishes: [Option<DesktopWish>; crate::displays::SLOTS],
+    /// Where the menu stands, and with it the display that rides with it
+    pub place: MenuPlace,
 }
 
 /// The sizes of the menu's parts in dp. A dp is a millimeter in the room. The text is 22 dp tall or
@@ -103,12 +106,12 @@ pub fn rows(input: &MenuInput<'_>) -> Vec<MenuRow> {
         if display.info.removable {
             buttons.push(MenuButton { label: "Remove".into(), action: MenuAction::RemoveDisplay(stream), kind: ButtonKind::Danger });
         }
-        let place = if on_hand { "On the left hand" } else { "In the room" };
+        let place = if on_hand { with_menu(input.place) } else { "In the room".to_string() };
         let mut details = cost_lines(shown, &display.measured, wish.as_ref());
         // The place goes in front of the first line when it fits, else in a line of its own
         match details.first_mut() {
             Some(first) if first.len() + place.len() + 2 <= 40 => *first = format!("{place}. {first}"),
-            _ => details.insert(0, place.to_string()),
+            _ => details.insert(0, place),
         }
         rows.push(MenuRow { title: display.info.name.clone(), details, buttons });
     }
@@ -120,6 +123,12 @@ pub fn rows(input: &MenuInput<'_>) -> Vec<MenuRow> {
     actions.push(MenuButton { label: "Controls".into(), action: MenuAction::OpenControls, kind: ButtonKind::Normal });
     rows.push(MenuRow { title: String::new(), details: input.displays.notice.iter().cloned().collect(), buttons: actions });
     rows
+}
+
+/// Where a display that rides with the menu stands, in words for the menu's rows.
+fn with_menu(place: MenuPlace) -> String {
+    let label = place.label();
+    label[..1].to_uppercase() + &label[1..]
 }
 
 /// Where a display's panel stands, for the wish that it asks for.
@@ -156,7 +165,7 @@ mod tests {
     }
 
     fn input<'a>(layout: &'a Layout, displays: &'a DisplaysView) -> MenuInput<'a> {
-        MenuInput { layout, console_open: false, displays, wishes: Default::default() }
+        MenuInput { layout, console_open: false, displays, wishes: Default::default(), place: MenuPlace::Hand(cranvr_common::controls::Hand::Left) }
     }
 
     #[test]

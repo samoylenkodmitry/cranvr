@@ -25,14 +25,29 @@ fn pose_key(name: &str) -> String {
     format!("pose:{name}")
 }
 
+/// Whether the launch puts every panel at its default place and keeps no carry, for a test that
+/// aims at the panels where the code puts them: the extra `default_places`. The user's places stay
+/// as they were.
+fn default_places() -> bool {
+    use std::sync::OnceLock;
+    static DEFAULT: OnceLock<bool> = OnceLock::new();
+    *DEFAULT.get_or_init(|| cranpose::launch_args().boolean("default_places").unwrap_or(false))
+}
+
 /// The pose of the panel `name` where the user left it, if the user carried it. The next start
 /// places the panel there.
 pub fn saved_pose(name: &str) -> Option<Pose> {
+    if default_places() {
+        return None;
+    }
     preferences().get(&pose_key(name)).and_then(|text| pose_from_text(&text))
 }
 
 /// Keeps the pose of the panel `name` for the next start.
 pub fn save_pose(name: &str, pose: &Pose) {
+    if default_places() {
+        return;
+    }
     if let Err(e) = preferences().set(&pose_key(name), &pose_to_text(pose)) {
         log::warn!("the pose of the {name} panel was not saved: {e}");
     }
@@ -41,11 +56,17 @@ pub fn save_pose(name: &str, pose: &Pose) {
 /// The width in meters that the user gave the panel `name`, if they did. A move event carries no
 /// size, so a panel that the user resizes keeps its width apart from its pose.
 pub fn saved_width(name: &str) -> Option<f32> {
+    if default_places() {
+        return None;
+    }
     preferences().get(&format!("width:{name}")).and_then(|text| text.trim().parse().ok()).filter(|width: &f32| width.is_finite())
 }
 
 /// Keeps the width in meters of the panel `name` for the next start.
 pub fn save_width(name: &str, width: f32) {
+    if default_places() {
+        return;
+    }
     if let Err(e) = preferences().set(&format!("width:{name}"), &format!("{width:.4}")) {
         log::warn!("the width of the {name} panel was not saved: {e}");
     }
@@ -53,6 +74,9 @@ pub fn save_width(name: &str, width: f32) {
 
 /// The size in dp that the user gave the panel `name`, if they resized it.
 fn saved_size(name: &str) -> Option<[f32; 2]> {
+    if default_places() {
+        return None;
+    }
     let text = preferences().get(&format!("size:{name}"))?;
     let (width, height) = text.split_once(',')?;
     let size: [f32; 2] = [width.trim().parse().ok()?, height.trim().parse().ok()?];
@@ -60,6 +84,9 @@ fn saved_size(name: &str) -> Option<[f32; 2]> {
 }
 
 fn save_size(name: &str, size: [f32; 2]) {
+    if default_places() {
+        return;
+    }
     if let Err(e) = preferences().set(&format!("size:{name}"), &format!("{:.0},{:.0}", size[0], size[1])) {
         log::warn!("the size of the {name} panel was not saved: {e}");
     }

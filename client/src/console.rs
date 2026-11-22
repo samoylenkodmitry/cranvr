@@ -11,7 +11,7 @@
 //! This file holds the data and the rules, with no Cranpose state. `console_panel.rs` draws them
 //! and places the panel.
 
-use cranvr_common::controls::{Action as ControlAction, Control, Controls, Hand, ModelsInGame};
+use cranvr_common::controls::{Action as ControlAction, Control, Controls, Hand, MenuHand, ModelsInGame};
 use serde_json::{json, Value};
 use std::{
     sync::atomic::{AtomicU8, Ordering},
@@ -276,13 +276,14 @@ impl Volume {
 }
 
 /// What a console button does. Most of them ask the host. The room and the volume are the client's
-/// own settings. The controller models in a game go to the Mac with the controls.
+/// own settings. The controller models in a game and the menu hand go to the Mac with the controls.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Press {
     Host(Action),
     Room(Room),
     Volume(Volume),
     Models(ModelsInGame),
+    MenuHand(MenuHand),
 }
 
 /// What decides whether the room shows behind the panels.
@@ -328,7 +329,9 @@ pub mod size {
 pub fn controls_height() -> f32 {
     use size::*;
     let rows = |heights: &[f32]| heights.iter().map(|h| h + GAP).sum::<f32>();
-    2.0 * PADDING + rows(&[TITLE, BUTTON]) + Control::ALL.len() as f32 * (BUTTON + GAP) + rows(&[TEXT, TEXT, BUTTON])
+    // The title, the tabs, a row for each input, the name and the choices of the menu hand, two lines
+    // and the buttons
+    2.0 * PADDING + rows(&[TITLE, BUTTON]) + Control::ALL.len() as f32 * (BUTTON + GAP) + rows(&[TEXT, BUTTON, TEXT, TEXT, BUTTON])
 }
 
 /// The console's height in dp for a menu: the rows that `console_panel.rs` draws, with their gaps.
@@ -445,6 +448,13 @@ impl Console {
     pub fn pick_models(&mut self, choice: ModelsInGame, now: Instant) -> Option<Controls> {
         self.menu.as_ref()?;
         let next = Controls { models_in_game: choice, ..self.controls };
+        self.show_controls(next, now)
+    }
+
+    /// The user picks the hand that carries the hand menu. See `step_control`.
+    pub fn pick_menu_hand(&mut self, choice: MenuHand, now: Instant) -> Option<Controls> {
+        self.menu.as_ref()?;
+        let next = Controls { menu_hand: choice, ..self.controls };
         self.show_controls(next, now)
     }
 
