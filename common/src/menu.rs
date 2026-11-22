@@ -74,6 +74,16 @@ impl Item {
         }
     }
 
+    /// Takes the hint away, for the headset, which shows none.
+    pub fn drop_hint(&mut self) {
+        match self {
+            Item::Choice(choice) => choice.hint.clear(),
+            Item::Toggle(toggle) => toggle.hint.clear(),
+            Item::Buttons(row) => row.hint.clear(),
+            Item::Heading { .. } | Item::Text { .. } => {}
+        }
+    }
+
     /// The button that runs `id` for `subject`.
     pub fn button(&self, id: &str, subject: Option<&str>) -> Option<&Button> {
         match self {

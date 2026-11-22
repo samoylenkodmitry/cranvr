@@ -739,6 +739,7 @@ fn read_loop(s: &Shared<'_>, units: mpsc::Sender<Received>, udp: bool) -> Error 
             s.epoch.fetch_add(1, Ordering::Relaxed);
         }
         Incoming::Control(HostMsg::Menu(text)) => s.hub.set_menu(s.id, &text),
+        Incoming::Control(HostMsg::MenuStatus(text)) => s.hub.set_menu_status(s.id, &text),
         Incoming::Control(HostMsg::TrackingWish(wish)) => {
             log::info!("the host asks for {}", if wish.is_empty() { "no tracking".to_string() } else { wish.names().join(", ") });
             s.hub.feed.set_wish(wish);

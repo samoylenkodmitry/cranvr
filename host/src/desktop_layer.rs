@@ -18,29 +18,31 @@ pub struct LayerState {
     pub frames: AtomicU32,
 }
 
-/// The console's menu: the cranvr app's vr-menu.json, with the stream's state as "status". None
-/// without the app's file: the console then stays away.
-pub(crate) fn menu() -> Option<Vec<u8>> {
+/// The console's menu: the cranvr app's vr-menu.json, when it holds a JSON object. None without the
+/// app's file: the console then stays away.
+pub(crate) fn menu() -> Option<String> {
+    let text = std::fs::read_to_string(status::menu_file()?).ok()?;
+    matches!(serde_json::from_str::<serde_json::Value>(&text), Ok(serde_json::Value::Object(_))).then_some(text)
+}
+
+/// The stream's state for the console (`HostMsg::MenuStatus`): the headset's refresh rate, the
+/// frames a second that the host sends and that the game makes, the latency and the game's program.
+pub(crate) fn menu_status() -> String {
     use serde_json::{json, Value};
-    let bytes = std::fs::read(status::menu_file()?).ok()?;
-    let Ok(Value::Object(mut menu)) = serde_json::from_slice::<Value>(&bytes) else { return None };
     let headset = status::latest("headset").filter(|h| h["connected"] == true);
     let stats = status::latest("stats");
     let game = status::latest("game").filter(|g| g["connected"] == true);
     let round = |v: &Value| v.as_f64().map(|n| (n * 10.0).round() / 10.0);
-    menu.insert(
-        "status".into(),
-        json!({
-            "refresh": headset.as_ref().and_then(|h| round(&h["fps"])),
-            "fps": stats.as_ref().and_then(|s| round(&s["fps"])),
-            "game_fps": stats.as_ref().and_then(|s| s["game_frames"].as_f64()).map(|f| f / 5.0),
-            "latency_ms": stats.as_ref().and_then(|s| round(&s["latency"]["total_ms"])),
-            // The game's program file, by which the console finds its name
-            "game": game.as_ref().map(|g| match g["program"].as_str() {
-                Some(path) => path.rsplit(['\\', '/']).next().unwrap_or(path),
-                None => g["name"].as_str().unwrap_or("a game"),
-            }),
+    json!({
+        "refresh": headset.as_ref().and_then(|h| round(&h["fps"])),
+        "fps": stats.as_ref().and_then(|s| round(&s["fps"])),
+        "game_fps": stats.as_ref().and_then(|s| s["game_frames"].as_f64()).map(|f| f / 5.0),
+        "latency_ms": stats.as_ref().and_then(|s| round(&s["latency"]["total_ms"])),
+        // The game's program file, by which the console finds its name
+        "game": game.as_ref().map(|g| match g["program"].as_str() {
+            Some(path) => path.rsplit(['\\', '/']).next().unwrap_or(path),
+            None => g["name"].as_str().unwrap_or("a game"),
         }),
-    );
-    serde_json::to_vec(&Value::Object(menu)).ok()
+    })
+    .to_string()
 }

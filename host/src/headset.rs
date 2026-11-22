@@ -189,6 +189,9 @@ pub trait Headset: Send + Sync {
     /// Sends the console's menu as a JSON text, when the link has a console.
     fn send_menu(&self, _menu: &str) {}
 
+    /// Sends the stream's state for the console as a JSON text, when the link has a console.
+    fn send_menu_status(&self, _status: &str) {}
+
     /// Asks the headset to open its hand menu, when a headset is connected and its link has one.
     /// Returns whether a headset took the request.
     fn open_menu(&self) -> bool {

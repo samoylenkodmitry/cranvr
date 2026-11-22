@@ -673,6 +673,17 @@ impl Hub {
         }
     }
 
+    /// The stream's state for the console from the host, for the connection `id`.
+    pub(crate) fn set_menu_status(&self, id: u64, text: &str) {
+        if self.current.load(Ordering::Acquire) != id {
+            return;
+        }
+        match crate::console::Status::parse(text) {
+            Some(status) => self.console.lock().unwrap().on_status(status),
+            None => log::warn!("the host sent a state of the stream that the console cannot read"),
+        }
+    }
+
     pub fn console(&self) -> ConsoleView {
         self.console.lock().unwrap().view()
     }

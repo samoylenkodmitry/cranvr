@@ -18,29 +18,39 @@ fn pages() -> Value {
     ])
 }
 
-fn menu_text(game: Option<&str>) -> String {
-    let mut menu = json!({"pages": pages(), "controls": {}, "status": {"refresh": 120, "fps": 119.4, "game_fps": 117, "latency_ms": 46.2}});
-    menu["status"]["game"] = game.map_or(Value::Null, |game| game.into());
-    menu.to_string()
+fn menu_text() -> String {
+    json!({"pages": pages(), "controls": {}}).to_string()
 }
 
 /// A menu with the pages only, as the app writes it before a headset streams
 const BARE: &str = r#"{"pages":[],"controls":{}}"#;
 
+/// A menu that knows whether `game` runs, as the console's menu does once the stream's state came
 fn menu(game: Option<&str>) -> Menu {
-    Menu::parse(&menu_text(game)).unwrap()
+    let mut menu = Menu::parse(&menu_text()).unwrap();
+    menu.status.game = game.map(str::to_string);
+    menu
+}
+
+/// The host's state with `game` and then its menu, as the host sends them
+fn show(console: &mut Console, game: Option<&str>) {
+    console.on_status(Status { game: game.map(str::to_string), ..Status::default() });
+    console.on_menu(menu(None));
 }
 
 #[test]
 fn the_menu_comes_from_the_hosts_json() {
-    let menu = menu(Some("Beat Saber.exe"));
+    let menu = menu(None);
     assert_eq!(menu.pages.len(), 3);
     assert_eq!(menu.main().map(|page| page.id.as_str()), Some("play"));
-    assert_eq!(menu.status, Status { refresh: 120.0, fps: 119.4, game_fps: 117.0, latency_ms: Some(46.2), game: Some("Beat Saber.exe".into()) });
+    // The stream's state comes apart
+    let status = Status::parse(r#"{"refresh":120,"fps":119.4,"game_fps":117,"latency_ms":46.2,"game":"Beat Saber.exe"}"#).unwrap();
+    assert_eq!(status, Status { refresh: 120.0, fps: 119.4, game_fps: 117.0, latency_ms: Some(46.2), game: Some("Beat Saber.exe".into()) });
+    assert_eq!(Status::parse(r#"{"refresh":null}"#).unwrap(), Status::default(), "no headset streams");
+    assert_eq!(Status::parse("[1]"), None);
     // The menus list the pages after the main page that ask for it: a game's page is not listed
     assert_eq!(menu.listed(), [("stream".to_string(), "Stream".to_string())]);
     assert_eq!(menu.item(&Request::set("fps", "90")).and_then(Item::value), Some("120"));
-    // The host sends the file without a status while no headset streams
     let bare = Menu::parse(BARE).unwrap();
     assert_eq!((bare.pages.len(), bare.status.game), (0, None));
     assert_eq!(Menu::parse("not json"), None);
@@ -107,20 +117,20 @@ fn a_request_is_the_json_that_the_app_reads() {
 fn the_first_menu_opens_the_console_and_a_game_closes_it() {
     let mut console = Console::default();
     assert!(!console.view().open);
-    console.on_menu(menu(None));
+    show(&mut console, None);
     assert!(console.view().open);
     // The next menus change nothing while no game starts
-    console.on_menu(menu(None));
+    show(&mut console, None);
     assert!(console.view().open);
     // The user hides it. A menu without a change of the game keeps it hidden.
     console.close();
-    console.on_menu(menu(None));
+    show(&mut console, None);
     assert!(!console.view().open);
     // A game starts: hidden. The game ends: shown again
-    console.on_menu(menu(Some("Beat Saber.exe")));
+    show(&mut console, Some("Beat Saber.exe"));
     assert!(!console.view().open);
-    console.on_menu(menu(Some("Beat Saber.exe")));
-    console.on_menu(menu(None));
+    show(&mut console, Some("Beat Saber.exe"));
+    show(&mut console, None);
     assert!(console.view().open);
     // The link ends: no menu, no console
     console.clear();
@@ -324,11 +334,11 @@ fn the_console_follows_the_game_and_the_setting_into_its_backdrop() {
     let mut console = Console::default();
     // No link and no menu: no game, so the room shows
     assert!(console.backdrop(None).shows_room(true));
-    console.on_menu(menu(None));
+    show(&mut console, None);
     assert!(console.backdrop(None).shows_room(true));
     // A game starts. The desktop's hiding tells it first, the menu later.
     assert!(!console.backdrop(Some(true)).shows_room(true));
-    console.on_menu(menu(Some("Beat Saber.exe")));
+    show(&mut console, Some("Beat Saber.exe"));
     assert!(!console.backdrop(Some(true)).shows_room(true));
     // The host has no desktop: the menu alone keeps the game on screen
     assert!(!console.backdrop(None).shows_room(true));
@@ -359,4 +369,20 @@ fn a_notice_from_before_the_press_does_not_answer_it() {
     let mut newer = old.clone();
     newer.notice = Some("A new notice".into());
     assert_eq!(change.progress(&newer, start), Progress::Done);
+}
+
+#[test]
+fn the_state_comes_apart_and_a_game_that_runs_at_the_connection_keeps_the_console_hidden() {
+    let mut console = Console::default();
+    // The host sends the state first
+    console.on_status(Status { game: Some("Beat Saber.exe".into()), ..Status::default() });
+    assert!(!console.view().open, "no menu yet");
+    console.on_menu(menu(None));
+    assert!(!console.view().open, "a game runs");
+    assert_eq!(console.view().menu.unwrap().status.game.as_deref(), Some("Beat Saber.exe"));
+    // A new menu keeps the state, and the game's end alone shows the console
+    console.on_menu(menu(None));
+    assert!(!console.view().open);
+    console.on_status(Status::default());
+    assert!(console.view().open, "the game ended");
 }

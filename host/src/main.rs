@@ -655,11 +655,14 @@ fn main() {
 /// How often the host looks for a new menu for the headset's console
 const MENU_EVERY: Duration = Duration::from_secs(1);
 
-/// Sends the console's menu to a connected headset, when it differs from the last one that went out.
+/// Sends the console's menu and the stream's state to a connected headset, each when it differs from
+/// the last one that went out. The state changes every few seconds, the pages seldom, so a change of
+/// the state sends no pages.
 #[derive(Default)]
 struct ConsoleMenu {
     connected: bool,
     last: Option<String>,
+    last_status: Option<String>,
     checked: Option<Instant>,
 }
 
@@ -667,6 +670,7 @@ impl ConsoleMenu {
     fn connected(&mut self) {
         self.connected = true;
         self.last = None;
+        self.last_status = None;
         self.checked = None;
     }
 
@@ -679,8 +683,15 @@ impl ConsoleMenu {
             return;
         }
         self.checked = Some(Instant::now());
-        let Some(menu) = desktop_layer::menu().and_then(|bytes| String::from_utf8(bytes).ok()) else { return };
+        let Some(menu) = desktop_layer::menu() else { return };
+        // The state goes first, so the console knows whether a game runs when the first menu comes
+        let status = desktop_layer::menu_status();
+        if self.last_status.as_deref() != Some(&status) {
+            headset.send_menu_status(&status);
+            self.last_status = Some(status);
+        }
         if self.last.as_deref() != Some(&menu) {
+            info!("The console's menu goes to the headset: {} bytes", menu.len());
             headset.send_menu(&menu);
             self.last = Some(menu);
         }

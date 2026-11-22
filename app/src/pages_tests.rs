@@ -185,7 +185,10 @@ fn the_menu_carries_the_pages_and_the_notice_only_while_there_is_one() {
     assert_eq!(read(&model)["pages"][0]["id"], PLAY);
     model.note_message("The right eye stayed black. The game restarts.".into());
     assert_eq!(read(&model)["notice"], "The right eye stayed black. The game restarts.");
-    // The pages read back as the headset reads them
+    // The pages read back as the headset reads them, without the window's hints
     let pages: Vec<Page> = serde_json::from_value(read(&model)["pages"].clone()).unwrap();
-    assert_eq!(pages, super::pages(&Settings::default(), &model));
+    let mut shown = super::pages(&Settings::default(), &model);
+    shown.iter_mut().for_each(|page| page.items.iter_mut().for_each(Item::drop_hint));
+    assert_eq!(pages, shown);
+    assert!(!read(&model).to_string().contains("\"hint\""));
 }

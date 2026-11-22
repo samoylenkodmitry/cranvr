@@ -825,11 +825,16 @@ pub fn write_vr_menu(settings: &Settings, model: &Model) {
     }
 }
 
-/// The text of vr-menu.json.
+/// The text of vr-menu.json. The headset shows no hints, so the pages go without them: the host
+/// sends the menu again at each change of the stream's numbers.
 pub fn vr_menu(settings: &Settings, model: &Model) -> String {
     let notice = model.notice.as_ref().map(|(notice, _)| notice.headset.as_str()).filter(|notice| !notice.is_empty());
+    let mut pages = crate::pages::pages(settings, model);
+    for page in &mut pages {
+        page.items.iter_mut().for_each(cranvr_common::menu::Item::drop_hint);
+    }
     let mut menu = serde_json::json!({
-        "pages": crate::pages::pages(settings, model),
+        "pages": pages,
         "controls": settings.controls,
     });
     if let Some(notice) = notice {

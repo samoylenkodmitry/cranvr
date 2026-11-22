@@ -71,7 +71,7 @@ pub use wire::{Error, Nanos};
 /// Version 16 carries the settings and the actions as pages of items (`cranvr_common::menu`) in the
 /// console's menu, and the console sends a generic `set` or `run` request for an item. The menu's old
 /// keys (`games`, `fps`, `game_scale`, `msaa`) and the old requests (`play`, `stop`, `set` with a field)
-/// are gone.
+/// are gone. The stream's state for the console travels apart in [`message::HostMsg::MenuStatus`].
 pub const PROTOCOL_VERSION: u16 = 16;
 
 /// The largest datagram, in bytes, sealed: the counter and the tag are in it. A media packet and

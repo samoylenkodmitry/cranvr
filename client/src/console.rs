@@ -42,7 +42,7 @@ pub fn take_page_request() -> Option<Shown> {
     PAGE_REQUEST.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
 }
 
-/// The stream's state, from the host.
+/// The stream's state, from the host (`HostMsg::MenuStatus`).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Status {
     /// The headset's refresh rate in Hz
@@ -69,23 +69,30 @@ pub struct Menu {
     pub controls: Controls,
 }
 
-impl Menu {
-    /// The menu from the host's text. `None` for a text that is no menu: it lacks the pages, a page
-    /// does not read, or the controls are missing. The status is the host's own and is missing while
-    /// no headset streams.
+impl Status {
+    /// The state from the host's text. A text that is no JSON object gives no state.
     pub fn parse(text: &str) -> Option<Self> {
-        let v: Value = serde_json::from_str(text).ok()?;
-        let s = &v["status"];
+        let s: Value = serde_json::from_str(text).ok().filter(Value::is_object)?;
         let number = |v: &Value| v.as_f64().map(|n| n as f32);
         Some(Self {
+            refresh: number(&s["refresh"]).unwrap_or(0.0),
+            fps: number(&s["fps"]).unwrap_or(0.0),
+            game_fps: number(&s["game_fps"]).unwrap_or(0.0),
+            latency_ms: number(&s["latency_ms"]),
+            game: s["game"].as_str().map(str::to_string),
+        })
+    }
+}
+
+impl Menu {
+    /// The menu from the host's text. `None` for a text that is no menu: it lacks the pages, a page
+    /// does not read, or the controls are missing. The stream's state comes apart
+    /// (`Console::on_status`).
+    pub fn parse(text: &str) -> Option<Self> {
+        let v: Value = serde_json::from_str(text).ok()?;
+        Some(Self {
             pages: serde_json::from_value(v.get("pages")?.clone()).ok()?,
-            status: Status {
-                refresh: number(&s["refresh"]).unwrap_or(0.0),
-                fps: number(&s["fps"]).unwrap_or(0.0),
-                game_fps: number(&s["game_fps"]).unwrap_or(0.0),
-                latency_ms: number(&s["latency_ms"]),
-                game: s["game"].as_str().map(str::to_string),
-            },
+            status: Status::default(),
             notice: v["notice"].as_str().filter(|notice| !notice.is_empty()).map(str::to_string),
             controls: Controls::from_json(&v["controls"].to_string())?,
         })
@@ -356,6 +363,8 @@ pub struct Console {
     open: bool,
     /// Whether a game ran at the last menu
     game_ran: Option<bool>,
+    /// The stream's state, which comes apart from the menu
+    status: Status,
     /// What the buttons of the controllers do. The Mac owns the mapping (`app.json`): its menu
     /// sets it, and the headset keeps the last one for the time without a link.
     controls: Controls,
@@ -482,12 +491,8 @@ impl Console {
         self.on_menu_at(menu, Instant::now())
     }
 
-    pub fn on_menu_at(&mut self, menu: Menu, now: Instant) -> Option<Controls> {
-        let runs = menu.status.game.is_some();
-        if self.game_ran != Some(runs) {
-            self.game_ran = Some(runs);
-            self.open = !runs;
-        }
+    pub fn on_menu_at(&mut self, mut menu: Menu, now: Instant) -> Option<Controls> {
+        menu.status = self.status.clone();
         let mut changed = None;
         let controls = menu.controls;
         // A change of the user's shows at once and the Mac repeats it a moment later. A menu that
@@ -505,13 +510,38 @@ impl Console {
             changed = Some(controls);
         }
         self.menu = Some(menu);
+        self.follow_game();
         changed
+    }
+
+    /// The stream's state from the host. A game's start or end shows or hides the console as a menu
+    /// does.
+    pub fn on_status(&mut self, status: Status) {
+        if let Some(menu) = &mut self.menu {
+            menu.status = status.clone();
+        }
+        self.status = status;
+        self.follow_game();
+    }
+
+    /// The console shows when the first menu comes and while no game runs, and it hides when a game
+    /// starts. The user's own toggle holds until the game starts or stops.
+    fn follow_game(&mut self) {
+        if self.menu.is_none() {
+            return;
+        }
+        let runs = self.status.game.is_some();
+        if self.game_ran != Some(runs) {
+            self.game_ran = Some(runs);
+            self.open = !runs;
+        }
     }
 
     /// The link ended: the menu is gone.
     pub fn clear(&mut self) {
         self.menu = None;
         self.game_ran = None;
+        self.status = Status::default();
         self.open = self.keep_open;
         self.pending_controls = None;
     }
