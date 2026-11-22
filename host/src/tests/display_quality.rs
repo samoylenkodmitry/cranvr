@@ -306,7 +306,7 @@ fn measure(script: &[(Motion, Duration)], format: Format, mbps: u64, spacing: Sp
     let mut display = DisplayEncoder::new(size, fps, mbps, sender.clone()).expect("encoder");
     // The old encoder: frames 1 ms apart on the time line, a key frame every 10 s and no cap
     let key_every = Some(Duration::from_secs(10));
-    let old = Encoder::new(&EncoderConfig { width: size[0], height: size[1], fps: fps as f32, bitrate_bps: mbps * 1_000_000, full_range: true, strict_rate: false, key_every, max_qp: None }, sender)
+    let old = Encoder::new(&EncoderConfig { width: size[0], height: size[1], fps: fps as f32, bitrate_bps: mbps * 1_000_000, full_range: true, strict_rate: false, key_every, max_qp: None, real_time: false }, sender)
         .expect("encoder");
     // The curve may try the host's time line without the cap: `CRANVR_QUALITY_NO_CAP=1`
     let no_cap = std::env::var("CRANVR_QUALITY_NO_CAP").is_ok_and(|v| v == "1");
@@ -644,3 +644,6 @@ mod feed {
         assert!(back > ms(3300) && back < ms(4300), "the cap came back at {back:?}");
     }
 }
+
+#[path = "encoder_sharing.rs"]
+mod encoder_sharing;

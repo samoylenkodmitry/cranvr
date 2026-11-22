@@ -298,7 +298,8 @@ impl DisplayEncoder {
 
     fn session([width, height]: [u32; 2], fps: i32, mbps: u64, sender: &Sender<EncodedFrame>, capped: bool) -> Result<Encoder, String> {
         let max_qp = capped.then_some(DISPLAY_MAX_QP);
-        let config = EncoderConfig { width, height, fps: fps as f32, bitrate_bps: mbps * 1_000_000, full_range: true, strict_rate: false, key_every: None, max_qp };
+        // Out of real time: the eye stream's real-time session goes first on the Mac's encoder
+        let config = EncoderConfig { width, height, fps: fps as f32, bitrate_bps: mbps * 1_000_000, full_range: true, strict_rate: false, key_every: None, max_qp, real_time: false };
         Encoder::new(&config, sender.clone())
     }
 

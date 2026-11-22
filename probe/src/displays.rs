@@ -27,6 +27,8 @@ pub struct DisplayPlan {
     pub wanted: u8,
     /// The script of a game's run: show for a while, then hide (see the module's text)
     pub in_game: bool,
+    /// The most pictures a second that every wish asks for, in place of the client's own rule
+    pub max_fps: Option<u8>,
 }
 
 pub struct DisplaySet {
@@ -113,12 +115,13 @@ impl DisplaySet {
     /// pixels across at 30, and displays that show over a game get 2560 at 30. The Mac then encodes no
     /// more pixels a second than it does for one display.
     pub fn wish_size(&self) -> (u32, u8) {
-        match (self.plan.in_game, self.plan.wanted) {
+        let (width, fps) = match (self.plan.in_game, self.plan.wanted) {
             (true, _) => (2560, 30),
             (false, 0..=1) => (3840, 60),
             (false, 2) => (3840, 30),
             (false, _) => (2560, 30),
-        }
+        };
+        (width, self.plan.max_fps.unwrap_or(fps))
     }
 
     /// Wishes or ends the wish of every display.

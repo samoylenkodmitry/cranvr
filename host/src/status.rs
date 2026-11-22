@@ -10,7 +10,8 @@
 //! - `vr_display`: main (true when the virtual display became the main display at the first
 //!   pose of a connection, false when it stopped at the end), and display
 //! - `audio`: ok, and message when not ok: the capture of the Mac's sound for the headset
-//! - `stats`: fps, game_frames, render_ms, encode_ms, mbps, audio_s: seconds of the Mac's sound
+//! - `stats`: fps, game_frames, render_ms, encode_ms, encode_p95_ms (the eye frames' encode time,
+//!   mean and 95th percentile), mbps, audio_s: seconds of the Mac's sound
 //!   captured for the headset (every 5 seconds), and latency: the averages of the headset's
 //!   frame timing reports since the last line (see `Headset::take_stats`), or null. The headset
 //!   reports no timing while it shows no stream: with its Room setting at Passthrough and no game
