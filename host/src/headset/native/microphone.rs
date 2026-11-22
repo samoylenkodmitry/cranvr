@@ -17,8 +17,8 @@
 //! microphone with `HostMsg::Microphone(true)` while the stamp is fresh and with `false` after it
 //! stops. The headset records only in between, so the microphone costs nothing while no game records.
 //!
-//! The headset sends 10 ms a datagram. The host writes each datagram into the ring at once. A lost
-//! datagram becomes silence. A late one is dropped. The reader stays 15 ms behind the newest frame and
+//! The headset sends 5 ms a datagram. The host writes each datagram into the ring at once. A lost
+//! datagram becomes silence. A late one is dropped. The reader stays 10 ms behind the newest frame and
 //! skips forward when the lag stays larger, so the drift between the headset's clock and the Mac's
 //! clock adds no delay.
 
@@ -43,7 +43,7 @@ use std::{
 const MAGIC: u32 = 0x434d_5243;
 const VERSION: u32 = 1;
 const HEADER: usize = 64;
-/// 341 ms: far more than the reader's lag of 15 ms, so the reader never meets the writer
+/// 341 ms: far more than the reader's lag of 10 ms, so the reader never meets the writer
 const CAPACITY: usize = 16384;
 const WRITE_POS: usize = 16;
 const READER_BEAT: usize = 24;

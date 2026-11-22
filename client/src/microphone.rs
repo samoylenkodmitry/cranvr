@@ -5,12 +5,13 @@
 //! the microphone costs nothing while no game records.
 //!
 //! Cranpose's `backend::open_microphone` records with an AAudio input stream on a Quest, in
-//! low-latency mode with the preset for a call: Android cancels the echo of the game's sound that the
-//! headset's speakers play. The launch extra `microphone_preset=recognition` records without the echo
-//! cancellation, for a test that plays a sound through the headset's own speakers. The recorder runs
+//! low-latency mode with the preset for speech recognition. On a Quest 3 a game hears the sound about
+//! 30 ms sooner with it than with the preset for a call, which cancels the echo of the headset's
+//! speakers (see "The microphone in games" in the README). The launch extra
+//! `microphone_preset=communication` records with the call preset. The recorder runs
 //! on the input thread. It mixes the channels down to one, resamples to 48 kHz when the device runs
 //! at another rate and puts the frames into a lock-free queue. A thread of this file sends them in
-//! datagrams of 10 ms (`ClientDatagram::Microphone`, 16 bits). Each datagram carries the time at
+//! datagrams of 5 ms (`ClientDatagram::Microphone`, 16 bits). Each datagram carries the time at
 //! which the microphone took its first frame, from the stream's capture time, so the host knows how
 //! old the sound is.
 //!
@@ -162,10 +163,10 @@ fn record_until(link: &ClientLink, stop: &AtomicBool) {
     let origin = Arc::new(Origin(AtomicU64::new(now_ns())));
     let dropped = Arc::new(AtomicU64::new(0));
     let capture = Capture { queue: producer, origin: Arc::clone(&origin), written: 0, phase: 0.0, last: 0.0, dropped: Arc::clone(&dropped) };
-    let preset = match cranpose::launch_args().string("microphone_preset") {
-        Some("recognition") => InputPreset::VoiceRecognition,
-        Some("unprocessed") => InputPreset::Unprocessed,
-        _ => InputPreset::VoiceCommunication,
+    let preset = if cranpose::launch_args().string("microphone_preset") == Some("communication") {
+        InputPreset::VoiceCommunication
+    } else {
+        InputPreset::VoiceRecognition
     };
     let source = match backend::open_microphone(Box::new(capture), preset) {
         Ok(source) => source,
