@@ -1,7 +1,7 @@
 use crate::{
     backend::{self, Model, Settings, StreamPath},
     black_eye,
-    launch::{self, GameOptions},
+    launch::{self, GameOptions, OpenVr},
     setup::{self, Progress, Setup},
     steam::{self, SteamState},
     system::{self, Permission},
@@ -856,20 +856,21 @@ fn LaunchOptions(settings: MutableState<Settings>, program: String) {
                 Hint(options.eye_one_pass_reason.clone());
             }
             Hint("For a game whose picture stays black, in the right eye or in both eyes. \"Each eye in its own pass\": the runtime refuses two-eye images, so the game draws each eye apart. This costs frames. \"Both eyes in one pass\": the runtime tells the game that a vertex shader may choose the eye, as a game that draws both eyes in one pass needs, or that draws both eyes into a picture of its own, as a Unity game with the OpenVR provider does.".into());
-            let (own, default_on) = (options.opencomposite, wine.opencomposite);
+            let (own, default_choice) = (options.openvr, wine.openvr);
             let key = program.clone();
             FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
                 Text("OpenVR".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
                 for (label, choice) in [
-                    (format!("As in Settings ({})", if default_on { "OpenComposite" } else { "off" }), None),
-                    ("OpenComposite".to_owned(), Some(true)),
-                    ("Off".to_owned(), Some(false)),
+                    (format!("As in Settings ({})", default_choice.label()), None),
+                    (OpenVr::OpenComposite.label().to_owned(), Some(OpenVr::OpenComposite)),
+                    (OpenVr::SteamVr.label().to_owned(), Some(OpenVr::SteamVr)),
+                    (OpenVr::Off.label().to_owned(), Some(OpenVr::Off)),
                 ] {
                     let key = key.clone();
-                    Choice(label, own == choice, move || edit_launch(settings, &key, |o| o.opencomposite = choice));
+                    Choice(label, own == choice, move || edit_launch(settings, &key, |o| o.openvr = choice));
                 }
             });
-            Hint("An OpenVR game needs OpenComposite to run, because SteamVR is not installed. Off leaves the game no OpenVR runtime, so a game with an OpenXR mode takes that. It applies when the game starts.".into());
+            Hint(OPENVR_HINT.into());
             if shown {
                 OptionField("Wine DLL overrides", dll);
                 Hint("As WINEDLLOVERRIDES takes them, such as winhttp=n,b. The program then loads a winhttp.dll from its own folder before Wine's. Use it only for a mod loader that does not start without it: a loader that patched the game's files already starts twice with it.".into());
@@ -936,18 +937,24 @@ fn edit_launch(settings: MutableState<Settings>, program: &str, edit: impl FnOnc
     settings.with(Settings::save);
 }
 
-/// The choice for every program: OpenVR games run through OpenComposite (see openvr.rs). A program can
-/// set its own in its options. The Wine card and the Settings tab both show it.
+/// What the OpenVR choice means, in the Play tab and in Settings
+const OPENVR_HINT: &str = "OpenComposite runs an OpenVR game through cranvr's runtime without SteamVR. SteamVR runs the game in SteamVR itself, for a game that needs SteamVR. Install SteamVR from your Steam library first. SteamVR starts with the game and closes after it. Off leaves the game no OpenVR runtime, so a game with an OpenXR mode takes that. An OpenXR game ignores the choice. It applies when the game starts.";
+
+/// The choice for every program: the OpenVR runtime of OpenVR games (see openvr.rs). A program can set
+/// its own in its options. The Wine card and the Settings tab both show it.
 #[composable]
 fn OpenVrSetting(settings: MutableState<Settings>) {
-    let on = settings.with(|s| s.wine.opencomposite);
+    let now = settings.with(|s| s.wine.openvr);
     FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-        Choice("OpenVR games through OpenComposite".into(), on, move || {
-            settings.update(|s| s.wine.opencomposite = !s.wine.opencomposite);
-            settings.with(Settings::save);
-        });
+        Text("OpenVR games".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
+        for choice in [OpenVr::OpenComposite, OpenVr::SteamVr, OpenVr::Off] {
+            Choice(choice.label().into(), now == choice, move || {
+                settings.update(|s| s.wine.openvr = choice);
+                settings.with(Settings::save);
+            });
+        }
     });
-    Hint("OpenComposite turns the OpenVR calls of a game into OpenXR calls to cranvr's runtime, so a SteamVR game runs without SteamVR. It changes no file of the game. An OpenXR game ignores it. It applies when a game starts. Each game can choose otherwise in its options.".into());
+    Hint(format!("{OPENVR_HINT} Each game can choose otherwise in its options."));
 }
 
 /// The Wine that runs the games and the options of every program that cranvr starts. The raw

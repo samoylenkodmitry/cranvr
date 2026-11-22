@@ -965,7 +965,7 @@ mod tests {
             "left": {"trigger": "right_click", "menu": "recenter"},
             "right": {"grip": "grab", "secondary": "keyboard"}
         },
-        "launch": {"C:\\Games\\game.exe": {"args": "-vr", "opencomposite": false}},
+        "launch": {"C:\\Games\\game.exe": {"args": "-vr", "openvr": "off"}},
         "wine": {"mac_window": true},
         "added_games": [{"name": "Mods", "program": "/Games/Mods/game.exe"}]
     }"#;
@@ -981,7 +981,7 @@ mod tests {
         // The wrong entry keeps the standard action
         assert_eq!(s.controls.action(Hand::Right, Control::Grip), Action::Nothing);
         assert_eq!(s.launch["C:\\Games\\game.exe"].args, "-vr");
-        assert_eq!(s.launch["C:\\Games\\game.exe"].opencomposite, Some(false));
+        assert_eq!(s.launch["C:\\Games\\game.exe"].openvr, Some(crate::launch::OpenVr::Off));
         assert!(s.wine.mac_window);
         assert_eq!(s.added_games.len(), 1);
         assert_eq!(reading.unreadable.len(), 1, "{:?}", reading.unreadable);

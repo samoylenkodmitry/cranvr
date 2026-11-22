@@ -1,14 +1,15 @@
 # Wine patches
 
-cranvr keeps Gcenx's macOS build of Wine 11.10 as its engine. It replaces five files of it with files built from the same Wine tag and cranvr's patches:
+cranvr keeps Gcenx's macOS build of Wine 11.10 as its engine. It replaces six files of it with files built from the same Wine tag and cranvr's patches:
 
 - `wined3d.dll` holds vkd3d-shader, the HLSL compiler (LGPL 2.1 or later, like Wine). A game that compiles its shaders at run time calls `D3DCompile` in `d3dcompiler_47.dll`, which calls vkd3d-shader in `wined3d.dll`. A game ships its own `d3dcompiler_47.dll` too. Wine loads its own copy first, so every game's HLSL goes through vkd3d-shader.
 - `winemac.so` is the Mac side of Wine's Mac driver. It makes the OpenGL contexts of a Windows program.
 - `opengl32.so` is the Mac side of Wine's `opengl32.dll`. Every OpenGL call of a program goes through it.
 - `wininet.dll` is Wine's HTTP client of the WinINet API.
+- `wtsapi32.dll` answers questions about the Windows session, such as whether the screen is locked.
 - `ntdll.so` is the Mac side of `ntdll.dll`. It manages the memory of a Windows program, among other things.
 
-`scripts/build-wine.sh` clones Wine at the tag `wine-11.10` (commit `2cac6ccf33c0807f374dc96f5a20e35a2da86157`) into `third_party/wine/src` (not committed), applies the patches in this folder and builds the five files into `third_party/wine/build/bin`: the DLLs with MinGW-w64, the Mac libraries with Xcode's clang for x86_64 and macOS 10.15 and newer, as Gcenx's build has. The build runs under Rosetta 2, because Wine's configure wants a 64-bit Intel host. `scripts/setup-wine.sh` copies the DLLs into the engine and into the prefix's `system32`, where the loader takes them, and the libraries into the engine. The wine tree is not used otherwise. `package-game-support.sh` packs the pinned source tree and the patches as `SOURCE/wine-source.tar.xz` and as `cranvr-wine-source.tar.xz` in the release.
+`scripts/build-wine.sh` clones Wine at the tag `wine-11.10` (commit `2cac6ccf33c0807f374dc96f5a20e35a2da86157`) into `third_party/wine/src` (not committed), applies the patches in this folder and builds the six files into `third_party/wine/build/bin`: the DLLs with MinGW-w64, the Mac libraries with Xcode's clang for x86_64 and macOS 10.15 and newer, as Gcenx's build has. The build runs under Rosetta 2, because Wine's configure wants a 64-bit Intel host. `scripts/setup-wine.sh` copies the DLLs into the engine and into the prefix's `system32`, where the loader takes them, and the libraries into the engine. The wine tree is not used otherwise. `package-game-support.sh` packs the pinned source tree and the patches as `SOURCE/wine-source.tar.xz` and as `cranvr-wine-source.tar.xz` in the release.
 
 ## patches
 
@@ -46,6 +47,12 @@ cranvr keeps Gcenx's macOS build of Wine 11.10 as its engine. It replaces five f
 - With the patch, `map_view` places memory at no fixed address above 4 GB for such a program: first in the reserved area above 4 GB, then in the host's free space, never in the low area. A request with an address, with address limits (`zero_bits`, `MEM_ADDRESS_REQUIREMENTS`) or with `MEM_TOP_DOWN` behaves as before. A program without the two flags behaves as before.
 - Thread stacks stay in the low area. Wine's Mac side gives each thread a stack of its own for system calls, above 4 GB. A thread that is suspended on its way out of a system call (`__wine_syscall_dispatcher_return`, which on macOS makes a system call of its own) reports a context whose `Rsp` points into that stack: the syscall frame plus 0x70. Chromium's sampling profiler, which Steam's web helper runs with `--start-stack-profiler`, copies the stack from `Rsp` up to `StackBase`. In a first version of the patch the main thread's stack started at 0x100110000, right above the Mac-side stack of the thread at 0x100000000. The copy in `libcef.dll` (RVA 0x922cc1a) started at 0x10010fd70, read the no-access page at 0x100110000 and faulted. The web helper crashed 5 to 8 times a minute. Steam restarted it each time, so its store page stayed empty. With the thread stack below 4 GB the reported `Rsp` lies above `StackBase`. The profiler then drops the sample, as it did before the patch.
 
+`0006-wtsapi32-session-of-the-console-is-unlocked.patch`
+
+- SteamVR's compositor asks `WTSQuerySessionInformationA` for `WTSSessionInfoEx` and `WTSIsRemoteSession`, to learn whether the screen of the computer is locked. Wine 11.10 answered neither class ("Unimplemented class 25" and "29"). The compositor took the session as locked. In that state SteamVR marks the headset's pose of each frame invalid (`TrackingResult_Uninitialized`) and fades the picture out to a plain color. The pose that `WaitGetPoses` returned to a game for the head was invalid in every frame, with SteamVR's own null driver too. The setting `steamvr.allowDisplayLockedMode` hid the symptom.
+- `WTSSessionInfoEx` now gives level 1 of `WTSINFOEX` with the console's session: active, `WTS_SESSIONSTATE_UNLOCK`, the station "Console", the user and the computer's name. `WTSIsRemoteSession` gives one byte, 0. The ANSI call converts the strings of the first one and passes the byte of the second. The patch adds the structures to `include/wtsapi32.h`.
+- With the patch, an OpenVR program under SteamVR got a valid head pose in 1056 of 1056 frames (none before), and SteamVR showed its room instead of the fade.
+
 ## tests
 
 `tests/hlsl_compile.cpp` loads a `d3dcompiler_47.dll` and compiles one HLSL file with `D3DCompile`. It prints `hlsl_compile: PASS` or `FAIL` with the compiler's messages. `tests/isnan.hlsl` calls `isnan` on a scalar and on a vector.
@@ -56,4 +63,6 @@ cranvr keeps Gcenx's macOS build of Wine 11.10 as its engine. It replaces five f
 
 `tests/stack_sample_check.cpp` samples a thread as a profiler does. A second thread makes system calls in a loop. The program suspends it 20000 times, reads `Rsp` and checks that every page from there up to `StackBase` is readable, when that range is shorter than 8 MB. It prints `stack_sample_check: PASS`, or `FAIL` with the count of copies that would fault. Under Wine without patch 0005 about a quarter of the samples report an `Rsp` above the thread's stack. With the first version of the patch the same share lay just below the stack. Every one of those copies would fault.
 
-`scripts/setup-wine.sh` runs the four programs in the prefix after each install and stops when one fails.
+`tests/session_check.cpp` asks for `WTSSessionInfoEx` and `WTSIsRemoteSession` as SteamVR's compositor does. It prints `session_check: PASS` when the session is active, unlocked and local. Under Wine without patch 0006 it prints `FAIL: WTSSessionInfoEx has no answer`.
+
+`scripts/setup-wine.sh` runs the five programs in the prefix after each install and stops when one fails.

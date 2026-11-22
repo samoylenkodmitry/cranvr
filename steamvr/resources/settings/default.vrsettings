@@ -1,0 +1,6 @@
+{
+	"driver_cranvr": {
+		"enable": true,
+		"controllerRenderModel": "oculus_quest_plus_controller"
+	}
+}

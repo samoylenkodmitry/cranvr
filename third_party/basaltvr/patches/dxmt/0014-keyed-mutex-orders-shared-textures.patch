@@ -1,0 +1,140 @@
+Subject: [PATCH] d3d11: a keyed mutex for shared textures (cranvr)
+
+SteamVR passes frames between its processes in textures made with SHARED_KEYEDMUTEX and orders the access with their
+keyed mutexes. Chromium's GPU process asks the textures that it shares for the mutex too. DXMT gave no such interface.
+A texture made with SHARED_KEYEDMUTEX now answers the query. ReleaseSync returns once the GPU has finished every
+command that the device sent before it, so the texture holds the writer's draws when the reader learns of them.
+AcquireSync then returns at once.
+---
+diff --git a/src/d3d11/d3d11_keyed_mutex.hpp b/src/d3d11/d3d11_keyed_mutex.hpp
+new file mode 100644
+index 0000000..a82e8cc
+--- /dev/null
++++ b/src/d3d11/d3d11_keyed_mutex.hpp
+@@ -0,0 +1,80 @@
++#pragma once
++/*
++ * cranvr: IDXGIKeyedMutex for a resource created with D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.
++ *
++ * SteamVR passes frames between its processes in shared textures and orders the access with their
++ * keyed mutexes: the writer releases the mutex after its draws, the reader acquires it before its
++ * reads. DXMT gave no such interface. This one makes the order hold without shared state: ReleaseSync
++ * returns once the GPU has finished every command that the device sent before it, so the texture
++ * holds the writer's draws when the reader learns of them. AcquireSync then returns at once. The key
++ * is not checked, so a reader that waits for one writer of several gets no wait.
++ */
++#include "dxgi1_2.h"
++#include "com/com_pointer.hpp"
++#include "d3d11_1.h"
++#include "log/log.hpp"
++#include <windows.h>
++
++namespace dxmt {
++
++template <typename IResource> class MTLDXGIKeyedMutex : public IDXGIKeyedMutex {
++public:
++  MTLDXGIKeyedMutex(IResource *pResource) : resource_(pResource) {}
++  virtual ~MTLDXGIKeyedMutex() {}
++
++  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) final {
++    return resource_->QueryInterface(riid, ppvObject);
++  }
++  ULONG STDMETHODCALLTYPE AddRef() final { return resource_->AddRef(); }
++  ULONG STDMETHODCALLTYPE Release() final { return resource_->Release(); }
++
++  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT data_size, const void *data) final {
++    return resource_->SetPrivateData(guid, data_size, data);
++  }
++  HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid, const IUnknown *object) final {
++    return resource_->SetPrivateDataInterface(guid, object);
++  }
++  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT *data_size, void *data) final {
++    return resource_->GetPrivateData(guid, data_size, data);
++  }
++  HRESULT STDMETHODCALLTYPE GetParent(REFIID riid, void **parent) final { return GetDevice(riid, parent); }
++  HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void **ppDevice) final {
++    return resource_->GetDeviceInterface(riid, ppDevice);
++  }
++
++  HRESULT STDMETHODCALLTYPE AcquireSync(UINT64 Key, DWORD dwMilliseconds) final {
++    // The writer's ReleaseSync waited for its GPU work
++    return S_OK;
++  }
++
++  HRESULT STDMETHODCALLTYPE ReleaseSync(UINT64 Key) final {
++    Com<ID3D11Device> device;
++    if (FAILED(resource_->GetDeviceInterface(__uuidof(ID3D11Device), reinterpret_cast<void **>(&device))))
++      return S_OK;
++    Com<ID3D11DeviceContext> context;
++    device->GetImmediateContext(&context);
++    if (!query_) {
++      D3D11_QUERY_DESC desc = {D3D11_QUERY_EVENT, 0};
++      if (FAILED(device->CreateQuery(&desc, &query_)))
++        return S_OK;
++    }
++    context->End(query_.ptr());
++    context->Flush();
++    // A frame of the GPU takes milliseconds; a stuck GPU must not hold the caller for good
++    ULONGLONG until = GetTickCount64() + 1000;
++    while (context->GetData(query_.ptr(), nullptr, 0, 0) == S_FALSE) {
++      if (GetTickCount64() > until) {
++        WARN("DXGIKeyedMutex::ReleaseSync: the GPU did not finish within a second");
++        break;
++      }
++      SwitchToThread();
++    }
++    return S_OK;
++  }
++
++private:
++  IResource *resource_; // aggregated: the resource holds this object
++  Com<ID3D11Query> query_;
++};
++
++} // namespace dxmt
+diff --git a/src/d3d11/d3d11_resource.hpp b/src/d3d11/d3d11_resource.hpp
+index 80927e5..9ef6170 100644
+--- a/src/d3d11/d3d11_resource.hpp
++++ b/src/d3d11/d3d11_resource.hpp
+@@ -8,6 +8,7 @@
+ #include "com/com_guid.hpp"
+ #include "d3d11_view.hpp"
+ #include "dxgi_resource.hpp"
++#include "d3d11_keyed_mutex.hpp"
+ #include "log/log.hpp"
+ #include "../d3d10/d3d10_buffer.hpp"
+ #include "../d3d10/d3d10_texture.hpp"
+@@ -187,6 +188,7 @@ public:
+       MTLD3D11DeviceChild<D3D11ResourceCommon, Base...>(device),
+       desc(desc),
+       dxgi_resource(new MTLDXGIResource<TResourceBase<tag, Base...>>(this)),
++      keyed_mutex(new MTLDXGIKeyedMutex<TResourceBase<tag, Base...>>(this)),
+       d3d10(reinterpret_cast<tag::COM *>(this), device->GetImmediateContextPrivate()) {
+     // D3D11ResourceCommonß::bind_flags_
+     this->bind_flags_ = desc.BindFlags;
+@@ -238,6 +240,17 @@ public:
+       return S_OK;
+     }
+ 
++    if (riid == __uuidof(IDXGIKeyedMutex)) {
++      if (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) {
++        *ppvObject = ref(keyed_mutex.get());
++        return S_OK;
++      }
++      static bool warned = false;
++      if (!std::exchange(warned, true))
++        WARN("D3D11Resource: IDXGIKeyedMutex of a resource that was not created with SHARED_KEYEDMUTEX");
++      return E_NOINTERFACE;
++    }
++
+     if (logQueryInterfaceError(__uuidof(typename tag::COM), riid)) {
+       WARN("D3D11Resource(", tag::debug_name ,"): Unknown interface query ", str::format(riid));
+     }
+@@ -307,6 +320,7 @@ public:
+ protected:
+   tag::DESC1 desc;
+   std::unique_ptr<IDXGIResource1> dxgi_resource;
++  std::unique_ptr<IDXGIKeyedMutex> keyed_mutex;
+   tag::D3D10_IMPL d3d10;
+ };
+ 

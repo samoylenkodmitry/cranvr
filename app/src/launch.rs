@@ -47,9 +47,34 @@ pub struct GameOptions {
     pub env: String,
     /// The program's arguments, separated by spaces
     pub args: String,
-    /// The program's OpenVR calls go to OpenComposite (see openvr.rs): its own choice, or None to
-    /// follow [`WineOptions::opencomposite`]
-    pub opencomposite: Option<bool>,
+    /// The OpenVR runtime of the program (see openvr.rs): its own choice, or None to follow
+    /// [`WineOptions::openvr`]
+    pub openvr: Option<OpenVr>,
+}
+
+/// The runtime that answers a game's OpenVR calls. An OpenXR game ignores the choice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenVr {
+    /// OpenComposite turns the game's OpenVR calls into OpenXR calls to cranvr's runtime
+    #[default]
+    OpenComposite,
+    /// SteamVR for Windows runs in the prefix with cranvr's driver, for a game that needs SteamVR
+    /// itself: its own menus, its input bindings or its overlays
+    SteamVr,
+    /// No OpenVR runtime: a game with an OpenXR mode takes that
+    Off,
+}
+
+impl OpenVr {
+    /// The name that the Play tab shows
+    pub fn label(self) -> &'static str {
+        match self {
+            OpenVr::OpenComposite => "OpenComposite",
+            OpenVr::SteamVr => "SteamVR",
+            OpenVr::Off => "Off",
+        }
+    }
 }
 
 impl GameOptions {
@@ -81,23 +106,21 @@ pub struct WineOptions {
     pub dll_overrides: String,
     /// Environment variables for every program, as in [`GameOptions::env`]
     pub env: String,
-    /// OpenVR games run through OpenComposite, which turns their OpenVR calls into OpenXR calls to
-    /// cranvr's runtime (see openvr.rs). On by default: SteamVR is not installed, so an OpenVR game
-    /// finds no runtime without it. An OpenXR game ignores the choice. A program can set its own
-    /// ([`GameOptions::opencomposite`]).
-    pub opencomposite: bool,
+    /// The OpenVR runtime of every program (see openvr.rs). OpenComposite by default: it needs no
+    /// SteamVR, and an OpenVR game finds no runtime without one. An OpenXR game ignores the choice. A
+    /// program can set its own ([`GameOptions::openvr`]).
+    pub openvr: OpenVr,
 }
 
 impl Default for WineOptions {
     fn default() -> Self {
-        Self { mac_window: false, dll_overrides: String::new(), env: String::new(), opencomposite: true }
+        Self { mac_window: false, dll_overrides: String::new(), env: String::new(), openvr: OpenVr::OpenComposite }
     }
 }
 
-/// Whether the program's OpenVR calls go to OpenComposite: its own choice, else the choice for every
-/// program.
-pub fn opencomposite(wine: &WineOptions, game: &GameOptions) -> bool {
-    game.opencomposite.unwrap_or(wine.opencomposite)
+/// The program's OpenVR runtime: its own choice, else the choice for every program.
+pub fn openvr(wine: &WineOptions, game: &GameOptions) -> OpenVr {
+    game.openvr.unwrap_or(wine.openvr)
 }
 
 /// The environment that the options add to a program's start, in the order that it is set. A
@@ -192,26 +215,30 @@ mod tests {
 
     #[test]
     fn a_program_follows_the_choice_for_every_program_until_it_has_its_own() {
-        let on = WineOptions::default();
-        let off = WineOptions { opencomposite: false, ..Default::default() };
-        let own = |choice| GameOptions { opencomposite: choice, ..Default::default() };
-        assert!(on.opencomposite, "OpenComposite starts on");
-        assert!(opencomposite(&on, &own(None)));
-        assert!(!opencomposite(&off, &own(None)));
-        assert!(!opencomposite(&on, &own(Some(false))));
-        assert!(opencomposite(&off, &own(Some(true))));
+        let default = WineOptions::default();
+        let steamvr = WineOptions { openvr: OpenVr::SteamVr, ..Default::default() };
+        let own = |choice| GameOptions { openvr: choice, ..Default::default() };
+        assert_eq!(default.openvr, OpenVr::OpenComposite, "OpenComposite is the default");
+        assert_eq!(openvr(&default, &own(None)), OpenVr::OpenComposite);
+        assert_eq!(openvr(&steamvr, &own(None)), OpenVr::SteamVr);
+        assert_eq!(openvr(&steamvr, &own(Some(OpenVr::Off))), OpenVr::Off);
+        assert_eq!(openvr(&default, &own(Some(OpenVr::SteamVr))), OpenVr::SteamVr);
         assert!(own(None).is_default());
-        assert!(!own(Some(true)).is_default());
+        assert!(!own(Some(OpenVr::SteamVr)).is_default());
         // The choice reaches no environment variable: the OpenVR path file carries it
-        assert_eq!(environment(&off, &own(Some(true))), environment(&on, &own(Some(false))));
+        assert_eq!(environment(&steamvr, &own(Some(OpenVr::Off))), environment(&default, &own(Some(OpenVr::SteamVr))));
     }
 
     #[test]
-    fn settings_saved_before_the_choice_existed_keep_it_on() {
+    fn the_choice_is_saved_by_name_and_a_missing_one_is_the_default() {
+        let game = GameOptions { openvr: Some(OpenVr::SteamVr), ..Default::default() };
+        let text = serde_json::to_string(&game).unwrap();
+        assert!(text.contains(r#""openvr":"steamvr""#), "{text}");
+        assert_eq!(serde_json::from_str::<GameOptions>(&text).unwrap(), game);
         let wine: WineOptions = serde_json::from_str(r#"{"mac_window": true}"#).unwrap();
-        assert!(wine.opencomposite && wine.mac_window);
+        assert!(wine.mac_window && wine.openvr == OpenVr::OpenComposite);
         let game: GameOptions = serde_json::from_str(r#"{"args": "-x"}"#).unwrap();
-        assert_eq!(game.opencomposite, None);
+        assert_eq!(game.openvr, None);
     }
 
     #[test]

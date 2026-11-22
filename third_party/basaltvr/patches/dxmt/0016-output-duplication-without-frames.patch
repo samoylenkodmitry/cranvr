@@ -1,0 +1,140 @@
+Subject: [PATCH] dxgi: a desktop duplication that delivers no frame (cranvr)
+
+DuplicateOutput failed with DXGI_ERROR_UNSUPPORTED. SteamVR's desktop view treats the failure as fatal. The output
+now gives a duplication whose AcquireNextFrame waits up to the timeout (100 ms at most) and reports that no frame
+came. The view of the Windows desktop stays empty.
+---
+diff --git a/src/dxgi/dxgi_output.cpp b/src/dxgi/dxgi_output.cpp
+index 43acbd0..03b1519 100644
+--- a/src/dxgi/dxgi_output.cpp
++++ b/src/dxgi/dxgi_output.cpp
+@@ -135,6 +135,79 @@ void FilterModesByDesc(std::vector<DXGI_MODE_DESC1> &Modes,
+   }
+ }
+ 
++/*
++ * cranvr: a duplication of the output that never delivers a frame. DXMT captures no desktop, and SteamVR's
++ * dashboard process (vrdashboard.exe) exits when DuplicateOutput fails ("Failed to initialize vrdesktop"), so its
++ * dashboard never shows. With this object the dashboard starts, and its view of the Windows desktop stays empty.
++ * AcquireNextFrame waits as long as the caller allows, up to 100 ms, and then reports that no frame came.
++ */
++class MTLDXGIOutputDuplicationWithoutFrames : public MTLDXGIObject<IDXGIOutputDuplication> {
++public:
++  MTLDXGIOutputDuplicationWithoutFrames(IDXGIOutput *output, const DXGI_MODE_DESC &mode) : output_(output), mode_(mode) {}
++
++  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) final {
++    if (ppvObject == nullptr)
++      return E_POINTER;
++    *ppvObject = nullptr;
++    if (riid == __uuidof(IUnknown) || riid == __uuidof(IDXGIObject) || riid == __uuidof(IDXGIOutputDuplication)) {
++      *ppvObject = ref(this);
++      return S_OK;
++    }
++    return E_NOINTERFACE;
++  }
++
++  HRESULT STDMETHODCALLTYPE GetParent(REFIID riid, void **ppParent) final {
++    return output_->QueryInterface(riid, ppParent);
++  }
++
++  void STDMETHODCALLTYPE GetDesc(DXGI_OUTDUPL_DESC *pDesc) final {
++    if (!pDesc)
++      return;
++    pDesc->ModeDesc = mode_;
++    pDesc->Rotation = DXGI_MODE_ROTATION_IDENTITY;
++    pDesc->DesktopImageInSystemMemory = FALSE;
++  }
++
++  HRESULT STDMETHODCALLTYPE
++  AcquireNextFrame(UINT TimeoutInMilliseconds, DXGI_OUTDUPL_FRAME_INFO *pFrameInfo, IDXGIResource **ppDesktopResource) final {
++    if (pFrameInfo)
++      *pFrameInfo = {};
++    if (ppDesktopResource)
++      *ppDesktopResource = nullptr;
++    if (TimeoutInMilliseconds)
++      Sleep(std::min(TimeoutInMilliseconds, 100u));
++    return DXGI_ERROR_WAIT_TIMEOUT;
++  }
++
++  HRESULT STDMETHODCALLTYPE GetFrameDirtyRects(UINT, RECT *, UINT *pRequired) final {
++    if (pRequired)
++      *pRequired = 0;
++    return DXGI_ERROR_INVALID_CALL;
++  }
++
++  HRESULT STDMETHODCALLTYPE GetFrameMoveRects(UINT, DXGI_OUTDUPL_MOVE_RECT *, UINT *pRequired) final {
++    if (pRequired)
++      *pRequired = 0;
++    return DXGI_ERROR_INVALID_CALL;
++  }
++
++  HRESULT STDMETHODCALLTYPE GetFramePointerShape(UINT, void *, UINT *pRequired, DXGI_OUTDUPL_POINTER_SHAPE_INFO *) final {
++    if (pRequired)
++      *pRequired = 0;
++    return DXGI_ERROR_INVALID_CALL;
++  }
++
++  HRESULT STDMETHODCALLTYPE MapDesktopSurface(DXGI_MAPPED_RECT *) final { return DXGI_ERROR_UNSUPPORTED; }
++
++  HRESULT STDMETHODCALLTYPE UnMapDesktopSurface() final { return DXGI_ERROR_INVALID_CALL; }
++
++  HRESULT STDMETHODCALLTYPE ReleaseFrame() final { return S_OK; }
++
++private:
++  Com<IDXGIOutput> output_;
++  DXGI_MODE_DESC mode_;
++};
++
+ class MTLDXGIOutputImpl : public MTLDXGIOutput {
+ public:
+   MTLDXGIOutputImpl(IMTLDXGIAdapter *adapter, HMONITOR monitor, DxgiOptions &options)
+@@ -540,13 +613,30 @@ public:
+                   IDXGIOutputDuplication **ppOutputDuplication) final {
+     InitReturnPtr(ppOutputDuplication);
+ 
+-    if (!pDevice)
++    if (!pDevice || !ppOutputDuplication)
+       return E_INVALIDARG;
+ 
+-    ERR("Not implemented");
++    return DuplicateWithoutFrames(ppOutputDuplication);
++  }
+ 
+-    // At least return a valid error code
+-    return DXGI_ERROR_UNSUPPORTED;
++  /* cranvr: see MTLDXGIOutputDuplicationWithoutFrames */
++  HRESULT
++  DuplicateWithoutFrames(IDXGIOutputDuplication **ppOutputDuplication) {
++    DXGI_MODE_DESC mode = {};
++    DXGI_OUTPUT_DESC desc;
++    if (SUCCEEDED(GetDesc(&desc))) {
++      mode.Width = desc.DesktopCoordinates.right - desc.DesktopCoordinates.left;
++      mode.Height = desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top;
++    }
++    mode.RefreshRate = {60, 1};
++    mode.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++    static bool told = false;
++    if (!told) {
++      told = true;
++      WARN("DXGIOutput: DuplicateOutput gives a duplication without frames; the desktop is not captured");
++    }
++    *ppOutputDuplication = new MTLDXGIOutputDuplicationWithoutFrames(this, mode);
++    return S_OK;
+   }
+ 
+   HRESULT
+@@ -625,12 +715,10 @@ public:
+                    const DXGI_FORMAT *formats,
+                    IDXGIOutputDuplication **ppOutputDuplication) override {
+     InitReturnPtr(ppOutputDuplication);
+-    if (!pDevice)
++    if (!pDevice || !ppOutputDuplication)
+       return E_INVALIDARG;
+ 
+-    ERR("Not implemented");
+-
+-    return DXGI_ERROR_UNSUPPORTED;
++    return DuplicateWithoutFrames(ppOutputDuplication);
+   }
+ 
+ private:

@@ -1,0 +1,146 @@
+Subject: [PATCH] d3d11: an opened shared texture can be shared again (cranvr)
+
+On Windows a process can share a texture that another process shared with it. SteamVR's web helper opens the
+textures of Chromium's GPU process and passes them on to SteamVR's compositor ("SetOverlayTexture failure
+(VROverlayError_InvalidTexture)"). OpenSharedResource and OpenSharedResource1 now give the opened texture a kernel
+allocation of its own with the private data of the shared one. GetSharedHandle and CreateSharedHandle then work on it,
+and the next process opens the same memory.
+---
+diff --git a/src/d3d11/d3d11_device.cpp b/src/d3d11/d3d11_device.cpp
+index 6a8caca..85f3b8f 100644
+--- a/src/d3d11/d3d11_device.cpp
++++ b/src/d3d11/d3d11_device.cpp
+@@ -453,7 +453,10 @@ public:
+ 
+   HRESULT STDMETHODCALLTYPE
+   OpenSharedResource(HANDLE hResource, REFIID ReturnedInterface, void **ppResource) override {
+-    return ImportSharedTexture(this, hResource, ReturnedInterface, ppResource);
++    HRESULT hr = ImportSharedTexture(this, hResource, ReturnedInterface, ppResource);
++    if (hr == S_OK && ppResource && *ppResource)
++      ShareOpenedTexture(this, hResource, false, *ppResource);
++    return hr;
+   }
+ 
+   HRESULT STDMETHODCALLTYPE
+@@ -770,7 +773,10 @@ public:
+ 
+   HRESULT STDMETHODCALLTYPE
+   OpenSharedResource1(HANDLE hResource, REFIID ReturnedInterface, void **ppResource) override {
+-    return ImportSharedTextureFromNtHandle(this, hResource, ReturnedInterface, ppResource);
++    HRESULT hr = ImportSharedTextureFromNtHandle(this, hResource, ReturnedInterface, ppResource);
++    if (hr == S_OK && ppResource && *ppResource)
++      ShareOpenedTexture(this, hResource, true, *ppResource);
++    return hr;
+   }
+ 
+   HRESULT STDMETHODCALLTYPE
+diff --git a/src/d3d11/d3d11_resource.hpp b/src/d3d11/d3d11_resource.hpp
+index 80927e5..f840b52 100644
+--- a/src/d3d11/d3d11_resource.hpp
++++ b/src/d3d11/d3d11_resource.hpp
+@@ -128,6 +128,8 @@ struct D3D11ResourceCommon : ID3D11Resource {
+   virtual HRESULT GetSharedHandle(HANDLE *pSharedHandle) = 0;
+   virtual HRESULT
+   CreateSharedHandle(const SECURITY_ATTRIBUTES *Attributes, DWORD Access, const WCHAR *pName, HANDLE *pNTHandle) = 0;
++  /* cranvr: the kernel handles that share an opened texture again (see ShareOpenedTexture) */
++  virtual void AdoptSharedHandles(UINT LocalHandle, UINT GlobalHandle) {}
+ 
+   virtual Rc<StagingResource> staging(UINT Subresource) = 0;
+   virtual Rc<DynamicBuffer> dynamicBuffer(UINT *pBufferLength, UINT *pBindFlags) = 0;
+@@ -509,6 +511,8 @@ HRESULT ImportSharedTexture(MTLD3D11Device *pDevice, HANDLE hResource, REFIID ri
+ 
+ HRESULT ImportSharedTextureFromNtHandle(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void **ppTexture);
+ 
++void ShareOpenedTexture(MTLD3D11Device *pDevice, HANDLE hResource, bool NtHandle, void *pResource);
++
+ HRESULT ImportSharedTextureByName(
+     MTLD3D11Device *pDevice, LPCWSTR lpName, DWORD dwDesiredAccess, REFIID riid, void **ppTexture
+ );
+diff --git a/src/d3d11/d3d11_texture_device.cpp b/src/d3d11/d3d11_texture_device.cpp
+index 55ee999..85cd09c 100644
+--- a/src/d3d11/d3d11_texture_device.cpp
++++ b/src/d3d11/d3d11_texture_device.cpp
+@@ -312,6 +312,13 @@ public:
+   void SetMinLOD(float MinLod) override { min_lod = MinLod; }
+ 
+   float GetMinLOD() override { return min_lod; }
++
++  void AdoptSharedHandles(UINT LocalHandle, UINT GlobalHandle) override {
++    if (local_kmt_)
++      return;
++    local_kmt_ = LocalHandle;
++    global_kmt_ = GlobalHandle;
++  }
+ };
+ 
+ struct SharedResourceData {
+@@ -692,4 +699,67 @@ ImportSharedTextureByName(
+ 
+ #pragma endregion
+ 
+-} // namespace dxmt
+\ No newline at end of file
++/*
++ * cranvr: shares a texture that this process opened again, as Windows allows. SteamVR's web helper opens the
++ * textures that Chromium's GPU process shares and passes them on to SteamVR's compositor. The compositor then opens
++ * them in turn. A new kernel allocation with the private data of the shared one names the same mach port, so the
++ * next process opens the same memory. The texture keeps the new handles until it is released.
++ */
++void
++ShareOpenedTexture(MTLD3D11Device *pDevice, HANDLE hResource, bool NtHandle, void *pResource) {
++  Com<ID3D11Resource> resource;
++  if (FAILED(static_cast<IUnknown *>(pResource)->QueryInterface(IID_PPV_ARGS(&resource))))
++    return;
++  D3D11_RESOURCE_DIMENSION dimension;
++  resource->GetType(&dimension);
++  if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER || dimension == D3D11_RESOURCE_DIMENSION_UNKNOWN)
++    return;
++  char data[512];
++  UINT size = 0;
++  if (NtHandle) {
++    D3DKMT_QUERYRESOURCEINFOFROMNTHANDLE query = {};
++    query.hDevice = pDevice->GetLocalD3DKMT();
++    query.hNtHandle = hResource;
++    query.pPrivateRuntimeData = data;
++    query.PrivateRuntimeDataSize = sizeof(data);
++    if (D3DKMTQueryResourceInfoFromNtHandle(&query))
++      return;
++    size = query.PrivateRuntimeDataSize;
++  } else {
++    D3DKMT_QUERYRESOURCEINFO query = {};
++    query.hDevice = pDevice->GetLocalD3DKMT();
++    query.hGlobalShare = static_cast<D3DKMT_HANDLE>(reinterpret_cast<uintptr_t>(hResource));
++    query.pPrivateRuntimeData = data;
++    query.PrivateRuntimeDataSize = sizeof(data);
++    if (D3DKMTQueryResourceInfo(&query))
++      return;
++    size = query.PrivateRuntimeDataSize;
++  }
++  if (!size || size > sizeof(data))
++    return;
++
++  D3DKMT_CREATEALLOCATION create = {};
++  create.hDevice = pDevice->GetLocalD3DKMT();
++  create.pPrivateRuntimeData = data;
++  create.PrivateRuntimeDataSize = size;
++  create.Flags.StandardAllocation = 1;
++  create.NumAllocations = 1;
++  D3DDDI_ALLOCATIONINFO2 allocationInfo = {};
++  create.pAllocationInfo2 = &allocationInfo;
++  D3DKMT_CREATESTANDARDALLOCATION standardAllocation = {};
++  create.pStandardAllocation = &standardAllocation;
++  standardAllocation.Type = D3DKMT_STANDARDALLOCATIONTYPE_EXISTINGHEAP;
++  create.Flags.ExistingSysMem = 1;
++  D3DDDI_ALLOCATIONINFO systemMem;
++  allocationInfo.pSystemMem = &systemMem;
++  create.Flags.CreateResource = 1;
++  create.Flags.CreateShared = 1;
++  create.Flags.NtSecuritySharing = NtHandle;
++  if (D3DKMTCreateAllocation2(&create)) {
++    WARN("ShareOpenedTexture: the opened texture cannot be shared again");
++    return;
++  }
++  GetResourceCommon(resource.ptr())->AdoptSharedHandles(create.hResource, create.hGlobalShare);
++}
++
++} // namespace dxmt

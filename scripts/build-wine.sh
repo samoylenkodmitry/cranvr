@@ -8,6 +8,8 @@
 #     compatibility profile of 3.2 or newer, which macOS does not have.
 #   - opengl32.so, the Mac side of Wine's opengl32: it compiles the legacy GLSL of such a program in a core context.
 #   - wininet.dll: it closes the handles of a program with requests on several threads without a race.
+#   - wtsapi32.dll: it reports the program's session as the console, unlocked and local. SteamVR's compositor hides
+#     the headset's picture while it takes the session as locked.
 #   - ntdll.so, the Mac side of ntdll: it gives a program with high-entropy addresses its memory above 4 GB, as
 #     Windows does. The detours of MonoMod (Harmony in Unity mods) need free pages near their code. Thread stacks
 #     stay below 4 GB, under the stacks of Wine's Mac side.
@@ -16,13 +18,14 @@
 # Then:  scripts/package-game-support.sh
 #
 # It clones Wine at the tag wine-11.10 (commit pinned below) into DIR, applies cranvr's patches from
-# third_party/wine/patches and builds the five files. Windows files are 64-bit PE files from the MinGW-w64 cross
+# third_party/wine/patches and builds the six files. Windows files are 64-bit PE files from the MinGW-w64 cross
 # compiler that builds BasaltVR's runtime. Mac files are x86_64 libraries for Rosetta 2 with macOS 10.15 as the
 # oldest system, as Gcenx's build has. Wine's build needs a 64-bit Intel host to configure, so the script runs
 # configure and make under Rosetta 2 (arch -x86_64). The build goes to the build folder beside DIR. The results are
-# in build/bin: wined3d.dll and wininet.dll (stripped), winemac.so, opengl32.so, ntdll.so, and cranvr's test programs
-# hlsl_compile.exe (the HLSL compiler), gl_compat_check.exe (an OpenGL program like Google Earth VR),
-# far_jump_check.exe (MonoMod's far jump) and stack_sample_check.exe (a sampling profiler's stack copy).
+# in build/bin: wined3d.dll, wininet.dll and wtsapi32.dll (stripped), winemac.so, opengl32.so, ntdll.so, and cranvr's
+# test programs hlsl_compile.exe (the HLSL compiler), gl_compat_check.exe (an OpenGL program like Google Earth VR),
+# far_jump_check.exe (MonoMod's far jump), stack_sample_check.exe (a sampling profiler's stack copy) and
+# session_check.exe (the session's state, as SteamVR asks for it).
 #
 # Needs: brew install mingw-w64 bison (Apple's bison is too old; Homebrew's is keg-only and found here),
 # flex, Xcode's command line tools and Rosetta 2 (softwareupdate --install-rosetta).
@@ -94,7 +97,7 @@ if [[ ! -f ${build}/wine/Makefile || $(cat "${build}/wine/configure-line.txt" 2>
     rm -rf "${build}/wine"
     mkdir -p "${build}/wine"
     print "Configuring Wine"
-    # Only the five files of this build are used: the game support keeps the rest of Gcenx's Wine. So every
+    # Only the six files of this build are used: the game support keeps the rest of Gcenx's Wine. So every
     # optional library is off. winemac.so and opengl32.so need none of them. ntdll.so unwinds with the system's
     # unwinder, as Gcenx's does, so configure keeps it.
     (cd "${build}/wine" && CC="clang -arch x86_64" CXX="clang++ -arch x86_64" arch -x86_64 "${dir}/configure" \
@@ -102,13 +105,14 @@ if [[ ! -f ${build}/wine/Makefile || $(cat "${build}/wine/configure-line.txt" 2>
     print -r -- "${configure_line}" > "${build}/wine/configure-line.txt"
 fi
 
-print "Building wined3d.dll, wininet.dll, winemac.so, opengl32.so and ntdll.so (under Rosetta 2)"
-(cd "${build}/wine" && arch -x86_64 make -j"$(sysctl -n hw.ncpu)" dlls/wined3d/all dlls/wininet/all \
+print "Building wined3d.dll, wininet.dll, wtsapi32.dll, winemac.so, opengl32.so and ntdll.so (under Rosetta 2)"
+(cd "${build}/wine" && arch -x86_64 make -j"$(sysctl -n hw.ncpu)" dlls/wined3d/all dlls/wininet/all dlls/wtsapi32/all \
     dlls/winemac.drv/all dlls/opengl32/all dlls/ntdll/all > make.log 2>&1) || { tail -30 "${build}/wine/make.log" >&2; exit 1; }
 
 mkdir -p "${build}/bin"
 x86_64-w64-mingw32-strip -o "${build}/bin/wined3d.dll" "${build}/wine/dlls/wined3d/x86_64-windows/wined3d.dll"
 x86_64-w64-mingw32-strip -o "${build}/bin/wininet.dll" "${build}/wine/dlls/wininet/x86_64-windows/wininet.dll"
+x86_64-w64-mingw32-strip -o "${build}/bin/wtsapi32.dll" "${build}/wine/dlls/wtsapi32/x86_64-windows/wtsapi32.dll"
 cp "${build}/wine/dlls/winemac.drv/winemac.so" "${build}/wine/dlls/opengl32/opengl32.so" "${build}/wine/dlls/ntdll/ntdll.so" \
     "${build}/bin/"
 # ntdll.so unwinds through the Mac side with the system's unwinder, as the ntdll.so of Gcenx's build does
@@ -124,12 +128,15 @@ for lib in winemac.so opengl32.so ntdll.so; do
     fi
 done
 
-# cranvr's test programs for the HLSL compiler, for OpenGL, for MonoMod's far jump and for a profiler's stack copy
-print "Building hlsl_compile.exe, gl_compat_check.exe, far_jump_check.exe and stack_sample_check.exe"
+# cranvr's test programs for the HLSL compiler, for OpenGL, for MonoMod's far jump, for a profiler's stack copy and
+# for the session's state
+print "Building hlsl_compile.exe, gl_compat_check.exe, far_jump_check.exe, stack_sample_check.exe and session_check.exe"
 x86_64-w64-mingw32-g++ -std=c++17 -O2 -Wall -s -static -static-libgcc -static-libstdc++ \
     -o "${build}/bin/hlsl_compile.exe" "${support}/tests/hlsl_compile.cpp"
 x86_64-w64-mingw32-g++ -std=c++17 -O2 -Wall -s -static -static-libgcc -static-libstdc++ \
     -o "${build}/bin/gl_compat_check.exe" "${support}/tests/gl_compat_check.cpp" -lopengl32 -lgdi32
+x86_64-w64-mingw32-g++ -std=c++17 -O2 -Wall -s -static -static-libgcc -static-libstdc++ \
+    -o "${build}/bin/session_check.exe" "${support}/tests/session_check.cpp" -lwtsapi32
 # Programs with high-entropy addresses, as Unity games and Steam are: MinGW's linker marks them so by default
 for check in far_jump_check stack_sample_check; do
     x86_64-w64-mingw32-g++ -std=c++17 -O2 -Wall -s -static -static-libgcc -static-libstdc++ -Wl,--dynamicbase \

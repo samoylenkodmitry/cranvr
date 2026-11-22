@@ -6,11 +6,13 @@
 #   PROGRAM.exe  a Windows path (C:\...) or a Mac path
 #   --mute       start without sound (Wine gets no audio driver)
 #
-# Environment: CRANVR_OPENCOMPOSITE=1 or 0 turns OpenComposite on or off for this start (default: the
-# app's setting "OpenVR games" in app.json, which is on until the user turns it off). On, an OpenVR game
-# finds OpenComposite, which sends its calls to the OpenXR runtime of cranvr: the script writes the
-# prefix's OpenVR path file (%LOCALAPPDATA%\\openvr\\openvrpaths.vrpath). Off, the script removes that
-# file when it points at OpenComposite. No file of a game changes. An OpenXR game ignores the file.
+# Environment: CRANVR_OPENVR=opencomposite, steamvr or off chooses the OpenVR runtime for this start
+# (default: the app's setting "OpenVR games" in app.json, which is OpenComposite until the user changes
+# it). The script writes the prefix's OpenVR path file (%LOCALAPPDATA%\\openvr\\openvrpaths.vrpath), as the
+# app does (app/src/openvr.rs). OpenComposite sends an OpenVR game's calls to the OpenXR runtime of cranvr.
+# SteamVR runs the game in SteamVR for Windows from the prefix's Steam library, with cranvr's driver in
+# C:\\cranvr\\steamvr: the game starts SteamVR, and SteamVR ends with the game. Off removes a file that
+# cranvr wrote. No file of a game changes. An OpenXR game ignores the file.
 #
 # Environment: CRANVR_MAX_MSAA caps the MSAA samples a game may use (default: the app's setting, else
 # 2; 0 for no cap). The script applies no option of a particular game: set them yourself, as the
@@ -135,22 +137,66 @@ fi
 export MVK_CONFIG_LOG_LEVEL=0
 
 # OpenVR runtime: the same choice as the app makes (app/src/openvr.rs)
-oc=${CRANVR_OPENCOMPOSITE:-}
-if [[ -z ${oc} && -f ${home}/app.json ]]; then
-    oc=$(python3 -I -c 'import json, sys; v = json.load(open(sys.argv[1])).get("wine", {}).get("opencomposite", True); print(1 if v else 0)' "${home}/app.json" 2>/dev/null || true)
+openvr=${CRANVR_OPENVR:-}
+if [[ -z ${openvr} && -f ${home}/app.json ]]; then
+    openvr=$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1])).get("wine", {}).get("openvr", "opencomposite"))' "${home}/app.json" 2>/dev/null || true)
 fi
+openvr=${openvr:-opencomposite}
+[[ ${openvr} == (opencomposite|steamvr|off) ]] || { print -u2 "CRANVR_OPENVR takes opencomposite, steamvr or off, not ${openvr}"; exit 2; }
 prefix=${home}/wine/prefix
 user_dir=${prefix}/drive_c/users/$(id -un)
 [[ -d ${user_dir} ]] || user_dir=$(print -rl -- "${prefix}"/drive_c/users/*(/N) | grep -v '/Public$' | head -1)
 if [[ -n ${user_dir} ]]; then
     vrpath=${user_dir}/AppData/Local/openvr/openvrpaths.vrpath
-    if [[ ${oc:-1} == 1 && -f ${prefix}/drive_c/opencomposite/bin/vrclient_x64.dll ]]; then
-        mkdir -p "${vrpath:h}"
-        print -r -- '{"jsonid": "vrpathreg", "runtime": ["C:\\opencomposite"], "version": 1}' > "${vrpath}"
-        print "OpenVR games use OpenComposite (${vrpath})"
-    elif [[ ${oc:-1} == 0 && -f ${vrpath} ]] && grep -q 'C:\\\\opencomposite' "${vrpath}"; then
-        rm -f "${vrpath}"
-        print "OpenVR games find no runtime (OpenComposite is off)"
-    fi
+    case ${openvr} in
+        opencomposite)
+            [[ -f ${prefix}/drive_c/opencomposite/bin/vrclient_x64.dll ]] || { print -u2 "The game support has no OpenComposite"; exit 1; }
+            mkdir -p "${vrpath:h}"
+            print -r -- '{"jsonid": "vrpathreg", "runtime": ["C:\\opencomposite"], "version": 1}' > "${vrpath}"
+            print "OpenVR games use OpenComposite (${vrpath})" ;;
+        steamvr)
+            [[ -f ${prefix}/drive_c/cranvr/steamvr/driver.vrdrivermanifest ]] || { print -u2 "The game support has no SteamVR driver"; exit 1; }
+            mkdir -p "${vrpath:h}"
+            # SteamVR's folder from its manifest (app 250820) in one of the Steam libraries of the prefix
+            python3 -I - "${prefix}" "${vrpath}" <<'PYTHON' || exit 1
+import json, os, re, sys
+prefix, vrpath = sys.argv[1], sys.argv[2]
+steam = os.path.join(prefix, "drive_c", "Program Files (x86)", "Steam")
+def windows(path):
+    rest = os.path.relpath(path, os.path.join(prefix, "drive_c"))
+    return ("C:\\" + rest if not rest.startswith("..") else "Z:" + path).replace("/", "\\")
+libraries = [os.path.join(steam, "steamapps")]
+try:
+    text = open(os.path.join(steam, "steamapps", "libraryfolders.vdf"), encoding="utf-8", errors="replace").read()
+    for found in re.findall(r'"path"\s+"([^"]+)"', text):
+        found = found.replace("\\\\", "\\")
+        drive, rest = found[0].upper(), found[3:].replace("\\", "/")
+        root = os.path.join(prefix, "drive_c", rest) if drive == "C" else "/" + rest
+        libraries.append(os.path.join(root, "steamapps"))
+except OSError:
+    pass
+for steamapps in libraries:
+    try:
+        manifest = open(os.path.join(steamapps, "appmanifest_250820.acf"), encoding="utf-8", errors="replace").read()
+    except OSError:
+        continue
+    installdir = re.search(r'"installdir"\s+"([^"]+)"', manifest)
+    folder = os.path.join(steamapps, "common", installdir.group(1)) if installdir else ""
+    if folder and os.path.isfile(os.path.join(folder, "bin", "win64", "vrserver.exe")):
+        paths = {"config": [windows(os.path.join(steam, "config"))], "external_drivers": ["C:\\cranvr\\steamvr"],
+                 "jsonid": "vrpathreg", "log": [windows(os.path.join(steam, "logs"))], "runtime": [windows(folder)], "version": 1}
+        open(vrpath, "w").write(json.dumps(paths))
+        print("OpenVR games use SteamVR in " + windows(folder) + " (" + vrpath + ")")
+        sys.exit(0)
+print("SteamVR is not installed: install SteamVR from the Steam library of the prefix", file=sys.stderr)
+sys.exit(1)
+PYTHON
+            ;;
+        off)
+            if [[ -f ${vrpath} ]] && grep -qE 'C:\\\\(opencomposite|cranvr\\\\steamvr)' "${vrpath}"; then
+                rm -f "${vrpath}"
+                print "OpenVR games find no runtime (OpenVR is off)"
+            fi ;;
+    esac
 fi
 exec "${wine_root}/bin/wine" "${program}" "$@"

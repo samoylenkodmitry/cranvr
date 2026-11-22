@@ -4,14 +4,17 @@
 #   - the BasaltVR DXMT fork, which shares each game image with the host as an IOSurface
 #   - the BasaltVR OpenXR runtime (C:\basalt\runtime), registered as the active runtime
 #   - OpenComposite (C:\opencomposite), which turns a game's OpenVR calls into OpenXR calls to that
-#     runtime. A game finds it through the prefix's OpenVR path file when cranvr's choice is on (see
-#     scripts/run-game.sh); this script writes no such file.
+#     runtime, and cranvr's SteamVR driver (C:\cranvr\steamvr, scripts/build-steamvr-driver.sh), which runs
+#     a game in SteamVR for Windows from the prefix's Steam library. A game finds either one through the
+#     prefix's OpenVR path file, which its launch options choose (see scripts/run-game.sh); this script
+#     writes no such file.
 #   - Wine's files with cranvr's patches (scripts/build-wine.sh): wined3d.dll, whose HLSL compiler
 #     (vkd3d-shader) a game that compiles its shaders at run time uses through d3dcompiler_47.dll;
 #     winemac.so and opengl32.so, which give an OpenGL game that asks for the compatibility profile a core
 #     context and compile its legacy GLSL; wininet.dll, whose handles a game with requests on several
 #     threads closed in a race; ntdll.so, which gives a program with high-entropy addresses its memory above
-#     4 GB as Windows does, so MonoMod's detours in Unity mods find free pages near their code
+#     4 GB as Windows does, so MonoMod's detours in Unity mods find free pages near their code; wtsapi32.dll,
+#     which reports the session as unlocked, so SteamVR's compositor shows the picture
 #
 # The BasaltVR checkout must have run, in this order:
 #   runtime/scripts/test-dxmt.zsh          (downloads Wine 11.10 and stock DXMT)
@@ -50,6 +53,7 @@ if [[ -x ${1:A}/engine/bin/wine && -f ${1:A}/runtime/basalt_openxr.dll ]]; then
     fork=${1:A}/dxmt
     runtime_bin=${1:A}/runtime
     opencomposite_bin=${1:A}/opencomposite
+    steamvr_driver=${1:A}/steamvr-driver
     wine_bin=${1:A}/wine-patched
     version_file=${1:A}/VERSION
 else
@@ -58,6 +62,7 @@ else
     fork=${basalt}/build/dxmt/fork-install
     runtime_bin=${basalt}/build/bin
     opencomposite_bin=${CRANVR_OPENCOMPOSITE_DIR:-${0:A:h:h}/third_party/opencomposite/build}/bin
+    steamvr_driver=${CRANVR_STEAMVR_DRIVER_DIR:-${0:A:h:h}/target/steamvr-driver/cranvr}
     wine_bin=${CRANVR_WINE_DIR:-${0:A:h:h}/third_party/wine/build}/bin
     version_file=${0:A:h}/game-support-version.txt
 fi
@@ -104,7 +109,7 @@ done
 # system32, and the loader takes that one. An engine that exists already is not cloned again, so each file
 # is copied in by name.
 if [[ -f ${wine_bin}/wined3d.dll ]]; then
-    for dll in wined3d.dll wininet.dll; do
+    for dll in wined3d.dll wininet.dll wtsapi32.dll; do
         cp "${wine_bin}/${dll}" "${wine_root}/lib/wine/x86_64-windows/${dll}"
         cp "${wine_bin}/${dll}" "${prefix}/drive_c/windows/system32/${dll}"
     done
@@ -113,7 +118,8 @@ if [[ -f ${wine_bin}/wined3d.dll ]]; then
     done
     mkdir -p "${prefix}/drive_c/wine-patched"
     cp "${wine_bin}/hlsl_compile.exe" "${wine_bin}/isnan.hlsl" "${wine_bin}/gl_compat_check.exe" \
-        "${wine_bin}/far_jump_check.exe" "${wine_bin}/stack_sample_check.exe" "${prefix}/drive_c/wine-patched/"
+        "${wine_bin}/far_jump_check.exe" "${wine_bin}/stack_sample_check.exe" "${wine_bin}/session_check.exe" \
+        "${prefix}/drive_c/wine-patched/"
 else
     print "No patched Wine files in ${wine_bin}: Wine's HLSL compiler lacks isnan, OpenGL games get no compatibility profile, and MonoMod's far detours can miss."
 fi
@@ -138,6 +144,17 @@ if [[ -f ${opencomposite_bin}/vrclient_x64.dll ]]; then
     cp "${opencomposite_bin}/openvr_smoke.exe" "${oc_dir}/"
 else
     print "No OpenComposite in ${opencomposite_bin}: this stack runs OpenXR games only."
+fi
+
+# cranvr's SteamVR driver, in the folder that the OpenVR path file names for SteamVR (app/src/openvr.rs). The
+# folder is replaced as a whole, so no file of an older driver stays.
+driver_dir=${prefix}/drive_c/cranvr/steamvr
+if [[ -f ${steamvr_driver}/bin/win64/driver_cranvr.dll ]]; then
+    rm -rf "${driver_dir}"
+    mkdir -p "${driver_dir:h}"
+    cp -R "${steamvr_driver}" "${driver_dir}"
+else
+    print "No SteamVR driver in ${steamvr_driver}: games run without SteamVR (scripts/build-steamvr-driver.sh builds it)."
 fi
 
 # A crash should end the program, not wait in Wine's debugger
@@ -183,6 +200,15 @@ if [[ -f ${prefix}/drive_c/wine-patched/stack_sample_check.exe ]]; then
     if [[ ${sample_out} != *"stack_sample_check: PASS"* ]]; then
         print -u2 "FAIL: stack_sample_check.exe (run it by hand for details):"
         print -u2 -r -- "${sample_out}"
+        exit 1
+    fi
+fi
+if [[ -f ${prefix}/drive_c/wine-patched/session_check.exe ]]; then
+    print "Checking that the session counts as unlocked, as SteamVR asks"
+    session_out=$(cd "${prefix}/drive_c/wine-patched" && "${wine_root}/bin/wine" ./session_check.exe 2>&1 || true)
+    if [[ ${session_out} != *"session_check: PASS"* ]]; then
+        print -u2 "FAIL: session_check.exe (run it by hand for details):"
+        print -u2 -r -- "${session_out}"
         exit 1
     fi
 fi

@@ -1,0 +1,35 @@
+Subject: [PATCH] d3d11: the DXGI usage of a resource from its bind flags (cranvr)
+
+IDXGIResource::GetUsage returned 0. ANGLE in Chromium reads the usage of a texture that another process shared, to
+learn whether it may draw into the texture and read it. SteamVR's web panels run in Chromium. The usage now follows
+the bind flags and the usage of the description, as on Windows.
+---
+diff --git a/src/d3d11/d3d11_resource.hpp b/src/d3d11/d3d11_resource.hpp
+index 9ef6170..65b92f9 100644
+--- a/src/d3d11/d3d11_resource.hpp
++++ b/src/d3d11/d3d11_resource.hpp
+@@ -278,11 +278,23 @@ public:
+     return device->QueryInterface(riid, ppDevice);
+   };
+ 
++  /* cranvr: the usage follows the bind flags, as in Windows. It was always 0, and a program that checks it (ANGLE
++   * in a Chromium GPU process, for a texture that another program shares with it) took the resource as one that it
++   * can neither draw into nor read. */
+   virtual HRESULT GetDXGIUsage(DXGI_USAGE *pUsage) {
+     if (!pUsage) {
+       return E_INVALIDARG;
+     }
+-    *pUsage = 0;
++    DXGI_USAGE usage = 0;
++    if (desc.BindFlags & D3D11_BIND_SHADER_RESOURCE)
++      usage |= DXGI_USAGE_SHADER_INPUT;
++    if (desc.BindFlags & D3D11_BIND_RENDER_TARGET)
++      usage |= DXGI_USAGE_RENDER_TARGET_OUTPUT;
++    if (desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS)
++      usage |= DXGI_USAGE_UNORDERED_ACCESS;
++    if (desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE))
++      usage |= DXGI_USAGE_SHARED;
++    *pUsage = usage;
+     return S_OK;
+   }
+ 
