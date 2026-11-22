@@ -15,6 +15,8 @@ pub struct Options {
     pub mbps: u64,
     /// Accept every client without a pairing (for tests)
     pub trust_all: bool,
+    /// Take a link over a USB cable. `--no-cable` turns it off for the Connection choice Wi-Fi.
+    pub cable: bool,
     /// The UDP port that answers the headsets' discovery queries. `None` turns discovery off.
     pub discovery_port: Option<u16>,
     /// Plan the host's own scene's frames for the headset's display

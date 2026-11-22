@@ -14,6 +14,10 @@
 //! gives the panel's list. `target` says where a connection goes when it starts, and again when a
 //! link that streamed has ended. A cable is preferred to the Wi-Fi entry of the same Mac. A running
 //! Wi-Fi link never moves to the cable: nothing here looks at a link that runs.
+//!
+//! The Mac's user may choose Wi-Fi in the Mac's app. The host then says so at the start of each
+//! connection, on both ways over the cable (`HostProbe::cable`). Such a Mac still shows its key
+//! behind the cable, so an aim at the cable goes to the same Mac's Wi-Fi entry.
 
 use crate::{
     discovery::FoundHost,
@@ -70,12 +74,20 @@ pub struct UsbMac {
     pub key: Option<[u8; KEY_LEN]>,
     pub version: u16,
     pub way: Way,
+    /// The Mac's user chose Wi-Fi: the Mac takes no link over the cable. The headset connects to
+    /// the same Mac over Wi-Fi.
+    pub wifi_only: bool,
 }
 
 impl UsbMac {
     /// The start of the hash of the host's key, when the host showed its key
     pub fn fingerprint(&self) -> Option<[u8; FINGERPRINT_LEN]> {
         self.key.map(|key| fingerprint(&key))
+    }
+
+    /// The Mac when it takes a link over the cable
+    pub fn usable(&self) -> Option<&Self> {
+        (!self.wifi_only).then_some(self)
     }
 
     /// Whether the Mac asks its user for a code before it lets this headset stream. A Mac on the
@@ -129,7 +141,7 @@ fn probe_usb_network() -> Option<UsbMac> {
 
 fn probe_at(route: &dyn Route, address: SocketAddr, way: Way) -> Option<UsbMac> {
     match probe_host_via(route, address, PROBE_TIMEOUT) {
-        Ok(probe) => Some(UsbMac { address, key: probe.key, version: probe.version, way }),
+        Ok(probe) => Some(UsbMac { address, key: probe.key, version: probe.version, way, wifi_only: !probe.cable }),
         Err(e) => {
             log::debug!("nothing answers behind the cable at {address}: {e}");
             None
@@ -172,6 +184,9 @@ fn run(hub: &'static Hub) {
         let found = probe();
         if hub.usb() != found {
             match &found {
+                Some(mac) if mac.wifi_only => {
+                    log::info!("a Mac answers behind the USB cable at {}, and its user chose Wi-Fi", mac.address)
+                }
                 Some(mac) => log::info!("a Mac answers behind the USB cable at {}", mac.address),
                 None => log::info!("the USB cable no longer answers"),
             }
@@ -197,8 +212,10 @@ pub enum Line {
 
 /// The panel's list: the Mac behind the cable first, then the Macs of the Wi-Fi search. The Wi-Fi
 /// entry of the cable's Mac stays out, so each Mac has one line. The cable wins for that Mac. The
-/// user who wants Wi-Fi sets the Mac's choice to Wi-Fi, which takes the cable away.
+/// user who wants Wi-Fi sets the Mac's choice to Wi-Fi, which takes the cable away: the Mac then
+/// has its Wi-Fi line.
 pub fn entries(found: &[FoundHost], usb: Option<&UsbMac>) -> Vec<Line> {
+    let usb = usb.and_then(UsbMac::usable);
     let cable = usb.and_then(UsbMac::fingerprint);
     usb.map(|mac| Line::Cable(mac.clone()))
         .into_iter()
@@ -251,7 +268,12 @@ fn port_of(address: &str) -> u16 {
 /// fingerprint, the cable wins when the Mac behind it has the same one. Otherwise the aim goes to
 /// the Wi-Fi entry with that fingerprint, which a USB link falls back to when the cable is out. When
 /// no such entry exists, the aim keeps its address.
+///
+/// A Mac whose user chose Wi-Fi counts as no cable. An aim at the cable then means that Mac: its
+/// key behind the cable finds its Wi-Fi entry.
 pub fn target(aim: &Aim, usb: Option<&UsbMac>, found: &[FoundHost]) -> Target {
+    let aim = &Aim { address: aim.address.clone(), fingerprint: aim.fingerprint.or_else(|| mac_set_to_wifi(&aim.address, usb)) };
+    let usb = usb.and_then(UsbMac::usable);
     let as_aimed = || {
         if !is_loopback(&aim.address) {
             return Target { address: aim.address.clone(), path: Path::WiFi };
@@ -273,6 +295,12 @@ pub fn target(aim: &Aim, usb: Option<&UsbMac>, found: &[FoundHost]) -> Target {
     }
 }
 
+/// The fingerprint of the Mac behind the cable when `address` aims at the cable and that Mac's user
+/// chose Wi-Fi
+pub fn mac_set_to_wifi(address: &str, usb: Option<&UsbMac>) -> Option<[u8; FINGERPRINT_LEN]> {
+    usb.filter(|mac| mac.wifi_only && is_loopback(address) && port_of(address) == mac.address.port())?.fingerprint()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,7 +314,7 @@ mod tests {
 
     /// A Mac behind the cable whose key has the fingerprint of the first byte's key
     fn cable(key_byte: u8) -> UsbMac {
-        UsbMac { address: address(), key: Some([key_byte; KEY_LEN]), version: PROTOCOL_VERSION, way: Way::AdbReverse }
+        UsbMac { address: address(), key: Some([key_byte; KEY_LEN]), version: PROTOCOL_VERSION, way: Way::AdbReverse, wifi_only: false }
     }
 
     /// The same Mac on the headset's USB network: its link-local address on the cable's link
@@ -407,6 +435,29 @@ mod tests {
         assert_eq!(target(&aim("127.0.0.1:9962", None), Some(&network), &found), Target { address: "127.0.0.1:9962".into(), path: Path::Usb });
         // The Wi-Fi entry of the same Mac shows once, as the cable
         assert_eq!(entries(&found, Some(&network)), [Line::Cable(network)]);
+    }
+
+    // The Mac's user chose Wi-Fi: the Mac shows its key behind the cable on either way and takes
+    // no link there. The aim at the cable and the press on the Mac's Wi-Fi line both go to its
+    // Wi-Fi address. The panel lists that Mac by Wi-Fi.
+    #[test]
+    fn a_mac_set_to_wifi_takes_the_aim_at_the_cable_over_wifi() {
+        for way in [usb_network(1), cable(1)] {
+            let mac = UsbMac { wifi_only: true, ..way };
+            let fp = mac.fingerprint().unwrap();
+            let found = [wifi("Mac", [192, 168, 1, 20], fp), wifi("Other", [192, 168, 1, 21], B)];
+            let over_wifi = Target { address: "192.168.1.20:9950".into(), path: Path::WiFi };
+            assert_eq!(target(&aim("127.0.0.1:9950", None), Some(&mac), &found), over_wifi);
+            assert_eq!(target(&aim("192.168.1.20:9950", Some(fp)), Some(&mac), &found), over_wifi);
+            assert_eq!(entries(&found, Some(&mac)), [Line::WiFi(found[0].clone()), Line::WiFi(found[1].clone())]);
+            // A test host on another port is another Mac
+            assert_eq!(mac_set_to_wifi("127.0.0.1:9962", Some(&mac)), None);
+            // The Wi-Fi search has not listed the Mac yet: the aim keeps its address
+            assert_eq!(target(&aim("127.0.0.1:9950", None), Some(&mac), &[]).address, "127.0.0.1:9950");
+        }
+        // The user chooses the cable again: the cable wins
+        let t = target(&aim("127.0.0.1:9950", None), Some(&usb_network(1)), &[wifi("Mac", [192, 168, 1, 20], usb_network(1).fingerprint().unwrap())]);
+        assert_eq!(t.path, Path::Usb);
     }
 
     #[test]

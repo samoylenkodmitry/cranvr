@@ -28,8 +28,13 @@ pub const MAGIC: [u8; 4] = *b"CRNV";
 
 /// The client's first bytes on the TCP connection: the magic and its protocol version.
 pub const CLIENT_PREAMBLE_LEN: usize = 6;
-/// The host's answer: the magic and the host's protocol version.
-pub const HOST_PREAMBLE_LEN: usize = 6;
+/// The host's answer: the magic, the host's protocol version and whether the host takes a link
+/// over a USB cable.
+pub const HOST_PREAMBLE_LEN: usize = 7;
+/// The start of the host's answer: the magic and the version. A host of another version may answer
+/// with another length, so a client reads this much first. It reads the rest only from a host of
+/// its own version.
+pub const HOST_VERSION_LEN: usize = 6;
 
 pub fn client_preamble(version: u16) -> [u8; CLIENT_PREAMBLE_LEN] {
     let mut out = [0; CLIENT_PREAMBLE_LEN];
@@ -46,19 +51,31 @@ pub fn parse_client_preamble(bytes: &[u8; CLIENT_PREAMBLE_LEN]) -> Result<u16, E
     Ok(u16::from_le_bytes([bytes[4], bytes[5]]))
 }
 
-pub fn host_preamble(version: u16) -> [u8; HOST_PREAMBLE_LEN] {
+/// The host's answer to a client's preamble. `cable` is false when the host's user chose Wi-Fi:
+/// a headset on the Mac's USB cable then connects over Wi-Fi.
+pub fn host_preamble(version: u16, cable: bool) -> [u8; HOST_PREAMBLE_LEN] {
     let mut out = [0; HOST_PREAMBLE_LEN];
     out[..4].copy_from_slice(&MAGIC);
     out[4..6].copy_from_slice(&version.to_le_bytes());
+    out[6] = u8::from(cable);
     out
 }
 
-/// The host's protocol version
-pub fn parse_host_preamble(bytes: &[u8; HOST_PREAMBLE_LEN]) -> Result<u16, Error> {
-    if bytes[..4] != MAGIC {
+/// The host's protocol version, from the first [`HOST_VERSION_LEN`] bytes of its preamble
+pub fn parse_host_preamble(bytes: &[u8]) -> Result<u16, Error> {
+    if bytes.len() < HOST_VERSION_LEN || bytes[..4] != MAGIC {
         return Err(Error::Malformed("not a cranvr host"));
     }
     Ok(u16::from_le_bytes([bytes[4], bytes[5]]))
+}
+
+/// Whether the host takes a link over a USB cable, from the whole preamble of a host of this version
+pub fn host_takes_cable(bytes: &[u8; HOST_PREAMBLE_LEN]) -> Result<bool, Error> {
+    match bytes[HOST_VERSION_LEN] {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(Error::Malformed("the host's answer about the cable is neither yes nor no")),
+    }
 }
 
 /// Whether the other side must update when two sides of different versions cannot talk: the side
@@ -169,6 +186,9 @@ pub enum RejectReason {
     Denied,
     /// The host's user did not answer in time
     NoAnswer,
+    /// The client came over a USB cable, and the host's user chose Wi-Fi. The client connects
+    /// over Wi-Fi.
+    WiFiOnly,
 }
 
 /// How long a host holds a connection for its user's answer. A client waits a little longer.

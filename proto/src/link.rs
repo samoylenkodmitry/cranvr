@@ -30,7 +30,7 @@ use std::{
     net::{Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Mutex,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -416,10 +416,12 @@ fn read_flight<'a>(tcp: &mut TcpStream, buf: &'a mut Vec<u8>, len: usize) -> Res
 // ---------------------------------------------------------------------------------------------
 // Host
 
-/// The host's listening socket and its key.
+/// The host's listening socket, its key and its switch for the USB cable.
 pub struct HostListener {
     listener: TcpListener,
     identity: Identity,
+    /// Whether the host takes a link over a USB cable. The preamble tells it to every client.
+    cable: Arc<AtomicBool>,
 }
 
 /// How the host wants to send media to a client.
@@ -448,7 +450,7 @@ impl HostListener {
     /// Listens on `addr`. `identity` is the host's key: the client checks it against the key that
     /// it paired with.
     pub fn bind(addr: impl ToSocketAddrs, identity: Identity) -> Result<Self, Error> {
-        Ok(Self { listener: TcpListener::bind(addr)?, identity })
+        Ok(Self { listener: TcpListener::bind(addr)?, identity, cable: Arc::new(AtomicBool::new(true)) })
     }
 
     /// Listens on `port` on every IPv6 address, beside a listener of [`HostListener::bind`] on the
@@ -460,7 +462,15 @@ impl HostListener {
         socket.set_reuse_address(true)?;
         socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
         socket.listen(128)?;
-        Ok(Self { listener: socket.into(), identity })
+        Ok(Self { listener: socket.into(), identity, cable: Arc::new(AtomicBool::new(true)) })
+    }
+
+    /// Shares the switch that says whether this host takes a link over a USB cable. The host's
+    /// user turns it off with the choice of Wi-Fi. The preamble of each later connection carries
+    /// the switch's state. A listener without a shared switch takes the cable.
+    pub fn share_cable_switch(mut self, cable: Arc<AtomicBool>) -> Self {
+        self.cable = cable;
+        self
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, Error> {
@@ -484,7 +494,7 @@ impl HostListener {
         tcp.read_exact(&mut client_pre)?;
         let theirs = parse_client_preamble(&client_pre)?;
         // The host answers with its own version, so a client of another one can say which side to update
-        let host_pre = host_preamble(PROTOCOL_VERSION);
+        let host_pre = host_preamble(PROTOCOL_VERSION, self.cable.load(Ordering::Relaxed));
         tcp.write_all(&host_pre)?;
         if theirs != PROTOCOL_VERSION {
             return Err(Error::Version { ours: PROTOCOL_VERSION, theirs });
@@ -666,6 +676,21 @@ pub struct HostProbe {
     /// The host's key. `None` when the host speaks another version than this side: it then ends
     /// the exchange after the version exchange.
     pub key: Option<[u8; KEY_LEN]>,
+    /// The host takes a link over a USB cable. It is false when the host's user chose Wi-Fi. A host
+    /// of another version says nothing about it, and the probe gives true for it.
+    pub cable: bool,
+}
+
+/// Reads the host's preamble: the version first, and the rest only from a host of this side's
+/// version. A host of another version ends the exchange after its version.
+fn read_host_preamble(tcp: &mut TcpStream) -> Result<(u16, [u8; HOST_PREAMBLE_LEN]), Error> {
+    let mut host_pre = [0u8; HOST_PREAMBLE_LEN];
+    tcp.read_exact(&mut host_pre[..HOST_VERSION_LEN])?;
+    let theirs = parse_host_preamble(&host_pre)?;
+    if theirs == PROTOCOL_VERSION {
+        tcp.read_exact(&mut host_pre[HOST_VERSION_LEN..])?;
+    }
+    Ok((theirs, host_pre))
 }
 
 /// Opens a connection to `host`, runs the version exchange and the first two flights of the key
@@ -686,12 +711,11 @@ pub fn probe_host_via(route: &dyn Route, host: SocketAddr, timeout: Duration) ->
     tcp.set_write_timeout(Some(timeout))?;
     let client_pre = client_preamble(PROTOCOL_VERSION);
     tcp.write_all(&client_pre)?;
-    let mut host_pre = [0u8; HOST_PREAMBLE_LEN];
-    tcp.read_exact(&mut host_pre)?;
-    let theirs = parse_host_preamble(&host_pre)?;
+    let (theirs, host_pre) = read_host_preamble(&mut tcp)?;
     if theirs != PROTOCOL_VERSION {
-        return Ok(HostProbe { version: theirs, key: None });
+        return Ok(HostProbe { version: theirs, key: None, cable: true });
     }
+    let cable = host_takes_cable(&host_pre)?;
     let mut buf = Vec::new();
     let fresh = Ephemeral::new()?;
     write_flight(&mut tcp, &fresh.public())?;
@@ -700,7 +724,7 @@ pub fn probe_host_via(route: &dyn Route, host: SocketAddr, timeout: Duration) ->
     if !verify_host(&hello.key, &transcript, &hello.signature) {
         return Err(Error::Crypto("the host's signature is not valid"));
     }
-    Ok(HostProbe { version: theirs, key: Some(hello.key) })
+    Ok(HostProbe { version: theirs, key: Some(hello.key), cable })
 }
 
 /// The client's end of a session.
@@ -758,12 +782,11 @@ impl ClientLink {
         tcp.set_write_timeout(Some(timeout))?;
         let client_pre = client_preamble(PROTOCOL_VERSION);
         tcp.write_all(&client_pre)?;
-        let mut host_pre = [0u8; HOST_PREAMBLE_LEN];
-        tcp.read_exact(&mut host_pre)?;
-        let theirs = parse_host_preamble(&host_pre)?;
+        let (theirs, host_pre) = read_host_preamble(&mut tcp)?;
         if theirs != PROTOCOL_VERSION {
             return Err(Error::Version { ours: PROTOCOL_VERSION, theirs });
         }
+        host_takes_cable(&host_pre)?;
         let mut buf = Vec::new();
         let fresh = Ephemeral::new()?;
         write_flight(&mut tcp, &fresh.public())?;

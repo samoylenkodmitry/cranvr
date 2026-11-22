@@ -307,7 +307,8 @@ fn a_host_of_another_version_is_refused_by_the_client_and_names_the_side_to_upda
             let mut hello = [0u8; CLIENT_PREAMBLE_LEN];
             tcp.read_exact(&mut hello).unwrap();
             assert_eq!(parse_client_preamble(&hello).unwrap(), cranvr_proto::PROTOCOL_VERSION);
-            tcp.write_all(&host_preamble(theirs)).unwrap();
+            // A host of another version may send a shorter preamble, as version 10 did, and closes
+            tcp.write_all(&host_preamble(theirs, true)[..HOST_VERSION_LEN]).unwrap();
         });
         let error = ClientLink::connect(addr, &caps(), &identity(), None, WAIT).err().expect("a host of another version refuses");
         assert!(matches!(error, Error::Version { ours: o, theirs: t } if o == ours && t == theirs), "{error:?}");
@@ -487,6 +488,37 @@ fn a_probe_learns_the_hosts_key_and_the_host_serves_the_next_client() {
     assert_eq!(name, caps().name);
 }
 
+// The host's user chooses Wi-Fi with a switch that the listener shares. Each later connection
+// tells it in the host's preamble, so a probe over the cable sees it with the host's key: the
+// headset finds the same Mac on Wi-Fi by that key. A change of the switch counts from the next
+// connection, and a client still gets its session from the host that ignores the switch.
+#[test]
+fn a_probe_sees_the_hosts_choice_of_the_cable_with_its_key() {
+    let switch = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let listener = HostListener::bind("127.0.0.1:0", host_identity()).unwrap().share_cable_switch(Arc::clone(&switch));
+    let addr = listener.local_addr().unwrap();
+    let key = listener.public_key();
+    let host = thread::spawn(move || {
+        for _ in 0..2 {
+            assert!(listener.accept().is_err(), "a probe leaves before its key");
+        }
+        listener.accept().map(|pending| pending.caps.name)
+    });
+    let off = probe_host(addr, WAIT).unwrap();
+    assert_eq!((off.key, off.cable), (Some(key), false));
+    switch.store(true, std::sync::atomic::Ordering::Relaxed);
+    let on = probe_host(addr, WAIT).unwrap();
+    assert_eq!((on.key, on.cable), (Some(key), true));
+    let _client = thread::spawn(move || ClientLink::connect(addr, &caps(), &identity(), None, Duration::from_secs(1)));
+    assert_eq!(host.join().unwrap().unwrap(), caps().name);
+    // A listener without a shared switch takes the cable
+    let plain = HostListener::bind("127.0.0.1:0", host_identity()).unwrap();
+    let addr = plain.local_addr().unwrap();
+    let host = thread::spawn(move || plain.accept().err());
+    assert!(probe_host(addr, WAIT).unwrap().cable);
+    host.join().unwrap();
+}
+
 // A host of another protocol version ends the exchange after the versions. The probe returns its version.
 #[test]
 fn a_probe_of_a_host_of_another_version_gets_its_version_and_no_key() {
@@ -496,10 +528,10 @@ fn a_probe_of_a_host_of_another_version_gets_its_version_and_no_key() {
         let (mut tcp, _) = listener.accept().unwrap();
         let mut hello = [0u8; CLIENT_PREAMBLE_LEN];
         tcp.read_exact(&mut hello).unwrap();
-        tcp.write_all(&host_preamble(cranvr_proto::PROTOCOL_VERSION + 1)).unwrap();
+        tcp.write_all(&host_preamble(cranvr_proto::PROTOCOL_VERSION + 1, true)[..HOST_VERSION_LEN]).unwrap();
     });
     let probe = probe_host(addr, WAIT).unwrap();
-    assert_eq!((probe.version, probe.key), (cranvr_proto::PROTOCOL_VERSION + 1, None));
+    assert_eq!((probe.version, probe.key, probe.cable), (cranvr_proto::PROTOCOL_VERSION + 1, None, true));
     host.join().unwrap();
 }
 

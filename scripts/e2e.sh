@@ -143,7 +143,9 @@
 #                 reverse` for the run's port, with the headset's USB network not asked for
 #                 (usb_network false); the log must show the peer 127.0.0.1 and TCP media. The headset
 #                 needs a few seconds to change its USB functions between the two, so an adb run right
-#                 after a usb-network run waits for adb to settle.
+#                 after a usb-network run waits for adb to settle. With --host-arg --no-cable (the
+#                 Connection choice Wi-Fi) the way is set up the same, and the log must show the
+#                 headset's Wi-Fi address and UDP media: the host takes no link over the cable.
 #                 Without --quest the client is cranvr-probe on this Mac, over loopback with UDP
 #                 media and parity packets. It simulates a headset's display: it reports the
 #                 frame timing and the loss, and it checks the eye badges of the host's scene.
@@ -595,10 +597,16 @@ case ${client} in
                 # The host's log names the way that the run took
                 path_line=$(grep -h "Native protocol: .* connected, .* media" "${work}/host.log" "${work}/host.out" 2>/dev/null | tail -1)
                 print "Path: ${path_line##*Native protocol: }"
-                case ${cable} in
-                    usb-network) [[ ${path_line} == *" at [fe80:"*"UDP media"* ]] || { print -u2 "The headset did not stream over its USB network"; client_exit=1; } ;;
-                    adb) [[ ${path_line} == *" at 127.0.0.1:"*"TCP media"* ]] || { print -u2 "The headset did not stream through adb reverse"; client_exit=1; } ;;
-                esac
+                if (( ${more_host_args[(Ie)--no-cable]} )); then
+                    # The choice of Wi-Fi: an IPv4 address of the network, neither loopback nor the cable's link
+                    [[ ${path_line} == *" at "[0-9]*"UDP media"* && ${path_line} != *" at 127."* ]] \
+                        || { print -u2 "The headset on the cable did not stream over Wi-Fi with the host's cable off"; client_exit=1; }
+                else
+                    case ${cable} in
+                        usb-network) [[ ${path_line} == *" at [fe80:"*"UDP media"* ]] || { print -u2 "The headset did not stream over its USB network"; client_exit=1; } ;;
+                        adb) [[ ${path_line} == *" at 127.0.0.1:"*"TCP media"* ]] || { print -u2 "The headset did not stream through adb reverse"; client_exit=1; } ;;
+                    esac
+                fi
             else
                 # What the headset shows, both eyes after its compositor
                 "${adb_cmd[@]}" exec-out screencap -p > "${work}/quest.png" || true

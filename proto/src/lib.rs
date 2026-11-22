@@ -52,7 +52,11 @@ pub use wire::{Error, Nanos};
 /// Version 10 says in the client's capabilities whether the link runs over a USB cable
 /// (`ClientCaps::cable`). The headset's USB network carries UDP, so a TCP-only path no longer
 /// stands for the cable.
-pub const PROTOCOL_VERSION: u16 = 10;
+///
+/// Version 11 says in the host's preamble whether the host takes a link over a USB cable. The
+/// host's user chooses Wi-Fi to stop the cable on every way over it: the headset's USB network and
+/// `adb reverse`.
+pub const PROTOCOL_VERSION: u16 = 11;
 
 /// The largest datagram, in bytes, sealed: the counter and the tag are in it. A media packet and
 /// any datagram message fit in it. A typical path MTU of 1500 bytes minus the IP and UDP headers
