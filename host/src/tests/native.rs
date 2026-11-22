@@ -48,6 +48,7 @@ fn config(port: u16) -> Config {
         approval_wait: Duration::from_secs(30),
         approve_loopback: false,
         trust_all: false,
+        cable: Arc::new(AtomicBool::new(true)),
         display_lock: true,
         desktop: Default::default(),
         audio: false,
@@ -532,13 +533,23 @@ fn the_status_line_tells_the_app_who_is_paired_and_who_waits() {
 fn the_user_answers_with_a_line_that_names_the_key() {
     let key = identity().public_key();
     let hex = cranvr_proto::identity::to_hex(&key);
-    assert_eq!(parse_answer(&format!("allow {hex}")), Some((true, key)));
-    assert_eq!(parse_answer(&format!("  deny   {hex}  ")), Some((false, key)));
-    assert_eq!(parse_answer(&format!("allow {}", &hex[..60])), None, "a short key");
-    assert_eq!(parse_answer(&format!("grant {hex}")), None);
-    assert_eq!(parse_answer(&format!("allow {hex} now")), None);
-    assert_eq!(parse_answer("allow"), None);
-    assert_eq!(parse_answer(""), None);
+    assert_eq!(parse_command(&format!("allow {hex}")), Some(Command::Answer { allow: true, key }));
+    assert_eq!(parse_command(&format!("  deny   {hex}  ")), Some(Command::Answer { allow: false, key }));
+    assert_eq!(parse_command(&format!("allow {}", &hex[..60])), None, "a short key");
+    assert_eq!(parse_command(&format!("grant {hex}")), None);
+    assert_eq!(parse_command(&format!("allow {hex} now")), None);
+    assert_eq!(parse_command("allow"), None);
+    assert_eq!(parse_command(""), None);
+}
+
+// The cranvr app writes the Connection choice to the host's input: off for Wi-Fi
+#[test]
+fn the_connection_choice_comes_as_a_line() {
+    assert_eq!(parse_command("cable off"), Some(Command::Cable(false)));
+    assert_eq!(parse_command(" cable  on "), Some(Command::Cable(true)));
+    for wrong in ["cable", "cable maybe", "cable on now", "cables off"] {
+        assert_eq!(parse_command(wrong), None, "{wrong}");
+    }
 }
 
 #[test]
@@ -724,6 +735,45 @@ fn a_headset_on_its_usb_network_reaches_the_host_by_a_link_local_address() {
     client.duplex.close();
 }
 
+// With the Connection choice Wi-Fi the host takes no link over the USB cable, on either way. A
+// probe over the cable learns it with the host's key. A client that comes over the cable anyway
+// hears `WiFiOnly`, and the same headset over Wi-Fi gets its session. The choice changes on the
+// host's input and counts from the next connection.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_choice_of_wifi_stops_the_cable_on_both_ways() {
+    let port = free_port();
+    let mut config = config(port);
+    config.trust_all = true;
+    config.cable.store(false, Ordering::Relaxed);
+    let cable = Arc::clone(&config.cable);
+    let (_headset, mut events) = start(config).unwrap();
+    // The headset's USB network (a link-local address) and `adb reverse` (loopback)
+    let usb_network: SocketAddr = std::net::SocketAddrV6::new(std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1), port, 0, 1).into();
+    let adb_reverse: SocketAddr = ([127, 0, 0, 1], port).into();
+    let mut cabled = caps("Cabled headset");
+    cabled.cable = true;
+    for way in [usb_network, adb_reverse] {
+        let probe = cranvr_proto::link::probe_host(way, Duration::from_secs(10)).unwrap();
+        assert_eq!((probe.key, probe.cable), (Some(cranvr_proto::identity::Identity::from_seed([7; 32]).public_key()), false), "{way}");
+        let refused = ClientLink::connect(way, &cabled, &identity(), None, Duration::from_secs(10));
+        assert!(matches!(refused, Err(cranvr_proto::Error::Rejected(RejectReason::WiFiOnly))), "{way}: {:?}", refused.err());
+    }
+    // The same headset over Wi-Fi says no cable
+    let wifi = ClientLink::connect(adb_reverse, &caps("Cabled headset"), &identity(), None, Duration::from_secs(10)).unwrap();
+    let Event::Connected { cable: by_cable, .. } = wait_for(&mut *events, |e| matches!(e, Event::Connected { .. })) else { unreachable!() };
+    assert!(!by_cable);
+    wifi.duplex.close();
+    wait_for(&mut *events, |e| matches!(e, Event::Disconnected));
+    // The user chooses the cable again
+    cable.store(true, Ordering::Relaxed);
+    assert!(cranvr_proto::link::probe_host(usb_network, Duration::from_secs(10)).unwrap().cable);
+    let client = ClientLink::connect(usb_network, &cabled, &identity(), None, Duration::from_secs(10)).unwrap();
+    let Event::Connected { cable: by_cable, .. } = wait_for(&mut *events, |e| matches!(e, Event::Connected { .. })) else { unreachable!() };
+    assert!(by_cable);
+    client.duplex.close();
+}
+
 /// A client that says it speaks `version`, written by hand: it sends the preamble and reads the
 /// host's answer, which holds the host's version.
 fn client_of_version(addr: SocketAddr, version: u16) -> u16 {
@@ -732,6 +782,7 @@ fn client_of_version(addr: SocketAddr, version: u16) -> u16 {
     let mut tcp = std::net::TcpStream::connect(addr).unwrap();
     tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     tcp.write_all(&client_preamble(version)).unwrap();
+    // The host answers a client of another version with its whole preamble
     let mut host_pre = [0u8; HOST_PREAMBLE_LEN];
     tcp.read_exact(&mut host_pre).unwrap();
     parse_host_preamble(&host_pre).unwrap()

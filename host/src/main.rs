@@ -119,7 +119,7 @@ impl Default for Views {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: cranvr-host [--native-port PORT] [--fps 72|80|90|120, default 120] [--eye-width PIXELS] [--mbps N] [--trust-all] [--discovery-port N] [--no-display-lock] [--tcp] [--no-foveation] [--game-scale F] [--strict-rate-control] [--no-game-audio] [--no-hand-controllers] [--desktop] [--desktop-fps N] [--virtual-display WxH] [--vr-main-display] [--pointer-pitch DEG] [--screen-in-view] [--no-desktop-layer] [--config-dir DIR] [--status]\n\
+        "usage: cranvr-host [--native-port PORT] [--fps 72|80|90|120, default 120] [--eye-width PIXELS] [--mbps N] [--trust-all] [--no-cable] [--discovery-port N] [--no-display-lock] [--tcp] [--no-foveation] [--game-scale F] [--strict-rate-control] [--no-game-audio] [--no-hand-controllers] [--desktop] [--desktop-fps N] [--virtual-display WxH] [--vr-main-display] [--pointer-pitch DEG] [--screen-in-view] [--no-desktop-layer] [--config-dir DIR] [--status]\n\
          \n  --native-port N   the TCP port to listen on (default 9950)\
          \n  --trust-all       accept any client on the network without a pairing (for tests)\
          \n  A headset that the host does not know waits for the user: the cranvr app on this Mac\
@@ -127,6 +127,9 @@ fn usage() -> ! {
          \n                    into the host's input (the status line gives the key). The host remembers\
          \n                    an allowed headset in paired-headsets.txt. It has a key of its own in\
          \n                    host-identity.txt: keep it, or the paired headsets refuse the host.\
+         \n  --no-cable        take no link over a USB cable: a headset on the cable connects over\
+         \n                    Wi-Fi (the app's Connection choice Wi-Fi). With --status the host\
+         \n                    takes `cable on` and `cable off` on its input.\
          \n  --discovery-port N  the UDP port that answers the headsets' search for this Mac\
          \n                    (default 9950; 0 turns it off)\
          \n  --no-display-lock render at the arrival of each pose, not at a time that follows the\
@@ -174,6 +177,7 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
         eye_width_given: false,
         mbps: 100,
         trust_all: false,
+        cable: true,
         discovery_port: Some(cranvr_proto::discovery::DEFAULT_PORT),
         display_lock: true,
         tcp: false,
@@ -208,6 +212,7 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
             "--eye-width" => options.eye_width = value().parse().unwrap_or_else(|_| usage()),
             "--mbps" => options.mbps = value().parse().unwrap_or_else(|_| usage()),
             "--trust-all" => options.trust_all = true,
+            "--no-cable" => options.cable = false,
             "--discovery-port" => {
                 // 0 turns discovery off
                 options.discovery_port = Some(value().parse().unwrap_or_else(|_| usage())).filter(|port| *port != 0)
@@ -325,6 +330,7 @@ fn native_config(
         approval_wait: cranvr_proto::message::APPROVAL_WAIT,
         approve_loopback: false,
         trust_all: options.trust_all,
+        cable: Arc::new(AtomicBool::new(options.cable)),
         display_lock: options.display_lock,
         desktop,
         audio: options.game_audio,
@@ -403,7 +409,7 @@ fn main() {
         // A host without --status leaves its input alone: a background job that reads its
         // terminal would stop.
         if status::enabled() {
-            headset::native::read_answers(Arc::clone(&config.pairings));
+            headset::native::read_input(Arc::clone(&config.pairings), Arc::clone(&config.cable));
         }
         headset::native::start(config).unwrap_or_else(|e| {
             error!("Native protocol: cannot listen on port {}: {e}", options.native_port);

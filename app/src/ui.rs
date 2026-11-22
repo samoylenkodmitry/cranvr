@@ -1289,9 +1289,11 @@ fn ConnectionCard(settings: MutableState<Settings>, model: MutableState<Model>) 
             Text("Stream by".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
             for (label, option) in [("Automatic", Connection::Automatic), ("Wi-Fi", Connection::WiFi), ("USB cable", Connection::Usb)] {
                 Choice(label.into(), choice == option, move || {
-                    // The cable is an adb matter: the host keeps running and a stream keeps its path
+                    // The host keeps running and a stream keeps its path. The adb thread and the
+                    // host's next connection follow the choice.
                     settings.update(|s| s.connection = option);
                     settings.with(Settings::save);
+                    backend::tell_host_connection(option);
                 });
             }
         });

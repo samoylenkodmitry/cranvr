@@ -655,6 +655,26 @@ pub fn answer_pairing(key: &str, allow: bool) {
     }
 }
 
+/// The line that tells the host the user's Connection choice: off for Wi-Fi, so the host takes no
+/// link over the USB cable (see host/src/headset/native.rs).
+fn cable_line(connection: Connection) -> &'static str {
+    if connection.allows_usb() {
+        "cable on\n"
+    } else {
+        "cable off\n"
+    }
+}
+
+/// Tells the running host the user's Connection choice. It counts from the headset's next
+/// connection. A host that starts later gets the choice on its command line.
+pub fn tell_host_connection(connection: Connection) {
+    let mut input = HOST_INPUT.lock().unwrap();
+    let sent = input.as_mut().map(|input| input.write_all(cable_line(connection).as_bytes()).and_then(|()| input.flush()));
+    if matches!(sent, Some(Err(_))) {
+        notify("The host did not take the Connection choice. It counts from the next start of the host.".into());
+    }
+}
+
 /// The command line of `cranvr-host`. `test` is for tests on one Mac: the probe needs no pairing and
 /// TCP media.
 fn host_args(settings: &Settings, config_dir: &Path, test: bool) -> Vec<OsString> {
@@ -666,6 +686,9 @@ fn host_args(settings: &Settings, config_dir: &Path, test: bool) -> Vec<OsString
     args.extend(["--config-dir".into(), config_dir.as_os_str().to_owned()]);
     if test {
         args.extend(["--trust-all", "--tcp"].map(OsString::from));
+    }
+    if !settings.connection.allows_usb() {
+        args.push("--no-cable".into());
     }
     if !settings.foveation {
         args.push("--no-foveation".into());
@@ -1100,10 +1123,27 @@ mod tests {
 
     #[test]
     fn the_settings_reach_the_host() {
-        let quiet = Settings { foveation: false, game_audio: false, hand_controllers: false, virtual_display: Some((1920, 1080)), ..Default::default() };
+        let quiet = Settings {
+            foveation: false,
+            game_audio: false,
+            hand_controllers: false,
+            virtual_display: Some((1920, 1080)),
+            connection: Connection::WiFi,
+            ..Default::default()
+        };
         let args = host_options(&quiet);
-        for wanted in ["--no-foveation", "--no-game-audio", "--no-hand-controllers", "--virtual-display", "1920x1080"] {
+        for wanted in ["--no-foveation", "--no-game-audio", "--no-hand-controllers", "--virtual-display", "1920x1080", "--no-cable"] {
             assert!(args.contains(&wanted.to_string()), "{wanted} in {args:?}");
+        }
+    }
+
+    // The cable is on for Automatic and USB cable, off for Wi-Fi: on the command line and in a change
+    #[test]
+    fn the_connection_choice_reaches_the_host() {
+        assert_eq!(cable_line(Connection::WiFi), "cable off\n");
+        for cable in [Connection::Automatic, Connection::Usb] {
+            assert_eq!(cable_line(cable), "cable on\n");
+            assert!(!host_options(&Settings { connection: cable, ..Default::default() }).contains(&"--no-cable".to_string()));
         }
     }
 

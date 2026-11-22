@@ -17,7 +17,7 @@ use crate::{
         StreamLayout,
     },
     phone, sizing, tracking,
-    usb::{self, Aim, Path},
+    usb::{self, Aim, Path, UsbMac},
     usb_network::{self, NetworkRoute},
 };
 use cranpose::{
@@ -239,6 +239,7 @@ fn failure_text(error: &Error, host: &str) -> String {
         Error::Rejected(RejectReason::Denied) => "The Mac denied this headset. Press the Mac to ask again.".into(),
         Error::Rejected(RejectReason::NoAnswer) => "Nobody answered on the Mac. Press the Mac to ask again.".into(),
         Error::Rejected(RejectReason::Busy) => "The Mac is busy with another headset.".into(),
+        Error::Rejected(RejectReason::WiFiOnly) => "The Mac is set to Wi-Fi. This headset connects to it over Wi-Fi.".into(),
         Error::HostKeyChanged => format!(
             "{host} does not have the key that this headset paired with. Someone may pose as the Mac. If you reinstalled cranvr on the Mac, press Forget host key and connect again."
         ),
@@ -321,10 +322,13 @@ fn route(hub: &'static Hub, text: &str, fingerprint: Option<[u8; 8]>) -> (String
         thread::sleep(Duration::from_millis(200));
     }
     let loopback = usb::is_loopback(text);
-    let cable = usb::probe_settled();
+    let probed = usb::probe_settled();
+    // A Mac whose user chose Wi-Fi counts as no cable here
+    let cable = probed.as_ref().and_then(UsbMac::usable);
     // A Mac that this headset paired with is known by its address. Another Mac behind a typed
     // address shows itself to a question, which is asked only when a cable could take its place.
-    let mut mac = fingerprint.or_else(|| {
+    // A Mac set to Wi-Fi shows its key behind the cable, which finds it on Wi-Fi.
+    let mut mac = fingerprint.or_else(|| usb::mac_set_to_wifi(text, probed.as_ref())).or_else(|| {
         let key = crate::settings::host_key(&host_name(text)).filter(|_| !loopback)?;
         Some(cranvr_proto::identity::fingerprint(&key))
     });
@@ -333,10 +337,11 @@ fn route(hub: &'static Hub, text: &str, fingerprint: Option<[u8; 8]>) -> (String
     }
     let mut found = hub.found();
     if cable.is_none() && loopback && mac.is_some_and(|mac| !found.iter().any(|host| host.fingerprint == mac)) {
-        // The cable is out and the search has not listed the Mac yet: ask the network now
+        // The cable is out or set to Wi-Fi, and the search has not listed the Mac yet: ask the
+        // network now
         found = crate::discovery::search_now(Duration::from_millis(1500));
     }
-    let target = usb::target(&Aim { address: text.to_string(), fingerprint: mac }, cable.as_ref(), &found);
+    let target = usb::target(&Aim { address: text.to_string(), fingerprint: mac }, probed.as_ref(), &found);
     if target.address != text.trim() {
         log::info!("{text} connects as {} over {:?}", target.address, target.path);
     }

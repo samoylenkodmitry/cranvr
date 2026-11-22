@@ -420,7 +420,7 @@ fn a_man_in_the_middle_that_swaps_the_fresh_key_breaks_the_host_signature() {
         let (mut tcp, _) = listener.accept().unwrap();
         let mut client_pre = [0u8; CLIENT_PREAMBLE_LEN];
         tcp.read_exact(&mut client_pre).unwrap();
-        let host_pre = host_preamble(cranvr_proto::PROTOCOL_VERSION);
+        let host_pre = host_preamble(cranvr_proto::PROTOCOL_VERSION, true);
         tcp.write_all(&host_pre).unwrap();
         let mut buf = Vec::new();
         read_tcp_packet(&mut tcp, &mut buf).unwrap();
@@ -654,7 +654,7 @@ impl FakeHost {
         let (mut tcp, _) = listener.accept().unwrap();
         let mut client_pre = [0u8; CLIENT_PREAMBLE_LEN];
         tcp.read_exact(&mut client_pre).unwrap();
-        let host_pre = host_preamble(cranvr_proto::PROTOCOL_VERSION);
+        let host_pre = host_preamble(cranvr_proto::PROTOCOL_VERSION, true);
         tcp.write_all(&host_pre).unwrap();
         let mut buf = Vec::new();
         read_tcp_packet(&mut tcp, &mut buf).unwrap();

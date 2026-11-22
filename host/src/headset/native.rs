@@ -80,6 +80,10 @@ pub struct Config {
     pub approve_loopback: bool,
     /// Accept every client without a pairing (for tests)
     pub trust_all: bool,
+    /// Whether the host takes a link over a USB cable: the headset's USB network or `adb reverse`.
+    /// The user turns it off with the Connection choice Wi-Fi. The host's preamble tells each client,
+    /// and the host refuses a client that comes over the cable while it is off.
+    pub cable: Arc<AtomicBool>,
     /// Send the media over TCP, as a USB link needs it
     pub tcp_media: bool,
     pub wishes: HostWishes,
@@ -193,13 +197,19 @@ fn announce(config: &Config) {
 pub fn start(config: Config) -> std::io::Result<(Arc<dyn Headset>, Box<dyn EventSource>)> {
     // Any machine on the network may connect. A client that the host does not know waits for the user.
     let address: SocketAddr = ([0, 0, 0, 0], config.port).into();
-    let listener = HostListener::bind(address, config.identity.clone()).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let listener = HostListener::bind(address, config.identity.clone())
+        .map_err(|e| std::io::Error::other(e.to_string()))?
+        .share_cable_switch(Arc::clone(&config.cable));
     info!("Native protocol: this host's key starts with {}", to_hex(&config.identity.public_key()[..8]));
     info!("Native protocol: listening on {address}");
+    if !config.cable.load(Ordering::Relaxed) {
+        info!("Native protocol: the user chose Wi-Fi, so a headset on the USB cable connects over Wi-Fi");
+    }
     // A headset's USB network to this Mac has IPv6 link-local addresses only. Without this
     // listener the headset still reaches the host over Wi-Fi and `adb reverse`.
     let cable_listener = match HostListener::bind_ipv6(config.port, config.identity.clone()) {
         Ok(listener) => {
+            let listener = listener.share_cable_switch(Arc::clone(&config.cable));
             info!("Native protocol: listening on [::]:{} for a headset's USB network", config.port);
             Some(listener)
         }
@@ -257,32 +267,53 @@ fn start_discovery(port: u16, config: &Config) {
     thread::Builder::new().name("native-discovery".into()).spawn(move || responder.run(&NEVER, &answer)).ok();
 }
 
-/// Reads the user's answers from the host's input: `allow KEY` or `deny KEY`, with the key that the
-/// status line shows. The cranvr app writes them. A person who runs the host by hand may type them.
-pub fn read_answers(pairings: Arc<Pairings>) {
+/// Reads the cranvr app's lines from the host's input. `allow KEY` or `deny KEY` is the user's answer
+/// to a headset's request, with the key that the status line shows. `cable on` or `cable off` is the
+/// user's Connection choice: off for Wi-Fi. A person who runs the host by hand may type them.
+pub fn read_input(pairings: Arc<Pairings>, cable: Arc<AtomicBool>) {
     thread::Builder::new()
-        .name("native-answers".into())
+        .name("native-input".into())
         .spawn(move || {
             for line in std::io::stdin().lines().map_while(Result::ok) {
-                let Some((allow, key)) = parse_answer(&line) else { continue };
-                if !pairings.answer(&key, allow) {
-                    info!("Native protocol: no headset with the key {} waits for an answer", to_hex(&key[..4]));
+                match parse_command(&line) {
+                    Some(Command::Answer { allow, key }) => {
+                        if !pairings.answer(&key, allow) {
+                            info!("Native protocol: no headset with the key {} waits for an answer", to_hex(&key[..4]));
+                        }
+                    }
+                    Some(Command::Cable(on)) if cable.swap(on, Ordering::Relaxed) != on => info!(
+                        "Native protocol: {}. A running link keeps its way.",
+                        if on { "the user allowed the USB cable" } else { "the user chose Wi-Fi, so the next headset on the USB cable connects over Wi-Fi" }
+                    ),
+                    Some(Command::Cable(_)) | None => {}
                 }
             }
         })
         .ok();
 }
 
-/// `allow KEY` or `deny KEY` as the user's answer. The key is 64 hex digits.
-fn parse_answer(line: &str) -> Option<(bool, [u8; KEY_LEN])> {
+/// A line of the host's input.
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    /// The user's answer to the headset with this key
+    Answer { allow: bool, key: [u8; KEY_LEN] },
+    /// Whether the host takes a link over a USB cable
+    Cable(bool),
+}
+
+/// `allow KEY`, `deny KEY` (the key is 64 hex digits), `cable on` or `cable off`.
+fn parse_command(line: &str) -> Option<Command> {
     let mut words = line.split_whitespace();
-    let allow = match words.next()? {
-        "allow" => true,
-        "deny" => false,
+    let command = match words.next()? {
+        word @ ("allow" | "deny") => Command::Answer { allow: word == "allow", key: from_hex(words.next()?)? },
+        "cable" => Command::Cable(match words.next()? {
+            "on" => true,
+            "off" => false,
+            _ => return None,
+        }),
         _ => return None,
     };
-    let key = from_hex(words.next()?)?;
-    words.next().is_none().then_some((allow, key))
+    words.next().is_none().then_some(command)
 }
 
 /// What a version mismatch says to the host's user. The client that could not talk is gone, so the
@@ -315,6 +346,13 @@ fn accept_loop(listener: HostListener, config: Arc<Config>, shared: Arc<Shared>)
             }
         };
         let name = display_name(&pending.caps.name);
+        if pending.caps.cable && !config.cable.load(Ordering::Relaxed) {
+            // The headset probed the cable a moment before the user chose Wi-Fi. It connects over
+            // Wi-Fi next, because the preamble of its next probe says that the cable is off.
+            info!("Native protocol: {name} at {} came over the USB cable, and the user chose Wi-Fi", pending.peer);
+            pending.reject(RejectReason::WiFiOnly);
+            continue;
+        }
         if shared.session().is_some() {
             warn!("Native protocol: {name} at {} was refused: another headset is connected", pending.peer);
             pending.reject(RejectReason::Busy);
