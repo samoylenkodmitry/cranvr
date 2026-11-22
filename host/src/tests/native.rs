@@ -1123,3 +1123,18 @@ fn the_hands_that_the_app_holds_back_reach_the_frame_loop_and_the_game_sees_rest
     assert_eq!(held, Some([false, true]));
     assert_eq!(right_trigger, Some(0.0), "the game sees a trigger at rest while a panel holds the hand");
 }
+
+// A press of the cranvr app on the headset's own page comes as `headset` and a JSON object
+#[test]
+fn a_press_on_the_headsets_page_comes_as_a_line() {
+    let request = r#"{"action":"run","id":"headset.recenter"}"#;
+    assert_eq!(parse_command(&format!("headset {request}")), Some(Command::Headset(request.into())));
+    assert_eq!(parse_command(&format!("headset   {request}  ")), Some(Command::Headset(request.into())));
+    for wrong in ["headset", "headset recenter", "headset [1]", "headsets {}"] {
+        assert_eq!(parse_command(wrong), None, "{wrong}");
+    }
+    // The page comes from the headset and goes to the app as a status line
+    assert!(crate::status::headset_page(r#"{"id":"headset","title":"Headset","items":[]}"#));
+    assert_eq!(crate::status::latest("headset_page").unwrap()["page"]["id"], "headset");
+    assert!(!crate::status::headset_page("not json"));
+}

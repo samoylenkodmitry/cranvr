@@ -243,6 +243,12 @@ pub enum ClientMsg {
     /// and how many a second. A display that the client does not wish costs the Mac and the headset
     /// nothing: the host runs no capture and no encoder and sends nothing for it.
     DisplayWish { stream: u8, wish: DesktopWish },
+    /// The headset's own page as a JSON object (`cranvr_common::menu::Page`): its panels with Show
+    /// and Hide, each display's place, Add display, Recenter and the like. The headset owns these, and
+    /// the cranvr app on the Mac draws the page and sends a press back as
+    /// [`HostMsg::HeadsetRequest`]. The client sends the page after the welcome and when it changes.
+    /// The host hands it to the app as a `headset_page` status line.
+    HeadsetPage(String),
 }
 
 /// How much of the headset the app has. The values follow the states of an OpenXR session and
@@ -337,6 +343,10 @@ pub enum HostMsg {
     /// they change. The host sends it before the first menu and again when it changes, at most once
     /// a second.
     MenuStatus(String),
+    /// A press of the cranvr app on the Mac on the headset's own page ([`ClientMsg::HeadsetPage`]), as
+    /// a JSON object (`cranvr_common::menu::Request`). The client does it as a press in the headset
+    /// does.
+    HeadsetRequest(String),
 }
 
 /// Datagram messages from the client to the host.

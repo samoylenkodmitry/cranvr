@@ -72,6 +72,8 @@ pub use wire::{Error, Nanos};
 /// console's menu, and the console sends a generic `set` or `run` request for an item. The menu's old
 /// keys (`games`, `fps`, `game_scale`, `msaa`) and the old requests (`play`, `stop`, `set` with a field)
 /// are gone. The stream's state for the console travels apart in [`message::HostMsg::MenuStatus`].
+/// The headset sends its own page ([`message::ClientMsg::HeadsetPage`]) and the Mac presses it
+/// ([`message::HostMsg::HeadsetRequest`]).
 pub const PROTOCOL_VERSION: u16 = 16;
 
 /// The largest datagram, in bytes, sealed: the counter and the tag are in it. A media packet and

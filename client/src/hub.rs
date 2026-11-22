@@ -378,6 +378,12 @@ pub struct Hub {
     fires: Mutex<Vec<Fire>>,
     /// The Mac asked to open the hand menu, and the UI has not opened it yet
     menu_asked: AtomicBool,
+    /// The Mac's presses on the headset's own page that the UI has not done yet
+    headset_requests: Mutex<Vec<cranvr_common::menu::Request>>,
+    /// The headset's own page that went to the Mac last, with the connection that took it
+    headset_page_sent: Mutex<Option<(u64, String)>>,
+    /// The connection for which the headset told the Mac its room and volume
+    told_choices: AtomicU64,
     /// The saved settings of the console were loaded. A rebuilt composition must not load them
     /// again, because the choices in memory are newer when a save failed.
     settings_loaded: AtomicBool,
@@ -407,6 +413,9 @@ pub fn hub() -> &'static Hub {
         runner: Mutex::new(Runner::default()),
         fires: Mutex::new(Vec::new()),
         menu_asked: AtomicBool::new(false),
+        headset_requests: Mutex::new(Vec::new()),
+        headset_page_sent: Mutex::new(None),
+        told_choices: AtomicU64::new(0),
         settings_loaded: AtomicBool::new(false),
     })
 }
@@ -663,11 +672,13 @@ impl Hub {
         }
         match Menu::parse(text) {
             Some(menu) => {
+                let choices = menu.headset;
                 let changed = self.console.lock().unwrap().on_menu(menu);
                 // The headset keeps the mapping for the time without a link
                 if let Some(controls) = changed {
                     settings::remember_controls(&controls);
                 }
+                self.take_choices(id, choices);
             }
             None => log::warn!("the host sent a menu that the console cannot read"),
         }
@@ -681,6 +692,33 @@ impl Hub {
         match crate::console::Status::parse(text) {
             Some(status) => self.console.lock().unwrap().on_status(status),
             None => log::warn!("the host sent a state of the stream that the console cannot read"),
+        }
+    }
+
+    /// The room and the volume that the Mac keeps. A choice that the Mac has not heard yet is the
+    /// headset's own: it goes to the Mac once for each connection. A choice of the Mac applies here
+    /// and stays for the time without a link.
+    fn take_choices(&self, id: u64, choices: crate::console::HeadsetChoices) {
+        let (room, volume) = {
+            let console = self.console.lock().unwrap();
+            let view = console.view();
+            (view.room, view.volume)
+        };
+        if (choices.room.is_none() || choices.volume.is_none()) && self.told_choices.swap(id, Ordering::AcqRel) != id {
+            use cranvr_common::menu::Request;
+            if choices.room.is_none() {
+                self.send_request(&Request::set("headset_room", room.key()));
+            }
+            if choices.volume.is_none() {
+                self.send_request(&Request::set("headset_volume", volume.key()));
+            }
+        }
+        if let Some(chosen) = choices.room.filter(|chosen| *chosen != room) {
+            self.choose_room(chosen);
+        }
+        if let Some(chosen) = choices.volume.filter(|chosen| *chosen != volume) {
+            log::info!("the Mac sets the volume to {}", chosen.label());
+            self.choose_volume(chosen);
         }
     }
 
@@ -718,6 +756,46 @@ impl Hub {
     pub fn ask_for_menu(&self) {
         log::info!("the Mac asks to open the hand menu");
         self.menu_asked.store(true, Ordering::Relaxed);
+    }
+
+    /// A press of the Mac on the headset's own page (`HostMsg::HeadsetRequest`). The UI does it with
+    /// its next look.
+    pub fn ask_headset(&self, text: &str) {
+        match serde_json::from_str(text).ok().as_ref().and_then(cranvr_common::menu::Request::from_json) {
+            Some(request) => {
+                log::info!("the Mac asks the headset for {text}");
+                let mut queue = self.headset_requests.lock().unwrap();
+                queue.push(request);
+                // A queue that nobody drains must not grow
+                let extra = queue.len().saturating_sub(16);
+                queue.drain(..extra);
+            }
+            None => log::warn!("the Mac sent a request for the headset that it cannot read: {text}"),
+        }
+    }
+
+    /// The Mac's presses on the headset's page since the last call
+    pub fn take_headset_requests(&self) -> Vec<cranvr_common::menu::Request> {
+        std::mem::take(&mut *self.headset_requests.lock().unwrap())
+    }
+
+    /// Sends the headset's own page to the Mac when it differs from the one that the link took last,
+    /// or when the link is new.
+    pub fn send_headset_page(&self, page: &cranvr_common::menu::Page) {
+        let id = self.current.load(Ordering::Acquire);
+        if id == 0 || self.snapshot.lock().unwrap().state != LinkState::Streaming {
+            return;
+        }
+        let Ok(text) = serde_json::to_string(page) else { return };
+        let mut sent = self.headset_page_sent.lock().unwrap();
+        if sent.as_ref().is_some_and(|(last_id, last)| *last_id == id && *last == text) {
+            return;
+        }
+        let taken = self.connection.lock().unwrap().as_ref().is_some_and(|connection| connection.send_headset_page(text.clone()));
+        if taken {
+            log::info!("the headset's page goes to the Mac: {} items, {} bytes", page.items.len(), text.len());
+            *sent = Some((id, text));
+        }
     }
 
     /// Whether the Mac asked to open the hand menu since the last call
@@ -826,14 +904,14 @@ impl Hub {
         audio::set_gain(volume.gain());
     }
 
-    /// The user chose what shows behind the panels while no game runs.
+    /// What shows behind the panels while no game runs, as the Mac keeps it.
     pub fn choose_room(&self, room: Room) {
-        log::info!("the console sets the room to {}", room.key());
+        log::info!("the Mac sets the room to {}", room.key());
         self.console.lock().unwrap().set_room(room);
         settings::remember_room(room);
     }
 
-    /// The user chose how loud the sound plays.
+    /// How loud the sound plays, as the Mac keeps it.
     pub fn choose_volume(&self, volume: Volume) {
         self.console.lock().unwrap().set_volume(volume);
         audio::set_gain(volume.gain());

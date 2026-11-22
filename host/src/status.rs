@@ -26,6 +26,8 @@
 //!   eye stayed black for several seconds while its left eye showed a picture. Eye "both": both
 //!   eyes stayed black for 90 seconds while the game delivered frames (see eye_check.rs). The host
 //!   sends it once for each game run.
+//! - `headset_page`: page, the headset's own page (`cranvr_common::menu::Page`): its panels, its
+//!   displays and its actions, which the app draws and presses through `headset JSON` on the input
 //! - `vr_request`: a button of the console in VR (see desktop_layer.rs): action "set" with id and
 //!   value, or "run" with id, each with the game's program as subject when the item names a game
 //!   (`cranvr_common::menu::Request`)
@@ -93,6 +95,18 @@ pub fn console_request(text: &str) -> bool {
         Ok(Value::Object(mut request)) => {
             request.insert("type".into(), "vr_request".into());
             emit(Value::Object(request));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Hands the headset's own page, a JSON object, to the cranvr app as a `headset_page` status line.
+/// Returns whether the text was such an object.
+pub fn headset_page(text: &str) -> bool {
+    match serde_json::from_str::<Value>(text) {
+        Ok(page @ Value::Object(_)) => {
+            emit(serde_json::json!({"type": "headset_page", "page": page}));
             true
         }
         _ => false,

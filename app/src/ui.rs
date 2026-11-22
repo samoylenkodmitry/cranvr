@@ -506,6 +506,10 @@ fn HeadsetCard(settings: MutableState<Settings>, model: MutableState<Model>) {
                 FlowRow(Modifier::empty().fill_max_width(), flow(), || {
                     Action("Open the menu in the headset".into(), backend::open_headset_menu);
                 });
+                // The headset's own page: its panels, its displays and its actions, as it sends them
+                if let Some(page) = model.with(|m| m.headset_page.clone()) {
+                    PageItems(page.items, settings, model);
+                }
             }
             None => {
                 Label("No headset connected".into());

@@ -100,6 +100,12 @@ pub struct Settings {
     pub added_games: Vec<AddedGame>,
     /// What games under Wine hear from the device "cranvr microphone" (see `microphone.rs`)
     pub microphone: crate::microphone::MicrophoneSource,
+    /// What the headset shows behind its panels while no game runs: "passthrough" or "scene". None
+    /// until the headset tells its own choice once: the headset kept it before the Mac did.
+    pub headset_room: Option<String>,
+    /// How loud the headset plays the sound, in percent of what the host sends. None until the
+    /// headset tells its own choice once.
+    pub headset_volume: Option<u32>,
 }
 
 impl Default for Settings {
@@ -126,6 +132,8 @@ impl Default for Settings {
             wine: WineOptions::default(),
             added_games: Vec::new(),
             microphone: Default::default(),
+            headset_room: None,
+            headset_volume: None,
         }
     }
 }
@@ -502,6 +510,9 @@ pub struct Model {
     pub learned_sizes: Vec<(String, f32)>,
     /// A setup ran at the last refresh, so its end shows at once
     pub setup_was_running: bool,
+    /// The connected headset's own page: its panels, its displays and its actions (see
+    /// `HostMsg::HeadsetRequest`)
+    pub headset_page: Option<cranvr_common::menu::Page>,
 }
 
 impl Model {
@@ -544,6 +555,12 @@ impl Model {
         self.log.push_back(line);
     }
 
+    /// Takes a status line of the host, for a test of another module.
+    #[cfg(test)]
+    pub fn apply_status_for_test(&mut self, v: &Value) {
+        self.apply_status(v);
+    }
+
     fn apply_status(&mut self, v: &Value) {
         match v["type"].as_str() {
             Some("headset") => {
@@ -556,6 +573,7 @@ impl Model {
                 if self.headset.is_none() {
                     self.stats = None;
                     self.vr_main = false;
+                    self.headset_page = None;
                 }
             }
             Some("game") => {
@@ -598,6 +616,7 @@ impl Model {
                 });
             }
             Some("vr_request") => self.vr_requests.push(v.clone()),
+            Some("headset_page") => self.headset_page = serde_json::from_value(v["page"].clone()).ok(),
             Some("black_eye") => self.black_eyes.push(v.clone()),
             Some("stats") => {
                 self.stats = Some(Stats {
@@ -707,6 +726,17 @@ pub fn tell_host_connection(connection: Connection) {
 /// The line that asks the host to open the hand menu of the connected headset (see
 /// host/src/headset/native.rs).
 const OPEN_MENU_LINE: &str = "menu open\n";
+
+/// Hands a press of the window on the headset's own page to the host, which sends it to the headset
+/// (`HostMsg::HeadsetRequest`).
+pub fn send_headset_request(request: &cranvr_common::menu::Request) {
+    let mut input = HOST_INPUT.lock().unwrap();
+    let line = format!("headset {}\n", request.to_json());
+    let sent = input.as_mut().map(|input| input.write_all(line.as_bytes()).and_then(|()| input.flush()));
+    if !matches!(sent, Some(Ok(()))) {
+        notify("The host did not take the request. Start the host and connect the headset.".into());
+    }
+}
 
 /// Asks the connected headset to open its hand menu, for a user whose controllers do not reach it.
 pub fn open_headset_menu() {
@@ -834,6 +864,8 @@ pub fn vr_menu(settings: &Settings, model: &Model) -> String {
         page.items.iter_mut().for_each(cranvr_common::menu::Item::drop_hint);
     }
     let mut menu = serde_json::json!({
+        // The headset applies these two itself, and it tells its own choice while they are null
+        "headset": {"room": settings.headset_room, "volume": settings.headset_volume},
         "pages": pages,
         "controls": settings.controls,
     });

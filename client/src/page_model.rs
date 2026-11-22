@@ -13,7 +13,7 @@
 //!
 //! The headset shows no hints: they are the Mac window's long words.
 
-use crate::console::{size, Menu, Pending, Press, Progress, Room, Shown, Volume};
+use crate::console::{size, Menu, Pending, Press, Progress, Shown};
 use cranvr_common::menu::{Buttons, Choice, Item, Page, Press as Link, Request, Style, Toggle, Tone, OFF, ON};
 use std::time::Instant;
 
@@ -254,26 +254,15 @@ pub fn page_rows(page: &Page, pending: Option<(&Pending, Progress)>) -> Vec<Row>
     rows
 }
 
-/// What the console needs besides the menu: the client's own settings and the link.
+/// What the console needs besides the menu: the link.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Local {
-    pub room: Room,
-    pub volume: Volume,
     /// A link runs, so Disconnect has a meaning
     pub link: bool,
 }
 
 fn key(label: &str, press: Press, look: Look) -> Key {
     Key { label: label.into(), press, look }
-}
-
-/// The two settings that the client keeps for itself: what shows behind the panels while no game
-/// runs, and how loud the sound plays.
-fn client_rows(local: Local, rows: &mut Vec<Row>) {
-    let rooms = Room::ALL.iter().map(|room| key(room.label(), Press::Room(*room), if *room == local.room { Look::Selected } else { Look::Normal })).collect();
-    rows.push(Row::new(Line::Keys { name: Name::Setting("Room".into()), keys: rooms }));
-    let volumes = Volume::ALL.iter().map(|volume| key(&volume.label(), Press::Volume(*volume), if *volume == local.volume { Look::Selected } else { Look::Normal })).collect();
-    rows.push(Row::new(Line::Keys { name: Name::Setting("Volume".into()), keys: volumes }));
 }
 
 /// The buttons at the bottom of the main page. Close hides the console. Controls opens the page for
@@ -288,14 +277,10 @@ fn bottom(local: Local) -> Row {
 }
 
 /// The rows of the console on `shown` with this menu. `status` is the stream's state for the title.
-/// Without a menu the console shows that the host offers none and the client's own settings.
+/// Without a menu the console shows that the host offers none, and its buttons.
 pub fn console_rows(menu: Option<&Menu>, shown: &Shown, local: Local, no_menu: &str, pending: Option<&Pending>, now: Instant) -> Vec<Row> {
     let Some(menu) = menu else {
-        let mut rows = vec![Row::new(Line::Title { text: "cranvr".into(), status: String::new() }), Row::new(Line::Text { text: no_menu.into(), tone: Tone::Muted })];
-        rows.push(Row::new(Line::Heading("Settings".into())));
-        client_rows(local, &mut rows);
-        rows.push(bottom(local));
-        return rows;
+        return vec![Row::new(Line::Title { text: "cranvr".into(), status: String::new() }), Row::new(Line::Text { text: no_menu.into(), tone: Tone::Muted }), bottom(local)];
     };
     let pending = pending.map(|pending| (pending, pending.progress(menu, now)));
     let page = match shown {
@@ -338,7 +323,6 @@ pub fn console_rows(menu: Option<&Menu>, shown: &Shown, local: Local, no_menu: &
             rows.push(Row::new(Line::Keys { name: Name::None, keys: chunk.to_vec() }));
         }
     }
-    client_rows(local, &mut rows);
     rows.push(bottom(local));
     rows
 }

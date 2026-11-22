@@ -56,9 +56,11 @@
 //!   for the host's menu and reads its pages. For each page that the hand menu lists, the right
 //!   controller holds B, which opens the hand menu, and presses the page's button there: the console
 //!   opens on that page. It presses the first option of the page's first choice that restarts nothing
-//!   and does not hold now, or the other state of its first such toggle. It presses no action. After
-//!   the last page it goes Back to the main page, opens the first game's Options and presses a change
-//!   there in the same way. `scripted_pages` names the pages to walk as a comma list of their ids.
+//!   and does not hold now, or the other state of its first such toggle. It presses no action. The
+//!   hand menu's Console button hides the console before each page's button opens it anew, because a
+//!   console that grows while it shows does not keep its middle. After the last page the Console
+//!   button shows the main page anew, B closes the hand menu, and the walk opens the first game's
+//!   Options and presses a change there in the same way. `scripted_pages` names the pages to walk as a comma list of their ids.
 //!   Each press waits 1 s with the ray at rest, as the pointer smooths the
 //!   ray. The log names each aim and each choice ("scripted pages:"), and the host's app saves each
 //!   change in its `app.json`.
@@ -378,7 +380,7 @@ fn empty_menu_height() -> f32 {
     use crate::{displays::DisplaysView, menu_place::MenuPlace, panel_layout::Layout};
     let layout = Layout::default();
     let displays = DisplaysView::default();
-    let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays, wishes: Default::default(), place: MenuPlace::View, adding: false, pages: &[] };
+    let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays, wishes: Default::default(), place: MenuPlace::View, adding: false, pages: &[], costs: true };
     menu_model::height(&menu_model::rows(&input))
 }
 
@@ -506,8 +508,17 @@ fn pages_check() {
             }
             std::thread::sleep(Duration::from_millis(200));
         };
-        // The list of displays comes with the link too, and the hand menu lists them above the pages
+        // The list of displays comes with the link too, and the hand menu lists them above the pages.
+        // The headset tells the Mac its room and volume when the Mac has none, and the next menu
+        // carries them: the pages' sizes count from that menu.
         std::thread::sleep(Duration::from_millis(1500));
+        let menu = loop {
+            let now = crate::hub::hub().console().menu.unwrap_or(menu.clone());
+            if (now.headset.room.is_some() && now.headset.volume.is_some()) || since.elapsed() > Duration::from_secs(8) {
+                break now;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        };
         match pages_script(&menu) {
             Some(right) => script_controller(right),
             None => log::warn!("scripted pages: the menu has no page with a change to press"),
@@ -519,7 +530,6 @@ fn pages_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
     use crate::{
         console::{Press, Shown},
         displays::displays,
-        hub::hub,
         menu_place::MenuPlace,
         page_model::{console_rows, find_key, key_point, Local},
         panel_layout::Layout,
@@ -528,14 +538,13 @@ fn pages_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
     let rest = ScriptedButtons::default();
     let pull = ScriptedButtons { trigger: 1.0, ..rest };
     let at = MENU_RIGHT_AT;
-    let view = hub().console();
-    let local = Local { room: view.room, volume: view.volume, link: true };
+    let local = Local { link: true };
     let now = std::time::Instant::now();
     // The hand menu in front of the user: its rows, as `hand_menu.rs` lays them out
     let pages = menu.listed();
     let layout = Layout::default();
     let displays_view = displays().menu_view();
-    let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays_view, wishes: Default::default(), place: MenuPlace::View, adding: false, pages: &pages };
+    let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays_view, wishes: Default::default(), place: MenuPlace::View, adding: false, pages: &pages, costs: true };
     let rows = menu_model::rows(&input);
     let height = menu_model::height(&rows);
     // The place of the button of the page `index` in the hand menu
@@ -563,31 +572,34 @@ fn pages_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
     };
     let mut right = ScriptedController::new(Hand::Right, at, away_from(at)).holding(Duration::from_millis(500), rest);
     log::info!("scripted pages: the hand menu {height:.0} dp tall with {} pages", pages.len());
-    // Each page: a hold of B opens the hand menu, the page's button opens the console there, and the
-    // first change of the page that restarts nothing is pressed
+    // The Console row's button, at the right end of the menu's first row, hides or shows the console
+    let console_button = on_view_menu(height, WIDTH - PADDING - menu_model::size::BUTTON / 2.0, PADDING + TITLE + GAP + ROW / 2.0);
+    let hold_b = |script: ScriptedController| script.holding(Duration::from_millis(1200), ScriptedButtons { secondary: true, ..rest }).holding(Duration::from_millis(800), rest);
+    // Each page: a hold of B opens the hand menu, its Console button hides the console that shows,
+    // and the page's button opens the console anew there, at its place in front of the user. The
+    // first change of the page that restarts nothing is pressed. A console that grows while it shows
+    // does not keep its middle, so each page opens anew.
     // `scripted_pages` names the pages to walk, as a comma list of their ids; all by default
     let wanted: Option<Vec<String>> = launch_args().string("scripted_pages").map(|list| list.split(',').map(|id| id.trim().to_string()).collect());
-    let mut last = None;
     for (index, (id, short)) in pages.iter().enumerate() {
         if wanted.as_ref().is_some_and(|wanted| !wanted.contains(id)) {
             continue;
         }
         let target = page_button(index)?;
-        right = right.holding(Duration::from_millis(1200), ScriptedButtons { secondary: true, ..rest }).holding(Duration::from_millis(800), rest);
+        right = press(hold_b(right), console_button);
         log::info!("scripted pages: the page {short} ({id}) at {target:?}");
         right = press(right, target);
-        let page = Shown::Host(id.clone());
         if let Some(change) = menu.page(id).and_then(first_change) {
-            let target = key_at(&page, &Press::Host(change.clone()))?;
+            let target = key_at(&Shown::Host(id.clone()), &Press::Host(change.clone()))?;
             log::info!("scripted pages: on {id} the change {} at {target:?}", change.to_json());
             right = press(right, target);
         }
-        last = Some(page);
     }
-    let page = last?;
-    // Back to the main page, and the first game's options there: the first link to a page that the
-    // menus do not list
-    right = press(right, key_at(&page, &Press::Back)?);
+    // The main page anew: the Console button hides the console and shows it again on its main page,
+    // and B closes the hand menu. Then the first game's options: the first link to a page that the
+    // menus do not list.
+    right = press(press(hold_b(right), console_button), console_button);
+    right = hold_b(right);
     let options = menu.main().and_then(|main| {
         main.items.iter().find_map(|item| match item {
             cranvr_common::menu::Item::Buttons(row) => row.buttons.iter().find_map(|button| match &button.press {
