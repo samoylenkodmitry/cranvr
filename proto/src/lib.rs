@@ -65,7 +65,9 @@ pub use wire::{Error, Nanos};
 ///
 /// Version 14 adds the action `menu` to the controls of the console's menu: a button that opens the
 /// hand menu.
-pub const PROTOCOL_VERSION: u16 = 14;
+///
+/// Version 15 adds [`message::HostMsg::OpenMenu`]: the Mac opens the headset's hand menu.
+pub const PROTOCOL_VERSION: u16 = 15;
 
 /// The largest datagram, in bytes, sealed: the counter and the tag are in it. A media packet and
 /// any datagram message fit in it. A typical path MTU of 1500 bytes minus the IP and UDP headers

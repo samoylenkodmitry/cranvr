@@ -189,6 +189,12 @@ pub trait Headset: Send + Sync {
     /// Sends the console's menu as a JSON text, when the link has a console.
     fn send_menu(&self, _menu: &str) {}
 
+    /// Asks the headset to open its hand menu, when a headset is connected and its link has one.
+    /// Returns whether a headset took the request.
+    fn open_menu(&self) -> bool {
+        false
+    }
+
     /// The tracking features that a game uses now. The link asks the headset for these, within what
     /// the headset offers, and for nothing else. It asks again at each new connection.
     fn set_tracking_wish(&self, _wish: Features) {}

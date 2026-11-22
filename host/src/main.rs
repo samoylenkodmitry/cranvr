@@ -166,7 +166,8 @@ fn usage() -> ! {
          \n  --no-desktop-layer do not show the desktop as a panel in the headset\
          \n\nEnvironment: CRANVR_POINTER_DRY_RUN=1 logs the mouse events that a controller would make\
          \nand posts none (for tests with a controller on a desk).\
-         \n  --status          print status lines (@cranvr JSON) on stdout, for the cranvr app\
+         \n  --status          print status lines (@cranvr JSON) on stdout, for the cranvr app. The\
+         \n                    line `menu open` on the input opens the headset's hand menu.\
          \n\nGames: the host writes runtime-control.txt into the config dir. Start the game under Wine\
          \nwith BASALT_CONTROL set to that file's Windows path (scripts/run-game.sh does this)."
     );
@@ -438,16 +439,18 @@ fn main() {
             ..Default::default()
         };
         let config = native_config(&options, &config_dir, panel);
-        // The cranvr app sends the user's answers to the headsets' requests on the host's input.
-        // A host without --status leaves its input alone: a background job that reads its
-        // terminal would stop.
-        if status::enabled() {
-            headset::native::read_input(Arc::clone(&config.pairings), Arc::clone(&config.cable));
-        }
-        headset::native::start(config).unwrap_or_else(|e| {
+        let (pairings, cable) = (Arc::clone(&config.pairings), Arc::clone(&config.cable));
+        let started = headset::native::start(config).unwrap_or_else(|e| {
             error!("Native protocol: cannot listen on port {}: {e}", options.native_port);
             std::process::exit(1)
-        })
+        });
+        // The cranvr app sends the user's answers to the headsets' requests and its other lines on
+        // the host's input. A host without --status leaves its input alone: a background job that
+        // reads its terminal would stop.
+        if status::enabled() {
+            headset::native::read_input(pairings, cable, Arc::clone(&started.0));
+        }
+        started
     };
     let shared = Arc::new(Shared {
         stream: Mutex::new(None),

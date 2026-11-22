@@ -376,6 +376,8 @@ pub struct Hub {
     runner: Mutex<Runner>,
     /// The headset actions that fired and that the UI has not run yet
     fires: Mutex<Vec<Fire>>,
+    /// The Mac asked to open the hand menu, and the UI has not opened it yet
+    menu_asked: AtomicBool,
     /// The saved settings of the console were loaded. A rebuilt composition must not load them
     /// again, because the choices in memory are newer when a save failed.
     settings_loaded: AtomicBool,
@@ -404,6 +406,7 @@ pub fn hub() -> &'static Hub {
         console: Mutex::new(Console::default()),
         runner: Mutex::new(Runner::default()),
         fires: Mutex::new(Vec::new()),
+        menu_asked: AtomicBool::new(false),
         settings_loaded: AtomicBool::new(false),
     })
 }
@@ -698,6 +701,17 @@ impl Hub {
         let extra = queue.len().saturating_sub(16);
         queue.drain(..extra);
         fires
+    }
+
+    /// The Mac asks to open the hand menu (`HostMsg::OpenMenu`). The UI opens it with its next look.
+    pub fn ask_for_menu(&self) {
+        log::info!("the Mac asks to open the hand menu");
+        self.menu_asked.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the Mac asked to open the hand menu since the last call
+    pub fn take_menu_request(&self) -> bool {
+        self.menu_asked.swap(false, Ordering::Relaxed)
     }
 
     /// The headset actions that fired and that the UI has not taken yet
