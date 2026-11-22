@@ -140,6 +140,10 @@ pub fn ClientApp() {
             for fire in hub().take_fires() {
                 run_fire(fire.action, layout, typing, recenters, menu_open);
             }
+            if hub().take_menu_request() && !menu_open.get_non_reactive() {
+                log::info!("the Mac opens the hand menu {}", hand_menu::current_place().label());
+                menu_open.set(true);
+            }
             if let Some(pointer) = &pointer_settings {
                 let streaming = snapshot.get_non_reactive().state == LinkState::Streaming;
                 let shown = layout.get_non_reactive();

@@ -528,6 +528,10 @@ fn HeadsetCard(settings: MutableState<Settings>, model: MutableState<Model>) {
                     let latency = st.latency_ms.map(|ms| format!(", {ms:.0} ms from motion to display")).unwrap_or_default();
                     Hint(format!("{:.0} fps, render {:.1} ms, encode {:.1} ms, {}{latency}", st.fps, st.render_ms, st.encode_ms, bitrate_text(&st)));
                 }
+                // A user whose controllers do not reach the hand menu opens it from here
+                FlowRow(Modifier::empty().fill_max_width(), flow(), || {
+                    Action("Open the menu in the headset".into(), backend::open_headset_menu);
+                });
             }
             None => {
                 Label("No headset connected".into());
@@ -1195,7 +1199,7 @@ fn ControlsPage(settings: MutableState<Settings>) {
     let menu_hand = controls.menu_hand;
     Card(move || {
         Heading("Hand menu".into());
-        Hint("The hand menu shows and hides every panel and opens the console. A button opens it, as the controls above say, or a press on the ball. With both controllers the ball and the menu ride on one hand, and the other hand points at them. Auto puts them on the hand that did not last press a panel. With one controller, or none, they stand in front of you, and that controller points at them. A controller that stops tracking for 2 seconds gives them up.".into());
+        Hint("The hand menu shows and hides every panel and opens the console. A button opens it, as the controls above say, or a press on the ball, or the button \"Open the menu in the headset\" at the top of this window while a headset is connected. With both controllers the ball and the menu ride on one hand, and the other hand points at them. Auto puts them on the hand that did not last press a panel. With one controller, or none, they stand in front of you, and that controller points at them. A controller that stops tracking for 2 seconds gives them up.".into());
         FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
             for choice in MenuHand::ALL {
                 Choice(choice.label().into(), menu_hand == choice, move || set_menu_hand(settings, choice));

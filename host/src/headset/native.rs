@@ -276,8 +276,9 @@ fn start_discovery(port: u16, config: &Config) {
 
 /// Reads the cranvr app's lines from the host's input. `allow KEY` or `deny KEY` is the user's answer
 /// to a headset's request, with the key that the status line shows. `cable on` or `cable off` is the
-/// user's Connection choice: off for Wi-Fi. A person who runs the host by hand may type them.
-pub fn read_input(pairings: Arc<Pairings>, cable: Arc<AtomicBool>) {
+/// user's Connection choice: off for Wi-Fi. `menu open` opens the hand menu of the connected headset.
+/// A person who runs the host by hand may type them.
+pub fn read_input(pairings: Arc<Pairings>, cable: Arc<AtomicBool>, headset: Arc<dyn Headset>) {
     thread::Builder::new()
         .name("native-input".into())
         .spawn(move || {
@@ -293,6 +294,13 @@ pub fn read_input(pairings: Arc<Pairings>, cable: Arc<AtomicBool>) {
                         if on { "the user allowed the USB cable" } else { "the user chose Wi-Fi, so the next headset on the USB cable connects over Wi-Fi" }
                     ),
                     Some(Command::Cable(_)) | None => {}
+                    Some(Command::OpenMenu) => {
+                        if headset.open_menu() {
+                            info!("Native protocol: the user asked the headset to open its hand menu");
+                        } else {
+                            info!("Native protocol: no headset is connected to open its hand menu");
+                        }
+                    }
                 }
             }
         })
@@ -306,9 +314,11 @@ enum Command {
     Answer { allow: bool, key: [u8; KEY_LEN] },
     /// Whether the host takes a link over a USB cable
     Cable(bool),
+    /// The user asks the headset to open its hand menu
+    OpenMenu,
 }
 
-/// `allow KEY`, `deny KEY` (the key is 64 hex digits), `cable on` or `cable off`.
+/// `allow KEY`, `deny KEY` (the key is 64 hex digits), `cable on`, `cable off` or `menu open`.
 fn parse_command(line: &str) -> Option<Command> {
     let mut words = line.split_whitespace();
     let command = match words.next()? {
@@ -318,6 +328,10 @@ fn parse_command(line: &str) -> Option<Command> {
             "off" => false,
             _ => return None,
         }),
+        "menu" => match words.next()? {
+            "open" => Command::OpenMenu,
+            _ => return None,
+        },
         _ => return None,
     };
     words.next().is_none().then_some(command)
@@ -1514,6 +1528,17 @@ impl Headset for Native {
         if let Some(session) = self.shared.session() {
             if let Err(e) = session.link.duplex.send_control(&HostMsg::Menu(menu.to_owned())) {
                 warn!("Native protocol: the console's menu did not go out: {e}");
+            }
+        }
+    }
+
+    fn open_menu(&self) -> bool {
+        let Some(session) = self.shared.session() else { return false };
+        match session.link.duplex.send_control(&HostMsg::OpenMenu) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("Native protocol: the request to open the hand menu did not go out: {e}");
+                false
             }
         }
     }

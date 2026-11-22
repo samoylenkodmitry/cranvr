@@ -554,6 +554,16 @@ fn the_connection_choice_comes_as_a_line() {
     }
 }
 
+// The cranvr app's button "Open the menu in the headset" writes a line to the host's input
+#[test]
+fn the_request_to_open_the_hand_menu_comes_as_a_line() {
+    assert_eq!(parse_command("menu open"), Some(Command::OpenMenu));
+    assert_eq!(parse_command("  menu   open "), Some(Command::OpenMenu));
+    for wrong in ["menu", "menu close", "menu open now", "menus open"] {
+        assert_eq!(parse_command(wrong), None, "{wrong}");
+    }
+}
+
 #[test]
 fn a_version_mismatch_tells_the_user_which_side_to_update() {
     use cranvr_proto::wire::Error;

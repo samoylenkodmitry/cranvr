@@ -616,6 +616,7 @@ fn read_loop(shared: &Arc<Shared>, units: &mpsc::Sender<Received>, udp: bool) {
             }
         }
         Incoming::Control(HostMsg::Bye) => shared.stop.store(true, Ordering::Relaxed),
+        Incoming::Control(HostMsg::OpenMenu) => println!("probe: the host asks to open the hand menu"),
         Incoming::Control(HostMsg::Microphone(record)) => {
             if shared.recording.swap(record, Ordering::Relaxed) != record {
                 println!("probe: the host asks {} the microphone", if record { "for" } else { "no more for" });

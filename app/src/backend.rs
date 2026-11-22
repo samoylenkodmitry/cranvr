@@ -690,6 +690,19 @@ pub fn tell_host_connection(connection: Connection) {
     }
 }
 
+/// The line that asks the host to open the hand menu of the connected headset (see
+/// host/src/headset/native.rs).
+const OPEN_MENU_LINE: &str = "menu open\n";
+
+/// Asks the connected headset to open its hand menu, for a user whose controllers do not reach it.
+pub fn open_headset_menu() {
+    let mut input = HOST_INPUT.lock().unwrap();
+    let sent = input.as_mut().map(|input| input.write_all(OPEN_MENU_LINE.as_bytes()).and_then(|()| input.flush()));
+    if !matches!(sent, Some(Ok(()))) {
+        notify("The host did not take the request. Start the host and connect the headset.".into());
+    }
+}
+
 /// The command line of `cranvr-host`. `test` is for tests on one Mac: the probe needs no pairing and
 /// TCP media.
 fn host_args(settings: &Settings, config_dir: &Path, test: bool) -> Vec<OsString> {

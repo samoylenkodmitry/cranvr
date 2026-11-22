@@ -326,6 +326,9 @@ pub enum HostMsg {
     /// and sends [`ClientDatagram::Microphone`]. A client that does not record costs nothing. The
     /// host sends it when the client connects and when it changes.
     Microphone(bool),
+    /// The host's user asks the headset to open its hand menu: a button of the cranvr app on the Mac.
+    /// A user whose controllers do not reach the menu opens it this way.
+    OpenMenu,
 }
 
 /// Datagram messages from the client to the host.
