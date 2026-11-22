@@ -485,6 +485,20 @@ if [[ -n ${wine} ]]; then
         > "${work}/game.log" 2>&1 &
     pids+=($!)
 fi
+# SteamVR goes on drawing its own room after the program ends, so the host's last eyes are SteamVR's. The run keeps
+# the eyes of 10 seconds into the program's frames for the check below.
+if (( steamvr )); then
+    (
+        for i in {1..240}; do
+            grep -q "openvr_smoke: initialised" "${work}/game.log" 2>/dev/null && break
+            sleep 0.5
+        done
+        sleep 10
+        mkdir -p "${work}/eyes-game"
+        cp "${work}/eyes/eye-left.png" "${work}/eyes/eye-right.png" "${work}/eyes-game/" 2>/dev/null
+    ) &
+    pids+=($!)
+fi
 
 probe_args=(--seconds "${seconds}" --connect "127.0.0.1:${native_port}" --drop-percent "${native_drop}")
 (( native_tcp )) && probe_args+=(--tcp)
@@ -583,7 +597,9 @@ sys.exit(0 if mean >= 0.5 * fps else 1)
 PYTHON
     fi
     # The picture of each eye reaches the host the right way up: the program's upper half is bright, its lower half nearly black
-    python3 -I - "${work}/eyes" <<'PYTHON' || { print -u2 "The picture of the OpenVR program is not the right way up in the host; see ${work}/eyes"; openvr_exit=1; }
+    eyes=${work}/eyes
+    (( steamvr )) && eyes=${work}/eyes-game
+    python3 -I - "${eyes}" <<'PYTHON' || { print -u2 "The picture of the OpenVR program is not the right way up in the host; see ${eyes}"; openvr_exit=1; }
 import struct, sys, zlib
 def read_png(path):
     data = open(path, "rb").read()
