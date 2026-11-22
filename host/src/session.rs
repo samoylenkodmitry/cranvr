@@ -33,6 +33,8 @@ pub struct Options {
     pub strict_rate: bool,
     /// The Mac's sound plays in the headset (see game_audio.rs)
     pub game_audio: bool,
+    /// Keep the ring of the headset's microphone for games (`headset/native/microphone.rs`)
+    pub microphone: bool,
     /// Scaled displays get their panels' own pixels while a game runs (see display_modes.rs)
     pub unscale_displays: bool,
     /// A tracked hand makes the controller of a game that has no hand code, while the headset

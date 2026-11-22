@@ -23,6 +23,7 @@ fn caps(name: &str) -> ClientCaps {
         foveation: true,
         tcp_only: false,
         cable: false,
+        microphone: false,
     }
 }
 
@@ -52,6 +53,7 @@ fn config(port: u16) -> Config {
         display_lock: true,
         desktop: Default::default(),
         audio: false,
+        microphone: None,
         tcp_media: false,
         wishes: HostWishes {
             eye_width: 2064,

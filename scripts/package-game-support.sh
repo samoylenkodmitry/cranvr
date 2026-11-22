@@ -1,7 +1,7 @@
 #!/bin/zsh
 # Packs cranvr's game support into one archive that another Mac can install without building:
 # Wine 11.10 with cranvr's DXMT fork and cranvr's patched Wine files (wined3d.dll, wininet.dll, wtsapi32.dll,
-# user32.dll, winemac.so, opengl32.so and ntdll.so), BasaltVR's OpenXR runtime with cranvr's patches, OpenComposite, which runs
+# user32.dll, winemac.so, opengl32.so, ntdll.so and winecoreaudio.so), BasaltVR's OpenXR runtime with cranvr's patches, OpenComposite, which runs
 # OpenVR games on that runtime, and cranvr's SteamVR driver, which runs OpenVR games in SteamVR for Windows.
 #
 # Usage: scripts/package-game-support.sh [OUT_DIR]
@@ -31,13 +31,14 @@
 #                OpenVR test program
 #   steamvr-driver/  cranvr's SteamVR driver as SteamVR loads it: driver.vrdrivermanifest, bin/win64/driver_cranvr.dll
 #                and resources/settings/default.vrsettings
-#   wine-patched/  Wine's wined3d.dll, wininet.dll, wtsapi32.dll, user32.dll, winemac.so, opengl32.so and ntdll.so with cranvr's
-#                patches,
+#   wine-patched/  Wine's wined3d.dll, wininet.dll, wtsapi32.dll, user32.dll, winemac.so, opengl32.so, ntdll.so and
+#                winecoreaudio.so with cranvr's patches,
 #                hlsl_compile.exe (cranvr's test program for the HLSL compiler) with the shader that it compiles,
 #                gl_compat_check.exe (cranvr's test program for an OpenGL program like Google Earth VR),
 #                far_jump_check.exe (cranvr's test program for the far jump of MonoMod's detours),
-#                stack_sample_check.exe (cranvr's test program for a sampling profiler's stack copy) and
-#                session_check.exe (cranvr's test program for the session's state, as SteamVR asks for it)
+#                stack_sample_check.exe (cranvr's test program for a sampling profiler's stack copy),
+#                session_check.exe (cranvr's test program for the session's state, as SteamVR asks for it) and
+#                microphone_check.exe (cranvr's test program for the microphone that games hear)
 #   SOURCE/      opencomposite-source.tar.xz and wine-source.tar.xz: the sources of those files (see below)
 #   LICENSES/    the licenses of Wine, DXMT, BasaltVR, the OpenXR SDK and OpenComposite with its parts
 #   SOURCES.md   where each part comes from and which patches it carries
@@ -94,8 +95,8 @@ if [[ ${oc_support}/tests/openvr_smoke.cpp -nt ${oc_build}/bin/openvr_smoke.exe 
     exit 1
 fi
 
-wine_files=(wined3d.dll wininet.dll wtsapi32.dll user32.dll winemac.so opengl32.so ntdll.so hlsl_compile.exe isnan.hlsl
-    gl_compat_check.exe far_jump_check.exe stack_sample_check.exe session_check.exe)
+wine_files=(wined3d.dll wininet.dll wtsapi32.dll user32.dll winemac.so opengl32.so ntdll.so winecoreaudio.so hlsl_compile.exe
+    isnan.hlsl gl_compat_check.exe far_jump_check.exe stack_sample_check.exe session_check.exe microphone_check.exe)
 for f in "${wine_files[@]/#/${wine_build}/bin/}" "${wine_src}/.git"; do
     if [[ ! -e ${f} ]]; then
         print -u2 "Missing ${f}. Run scripts/build-wine.sh first."
@@ -103,7 +104,7 @@ for f in "${wine_files[@]/#/${wine_build}/bin/}" "${wine_src}/.git"; do
     fi
 done
 # A file older than the patches, the build or its test program was built before the last change
-for file in wined3d.dll wininet.dll wtsapi32.dll user32.dll winemac.so opengl32.so ntdll.so; do
+for file in wined3d.dll wininet.dll wtsapi32.dll user32.dll winemac.so opengl32.so ntdll.so winecoreaudio.so; do
     for source in "${wine_support}"/patches/*.patch "${cranvr}/scripts/build-wine.sh"; do
         if [[ ${source} -nt ${wine_build}/bin/${file} ]]; then
             print -u2 "${source:t} is newer than ${file}. Run scripts/build-wine.sh first."
@@ -112,7 +113,8 @@ for file in wined3d.dll wininet.dll wtsapi32.dll user32.dll winemac.so opengl32.
     done
 done
 for pair in hlsl_compile.cpp:hlsl_compile.exe isnan.hlsl:hlsl_compile.exe gl_compat_check.cpp:gl_compat_check.exe \
-    far_jump_check.cpp:far_jump_check.exe stack_sample_check.cpp:stack_sample_check.exe session_check.cpp:session_check.exe; do
+    far_jump_check.cpp:far_jump_check.exe stack_sample_check.cpp:stack_sample_check.exe session_check.cpp:session_check.exe \
+    microphone_check.cpp:microphone_check.exe; do
     if [[ ${wine_support}/tests/${pair%%:*} -nt ${wine_build}/bin/${pair##*:} ]]; then
         print -u2 "${pair%%:*} is newer than ${pair##*:}. Run scripts/build-wine.sh first."
         exit 1
@@ -162,7 +164,8 @@ cp "${wine_files[@]/#/${wine_build}/bin/}" "${root}/wine-patched/"
 # The engine's own copies: the prefix takes its copies of the Windows DLLs from wine-patched/ at setup
 cp "${wine_build}/bin/wined3d.dll" "${wine_build}/bin/wininet.dll" "${wine_build}/bin/wtsapi32.dll" "${wine_build}/bin/user32.dll" \
     "${root}/engine/lib/wine/x86_64-windows/"
-cp "${wine_build}/bin/winemac.so" "${wine_build}/bin/opengl32.so" "${wine_build}/bin/ntdll.so" "${root}/engine/lib/wine/x86_64-unix/"
+cp "${wine_build}/bin/winemac.so" "${wine_build}/bin/opengl32.so" "${wine_build}/bin/ntdll.so" "${wine_build}/bin/winecoreaudio.so" \
+    "${root}/engine/lib/wine/x86_64-unix/"
 # The patched files are Wine's (LGPL 2.1 or later; wined3d.dll holds vkd3d-shader). Their source goes with them:
 # the pinned tag's tree as it is on winehq.org, cranvr's patches and the steps of the build.
 wine_commit=$(git -C "${wine_src}" rev-parse HEAD)
@@ -173,10 +176,11 @@ git -C "${wine_src}" archive --format=tar HEAD | tar -x -C "${wine_tree}/Wine"
 cp -R "${wine_support}/patches" "${wine_tree}/cranvr/"
 cp "${wine_support}/tests/hlsl_compile.cpp" "${wine_support}/tests/isnan.hlsl" "${wine_support}/tests/gl_compat_check.cpp" \
     "${wine_support}/tests/far_jump_check.cpp" "${wine_support}/tests/stack_sample_check.cpp" \
-    "${wine_support}/tests/session_check.cpp" "${wine_tree}/cranvr/tests/"
+    "${wine_support}/tests/session_check.cpp" "${wine_support}/tests/microphone_check.cpp" "${wine_tree}/cranvr/tests/"
 cp "${cranvr}/scripts/build-wine.sh" "${wine_tree}/cranvr/scripts/"
 {
-    print "Source of wined3d.dll, wininet.dll, wtsapi32.dll, user32.dll, winemac.so, opengl32.so and ntdll.so in cranvr's game support"
+    print "Source of wined3d.dll, wininet.dll, wtsapi32.dll, user32.dll, winemac.so, opengl32.so, ntdll.so and winecoreaudio.so"
+    print "in cranvr's game support"
     print "(Wine 11.10, LGPL 2.1 or later, see Wine/COPYING.LIB and Wine/libs/vkd3d/COPYING)"
     print
     print "Wine/            https://gitlab.winehq.org/wine/wine at the tag wine-11.10, commit ${wine_commit}, as it is"
@@ -195,12 +199,16 @@ cp "${cranvr}/scripts/build-wine.sh" "${wine_tree}/cranvr/scripts/"
     print "                 0006 makes wtsapi32 answer WTSSessionInfoEx (the console's session, unlocked) and WTSIsRemoteSession"
     print "                 (a local session): SteamVR's compositor took a session without an answer as locked and hid the picture,"
     print "                 0007 makes user32 export DwmGetDxSharedSurface, which fails: SteamVR's dashboard did not start"
-    print "                 without the import (vrdesktop.dll)."
-    print "cranvr/tests     hlsl_compile.cpp, gl_compat_check.cpp, far_jump_check.cpp, stack_sample_check.cpp and session_check.cpp, the test"
+    print "                 without the import (vrdesktop.dll),"
+    print "                 0008 gives winecoreaudio the capture device \"cranvr microphone\", the default one, while cranvr's"
+    print "                 microphone.txt names a source: it records the headset's microphone from a ring in shared memory"
+    print "                 that cranvr's host writes, a Mac input device, or silence (dlls/winecoreaudio.drv/coreaudio.c)."
+    print "cranvr/tests     hlsl_compile.cpp, gl_compat_check.cpp, far_jump_check.cpp, stack_sample_check.cpp, session_check.cpp and"
+    print "                 microphone_check.cpp, the test"
     print "                 programs that are next to the files (they are not part of Wine). isnan.hlsl is the shader that"
     print "                 hlsl_compile.exe compiles."
     print "cranvr/scripts/build-wine.sh  the build: git apply, configure (under Rosetta 2 on an Apple Silicon Mac, with"
-    print "                 MinGW-w64 for the Windows files and macOS 10.15 as the oldest system), then make for the seven"
+    print "                 MinGW-w64 for the Windows files and macOS 10.15 as the oldest system), then make for the eight"
     print "                 files. They appear under dlls/ in the build folder. It needs flex, bison 3 or later and mingw-w64"
     print "                 (Homebrew), and Xcode's command line tools."
 } > "${wine_tree}/README.txt"
@@ -293,7 +301,7 @@ dxmt_commit=$(git -C "${runtime}/build/dxmt/src" rev-parse HEAD)
     print "# Sources of cranvr's game support"
     print
     print -r -- "- Wine 11.10: Gcenx's macOS build, https://github.com/Gcenx/macOS_Wine_builds/releases/tag/11.10 (LGPL 2.1 or later; source at https://gitlab.winehq.org/wine/wine/-/tags/wine-11.10). Unchanged, apart from DXMT's DLLs and the patched Wine files (next line)."
-    print -r -- "- wined3d.dll, wininet.dll, wtsapi32.dll, user32.dll, winemac.so, opengl32.so and ntdll.so of Wine 11.10 (LGPL 2.1 or later), built from https://gitlab.winehq.org/wine/wine at the tag wine-11.10, commit ${wine_commit}, with cranvr's patches 0001 (the HLSL intrinsic isnan in vkd3d-shader), 0002 (a core OpenGL context for a request of the compatibility profile), 0003 (legacy GLSL in a core context), 0004 (wininet's handles closed on several threads), 0005 (memory above 4 GB for a program with high-entropy addresses on macOS), 0006 (an unlocked local session for SteamVR) and 0007 (DwmGetDxSharedSurface for SteamVR's dashboard). They replace the files in the engine, and the DLLs also in the Wine prefix. Their source, the patches and the build are in SOURCE/wine-source.tar.xz of this archive and in the file cranvr-wine-source.tar.xz of the release. wine-patched/hlsl_compile.exe, wine-patched/gl_compat_check.exe, wine-patched/far_jump_check.exe, wine-patched/stack_sample_check.exe and wine-patched/session_check.exe are cranvr's own test programs (MIT)."
+    print -r -- "- wined3d.dll, wininet.dll, wtsapi32.dll, user32.dll, winemac.so, opengl32.so, ntdll.so and winecoreaudio.so of Wine 11.10 (LGPL 2.1 or later), built from https://gitlab.winehq.org/wine/wine at the tag wine-11.10, commit ${wine_commit}, with cranvr's patches 0001 (the HLSL intrinsic isnan in vkd3d-shader), 0002 (a core OpenGL context for a request of the compatibility profile), 0003 (legacy GLSL in a core context), 0004 (wininet's handles closed on several threads), 0005 (memory above 4 GB for a program with high-entropy addresses on macOS), 0006 (an unlocked local session for SteamVR), 0007 (DwmGetDxSharedSurface for SteamVR's dashboard) and 0008 (the capture device \"cranvr microphone\", which records the headset's microphone, a Mac input device or silence). They replace the files in the engine, and the DLLs also in the Wine prefix. Their source, the patches and the build are in SOURCE/wine-source.tar.xz of this archive and in the file cranvr-wine-source.tar.xz of the release. wine-patched/hlsl_compile.exe, wine-patched/gl_compat_check.exe, wine-patched/far_jump_check.exe, wine-patched/stack_sample_check.exe, wine-patched/session_check.exe and wine-patched/microphone_check.exe are cranvr's own test programs (MIT)."
     print -r -- "- DXMT v0.80 (MIT), https://github.com/3Shain/dxmt, with BasaltVR's patches 0001 to 0004 and cranvr's patches 0005 to 0018. Tree commit ${dxmt_commit}."
     print -r -- "- steamvr-driver/: cranvr's SteamVR driver (MIT), built from steamvr/driver_cranvr.cpp of cranvr with MinGW-w64. It includes Valve's openvr_driver.h of OpenVR 2.15.6 (BSD 3-Clause, LICENSES/SteamVR-driver-OpenVR-headers-BSD-3-Clause.txt). SteamVR itself is not part of this archive: it comes from the user's Steam library."
     print -r -- "- BasaltVR (MIT), https://github.com/Stooovie/BasaltVR at ${basalt_commit}, with cranvr's runtime patches."

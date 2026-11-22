@@ -106,6 +106,8 @@ pub struct ClientCaps {
     /// The link runs over a USB cable: `adb reverse` or the headset's USB network to the Mac. The
     /// host then sends at the cable's bitrate.
     pub cable: bool,
+    /// The client can record its microphone for the host's games (see [`HostMsg::Microphone`])
+    pub microphone: bool,
 }
 
 /// The two eyes' field of view and their place relative to the head.
@@ -320,6 +322,10 @@ pub enum HostMsg {
     /// client connects and when it changes. The host hides no display for a game: a display that
     /// the client wishes goes on.
     GameRuns(bool),
+    /// Whether a game records from the client's microphone. The client records while it is true
+    /// and sends [`ClientDatagram::Microphone`]. A client that does not record costs nothing. The
+    /// host sends it when the client connects and when it changes.
+    Microphone(bool),
 }
 
 /// Datagram messages from the client to the host.
@@ -349,6 +355,8 @@ pub enum ClientDatagram {
     /// The controllers' input with the hands that the app holds back from the game (see
     /// [`InputHold`]). The client sends it for every headset frame that has input.
     InputHold(InputHold),
+    /// Sound of the client's microphone, while the host asks for it with [`HostMsg::Microphone`]
+    Microphone(Microphone),
 }
 
 /// Datagram messages from the host to the client.
@@ -512,6 +520,25 @@ pub struct Audio {
     pub sequence: u32,
     /// When the host captured the first sample, on the host's clock
     pub host_time: Nanos,
+    pub pcm: Vec<u8>,
+}
+
+/// The format of the client's microphone in [`Microphone`]: one channel at 48 kHz, 16 bits.
+pub const MICROPHONE_FORMAT: AudioFormat = AudioFormat { sample_rate: 48_000, channels: 1, sample: SampleFormat::S16Le };
+
+/// The frames in one [`Microphone`] datagram: 10 ms, 960 bytes.
+pub const MICROPHONE_FRAMES: usize = 480;
+
+const _: () = assert!(MICROPHONE_FRAMES * 2 <= MAX_AUDIO_BYTES);
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Microphone {
+    /// Counts up by one per datagram, so the host sees gaps
+    pub sequence: u32,
+    /// When the microphone took the first frame, on the client's clock. A client whose platform
+    /// gives no capture time sends the time at which the frame reached the app.
+    pub captured: Nanos,
+    /// [`MICROPHONE_FRAMES`] frames of [`MICROPHONE_FORMAT`]
     pub pcm: Vec<u8>,
 }
 

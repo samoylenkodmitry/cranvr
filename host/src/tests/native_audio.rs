@@ -30,6 +30,7 @@ fn the_sound_reaches_the_client_in_datagrams_of_five_milliseconds() {
         display_lock: false,
         desktop: Default::default(),
         audio: true,
+        microphone: None,
         tcp_media: false,
         wishes: HostWishes {
             eye_width: 2064,
@@ -53,6 +54,7 @@ fn the_sound_reaches_the_client_in_datagrams_of_five_milliseconds() {
         foveation: true,
         tcp_only: false,
         cable: false,
+        microphone: false,
     };
     let client = Arc::new(ClientLink::connect(([127, 0, 0, 1], port).into(), &caps, &identity, None, Duration::from_secs(10)).unwrap());
     // The welcome tells the client that sound comes

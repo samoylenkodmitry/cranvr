@@ -15,7 +15,9 @@
 #     threads closed in a race; ntdll.so, which gives a program with high-entropy addresses its memory above
 #     4 GB as Windows does, so MonoMod's detours in Unity mods find free pages near their code; wtsapi32.dll,
 #     which reports the session as unlocked, so SteamVR's compositor shows the picture; user32.dll, which exports
-#     the function that SteamVR's dashboard needs to start
+#     the function that SteamVR's dashboard needs to start; winecoreaudio.so, which gives games the capture
+#     device "cranvr microphone" (the headset's microphone, a Mac input device or silence, as cranvr's
+#     microphone.txt says)
 #
 # The BasaltVR checkout must have run, in this order:
 #   runtime/scripts/test-dxmt.zsh          (downloads Wine 11.10 and stock DXMT)
@@ -114,13 +116,13 @@ if [[ -f ${wine_bin}/wined3d.dll ]]; then
         cp "${wine_bin}/${dll}" "${wine_root}/lib/wine/x86_64-windows/${dll}"
         cp "${wine_bin}/${dll}" "${prefix}/drive_c/windows/system32/${dll}"
     done
-    for lib in winemac.so opengl32.so ntdll.so; do
+    for lib in winemac.so opengl32.so ntdll.so winecoreaudio.so; do
         cp "${wine_bin}/${lib}" "${wine_root}/lib/wine/x86_64-unix/${lib}"
     done
     mkdir -p "${prefix}/drive_c/wine-patched"
     cp "${wine_bin}/hlsl_compile.exe" "${wine_bin}/isnan.hlsl" "${wine_bin}/gl_compat_check.exe" \
         "${wine_bin}/far_jump_check.exe" "${wine_bin}/stack_sample_check.exe" "${wine_bin}/session_check.exe" \
-        "${prefix}/drive_c/wine-patched/"
+        "${wine_bin}/microphone_check.exe" "${prefix}/drive_c/wine-patched/"
 else
     print "No patched Wine files in ${wine_bin}: Wine's HLSL compiler lacks isnan, OpenGL games get no compatibility profile, and MonoMod's far detours can miss."
 fi
@@ -210,6 +212,18 @@ if [[ -f ${prefix}/drive_c/wine-patched/session_check.exe ]]; then
     if [[ ${session_out} != *"session_check: PASS"* ]]; then
         print -u2 "FAIL: session_check.exe (run it by hand for details):"
         print -u2 -r -- "${session_out}"
+        exit 1
+    fi
+fi
+if [[ -f ${prefix}/drive_c/wine-patched/microphone_check.exe ]]; then
+    print "Checking that games record from the device \"cranvr microphone\""
+    mic_home=$(mktemp -d)
+    print off > "${mic_home}/microphone.txt"
+    mic_out=$(cd "${prefix}/drive_c/wine-patched" && CRANVR_HOME=${mic_home} "${wine_root}/bin/wine" ./microphone_check.exe --list 2>&1 || true)
+    rm -rf "${mic_home}"
+    if [[ ${mic_out} != *"default capture device: Microphone (cranvr microphone)"* ]]; then
+        print -u2 "FAIL: microphone_check.exe --list (run it by hand for details):"
+        print -u2 -r -- "${mic_out}"
         exit 1
     fi
 fi

@@ -182,6 +182,7 @@ fn refresh(settings: MutableState<Settings>, model: MutableState<Model>, slow: b
     if slow || setup_ended {
         next.lan = system::lan_addresses();
         next.permissions = PERMISSIONS.map(Permission::granted);
+        next.input_devices = crate::microphone::input_devices();
         next.steam = steam::state();
         next.rosetta = steam::rosetta_ready();
         next.game_support = steam::game_support_installed();
@@ -1275,6 +1276,7 @@ fn GeneralSettings(settings: MutableState<Settings>, model: MutableState<Model>)
         Hint("A game that stays below the refresh rate for a minute renders smaller at its next start, as a share of the size above. A game reads its size only when it starts.".into());
         Hint("Changes restart the host; the headset reconnects by itself.".into());
     });
+    MicrophoneCard(settings, model);
     let paired = model.with(|m| m.native.as_ref().map(|n| n.paired.clone()));
     Card(move || {
         Heading("Paired headsets".into());
@@ -1290,6 +1292,40 @@ fn GeneralSettings(settings: MutableState<Settings>, model: MutableState<Model>)
                 Hint(format!("Delete the line of a headset from paired-headsets.txt in {} and restart the host to forget it.", backend::config_dir().display()));
             }
         }
+    });
+}
+
+/// What games under Wine hear from the device "cranvr microphone": the headset's microphone, an input
+/// device of this Mac, or nothing. The choice needs no restart of the host: a game's stream reads it
+/// when it opens.
+#[composable]
+fn MicrophoneCard(settings: MutableState<Settings>, model: MutableState<Model>) {
+    use crate::microphone::MicrophoneSource;
+    let current = settings.with(|s| s.microphone.clone());
+    let devices = model.with(|m| m.input_devices.clone());
+    let choose = move |source: MicrophoneSource| {
+        settings.update(|s| s.microphone = source);
+        settings.with(Settings::save);
+    };
+    Card(move || {
+        Heading("Microphone in games".into());
+        let (shown, listed) = (current.clone(), devices.clone());
+        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+            let current = shown.clone();
+            Choice("Headset".into(), current == MicrophoneSource::Headset, move || choose(MicrophoneSource::Headset));
+            for device in listed.clone() {
+                let chosen = matches!(&current, MicrophoneSource::Mac { uid, .. } if *uid == device.uid);
+                let source = MicrophoneSource::Mac { uid: device.uid.clone(), name: device.name.clone() };
+                Choice(device.name.clone(), chosen, move || choose(source.clone()));
+            }
+            Choice("Off".into(), current == MicrophoneSource::Off, move || choose(MicrophoneSource::Off));
+        });
+        if let MicrophoneSource::Mac { uid, name } = &current {
+            if !devices.iter().any(|device| device.uid == *uid) {
+                Hint(format!("{name} is not connected. Games hear silence until it is."));
+            }
+        }
+        Hint("Games under Wine record from the device \"cranvr microphone\". It takes the sound of this choice. The headset records only while a game does. A game hears a change when it opens its microphone again. With a Mac input device, macOS asks once whether cranvr may use the microphone.".into());
     });
 }
 

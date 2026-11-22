@@ -98,6 +98,8 @@ pub struct Settings {
     pub wine: WineOptions,
     /// The games that the user added from a folder, in the order of adding
     pub added_games: Vec<AddedGame>,
+    /// What games under Wine hear from the device "cranvr microphone" (see `microphone.rs`)
+    pub microphone: crate::microphone::MicrophoneSource,
 }
 
 impl Default for Settings {
@@ -123,6 +125,7 @@ impl Default for Settings {
             launch: BTreeMap::new(),
             wine: WineOptions::default(),
             added_games: Vec::new(),
+            microphone: Default::default(),
         }
     }
 }
@@ -195,6 +198,9 @@ impl Settings {
         let path = Self::path();
         if let Err(e) = self.save_to(&path) {
             log(format!("Settings not saved: {e}"));
+        }
+        if let Err(e) = crate::microphone::write_choice(&config_dir(), &self.microphone) {
+            log(format!("The microphone's choice is not written: {e}"));
         }
         set_settings_problem(Self::load_from(&path).problem(&path));
     }
@@ -466,6 +472,8 @@ pub struct Model {
     pub settings_problem: Option<String>,
     /// Screen Recording and Accessibility
     pub permissions: [bool; 2],
+    /// The Mac's input devices, for the microphone's choice
+    pub input_devices: Vec<crate::microphone::InputDevice>,
     pub steam: crate::steam::SteamState,
     /// Whether Rosetta 2 runs Intel code, which Wine needs
     pub rosetta: bool,

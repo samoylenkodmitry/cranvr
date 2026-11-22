@@ -1,6 +1,6 @@
 # Wine patches
 
-cranvr keeps Gcenx's macOS build of Wine 11.10 as its engine. It replaces seven files of it with files built from the same Wine tag and cranvr's patches:
+cranvr keeps Gcenx's macOS build of Wine 11.10 as its engine. It replaces eight files of it with files built from the same Wine tag and cranvr's patches:
 
 - `wined3d.dll` holds vkd3d-shader, the HLSL compiler (LGPL 2.1 or later, like Wine). A game that compiles its shaders at run time calls `D3DCompile` in `d3dcompiler_47.dll`, which calls vkd3d-shader in `wined3d.dll`. A game ships its own `d3dcompiler_47.dll` too. Wine loads its own copy first, so every game's HLSL goes through vkd3d-shader.
 - `winemac.so` is the Mac side of Wine's Mac driver. It makes the OpenGL contexts of a Windows program.
@@ -9,8 +9,9 @@ cranvr keeps Gcenx's macOS build of Wine 11.10 as its engine. It replaces seven 
 - `wtsapi32.dll` answers questions about the Windows session, such as whether the screen is locked.
 - `user32.dll` holds the window functions of Windows.
 - `ntdll.so` is the Mac side of `ntdll.dll`. It manages the memory of a Windows program, among other things.
+- `winecoreaudio.so` is the Mac side of Wine's CoreAudio driver. It gives a Windows program the Mac's sound devices.
 
-`scripts/build-wine.sh` clones Wine at the tag `wine-11.10` (commit `2cac6ccf33c0807f374dc96f5a20e35a2da86157`) into `third_party/wine/src` (not committed), applies the patches in this folder and builds the seven files into `third_party/wine/build/bin`: the DLLs with MinGW-w64, the Mac libraries with Xcode's clang for x86_64 and macOS 10.15 and newer, as Gcenx's build has. The build runs under Rosetta 2, because Wine's configure wants a 64-bit Intel host. `scripts/setup-wine.sh` copies the DLLs into the engine and into the prefix's `system32`, where the loader takes them, and the libraries into the engine. The wine tree is not used otherwise. `package-game-support.sh` packs the pinned source tree and the patches as `SOURCE/wine-source.tar.xz` and as `cranvr-wine-source.tar.xz` in the release.
+`scripts/build-wine.sh` clones Wine at the tag `wine-11.10` (commit `2cac6ccf33c0807f374dc96f5a20e35a2da86157`) into `third_party/wine/src` (not committed), applies the patches in this folder and builds the eight files into `third_party/wine/build/bin`: the DLLs with MinGW-w64, the Mac libraries with Xcode's clang for x86_64 and macOS 10.15 and newer, as Gcenx's build has. The build runs under Rosetta 2, because Wine's configure wants a 64-bit Intel host. `scripts/setup-wine.sh` copies the DLLs into the engine and into the prefix's `system32`, where the loader takes them, and the libraries into the engine. The wine tree is not used otherwise. `package-game-support.sh` packs the pinned source tree and the patches as `SOURCE/wine-source.tar.xz` and as `cranvr-wine-source.tar.xz` in the release.
 
 ## patches
 
@@ -60,6 +61,16 @@ cranvr keeps Gcenx's macOS build of Wine 11.10 as its engine. It replaces seven 
 - `user32.dll` now exports `DwmGetDxSharedSurface`. It fails with `ERROR_CALL_NOT_IMPLEMENTED`, because Wine has no DWM that composes windows from shared surfaces. `vrdesktop.dll` then takes the desktop's picture another way.
 - With the patch, vrdesktop initializes, and the menu button opens the dashboard over the game in the headset's picture.
 
+`0008-winecoreaudio-cranvr-microphone.patch`
+
+- Wine 11.10 gives a program the Mac's input devices as capture devices. A game records from the default one. The headset's microphone is no device of the Mac. macOS adds a virtual input device only through an audio driver in `/Library/Audio/Plug-Ins/HAL`, which needs an install with an administrator's password.
+- While `microphone.txt` exists in cranvr's config dir (`$CRANVR_HOME`, else `~/Library/Application Support/cranvr`), the driver lists the capture device "cranvr microphone" first and makes it the default one. Windows programs see it as "Microphone (cranvr microphone)". A stream of it reads the file when it opens. `headset` reads the ring `microphone.pcm`, which cranvr's host writes. `mac <UID>` records from the Mac input device with that Core Audio UID, as Wine records from any other device. `off`, other text and a Mac device that is not connected record silence.
+- The ring holds a header of 64 bytes and then 16-bit samples of one channel at 48 kHz. The header has the magic `CRMC`, the version 1, the rate, the capacity in frames (a power of two) and the host's count of frames written. The reader adds a heartbeat (`mach_continuous_time` in nanoseconds) in each period while the stream runs, with its counts of frames read, frames missing and skips. The host asks the headset to record only while the heartbeat is younger than 500 ms.
+- The reader takes the frames that are due at 48 kHz by the Mac's clock. It stays 720 frames (15 ms) behind the newest frame of the ring, since the host writes 10 ms at a time. When the least lag over half a second is more than 1200 frames, the reader skips forward to 720 frames. The difference between the headset's clock and the Mac's clock and a late datagram thus add no lasting delay. A frame that is missing gives silence. `GetStreamLatency` reports the 15 ms and the period.
+- The device's mix format is 48 kHz, one channel, 32-bit float. A stream in another linear PCM format gets Wine's converter, as a stream of a Mac device does.
+- Wine's capture path moved its read offset past the end of the buffer when a full buffer took more frames. `GetBuffer` then copied from outside the buffer, and the program crashed with a page fault. The read offset now follows the write offset.
+- With the patch and a test writer that put a click into the ring every 500 ms, `microphone_check.exe` got each click 16 to 19 ms after the writer had written it, 48000 frames a second, with no discontinuity.
+
 ## tests
 
 `tests/hlsl_compile.cpp` loads a `d3dcompiler_47.dll` and compiles one HLSL file with `D3DCompile`. It prints `hlsl_compile: PASS` or `FAIL` with the compiler's messages. `tests/isnan.hlsl` calls `isnan` on a scalar and on a vector.
@@ -72,4 +83,6 @@ cranvr keeps Gcenx's macOS build of Wine 11.10 as its engine. It replaces seven 
 
 `tests/session_check.cpp` asks for `WTSSessionInfoEx` and `WTSIsRemoteSession` as SteamVR's compositor does. It prints `session_check: PASS` when the session is active, unlocked and local. Under Wine without patch 0006 it prints `FAIL: WTSSessionInfoEx has no answer`.
 
-`scripts/setup-wine.sh` runs the five programs in the prefix after each install and stops when one fails.
+`tests/microphone_check.cpp` records from the default capture device as a voice chat does: WASAPI in shared mode with an event and a buffer of 20 ms. With `--list` it prints the device's name and ends. Otherwise it prints an `onset` line for each sound that starts after 200 ms of quiet, with the time at which it got the block. The time is the performance counter in units of 100 ns, which is `mach_continuous_time` under Wine on macOS, so a program on the Mac can compare it with its own clock. At the end it prints the frames a second and the blocks with a discontinuity.
+
+`scripts/setup-wine.sh` runs the six programs in the prefix after each install and stops when one fails. It runs `microphone_check.exe --list` with a config dir of its own that chooses `off`.

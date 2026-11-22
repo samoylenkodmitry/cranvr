@@ -66,6 +66,8 @@ pub struct Options {
     pub displays_in_game: bool,
     /// The most pictures a second of each display's wish, in place of the client's rule
     pub display_fps: Option<u8>,
+    /// Offer a microphone: while the host asks, the probe sends a click every 500 ms
+    pub microphone: bool,
     /// The right hand points at a panel in every other window of its script: its input is the
     /// panel's press, which the host must hold back from the game. The fake game checks that none
     /// of it arrives (`--expect-held`).
@@ -167,6 +169,8 @@ struct Latencies {
 
 struct Shared {
     link: ClientLink,
+    /// The host asks for the microphone
+    recording: AtomicBool,
     receiver: Mutex<FrameReceiver>,
     clock: Mutex<ClockSync>,
     /// The head poses that the probe sent, by sample time. The decoder checks the eye poses that
@@ -240,7 +244,7 @@ impl Shared {
 /// The height of the probe's floor in its room, in meters
 const PROBE_FLOOR: f32 = -0.3;
 
-fn caps(tcp: bool, quest_view: bool) -> ClientCaps {
+fn caps(tcp: bool, quest_view: bool, microphone: bool) -> ClientCaps {
     let fov = if quest_view {
         let degrees = |d: f32| d.to_radians();
         let left = Fov { left: degrees(-54.0), right: degrees(40.0), up: degrees(44.0), down: degrees(-55.0) };
@@ -262,6 +266,7 @@ fn caps(tcp: bool, quest_view: bool) -> ClientCaps {
         tcp_only: tcp,
         // The probe's TCP media stands for `adb reverse` over the cable
         cable: tcp,
+        microphone,
     }
 }
 
@@ -274,7 +279,7 @@ pub fn run(o: Options) -> i32 {
     // pairing
     let identity = cranvr_proto::identity::Identity::generate().expect("random numbers for the probe's key");
     let link = loop {
-        match ClientLink::connect(o.connect, &caps(o.tcp, o.quest_view), &identity, None, Duration::from_secs(5)) {
+        match ClientLink::connect(o.connect, &caps(o.tcp, o.quest_view, o.microphone), &identity, None, Duration::from_secs(5)) {
             Ok(link) => break link,
             // The host is not up yet, or not ready
             Err(Error::Io(_) | Error::Timeout | Error::Closed) if started.elapsed() < Duration::from_secs(60) => {
@@ -303,6 +308,7 @@ pub fn run(o: Options) -> i32 {
     );
     let shared = Arc::new(Shared {
         link,
+        recording: AtomicBool::new(false),
         receiver: Mutex::new(FrameReceiver::new()),
         clock: Mutex::new(ClockSync::new()),
         sent_poses: Mutex::new(VecDeque::new()),
@@ -396,6 +402,10 @@ pub fn run(o: Options) -> i32 {
     {
         let shared = Arc::clone(&shared);
         thread::Builder::new().name("tracking".into()).spawn(move || tracking_loop(&shared, period, vsync_origin)).unwrap();
+    }
+    if o.microphone {
+        let shared = Arc::clone(&shared);
+        thread::Builder::new().name("microphone".into()).spawn(move || microphone_loop(&shared)).unwrap();
     }
     // The decoder
     let results = Arc::new(Mutex::new(DecodeResults::default()));
@@ -601,6 +611,11 @@ fn read_loop(shared: &Arc<Shared>, units: &mpsc::Sender<Received>, udp: bool) {
             }
         }
         Incoming::Control(HostMsg::Bye) => shared.stop.store(true, Ordering::Relaxed),
+        Incoming::Control(HostMsg::Microphone(record)) => {
+            if shared.recording.swap(record, Ordering::Relaxed) != record {
+                println!("probe: the host asks {} the microphone", if record { "for" } else { "no more for" });
+            }
+        }
         Incoming::Control(HostMsg::TrackingWish(wish)) => {
             shared.wish.store(wish.0, Ordering::Relaxed);
             // The wall clock lets a test compare this line with the game's
@@ -1197,4 +1212,60 @@ fn print_summary(shared: &Shared, r: &DecodeResults, seconds: f32, expected: u64
     println!("probe: frame arrival: pose to send start (ms): {}", describe(&l.pose_to_send));
     println!("probe: frame arrival: network, send start to last packet (ms): {}", describe(&l.network));
     println!("probe: frame arrival: decode (ms): {}", describe(&l.decode));
+}
+
+/// The time on `mach_continuous_time` in ns, the clock of Wine's performance counter
+fn continuous_ns() -> u64 {
+    #[repr(C)]
+    struct Timebase {
+        numer: u32,
+        denom: u32,
+    }
+    extern "C" {
+        fn mach_continuous_time() -> u64;
+        fn mach_timebase_info(info: *mut Timebase) -> i32;
+    }
+    let mut info = Timebase { numer: 0, denom: 0 };
+    // SAFETY: `info` is a place for the timebase, and the clock is a plain read
+    let ticks = unsafe {
+        mach_timebase_info(&mut info);
+        mach_continuous_time()
+    };
+    (u128::from(ticks) * u128::from(info.numer) / u128::from(info.denom.max(1))) as u64
+}
+
+/// Sends the microphone while the host asks: 10 ms a datagram in real time, silence with a click of
+/// 2 ms every 500 ms. Each click prints its time, so a test compares it with the time at which a
+/// program under Wine heard it.
+fn microphone_loop(shared: &Shared) {
+    use cranvr_proto::message::{Microphone, MICROPHONE_FRAMES};
+    const CLICK_EVERY: u64 = 24_000;
+    const CLICK_FRAMES: u64 = 96;
+    let (mut sequence, mut frame, mut start) = (0u32, 0u64, None::<Instant>);
+    while !shared.stop.load(Ordering::Relaxed) {
+        if !shared.recording.load(Ordering::Relaxed) {
+            start = None;
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        let begun = *start.get_or_insert_with(|| {
+            frame = 0;
+            Instant::now()
+        });
+        let due = (begun.elapsed().as_secs_f64() * 48_000.0) as u64;
+        while frame + MICROPHONE_FRAMES as u64 <= due {
+            let mut pcm = Vec::with_capacity(MICROPHONE_FRAMES * 2);
+            for k in frame..frame + MICROPHONE_FRAMES as u64 {
+                let value: i16 = if k % CLICK_EVERY < CLICK_FRAMES { if (k / 4) % 2 == 0 { 20_000 } else { -20_000 } } else { 0 };
+                pcm.extend_from_slice(&value.to_le_bytes());
+                if k % CLICK_EVERY == 0 {
+                    println!("probe: microphone click at {} ns", continuous_ns());
+                }
+            }
+            shared.link.duplex.send_datagram(&ClientDatagram::Microphone(Microphone { sequence, captured: now_ns(), pcm })).ok();
+            sequence = sequence.wrapping_add(1);
+            frame += MICROPHONE_FRAMES as u64;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
 }

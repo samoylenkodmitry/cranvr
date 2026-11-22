@@ -7,7 +7,7 @@
 #              with the hardened runtime and a secure timestamp, as notarization needs.
 #              scripts/release-app.sh runs this, then notarizes the app.
 #
-# macOS keeps permissions (Screen Recording, Accessibility, Local Network) per signed app. The
+# macOS keeps permissions (Screen Recording, Accessibility, Local Network, Microphone) per signed app. The
 # script signs with your first "Apple Development" identity, so a rebuilt app keeps them.
 # Set CRANVR_SIGN_IDENTITY to choose another identity, or "-" for an ad-hoc signature (then
 # macOS asks again after each build).
@@ -52,6 +52,8 @@ cat > "${app}/Contents/Info.plist" <<EOF
     <key>NSHighResolutionCapable</key><true/>
     <key>NSLocalNetworkUsageDescription</key>
     <string>cranvr finds your headset on the local network and streams to it.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Games on this Mac hear the input device that you chose in cranvr's settings.</string>
 </dict>
 </plist>
 EOF
@@ -60,7 +62,19 @@ kind='Apple Development'
 sign_options=()
 if ${release}; then
     kind='Developer ID Application'
-    sign_options=(--options runtime --timestamp)
+    # The hardened runtime lets a game under Wine, which cranvr starts, record from a Mac input device
+    # (the Settings tab's "Microphone in games") only with this entitlement
+    entitlements=${root}/target/release/cranvr.entitlements
+    cat > "${entitlements}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.device.audio-input</key><true/>
+</dict>
+</plist>
+EOF
+    sign_options=(--options runtime --timestamp --entitlements "${entitlements}")
 fi
 identity=${CRANVR_SIGN_IDENTITY:-$(security find-identity -v -p codesigning | grep -m1 "${kind}" | awk '{print $2}' || true)}
 if ${release} && [[ -z ${identity} || ${identity} == - ]]; then

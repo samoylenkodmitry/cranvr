@@ -15,19 +15,23 @@
 #   - ntdll.so, the Mac side of ntdll: it gives a program with high-entropy addresses its memory above 4 GB, as
 #     Windows does. The detours of MonoMod (Harmony in Unity mods) need free pages near their code. Thread stacks
 #     stay below 4 GB, under the stacks of Wine's Mac side.
+#   - winecoreaudio.so, the Mac side of Wine's CoreAudio driver: it adds the capture device "cranvr microphone",
+#     which records the source that the cranvr app chose (the headset's microphone through the host, a Mac input
+#     device, or silence).
 #
 # Usage: scripts/build-wine.sh [DIR]   (default: third_party/wine/src)
 # Then:  scripts/package-game-support.sh
 #
 # It clones Wine at the tag wine-11.10 (commit pinned below) into DIR, applies cranvr's patches from
-# third_party/wine/patches and builds the seven files. Windows files are 64-bit PE files from the MinGW-w64 cross
+# third_party/wine/patches and builds the eight files. Windows files are 64-bit PE files from the MinGW-w64 cross
 # compiler that builds BasaltVR's runtime. Mac files are x86_64 libraries for Rosetta 2 with macOS 10.15 as the
 # oldest system, as Gcenx's build has. Wine's build needs a 64-bit Intel host to configure, so the script runs
 # configure and make under Rosetta 2 (arch -x86_64). The build goes to the build folder beside DIR. The results are
-# in build/bin: wined3d.dll, wininet.dll, wtsapi32.dll and user32.dll (stripped), winemac.so, opengl32.so, ntdll.so, and cranvr's
+# in build/bin: wined3d.dll, wininet.dll, wtsapi32.dll and user32.dll (stripped), winemac.so, opengl32.so, ntdll.so, winecoreaudio.so, and cranvr's
 # test programs hlsl_compile.exe (the HLSL compiler), gl_compat_check.exe (an OpenGL program like Google Earth VR),
-# far_jump_check.exe (MonoMod's far jump), stack_sample_check.exe (a sampling profiler's stack copy) and
-# session_check.exe (the session's state, as SteamVR asks for it).
+# far_jump_check.exe (MonoMod's far jump), stack_sample_check.exe (a sampling profiler's stack copy),
+# session_check.exe (the session's state, as SteamVR asks for it) and microphone_check.exe (a program that records from
+# the default capture device).
 #
 # Needs: brew install mingw-w64 bison (Apple's bison is too old; Homebrew's is keg-only and found here),
 # flex, Xcode's command line tools and Rosetta 2 (softwareupdate --install-rosetta).
@@ -107,9 +111,9 @@ if [[ ! -f ${build}/wine/Makefile || $(cat "${build}/wine/configure-line.txt" 2>
     print -r -- "${configure_line}" > "${build}/wine/configure-line.txt"
 fi
 
-print "Building wined3d.dll, wininet.dll, wtsapi32.dll, user32.dll, winemac.so, opengl32.so and ntdll.so (under Rosetta 2)"
+print "Building wined3d.dll, wininet.dll, wtsapi32.dll, user32.dll, winemac.so, opengl32.so, ntdll.so and winecoreaudio.so (under Rosetta 2)"
 (cd "${build}/wine" && arch -x86_64 make -j"$(sysctl -n hw.ncpu)" dlls/wined3d/all dlls/wininet/all dlls/wtsapi32/all dlls/user32/all \
-    dlls/winemac.drv/all dlls/opengl32/all dlls/ntdll/all > make.log 2>&1) || { tail -30 "${build}/wine/make.log" >&2; exit 1; }
+    dlls/winemac.drv/all dlls/opengl32/all dlls/ntdll/all dlls/winecoreaudio.drv/all > make.log 2>&1) || { tail -30 "${build}/wine/make.log" >&2; exit 1; }
 
 mkdir -p "${build}/bin"
 x86_64-w64-mingw32-strip -o "${build}/bin/wined3d.dll" "${build}/wine/dlls/wined3d/x86_64-windows/wined3d.dll"
@@ -117,13 +121,13 @@ x86_64-w64-mingw32-strip -o "${build}/bin/wininet.dll" "${build}/wine/dlls/winin
 x86_64-w64-mingw32-strip -o "${build}/bin/wtsapi32.dll" "${build}/wine/dlls/wtsapi32/x86_64-windows/wtsapi32.dll"
 x86_64-w64-mingw32-strip -o "${build}/bin/user32.dll" "${build}/wine/dlls/user32/x86_64-windows/user32.dll"
 cp "${build}/wine/dlls/winemac.drv/winemac.so" "${build}/wine/dlls/opengl32/opengl32.so" "${build}/wine/dlls/ntdll/ntdll.so" \
-    "${build}/bin/"
+    "${build}/wine/dlls/winecoreaudio.drv/winecoreaudio.so" "${build}/bin/"
 # ntdll.so unwinds through the Mac side with the system's unwinder, as the ntdll.so of Gcenx's build does
 if ! nm -u "${build}/bin/ntdll.so" | grep -q _Unwind_Find_FDE; then
     print -u2 "FAIL: ntdll.so is built without the system's unwinder"
     exit 1
 fi
-for lib in winemac.so opengl32.so ntdll.so; do
+for lib in winemac.so opengl32.so ntdll.so winecoreaudio.so; do
     minos=$(otool -l "${build}/bin/${lib}" | awk '/LC_BUILD_VERSION/ { found = 1 } found && /minos/ { print $2; exit }')
     if [[ ${minos} != ${MACOSX_DEPLOYMENT_TARGET} ]]; then
         print -u2 "FAIL: ${lib} is built for macOS ${minos}, not ${MACOSX_DEPLOYMENT_TARGET}"
@@ -132,14 +136,16 @@ for lib in winemac.so opengl32.so ntdll.so; do
 done
 
 # cranvr's test programs for the HLSL compiler, for OpenGL, for MonoMod's far jump, for a profiler's stack copy and
-# for the session's state
-print "Building hlsl_compile.exe, gl_compat_check.exe, far_jump_check.exe, stack_sample_check.exe and session_check.exe"
+# for the session's state, and the one that records
+print "Building hlsl_compile.exe, gl_compat_check.exe, far_jump_check.exe, stack_sample_check.exe, session_check.exe and microphone_check.exe"
 x86_64-w64-mingw32-g++ -std=c++17 -O2 -Wall -s -static -static-libgcc -static-libstdc++ \
     -o "${build}/bin/hlsl_compile.exe" "${support}/tests/hlsl_compile.cpp"
 x86_64-w64-mingw32-g++ -std=c++17 -O2 -Wall -s -static -static-libgcc -static-libstdc++ \
     -o "${build}/bin/gl_compat_check.exe" "${support}/tests/gl_compat_check.cpp" -lopengl32 -lgdi32
 x86_64-w64-mingw32-g++ -std=c++17 -O2 -Wall -s -static -static-libgcc -static-libstdc++ \
     -o "${build}/bin/session_check.exe" "${support}/tests/session_check.cpp" -lwtsapi32
+x86_64-w64-mingw32-g++ -std=c++17 -O2 -Wall -s -static -static-libgcc -static-libstdc++ \
+    -o "${build}/bin/microphone_check.exe" "${support}/tests/microphone_check.cpp" -lole32
 # Programs with high-entropy addresses, as Unity games and Steam are: MinGW's linker marks them so by default
 for check in far_jump_check stack_sample_check; do
     x86_64-w64-mingw32-g++ -std=c++17 -O2 -Wall -s -static -static-libgcc -static-libstdc++ -Wl,--dynamicbase \

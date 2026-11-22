@@ -149,6 +149,7 @@ fn device_caps(path: Media, headset: Option<&HeadsetInfo>, phone: Option<PhoneIn
             foveation: false,
             tcp_only,
             cable,
+            microphone: false,
         };
     }
     let (name, recommended, refresh_rates) = match headset {
@@ -174,6 +175,8 @@ fn device_caps(path: Media, headset: Option<&HeadsetInfo>, phone: Option<PhoneIn
         foveation: true,
         tcp_only,
         cable,
+        // A headset records for the host's games. The flat window on a desktop has no backend for it.
+        microphone: headset.is_some() && cranpose_audio::has_device_backend(),
     }
 }
 
@@ -532,7 +535,7 @@ struct Averages {
 struct Shared<'a> {
     hub: &'static Hub,
     id: u64,
-    link: &'a ClientLink,
+    link: &'a Arc<ClientLink>,
     stop: &'a AtomicBool,
     stream: Mutex<StreamParams>,
     /// The parameter sets of the decoder
@@ -579,7 +582,7 @@ impl Shared<'_> {
 }
 
 /// Runs a session until the link ends and returns the reason.
-fn session(hub: &'static Hub, id: u64, link: &ClientLink, device: Device, hello_views: Views, stop: &AtomicBool) -> Error {
+fn session(hub: &'static Hub, id: u64, link: &Arc<ClientLink>, device: Device, hello_views: Views, stop: &AtomicBool) -> Error {
     let stream = link.welcome.stream.clone();
     let layout = StreamLayout::new(stream.eye_size, stream.foveation);
     let picture = layout.frame();
@@ -686,6 +689,7 @@ fn session(hub: &'static Hub, id: u64, link: &ClientLink, device: Device, hello_
     });
     crate::displays::displays().session_end();
     crate::audio::close();
+    crate::microphone::close();
     hub.feed.set_wish(cranvr_proto::tracking::Features::NONE);
     reason
 }
@@ -739,6 +743,7 @@ fn read_loop(s: &Shared<'_>, units: mpsc::Sender<Received>, udp: bool) -> Error 
             log::info!("the host asks for {}", if wish.is_empty() { "no tracking".to_string() } else { wish.names().join(", ") });
             s.hub.feed.set_wish(wish);
         }
+        Incoming::Control(HostMsg::Microphone(record)) => crate::microphone::on_wish(s.link, record),
         Incoming::Control(HostMsg::Bye) => {
             s.stop.store(true, Ordering::Relaxed);
             s.link.duplex.close();
