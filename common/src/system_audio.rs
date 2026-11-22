@@ -1,10 +1,10 @@
 //! The macOS permission to record this Mac's sound ("System Audio Recording"). The host's Core Audio
-//! tap needs it. macOS gives it to an app: the cranvr app asks for it, and the host inherits it as the
-//! app's child.
+//! tap needs it. macOS gives it to an app: the cranvr app asks for it. The host inherits it as the app's
+//! child.
 //!
 //! macOS has no public call that reads or requests this permission. Creating a tap is the only
-//! public way, and a tap shows the prompt in the name of whatever app started the process: a test
-//! host started from a terminal would ask for the terminal. So this module calls the TCC framework,
+//! public way. A tap shows the prompt in the name of whatever app started the process: a test host
+//! started from a terminal would ask for the terminal. So this module calls the TCC framework,
 //! as other apps that record the system sound do: `TCCAccessPreflight` reads the state and never
 //! shows a prompt, `TCCAccessRequest` shows the prompt once. The framework is private, so it loads
 //! at run time. Without it, the state reads as unknown.

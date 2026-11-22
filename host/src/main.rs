@@ -273,7 +273,7 @@ fn default_eye_width(foveation: bool, fps: u32) -> u32 {
 }
 
 /// Starts the capture of the Mac's sound in the background. It waits for the System Audio
-/// Recording permission, which the app asks for, and starts again on a new output device.
+/// Recording permission, which the app asks for. It starts again on a new output device.
 fn start_game_audio() {
     use cranvr_common::system_audio::{self, Access};
     thread::Builder::new()

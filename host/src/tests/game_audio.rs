@@ -44,7 +44,7 @@ fn sound_at_48_khz_passes_as_it_is() {
 }
 
 // A device at 44.1 kHz hands over buffers of 441 frames. One second of them must become one
-// second at 48 kHz, and a ramp must stay a ramp across the seams of the buffers.
+// second at 48 kHz. A ramp must stay a ramp across the seams of the buffers.
 #[test]
 fn sound_at_44_1_khz_becomes_48_khz_without_seams() {
     let mut resampler = Resampler::new(44_100.0);

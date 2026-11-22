@@ -5,7 +5,7 @@
 //! The tap takes each app's sound before the Mac's volume, so the Mac can stay muted while the
 //! headset plays it.
 //!
-//! The tap needs no screen stream. The sound came from ScreenCaptureKit before, and its stream was
+//! The tap needs no screen stream. The sound came from ScreenCaptureKit before. Its stream was
 //! bound to the main display. WindowServer then worked for every change of the screen, even with
 //! every display hidden in the headset: one such stream added about a third to its GPU time
 //! (issue #118).
@@ -85,7 +85,7 @@ struct Measure {
     age_max_ns: u64,
     peak: u16,
     gaps: u64,
-    /// The host time and the device's sample time of the first buffer, and of the newest one
+    /// The host time and the device's sample time of the first buffer and of the newest one
     first: Option<(u64, f64)>,
     newest: Option<(u64, f64)>,
     next_sample_time: Option<f64>,
@@ -189,7 +189,7 @@ unsafe fn interleave(description: &StreamDescription, buffers: &[AudioBuffer]) -
 
 /// Turns interleaved 16-bit stereo at the device's rate into 48 kHz by linear interpolation. It keeps
 /// the last frame and the position between buffers, so the buffers join without a seam. Most output
-/// devices run at 48 kHz, and then the samples pass as they are.
+/// devices run at 48 kHz. The samples then pass as they are.
 struct Resampler {
     /// Input frames per output frame
     step: f64,
@@ -283,7 +283,7 @@ fn process_object(pid: i32) -> Option<AudioObjectID> {
         .filter(|object| *object != 0)
 }
 
-/// The processes whose sound stays out of the tap: the host, and the cranvr app that started it.
+/// The processes whose sound stays out of the tap: the host and the cranvr app that started it.
 /// Neither plays sound today. The headset's own sound must never come back to it.
 fn own_processes() -> Vec<AudioObjectID> {
     let mut pids = vec![std::process::id() as i32];
@@ -358,7 +358,7 @@ pub struct Capture {
     pub summary: String,
 }
 
-// The Core Audio objects are ids, and the blocks run on the capture's own queue
+// The Core Audio objects are ids. The blocks run on the capture's own queue.
 unsafe impl Send for Capture {}
 
 impl Capture {
