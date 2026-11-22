@@ -11,7 +11,7 @@
 //! `microphone_preset=communication` records with the call preset. The recorder runs
 //! on the input thread. It mixes the channels down to one, resamples to 48 kHz when the device runs
 //! at another rate and puts the frames into a lock-free queue. A thread of this file sends them in
-//! datagrams of 5 ms (`ClientDatagram::Microphone`, 16 bits). Each datagram carries the time at
+//! datagrams of 10 ms (`ClientDatagram::Microphone`, 16 bits). Each datagram carries the time at
 //! which the microphone took its first frame, from the stream's capture time, so the host knows how
 //! old the sound is.
 //!

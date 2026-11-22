@@ -1,5 +1,5 @@
 diff --git a/dlls/winecoreaudio.drv/coreaudio.c b/dlls/winecoreaudio.drv/coreaudio.c
-index c7e0dc2..2961c46 100644
+index c7e0dc2..8226035 100644
 --- a/dlls/winecoreaudio.drv/coreaudio.c
 +++ b/dlls/winecoreaudio.drv/coreaudio.c
 @@ -48,6 +48,9 @@
@@ -41,13 +41,13 @@ index c7e0dc2..2961c46 100644
 +#define CRANVR_RING_VERSION 1
 +#define CRANVR_RING_RATE 48000
 +#define CRANVR_RING_HEADER 64
-+/* The reader stays this far behind the newest frame of the ring: the headset sends 5 ms at a
++/* The reader stays this far behind the newest frame of the ring: the headset sends 10 ms at a
 + * time, and the frames of one datagram arrive at once. */
-+#define CRANVR_TARGET_FRAMES 480
++#define CRANVR_TARGET_FRAMES 720
 +/* The least lag over a window that the reader keeps. Beyond it, the reader skips to the target,
 + * so a late datagram adds no delay for good and the drift between the headset's clock and the
 + * Mac's stays bounded. */
-+#define CRANVR_SLACK_FRAMES 240
++#define CRANVR_SLACK_FRAMES 480
 +#define CRANVR_WINDOW_FRAMES 24000
 +/* A lag beyond this skips at once, after a stall of the stream */
 +#define CRANVR_MAX_LAG_FRAMES 4800

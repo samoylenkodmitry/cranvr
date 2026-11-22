@@ -526,8 +526,8 @@ pub struct Audio {
 /// The format of the client's microphone in [`Microphone`]: one channel at 48 kHz, 16 bits.
 pub const MICROPHONE_FORMAT: AudioFormat = AudioFormat { sample_rate: 48_000, channels: 1, sample: SampleFormat::S16Le };
 
-/// The frames in one [`Microphone`] datagram: 5 ms, 480 bytes, the period of a Quest 3's capture.
-pub const MICROPHONE_FRAMES: usize = 240;
+/// The frames in one [`Microphone`] datagram: 10 ms, 960 bytes.
+pub const MICROPHONE_FRAMES: usize = 480;
 
 const _: () = assert!(MICROPHONE_FRAMES * 2 <= MAX_AUDIO_BYTES);
 
