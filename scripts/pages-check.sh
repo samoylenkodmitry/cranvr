@@ -16,7 +16,8 @@
 #
 # At the end the run presses two buttons of the window on the headset's own page: Show or Hide of the
 # stream numbers and Recenter. The client starts with `save_choices=false`, so the test app's room,
-# volume and controls do not replace the headset's saved ones.
+# volume and controls do not replace the headset's saved ones. It starts with its own set of panels
+# (`shown`), so a press on Show or Hide saves no layout over the user's.
 #
 # The Quest must run a build from `scripts/build-client.sh --scripted-hand`, and `cargo build
 # --release` must have built cranvr and cranvr-host. The test app has its own folder in WORKDIR with a
@@ -52,7 +53,7 @@ logcat=$!
 ${adb_cmd} reverse tcp:${port} tcp:${port} > /dev/null
 ${adb_cmd} shell am force-stop dev.cranvr.client
 ${adb_cmd} shell am broadcast -a com.oculus.vrpowermanager.prox_close > /dev/null
-extras=(--es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room scene --ez default_places true --ez save_choices false --es scripted_pointer pages --es forget_host_key 127.0.0.1:${port})
+extras=(--es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room scene --ez default_places true --ez save_choices false --es shown connection,stats,display1 --es scripted_pointer pages --es forget_host_key 127.0.0.1:${port})
 [[ -n ${walk} ]] && extras+=(--es scripted_pages ${walk})
 [[ -n ${actions} ]] && extras+=(--es scripted_actions ${actions})
 ${adb_cmd} shell am start -n dev.cranvr.client/dev.cranpose.android.CranposeActivity ${extras} > /dev/null

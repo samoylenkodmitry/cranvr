@@ -104,7 +104,7 @@ pub struct Options {
     /// Pulls the right trigger once, in the same way
     pub right_trigger: Option<(f32, f32)>,
     /// Sends one request of the console at this many seconds, as a press on a button of the headset's console
-    /// does: a JSON object such as `{"action": "play", "game": "The Lab"}`
+    /// does: a JSON object such as `{"action": "set", "id": "fps", "value": "90"}`
     pub console: Option<(f32, String)>,
 }
 
