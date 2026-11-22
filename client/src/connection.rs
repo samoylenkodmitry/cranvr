@@ -405,7 +405,9 @@ fn run(
     // A host on this device or this Mac (USB through `adb reverse`, or a flat window beside the
     // host) is reached through no network. Its key is not checked, as the host does not check the
     // pairing of a client on loopback. Any other host must be the one that this headset paired with.
-    let name = host_name(text);
+    // The Mac's link-local address on the USB network changes with the cable's interface, so a
+    // host there is remembered by the cable and the port
+    let name = if usb_network.is_some() { usb_network::host_name(host.port()) } else { host_name(text) };
     // A Mac from the search may have a new address since the last pairing: the fingerprint finds its key.
     // The fingerprint comes first: an address that moved to another paired Mac must not look like a fake
     let pinned = if host.ip().is_loopback() {
@@ -434,12 +436,7 @@ fn run(
     if pinned.is_none() && !host.ip().is_loopback() {
         // The host accepted this headset, so this is the host that the user meant to pair with
         log::info!("paired with the host key {} at {host}", cranvr_proto::identity::to_hex(&link.host_key[..8]));
-        if usb_network.is_some() {
-            // The cable's link-local address changes with its interface: the fingerprint finds the key
-            crate::settings::remember_host_fingerprint(&link.host_key);
-        } else {
-            crate::settings::remember_host_key(&name, &link.host_key);
-        }
+        crate::settings::remember_host_key(&name, &link.host_key);
     }
     hub.learn_mac(id, cranvr_proto::identity::fingerprint(&link.host_key));
     *slot.lock().unwrap() = Some(Arc::clone(&link));

@@ -122,6 +122,12 @@ pub fn find_hosts(network: &Network) -> Vec<(SocketAddr, cranvr_proto::discovery
     }
 }
 
+/// The name under which the headset remembers the key of the host on the USB network at `port`.
+/// The launch argument `forget_host_key` takes it too.
+pub fn host_name(port: u16) -> String {
+    format!("usb-network:{port}")
+}
+
 /// The sockets of a link over the USB network: bound to the network, so they use the cable
 /// whatever the headset's default network is.
 pub struct NetworkRoute(pub Network);
