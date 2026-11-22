@@ -25,8 +25,10 @@ pub const PERMISSIONS: [Permission; 3] = [Permission::ScreenRecording, Permissio
 
 /// Applies a press of the window or of the headset, as `pages::apply` reads it, and does its effects.
 pub fn act(settings: &mut Settings, model: &mut Model, request: &Request) {
-    let games = if model.games.is_empty() { steam::games() } else { model.games.clone() };
-    let outcome = pages::apply(settings, &games, request);
+    if model.games.is_empty() {
+        model.games = steam::games();
+    }
+    let outcome = pages::apply(settings, model, request);
     if let Some(why) = outcome.refused {
         model.note_message(why);
         return;
@@ -67,6 +69,18 @@ pub fn act(settings: &mut Settings, model: &mut Model, request: &Request) {
                 model.learned_sizes = backend::learned_game_sizes();
             }
             Effect::Setup => crate::setup::start(),
+            Effect::TellConnection(connection) => backend::tell_host_connection(connection),
+            Effect::DownloadUsb => usb::download_tools(),
+            Effect::RestartHost => {
+                model.network.clear();
+                model.audio = None;
+                match backend::start_host(settings) {
+                    Ok(()) => model.running = true,
+                    Err(e) => model.message = Some(e),
+                }
+            }
+            Effect::AskPermission(permission) => permission.request(),
+            Effect::PermissionSettings(permission) => permission.open_settings(),
             Effect::OpenSteam => {
                 // Steam may need seconds to start: keep the window responsive
                 thread::spawn(|| {

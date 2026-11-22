@@ -7,7 +7,7 @@ use crate::{
     setup::Setup,
     steam::{self, SteamState},
     system,
-    usb::{self, Connection, Download},
+    usb::{self, Connection},
 };
 use cranpose::prelude::*;
 use cranpose::text::{FontWeight, TextUnit};
@@ -117,17 +117,6 @@ fn Card(content: impl FnMut() + 'static) {
         ColumnSpec::default().vertical_arrangement(LinearArrangement::SpacedBy(10.0)),
         content,
     );
-}
-
-/// Saves new settings and restarts a running host with them.
-fn change(settings: MutableState<Settings>, model: MutableState<Model>, edit: impl FnOnce(&mut Settings)) {
-    settings.update(edit);
-    let s = settings.with(Clone::clone);
-    s.save();
-    if backend::host_running() {
-        let result = backend::start_host(&s);
-        model.update(|m| m.message = result.err());
-    }
 }
 
 // A start by hand begins a fresh check of the network: old notices go away.
@@ -791,18 +780,9 @@ fn edit_launch(settings: MutableState<Settings>, program: &str, edit: impl FnOnc
     settings.with(Settings::save);
 }
 
-/// The choice for every program: the OpenVR runtime of OpenVR games (see openvr.rs), from the model's
-/// stream page. A program can set its own in its options. The Wine card and the Settings tab both
-/// show it.
-#[composable]
-fn OpenVrSetting(settings: MutableState<Settings>, model: MutableState<Model>) {
-    if let Some(item) = page_of(settings, model, pages::STREAM).and_then(|page| page.find("wine.openvr", None).cloned()) {
-        ItemView(item, settings, model);
-    }
-}
-
-/// The Wine that runs the games and the options of every program that cranvr starts. The raw
-/// fields sit behind "Advanced", which starts open when they hold values.
+/// The Wine that runs the games and the options of every program that cranvr starts: the model's
+/// page (see pages.rs), which the headset shows too, and the raw fields behind "Advanced", which
+/// starts open when they hold values. The headset shows no text field.
 #[composable]
 fn WineCard(settings: MutableState<Settings>, model: MutableState<Model>) {
     let wine = settings.with(|s| s.wine.clone());
@@ -810,21 +790,20 @@ fn WineCard(settings: MutableState<Settings>, model: MutableState<Model>) {
     let advanced = rememberMutableStateOf(move || raw_fields_set);
     let dll = cranpose_core::remember(|| TextFieldState::new(&wine.dll_overrides)).with(|state| *state);
     let env = cranpose_core::remember(|| TextFieldState::new(&wine.env)).with(|state| *state);
+    // The page's lines of the raw fields stand in the fields here
+    let items: Vec<Item> = page_of(settings, model, pages::WINE)
+        .map(|page| page.items)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|item| !matches!(item, Item::Text { text, .. } if text.contains("for every program:")))
+        .collect();
     Card(move || {
-        Heading("Wine".into());
-        Label(format!("Wine: {}", steam::engine().display()));
-        Label(format!("Prefix: {}", steam::prefix().display()));
+        PageItems(items.clone(), settings, model);
         Hint("The game support step installs this Wine with DXMT and cranvr's OpenXR runtime into this prefix. Another Wine or prefix lacks them, so cranvr uses these.".into());
-        let (mac_window, shown) = (wine.mac_window, advanced.get());
+        let shown = advanced.get();
         FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-            Choice("Game window on the Mac shows the picture".into(), mac_window, move || {
-                settings.update(|s| s.wine.mac_window = !s.wine.mac_window);
-                settings.with(Settings::save);
-            });
             Choice("Advanced".into(), shown, move || advanced.set(!shown));
         });
-        Hint("Off: a game's own window on the Mac stays empty and costs no GPU time. The headset shows the game either way.".into());
-        OpenVrSetting(settings, model);
         if shown {
             OptionField("DLL overrides", dll);
             OptionField("Environment", env);
@@ -846,79 +825,16 @@ fn WineCard(settings: MutableState<Settings>, model: MutableState<Model>) {
     });
 }
 
+/// The Mac's desktop in the headset and the permissions that it needs: the model's page (see
+/// pages.rs), which the headset shows too.
 #[composable]
 fn DesktopTab(settings: MutableState<Settings>, model: MutableState<Model>) {
-    let s = settings.with(Clone::clone);
-    let permissions = model.with(|m| m.permissions);
+    let items = page_of(settings, model, pages::DESKTOP).map(|page| page.items).unwrap_or_default();
     Card(move || {
-        Heading("Mac desktop in VR".into());
-        Hint("A screen in front of you shows the Mac while no game runs.".into());
-        let on = s.desktop;
-        FlowRow(Modifier::empty(), flow(), move || {
-            Choice(
-                if on { "Desktop view: on".into() } else { "Desktop view: off".into() },
-                on,
-                move || change(settings, model, |s| s.desktop = !s.desktop),
-            );
-        });
-        let size = s.virtual_display;
-        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-            Text("Screen in VR".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
-            for (label, choice) in [
-                ("The main display", None),
-                ("Add a display 1920 x 1080", Some((1920, 1080))),
-                ("Add a display 2560 x 1440", Some((2560, 1440))),
-            ] {
-                Choice(label.into(), size == choice, move || change(settings, model, move |s| s.virtual_display = choice));
-            }
-        });
-        Hint("The headset shows your main display as it is. An added display is one more monitor that only the headset shows: drag windows onto it.".into());
-        let (vr_main, window_in_vr) = (s.vr_main_display, s.window_in_vr);
-        if size.is_some() {
-            FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-                Choice("Main display while the headset is on".into(), vr_main, move || {
-                    change(settings, model, |s| s.vr_main_display = !s.vr_main_display)
-                });
-                Choice("Bring the cranvr window into VR".into(), window_in_vr, move || {
-                    change(settings, model, |s| s.window_in_vr = !s.window_in_vr)
-                });
-            });
-            Hint("As the main display it gets the menu bar, the Dock and new windows, Steam's too. Your other displays go back when the headset leaves.".into());
-        }
-        for (permission, granted) in PERMISSIONS.into_iter().zip(permissions) {
-            FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-                Text(
-                    format!("{}: {}", permission.title(), if granted { "allowed" } else { "not allowed" }),
-                    Modifier::empty().padding(8.0),
-                    if granted { colored(110, 200, 140) } else { colored(240, 170, 90) },
-                );
-                Text(format!("({})", permission.reason()), Modifier::empty().padding(8.0), dim_style());
-                if !granted {
-                    Primary("Allow".into(), move || permission.request());
-                    Action("Open System Settings".into(), move || permission.open_settings());
-                }
-            });
-        }
+        PageItems(items.clone(), settings, model);
         if !system::in_app_bundle() {
             Hint("Start cranvr from /Applications/cranvr.app: macOS then gives these permissions to cranvr. From a terminal they go to the terminal app.".into());
         }
-        if permissions.iter().any(|g| !g) {
-            Hint("After you allow a permission in System Settings, macOS may ask to quit and reopen cranvr.".into());
-        }
-    });
-    let fps = settings.with(|s| s.desktop_fps);
-    Card(move || {
-        Heading("Controls in the headset".into());
-        Label("Point the right controller at the screen to move the mouse.".into());
-        Label("Pull the right trigger to click. Push the right thumbstick up or down to scroll.".into());
-        Label("Click the right thumbstick to bring the screen in front of you.".into());
-        FlowRow(Modifier::empty(), flow(), move || {
-            Text("Screen updates".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
-            for rate in [30u32, 60] {
-                Choice(format!("{rate} per second"), fps == rate, move || change(settings, model, |s| s.desktop_fps = rate));
-            }
-        });
-        Hint("60 updates per second move the cursor smoother, but cost frames: each capture of a large display takes GPU time.".into());
     });
 }
 
@@ -1033,116 +949,17 @@ fn ControlsPage(settings: MutableState<Settings>) {
     });
 }
 
+/// The connection, the stream, the sound and the Mac: the model's pages (see pages.rs), which the
+/// headset shows too.
 #[composable]
 fn GeneralSettings(settings: MutableState<Settings>, model: MutableState<Model>) {
     // The way of the stream comes first: the cable is the choice that a user looks for
-    ConnectionCard(settings, model);
-    // The stream's settings are the model's (see pages.rs): the headset's console shows the same page
-    let stream = page_of(settings, model, pages::STREAM).map(|page| page.items).unwrap_or_default();
-    Card(move || {
-        PageItems(stream.clone(), settings, model);
-        Hint("A change of the refresh rate, the bitrate, the foveation, the game size, the sound, the panel pixels or the hand controllers restarts the host; the headset reconnects by itself.".into());
-    });
-    MicrophoneCard(settings, model);
-    let paired = model.with(|m| m.native.as_ref().map(|n| n.paired.clone()));
-    Card(move || {
-        Heading("Paired headsets".into());
-        match &paired {
-            None => Hint("The host tells which headsets are paired while it runs.".into()),
-            Some(names) if names.is_empty() => {
-                Hint("None yet. Open the cranvr app on the headset. This window then asks you to allow it.".into())
-            }
-            Some(names) => {
-                for name in names {
-                    Text(name.clone(), Modifier::empty().padding(8.0), TextStyle::default());
-                }
-                Hint(format!("Delete the line of a headset from paired-headsets.txt in {} and restart the host to forget it.", backend::config_dir().display()));
-            }
-        }
-    });
-}
-
-/// What games under Wine hear from the device "cranvr microphone": the headset's microphone, an input
-/// device of this Mac, or nothing. The choice needs no restart of the host: a game's stream reads it
-/// when it opens.
-#[composable]
-fn MicrophoneCard(settings: MutableState<Settings>, model: MutableState<Model>) {
-    use crate::microphone::MicrophoneSource;
-    let current = settings.with(|s| s.microphone.clone());
-    let devices = model.with(|m| m.input_devices.clone());
-    let choose = move |source: MicrophoneSource| {
-        settings.update(|s| s.microphone = source);
-        settings.with(Settings::save);
-    };
-    Card(move || {
-        Heading("Microphone in games".into());
-        let (shown, listed) = (current.clone(), devices.clone());
-        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-            let current = shown.clone();
-            Choice("Headset".into(), current == MicrophoneSource::Headset, move || choose(MicrophoneSource::Headset));
-            for device in listed.clone() {
-                let chosen = matches!(&current, MicrophoneSource::Mac { uid, .. } if *uid == device.uid);
-                let source = MicrophoneSource::Mac { uid: device.uid.clone(), name: device.name.clone() };
-                Choice(device.name.clone(), chosen, move || choose(source.clone()));
-            }
-            Choice("Off".into(), current == MicrophoneSource::Off, move || choose(MicrophoneSource::Off));
+    for id in [pages::CONNECTION, pages::STREAM, pages::SOUND, pages::MAC] {
+        let items = page_of(settings, model, id).map(|page| page.items).unwrap_or_default();
+        Card(move || {
+            PageItems(items.clone(), settings, model);
         });
-        if let MicrophoneSource::Mac { uid, name } = &current {
-            if !devices.iter().any(|device| device.uid == *uid) {
-                Hint(format!("{name} is not connected. Games hear silence until it is."));
-            }
-        }
-        Hint("Games under Wine record from the device \"cranvr microphone\". It takes the sound of this choice. The headset records only while a game does. A game hears a change when it opens its microphone again. With a Mac input device, macOS asks once whether cranvr may use the microphone.".into());
-    });
-}
-
-/// How the stream reaches the headset (see usb.rs), and the button that adds the tool that the
-/// cable needs when this Mac has none.
-#[composable]
-fn ConnectionCard(settings: MutableState<Settings>, model: MutableState<Model>) {
-    let choice = settings.with(|s| s.connection);
-    let status = model.with(|m| m.usb.clone());
-    Card(move || {
-        Heading("Connection".into());
-        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-            Text("Stream by".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
-            for (label, option) in [("Automatic", Connection::Automatic), ("Wi-Fi", Connection::WiFi), ("USB cable", Connection::Usb)] {
-                Choice(label.into(), choice == option, move || {
-                    // The host keeps running and a stream keeps its path. The adb thread and the
-                    // host's next connection follow the choice.
-                    settings.update(|s| s.connection = option);
-                    settings.with(Settings::save);
-                    backend::tell_host_connection(option);
-                });
-            }
-        });
-        Hint(
-            match choice {
-                Connection::Automatic => "The stream uses the USB cable while the headset is plugged into this Mac. Otherwise it uses Wi-Fi.",
-                Connection::WiFi => "The stream always uses Wi-Fi. This Mac gives the headset no link over the cable.",
-                Connection::Usb => "The stream uses the USB cable. This window says when the headset is not on it.",
-            }
-            .into(),
-        );
-        Hint("A change counts from the next connection of the headset. A running stream keeps its path.".into());
-        Hint("The cable needs developer mode on the headset. Turn it on in the Meta Horizon app on your phone.".into());
-        if choice.allows_usb() && status.adb.is_none() && status.looked {
-            Label("The USB cable needs a tool from Google that this Mac does not have.".into());
-            match status.download.clone() {
-                Download::Working(text) => {
-                    Text(text, Modifier::empty(), colored(230, 180, 90));
-                }
-                Download::Failed(text) => {
-                    Text(text, Modifier::empty(), colored(240, 170, 90));
-                    FlowRow(Modifier::empty(), flow(), || Primary("Try again".into(), usb::download_tools));
-                }
-                Download::Idle => {
-                    FlowRow(Modifier::empty(), flow(), || Primary("Add USB support".into(), usb::download_tools));
-                }
-            }
-            Hint(format!("The button downloads Google's Android platform-tools for macOS ({}) from dl.google.com into {}.", usb::TOOLS_SIZE, backend::config_dir().display()));
-        }
-    });
+    }
 }
 
 #[composable]

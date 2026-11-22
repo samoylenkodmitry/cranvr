@@ -5,7 +5,7 @@ use crate::{
 };
 use cranvr_common::{
     controls::{Action, Control, Controls, Hand, ModelsInGame},
-    menu::{Item, Page, Request},
+    menu::{Buttons, Item, Page, Request},
 };
 use serde_json::Value;
 use std::path::PathBuf;
@@ -51,27 +51,27 @@ fn every_stream_setting_shows_its_value_and_a_request_changes_it_in_the_settings
     let games = [lab()];
     let model = model_with(games.to_vec());
     let stream = page(&pages(&settings, &model), STREAM).clone();
-    for (id, value) in [("fps", "120"), ("mbps", "100"), ("foveation_level", "medium"), ("game_scale", "70"), ("game_msaa_limit", "2"), ("game_audio", "on"), ("wine.openvr", "opencomposite")] {
+    for (id, value) in [("fps", "120"), ("mbps", "100"), ("foveation_level", "medium"), ("game_scale", "70"), ("game_msaa_limit", "2"), ("hand_controllers", "on"), ("autostart", "on")] {
         assert_eq!(stream.find(id, None).and_then(Item::value), Some(value), "{id}");
     }
     // A change that the host reads at its start restarts it
-    let out = apply(&mut settings, &games, &Request::set("foveation_level", "high"));
+    let out = apply(&mut settings, &model_with(games.to_vec()), &Request::set("foveation_level", "high"));
     assert_eq!((out.changed, out.restart), (true, true));
     assert_eq!(settings.foveation_level, FoveationLevel::High);
-    let out = apply(&mut settings, &games, &Request::set("game_scale", "85"));
+    let out = apply(&mut settings, &model_with(games.to_vec()), &Request::set("game_scale", "85"));
     assert!(out.restart && (settings.game_scale - 0.85).abs() < 1e-6);
     // The anti-aliasing limit counts at a game's start, so the stream goes on
-    let out = apply(&mut settings, &games, &Request::set("game_msaa_limit", "0"));
+    let out = apply(&mut settings, &model_with(games.to_vec()), &Request::set("game_msaa_limit", "0"));
     assert_eq!((out.changed, out.restart, settings.game_msaa_limit), (true, false, 0));
-    let out = apply(&mut settings, &games, &Request::set("hand_controllers", "off"));
+    let out = apply(&mut settings, &model_with(games.to_vec()), &Request::set("hand_controllers", "off"));
     assert!(out.restart && !settings.hand_controllers);
     // The same value again changes nothing and restarts nothing
-    let out = apply(&mut settings, &games, &Request::set("hand_controllers", "off"));
+    let out = apply(&mut settings, &model_with(games.to_vec()), &Request::set("hand_controllers", "off"));
     assert_eq!((out.changed, out.restart), (false, false));
     // A value that the setting does not offer, and a setting that does not exist, change nothing
     let before = settings.clone();
     for request in [Request::set("fps", "100"), Request::set("game_audio", "maybe"), Request::set("volume", "200"), Request::run("format.disk")] {
-        let out = apply(&mut settings, &games, &request);
+        let out = apply(&mut settings, &model_with(games.to_vec()), &request);
         assert!(out.refused.is_some() && !out.changed, "{request:?}");
     }
     assert_eq!(settings, before);
@@ -94,18 +94,18 @@ fn a_game_s_page_shows_and_sets_its_vr_system_and_its_eyes_and_cranvrs_reason() 
     assert_eq!(row.detail, "SteamVR");
     // The headset sets The Lab back to the setting for every program: the choice is the user's now,
     // so cranvr's reason goes and the options leave no entry
-    let out = apply(&mut settings, &games, &Request::set("game.openvr", "default").of(program.clone()));
+    let out = apply(&mut settings, &model_with(games.to_vec()), &Request::set("game.openvr", "default").of(program.clone()));
     assert!(out.changed && !out.restart);
     assert!(!settings.launch.contains_key(&program), "{:?}", settings.launch);
     // The two eye options ask for opposite things
-    apply(&mut settings, &games, &Request::set("game.eye_per_pass", "on").of(program.clone()));
-    apply(&mut settings, &games, &Request::set("game.eye_one_pass", "on").of(program.clone()));
+    apply(&mut settings, &model_with(games.to_vec()), &Request::set("game.eye_per_pass", "on").of(program.clone()));
+    apply(&mut settings, &model_with(games.to_vec()), &Request::set("game.eye_one_pass", "on").of(program.clone()));
     let options = &settings.launch[&program];
     assert!(options.eye_one_pass && !options.eye_per_pass && !options.eye_one_pass_declined);
     // A word that is no VR system, and a game that is not installed, change nothing
     let before = settings.clone();
-    assert!(apply(&mut settings, &games, &Request::set("game.openvr", "oculus").of(program.clone())).refused.is_some());
-    assert!(apply(&mut settings, &games, &Request::set("game.openvr", "off").of("C:\\Gone\\gone.exe")).refused.is_some());
+    assert!(apply(&mut settings, &model_with(games.to_vec()), &Request::set("game.openvr", "oculus").of(program.clone())).refused.is_some());
+    assert!(apply(&mut settings, &model_with(games.to_vec()), &Request::set("game.openvr", "off").of("C:\\Gone\\gone.exe")).refused.is_some());
     assert_eq!(settings, before);
 }
 
@@ -114,13 +114,13 @@ fn play_starts_a_game_by_its_program_and_stop_ends_steam_and_games() {
     let games = [lab(), added()];
     let program = steam::program(&lab()).unwrap();
     let mut settings = Settings::default();
-    let out = apply(&mut settings, &games, &Request::run("game.play").of(program.clone()));
+    let out = apply(&mut settings, &model_with(games.to_vec()), &Request::run("game.play").of(program.clone()));
     assert_eq!(out.effects, [Effect::Play(lab())]);
     assert_eq!(out.pending, Some(pending::Request::Play(program.clone())));
     assert!(!out.changed);
-    let out = apply(&mut settings, &games, &Request::run("steam.stop"));
+    let out = apply(&mut settings, &model_with(games.to_vec()), &Request::run("steam.stop"));
     assert_eq!((out.effects, out.pending), (vec![Effect::StopAll], Some(pending::Request::StopSteam)));
-    assert!(apply(&mut settings, &games, &Request::run("game.play").of("C:\\Gone\\gone.exe")).refused.is_some());
+    assert!(apply(&mut settings, &model_with(games.to_vec()), &Request::run("game.play").of("C:\\Gone\\gone.exe")).refused.is_some());
 }
 
 #[test]
@@ -153,8 +153,8 @@ fn only_a_game_that_the_user_added_has_remove() {
     let removes = |id: &str| page(&pages, id).items.iter().any(|item| item.button("game.remove", Some(&added_program)).is_some() || item.button("game.remove", Some(&lab_program)).is_some());
     assert!(!removes(&game_page(&lab_program)));
     assert!(removes(&game_page(&added_program)));
-    assert!(apply(&mut settings.clone(), &games, &Request::run("game.remove").of(lab_program)).refused.is_some());
-    let out = apply(&mut settings, &games, &Request::run("game.remove").of(added_program));
+    assert!(apply(&mut settings.clone(), &model_with(games.to_vec()), &Request::run("game.remove").of(lab_program)).refused.is_some());
+    let out = apply(&mut settings, &model_with(games.to_vec()), &Request::run("game.remove").of(added_program));
     assert!(out.changed && settings.added_games.is_empty());
 }
 
@@ -172,11 +172,11 @@ fn the_controls_travel_with_the_menu_and_come_back_with_a_request() {
     let mut changed = settings.controls;
     assert!(changed.set(Hand::Left, Control::Grip, Action::Recenter));
     let never = Controls { models_in_game: ModelsInGame::Never, ..changed };
-    let out = apply(&mut settings, &[], &Request::set("controls", serde_json::to_string(&never).unwrap()));
+    let out = apply(&mut settings, &Model::default(), &Request::set("controls", serde_json::to_string(&never).unwrap()));
     assert!(out.changed && !out.restart);
     assert_eq!(settings.controls, never);
     // A value that is no mapping changes nothing
-    assert!(apply(&mut settings, &[], &Request::set("controls", "5")).refused.is_some());
+    assert!(apply(&mut settings, &Model::default(), &Request::set("controls", "5")).refused.is_some());
     assert_eq!(settings.controls, never);
 }
 
@@ -262,8 +262,128 @@ fn a_running_setup_shows_its_steps_and_a_failed_one_offers_retry() {
 #[test]
 fn setup_and_open_steam_are_actions_of_either_app() {
     let mut settings = Settings::default();
-    assert_eq!(apply(&mut settings, &[], &Request::run("setup.start")).effects, [Effect::Setup]);
-    let out = apply(&mut settings, &[], &Request::run("steam.open"));
+    assert_eq!(apply(&mut settings, &Model::default(), &Request::run("setup.start")).effects, [Effect::Setup]);
+    let out = apply(&mut settings, &Model::default(), &Request::run("steam.open"));
     assert_eq!((out.effects, out.pending), (vec![Effect::OpenSteam], Some(pending::Request::OpenSteam)));
     assert!(!out.changed);
+}
+
+#[test]
+fn every_setting_stands_on_one_page_only() {
+    let model = model_with(vec![lab()]);
+    let pages = pages(&Settings { virtual_display: Some((1920, 1080)), ..Settings::default() }, &model);
+    let mut seen = std::collections::BTreeMap::new();
+    for page in &pages {
+        for item in &page.items {
+            let id = match item {
+                Item::Choice(choice) => (choice.id.clone(), choice.subject.clone()),
+                Item::Toggle(toggle) => (toggle.id.clone(), toggle.subject.clone()),
+                _ => continue,
+            };
+            assert!(seen.insert(id.clone(), page.id.clone()).is_none(), "{id:?} stands twice");
+        }
+    }
+    // Each setting of the table has a page
+    for setting in settings_table() {
+        assert!(seen.contains_key(&(setting.id.to_string(), None)), "{} has no page", setting.id);
+    }
+    let listed: Vec<&str> = pages.iter().filter(|page| page.listed).map(|page| page.short.as_str()).collect();
+    assert_eq!(listed, ["Play", "Steam", "Stream", "Connection", "Desktop", "Sound", "Wine", "Mac"]);
+}
+
+#[test]
+fn the_connection_choice_reaches_the_running_host_and_restarts_nothing() {
+    let mut settings = Settings::default();
+    let model = Model::default();
+    assert_eq!(page(&pages(&settings, &model), CONNECTION).find("connection", None).and_then(Item::value), Some("automatic"));
+    let out = apply(&mut settings, &model, &Request::set("connection", "wifi"));
+    assert_eq!((out.changed, out.restart, out.effects), (true, false, vec![Effect::TellConnection(Connection::WiFi)]));
+    assert_eq!(settings.connection, Connection::WiFi);
+    // The same choice again tells nothing
+    assert!(apply(&mut settings, &model, &Request::set("connection", "wifi")).effects.is_empty());
+    assert!(apply(&mut settings, &model, &Request::set("connection", "bluetooth")).refused.is_some());
+}
+
+#[test]
+fn the_connection_page_offers_the_cables_tool_when_the_mac_lacks_it() {
+    let settings = Settings::default();
+    let mut model = Model::default();
+    model.usb.looked = true;
+    let buttons = |model: &Model| page(&pages(&settings, model), CONNECTION).items.iter().filter_map(|item| item.button("usb.download", None).map(|button| button.label.clone())).collect::<Vec<_>>();
+    assert_eq!(buttons(&model), ["Add USB support"]);
+    model.usb.download = Download::Failed("The download stopped".into());
+    assert_eq!(buttons(&model), ["Try again"]);
+    model.usb.adb = Some("/usr/bin/adb".into());
+    assert!(buttons(&model).is_empty());
+    assert_eq!(apply(&mut settings.clone(), &model, &Request::run("usb.download")).effects, [Effect::DownloadUsb]);
+}
+
+#[test]
+fn the_desktop_page_shows_the_added_displays_settings_while_there_is_one() {
+    let mut settings = Settings::default();
+    let model = Model::default();
+    let has = |settings: &Settings, id: &str| page(&pages(settings, &model), DESKTOP).find(id, None).is_some();
+    assert!(!has(&settings, "vr_main_display") && !has(&settings, "window_in_vr"));
+    let out = apply(&mut settings, &model, &Request::set("virtual_display", "2560x1440"));
+    assert!(out.changed && out.restart);
+    assert_eq!(settings.virtual_display, Some((2560, 1440)));
+    assert!(has(&settings, "vr_main_display") && has(&settings, "window_in_vr"));
+    assert_eq!(page(&pages(&settings, &model), DESKTOP).find("virtual_display", None).and_then(Item::value), Some("2560x1440"));
+    // The window's move into VR is the window's own: the host keeps running
+    assert!(!apply(&mut settings, &model, &Request::set("window_in_vr", "on")).restart);
+    assert!(apply(&mut settings, &model, &Request::set("desktop_fps", "60")).restart);
+}
+
+#[test]
+fn a_missing_permission_has_ask_and_open_settings_on_the_mac() {
+    let settings = Settings::default();
+    let model = Model { permissions: [true, false, true], ..Default::default() };
+    let desktop = page(&pages(&settings, &model), DESKTOP).clone();
+    let rows: Vec<&Buttons> = desktop.items.iter().filter_map(|item| if let Item::Buttons(row) = item { Some(row) } else { None }).collect();
+    assert_eq!(rows.iter().map(|row| row.title.as_str()).collect::<Vec<_>>(), ["Screen Recording: allowed", "System Audio Recording: not allowed", "Accessibility: allowed"]);
+    assert!(rows[0].buttons.is_empty());
+    assert!(rows[1].buttons[0].runs("permission.ask", Some("system_audio")));
+    let out = apply(&mut settings.clone(), &model, &Request::run("permission.ask").of("system_audio"));
+    assert_eq!(out.effects, [Effect::AskPermission(Permission::SystemAudio)]);
+    let out = apply(&mut settings.clone(), &model, &Request::run("permission.settings").of("accessibility"));
+    assert_eq!(out.effects, [Effect::PermissionSettings(Permission::Accessibility)]);
+    assert!(apply(&mut settings.clone(), &model, &Request::run("permission.ask").of("camera")).refused.is_some());
+}
+
+#[test]
+fn the_microphone_offers_the_macs_inputs_and_keeps_a_device_that_is_gone() {
+    use crate::microphone::InputDevice;
+    let mut settings = Settings::default();
+    let mut model = Model { input_devices: vec![InputDevice { uid: "BuiltIn".into(), name: "MacBook Microphone".into() }], ..Default::default() };
+    let options = |settings: &Settings, model: &Model| match page(&pages(settings, model), SOUND).find("microphone", None) {
+        Some(Item::Choice(choice)) => choice.options.iter().map(|option| (option.value.clone(), option.label.clone())).collect::<Vec<_>>(),
+        _ => panic!("no microphone"),
+    };
+    assert_eq!(options(&settings, &model)[1], ("mac:BuiltIn".to_string(), "MacBook Microphone".to_string()));
+    let out = apply(&mut settings, &model, &Request::set("microphone", "mac:BuiltIn"));
+    assert!(out.changed && !out.restart);
+    assert_eq!(settings.microphone, MicrophoneSource::Mac { uid: "BuiltIn".into(), name: "MacBook Microphone".into() });
+    // The device goes away: it stays a choice with its name, and the page says so
+    model.input_devices.clear();
+    assert_eq!(options(&settings, &model)[1], ("mac:BuiltIn".to_string(), "MacBook Microphone (not connected)".to_string()));
+    assert!(page(&pages(&settings, &model), SOUND).items.iter().any(|item| matches!(item, Item::Text { text, .. } if text.starts_with("MacBook Microphone is not connected"))));
+    assert!(apply(&mut settings, &model, &Request::set("microphone", "mac:Unknown")).refused.is_some());
+    apply(&mut settings, &model, &Request::set("microphone", "off"));
+    assert_eq!(settings.microphone, MicrophoneSource::Off);
+}
+
+#[test]
+fn the_wine_page_has_the_options_of_every_program_and_the_mac_page_restarts_the_host() {
+    let mut settings = Settings::default();
+    settings.wine.dll_overrides = "winhttp=n,b".into();
+    let model = Model { running: true, ..Default::default() };
+    let pages = pages(&settings, &model);
+    let wine = page(&pages, WINE);
+    assert_eq!(wine.find("wine.openvr", None).and_then(Item::value), Some("opencomposite"));
+    assert!(wine.items.iter().any(|item| matches!(item, Item::Text { text, .. } if text == "DLL overrides for every program: winhttp=n,b")));
+    let out = apply(&mut settings, &model, &Request::set("wine.mac_window", "on"));
+    assert!(out.changed && !out.restart && settings.wine.mac_window);
+    let mac = page(&pages, MAC);
+    assert_eq!(mac.items.iter().find_map(|item| item.button("host.restart", None)).map(|b| b.label.as_str()), Some("Restart the host"));
+    assert_eq!(apply(&mut settings, &model, &Request::run("host.restart")).effects, [Effect::RestartHost]);
 }

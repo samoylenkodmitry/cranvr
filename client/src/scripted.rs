@@ -58,7 +58,8 @@
 //!   opens on that page. It presses the first option of the page's first choice that restarts nothing
 //!   and does not hold now, or the other state of its first such toggle. It presses no action. After
 //!   the last page it goes Back to the main page, opens the first game's Options and presses a change
-//!   there in the same way. Each press waits 1 s with the ray at rest, as the pointer smooths the
+//!   there in the same way. `scripted_pages` names the pages to walk as a comma list of their ids.
+//!   Each press waits 1 s with the ray at rest, as the pointer smooths the
 //!   ray. The log names each aim and each choice ("scripted pages:"), and the host's app saves each
 //!   change in its `app.json`.
 //! - `scripted_pointer=palm` plays two hands and no controller: the left hand holds its open palm
@@ -564,8 +565,13 @@ fn pages_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
     log::info!("scripted pages: the hand menu {height:.0} dp tall with {} pages", pages.len());
     // Each page: a hold of B opens the hand menu, the page's button opens the console there, and the
     // first change of the page that restarts nothing is pressed
+    // `scripted_pages` names the pages to walk, as a comma list of their ids; all by default
+    let wanted: Option<Vec<String>> = launch_args().string("scripted_pages").map(|list| list.split(',').map(|id| id.trim().to_string()).collect());
     let mut last = None;
     for (index, (id, short)) in pages.iter().enumerate() {
+        if wanted.as_ref().is_some_and(|wanted| !wanted.contains(id)) {
+            continue;
+        }
         let target = page_button(index)?;
         right = right.holding(Duration::from_millis(1200), ScriptedButtons { secondary: true, ..rest }).holding(Duration::from_millis(800), rest);
         log::info!("scripted pages: the page {short} ({id}) at {target:?}");

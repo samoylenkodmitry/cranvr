@@ -6,9 +6,10 @@
 # saves each change in its own app.json. The script prints the entries of that app.json that changed,
 # and the client's lines of the walk.
 #
-# Usage: scripts/pages-check.sh SERIAL WORKDIR [SECONDS] [PORT]
-#   SECONDS how long the run lasts (20 by default)
+# Usage: scripts/pages-check.sh SERIAL WORKDIR [SECONDS] [PORT] [PAGES]
+#   SECONDS how long the run lasts (20 by default). Each page takes about 6 s.
 #   PORT    the test app's port (9961 by default)
+#   PAGES   the ids of the pages to walk as a comma list, such as connection,desktop (all by default)
 #
 # The Quest must run a build from `scripts/build-client.sh --scripted-hand`, and `cargo build
 # --release` must have built cranvr and cranvr-host. The test app has its own folder in WORKDIR with a
@@ -18,7 +19,7 @@
 # and install the normal build.
 set -u
 serial=$1 work=$2
-seconds=${3:-20} port=${4:-9961}
+seconds=${3:-20} port=${4:-9961} walk=${5:-}
 root=${0:A:h:h}
 adb_cmd=(adb -s ${serial})
 home=${work}/home
@@ -27,7 +28,7 @@ mkdir -p ${program:h}
 : > ${program}
 # The entries that the walk may change stand in the file, so the check shows their change. A save
 # writes every other entry too, with its standard value.
-print "{\"desktop\": false, \"game_audio\": false, \"game_msaa_limit\": 2, \"launch\": {}, \"added_games\": [{\"name\": \"Fake\", \"program\": \"${program}\"}]}" > ${home}/app.json
+print "{\"desktop\": false, \"game_audio\": false, \"game_msaa_limit\": 2, \"connection\": \"Automatic\", \"microphone\": \"Headset\", \"wine\": {\"mac_window\": false}, \"launch\": {}, \"added_games\": [{\"name\": \"Fake\", \"program\": \"${program}\"}]}" > ${home}/app.json
 cp ${home}/app.json ${work}/app.before.json
 CRANVR_HOME=${home} CRANVR_NATIVE_PORT=${port} CRANVR_TEST_TRUST_ALL=1 CRANVR_HOST_BIN=${root}/target/release/cranvr-host \
     ${root}/target/release/cranvr --headless > ${work}/app.log 2>&1 &
@@ -39,6 +40,7 @@ ${adb_cmd} reverse tcp:${port} tcp:${port} > /dev/null
 ${adb_cmd} shell am force-stop dev.cranvr.client
 ${adb_cmd} shell am broadcast -a com.oculus.vrpowermanager.prox_close > /dev/null
 extras=(--es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room scene --ez default_places true --es scripted_pointer pages --es forget_host_key 127.0.0.1:${port})
+[[ -n ${walk} ]] && extras+=(--es scripted_pages ${walk})
 ${adb_cmd} shell am start -n dev.cranvr.client/dev.cranpose.android.CranposeActivity ${extras} > /dev/null
 sleep ${seconds}
 kill ${app} ${logcat} 2> /dev/null
@@ -54,4 +56,4 @@ for key in sorted(before):
 print(f"  ({len(set(after) - set(before))} entries more, which the save wrote with their standard values)")
 EOF
 print "The client's walk:"
-grep -E "scripted pages:|the console asks for|the hand menu opens the console|the hand menu opens|a button opens the hand menu" ${work}/logcat.txt | sed -E 's/^[0-9-]+ //'
+grep -E "scripted pages:|the console asks for|the console shows|the hand menu opens the console|a button opens the hand menu" ${work}/logcat.txt | sed -E 's/^[0-9-]+ //'
