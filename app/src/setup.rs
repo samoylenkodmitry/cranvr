@@ -29,7 +29,7 @@ impl Step {
             (Step::Rosetta, _) => "Lets this Mac run Wine's Intel code. macOS asks for your Mac password once.",
             (Step::GameSupport, SteamState::NoWine) => "Wine runs Windows games on a Mac. This adds its graphics layer (DXMT) and the VR runtime (OpenXR). A download of about 250 MB.",
             (Step::GameSupport, _) => "Updates the OpenXR runtime and DXMT in Wine.",
-            (Step::Steam, SteamState::NeedsSetup) => "Steam needs a repair after its own update. This takes a minute.",
+            (Step::Steam, SteamState::NeedsSetup) => "Steam's web helper is missing or unknown, so Steam needs a repair. This takes a minute.",
             (Step::Steam, _) => "Installs Steam and prepares it for this Mac. A download of about 1.6 GB.",
         }
     }
@@ -133,7 +133,8 @@ fn run() {
                 return;
             }
         }
-        // A new runtime can change Steam's web helper shim: Steam then needs its own step
+        // A new runtime brings a new web helper shim. Steam's start puts it in, so only a helper that
+        // the start cannot repair needs the Steam step.
         if step == Step::GameSupport && steam::state() == SteamState::NeedsSetup {
             update(|setup| {
                 if !setup.steps.iter().any(|(step, _)| *step == Step::Steam) {
