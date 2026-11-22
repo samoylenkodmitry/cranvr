@@ -4,7 +4,7 @@ use crate::{
     launch::{GameOptions, WineOptions},
     usb::Connection,
 };
-use cranvr_common::controls::Controls;
+use cranvr_common::{controls::Controls, foveation::FoveationLevel};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -55,7 +55,9 @@ pub struct AddedGame {
 pub struct Settings {
     pub fps: u32,
     pub mbps: u32,
-    pub foveation: bool,
+    /// How strongly the host foveates each eye. The key is new: an old file's `foveation`, which
+    /// said yes or no, gives way to the standard level.
+    pub foveation_level: FoveationLevel,
     pub desktop: bool,
     /// Desktop captures per second
     pub desktop_fps: u32,
@@ -103,7 +105,7 @@ impl Default for Settings {
         Self {
             fps: 120,
             mbps: 100,
-            foveation: true,
+            foveation_level: FoveationLevel::default(),
             desktop: true,
             desktop_fps: 30,
             game: String::new(),
@@ -372,7 +374,8 @@ fn entry_name(path: &[String]) -> String {
 pub struct Headset {
     pub eye: (u32, u32),
     pub fps: f64,
-    pub foveated: bool,
+    /// The level of a foveated stream; `None` when the stream has every pixel
+    pub foveation: Option<FoveationLevel>,
     /// Which way the stream travels, once the host says
     pub path: Option<StreamPath>,
 }
@@ -523,7 +526,7 @@ impl Model {
                 self.headset = v["connected"].as_bool().unwrap_or(false).then(|| Headset {
                     eye: (v["eye"][0].as_u64().unwrap_or(0) as u32, v["eye"][1].as_u64().unwrap_or(0) as u32),
                     fps: v["fps"].as_f64().unwrap_or(0.0),
-                    foveated: v["foveated"].as_bool().unwrap_or(false),
+                    foveation: v["foveation"].as_str().and_then(FoveationLevel::parse).filter(|level| *level != FoveationLevel::Off),
                     path: v["cable"].as_bool().map(StreamPath::of),
                 });
                 if self.headset.is_none() {
@@ -690,9 +693,7 @@ fn host_args(settings: &Settings, config_dir: &Path, test: bool) -> Vec<OsString
     if !settings.connection.allows_usb() {
         args.push("--no-cable".into());
     }
-    if !settings.foveation {
-        args.push("--no-foveation".into());
-    }
+    args.extend(["--foveation", settings.foveation_level.name()].map(OsString::from));
     if !settings.game_audio {
         args.push("--no-game-audio".into());
     }
@@ -1113,7 +1114,7 @@ mod tests {
         let args = host_options(&Settings::default());
         assert_eq!(
             args,
-            ["--status", "--fps", "120", "--mbps", "100", "--config-dir", "/cfg", "--game-scale", "0.7", "--desktop", "--desktop-fps", "30"]
+            ["--status", "--fps", "120", "--mbps", "100", "--config-dir", "/cfg", "--foveation", "medium", "--game-scale", "0.7", "--desktop", "--desktop-fps", "30"]
         );
         // `--tcp` would force TCP media on every client: only a test asks for it
         assert!(!args.contains(&"--tcp".to_string()));
@@ -1124,7 +1125,7 @@ mod tests {
     #[test]
     fn the_settings_reach_the_host() {
         let quiet = Settings {
-            foveation: false,
+            foveation_level: FoveationLevel::Off,
             game_audio: false,
             hand_controllers: false,
             virtual_display: Some((1920, 1080)),
@@ -1132,7 +1133,7 @@ mod tests {
             ..Default::default()
         };
         let args = host_options(&quiet);
-        for wanted in ["--no-foveation", "--no-game-audio", "--no-hand-controllers", "--virtual-display", "1920x1080", "--no-cable"] {
+        for wanted in ["off", "--no-game-audio", "--no-hand-controllers", "--virtual-display", "1920x1080", "--no-cable"] {
             assert!(args.contains(&wanted.to_string()), "{wanted} in {args:?}");
         }
     }
@@ -1240,13 +1241,13 @@ mod tests {
     #[test]
     fn the_hosts_headset_and_stats_lines_fill_the_model() {
         let mut model = Model::default();
-        model.apply_status(&serde_json::json!({"type": "headset", "connected": true, "eye": [2064, 2208], "fps": 120.0, "foveated": true}));
+        model.apply_status(&serde_json::json!({"type": "headset", "connected": true, "eye": [2064, 2208], "fps": 120.0, "foveated": true, "foveation": "high"}));
         model.apply_status(&serde_json::json!({
             "type": "stats", "fps": 119.6, "game_frames": 0, "render_ms": 3.1, "encode_ms": 4.2, "mbps": 40, "mbps_set": 100,
             "sent_mbps": 28.2, "latency": {"frames": 590, "total_ms": 21.5, "rtt_ms": 2.0, "decode_ms": 3.0}
         }));
         let headset = model.headset.clone().unwrap();
-        assert_eq!((headset.eye, headset.fps, headset.foveated), ((2064, 2208), 120.0, true));
+        assert_eq!((headset.eye, headset.fps, headset.foveation), ((2064, 2208), 120.0, Some(FoveationLevel::High)));
         let stats = model.stats.clone().unwrap();
         assert_eq!((stats.fps, stats.mbps, stats.mbps_set, stats.sent_mbps, stats.latency_ms), (119.6, 40, 100, 28.2, Some(21.5)));
         model.apply_status(&serde_json::json!({"type": "headset", "connected": false}));
@@ -1270,6 +1271,21 @@ mod tests {
         assert_eq!(path("192.168.1.30", false.into()), Some(StreamPath::WiFi));
         // A host that does not say leaves the path unknown
         assert_eq!(path("192.168.1.30", serde_json::Value::Null), None);
+    }
+
+    // The level has a key of its own. The yes or no of an old file stays out of the way: no error,
+    // the standard level, and a save drops it.
+    #[test]
+    fn the_foveation_level_reads_back_and_an_old_yes_or_no_gives_the_standard_level() {
+        let old = Settings::read(r#"{"fps": 90, "foveation": true}"#);
+        assert!(old.unreadable.is_empty() && old.problem(Path::new("app.json")).is_none());
+        assert_eq!(old.settings.foveation_level, FoveationLevel::Medium);
+        let text = old.settings.file_text(Some(r#"{"fps": 90, "foveation": true}"#)).unwrap();
+        assert!(!text.contains("\"foveation\"") && text.contains("\"foveation_level\": \"Medium\""), "{text}");
+        for level in FoveationLevel::ALL {
+            let text = serde_json::to_string(&Settings { foveation_level: level, ..Default::default() }).unwrap();
+            assert_eq!(Settings::read(&text).settings.foveation_level, level);
+        }
     }
 
     #[test]

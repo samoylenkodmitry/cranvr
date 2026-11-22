@@ -9,7 +9,7 @@
 #                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine | --hand-interaction [hand|both]
 #                        | --openvr-wine | --openvr-actions MODE | --openvr-overlay | --openvr-gl | --steamvr]
 #                       [--displays N] [--hold] [--hand-hold] [--displays-in-game]
-#                       [--game-stall AT:FOR]
+#                       [--game-stall AT:FOR] [--moving]
 #                       [--pause AT:FOR] [--left-trigger AT:FOR] [--right-trigger AT:FOR]
 #                       [--face-source visual|audio|unknown]
 #
@@ -80,6 +80,10 @@
 #                 offer, the host's file for the runtime and each sample carry the source. The
 #                 Windows program checks that the support structure says it, that a face tracker
 #                 which asks for the other source is refused, and each sample's dataSource.
+#   --moving      the fake game's picture moves all the time: a landscape with fine detail pans across
+#                 both eyes (cranvr-fake-game --moving), so a headset that lies still gets a moving
+#                 picture, as a game sends while the head turns. Implies --game. A quality test of the
+#                 eye stream on a Quest takes it, such as a comparison of --host-arg --foveation levels.
 #   --game-stall AT:FOR  with the probe: the fake game sends no frame for FOR seconds (under 3) from AT seconds
 #                 after its start, as a game does while it loads a level. The host must keep the game's last
 #                 picture: the run fails when the probe decodes a frame of the host's own scene (wrong
@@ -176,7 +180,7 @@ source "${root}/scripts/guardian.sh"
 seconds=20 fps=120 fps_given=0 game=0 desktop=0 sound=0 client=mac serial="" report=""
 displays=1 hold=0 hand_hold=0 displays_in_game=0 display_test=0
 tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 hand_interaction="" openvr_wine=0 openvr_actions="" openvr_overlay=0 openvr_gl=0 steamvr=0 face_source=audio
-game_stall=""
+game_stall="" moving=0
 wine="" wine_args=()
 native_tcp=0 native_drop=0 native_port=9950 pause="" left_trigger="" right_trigger="" cable=""
 more_host_args=() more_probe_args=()
@@ -185,6 +189,7 @@ while (( $# )); do
         --seconds) seconds=$2; shift 2 ;;
         --fps) fps=$2; fps_given=1; shift 2 ;;
         --game) game=1; shift ;;
+        --moving) game=1 moving=1; shift ;;
         --tracking)
             game=1 tracking=1; shift
             if (( $# )) && [[ $1 != --* ]]; then tracking_features=$1; shift; fi ;;
@@ -489,11 +494,14 @@ if (( game )); then
         (( hand_hold )) && game_args+=(--expect-hand-held)
         (( hold )) && game_args+=(--expect-held)
         [[ -n ${game_stall} ]] && game_args=(--stall "${game_stall}")
+        (( moving )) && game_args+=(--moving)
         "${bin}/cranvr-fake-game" --control "${work}/config/runtime-control.txt" --fps "${fps}" \
             --seconds $(( seconds + 4 )) "${game_args[@]}" > "${work}/game.log" 2>&1 &
     else
+        game_args=()
+        (( moving )) && game_args+=(--moving)
         "${bin}/cranvr-fake-game" --control "${work}/config/runtime-control.txt" --fps "${fps}" \
-            --seconds $(( seconds + 60 )) > "${work}/game.log" 2>&1 &
+            --seconds $(( seconds + 60 )) "${game_args[@]}" > "${work}/game.log" 2>&1 &
     fi
     game_pid=$!
     pids+=(${game_pid})

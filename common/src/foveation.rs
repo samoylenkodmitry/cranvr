@@ -15,9 +15,80 @@ pub struct FoveationConfig {
 }
 
 impl Default for FoveationConfig {
-    /// The defaults of the port.
+    /// The defaults of the port: the level Medium.
     fn default() -> Self {
         Self { center_size: [0.45, 0.4], center_shift: [0.4, 0.1], edge_ratio: [4.0, 5.0] }
+    }
+}
+
+impl FoveationConfig {
+    /// The same layout with its full-density region centered on the direction straight ahead of
+    /// the eye. `tangents` are the left eye's view: the tangents of its left, right, up and down
+    /// angles, left and down negative. The right eye is the left one's mirror, as the layout
+    /// stores it. A Quest 3's eye sees 54 degrees out and 40 degrees in, 44 degrees up and 55
+    /// down, so straight ahead lies at 62 percent of the width from the outer edge and at 40
+    /// percent of the height from the top. ALVR's shift puts the region's middle at 53 percent of
+    /// the height, which leaves straight ahead near the top of a small region.
+    pub fn centered(self, tangents: [f32; 4]) -> Self {
+        let [left, right, up, down] = tangents;
+        let ahead = [-left / (right - left), up / (up - down)];
+        let mut out = self;
+        for i in 0..2 {
+            // The region's middle lies at 0.5 + c0 * shift, where c0 is half the room that the
+            // region leaves. The unwarp needs a shift inside -1 to 1.
+            let c0 = (1.0 - self.center_size[i]) / 2.0;
+            if ahead[i].is_finite() && (0.0..=1.0).contains(&ahead[i]) && c0 > 0.0 {
+                out.center_shift[i] = ((ahead[i] - 0.5) / c0).clamp(-0.9, 0.9);
+            }
+        }
+        out
+    }
+}
+
+/// How strongly the host foveates each eye: the user's setting. Every level keeps the full pixel
+/// density in a center region and squeezes the edges. A stronger level has a smaller center and
+/// squeezes the edges more, so the encoder gets fewer pixels and gives each of them more bits. The
+/// Quest 3 tracks no eyes, so the region stays around the direction straight ahead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum FoveationLevel {
+    /// Every pixel at full density. The host then takes a smaller eye, which its encoder keeps up with.
+    Off,
+    /// About 54 percent of the pixels of an eye
+    Low,
+    /// ALVR's default: about 31 percent of the pixels
+    #[default]
+    Medium,
+    /// About 20 percent of the pixels
+    High,
+}
+
+impl FoveationLevel {
+    pub const ALL: [Self; 4] = [Self::Off, Self::Low, Self::Medium, Self::High];
+
+    /// The layout of the level, `None` for `Off`. The host centers it on the headset's view
+    /// ([`FoveationConfig::centered`]).
+    pub fn config(self) -> Option<FoveationConfig> {
+        let (center_size, edge_ratio) = match self {
+            Self::Off => return None,
+            Self::Low => ([0.6, 0.55], [2.5, 3.0]),
+            Self::Medium => return Some(FoveationConfig::default()),
+            Self::High => ([0.35, 0.3], [5.0, 6.0]),
+        };
+        Some(FoveationConfig { center_size, center_shift: [0.4, 0.1], edge_ratio })
+    }
+
+    /// The level's name on the host's command line and in its status lines
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|level| level.name() == name)
     }
 }
 
@@ -169,6 +240,72 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Each level is a layout that the client can unwarp, and a stronger level codes fewer pixels
+    #[test]
+    fn a_stronger_level_codes_fewer_pixels() {
+        let eye = [1680u32, 1760];
+        let mut last = u64::MAX;
+        for level in FoveationLevel::ALL {
+            assert_eq!(FoveationLevel::parse(level.name()), Some(level));
+            let Some(config) = level.config() else { continue };
+            let f = Foveation::new(eye, &config);
+            let pixels = u64::from(f.optimized[0]) * u64::from(f.optimized[1]);
+            assert!(pixels < last, "{level:?} codes {pixels} pixels");
+            last = pixels;
+            for view in [[0.1, 0.1], [0.6, 0.4], [0.95, 0.9]] {
+                let back = f.encoded_to_view(f.view_to_encoded(view));
+                assert!((back[0] - view[0]).abs() < 1e-3 && (back[1] - view[1]).abs() < 1e-3, "{level:?} {view:?}");
+            }
+        }
+        assert_eq!(FoveationLevel::parse("full"), None);
+    }
+
+    /// A Quest 3's left eye: the tangents of 54 degrees out, 40 in, 44 up and 55 down
+    const QUEST_3: [f32; 4] = [-1.3764, 0.8391, 0.9657, -1.4281];
+
+    /// Each level, centered on a Quest 3's view, keeps the full density within 15 degrees of
+    /// straight ahead on both axes. ALVR's shift left straight ahead near the top of the region.
+    #[test]
+    fn a_centered_level_keeps_full_density_around_straight_ahead() {
+        let eye = [1680u32, 1760];
+        let [left, right, up, down] = QUEST_3;
+        // A tangent of the view to its place: x from the outer edge, y from the top
+        let at = |tx: f32, ty: f32| [(tx - left) / (right - left), (up - ty) / (up - down)];
+        let reach = 15f32.to_radians().tan();
+        for level in FoveationLevel::ALL {
+            let Some(config) = level.config() else { continue };
+            let f = Foveation::new(eye, &config.centered(QUEST_3));
+            let density = |view: [f32; 2]| {
+                let a = f.view_to_encoded(view);
+                let b = f.view_to_encoded([view[0] + 0.001, view[1] + 0.001]);
+                [(b[0] - a[0]) / 0.001 * f.optimized[0] as f32 / eye[0] as f32, (b[1] - a[1]) / 0.001 * f.optimized[1] as f32 / eye[1] as f32]
+            };
+            for (tx, ty) in [(0.0, 0.0), (-reach, -reach), (reach, reach), (-reach, reach), (reach, -reach)] {
+                let d = density(at(tx, ty));
+                assert!((d[0] - 1.0).abs() < 0.05 && (d[1] - 1.0).abs() < 0.05, "{level:?} at {tx}, {ty}: {d:?}");
+            }
+            assert!(f.center_shift[1] < 0.0, "{level:?}: the region moves up, toward straight ahead");
+            // The client's unwarp undoes the host's warp across the whole view, both edges included
+            for i in 0..=20 {
+                for j in 0..=20 {
+                    let view = [i as f32 / 20.0, j as f32 / 20.0];
+                    let back = f.encoded_to_view(f.view_to_encoded(view));
+                    assert!((back[0] - view[0]).abs() < 1e-3 && (back[1] - view[1]).abs() < 1e-3, "{level:?} {view:?} -> {back:?}");
+                }
+            }
+        }
+        // ALVR's own shift: High's region ends right above straight ahead
+        let alvr = Foveation::new(eye, &FoveationLevel::High.config().unwrap());
+        let a = alvr.view_to_encoded(at(0.0, reach));
+        let b = alvr.view_to_encoded({
+            let v = at(0.0, reach);
+            [v[0], v[1] + 0.001]
+        });
+        assert!((b[1] - a[1]) / 0.001 * alvr.optimized[1] as f32 / (eye[1] as f32) < 0.9, "the old shift is squeezed 15 degrees up");
+        // A view with no extent keeps the shift
+        assert_eq!(FoveationConfig::default().centered([0.0; 4]), FoveationConfig::default());
     }
 
     #[test]

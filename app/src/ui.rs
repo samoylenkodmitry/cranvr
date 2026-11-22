@@ -9,7 +9,10 @@ use crate::{
 };
 use cranpose::prelude::*;
 use cranpose::text::{FontWeight, TextUnit};
-use cranvr_common::controls::{Action as ControlAction, Control, Controls, Hand, ModelsInGame};
+use cranvr_common::{
+    controls::{Action as ControlAction, Control, Controls, Hand, ModelsInGame},
+    foveation::FoveationLevel,
+};
 use cranpose::widgets::{FlowRow, FlowSpec};
 use std::{
     thread,
@@ -480,7 +483,7 @@ fn HeadsetCard(settings: MutableState<Settings>, model: MutableState<Model>) {
                         h.eye.0,
                         h.eye.1,
                         h.fps,
-                        if h.foveated { ", foveated" } else { "" }
+                        h.foveation.map(|level| format!(", foveation {}", level.name())).unwrap_or_default()
                     ),
                     Modifier::empty(),
                     colored(110, 200, 140),
@@ -1194,14 +1197,27 @@ fn GeneralSettings(settings: MutableState<Settings>, model: MutableState<Model>)
                 Choice(format!("{mbps} Mbps"), current_mbps == mbps, move || change(settings, model, |s| s.mbps = mbps));
             }
         });
-        let (foveation, autostart) = (s1.foveation, s1.autostart);
+        let (foveation, autostart) = (s1.foveation_level, s1.autostart);
         FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-            Choice("Foveated encoding".into(), foveation, move || change(settings, model, |s| s.foveation = !s.foveation));
+            Text("Foveated encoding".to_string(), Modifier::empty().padding(8.0), TextStyle::default());
+            for (label, level) in [("Off", FoveationLevel::Off), ("Low", FoveationLevel::Low), ("Medium", FoveationLevel::Medium), ("High", FoveationLevel::High)] {
+                Choice(label.into(), foveation == level, move || change(settings, model, |s| s.foveation_level = level));
+            }
+        });
+        Hint(
+            match foveation {
+                FoveationLevel::Off => "Every pixel at the same detail. At 120 Hz the eye is smaller, so the center is less sharp.",
+                FoveationLevel::Low => "The center is sharp and the edges lose a little detail. Each frame takes about 2 ms longer to encode and decode than at Medium.",
+                FoveationLevel::Medium => "The center is sharp and the edges lose detail. This is the standard level.",
+                FoveationLevel::High => "The center gets the most bits and the edges lose the most detail. The sharp region around straight ahead is smaller.",
+            }
+            .into(),
+        );
+        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
             Choice("Start the host when cranvr opens".into(), autostart, move || {
                 change(settings, model, |s| s.autostart = !s.autostart)
             });
         });
-        Hint("Foveated encoding sends the edges of the view at lower detail. It makes 120 Hz possible at the full Quest 3 resolution.".into());
         let game_audio = s1.game_audio;
         FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
             Choice("Game sound in the headset".into(), game_audio, move || {
