@@ -1,0 +1,324 @@
+Subject: [PATCH] d3d11: buffers that processes share (cranvr)
+
+SteamVR's compositor makes a constant buffer with D3D11_RESOURCE_MISC_SHARED and stops at start when the buffer
+has no shared handle ("Failed to create shared frame info constant buffer"). DXMT shared textures only. A buffer
+with the flag now lies on the memory of a named file mapping. A kernel allocation carries the mapping's name, the
+buffer's description and its size, so another process opens the same memory with OpenSharedResource. Such a buffer
+has no dynamic renames, because a rename would move it off the shared memory.
+---
+diff --git a/src/d3d11/d3d11_buffer.cpp b/src/d3d11/d3d11_buffer.cpp
+index 1269d63..34b879e 100644
+--- a/src/d3d11/d3d11_buffer.cpp
++++ b/src/d3d11/d3d11_buffer.cpp
+@@ -4,6 +4,8 @@
+ #include "dxmt_dynamic.hpp"
+ #include "dxmt_format.hpp"
+ #include "d3d11_resource.hpp"
++#include "d3d11_shared_buffer.hpp"
++#include "log/log.hpp"
+ 
+ namespace dxmt {
+ 
+@@ -24,6 +26,40 @@ private:
+   bool allow_raw_view;
+ 
+   Rc<DynamicBuffer> dynamic_;
++  /* cranvr: a buffer shared with D3D11_RESOURCE_MISC_SHARED (see d3d11_shared_buffer.hpp) */
++  SharedBufferMemory shared_;
++  D3DKMT_HANDLE local_kmt_ = 0;
++  D3DKMT_HANDLE global_kmt_ = 0;
++
++  /* The shared path of the constructor: the buffer lies on the memory of a file mapping. `imported` is the memory
++   * of a buffer that another process shared, else the buffer makes its own. False when it fails: the buffer then
++   * takes the ordinary path, unshared. */
++  bool
++  InitShared(const D3D11_BUFFER_DESC *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData, MTLD3D11Device *device,
++             const SharedBufferMemory *imported, D3DKMT_HANDLE importedGlobal) {
++    SharedBufferData data;
++    if (imported) {
++      shared_ = *imported;
++    } else if (!MakeSharedBufferMemory(*pDesc, data, shared_)) {
++      ERR("D3D11Buffer: no file mapping for a shared buffer of ", pDesc->ByteWidth, " bytes");
++      return false;
++    }
++    buffer_ = new Buffer(pDesc->ByteWidth, device->GetMTLDevice());
++    Flags<BufferAllocationFlag> flags;
++    auto allocation = buffer_->allocatePlaced(flags, shared_.view, shared_.size);
++    if (pInitialData)
++      memcpy(shared_.view, pInitialData->pSysMem, pDesc->ByteWidth);
++    auto _ = buffer_->rename(std::move(allocation));
++    structured = pDesc->MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
++    allow_raw_view = pDesc->MiscFlags & D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
++    // No dynamic buffer: its renames would move the buffer off the shared memory
++    if (imported) {
++      global_kmt_ = importedGlobal;
++    } else if (!ShareBuffer(device, data, &local_kmt_, &global_kmt_)) {
++      ERR("D3D11Buffer: no D3DKMT allocation for a shared buffer; it has no handle");
++    }
++    return true;
++  }
+ 
+   using SRVBase = TResourceViewBase<tag_shader_resource_view<D3D11Buffer>>;
+ 
+@@ -62,8 +98,15 @@ private:
+   };
+ 
+ public:
+-  D3D11Buffer(const tag_buffer::DESC1 *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData, MTLD3D11Device *device) :
++  D3D11Buffer(
++      const tag_buffer::DESC1 *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData, MTLD3D11Device *device,
++      const SharedBufferMemory *imported = nullptr, D3DKMT_HANDLE importedGlobal = 0
++  ) :
+       TResourceBase<tag_buffer>(*pDesc, device) {
++    if (((pDesc->MiscFlags & D3D11_RESOURCE_MISC_SHARED) && !(pDesc->MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE)) || imported) {
++      if (InitShared(pDesc, pInitialData, device, imported, importedGlobal))
++        return;
++    }
+     buffer_ = new Buffer(pDesc->ByteWidth, device->GetMTLDevice());
+     Flags<BufferAllocationFlag> flags;
+     if (!m_parent->IsTraced() && pDesc->Usage == D3D11_USAGE_DYNAMIC)
+@@ -100,6 +143,25 @@ public:
+     }
+   }
+ 
++  ~D3D11Buffer() {
++    if (local_kmt_) {
++      D3DKMT_DESTROYALLOCATION destroy = {};
++      destroy.hDevice = m_parent->GetLocalD3DKMT();
++      destroy.hResource = local_kmt_;
++      D3DKMTDestroyAllocation(&destroy);
++    }
++    if (shared_.mapping)
++      CloseHandle(shared_.mapping);
++  }
++
++  HRESULT
++  GetSharedHandle(HANDLE *pSharedHandle) override {
++    if (pSharedHandle == nullptr || (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE) || !global_kmt_)
++      return E_INVALIDARG;
++    *pSharedHandle = reinterpret_cast<HANDLE>(global_kmt_);
++    return S_OK;
++  }
++
+   HRESULT
+   STDMETHODCALLTYPE
+   QueryInterface(REFIID riid, void **ppvObject) override {
+@@ -296,6 +358,39 @@ public:
+   }
+ };
+ 
++/* cranvr: opens a buffer that another process shared (see d3d11_shared_buffer.hpp) */
++HRESULT
++ImportSharedBuffer(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void **ppResource) {
++  SharedBufferData data = {};
++  D3DDDI_OPENALLOCATIONINFO2 alloc = {};
++  D3DKMT_OPENRESOURCE open = {};
++  open.hDevice = pDevice->GetLocalD3DKMT();
++  open.hGlobalShare = static_cast<D3DKMT_HANDLE>(reinterpret_cast<uintptr_t>(hResource));
++  open.NumAllocations = 1;
++  open.pOpenAllocationInfo2 = &alloc;
++  open.pPrivateRuntimeData = &data;
++  open.PrivateRuntimeDataSize = sizeof(data);
++  if (D3DKMTOpenResource2(&open)) {
++    WARN("ImportSharedBuffer: Failed to open resource: ", hResource);
++    return E_INVALIDARG;
++  }
++  D3DKMT_DESTROYALLOCATION destroy = {};
++  destroy.hDevice = pDevice->GetLocalD3DKMT();
++  destroy.hResource = open.hResource;
++  D3DKMTDestroyAllocation(&destroy);
++  if (memcmp(data.magic, "dxmtbuf", 8)) {
++    WARN("ImportSharedBuffer: the handle names no shared buffer: ", hResource);
++    return E_INVALIDARG;
++  }
++  SharedBufferMemory memory;
++  if (!OpenSharedBufferMemory(data, memory)) {
++    WARN("ImportSharedBuffer: Failed to map the memory of the shared buffer: ", hResource);
++    return E_FAIL;
++  }
++  Com<D3D11Buffer> buffer = ref(new D3D11Buffer(&data.desc, nullptr, pDevice, &memory, open.hGlobalShare));
++  return buffer->QueryInterface(riid, ppResource);
++}
++
+ HRESULT
+ CreateBuffer(
+     MTLD3D11Device *pDevice, const D3D11_BUFFER_DESC *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData,
+diff --git a/src/d3d11/d3d11_resource.hpp b/src/d3d11/d3d11_resource.hpp
+index 80927e5..40bf52d 100644
+--- a/src/d3d11/d3d11_resource.hpp
++++ b/src/d3d11/d3d11_resource.hpp
+@@ -507,6 +507,9 @@ HRESULT CreateDeviceTexture3D(MTLD3D11Device *pDevice,
+ 
+ HRESULT ImportSharedTexture(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void **ppTexture);
+ 
++/* cranvr: a buffer that another process shared (d3d11_shared_buffer.hpp); ImportSharedTexture passes it on */
++HRESULT ImportSharedBuffer(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void **ppResource);
++
+ HRESULT ImportSharedTextureFromNtHandle(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void **ppTexture);
+ 
+ HRESULT ImportSharedTextureByName(
+diff --git a/src/d3d11/d3d11_shared_buffer.hpp b/src/d3d11/d3d11_shared_buffer.hpp
+new file mode 100644
+index 0000000..3285323
+--- /dev/null
++++ b/src/d3d11/d3d11_shared_buffer.hpp
+@@ -0,0 +1,110 @@
++#pragma once
++/*
++ * cranvr: a buffer created with D3D11_RESOURCE_MISC_SHARED is shared with other processes.
++ *
++ * SteamVR's compositor creates a constant buffer with each frame's information as a shared resource and stops
++ * when it gets no handle ("Failed to create shared frame info constant buffer!"). Each OpenVR program opens the
++ * buffer and copies it into a buffer that its CPU reads ("Failed to open frame info buffer"). DXMT shared
++ * textures only.
++ *
++ * The memory of such a buffer is a Windows file mapping, which Wine maps into each process that opens it. The
++ * Metal buffer of each process lies on that memory (newBufferWithBytesNoCopy), so the GPU of one process
++ * writes what the other process reads: Apple's GPUs share the memory with the CPU. The buffer has a D3DKMT
++ * allocation like a shared texture. Its private data names the mapping and holds the buffer's description,
++ * and its size (96 bytes) tells an open that the handle names a buffer.
++ */
++#include "d3d11_device.hpp"
++#include "util_win32_compat.h"
++#include <atomic>
++#include <cstdio>
++#include <cstring>
++
++namespace dxmt {
++
++struct SharedBufferData {
++  char magic[8];
++  D3D11_BUFFER_DESC desc;
++  uint32_t mapped_size;
++  char mapping[60];
++};
++// ImportSharedTexture in d3d11_texture_device.cpp tells a buffer by this size
++static_assert(sizeof(SharedBufferData) == 96);
++
++/* The memory of a shared buffer in this process. The view stays mapped while the process lives: a command buffer
++ * may still use the Metal buffer that lies on it after the D3D11 buffer is gone. */
++struct SharedBufferMemory {
++  HANDLE mapping = nullptr;
++  void *view = nullptr;
++  uint32_t size = 0;
++};
++
++/* Makes the file mapping of a new shared buffer and fills in its private data. */
++inline bool
++MakeSharedBufferMemory(const D3D11_BUFFER_DESC &desc, SharedBufferData &data, SharedBufferMemory &memory) {
++  static std::atomic<uint32_t> counter{0};
++  memset(&data, 0, sizeof(data));
++  memcpy(data.magic, "dxmtbuf", 8);
++  data.desc = desc;
++  // Metal wants whole pages under a buffer that lies on memory of its caller
++  data.mapped_size = (std::max(desc.ByteWidth, 256u) + 0xffffu) & ~0xffffu;
++  snprintf(data.mapping, sizeof(data.mapping), "Local\\dxmt-shared-buffer-%lu-%u", GetCurrentProcessId(), counter++);
++  memory.mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, data.mapped_size, data.mapping);
++  if (!memory.mapping)
++    return false;
++  memory.view = MapViewOfFile(memory.mapping, FILE_MAP_ALL_ACCESS, 0, 0, data.mapped_size);
++  if (!memory.view) {
++    CloseHandle(memory.mapping);
++    memory.mapping = nullptr;
++    return false;
++  }
++  memory.size = data.mapped_size;
++  return true;
++}
++
++/* Maps the memory of a buffer that another process shared. */
++inline bool
++OpenSharedBufferMemory(const SharedBufferData &data, SharedBufferMemory &memory) {
++  char name[sizeof(data.mapping) + 1] = {};
++  memcpy(name, data.mapping, sizeof(data.mapping));
++  memory.mapping = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, name);
++  if (!memory.mapping)
++    return false;
++  memory.view = MapViewOfFile(memory.mapping, FILE_MAP_ALL_ACCESS, 0, 0, data.mapped_size);
++  if (!memory.view) {
++    CloseHandle(memory.mapping);
++    memory.mapping = nullptr;
++    return false;
++  }
++  memory.size = data.mapped_size;
++  return true;
++}
++
++/* Makes the D3DKMT allocation that gives a shared buffer its global handle. */
++inline bool
++ShareBuffer(MTLD3D11Device *pDevice, SharedBufferData &data, D3DKMT_HANDLE *local, D3DKMT_HANDLE *global) {
++  if (!(pDevice->GetLocalD3DKMT() & 0xc0000000))
++    return false;
++  D3DKMT_CREATEALLOCATION create = {};
++  create.hDevice = pDevice->GetLocalD3DKMT();
++  create.pPrivateRuntimeData = &data;
++  create.PrivateRuntimeDataSize = sizeof(data);
++  create.Flags.StandardAllocation = 1;
++  create.NumAllocations = 1;
++  D3DDDI_ALLOCATIONINFO2 allocationInfo = {};
++  create.pAllocationInfo2 = &allocationInfo;
++  D3DKMT_CREATESTANDARDALLOCATION standardAllocation = {};
++  create.pStandardAllocation = &standardAllocation;
++  standardAllocation.Type = D3DKMT_STANDARDALLOCATIONTYPE_EXISTINGHEAP;
++  create.Flags.ExistingSysMem = 1;
++  D3DDDI_ALLOCATIONINFO systemMem = {};
++  allocationInfo.pSystemMem = &systemMem;
++  create.Flags.CreateResource = 1;
++  create.Flags.CreateShared = 1;
++  if (D3DKMTCreateAllocation2(&create))
++    return false;
++  *local = create.hResource;
++  *global = create.hGlobalShare;
++  return true;
++}
++
++} // namespace dxmt
+diff --git a/src/d3d11/d3d11_texture_device.cpp b/src/d3d11/d3d11_texture_device.cpp
+index 60de0c1..561396f 100644
+--- a/src/d3d11/d3d11_texture_device.cpp
++++ b/src/d3d11/d3d11_texture_device.cpp
+@@ -563,6 +563,9 @@ ImportSharedTexture(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void
+     return E_INVALIDARG;
+   }
+ 
++  // cranvr: the private data of a shared buffer has 96 bytes (SharedBufferData in d3d11_shared_buffer.hpp)
++  if (query.PrivateRuntimeDataSize == 96)
++    return ImportSharedBuffer(pDevice, hResource, riid, ppTexture);
+   if (query.PrivateRuntimeDataSize != sizeof(runtimeData)) {
+     WARN("ImportSharedTexture: Unexpected size: ", query.PrivateRuntimeDataSize);
+     return E_INVALIDARG;
+diff --git a/src/dxmt/dxmt_buffer.cpp b/src/dxmt/dxmt_buffer.cpp
+index 2d9704c..01d4f9a 100644
+--- a/src/dxmt/dxmt_buffer.cpp
++++ b/src/dxmt/dxmt_buffer.cpp
+@@ -147,6 +147,15 @@ Buffer::allocate(Flags<BufferAllocationFlag> flags) {
+   return new BufferAllocation(device_, info, flags);
+ };
+ 
++Rc<BufferAllocation>
++Buffer::allocatePlaced(Flags<BufferAllocationFlag> flags, void *memory, uint64_t length) {
++  WMTBufferInfo info;
++  info.memory.set(memory);
++  info.length = length;
++  info.options = WMTResourceHazardTrackingModeUntracked;
++  return new BufferAllocation(device_, info, flags);
++};
++
+ Rc<BufferAllocation>
+ Buffer::rename(Rc<BufferAllocation> &&newAllocation) {
+   Rc<BufferAllocation> old = std::move(current_);
+diff --git a/src/dxmt/dxmt_buffer.hpp b/src/dxmt/dxmt_buffer.hpp
+index 2ee36c0..00f9b80 100644
+--- a/src/dxmt/dxmt_buffer.hpp
++++ b/src/dxmt/dxmt_buffer.hpp
+@@ -140,6 +140,10 @@ public:
+ 
+   Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags);
+ 
++  /* cranvr: an allocation on memory that the caller keeps mapped, such as a file mapping that another process maps
++   * too (a shared D3D11 buffer) */
++  Rc<BufferAllocation> allocatePlaced(Flags<BufferAllocationFlag> flags, void *memory, uint64_t length);
++
+   Rc<BufferAllocation> rename(Rc<BufferAllocation> &&newAllocation);
+ 
+   Buffer(uint64_t length, WMT::Device device) : length_(length), device_(device) {}

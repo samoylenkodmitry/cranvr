@@ -194,8 +194,9 @@ pub fn steam_games() -> Vec<Game> {
             let Some(app_id) = file.strip_prefix("appmanifest_").and_then(|f| f.strip_suffix(".acf")) else { continue };
             let text = fs::read_to_string(entry.path()).unwrap_or_default();
             let (Some(name), Some(installdir)) = (vdf_value(&text, "name"), vdf_value(&text, "installdir")) else { continue };
-            // Steam's own tools (runtimes, redistributables) are not games
-            if name.starts_with("Steamworks") || name.contains("Redistributable") || name.starts_with("Proton") {
+            // Steam's own tools (runtimes, redistributables) are not games. SteamVR is the OpenVR runtime
+            // that a game's launch options choose (launch::OpenVr), so it is no game either.
+            if name.starts_with("Steamworks") || name.contains("Redistributable") || name.starts_with("Proton") || app_id == STEAMVR_APP_ID {
                 continue;
             }
             let exe = find_exe(&steamapps.join("common").join(&installdir), &installdir);
@@ -205,6 +206,24 @@ pub fn steam_games() -> Vec<Game> {
     games.sort_by_key(|a| a.name.to_lowercase());
     games.dedup_by(|a, b| a.app_id == b.app_id);
     games
+}
+
+/// SteamVR's app ID in the Steam store
+const STEAMVR_APP_ID: &str = "250820";
+
+/// Where SteamVR for Windows lives when a Steam library of the prefix has it, as Windows programs see it.
+pub fn steamvr() -> Option<openvr::SteamVr> {
+    let folder = libraries().into_iter().find_map(|steamapps| {
+        let text = fs::read_to_string(steamapps.join(format!("appmanifest_{STEAMVR_APP_ID}.acf"))).ok()?;
+        let folder = steamapps.join("common").join(vdf_value(&text, "installdir")?);
+        folder.join("bin/win64/vrserver.exe").is_file().then_some(folder)
+    })?;
+    let steam = steam_dir();
+    Some(openvr::SteamVr {
+        runtime: mac_to_windows(&folder),
+        config: mac_to_windows(&steam.join("config")),
+        log: mac_to_windows(&steam.join("logs")),
+    })
 }
 
 /// The `steamapps` folders: the one in Steam's folder and those in libraryfolders.vdf.
@@ -300,8 +319,9 @@ pub fn wine(program: &str) -> Command {
 fn game_wine(program: &str) -> Command {
     let settings = backend::Settings::load();
     let options = settings.launch.get(program).cloned().unwrap_or_default();
-    let on = launch::opencomposite(&settings.wine, &options);
-    if let Err(e) = openvr::apply(&prefix(), on) {
+    let choice = launch::openvr(&settings.wine, &options);
+    let steamvr = if choice == launch::OpenVr::SteamVr { steamvr() } else { None };
+    if let Err(e) = openvr::apply(&prefix(), choice, steamvr.as_ref()) {
         backend::notify(format!("cranvr could not set the OpenVR runtime: {e}"));
     }
     let mut command = wine_with(program, settings.game_msaa_limit);

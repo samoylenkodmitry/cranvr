@@ -14,10 +14,10 @@
 
 ## Game support
 
-The Mac app downloads Wine, DXMT, the OpenXR runtime and OpenComposite as one archive from the public repository samoylenkodmitry/cranvr-game-support, in its newest release. A change of a runtime, DXMT, OpenComposite or Wine patch needs a new release, or the apps of other people keep the old runtime.
+The Mac app downloads Wine, DXMT, the OpenXR runtime, OpenComposite and the SteamVR driver as one archive from the public repository samoylenkodmitry/cranvr-game-support, in its newest release. A change of a runtime, DXMT, OpenComposite or Wine patch or of the SteamVR driver needs a new release, or the apps of other people keep the old runtime.
 
 1. Set a new date in `scripts/game-support-version.txt` (`YYYY.MM.DD`, with `.2` after it for a second release on one day).
-2. Run `scripts/build-basaltvr.sh`, `scripts/build-opencomposite.sh`, `scripts/build-wine.sh` and `scripts/package-game-support.sh`. The archive, its `.sha256`, `cranvr-opencomposite-source.tar.xz` and `cranvr-wine-source.tar.xz` land in `target/game-support`.
+2. Run `scripts/build-basaltvr.sh`, `scripts/build-opencomposite.sh`, `scripts/build-wine.sh`, `scripts/build-steamvr-driver.sh` and `scripts/package-game-support.sh`. The archive, its `.sha256`, `cranvr-opencomposite-source.tar.xz` and `cranvr-wine-source.tar.xz` land in `target/game-support`.
 3. Publish the four files, with these names, as a release tagged `v` plus the version: `gh release create v2026.11.19 target/game-support/cranvr-game-support-macos.tar.xz target/game-support/cranvr-game-support-macos.tar.xz.sha256 target/game-support/cranvr-opencomposite-source.tar.xz target/game-support/cranvr-wine-source.tar.xz --repo samoylenkodmitry/cranvr-game-support --title "Game support 2026-11-19" --notes-file NOTES.md`. The notes say in plain words what changed. OpenComposite is GPL 3: its source must stay with each release that carries its DLL. Wine is LGPL 2.1: the source of the patched Wine files stays with each release too. The archive holds the same source in `SOURCE/`, with the licenses in `LICENSES/`, and the repository's README says so.
 4. Build the Mac app with the same version file. Its Play tab then offers "Update game support" to every Mac whose stamp in `wine/game-support-version.txt` is older.
 

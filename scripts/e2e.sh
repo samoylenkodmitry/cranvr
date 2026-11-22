@@ -7,7 +7,7 @@
 #                       [--quest [SERIAL] | --native-tcp] [--native-drop PERCENT] [--native-port PORT]
 #                       [--host-arg ARG]... [--probe-arg ARG]... [--report FILE]
 #                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine | --hand-interaction [hand|both]
-#                        | --openvr-wine | --openvr-actions MODE | --openvr-overlay | --openvr-gl]
+#                        | --openvr-wine | --openvr-actions MODE | --openvr-overlay | --openvr-gl | --steamvr]
 #                       [--displays N] [--hold] [--hand-hold] [--displays-in-game]
 #                       [--game-stall AT:FOR]
 #                       [--pause AT:FOR] [--left-trigger AT:FOR] [--right-trigger AT:FOR]
@@ -49,7 +49,7 @@
 #                 still. Set CRANVR_HOME to a stack that scripts/setup-wine.sh built from the runtime to test.
 #   --openvr-wine  an OpenVR program through OpenComposite and the real runtime: C:\opencomposite\openvr_smoke.exe
 #                 runs in Wine. It finds the runtime through the prefix's OpenVR path file, which
-#                 scripts/run-game.sh writes when CRANVR_OPENCOMPOSITE is 1 (this option sets it). It
+#                 scripts/run-game.sh writes for CRANVR_OPENVR=opencomposite (this option sets it). It
 #                 makes a Direct3D 11 device, submits both eyes in every frame and reads the head pose,
 #                 the controller state of IVRSystem for the scripted controllers (a pull of the left grip, the right
 #                 trigger at 0.75, the A button) and their poses in the array of WaitGetPoses (valid in
@@ -67,6 +67,13 @@
 #                 compatibility profile, draws with a shader of GLSL 1.10 and submits one OpenGL texture with both eyes
 #                 side by side. OpenComposite copies it into the runtime's Direct3D 11 images. The run checks the
 #                 picture of each eye in the host the same way. Implies --openvr-wine.
+#   --steamvr     the same program through SteamVR for Windows and cranvr's driver (steamvr/driver_cranvr.cpp):
+#                 scripts/run-game.sh writes the OpenVR path file for CRANVR_OPENVR=steamvr, and the program's
+#                 VR_Init starts SteamVR from the prefix's Steam library. The checks are those of --openvr-wine. The
+#                 run lasts at least 60 seconds, because SteamVR takes 10 to 20 seconds to start. SteamVR ends with
+#                 the program. Set CRANVR_HOME to a stack with SteamVR in its Steam library and the driver.
+#                 The probe offers a Quest 3's view (44 degrees up, 55 down), and the eye check also fails on
+#                 black rows at the bottom of an eye: a runtime that swaps the up and down angles leaves them.
 #   --face-source SOURCE  with --tracking and --tracking-wine: where the probe's face comes from.
 #                 audio (the default) is a Quest 3's microphone face, visual is a face from cameras,
 #                 and unknown is an offer that names no source, as a headset's offer before its face gives data. The
@@ -156,7 +163,7 @@ root=${0:A:h:h}
 source "${root}/scripts/guardian.sh"
 seconds=20 fps=120 fps_given=0 game=0 desktop=0 client=mac serial="" report=""
 displays=1 hold=0 hand_hold=0 displays_in_game=0 display_test=0
-tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 hand_interaction="" openvr_wine=0 openvr_actions="" openvr_overlay=0 openvr_gl=0 face_source=audio
+tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 hand_interaction="" openvr_wine=0 openvr_actions="" openvr_overlay=0 openvr_gl=0 steamvr=0 face_source=audio
 game_stall=""
 wine="" wine_args=()
 native_tcp=0 native_drop=0 native_port=9950 pause="" left_trigger="" right_trigger=""
@@ -179,6 +186,7 @@ while (( $# )); do
         --openvr-wine) openvr_wine=1; shift ;;
         --openvr-overlay) openvr_wine=1 openvr_overlay=1; shift ;;
         --openvr-gl) openvr_wine=1 openvr_gl=1; shift ;;
+        --steamvr) openvr_wine=1 steamvr=1; shift ;;
         --openvr-actions)
             openvr_wine=1 openvr_actions=$2; shift 2
             [[ ${openvr_actions} == (touch|vive|both) ]] || { print -u2 "--openvr-actions takes touch, vive or both"; exit 2; } ;;
@@ -228,14 +236,22 @@ if [[ ${client} == quest && -n ${hand_interaction} ]]; then
     exit 2
 fi
 if (( openvr_wine )); then
-    # The program ends a few seconds before the probe, so its verdict is in the log when the probe is done
-    (( seconds >= 20 )) || seconds=20
+    # The program ends a few seconds before the probe, so its verdict is in the log when the probe is done.
+    # SteamVR starts within the program's VR_Init, which takes its time before the program's seconds count.
+    if (( steamvr )); then
+        (( seconds >= 60 )) || seconds=60
+        program_seconds=$(( seconds - 35 ))
+        export CRANVR_OPENVR=steamvr
+    else
+        (( seconds >= 20 )) || seconds=20
+        program_seconds=$(( seconds - 6 ))
+        export CRANVR_OPENVR=opencomposite
+    fi
     wine='C:\opencomposite\openvr_smoke.exe'
-    wine_args=(--seconds $(( seconds - 6 )) --expect-input)
+    wine_args=(--seconds ${program_seconds} --expect-input)
     [[ -z ${openvr_actions} ]] || wine_args+=(--actions "${openvr_actions}")
     (( ! openvr_overlay )) || wine_args+=(--overlay)
     (( ! openvr_gl )) || wine_args+=(--gl)
-    export CRANVR_OPENCOMPOSITE=1
     # The run tests the path of an OpenVR program, not the rate. On a Mac that other builds keep busy (a
     # load average above 20) the program loses frames to the scheduler: the report of its second-by-second
     # frame counts shows 120 in the quiet seconds and 60 to 100 in the busy ones. The rest of the loss was
@@ -471,10 +487,25 @@ if [[ -n ${wine} ]]; then
         > "${work}/game.log" 2>&1 &
     pids+=($!)
 fi
+# SteamVR goes on drawing its own room after the program ends, so the host's last eyes are SteamVR's. The run keeps
+# the eyes of 10 seconds into the program's frames for the check below.
+if (( steamvr )); then
+    (
+        for i in {1..240}; do
+            grep -q "openvr_smoke: initialised" "${work}/game.log" 2>/dev/null && break
+            sleep 0.5
+        done
+        sleep 10
+        mkdir -p "${work}/eyes-game"
+        cp "${work}/eyes/eye-left.png" "${work}/eyes/eye-right.png" "${work}/eyes-game/" 2>/dev/null
+    ) &
+    pids+=($!)
+fi
 
 probe_args=(--seconds "${seconds}" --connect "127.0.0.1:${native_port}" --drop-percent "${native_drop}")
 (( native_tcp )) && probe_args+=(--tcp)
 (( game )) && probe_args+=(--game)
+(( steamvr )) && probe_args+=(--quest-view)
 # A real program and the desktop scene draw no eye badges
 if [[ -n ${wine} ]] || (( desktop )); then
     probe_args+=(--any-picture)
@@ -538,6 +569,17 @@ if (( openvr_wine )); then
     done
     grep -h "openvr_smoke:" "${work}/game.log" || true
     grep -q "openvr_smoke: PASS" "${work}/game.log" || { print -u2 "The OpenVR program did not pass; see ${work}/game.log"; openvr_exit=1; }
+    # The head's pose in the array of WaitGetPoses is valid in nearly every frame: a game draws its view with it
+    python3 -I - "${work}/game.log" <<'PYTHON' || { print -u2 "The OpenVR program got too few valid head poses; see ${work}/game.log"; openvr_exit=1; }
+import re, sys
+found = re.search(r"openvr_smoke: (\d+) frames in .*?, (\d+) valid head poses", open(sys.argv[1], errors="replace").read())
+if not found:
+    print("head: the program reported no frame count", file=sys.stderr)
+    sys.exit(1)
+frames, valid = int(found.group(1)), int(found.group(2))
+print("head: %d valid head poses of %d frames" % (valid, frames))
+sys.exit(0 if frames > 0 and valid >= 0.9 * frames else 1)
+PYTHON
     if (( openvr_overlay )); then
         # The frames of the program reach the host although an overlay is up: the host's count of game frames
         python3 -I - "${work}/host.out" "${fps}" <<'PYTHON' || { print -u2 "The host got too few game frames from the OpenVR program while its overlay was up; see ${work}/host.out"; openvr_exit=1; }
@@ -558,7 +600,9 @@ sys.exit(0 if mean >= 0.5 * fps else 1)
 PYTHON
     fi
     # The picture of each eye reaches the host the right way up: the program's upper half is bright, its lower half nearly black
-    python3 -I - "${work}/eyes" <<'PYTHON' || { print -u2 "The picture of the OpenVR program is not the right way up in the host; see ${work}/eyes"; openvr_exit=1; }
+    eyes=${work}/eyes
+    (( steamvr )) && eyes=${work}/eyes-game
+    python3 -I - "${eyes}" <<'PYTHON' || { print -u2 "The picture of the OpenVR program is upside down or leaves black rows in the host; see ${eyes}"; openvr_exit=1; }
 import struct, sys, zlib
 def read_png(path):
     data = open(path, "rb").read()
@@ -582,8 +626,14 @@ for eye in ("left", "right"):
     width, height, rows = read_png("%s/eye-%s.png" % (sys.argv[1], eye))
     quarter = max(1, height // 4)
     top, bottom = brightness(rows[:quarter]), brightness(rows[-quarter:])
-    print("eyes: the %s eye's upper quarter has brightness %.0f, its lower quarter %.0f" % (eye, top, bottom))
-    if not top > 2 * bottom:
+    # The program's lower half is dark, not black: rows of exact black at the bottom are a part of the view that
+    # the picture does not cover
+    black = 0
+    while black < height and not any(rows[height - 1 - black]):
+        black += 1
+    print("eyes: the %s eye's upper quarter has brightness %.0f, its lower quarter %.0f, %d black rows at the bottom of %d"
+          % (eye, top, bottom, black, height))
+    if not top > 2 * bottom or black > height // 50:
         bad = True
 sys.exit(1 if bad else 0)
 PYTHON

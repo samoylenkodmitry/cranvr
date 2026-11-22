@@ -1,0 +1,84 @@
+Subject: [PATCH] d3d11: a swapchain for a window of another process (cranvr)
+
+Chromium's GPU process makes the swapchains of the browser process's windows. DXMT refused a window of another
+process ("cross-process swapchain not supported yet"), and the GPU process gave up its GPU. A hidden window of this
+process now stands in for the other process's window. SteamVR's web panels use only the textures that Chromium shares,
+so the pictures of these swapchains need no window on screen.
+---
+diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
+index d47ca29..17d5fe1 100644
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -1,4 +1,5 @@
+ #include "d3d11_swapchain.hpp"
++#include <unordered_map>
+ #include "com/com_guid.hpp"
+ #include "config/config.hpp"
+ #include "d3d11_private.h"
+@@ -1095,6 +1096,43 @@ private:
+   float scale_factor = 1.0;
+ };
+ 
++/*
++ * cranvr: a hidden window of this process that stands in for the window of another process. Chromium's GPU
++ * process makes the swapchains of the browser process's windows. SteamVR's web panels run in Chromium and only use
++ * the textures that it shares, so the pictures of these swapchains need no window on screen. Without a swapchain
++ * the GPU process gives up its GPU, and the panels never reach the headset. Each window of another process keeps
++ * one stand-in, so a swapchain made again for it takes the same one.
++ */
++static HWND
++StandInWindowFor(HWND foreign) {
++  static dxmt::mutex lock;
++  static std::unordered_map<HWND, HWND> stand_ins;
++  std::lock_guard<dxmt::mutex> guard(lock);
++  auto found = stand_ins.find(foreign);
++  if (found != stand_ins.end() && IsWindow(found->second))
++    return found->second;
++  static ATOM window_class = 0;
++  if (!window_class) {
++    WNDCLASSW wc = {};
++    wc.lpfnWndProc = DefWindowProcW;
++    wc.hInstance = GetModuleHandleW(nullptr);
++    wc.lpszClassName = L"DXMTStandInWindow";
++    window_class = RegisterClassW(&wc);
++    if (!window_class)
++      return nullptr;
++  }
++  RECT client = {};
++  GetClientRect(foreign, &client);
++  HWND own = CreateWindowExW(
++      WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"DXMTStandInWindow", L"", WS_POPUP, 0, 0,
++      std::max<LONG>(client.right - client.left, 1), std::max<LONG>(client.bottom - client.top, 1), nullptr, nullptr,
++      GetModuleHandleW(nullptr), nullptr
++  );
++  if (own)
++    stand_ins[foreign] = own;
++  return own;
++}
++
+ HRESULT
+ CreateSwapChain(
+     IDXGIFactory1 *pFactory, MTLD3D11Device *pDevice, HWND hWnd, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
+@@ -1109,8 +1147,17 @@ CreateSwapChain(
+   DWORD window_process_id;
+   GetWindowThreadProcessId(hWnd, &window_process_id);
+   if (GetProcessId(GetCurrentProcess()) != window_process_id) {
+-    ERR("CreateSwapChain: cross-process swapchain not supported yet");
+-    return E_FAIL;
++    HWND stand_in = StandInWindowFor(hWnd);
++    if (!stand_in) {
++      ERR("CreateSwapChain: no window of this process stands in for the window of process ", window_process_id);
++      return E_FAIL;
++    }
++    static bool told = false;
++    if (!told) {
++      told = true;
++      WARN("CreateSwapChain: the window belongs to process ", window_process_id, "; a hidden window of this process takes its swapchain");
++    }
++    hWnd = stand_in;
+   }
+ 
+   Com<IMTLDXGIDevice> layer_factory;
+-- 
+2.56.1
+

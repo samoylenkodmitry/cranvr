@@ -187,3 +187,33 @@ does this at the start: it draws with an empty vertex shader (two inputs, no out
 shader that writes a constant. The pipeline now has the rasterizer off when the vertex shader declares no output and no geometry,
 hull or domain shader and no stream output takes its place. `DXMT_RASTERIZE_OUTPUTLESS_VERTEX_SHADERS=1` brings the
 former behavior back for a comparison. The log says once which vertex shader this was.
+
+Patches 0013 to 0018 run SteamVR for Windows under Wine (cranvr's SteamVR mode, `steamvr/driver_cranvr.cpp`). Each
+applies on its own to DXMT v0.80, as the build script checks.
+
+`0013-shared-buffers-between-processes.patch`: SteamVR's compositor makes a constant buffer with
+`D3D11_RESOURCE_MISC_SHARED` and stops at start when the buffer has no shared handle ("Failed to create shared frame
+info constant buffer"). A buffer with the flag now lies on the memory of a named file mapping. A kernel allocation
+carries the mapping's name, the description and the size, so another process opens the same memory with
+`OpenSharedResource`. Such a buffer has no dynamic renames: a rename would move it off the shared memory.
+
+`0014-keyed-mutex-orders-shared-textures.patch`: a texture made with `SHARED_KEYEDMUTEX` answers a query for
+`IDXGIKeyedMutex`. SteamVR orders the access to the frames that its processes share with these mutexes, and Chromium's
+GPU process asks for them too. `ReleaseSync` returns once the GPU has finished the device's commands before it, so the
+reader finds the writer's draws. `AcquireSync` returns at once.
+
+`0015-dxgi-usage-from-bind-flags.patch`: `IDXGIResource::GetUsage` follows the bind flags and the usage, as on Windows.
+It returned 0. ANGLE in Chromium reads it for a texture that another process shared.
+
+`0016-output-duplication-without-frames.patch`: `DuplicateOutput` gives a duplication that delivers no frame. It failed
+with `DXGI_ERROR_UNSUPPORTED`, and SteamVR's desktop view treats that as fatal.
+
+`0017-swapchain-for-a-window-of-another-process.patch`: a hidden window of the process stands in for a window of
+another process. Chromium's GPU process makes the swapchains of the browser's windows, and DXMT refused them ("cross-process
+swapchain not supported yet"). SteamVR's web panels use only the textures that Chromium shares.
+
+`0018-opened-textures-share-again.patch`: a texture that a process opened with `OpenSharedResource` or
+`OpenSharedResource1` gets a kernel allocation of its own with the private data of the shared one, so the process can
+share it again, as on Windows. SteamVR's web helper passes the textures of Chromium's GPU process on to the
+compositor. Without the patch each of them failed with `VROverlayError_InvalidTexture`, and SteamVR's panels and
+controller hints stayed away from the headset.
