@@ -172,6 +172,71 @@ impl Menu {
     }
 }
 
+/// How long a request to the Mac may run before the console says that it got no answer. A game's
+/// start waits for Steam and for Wine, which can take a minute.
+pub const ANSWER_TIME: Duration = Duration::from_secs(90);
+
+/// A request to the Mac that takes a while, such as a game's start. The console shows that it runs
+/// from the press until the host's menu shows its result or a new notice.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pending {
+    pub action: Action,
+    since: Instant,
+    /// The notice that the menu showed at the press: a new notice answers the request
+    notice: Option<String>,
+}
+
+/// Where a request to the Mac stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Progress {
+    /// The Mac works on it
+    Running,
+    /// The Mac gave no answer within `ANSWER_TIME`
+    NoAnswer,
+    /// The menu shows its result, or the Mac said why it failed
+    Done,
+}
+
+impl Pending {
+    /// The request of `action` at `now`, while the menu shows `notice`.
+    pub fn new(action: Action, notice: Option<String>, now: Instant) -> Self {
+        Self { action, since: now, notice }
+    }
+
+    /// Where the request stands in the host's `menu` at `now`.
+    pub fn progress(&self, menu: &Menu, now: Instant) -> Progress {
+        if menu.notice.is_some() && menu.notice != self.notice {
+            return Progress::Done;
+        }
+        let done = match &self.action {
+            Action::Play(name) => menu.games.iter().any(|game| &game.name == name && menu.runs(game)),
+            Action::Stop => menu.status.game.is_none(),
+            Action::Fps(fps) => menu.fps == *fps,
+            Action::Scale(scale) => (menu.game_scale - scale).abs() < 0.01,
+            Action::Msaa(samples) => menu.msaa == *samples,
+            Action::VrSystem(game, system) => menu.games.iter().any(|g| &g.name == game && g.vr == *system),
+        };
+        if done {
+            Progress::Done
+        } else if now.saturating_duration_since(self.since) > ANSWER_TIME {
+            Progress::NoAnswer
+        } else {
+            Progress::Running
+        }
+    }
+}
+
+impl Action {
+    /// The words of the button while the Mac works on the request
+    pub fn running_label(&self) -> &'static str {
+        match self {
+            Action::Play(_) => "Starting...",
+            Action::Stop => "Stopping...",
+            Action::Fps(_) | Action::Scale(_) | Action::Msaa(_) | Action::VrSystem(..) => "Changing...",
+        }
+    }
+}
+
 /// What a console button asks for.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {

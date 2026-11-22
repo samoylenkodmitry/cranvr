@@ -345,3 +345,36 @@ fn the_new_settings_fit_the_consoles_height() {
     let tall = height(Some(&menu));
     assert!(tall > 900.0 && tall < 1000.0, "{tall}");
 }
+
+#[test]
+fn a_game_s_start_runs_until_the_menu_shows_the_game_or_a_new_notice() {
+    let start = Instant::now();
+    let idle = menu(None);
+    let pending = Pending::new(Action::Play("Beat Saber".into()), idle.notice.clone(), start);
+    assert_eq!(pending.action.running_label(), "Starting...");
+    assert_eq!(pending.progress(&idle, start + Duration::from_secs(30)), Progress::Running);
+    assert_eq!(pending.progress(&menu(Some("Beat Saber.exe")), start + Duration::from_secs(30)), Progress::Done);
+    // Another game that runs answers nothing
+    assert_eq!(pending.progress(&menu(Some("hlvr.exe")), start + Duration::from_secs(1)), Progress::Running);
+    // The app's notice says why the start failed
+    let mut failed = menu(None);
+    failed.notice = Some("Steam did not start".into());
+    assert_eq!(pending.progress(&failed, start + Duration::from_secs(1)), Progress::Done);
+    assert_eq!(pending.progress(&idle, start + ANSWER_TIME + Duration::from_secs(1)), Progress::NoAnswer);
+}
+
+#[test]
+fn a_notice_from_before_the_press_does_not_answer_it_and_a_stop_ends_with_the_game() {
+    let start = Instant::now();
+    let mut running = menu(Some("Beat Saber.exe"));
+    running.notice = Some("An old notice".into());
+    let stop = Pending::new(Action::Stop, running.notice.clone(), start);
+    assert_eq!(stop.action.running_label(), "Stopping...");
+    assert_eq!(stop.progress(&running, start), Progress::Running);
+    let mut stopped = menu(None);
+    stopped.notice = running.notice.clone();
+    assert_eq!(stop.progress(&stopped, start), Progress::Done);
+    let fps = Pending::new(Action::Fps(90), running.notice.clone(), start);
+    assert_eq!(fps.progress(&running, start), Progress::Running);
+    assert_eq!(fps.progress(&Menu { fps: 90, ..running.clone() }, start), Progress::Done);
+}

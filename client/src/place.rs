@@ -128,8 +128,13 @@ pub fn movable(name: &'static str, modifier: SubspaceModifier, pose: Pose, on_mo
         // A carry holds the carrying hand back from the game until it ends
         crate::hover::set_handle(event.event_type != SpatialMoveEventType::End);
         on_move(&event);
-        if event.event_type == SpatialMoveEventType::End {
-            save_pose(name, &event.pose);
+        match event.event_type {
+            SpatialMoveEventType::Start => log::info!("the user takes the {name} panel at {:?}", event.pose.position),
+            SpatialMoveEventType::End => {
+                log::info!("the user puts the {name} panel down at {:?}", event.pose.position);
+                save_pose(name, &event.pose);
+            }
+            _ => {}
         }
     }))
 }

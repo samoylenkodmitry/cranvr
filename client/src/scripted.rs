@@ -42,6 +42,14 @@
 //!   has the standard mapping.
 //! - `scripted_pointer=none` plays both controllers as missing, for the look that opens the menu
 //!   (`gaze.rs`). With `gaze_pitch=0` the ball stands straight ahead, where a headset on a desk looks.
+//! - `scripted_pointer=press` checks that a press is never a move, on the hand menu in front of the
+//!   user (launch it with `hand_menu=open` and `default_places`). The left controller is missing. The
+//!   right one stands 60 cm from the menu. It points beside the menu, then at the Show button of the
+//!   stream's numbers, and pulls with a ray that strays 3 mm on the panel: the press clicks and moves
+//!   nothing. It then points at Recenter on the last row and tips its ray 6 degrees down onto the
+//!   menu's handle while it pulls: the press clicks Recenter and moves nothing. Last it points at
+//!   the handle, pulls and moves 10 cm to the right: the menu moves. The log says each frame in
+//!   which the ray entered a button of the menu ("scripted press:").
 //! - `scripted_pointer=palm` plays two hands and no controller: the left hand holds its open palm
 //!   35 cm ahead of the eyes and 15 cm below them, turned to the eyes, and never pinches. The right
 //!   hand points at the ball that shows in front of that palm and pinches every 2 s, which opens and
@@ -93,6 +101,10 @@ pub fn install_once() {
         }
         if args.string("scripted_pointer") == Some("palm") {
             palm_check();
+            return;
+        }
+        if args.string("scripted_pointer") == Some("press") {
+            press_check();
             return;
         }
         if args.string("scripted_pointer") == Some("menu") {
@@ -200,9 +212,14 @@ fn pointing_at_console() {
     });
 }
 
+/// The headset frames of a scripted run so far: the frame loop counts them, and a log names the frame
+/// of an event with it.
+pub static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Logs each change of the right controller's inputs in a run of `scripted_pointer=models`, so that a
-/// screen capture can be matched with the press that it shows.
+/// screen capture can be matched with the press that it shows. Counts the frame.
 pub fn note_input(input: &cranvr_proto::message::Input) {
+    FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     use cranvr_proto::message::buttons;
     use std::sync::{Mutex, OnceLock};
     static LAST: Mutex<Option<String>> = Mutex::new(None);
@@ -345,7 +362,7 @@ fn empty_menu_height() -> f32 {
     use crate::{displays::DisplaysView, menu_place::MenuPlace, panel_layout::Layout};
     let layout = Layout::default();
     let displays = DisplaysView::default();
-    let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays, wishes: Default::default(), place: MenuPlace::View };
+    let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays, wishes: Default::default(), place: MenuPlace::View, adding: false };
     menu_model::height(&menu_model::rows(&input))
 }
 
@@ -430,6 +447,105 @@ fn menu_check(hands: &str) {
                 .moving_to(Duration::from_millis(1), (at, away_from(at)), rest);
             script_controller(right);
         }
+    }
+}
+
+/// Where the right controller of the press check stands, in meters from the head's start: below the
+/// eyes and back by the head, about 60 cm from the menu
+const PRESS_AT: [f32; 3] = [0.1, -0.35, 0.05];
+
+/// The place in the room of the point `x`, `y` dp from the top left corner of the menu in front of
+/// the user, whose height is `height` dp.
+fn on_view_menu(height: f32, x: f32, y: f32) -> [f32; 3] {
+    let view = Pose::at([0.0, 0.0, -1.0]);
+    let menu = view.then(&hand_menu::menu_start(hand_menu::IN_VIEW, height));
+    menu.then(&Pose::at([(x - menu_model::size::WIDTH / 2.0) / 1000.0, (height / 2.0 - y) / 1000.0, 0.0])).position
+}
+
+/// Plays `scripted_pointer=press` (see the file's notes).
+fn press_check() {
+    use menu_model::size::{BUTTON, GAP, PADDING, ROW, TITLE, WIDTH};
+    let rest = ScriptedButtons::default();
+    let pull = ScriptedButtons { trigger: 1.0, ..rest };
+    let height = empty_menu_height();
+    let row_y = |row: f32| PADDING + TITLE + GAP + row * (ROW + GAP) + ROW / 2.0;
+    // The Show button of the stream's numbers, at the right end of the third row
+    let show = on_view_menu(height, WIDTH - PADDING - BUTTON / 2.0, row_y(2.0));
+    // Recenter, the first of the two buttons of the last row
+    let recenter = on_view_menu(height, PADDING + (WIDTH - 2.0 * PADDING - GAP) / 4.0, row_y(3.0));
+    let menu = Pose::at([0.0, 0.0, -1.0]).then(&hand_menu::menu_start(hand_menu::IN_VIEW, height));
+    let handle = ScriptedController::handle_of(&menu, [WIDTH, height]);
+    let at = PRESS_AT;
+    // The Show button's point 3 mm to its right: a dp is a millimeter
+    let strayed = on_view_menu(height, WIDTH - PADDING - BUTTON / 2.0 + 3.0, row_y(2.0));
+    // The ray to Recenter tipped 6 degrees down about the controller
+    let tipped = {
+        let to = [recenter[0] - at[0], recenter[1] - at[1], recenter[2] - at[2]];
+        let flat = (to[0] * to[0] + to[2] * to[2]).sqrt();
+        let pitch = (to[1] / flat).atan() - 6f32.to_radians();
+        [recenter[0], at[1] + flat * pitch.tan(), recenter[2]]
+    };
+    let carried = [at[0] + 0.1, at[1], at[2]];
+    let right = ScriptedController::new(Hand::Right, at, away_from(at))
+        .holding(Duration::from_millis(3000), rest)
+        // 3 s: the ray enters the Show button and rests there for a screen capture
+        .moving_to(Duration::from_millis(1), (at, show), rest)
+        .holding(Duration::from_millis(2000), rest)
+        // 5 s: the pull, with the ray's point straying 3 mm and back each 40 ms
+        .holding(Duration::from_millis(40), pull)
+        .moving_to(Duration::from_millis(40), (at, strayed), pull)
+        .moving_to(Duration::from_millis(40), (at, show), pull)
+        .moving_to(Duration::from_millis(40), (at, strayed), pull)
+        .moving_to(Duration::from_millis(40), (at, show), pull)
+        .holding(Duration::from_millis(1000), rest)
+        // 6.2 s: Recenter, then a pull that tips the ray onto the handle in 80 ms
+        .moving_to(Duration::from_millis(1), (at, recenter), rest)
+        .holding(Duration::from_millis(1000), rest)
+        .moving_to(Duration::from_millis(80), (at, tipped), ScriptedButtons { trigger: 0.4, ..rest })
+        .holding(Duration::from_millis(300), pull)
+        .holding(Duration::from_millis(1000), rest)
+        // 8.6 s: the handle, a pull and a carry 10 cm to the right
+        .moving_to(Duration::from_millis(1), (at, handle), rest)
+        .holding(Duration::from_millis(1000), rest)
+        .holding(Duration::from_millis(100), pull)
+        .moving_to(Duration::from_millis(500), (carried, [handle[0] + 0.1, handle[1], handle[2]]), pull)
+        .holding(Duration::from_millis(200), pull)
+        .holding(Duration::from_millis(500), rest)
+        .moving_to(Duration::from_millis(1), (carried, away_from(carried)), rest);
+    log::info!("scripted press: a menu {height:.0} dp tall; Show at {show:?}, Recenter at {recenter:?}, the handle at {handle:?}, the tipped ray toward {tipped:?}");
+    script_controller(missing(Hand::Left));
+    script_controller(right);
+}
+
+/// Logs the frame in which a pointer's point on the hand menu enters one of its buttons, in a run of
+/// `scripted_pointer=press`. The menu has no display and no link, so its buttons stand where
+/// `press_check` aims.
+pub fn note_menu_point(kind: cranpose::PointerEventKind, at: cranpose::Point) {
+    use menu_model::size::{BUTTON, GAP, PADDING, ROW, TITLE, WIDTH};
+    use std::sync::Mutex;
+    static INSIDE: Mutex<Option<&'static str>> = Mutex::new(None);
+    if launch_args().string("scripted_pointer") != Some("press") {
+        return;
+    }
+    let row_top = |row: f32| PADDING + TITLE + GAP + row * (ROW + GAP);
+    let half = (WIDTH - 2.0 * PADDING - GAP) / 2.0;
+    let buttons: [(&'static str, [f32; 4]); 2] = [
+        ("Show of the stream's numbers", [WIDTH - PADDING - BUTTON, row_top(2.0), BUTTON, ROW]),
+        ("Recenter", [PADDING, row_top(3.0), half, ROW]),
+    ];
+    let over = match kind {
+        cranpose::PointerEventKind::Exit => None,
+        _ => buttons
+            .iter()
+            .find(|(_, [x, y, w, h])| (*x..x + w).contains(&at.x) && (*y..y + h).contains(&at.y))
+            .map(|(name, _)| *name),
+    };
+    let mut inside = INSIDE.lock().unwrap();
+    if *inside != over {
+        if let Some(name) = over {
+            log::info!("scripted press: frame {}: the ray enters {name} at {:.0}, {:.0} dp", FRAME.load(std::sync::atomic::Ordering::Relaxed), at.x, at.y);
+        }
+        *inside = over;
     }
 }
 

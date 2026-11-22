@@ -64,7 +64,7 @@ use crate::{
     hover,
     hub::hub,
     menu_model::{self, ButtonKind, MenuAction, MenuInput, MenuRow},
-    menu_place::{workers, MenuPlace},
+    menu_place::MenuPlace,
     panel_layout::{layer_rank, Layout, PanelId},
     ui::{text_style, ACCENT_COLOR, KEY_COLOR, MUTED_COLOR, PANEL_COLOR, STOP_COLOR, TEXT_COLOR},
 };
@@ -72,10 +72,10 @@ use crate::place;
 use cranpose::launch_args;
 use cranpose::prelude::*;
 use cranpose::text::FontWeight;
-use cranpose_xr::{local_spatial_capabilities, FollowMode, FollowTarget, FollowingSubspace, Hand, HandJointType, Pose, SpatialPanel, SubspaceModifier, TrackedDimensions, Vibration};
+use cranpose_xr::{local_spatial_capabilities, FollowMode, FollowTarget, FollowingSubspace, Hand, HandJointType, Pose, SpatialPanel, SubspaceModifier, TrackedDimensions};
 use cranvr_common::controls::{Controls, Hand as ControlHand};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The ball's diameter in dp, a millimeter each
 pub const BALL: f32 = 50.0;
@@ -234,19 +234,6 @@ pub fn open_on_launch() -> bool {
 /// stands among the panels of the room, so a screenshot of the window shows its rows and words.
 pub fn flat_menu() -> bool {
     !local_spatial_capabilities().current().is_spatial_ui_enabled() && launch_args().string("hand_menu").is_some()
-}
-
-/// A click in the hand that works the menu tells the user that a press took. In front of the user
-/// either hand may work it, and a click on a controller that is missing does nothing.
-fn click() {
-    if let Some(haptics) = hub().headset().and_then(|headset| headset.haptics) {
-        let hands = workers(current_place(), [true; 2]);
-        for (hand, works) in [Hand::Left, Hand::Right].into_iter().zip(hands) {
-            if works {
-                haptics.vibrate(hand, Vibration::new(0.3, Duration::from_millis(30)));
-            }
-        }
-    }
 }
 
 /// What the hand's panels share with the app.
@@ -476,7 +463,6 @@ fn toggle_menu(state: HandState) {
     let open = !state.menu_open.get_non_reactive();
     log::info!("the hand menu {}", if open { "opens" } else { "closes" });
     state.menu_open.set(open);
-    click();
 }
 
 fn toggle_hand_display(state: HandState, stream: u8) {
@@ -484,7 +470,6 @@ fn toggle_hand_display(state: HandState, stream: u8) {
     layout.toggle(PanelId::Display(stream));
     log::info!("the display on the hand {}", if layout.shown(PanelId::Display(stream)) { "shows" } else { "hides" });
     commit(state, layout);
-    click();
 }
 
 /// Takes a new layout. The room's choice is saved. A game's pick is not.
@@ -506,10 +491,13 @@ pub fn Menu(state: HandState, console_open: bool, frame: HandFrame) {
         }
         delay(MENU_POLL).await;
     });
+    // A display that the user added, from the press until the host lists it or says why not
+    let adding = rememberMutableStateOf(|| None::<Adding>);
     let layout = state.layout.get();
     let wishes = crate::displays::wishes_of(&layout);
     let displays_view = view.get();
-    let input = MenuInput { layout: &layout, console_open, displays: &displays_view, wishes, place: state.place.get() };
+    let busy = adding.get().is_some_and(|add| add.runs(&displays_view));
+    let input = MenuInput { layout: &layout, console_open, displays: &displays_view, wishes, place: state.place.get(), adding: busy };
     let rows = menu_model::rows(&input);
     let height = menu_model::height(&rows);
     // The place that the user carried the menu to is read once for each opening. Cranpose keeps the
@@ -526,15 +514,38 @@ pub fn Menu(state: HandState, console_open: bool, frame: HandFrame) {
             move || {
                 Text("cranvr", Modifier::empty().height(menu_model::size::TITLE), text_style(32.0, TEXT_COLOR, Some(FontWeight::BOLD)));
                 for row in rows.clone() {
-                    RowView(row, state);
+                    RowView(row, state, adding);
                 }
             },
         );
     });
 }
 
+/// A display that the user asked the Mac for: how many the host listed then, its notice then and
+/// when.
+#[derive(Clone, PartialEq)]
+struct Adding {
+    listed: usize,
+    notice: Option<String>,
+    since: Instant,
+}
+
+/// How long the Mac may take to add a display before the menu stops saying that it adds one
+const ADD_TIME: Duration = Duration::from_secs(20);
+
+impl Adding {
+    fn new(view: &crate::displays::DisplaysView) -> Self {
+        Self { listed: view.displays.len(), notice: view.notice.clone(), since: Instant::now() }
+    }
+
+    /// Whether the Mac still adds the display: the host lists no new display and says nothing new.
+    fn runs(&self, view: &crate::displays::DisplaysView) -> bool {
+        view.displays.len() <= self.listed && view.notice == self.notice && self.since.elapsed() < ADD_TIME
+    }
+}
+
 #[composable]
-fn RowView(row: MenuRow, state: HandState) {
+fn RowView(row: MenuRow, state: HandState, adding: MutableState<Option<Adding>>) {
     use menu_model::size::*;
     Column(Modifier::empty().fill_max_width(), ColumnSpec::default(), move || {
         let (title, buttons) = (row.title.clone(), row.buttons.clone());
@@ -557,7 +568,7 @@ fn RowView(row: MenuRow, state: HandState) {
                     Button(
                         modifier.height(ROW).background(fill).rounded_corners(12.0),
                         ButtonSpec::default(),
-                        move || perform(action, state),
+                        move || perform(action, state, adding),
                         move || {
                             Text(button.label.clone(), Modifier::empty(), text_style(22.0, TEXT_COLOR, Some(FontWeight::BOLD)));
                         },
@@ -572,8 +583,7 @@ fn RowView(row: MenuRow, state: HandState) {
 }
 
 /// Does what a button of the menu says.
-fn perform(action: MenuAction, state: HandState) {
-    click();
+fn perform(action: MenuAction, state: HandState, adding: MutableState<Option<Adding>>) {
     let mut layout = state.layout.get_non_reactive();
     match action {
         MenuAction::TogglePanel(PanelId::Console) => {
@@ -603,7 +613,10 @@ fn perform(action: MenuAction, state: HandState) {
             layout.save();
             state.layout.set(layout);
         }
-        MenuAction::AddDisplay => displays().request_add(),
+        MenuAction::AddDisplay => {
+            adding.set(Some(Adding::new(&displays().menu_view())));
+            displays().request_add();
+        }
         MenuAction::Recenter => {
             log::info!("the hand menu puts the panels in front of the user again");
             state.recenter.set(state.recenter.get_non_reactive() + 1);

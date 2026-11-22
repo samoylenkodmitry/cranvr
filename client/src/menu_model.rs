@@ -63,6 +63,8 @@ pub struct MenuInput<'a> {
     pub wishes: [Option<DesktopWish>; crate::displays::SLOTS],
     /// Where the menu stands, and with it the display that rides with it
     pub place: MenuPlace,
+    /// The Mac works on a display that the user added and has not listed it yet
+    pub adding: bool,
 }
 
 /// The sizes of the menu's parts in dp. A dp is a millimeter in the room. The text is 22 dp tall or
@@ -117,7 +119,8 @@ pub fn rows(input: &MenuInput<'_>) -> Vec<MenuRow> {
     }
     let mut actions = Vec::new();
     if input.displays.can_add {
-        actions.push(MenuButton { label: "Add display".into(), action: MenuAction::AddDisplay, kind: ButtonKind::Normal });
+        let label = if input.adding { "Adding..." } else { "Add display" };
+        actions.push(MenuButton { label: label.into(), action: MenuAction::AddDisplay, kind: ButtonKind::Normal });
     }
     actions.push(MenuButton { label: "Recenter".into(), action: MenuAction::Recenter, kind: ButtonKind::Normal });
     actions.push(MenuButton { label: "Controls".into(), action: MenuAction::OpenControls, kind: ButtonKind::Normal });
@@ -165,7 +168,7 @@ mod tests {
     }
 
     fn input<'a>(layout: &'a Layout, displays: &'a DisplaysView) -> MenuInput<'a> {
-        MenuInput { layout, console_open: false, displays, wishes: Default::default(), place: MenuPlace::Hand(cranvr_common::controls::Hand::Left) }
+        MenuInput { layout, console_open: false, displays, wishes: Default::default(), place: MenuPlace::Hand(cranvr_common::controls::Hand::Left), adding: false }
     }
 
     #[test]
@@ -240,6 +243,17 @@ mod tests {
         displays.notice = Some("The Mac made no display".into());
         let rows = rows(&input(&layout, &displays));
         assert_eq!(rows.last().unwrap().details, vec!["The Mac made no display"]);
+    }
+
+    #[test]
+    fn the_add_button_says_that_the_mac_adds_a_display() {
+        let layout = Layout::default();
+        let displays = view(vec![info(1, "Mac display", false)], true);
+        let mut input = input(&layout, &displays);
+        let add = |input: &MenuInput<'_>| rows(input).last().unwrap().buttons[0].label.clone();
+        assert_eq!(add(&input), "Add display");
+        input.adding = true;
+        assert_eq!(add(&input), "Adding...");
     }
 
     #[test]
