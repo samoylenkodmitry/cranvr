@@ -1,5 +1,6 @@
 use crate::{
     backend::{self, Model, Settings, StreamPath},
+    pending::{self, Pending, Request},
     black_eye,
     launch::{self, GameOptions, OpenVr},
     setup::{self, Progress, Setup},
@@ -357,8 +358,28 @@ fn start_tab() -> Tab {
     }
 }
 
+/// What a control shows while the mouse rests on it and while a press holds it: a white veil over
+/// its face, which shows on the dark window. Cranpose's clickables draw it, so every button gets it.
+const INDICATION: Indication = Indication::overlay(Color(1.0, 1.0, 1.0, 0.12), Color(1.0, 1.0, 1.0, 0.3));
+
+/// The window, with the look of its controls under the mouse.
 #[composable]
 pub fn CranvrApp() {
+    CompositionLocalProvider([local_indication().provides(INDICATION)], Window);
+}
+
+/// Notes that the button of `request` asked for it now: the button shows that it runs.
+fn note(model: MutableState<Model>, request: Request) {
+    model.update(|m| m.pending = Some(Pending::new(request, m, Instant::now())));
+}
+
+/// The words of the button of `request`.
+fn label_of(model: MutableState<Model>, request: &Request, own: &str) -> String {
+    model.with(|m| pending::label(m.pending.as_ref(), m, request, own))
+}
+
+#[composable]
+fn Window() {
     let settings = rememberMutableStateOf(Settings::load);
     let model = rememberMutableStateOf(Model::default);
     let tab = rememberMutableStateOf(|| start_tab());
@@ -437,7 +458,10 @@ fn Header(settings: MutableState<Settings>, model: MutableState<Model>) {
             });
         } else {
             Text("Host stopped".to_string(), Modifier::empty().padding(8.0), dim_style());
-            Primary("Start".into(), move || start_host(settings, model));
+            Primary(label_of(model, &Request::StartHost, "Start"), move || {
+                note(model, Request::StartHost);
+                start_host(settings, model);
+            });
         }
     });
 }
@@ -648,7 +672,10 @@ fn PlayTab(settings: MutableState<Settings>, model: MutableState<Model>) {
                 choose_program("Choose the program of the game", start, true);
             });
             Action("Choose a program".into(), move || choose_program("Choose a Windows program", steam::prefix().join("drive_c"), false));
-            Action("Stop Steam and games".into(), steam::stop_all);
+            Action(label_of(model, &Request::StopSteam, "Stop Steam and games"), move || {
+                note(model, Request::StopSteam);
+                steam::stop_all();
+            });
         });
         Hint("Add a game: choose the program of a game that Steam does not list, such as a copy of a game with mods. cranvr reads the game's folder and fills in what the game needs. Options shows each value with its reason. Choose a program starts a program once.".into());
         // The options of the program chosen last, which the button above starts
@@ -765,7 +792,8 @@ fn SteamLibrary(settings: MutableState<Settings>, model: MutableState<Model>, la
         if running {
             Text("Steam is running.".to_string(), Modifier::empty().padding(8.0), colored(110, 200, 140));
         } else {
-            Primary("Open Steam".into(), move || {
+            Primary(label_of(model, &Request::OpenSteam, "Open Steam"), move || {
+                note(model, Request::OpenSteam);
                 let result = steam::start();
                 model.update(|m| m.message = result.err());
             });
@@ -803,9 +831,11 @@ fn GameRow(settings: MutableState<Settings>, model: MutableState<Model>, game: s
                 model.update(move |m| m.open_options = if m.open_options.as_ref() == Some(&program) { None } else { Some(program) });
             });
         }
-        if g.exe.is_some() {
+        if let (Some(_), Some(program)) = (g.exe.as_ref(), toggled.clone()) {
             let game = g.clone();
-            Primary("Play".into(), move || {
+            let request = Request::Play(program);
+            Primary(label_of(model, &request, "Play"), move || {
+                note(model, request.clone());
                 ensure_host(settings, model);
                 let game = game.clone();
                 // Steam may need seconds to start: keep the window responsive
@@ -1462,3 +1492,7 @@ mod bitrate_tests {
         assert_eq!(bitrate_text(&stats(50, 50)), "28 Mbps sent of 50");
     }
 }
+
+#[cfg(test)]
+#[path = "hover_tests.rs"]
+mod hover_tests;

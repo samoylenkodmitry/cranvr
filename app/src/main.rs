@@ -8,6 +8,7 @@ mod game_run;
 mod launch;
 mod microphone;
 mod openvr;
+mod pending;
 mod setup;
 mod steam;
 mod system;

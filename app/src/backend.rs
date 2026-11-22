@@ -498,6 +498,8 @@ pub struct Model {
     pub notice: Option<(crate::black_eye::Notice, Instant)>,
     /// The program whose launch options are open in the lists of games
     pub open_options: Option<String>,
+    /// The request of a button that runs now, such as a game's start (see pending.rs)
+    pub pending: Option<crate::pending::Pending>,
 }
 
 const LOG_LINES: usize = 200;
