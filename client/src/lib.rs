@@ -34,6 +34,7 @@ mod menu_place;
 mod microphone;
 mod models;
 mod hub;
+mod palm;
 mod panel_layout;
 mod phone;
 mod place;

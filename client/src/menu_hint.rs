@@ -50,9 +50,9 @@ fn input_name(hand: Hand, control: Control) -> String {
     }
 }
 
-/// The line for the mapping `controls`, the controllers that are present (left, right), the menu's
-/// place and whether a link streams.
-pub fn text(controls: &Controls, present: [bool; 2], place: MenuPlace, streaming: bool) -> String {
+/// The line for the mapping `controls`, the controllers that are present (left, right), whether the
+/// cameras track a hand, the menu's place and whether a link streams.
+pub fn text(controls: &Controls, present: [bool; 2], hands: bool, place: MenuPlace, streaming: bool) -> String {
     let names: Vec<String> =
         Hand::BOTH.into_iter().filter(|hand| present[hand.index()]).flat_map(|hand| controls.inputs_of(hand, Action::Menu).map(move |control| input_name(hand, control))).collect();
     if !names.is_empty() {
@@ -67,6 +67,8 @@ pub fn text(controls: &Controls, present: [bool; 2], place: MenuPlace, streaming
     };
     match pointer {
         Some(_) => "Point at the ball and pull the trigger".to_string(),
+        // A palm turned to the eyes carries a ball, which the other hand's pinch presses
+        None if hands => "Show a palm and pinch it with the other hand".to_string(),
         None => "Open the menu from the cranvr app on the Mac".to_string(),
     }
 }
@@ -79,29 +81,31 @@ mod tests {
     fn the_line_names_the_buttons_of_the_controllers_that_are_present() {
         let controls = Controls::default();
         let left = MenuPlace::Hand(Hand::Left);
-        assert_eq!(text(&controls, [true, true], left, true), "Hold the menu button or B to open the menu");
-        assert_eq!(text(&controls, [false, true], MenuPlace::View, true), "Hold B to open the menu");
-        assert_eq!(text(&controls, [true, false], MenuPlace::View, false), "Press the menu button to open the menu");
+        assert_eq!(text(&controls, [true, true], false, left, true), "Hold the menu button or B to open the menu");
+        assert_eq!(text(&controls, [false, true], false, MenuPlace::View, true), "Hold B to open the menu");
+        assert_eq!(text(&controls, [true, false], false, MenuPlace::View, false), "Press the menu button to open the menu");
         // A mapping without the menu leaves the ball
         let mut none = controls;
         none.set(Hand::Left, Control::Menu, Action::Console);
         none.set(Hand::Right, Control::Secondary, Action::Panels);
-        assert_eq!(text(&none, [true, true], left, true), "Point at the ball and pull the trigger");
-        assert_eq!(text(&none, [false, true], MenuPlace::View, true), "Point at the ball and pull the trigger");
+        assert_eq!(text(&none, [true, true], false, left, true), "Point at the ball and pull the trigger");
+        assert_eq!(text(&none, [false, true], false, MenuPlace::View, true), "Point at the ball and pull the trigger");
         // No controller: the Mac
-        assert_eq!(text(&none, [false, false], MenuPlace::View, true), "Open the menu from the cranvr app on the Mac");
-        assert_eq!(text(&controls, [false, false], MenuPlace::View, true), "Open the menu from the cranvr app on the Mac");
+        assert_eq!(text(&none, [false, false], false, MenuPlace::View, true), "Open the menu from the cranvr app on the Mac");
+        assert_eq!(text(&controls, [false, false], false, MenuPlace::View, true), "Open the menu from the cranvr app on the Mac");
+        // Hands without controllers: the palm
+        assert_eq!(text(&none, [false, false], true, MenuPlace::View, true), "Show a palm and pinch it with the other hand");
         // A trigger that opens the menu has its side in the name
         let mut trigger = none;
         trigger.set(Hand::Right, Control::Trigger, Action::Menu);
-        assert_eq!(text(&trigger, [true, true], left, false), "Press the right trigger to open the menu");
+        assert_eq!(text(&trigger, [true, true], false, left, false), "Press the right trigger to open the menu");
     }
 
     #[test]
     fn every_line_fits_under_the_ball() {
         let controls = Controls::default();
         for present in [[true, true], [true, false], [false, true], [false, false]] {
-            let line = text(&controls, present, MenuPlace::View, true);
+            let line = text(&controls, present, false, MenuPlace::View, true);
             assert!(line.len() <= 46, "{line}");
         }
     }

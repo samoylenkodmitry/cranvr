@@ -19,7 +19,8 @@ use crate::{
     hands,
     hold::{HoldFrame, PanelHold},
     hover,
-    menu_place::{self, MenuPlace, PlaceFrame, Placer},
+    menu_place::{self, PlaceFrame, Placer},
+    palm::{PalmFrame, PalmWatch},
     hub::{hub, DecoderView, Device, LinkState, Snapshot, Stats},
     panel_layout::{layers, Layout, PanelId},
     phone::{self, PhoneFrames},
@@ -106,7 +107,10 @@ pub fn ClientApp() {
     // The line under the ball shows at the first start and when the tracking falls to one
     // controller. It goes when the menu opens (see `menu_hint.rs`).
     let hint = rememberMutableStateOf(crate::menu_hint::wanted_at_start);
-    let hand = HandState { layout, menu_open, place, present, hint, recenter: recenters };
+    // An open palm that faces the eyes carries a ball (see `palm.rs`)
+    let palm = rememberMutableStateOf(|| None);
+    let hands_seen = rememberMutableStateOf(|| false);
+    let hand = HandState { layout, menu_open, place, present, hint, palm, hands: hands_seen, recenter: recenters };
     let opened = menu_open.get();
     LaunchedEffect(opened, async move |_| {
         if opened && hint.get_non_reactive() {
@@ -228,7 +232,7 @@ pub fn ClientApp() {
     // default pose in that frame, so the first start opens in front of the user. A saved pose is in
     // the same frame (see `place.rs`).
     FollowingSubspace(FollowTarget::View(FollowMode::Snap(TrackedDimensions::TranslationAndYaw)), move || {
-        HeadsetFrames(menu_open, place, present, hint);
+        HeadsetFrames(hand);
         // A flat window shows the panels in this order, side by side. In a headset each panel has
         // its own place. The hand menu shows and hides them. While no link runs the connect panel
         // shows anyway, so a user always sees how to connect and sees the code that the Mac asks
@@ -474,10 +478,12 @@ pub(crate) fn text_style(size: f32, color: Color, weight: Option<FontWeight>) ->
 /// Hands each frame of the headset to the sender of the tracking. The callback runs on the frame
 /// loop once for each headset frame. It does no network call: the sender thread wakes and sends.
 #[composable]
-fn HeadsetFrames(menu_open: MutableState<bool>, place: MutableState<MenuPlace>, present: MutableState<[bool; 2]>, hint: MutableState<bool>) {
+fn HeadsetFrames(hand: HandState) {
+    let HandState { menu_open, place, present, hint, palm, hands, .. } = hand;
     let reader = remember(|| Rc::new(RefCell::new(FrameReader::default()))).with(Clone::clone);
     let hold = remember(|| Rc::new(RefCell::new(PanelHold::default()))).with(Clone::clone);
     let placer = remember(|| Rc::new(RefCell::new(Placer::default()))).with(Clone::clone);
+    let palms = remember(|| Rc::new(RefCell::new(PalmWatch::default()))).with(Clone::clone);
     SpatialFrameEffect(move |frame| {
         let now = now_ns();
         let mut read = reader.borrow_mut().read(frame, now);
@@ -491,6 +497,27 @@ fn HeadsetFrames(menu_open: MutableState<bool>, place: MutableState<MenuPlace>, 
                 log::info!("the hand menu moves {}: the left controller is {left}, the right one {right}", next.label());
                 hand_menu::set_place(next);
                 place.set(next);
+            }
+            // The palms of the hands that the cameras track, while no controller is in them
+            let palm_frames = [XrHand::Left, XrHand::Right].map(|side| palm_frame(frame.hand(side)));
+            let tracked = palm_frames.iter().any(|frame| frame.palm.is_some());
+            if tracked != hands.get_non_reactive() {
+                hands.set(tracked);
+            }
+            if let Some(eyes) = frame.device_pose.map(|pose| pose.position) {
+                let change = palms.borrow_mut().update(frame.predicted_display_time, eyes, palm_frames);
+                if change.shown != palm.get_non_reactive() {
+                    log::info!("the hand menu's ball {}", match change.shown {
+                        Some(cranvr_common::controls::Hand::Left) => "shows on the left palm",
+                        Some(cranvr_common::controls::Hand::Right) => "shows on the right palm",
+                        None => "leaves the palm",
+                    });
+                    palm.set(change.shown);
+                }
+                if change.menu {
+                    log::info!("the left palm's pinch {} the hand menu", if open { "closes" } else { "opens" });
+                    menu_open.set(!open);
+                }
             }
             let now_present = placer.present();
             let before = present.get_non_reactive();
@@ -513,6 +540,17 @@ fn HeadsetFrames(menu_open: MutableState<bool>, place: MutableState<MenuPlace>, 
         console_panel::on_frame(&read, now);
         hub().feed.push(read);
     });
+}
+
+/// What the frame says about one hand that the cameras track, for its palm's ball (see `palm.rs`).
+fn palm_frame(state: &cranpose_xr::HandState) -> PalmFrame {
+    let joint = state.joint(cranpose_xr::HandJointType::Palm);
+    let tracked = state.tracking_state == cranpose_xr::TrackingState::Tracking && joint.valid;
+    PalmFrame {
+        palm: tracked.then_some(joint.pose),
+        pinch: state.aim.map_or(0.0, |aim| aim.index.strength),
+        menu_pressed: state.aim.is_some_and(|aim| aim.menu_pressed),
+    }
 }
 
 /// What the frame says about the controllers, for the hand menu's place (see `menu_place.rs`). A hand

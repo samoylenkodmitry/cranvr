@@ -22,7 +22,7 @@ CHECK = re.compile(r"scripted menu check with (\w+): a menu (\d+) dp tall")
 ENTER = re.compile(r"(the left|the right|a) pointer (enters|presses) the hand (menu|ball) at (-?\d+), (-?\d+) dp")
 MOVE = re.compile(r"the hand menu moves (.*?): the left controller is (\w+), the right one (\w+)")
 OPEN = re.compile(r"(a button (opens|closes) the hand menu|the hand menu (opens|closes)\b.*|the Mac opens the hand menu.*|the Mac asks to open the hand menu|the hand menu closes: .*)")
-HINT = re.compile(r"(the menu hint (shows|goes).*)")
+HINT = re.compile(r"(the menu hint (shows|goes|says).*|the hand menu's ball (shows on|leaves) .*|the left palm's pinch .*|scripted palm check.*)")
 LAYERS = re.compile(r"layers composed by the app: (\d+) panels and (\d+) display surfaces")
 # The menu is 470 dp wide, and the ball 50 dp
 MENU_WIDTH, BALL = 470, 50
