@@ -1,6 +1,6 @@
 //! What the host starts with and what it agreed on with the headset.
 
-use cranvr_common::foveation::FoveationConfig;
+use cranvr_common::foveation::{FoveationConfig, FoveationLevel};
 use cranvr_proto::wire::Codec;
 
 pub struct Options {
@@ -23,7 +23,8 @@ pub struct Options {
     pub display_lock: bool,
     /// Send the media over TCP for every client, not only for a client that needs it
     pub tcp: bool,
-    pub foveation: bool,
+    /// How strongly each eye is foveated: `--foveation`
+    pub foveation: FoveationLevel,
     /// A game renders each eye at this share of the stream's eye size. Foveated encoding sends
     /// about a third of the eye's pixels, and a base M5 drew Beat Saber at 37 to 41 frames per
     /// second at the full size.

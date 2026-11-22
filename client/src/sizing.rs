@@ -7,12 +7,13 @@
 
 use crate::hub::StreamLayout;
 use cranpose::DecoderCapabilities;
-use cranvr_proto::message::FoveationParams;
+use cranvr_common::foveation::FoveationLevel;
 
-/// The foveation that the host uses by default. The client takes foveated frames, so it
-/// sizes the eye for the frame that this layout gives. The host's own parameters decide the stream.
-pub const DEFAULT_FOVEATION: FoveationParams =
-    FoveationParams { center_size: [0.45, 0.4], center_shift: [0.4, 0.1], edge_ratio: [4.0, 5.0] };
+/// The foveation that the client sizes its eye for. The user picks the level on the Mac, and the
+/// client learns it only with the stream. The weakest level, Low, gives the largest frame of the
+/// foveated ones, so a decoder that takes it takes every level. Off has a smaller eye of the host's
+/// own choice.
+const SIZING_LEVEL: FoveationLevel = FoveationLevel::Low;
 
 /// The smallest share of the recommended size that the client asks for.
 const LEAST_SHARE: f64 = 0.5;
@@ -21,7 +22,7 @@ const STEP: f64 = 0.9;
 
 /// The size of the decoded frame that the host encodes for an eye of `eye` pixels.
 pub fn frame_for(eye: [u32; 2], foveation: bool) -> [u32; 2] {
-    StreamLayout::new(eye, foveation.then_some(DEFAULT_FOVEATION)).frame()
+    StreamLayout::new(eye, foveation.then(|| SIZING_LEVEL.config().expect("a foveated level").into())).frame()
 }
 
 /// The eye size to ask for: `recommended`, or the largest smaller size that `fits`. `fits` says
@@ -55,10 +56,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_foveated_quest_3_eye_makes_a_frame_of_about_two_megapixels() {
+    fn a_quest_3_eye_is_sized_for_the_largest_foveated_frame() {
         let [w, h] = frame_for([1680, 1760], true);
         assert_eq!(frame_for([1680, 1760], false), [3360, 1760]);
-        assert!(w * h < 2_300_000 && w * h > 1_500_000, "{w} x {h}");
+        assert!(w * h < 3_400_000 && w * h > 3_000_000, "{w} x {h}");
+        for level in FoveationLevel::ALL {
+            let Some(config) = level.config() else { continue };
+            let [lw, lh] = StreamLayout::new([1680, 1760], Some(config.into())).frame();
+            assert!(lw <= w && lh <= h, "{level:?} gives {lw} x {lh}");
+        }
     }
 
     #[test]

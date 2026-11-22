@@ -567,8 +567,8 @@ fn session(hub: &'static Hub, id: u64, link: &ClientLink, device: Device, hello_
         picture[0],
         picture[1]
     );
-    // The decoder's limits were checked for the default foveation before the Hello. The host's
-    // own parameters and its wish give the frame now.
+    // The decoder's limits were checked for the weakest foveation before the Hello. The host's
+    // own level and its wish give the frame now.
     if let Some(limits) = decoder_limits() {
         if !sizing::decoder_takes(limits, picture, stream.refresh_hz) {
             log::warn!(

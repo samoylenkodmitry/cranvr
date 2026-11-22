@@ -28,7 +28,7 @@ mod tracking;
 mod virtual_display;
 
 use cranvr_common::{
-    foveation::{Foveation, FoveationConfig},
+    foveation::{Foveation, FoveationLevel},
     inputs::{RIGHT_THUMBSTICK_CLICK_ID, RIGHT_THUMBSTICK_Y_ID, RIGHT_TRIGGER_VALUE_ID},
 };
 use cranvr_proto::{message::HostWishes, wire::Codec};
@@ -119,7 +119,7 @@ impl Default for Views {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: cranvr-host [--native-port PORT] [--fps 72|80|90|120, default 120] [--eye-width PIXELS] [--mbps N] [--trust-all] [--no-cable] [--discovery-port N] [--no-display-lock] [--tcp] [--no-foveation] [--game-scale F] [--strict-rate-control] [--no-game-audio] [--no-hand-controllers] [--desktop] [--desktop-fps N] [--virtual-display WxH] [--vr-main-display] [--pointer-pitch DEG] [--screen-in-view] [--no-desktop-layer] [--config-dir DIR] [--status]\n\
+        "usage: cranvr-host [--native-port PORT] [--fps 72|80|90|120, default 120] [--eye-width PIXELS] [--mbps N] [--trust-all] [--no-cable] [--discovery-port N] [--no-display-lock] [--tcp] [--foveation off|low|medium|high] [--game-scale F] [--strict-rate-control] [--no-game-audio] [--no-hand-controllers] [--desktop] [--desktop-fps N] [--virtual-display WxH] [--vr-main-display] [--pointer-pitch DEG] [--screen-in-view] [--no-desktop-layer] [--config-dir DIR] [--status]\n\
          \n  --native-port N   the TCP port to listen on (default 9950)\
          \n  --trust-all       accept any client on the network without a pairing (for tests)\
          \n  A headset that the host does not know waits for the user: the cranvr app on this Mac\
@@ -135,7 +135,10 @@ fn usage() -> ! {
          \n  --no-display-lock render at the arrival of each pose, not at a time that follows the\
          \n                    headset's display (for comparison)\
          \n  --tcp             send the media over TCP to every headset instead of UDP\
-         \n  --no-foveation    encode every pixel at full density (needs a smaller eye size)\
+         \n  --foveation LEVEL how strongly each eye is foveated: off, low, medium (the default) or\
+         \n                    high. A stronger level keeps a smaller center at full density and\
+         \n                    squeezes the edges more. Off encodes every pixel at full density,\
+         \n                    with a smaller eye.\
          \n  --game-scale F    a game renders each eye at this share of the stream's eye size\
          \n                    (0.3 to 1, default 0.7; foveated encoding sends about a third of\
          \n                    the pixels anyway)\
@@ -181,7 +184,7 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
         discovery_port: Some(cranvr_proto::discovery::DEFAULT_PORT),
         display_lock: true,
         tcp: false,
-        foveation: true,
+        foveation: FoveationLevel::default(),
         game_scale: 0.7,
         strict_rate: false,
         game_audio: true,
@@ -219,7 +222,7 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
             }
             "--no-display-lock" => options.display_lock = false,
             "--tcp" => options.tcp = true,
-            "--no-foveation" => options.foveation = false,
+            "--foveation" => options.foveation = FoveationLevel::parse(&value()).unwrap_or_else(|| usage()),
             "--game-scale" => {
                 options.game_scale = value().parse::<f32>().ok().filter(|s| (0.3..=1.0).contains(s)).unwrap_or_else(|| usage())
             }
@@ -244,7 +247,7 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
     options.eye_width_given = options.eye_width != 0;
     options.eye_width_unfoveated = if options.eye_width == 0 { default_eye_width(false, options.fps as u32) } else { 0 };
     if options.eye_width == 0 {
-        options.eye_width = default_eye_width(options.foveation, options.fps as u32);
+        options.eye_width = default_eye_width(options.foveation != FoveationLevel::Off, options.fps as u32);
     }
     (options, desktop, config_dir)
 }
@@ -338,12 +341,12 @@ fn native_config(
         wishes: HostWishes {
             // A foveated eye takes the size that the headset asks for: its recommended size, within
             // its decoder's limits.
-            eye_width: if options.eye_width_given || !options.foveation { options.eye_width } else { 0 },
+            eye_width: if options.eye_width_given || options.foveation == FoveationLevel::Off { options.eye_width } else { 0 },
             eye_width_unfoveated: options.eye_width_unfoveated,
             refresh_hz: options.fps,
             bitrate_bps: options.mbps * 1_000_000,
             codecs: vec![Codec::Hevc],
-            foveation: options.foveation.then(|| FoveationConfig::default().into()),
+            foveation: options.foveation.config().map(Into::into),
             full_range: true,
             slices: 1,
         },
@@ -370,10 +373,11 @@ fn main() {
     let desktop_panel = desktop.enabled && desktop.layer;
     let layer: Arc<desktop_layer::LayerState> = Arc::default();
     info!(
-        "cranvr-host: {} Hz, {} px per eye, {} Mbps, config in {}",
+        "cranvr-host: {} Hz, {} px per eye, {} Mbps, foveation {}, config in {}",
         options.fps,
         options.eye_width,
         options.mbps,
+        options.foveation.name(),
         config_dir.display()
     );
     if options.trust_all {
@@ -472,7 +476,9 @@ fn main() {
                 }
                 let n = &negotiated;
                 // `cable` tells the app which way the stream travels
-                status::emit(json!({"type": "headset", "connected": true, "eye": [n.eye_width, n.eye_height], "fps": n.fps, "foveated": n.foveated, "ip": client_ip.to_string(), "cable": cable}));
+                // `foveation` names the level of a foveated stream, which the window shows
+                let level = if n.foveated { options.foveation } else { FoveationLevel::Off };
+                status::emit(json!({"type": "headset", "connected": true, "eye": [n.eye_width, n.eye_height], "fps": n.fps, "foveated": n.foveated, "foveation": level.name(), "ip": client_ip.to_string(), "cable": cable}));
                 // games that start from now on render at the stream's eye size
                 let scaled = |v: u32| (v as f32 * options.game_scale).round() as u32;
                 if let Err(e) = link.write_control_file((scaled(n.eye_width), scaled(n.eye_height)), n.fps.round() as u32) {
@@ -1503,6 +1509,10 @@ fn frame_loop(
 #[cfg(test)]
 #[path = "tests/eye_quality.rs"]
 mod eye_quality;
+
+#[cfg(test)]
+#[path = "tests/foveation_levels.rs"]
+mod foveation_levels;
 
 #[cfg(test)]
 mod tests {

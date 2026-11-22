@@ -15,9 +15,56 @@ pub struct FoveationConfig {
 }
 
 impl Default for FoveationConfig {
-    /// The defaults of the port.
+    /// The defaults of the port: the level Medium.
     fn default() -> Self {
         Self { center_size: [0.45, 0.4], center_shift: [0.4, 0.1], edge_ratio: [4.0, 5.0] }
+    }
+}
+
+/// How strongly the host foveates each eye: the user's setting. Every level keeps the full pixel
+/// density in a center region and squeezes the edges. A stronger level has a smaller center and
+/// squeezes the edges more, so the encoder gets fewer pixels and gives each of them more bits. The
+/// Quest 3 tracks no eyes, so the center stays where the lens is sharp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum FoveationLevel {
+    /// Every pixel at full density. The host then takes a smaller eye, which its encoder keeps up with.
+    Off,
+    /// About 54 percent of the pixels of an eye
+    Low,
+    /// ALVR's default: about 31 percent of the pixels
+    #[default]
+    Medium,
+    /// About 20 percent of the pixels
+    High,
+}
+
+impl FoveationLevel {
+    pub const ALL: [Self; 4] = [Self::Off, Self::Low, Self::Medium, Self::High];
+
+    /// The layout of the level, `None` for `Off`
+    pub fn config(self) -> Option<FoveationConfig> {
+        let (center_size, edge_ratio) = match self {
+            Self::Off => return None,
+            Self::Low => ([0.6, 0.55], [2.5, 3.0]),
+            Self::Medium => return Some(FoveationConfig::default()),
+            Self::High => ([0.35, 0.3], [5.0, 6.0]),
+        };
+        // The center stays where ALVR puts it, a little toward the nose
+        Some(FoveationConfig { center_size, center_shift: [0.4, 0.1], edge_ratio })
+    }
+
+    /// The level's name on the host's command line and in its status lines
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|level| level.name() == name)
     }
 }
 
@@ -169,6 +216,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Each level is a valid layout that the client can unwarp, and a stronger level codes fewer
+    /// pixels. Every level keeps the region where the measurements look at the center.
+    #[test]
+    fn a_stronger_level_codes_fewer_pixels_and_keeps_the_center() {
+        let eye = [1680u32, 1760];
+        let mut last = u64::MAX;
+        for level in FoveationLevel::ALL {
+            assert_eq!(FoveationLevel::parse(level.name()), Some(level));
+            let Some(config) = level.config() else { continue };
+            let f = Foveation::new(eye, &config);
+            let pixels = u64::from(f.optimized[0]) * u64::from(f.optimized[1]);
+            assert!(pixels < last, "{level:?} codes {pixels} pixels");
+            last = pixels;
+            for view in [[0.47, 0.40], [0.79, 0.67], [0.6, 0.5]] {
+                let back = f.encoded_to_view(f.view_to_encoded(view));
+                assert!((back[0] - view[0]).abs() < 1e-3 && (back[1] - view[1]).abs() < 1e-3, "{level:?} {view:?}");
+            }
+            // Full density at the corners of the measured center
+            let density = |x: f32, y: f32| {
+                let a = f.view_to_encoded([x, y]);
+                let b = f.view_to_encoded([x + 0.001, y + 0.001]);
+                [(b[0] - a[0]) / 0.001 * f.optimized[0] as f32 / eye[0] as f32, (b[1] - a[1]) / 0.001 * f.optimized[1] as f32 / eye[1] as f32]
+            };
+            for (x, y) in [(0.47, 0.40), (0.78, 0.66)] {
+                let d = density(x, y);
+                assert!((d[0] - 1.0).abs() < 0.05 && (d[1] - 1.0).abs() < 0.05, "{level:?} at {x}, {y}: {d:?}");
+            }
+        }
+        assert_eq!(FoveationLevel::parse("full"), None);
     }
 
     #[test]
