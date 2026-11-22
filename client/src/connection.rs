@@ -309,20 +309,21 @@ fn resolve(text: &str) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("{text} has no address"))
 }
 
-/// How long a connection at the launch waits for the hub to learn the device and for the cable's
-/// thread to ask for the USB network. Both come within about 0.2 s of the app's start.
-const ASK_WAIT: Duration = Duration::from_secs(2);
+/// How long a connection at the launch waits for the hub to learn the device. The runtime tells it
+/// within about 0.2 s of the app's start.
+const DEVICE_WAIT: Duration = Duration::from_secs(2);
+/// How long an aim at the cable waits for an answer behind it. The headset's USB network comes up
+/// about a second after the app asks for it.
+const CABLE_WAIT: Duration = Duration::from_secs(5);
 
 /// Where a connection to `text` goes and which path that is. A phone or a headset asks the cable
 /// now: the panel's list may be old, and a link that ended connects again through here. A flat
 /// window goes where the text says, because a host beside it is no cable.
 fn route(hub: &'static Hub, text: &str, fingerprint: Option<[u8; 8]>) -> (String, Option<Path>) {
-    // A connection that the launch starts may come before the hub knows that this is a headset, and
-    // before the cable's thread asks for the USB network. In 7 of 23 test runs it did: it took the
-    // address as typed, got a refusal at 127.0.0.1 and never tried again. It now waits for both. A
+    // A connection that the launch starts may come before the hub knows that this is a headset. A
     // flat window on a computer is never a headset, so only an Android build waits.
     let launched = Instant::now();
-    while cfg!(target_os = "android") && launched.elapsed() < ASK_WAIT && (!hub.device().is_live() || usb_network::not_asked_yet()) {
+    while cfg!(target_os = "android") && !hub.device().is_live() && launched.elapsed() < DEVICE_WAIT {
         thread::sleep(Duration::from_millis(50));
     }
     if !hub.device().is_live() {
@@ -334,7 +335,19 @@ fn route(hub: &'static Hub, text: &str, fingerprint: Option<[u8; 8]>) -> (String
         thread::sleep(Duration::from_millis(200));
     }
     let loopback = usb::is_loopback(text);
-    let probed = usb::probe_settled();
+    let mut probed = usb::probe_settled();
+    // An aim at the cable with no Mac known, as a launch with `127.0.0.1:PORT` gives, may come
+    // before the cable's ways answer: the USB network comes up about a second after the app's
+    // start. In 7 of 23 test runs the connection came first, got a refusal at 127.0.0.1 and never
+    // tried again. It asks the cable again for a few seconds. An aim with a known Mac falls back to
+    // that Mac's Wi-Fi entry at once when the cable is out.
+    if loopback && fingerprint.is_none() && probed.is_none() {
+        log::info!("nothing answers behind the USB cable yet; the connection asks again for up to {CABLE_WAIT:?}");
+        while probed.is_none() && launched.elapsed() < CABLE_WAIT {
+            thread::sleep(Duration::from_millis(250));
+            probed = usb::probe_settled();
+        }
+    }
     // A Mac whose user chose Wi-Fi counts as no cable here
     let cable = probed.as_ref().and_then(UsbMac::usable);
     // A Mac that this headset paired with is known by its address. Another Mac behind a typed

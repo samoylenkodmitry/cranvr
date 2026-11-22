@@ -119,13 +119,6 @@ pub fn network() -> Option<Network> {
     HELD.lock().unwrap().as_ref().and_then(|held| held.request.network())
 }
 
-/// Whether the cable's thread is about to ask for the USB network: this launch wants it, the
-/// platform may hand it out and no request exists yet. The thread asks once the app has the focus,
-/// a moment after the launch, so a connection that the launch starts may come first.
-pub fn not_asked_yet() -> bool {
-    wanted() && !UNSUPPORTED.load(Ordering::Relaxed) && HELD.lock().unwrap().is_none()
-}
-
 /// Whether a request is a moment old and has no answer yet. The headset switches its USB functions
 /// then, which cuts `adb` for about a second, and the USB network may come up right after it.
 pub fn settling() -> bool {
