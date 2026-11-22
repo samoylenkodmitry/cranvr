@@ -321,7 +321,7 @@ fn route(hub: &'static Hub, text: &str, fingerprint: Option<[u8; 8]>) -> (String
         thread::sleep(Duration::from_millis(200));
     }
     let loopback = usb::is_loopback(text);
-    let cable = usb::probe();
+    let cable = usb::probe_settled();
     // A Mac that this headset paired with is known by its address. Another Mac behind a typed
     // address shows itself to a question, which is asked only when a cable could take its place.
     let mut mac = fingerprint.or_else(|| {

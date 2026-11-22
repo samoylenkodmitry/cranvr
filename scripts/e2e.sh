@@ -388,6 +388,9 @@ cleanup() {
     if [[ -n ${package} ]]; then
         "${adb_cmd[@]}" shell am force-stop "${package}" >/dev/null 2>&1 || true
     fi
+    if [[ ${cable} == adb && ${native_port} != "${owner_port}" ]]; then
+        "${adb_cmd[@]}" reverse --remove "tcp:${native_port}" >/dev/null 2>&1 || true
+    fi
     if [[ ${client} == quest && -n ${package} ]]; then
         give_back
     fi

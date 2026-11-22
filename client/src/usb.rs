@@ -107,6 +107,19 @@ pub fn probe() -> Option<UsbMac> {
     probe_usb_network().or_else(|| probe_at(&AnyRoute, address(), Way::AdbReverse))
 }
 
+/// Asks the cable as [`probe`] does, for a connection that starts now. A USB network that came up a
+/// moment ago may not reach the Mac yet: the question then repeats until the Mac answers on it or
+/// the moment is over.
+pub fn probe_settled() -> Option<UsbMac> {
+    loop {
+        let found = probe();
+        if found.as_ref().is_some_and(|mac| mac.way == Way::UsbNetwork) || !usb_network::just_up() {
+            return found;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// The host on the USB network that listens on the cable's port
 fn probe_usb_network() -> Option<UsbMac> {
     let network = usb_network::network()?;

@@ -35,12 +35,17 @@ const RETRY: Duration = Duration::from_secs(10);
 /// How long a first connection waits for a request without an answer. The headset needs about a
 /// second to switch its USB functions. A headset without a cable never answers, so the wait ends.
 const SETTLE: Duration = Duration::from_secs(4);
+/// How long the Mac may take to answer on a USB network that just came up: macOS sets up its end
+/// of the link a moment after the headset's end
+const MAC_SETTLE: Duration = Duration::from_secs(3);
 
 /// The request and what the log said about it last.
 struct Held {
     request: RequestedNetwork,
     since: Instant,
     told: Option<NetworkRequestState>,
+    /// When the network last came up
+    up_since: Option<Instant>,
 }
 
 static HELD: Mutex<Option<Held>> = Mutex::new(None);
@@ -63,12 +68,18 @@ pub fn keep() {
         *held = None;
     }
     if held.is_none() && focus::current() == Focus::Focused {
-        *held = Some(Held { request: request_network(NetworkRequest::local(NetworkTransport::Usb)), since: Instant::now(), told: None });
+        *held = Some(Held { request: request_network(NetworkRequest::local(NetworkTransport::Usb)), since: Instant::now(), told: None, up_since: None });
     }
     if let Some(held) = held.as_mut() {
         let state = held.request.state();
         if held.told.as_ref() != Some(&state) {
             tell(&state);
+            let was_up = matches!(held.told, Some(NetworkRequestState::Available(_)));
+            match state {
+                NetworkRequestState::Available(_) if !was_up => held.up_since = Some(Instant::now()),
+                NetworkRequestState::Available(_) => {}
+                _ => held.up_since = None,
+            }
             held.told = Some(state);
         }
     }
@@ -99,6 +110,11 @@ pub fn network() -> Option<Network> {
 /// then, which cuts `adb` for about a second, and the USB network may come up right after it.
 pub fn settling() -> bool {
     HELD.lock().unwrap().as_ref().is_some_and(|held| held.since.elapsed() < SETTLE && held.request.state() == NetworkRequestState::Pending)
+}
+
+/// Whether the USB network came up a moment ago, so the Mac's end of the link may not answer yet
+pub fn just_up() -> bool {
+    HELD.lock().unwrap().as_ref().and_then(|held| held.up_since).is_some_and(|since| since.elapsed() < MAC_SETTLE)
 }
 
 /// The network of `address` when it is the Mac's link-local address on the USB network: an IPv6
