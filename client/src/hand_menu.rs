@@ -38,9 +38,9 @@
 //!   beside the controller, above its top and back along its ray. With the ray level and ahead they
 //!   are beside, up and toward the face;
 //! - in front of the user the menu stands 55 cm ahead of the eyes, its top edge 6 cm below them,
-//!   tilted to face them. The ball stands 28 cm to the left of the nose and 33 cm below the eyes,
-//!   left of the menu, and the hand's display stands to the right of the menu, turned toward the
-//!   eyes;
+//!   tilted to face them. The ball stands 26 cm to the left of the nose, 30 cm below the eyes and
+//!   45 cm ahead of them, left of the menu and nearer, and the hand's display stands to the right of
+//!   the menu, turned toward the eyes;
 //! - the hand's display is 42 cm wide by default. A 1920 point wide Mac display then shows 13 point
 //!   text 3 mm tall, which a Quest 3 resolves at the 45 cm that a hand holds it from the eyes. The user
 //!   can resize it with the corner sphere;
@@ -133,9 +133,10 @@ pub const ON_LEFT: HandFrame = HandFrame { base: [0.0; 3], stand: Stand::Hand { 
 pub const ON_RIGHT: HandFrame = HandFrame { base: [0.0; 3], stand: Stand::Hand { side: -1.0 }, menu: "hand-menu-right", display: "hand-display-right" };
 
 /// The frame of the panels in front of the user: the head's soft subspace has its origin a meter
-/// ahead of the eyes. The ball stands 28 cm left of the nose and 33 cm below the eyes, 55 cm ahead of
-/// them.
-pub const IN_VIEW: HandFrame = HandFrame { base: [-280.0, -330.0 - LIFT, FRONT_Z], stand: Stand::Front, menu: "view-menu", display: "view-display" };
+/// ahead of the eyes. The ball stands 26 cm left of the nose and 30 cm below the eyes, 45 cm ahead of
+/// them: 10 cm nearer than the menu, so a ray from the right hand passes in front of the open menu
+/// to reach it.
+pub const IN_VIEW: HandFrame = HandFrame { base: [-260.0, -300.0 - LIFT, FRONT_Z + 100.0], stand: Stand::Front, menu: "view-menu", display: "view-display" };
 
 /// The frame of the test on a desk: the head's subspace has its origin a meter ahead of the head. A
 /// left hand lies 30 cm left of the nose, 35 cm below it and 40 cm ahead of it.
@@ -563,9 +564,14 @@ mod tests {
         assert!(top < 0.0 && menu.position[1] > -0.4, "{menu:?}");
         assert!(menu.position[0].abs() < 1e-4, "{menu:?}");
         // The ball stands left of the menu and below the eyes, where the menu does not cover it
-        let ball = VIEW.then(&Pose::at([IN_VIEW.base[0], IN_VIEW.base[1] + LIFT, IN_VIEW.base[2]]));
-        assert!(ball.position[0] + BALL / 2000.0 < menu.position[0] - menu_model::size::WIDTH / 2000.0, "{ball:?}");
-        assert!(ball.position[1] < -0.25 && ball.position[2] > -0.6, "{ball:?}");
+        let ball = VIEW.then(&Pose::at([IN_VIEW.base[0], IN_VIEW.base[1] + LIFT, IN_VIEW.base[2]].map(|dp| dp / 1000.0)));
+        // Seen from the eyes, the ball's right edge lies left of the menu's left edge
+        let angle = |x: f32, z: f32| (x / -z).atan().to_degrees();
+        let menu_left = angle(menu.position[0] - menu_model::size::WIDTH / 2000.0, menu.position[2]);
+        assert!(angle(ball.position[0] + BALL / 2000.0, ball.position[2]) < menu_left - 3.0, "{ball:?}");
+        assert!((-0.35..-0.25).contains(&ball.position[1]) && (-0.5..-0.4).contains(&ball.position[2]), "{ball:?}");
+        // It stands nearer than the menu, so a ray from the right hand reaches it in front of the menu
+        assert!(ball.position[2] > menu.position[2] + 0.05, "{ball:?} {menu:?}");
         // The display stands right of the menu and faces the eyes
         let display = VIEW.then(&hand_display_start(IN_VIEW, [420.0, 236.0]));
         assert!(facing_the_head(&display) > 0.99, "{display:?}");

@@ -317,8 +317,11 @@ fn desktop_pointers(pitch: f32) {
 
 /// The time that a menu check waits for the link and the host's mapping before its first press
 const MENU_WAIT: Duration = Duration::from_secs(6);
-/// Where the menu check's right controller stands, in meters from the head's start
+/// Where the menu check's right controller stands, in meters from the head's start, and where its
+/// left controller stands when it is alone: 25 cm ahead of the head, nearer than the ball, so its ray
+/// meets the ball's face and not its edge
 const MENU_RIGHT_AT: [f32; 3] = [0.15, -0.3, -0.3];
+const MENU_LEFT_AT: [f32; 3] = [-0.1, -0.35, -0.25];
 
 /// The height of the menu that a host with no display gives: the console, the connection, the
 /// stream's numbers and the row of actions.
@@ -350,17 +353,21 @@ fn menu_check(hands: &str) {
     let view = Pose::at([0.0, 0.0, -1.0]);
     let view_menu = view.then(&hand_menu::menu_start(hand_menu::IN_VIEW, height)).position;
     let base = hand_menu::IN_VIEW.base;
-    let view_ball = view.then(&Pose::at([base[0], base[1] + hand_menu::LIFT, base[2]])).position;
+    let view_ball = view.then(&Pose::at([base[0], base[1] + hand_menu::LIFT, base[2]].map(|dp| dp / 1000.0))).position;
+    // Cranpose's pointer smooths the ray, so a press comes 1 s after each aim, on the point where
+    // the ray rests. The middle of the empty menu is the name of a row, which a press leaves alone.
     let alone = |hand: Hand, at: [f32; 3], open: ScriptedButtons| {
         ScriptedController::new(hand, at, away_from(at))
             .holding(MENU_WAIT, rest)
             .holding(Duration::from_millis(1200), open)
             .holding(Duration::from_millis(800), rest)
             .moving_to(Duration::from_millis(1), (at, view_menu), rest)
-            .holding(Duration::from_millis(1500), rest)
+            .holding(Duration::from_millis(1000), rest)
+            .holding(Duration::from_millis(200), pull)
+            .holding(Duration::from_millis(300), rest)
             .moving_to(Duration::from_millis(1), (at, view_ball), rest)
-            .holding(Duration::from_millis(500), rest)
-            .holding(Duration::from_millis(300), pull)
+            .holding(Duration::from_millis(1000), rest)
+            .holding(Duration::from_millis(200), pull)
             .holding(Duration::from_millis(1000), rest)
             .moving_to(Duration::from_millis(1), (at, away_from(at)), rest)
     };
@@ -372,7 +379,7 @@ fn menu_check(hands: &str) {
         }
         "left" => {
             script_controller(missing(Hand::Right));
-            script_controller(alone(Hand::Left, LEFT_AT, ScriptedButtons { menu: true, ..rest }));
+            script_controller(alone(Hand::Left, MENU_LEFT_AT, ScriptedButtons { menu: true, ..rest }));
         }
         _ => {
             // The left controller's ray is level and straight ahead, so its pose has no turn
@@ -388,18 +395,21 @@ fn menu_check(hands: &str) {
                 .holding(Duration::from_millis(800), rest)
                 // 8 s: the menu on the left hand
                 .moving_to(Duration::from_millis(1), (at, hand_menu), rest)
-                .holding(Duration::from_millis(1500), rest)
+                .holding(Duration::from_millis(1000), rest)
+                .holding(Duration::from_millis(200), pull)
+                .holding(Duration::from_millis(300), rest)
                 .moving_to(Duration::from_millis(1), (at, away_from(at)), rest)
                 // The left controller goes missing at 10 s, and the menu stands in front of the user from 12 s
                 .holding(Duration::from_millis(3000), rest)
                 .moving_to(Duration::from_millis(1), (at, view_menu), rest)
-                .holding(Duration::from_millis(1000), rest)
+                .holding(Duration::from_millis(800), rest)
+                .holding(Duration::from_millis(200), pull)
                 .moving_to(Duration::from_millis(1), (at, away_from(at)), rest)
                 // The left controller is back at 14 s, and the menu on its hand from 14.3 s
                 .holding(Duration::from_millis(1500), rest)
                 .moving_to(Duration::from_millis(1), (at, hand_ball), rest)
-                .holding(Duration::from_millis(500), rest)
-                .holding(Duration::from_millis(300), pull)
+                .holding(Duration::from_millis(1000), rest)
+                .holding(Duration::from_millis(200), pull)
                 .holding(Duration::from_millis(1000), rest)
                 .moving_to(Duration::from_millis(1), (at, away_from(at)), rest);
             script_controller(right);

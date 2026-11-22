@@ -142,12 +142,17 @@ pub fn hover_modifier(id: u32) -> Modifier {
                     if let Some(hovered) = hover_of(event.kind) {
                         set(id, event.id.0, hovered);
                     }
-                    // The log says where a ray enters the hand menu or its ball, so a test reads the
-                    // panel's place from the point that the ray was aimed at
-                    if event.kind == PointerEventKind::Enter && (id == MENU || id == STRIP) {
+                    // The log says where a ray enters the hand menu or its ball and where it presses
+                    // them, so a test reads the panel's place from the point that the ray was aimed at
+                    let verb = match event.kind {
+                        PointerEventKind::Enter => Some("enters"),
+                        PointerEventKind::Down => Some("presses"),
+                        _ => None,
+                    };
+                    if let Some(verb) = verb.filter(|_| id == MENU || id == STRIP) {
                         let hand = ["the left", "the right", "a"][slot_of(event.id.0)];
                         let what = if id == MENU { "menu" } else { "ball" };
-                        log::info!("{hand} pointer enters the hand {what} at {:.0}, {:.0} dp", event.position.x, event.position.y);
+                        log::info!("{hand} pointer {verb} the hand {what} at {:.0}, {:.0} dp", event.position.x, event.position.y);
                     }
                 }
             })
