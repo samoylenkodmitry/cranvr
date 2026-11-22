@@ -357,6 +357,18 @@ pub struct DisplaysView {
     pub notice: Option<String>,
 }
 
+impl DisplaysView {
+    /// The view without what changes every second: what each display costs and whether it streams.
+    /// The headset's page for the Mac shows no costs, so it reads only the rest.
+    pub fn without_costs(mut self) -> Self {
+        for display in &mut self.displays {
+            display.measured = Measured::default();
+            display.streaming = false;
+        }
+        self
+    }
+}
+
 impl Displays {
     fn new() -> Self {
         Self {

@@ -392,6 +392,12 @@ pub struct Hub {
 }
 
 /// The one hub of the process. The activity may rebuild the composition, and the link outlives it.
+/// Whether the headset's page should be made for the link `id` (0 for none): the link streams, and
+/// what the page reads `changed` since the last page went, or the link `sent` last got none.
+fn headset_page_due(id: u64, streaming: bool, changed: bool, sent: Option<u64>) -> bool {
+    id != 0 && streaming && (changed || sent != Some(id))
+}
+
 pub fn hub() -> &'static Hub {
     static HUB: OnceLock<Hub> = OnceLock::new();
     HUB.get_or_init(|| Hub {
@@ -790,10 +796,9 @@ impl Hub {
             self.headset_page_changed.store(true, Ordering::Relaxed);
         }
         let id = self.current.load(Ordering::Acquire);
-        if id == 0 || self.snapshot.lock().unwrap().state != LinkState::Streaming {
-            return false;
-        }
-        self.headset_page_changed.load(Ordering::Relaxed) || self.headset_page_sent.lock().unwrap().as_ref().is_none_or(|(sent, _)| *sent != id)
+        let streaming = self.snapshot.lock().unwrap().state == LinkState::Streaming;
+        let sent = self.headset_page_sent.lock().unwrap().as_ref().map(|(sent, _)| *sent);
+        headset_page_due(id, streaming, self.headset_page_changed.load(Ordering::Relaxed), sent)
     }
 
     /// Sends the headset's own page to the Mac when it differs from the one that the link took last,
@@ -806,6 +811,8 @@ impl Hub {
         let Ok(text) = serde_json::to_string(page) else { return };
         let mut sent = self.headset_page_sent.lock().unwrap();
         if sent.as_ref().is_some_and(|(last_id, last)| *last_id == id && *last == text) {
+            // What the page reads changed, and the page did not: the Mac has it
+            self.headset_page_changed.store(false, Ordering::Relaxed);
             return;
         }
         let taken = self.connection.lock().unwrap().as_ref().is_some_and(|connection| connection.send_headset_page(text.clone()));
@@ -1158,5 +1165,18 @@ mod tests {
         // One point late: the frame shows in this headset frame, as it is the next chance
         let late = intake_timing(d, 984_000_000, 991_666_667);
         assert_eq!((late.display_time, late.picked, late.late), (1_000_000_000, 984_000_000, true));
+    }
+
+    #[test]
+    fn the_headsets_page_is_made_for_a_new_link_and_after_a_change_only() {
+        // No link, or a link that does not stream yet: nothing
+        assert!(!headset_page_due(0, true, true, None));
+        assert!(!headset_page_due(3, false, true, None));
+        // A new link gets the page once
+        assert!(headset_page_due(3, true, false, None));
+        assert!(headset_page_due(3, true, false, Some(2)));
+        // A link that has the page gets it again only after a change
+        assert!(!headset_page_due(3, true, false, Some(3)));
+        assert!(headset_page_due(3, true, true, Some(3)));
     }
 }

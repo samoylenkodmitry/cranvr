@@ -21,7 +21,7 @@ use cranvr_common::{
 };
 use serde_json::Value;
 use std::{
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -66,11 +66,13 @@ pub struct HeadsetChoices {
     pub volume: Option<Volume>,
 }
 
-/// What the console shows: the app's pages and the host's state.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// What the console shows: the app's pages and the host's state. The UI takes a copy of it many
+/// times a second, in a game too, so the pages are shared: a copy and its compare cost no walk over
+/// the pages.
+#[derive(Clone, Debug, Default)]
 pub struct Menu {
     /// The pages of settings and actions. The first is the console's main page.
-    pub pages: Vec<Page>,
+    pub pages: Arc<Vec<Page>>,
     pub status: Status,
     /// One short line from the app about something that happens now, such as a game that restarts.
     /// The app writes it into vr-menu.json while it applies.
@@ -96,6 +98,17 @@ impl Status {
     }
 }
 
+impl PartialEq for Menu {
+    fn eq(&self, other: &Self) -> bool {
+        // A copy holds the same pages, so the pointers decide at once
+        (Arc::ptr_eq(&self.pages, &other.pages) || self.pages == other.pages)
+            && self.status == other.status
+            && self.notice == other.notice
+            && self.controls == other.controls
+            && self.headset == other.headset
+    }
+}
+
 impl Menu {
     /// The menu from the host's text. `None` for a text that is no menu: it lacks the pages, a page
     /// does not read, or the controls are missing. The stream's state comes apart
@@ -103,7 +116,7 @@ impl Menu {
     pub fn parse(text: &str) -> Option<Self> {
         let v: Value = serde_json::from_str(text).ok()?;
         Some(Self {
-            pages: serde_json::from_value(v.get("pages")?.clone()).ok()?,
+            pages: Arc::new(serde_json::from_value(v.get("pages")?.clone()).ok()?),
             status: Status::default(),
             notice: v["notice"].as_str().filter(|notice| !notice.is_empty()).map(str::to_string),
             controls: Controls::from_json(&v["controls"].to_string())?,

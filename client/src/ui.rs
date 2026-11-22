@@ -149,6 +149,7 @@ fn Client() {
     // what shows in a game (see `models.rs`).
     let controller_models = local_controller_models().current();
     LaunchedEffect((), async move |_| {
+        crate::menu_hint::forget_on_launch();
         for address in settings::host_keys_to_forget_on_launch() {
             log::info!("the launch forgets the host key of {address}");
             settings::forget_host_key(&crate::connection::host_name(&address));
@@ -201,7 +202,7 @@ fn Client() {
             }
             turns = turns.wrapping_add(1);
             if turns.is_multiple_of(20) {
-                let read = (layout.get_non_reactive(), console.get_non_reactive().open, displays().menu_view(), place.get_non_reactive());
+                let read = (layout.get_non_reactive(), console.get_non_reactive().open, displays().menu_view().without_costs(), place.get_non_reactive());
                 if hub().headset_page_due(page_read.as_ref() != Some(&read)) {
                     let (shown, console_open, listed, at) = &read;
                     let input = MenuInput { layout: shown, console_open: *console_open, displays: listed, wishes: Default::default(), place: *at, adding: false, pages: &[], costs: false };

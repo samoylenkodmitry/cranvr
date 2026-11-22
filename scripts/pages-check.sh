@@ -7,9 +7,10 @@
 # and the client's lines of the walk.
 #
 # Usage: scripts/pages-check.sh SERIAL WORKDIR [SECONDS] [PORT] [PAGES] [ACTIONS]
-#   SECONDS how long the run lasts (20 by default). Each page takes about 6 s. Keep it below 26: on a
-#           desk the Quest sets its USB configuration again about 30 s after the start, which ends
-#           adb and the link before the window's presses.
+#   SECONDS how long the run lasts (20 by default). Each page takes about 6 s. Keep it below 26. The
+#           user's client asks for the headset's USB network, and the run stops that client. About
+#           30 s later Horizon OS sets the USB functions back, which ends adb and the link before the
+#           window's presses.
 #   PORT    the test app's port (9961 by default)
 #   PAGES   the ids of the pages to walk as a comma list, such as connection,desktop (all by default)
 #   ACTIONS the ids of actions that the walk presses on those pages, such as log.watch (none by default)
@@ -17,7 +18,8 @@
 # At the end the run presses two buttons of the window on the headset's own page: Show or Hide of the
 # stream numbers and Recenter. The client starts with `save_choices=false`, so the test app's room,
 # volume and controls do not replace the headset's saved ones. It starts with its own set of panels
-# (`shown`), so a press on Show or Hide saves no layout over the user's.
+# (`shown`), so a press on Show or Hide saves no layout over the user's, and with `first_start`, so
+# the walk's opening of the hand menu does not mark the menu's hint as seen.
 #
 # The Quest must run a build from `scripts/build-client.sh --scripted-hand`, and `cargo build
 # --release` must have built cranvr and cranvr-host. The test app has its own folder in WORKDIR with a
@@ -53,7 +55,7 @@ logcat=$!
 ${adb_cmd} reverse tcp:${port} tcp:${port} > /dev/null
 ${adb_cmd} shell am force-stop dev.cranvr.client
 ${adb_cmd} shell am broadcast -a com.oculus.vrpowermanager.prox_close > /dev/null
-extras=(--es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room scene --ez default_places true --ez save_choices false --es shown connection,stats,display1 --es scripted_pointer pages --es forget_host_key 127.0.0.1:${port})
+extras=(--es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room scene --ez default_places true --ez save_choices false --ez first_start true --es shown connection,stats,display1 --es scripted_pointer pages --es forget_host_key 127.0.0.1:${port})
 [[ -n ${walk} ]] && extras+=(--es scripted_pages ${walk})
 [[ -n ${actions} ]] && extras+=(--es scripted_actions ${actions})
 ${adb_cmd} shell am start -n dev.cranvr.client/dev.cranpose.android.CranposeActivity ${extras} > /dev/null

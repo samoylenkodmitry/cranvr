@@ -24,6 +24,19 @@ pub fn wanted_at_start() -> bool {
     first_start_on_launch() || preferences().get(SEEN_KEY).is_none()
 }
 
+/// Forgets that the user opened the menu, when the launch has the extra `forget_menu_hint`. A test
+/// that opened the menu without `first_start` marked the line seen for a user who had not seen it:
+/// the line then shows again from the next start.
+pub fn forget_on_launch() {
+    if !launch_args().boolean("forget_menu_hint").unwrap_or(false) {
+        return;
+    }
+    match preferences().remove(SEEN_KEY) {
+        Ok(()) => log::info!("the launch forgets that the menu was opened: the menu hint shows from the next start"),
+        Err(e) => log::warn!("the menu hint's state was not forgotten: {e}"),
+    }
+}
+
 /// Keeps for the next starts that the user opened the menu once.
 pub fn mark_seen() {
     if first_start_on_launch() {
