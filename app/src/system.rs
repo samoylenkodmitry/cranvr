@@ -1,12 +1,14 @@
 //! macOS permissions. cranvr-host runs as a child of this app, and macOS gives a child the
 //! permissions of the app that started it. So the app asks for them, and the host inherits them.
 //!
-//! - Screen Recording: the desktop view captures the display. The host also captures the Mac's
-//!   sound for the headset with it.
+//! - Screen Recording: the desktop view captures the display.
+//! - System Audio Recording: the host captures the Mac's sound for the headset with a Core Audio tap
+//!   (`cranvr_common::system_audio`).
 //! - Accessibility: the controller moves the mouse.
 //! - Local Network: macOS asks by itself when the host first talks to the headset (Info.plist
 //!   carries the reason).
 
+use cranvr_common::system_audio::{self, Access};
 use std::{
     ffi::c_void,
     net::{IpAddr, Ipv4Addr},
@@ -45,6 +47,7 @@ extern "C" {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Permission {
     ScreenRecording,
+    SystemAudio,
     Accessibility,
 }
 
@@ -53,6 +56,7 @@ impl Permission {
         unsafe {
             match self {
                 Permission::ScreenRecording => CGPreflightScreenCaptureAccess(),
+                Permission::SystemAudio => system_audio::access() == Access::Granted,
                 Permission::Accessibility => AXIsProcessTrusted(),
             }
         }
@@ -66,11 +70,21 @@ impl Permission {
         }
     }
 
-    /// Shows the system prompt alone. It returns whether the permission is allowed.
+    /// Shows the system prompt alone. It returns false when the permission stays off: then only
+    /// System Settings helps. System Audio Recording returns true while its prompt waits for an answer.
     pub fn prompt(self) -> bool {
         unsafe {
             match self {
                 Permission::ScreenRecording => CGRequestScreenCaptureAccess(),
+                Permission::SystemAudio => match system_audio::access() {
+                    Access::Granted => true,
+                    Access::Denied => false,
+                    // The prompt answers later: the permission list reads the state again
+                    Access::Unknown => {
+                        system_audio::request();
+                        true
+                    }
+                },
                 Permission::Accessibility => {
                     let keys = [kAXTrustedCheckOptionPrompt];
                     let values = [kCFBooleanTrue];
@@ -93,6 +107,7 @@ impl Permission {
     pub fn open_settings(self) {
         let pane = match self {
             Permission::ScreenRecording => "Privacy_ScreenCapture",
+            Permission::SystemAudio => "Privacy_AudioCapture",
             Permission::Accessibility => "Privacy_Accessibility",
         };
         Command::new("open")
@@ -104,13 +119,15 @@ impl Permission {
     pub fn title(self) -> &'static str {
         match self {
             Permission::ScreenRecording => "Screen Recording",
+            Permission::SystemAudio => "System Audio Recording",
             Permission::Accessibility => "Accessibility",
         }
     }
 
     pub fn reason(self) -> &'static str {
         match self {
-            Permission::ScreenRecording => "shows your Mac's screen and plays its sound in the headset",
+            Permission::ScreenRecording => "shows your Mac's screen in the headset",
+            Permission::SystemAudio => "plays your Mac's sound in the headset",
             Permission::Accessibility => "lets the controller move the mouse and click",
         }
     }

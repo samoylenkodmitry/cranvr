@@ -22,7 +22,7 @@ use std::{
 const FPS_CHOICES: [u32; 3] = [72, 90, 120];
 const MBPS_CHOICES: [u32; 4] = [50, 100, 150, 200];
 const GAME_SCALE_CHOICES: [f32; 5] = [0.5, 0.6, 0.7, 0.85, 1.0];
-const PERMISSIONS: [Permission; 2] = [Permission::ScreenRecording, Permission::Accessibility];
+const PERMISSIONS: [Permission; 3] = [Permission::ScreenRecording, Permission::SystemAudio, Permission::Accessibility];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {

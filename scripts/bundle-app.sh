@@ -7,7 +7,7 @@
 #              with the hardened runtime and a secure timestamp, as notarization needs.
 #              scripts/release-app.sh runs this, then notarizes the app.
 #
-# macOS keeps permissions (Screen Recording, Accessibility, Local Network, Microphone) per signed app. The
+# macOS keeps permissions (Screen Recording, System Audio Recording, Accessibility, Local Network, Microphone) per signed app. The
 # script signs with your first "Apple Development" identity, so a rebuilt app keeps them.
 # Set CRANVR_SIGN_IDENTITY to choose another identity, or "-" for an ad-hoc signature (then
 # macOS asks again after each build).
@@ -47,13 +47,15 @@ cat > "${app}/Contents/Info.plist" <<EOF
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>${version}</string>
     <key>CFBundleVersion</key><string>${version}</string>
-    <key>LSMinimumSystemVersion</key><string>14.0</string>
+    <key>LSMinimumSystemVersion</key><string>14.2</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSLocalNetworkUsageDescription</key>
     <string>cranvr finds your headset on the local network and streams to it.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>Games on this Mac hear the input device that you chose in cranvr's settings.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>cranvr plays your Mac's sound in the headset.</string>
 </dict>
 </plist>
 EOF

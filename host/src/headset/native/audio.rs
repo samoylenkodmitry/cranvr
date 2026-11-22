@@ -1,5 +1,5 @@
-//! The Mac's sound for the native client. `game_audio.rs` captures what this Mac plays with
-//! ScreenCaptureKit and converts it to interleaved 16-bit stereo at 48 kHz. `send` below cuts it into
+//! The Mac's sound for the native client. `game_audio.rs` captures what this Mac plays with a
+//! Core Audio tap and converts it to interleaved 16-bit stereo at 48 kHz. `send` below cuts it into
 //! datagrams of `FRAMES_PER_DATAGRAM` stereo frames, 5 ms each. The client plays them (`client/src/audio.rs`).
 //!
 //! The sound goes out as plain PCM. Opus would cut 1.54 Mbps to about 0.1 Mbps. The stream's
@@ -7,8 +7,8 @@
 //! decode delay and needs no codec on the Quest.
 //!
 //! Each datagram carries the host's clock for its first sample, so the client can tell how old the
-//! sound is when it plays it. ScreenCaptureKit hands over a buffer of about 20 ms at once. The
-//! datagrams of one buffer therefore leave together. The client's jitter buffer absorbs it.
+//! sound is when it plays it. The capture hands over a buffer of 10 ms at once. The datagrams of
+//! one buffer therefore leave together. The client's jitter buffer absorbs it.
 
 use super::Session;
 use log::info;
@@ -105,8 +105,9 @@ pub fn send(pcm: &[u8]) {
 }
 
 fn log_loop(session: &Arc<Session>) {
-    let mut seen = (0u64, 0u64, 0u64);
-    let mut seen_buffers = 0u64;
+    // The counters run since the host started: a later session counts from its own start
+    let mut seen = (DATAGRAMS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed), FRAMES.load(Ordering::Relaxed));
+    let mut seen_buffers = BUFFERS.load(Ordering::Relaxed);
     let mut at = std::time::Instant::now();
     loop {
         thread::sleep(LOG_EVERY);
@@ -116,18 +117,28 @@ fn log_loop(session: &Arc<Session>) {
         let now = (DATAGRAMS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed), FRAMES.load(Ordering::Relaxed));
         let seconds = at.elapsed().as_secs_f64();
         let buffers = BUFFERS.load(Ordering::Relaxed);
+        let capture = crate::game_audio::take_stats();
         info!(
-            "Native audio: {:.2} s of sound a second in {:.0} datagrams a second, {:.2} Mbps of PCM; the capture hands over {:.1} buffers a second of {} frames ({:.1} ms)",
+            "Native audio: {:.2} s of sound a second in {:.0} datagrams a second, {:.2} Mbps of PCM; the capture hands over {:.1} buffers a second of {} frames ({:.1} ms), {}",
             (now.2 - seen.2) as f64 / SAMPLE_RATE / seconds,
             (now.0 - seen.0) as f64 / seconds,
             (now.1 - seen.1) as f64 * 8.0 / seconds / 1e6,
             (buffers - seen_buffers) as f64 / seconds,
             LAST_BUFFER_FRAMES.load(Ordering::Relaxed),
-            LAST_BUFFER_FRAMES.load(Ordering::Relaxed) as f64 * 1000.0 / SAMPLE_RATE
+            LAST_BUFFER_FRAMES.load(Ordering::Relaxed) as f64 * 1000.0 / SAMPLE_RATE,
+            describe_capture(&capture)
         );
         seen_buffers = buffers;
         (seen, at) = (now, std::time::Instant::now());
     }
+}
+
+/// The capture's numbers for the log line: the age of the newest sample when the host had it, the
+/// loudest sample, the lost buffers and the capture's clock against the Mac's clock.
+fn describe_capture(stats: &crate::game_audio::Stats) -> String {
+    let age = stats.age_ms.map_or("no age".to_string(), |(average, max)| format!("the newest sample {average:.1} ms old on average (max {max:.1} ms)"));
+    let clock = stats.clock_ppm.map_or(String::new(), |ppm| format!(", its clock {ppm:+.0} ppm against the Mac's"));
+    format!("{age}, peak level {:.3}, {} gaps{clock}", stats.peak, stats.gaps)
 }
 
 /// Seconds of sound that arrived while no client was connected, since the host started.

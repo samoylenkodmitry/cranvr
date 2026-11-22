@@ -473,7 +473,7 @@ pub struct Model {
     /// `message`.
     pub settings_problem: Option<String>,
     /// Screen Recording and Accessibility
-    pub permissions: [bool; 2],
+    pub permissions: [bool; 3],
     /// The Mac's input devices, for the microphone's choice
     pub input_devices: Vec<crate::microphone::InputDevice>,
     pub steam: crate::steam::SteamState,
