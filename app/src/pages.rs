@@ -34,6 +34,14 @@ pub const SOUND: &str = "sound";
 pub const WINE: &str = "wine";
 pub const MAC: &str = "mac";
 pub const HEADSET: &str = "headset";
+pub const PROGRAMS: &str = "programs";
+pub const LOG: &str = "log";
+/// The most programs that the page of found programs lists
+pub const FOUND_PROGRAMS: usize = 24;
+/// How long the log page carries the newest lines after the headset asked for them
+pub const LOG_TIME: std::time::Duration = std::time::Duration::from_secs(60);
+/// The lines that the log page carries
+const LOG_LINES: usize = 14;
 /// The id of a game's page: this prefix and the game's program
 pub const GAME_PAGE: &str = "game:";
 
@@ -494,6 +502,8 @@ pub fn pages(settings: &Settings, model: &Model) -> Vec<Page> {
         wine_page(settings, model),
         headset_page(settings, model),
         mac_page(model),
+        programs_page(model),
+        log_page(model),
     ];
     for game in &model.games {
         if let Some(page) = game_page_of(settings, model, game) {
@@ -768,6 +778,44 @@ fn headset_page(settings: &Settings, model: &Model) -> Page {
     Page { id: HEADSET.into(), title: "Headset".into(), short: "Headset".into(), listed: true, items }
 }
 
+/// The Windows programs that the Mac found, with Add and Run once: the headset has no file chooser,
+/// so it adds a game from this list. The window lists them too, beside its file chooser.
+fn programs_page(model: &Model) -> Page {
+    let mut items = vec![Item::Heading { text: "Programs on this Mac".into() }];
+    if model.found_programs.is_empty() {
+        items.push(Item::Text { text: "No other Windows program in the Steam libraries or in C:\\Games.".into(), tone: Tone::Muted });
+    }
+    for path in &model.found_programs {
+        let folder = path.parent().and_then(|folder| folder.file_name()).map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        let file = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        let subject = path.display().to_string();
+        items.push(Item::Buttons(Buttons {
+            title: folder,
+            detail: file,
+            buttons: vec![Button::run("Add", "programs.add").of(subject.clone()).styled(Style::Primary), Button::run("Run once", "programs.run").of(subject)],
+            hint: String::new(),
+        }));
+    }
+    items.push(Item::Text { text: "Add puts the program in the list of games with its own options. Run once starts it as it is.".into(), tone: Tone::Muted });
+    Page { id: PROGRAMS.into(), title: "Add a game".into(), short: "Add game".into(), listed: true, items }
+}
+
+/// The newest lines of the log, for a minute after the headset asked: the lines change all the
+/// time, and the menu goes to the headset at each change.
+fn log_page(model: &Model) -> Page {
+    let mut items = vec![Item::Heading { text: "Log".into() }];
+    if model.log_until.is_some() {
+        let lines: Vec<&String> = model.log.iter().rev().take(LOG_LINES).collect();
+        for line in lines.into_iter().rev() {
+            items.push(Item::Text { text: line.chars().take(140).collect(), tone: Tone::Muted });
+        }
+    } else {
+        items.push(Item::Text { text: "The newest lines of the log show here for a minute.".into(), tone: Tone::Muted });
+    }
+    items.push(Item::Buttons(Buttons { buttons: vec![Button::run("Show the newest lines", "log.watch")], ..Default::default() }));
+    Page { id: LOG.into(), title: "Log".into(), short: "Log".into(), listed: true, items }
+}
+
 /// The host, the settings file, the paired headsets and the Mac's addresses.
 fn mac_page(model: &Model) -> Page {
     let mut items = vec![Item::Heading { text: "This Mac".into() }];
@@ -896,6 +944,12 @@ pub enum Effect {
     PermissionSettings(Permission),
     /// Hands a press on the headset's own page to the headset
     ToHeadset(Request),
+    /// Adds a program that the Mac found to the games
+    AddProgram(std::path::PathBuf),
+    /// Starts a program that the Mac found once
+    RunProgram(std::path::PathBuf),
+    /// The log page carries the newest lines for a while
+    WatchLog,
 }
 
 /// What a request did.
@@ -985,6 +1039,15 @@ pub fn apply(settings: &mut Settings, model: &Model, request: &Request) -> Outco
             }
             Outcome { changed: settings.launch != before, ..Default::default() }
         }
+        Request::Run { id, subject } if id.starts_with("programs.") => {
+            // Only a program that the Mac found itself: a request names no other path to start
+            match model.found_programs.iter().find(|path| Some(path.display().to_string().as_str()) == subject.as_deref()) {
+                Some(path) if id == "programs.add" => Outcome { effects: vec![Effect::AddProgram(path.clone())], ..Default::default() },
+                Some(path) if id == "programs.run" => Outcome { effects: vec![Effect::RunProgram(path.clone())], ..Default::default() },
+                Some(_) => Outcome::refused(format!("cranvr has no action {id}")),
+                None => Outcome::refused("cranvr found no such program on this Mac".into()),
+            }
+        }
         Request::Run { id, subject } => run(settings, games, id, subject.as_deref()),
     }
 }
@@ -1018,6 +1081,7 @@ fn run(settings: &mut Settings, games: &[Game], id: &str, subject: Option<&str>)
         "steam.open" => Outcome { effects: vec![Effect::OpenSteam], pending: Some(pending::Request::OpenSteam), ..Default::default() },
         "usb.download" => Outcome { effects: vec![Effect::DownloadUsb], ..Default::default() },
         "host.restart" => Outcome { effects: vec![Effect::RestartHost], ..Default::default() },
+        "log.watch" => Outcome { effects: vec![Effect::WatchLog], ..Default::default() },
         "permission.ask" | "permission.settings" => match permission_of(subject) {
             Some(permission) if id == "permission.ask" => Outcome { effects: vec![Effect::AskPermission(permission)], ..Default::default() },
             Some(permission) => Outcome { effects: vec![Effect::PermissionSettings(permission)], ..Default::default() },

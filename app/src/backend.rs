@@ -513,6 +513,10 @@ pub struct Model {
     /// The connected headset's own page: its panels, its displays and its actions (see
     /// `HostMsg::HeadsetRequest`)
     pub headset_page: Option<cranvr_common::menu::Page>,
+    /// The Windows programs that the Mac found and that no game starts (see `steam::found_programs`)
+    pub found_programs: Vec<PathBuf>,
+    /// The pages carry the newest lines of the log until then: the headset asked to see them
+    pub log_until: Option<Instant>,
 }
 
 impl Model {

@@ -60,7 +60,8 @@
 //!   hand menu's Console button hides the console before each page's button opens it anew, because a
 //!   console that grows while it shows does not keep its middle. After the last page the Console
 //!   button shows the main page anew, B closes the hand menu, and the walk opens the first game's
-//!   Options and presses a change there in the same way. `scripted_pages` names the pages to walk as a comma list of their ids.
+//!   Options and presses a change there in the same way. `scripted_actions` names actions, as a comma
+//!   list of their ids, that the walk presses too on the pages that have them, such as `log.watch`. `scripted_pages` names the pages to walk as a comma list of their ids.
 //!   Each press waits 1 s with the ray at rest, as the pointer smooths the
 //!   ray. The log names each aim and each choice ("scripted pages:"), and the host's app saves each
 //!   change in its `app.json`.
@@ -581,6 +582,7 @@ fn pages_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
     // does not keep its middle, so each page opens anew.
     // `scripted_pages` names the pages to walk, as a comma list of their ids; all by default
     let wanted: Option<Vec<String>> = launch_args().string("scripted_pages").map(|list| list.split(',').map(|id| id.trim().to_string()).collect());
+    let actions: Vec<String> = launch_args().string("scripted_actions").map(|list| list.split(',').map(|id| id.trim().to_string()).collect()).unwrap_or_default();
     for (index, (id, short)) in pages.iter().enumerate() {
         if wanted.as_ref().is_some_and(|wanted| !wanted.contains(id)) {
             continue;
@@ -593,6 +595,24 @@ fn pages_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
             let target = key_at(&Shown::Host(id.clone()), &Press::Host(change.clone()))?;
             log::info!("scripted pages: on {id} the change {} at {target:?}", change.to_json());
             right = press(right, target);
+        }
+        // An action that the launch names (`scripted_actions`, a comma list of ids) is pressed too
+        for action in actions.iter() {
+            // The first button of the page that runs the action, for whatever it names
+            let request = menu.page(id).and_then(|page| {
+                page.items.iter().find_map(|item| match item {
+                    cranvr_common::menu::Item::Buttons(row) => row.buttons.iter().find_map(|button| match &button.press {
+                        cranvr_common::menu::Press::Run { id: run, .. } if run == action => button.press.request(),
+                        _ => None,
+                    }),
+                    _ => None,
+                })
+            });
+            if let Some(request) = request {
+                let target = key_at(&Shown::Host(id.clone()), &Press::Host(request.clone()))?;
+                log::info!("scripted pages: on {id} the action {} at {target:?}", request.to_json());
+                right = press(right, target);
+            }
         }
     }
     // The main page anew: the Console button hides the console and shows it again on its main page,

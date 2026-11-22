@@ -621,6 +621,9 @@ fn PlayTab(settings: MutableState<Settings>, model: MutableState<Model>) {
             });
         });
         Hint("Add a game: choose the program of a game that Steam does not list, such as a copy of a game with mods. cranvr reads the game's folder and fills in what the game needs. Options shows each value with its reason. Choose a program starts a program once.".into());
+        // The programs that the Mac found, which the headset adds from in place of a file chooser
+        let found = page_of(settings, model, pages::PROGRAMS).map(|page| page.items).unwrap_or_default();
+        PageItems(found, settings, model);
         // The options of the program chosen last, which the button above starts
         let last = settings.with(|s| s.game.clone());
         if last.starts_with('/') {

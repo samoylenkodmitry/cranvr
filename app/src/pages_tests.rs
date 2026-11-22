@@ -288,7 +288,7 @@ fn every_setting_stands_on_one_page_only() {
         assert!(seen.contains_key(&(setting.id.to_string(), None)), "{} has no page", setting.id);
     }
     let listed: Vec<&str> = pages.iter().filter(|page| page.listed).map(|page| page.short.as_str()).collect();
-    assert_eq!(listed, ["Play", "Steam", "Stream", "Connection", "Desktop", "Sound", "Wine", "Headset", "Mac"]);
+    assert_eq!(listed, ["Play", "Steam", "Stream", "Connection", "Desktop", "Sound", "Wine", "Headset", "Mac", "Add game", "Log"]);
 }
 
 #[test]
@@ -422,4 +422,34 @@ fn a_press_on_the_headsets_own_page_goes_to_the_headset() {
     assert_eq!(model.headset_page.as_ref().map(|page| page.title.as_str()), Some("In the headset"));
     model.apply_status_for_test(&serde_json::json!({"type": "headset", "connected": false}));
     assert!(model.headset_page.is_none());
+}
+
+#[test]
+fn the_headset_adds_or_runs_only_a_program_that_the_mac_found() {
+    let found = PathBuf::from("/Users/x/Library/Application Support/cranvr/wine/prefix/drive_c/Games/Copy/game.exe");
+    let model = Model { found_programs: vec![found.clone()], ..Default::default() };
+    let mut settings = Settings::default();
+    let programs = page(&pages(&settings, &model), PROGRAMS).clone();
+    let Some(Item::Buttons(row)) = programs.items.get(1) else { panic!("{programs:?}") };
+    assert_eq!((row.title.as_str(), row.detail.as_str()), ("Copy", "game.exe"));
+    let subject = found.display().to_string();
+    assert_eq!(apply(&mut settings, &model, &Request::run("programs.add").of(subject.clone())).effects, [Effect::AddProgram(found.clone())]);
+    assert_eq!(apply(&mut settings, &model, &Request::run("programs.run").of(subject)).effects, [Effect::RunProgram(found)]);
+    // A path that the Mac did not find starts nothing
+    let out = apply(&mut settings, &model, &Request::run("programs.run").of("/bin/sh"));
+    assert!(out.effects.is_empty() && out.refused.is_some());
+}
+
+#[test]
+fn the_log_page_carries_the_newest_lines_only_for_a_while_after_the_headset_asked() {
+    let mut model = Model::default();
+    for n in 0..30 {
+        model.log(format!("line {n}"));
+    }
+    let texts = |model: &Model| page(&pages(&Settings::default(), model), LOG).items.iter().filter_map(|item| if let Item::Text { text, .. } = item { Some(text.clone()) } else { None }).collect::<Vec<_>>();
+    assert_eq!(texts(&model), ["The newest lines of the log show here for a minute."]);
+    assert_eq!(apply(&mut Settings::default(), &model, &Request::run("log.watch")).effects, [Effect::WatchLog]);
+    model.log_until = Some(Instant::now() + LOG_TIME);
+    let lines = texts(&model);
+    assert_eq!((lines.len(), lines.first().map(String::as_str), lines.last().map(String::as_str)), (14, Some("line 16"), Some("line 29")));
 }
