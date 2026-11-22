@@ -91,14 +91,26 @@ fn while_the_link_streams_only_a_hold_fires_and_a_short_press_stays_with_the_gam
     assert!(runner.update(&controls, &menu, 1_000 * MS, true).is_empty());
     assert!(runner.update(&controls, &menu, 1_000 * MS + HOLD_NS - 1, true).is_empty());
     assert!(runner.update(&controls, &released, 1_000 * MS + HOLD_NS + MS, true).is_empty());
-    // A hold fires once, as the menu button's hold always opened the console
+    // A hold fires once: the left menu button opens the hand menu
     assert!(runner.update(&controls, &menu, 2_000 * MS, true).is_empty());
-    assert_eq!(runner.update(&controls, &menu, 2_000 * MS + HOLD_NS, true), vec![Fire { hand: Hand::Left, action: Action::Console }]);
+    assert_eq!(runner.update(&controls, &menu, 2_000 * MS + HOLD_NS, true), vec![Fire { hand: Hand::Left, action: Action::Menu }]);
     assert!(runner.update(&controls, &menu, 2_000 * MS + 2 * HOLD_NS, true).is_empty(), "one action for one hold");
     // The next hold fires again
     assert!(runner.update(&controls, &released, 3_000 * MS, true).is_empty());
     assert!(runner.update(&controls, &menu, 4_000 * MS, true).is_empty());
     assert_eq!(runner.update(&controls, &menu, 4_000 * MS + HOLD_NS, true).len(), 1);
+}
+
+#[test]
+fn a_hold_of_b_on_the_right_controller_alone_opens_the_menu() {
+    let controls = Controls::default();
+    let mut runner = Runner::default();
+    let b = input(HandInput::default(), pressed(bit::SECONDARY));
+    assert!(runner.update(&controls, &b, 0, true).is_empty());
+    assert_eq!(runner.update(&controls, &b, HOLD_NS, true), vec![Fire { hand: Hand::Right, action: Action::Menu }]);
+    // Without a stream a press opens it
+    let mut runner = Runner::default();
+    assert_eq!(runner.update(&controls, &b, 0, false), vec![Fire { hand: Hand::Right, action: Action::Menu }]);
 }
 
 #[test]

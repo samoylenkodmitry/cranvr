@@ -1200,7 +1200,7 @@ fn ControlsPage(settings: MutableState<Settings>) {
         for action in ControlAction::ALL {
             Hint(format!("{}: {}", action.label(), action.describe()));
         }
-        Hint("A mouse action works on the Mac's desktop panel, where the controller points. The headset's own panels take the trigger as their click, whatever it is set to here. Show or hide panels, Open the console, Recenter and Keyboard work wherever the controller points. While the headset streams they need a hold of 0.8 seconds, so a short press still belongs to the game.".into());
+        Hint("A mouse action works on the Mac's desktop panel, where the controller points. The headset's own panels take the trigger as their click, whatever it is set to here. Open the menu, Show or hide panels, Open the console, Recenter and Keyboard work wherever the controller points. While the headset streams they need a hold of 0.8 seconds, so a short press still belongs to the game.".into());
         Hint("The Mac has one mouse. The controller that holds a button keeps it, and the controller that presses next takes it. A change reaches the headset within a second.".into());
     });
 }

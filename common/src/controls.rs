@@ -23,6 +23,9 @@ pub enum Action {
     MiddleClick,
     /// Scrolls the desktop panel. Only a thumbstick axis offers it.
     Scroll,
+    /// Opens or closes the hand menu, wherever the menu stands: on a hand or in front of the user.
+    /// The menu lists every panel, the console among them.
+    Menu,
     /// Shows or hides the connect and stats panels
     Panels,
     /// Opens or closes the console
@@ -37,11 +40,12 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 9] = [
+    pub const ALL: [Action; 10] = [
         Action::LeftClick,
         Action::RightClick,
         Action::MiddleClick,
         Action::Scroll,
+        Action::Menu,
         Action::Panels,
         Action::Console,
         Action::Recenter,
@@ -56,6 +60,7 @@ impl Action {
             Action::RightClick => "right_click",
             Action::MiddleClick => "middle_click",
             Action::Scroll => "scroll",
+            Action::Menu => "menu",
             Action::Panels => "panels",
             Action::Console => "console",
             Action::Recenter => "recenter",
@@ -75,6 +80,7 @@ impl Action {
             Action::RightClick => "Right click",
             Action::MiddleClick => "Middle click",
             Action::Scroll => "Scroll",
+            Action::Menu => "Open the menu",
             Action::Panels => "Show or hide panels",
             Action::Console => "Open the console",
             Action::Recenter => "Recenter",
@@ -90,6 +96,7 @@ impl Action {
             Action::RightClick => "Clicks the right mouse button on the Mac's desktop panel.",
             Action::MiddleClick => "Clicks the middle mouse button on the Mac's desktop panel.",
             Action::Scroll => "Scrolls the Mac's desktop panel.",
+            Action::Menu => "Opens or closes the hand menu, which shows and hides every panel and opens the console.",
             Action::Panels => "Shows or hides the connect and stats panels.",
             Action::Console => "Opens or closes the console.",
             Action::Recenter => "Brings the panels in front of you.",
@@ -105,7 +112,7 @@ impl Action {
 
     /// The headset does it with no regard for where the controller points
     pub fn is_headset(self) -> bool {
-        matches!(self, Action::Panels | Action::Console | Action::Recenter | Action::Keyboard)
+        matches!(self, Action::Menu | Action::Panels | Action::Console | Action::Recenter | Action::Keyboard)
     }
 }
 
@@ -265,11 +272,12 @@ impl Control {
     /// five other inputs use them (see `client/src/controls.rs`). A button does the rest.
     pub fn offers(self) -> &'static [Action] {
         const AXIS: [Action; 2] = [Action::Scroll, Action::Nothing];
-        const MENU: [Action; 5] = [Action::Panels, Action::Console, Action::Recenter, Action::Keyboard, Action::Nothing];
-        const BUTTON: [Action; 8] = [
+        const MENU: [Action; 6] = [Action::Menu, Action::Panels, Action::Console, Action::Recenter, Action::Keyboard, Action::Nothing];
+        const BUTTON: [Action; 9] = [
             Action::LeftClick,
             Action::RightClick,
             Action::MiddleClick,
+            Action::Menu,
             Action::Panels,
             Action::Console,
             Action::Recenter,
@@ -305,23 +313,24 @@ impl HandControls {
     /// - The trigger is the left mouse button, as it was.
     /// - The grip does nothing: a window is carried by its handle, as it was.
     /// - The first face button (A or X) is the right mouse button.
-    /// - The second face button (B or Y) shows or hides the panels.
+    /// - Y on the left controller shows or hides the panels.
     /// - The thumbstick scrolls, and its press is the middle mouse button, as a mouse wheel's.
-    /// - The left menu button opens the console, as it did. The right controller has none.
+    /// - The left menu button and B on the right controller open the hand menu. A user with only
+    ///   one controller in hand still has a button for the menu. The menu holds the console.
     ///
-    /// The two controllers are the same, so a user may point with either. A mouse button works only
-    /// where the controller points at the Mac's desktop panel, so it does nothing while a game is the
-    /// only thing in view.
+    /// The two controllers are the same otherwise, so a user may point with either. A mouse button
+    /// works only where the controller points at the Mac's desktop panel, so it does nothing while a
+    /// game is the only thing in view.
     pub fn standard(hand: Hand) -> Self {
         Self {
             trigger: Action::LeftClick,
             grip: Action::Nothing,
             primary: Action::RightClick,
-            secondary: Action::Panels,
+            secondary: if hand == Hand::Left { Action::Panels } else { Action::Menu },
             stick_click: Action::MiddleClick,
             stick_vertical: Action::Scroll,
             stick_horizontal: Action::Scroll,
-            menu: if hand == Hand::Left { Action::Console } else { Action::Nothing },
+            menu: if hand == Hand::Left { Action::Menu } else { Action::Nothing },
         }
     }
 
@@ -512,15 +521,25 @@ mod tests {
     }
 
     #[test]
-    fn the_standard_mapping_keeps_what_the_controllers_did_before() {
+    fn the_standard_mapping_opens_the_menu_from_either_controller() {
         let controls = Controls::default();
-        // The trigger clicked, the thumbstick scrolled and the left menu button opened the console
+        // The trigger clicks and the thumbstick scrolls on both
         for hand in Hand::BOTH {
             assert_eq!(controls.action(hand, Control::Trigger), Action::LeftClick);
             assert_eq!(controls.action(hand, Control::StickVertical), Action::Scroll);
         }
-        assert_eq!(controls.action(Hand::Left, Control::Menu), Action::Console);
+        // The left menu button and B open the menu, so one controller alone opens it
+        assert_eq!(controls.inputs_of(Hand::Left, Action::Menu).collect::<Vec<_>>(), vec![Control::Menu]);
+        assert_eq!(controls.inputs_of(Hand::Right, Action::Menu).collect::<Vec<_>>(), vec![Control::Secondary]);
+        assert_eq!(controls.action(Hand::Left, Control::Secondary), Action::Panels);
         assert_eq!(controls.action(Hand::Right, Control::Menu), Action::Nothing);
+        // The menu holds the console, so no button of the standard mapping opens it
+        assert!(Hand::BOTH.iter().all(|hand| controls.inputs_of(*hand, Action::Console).count() == 0));
+        // Every button and the menu button may open the menu. An axis may not.
+        for control in Control::ALL {
+            assert_eq!(control.offers().contains(&Action::Menu), !control.is_axis(), "{control:?}");
+        }
+        assert!(Action::Menu.is_headset());
     }
 
     #[test]
@@ -596,8 +615,8 @@ mod tests {
     #[test]
     fn the_inputs_that_do_an_action_are_listed_for_the_controller_that_has_them() {
         let controls = Controls::default();
-        let consoles: Vec<_> = controls.inputs_of(Hand::Left, Action::Console).collect();
-        assert_eq!(consoles, vec![Control::Menu]);
+        let menus: Vec<_> = controls.inputs_of(Hand::Left, Action::Menu).collect();
+        assert_eq!(menus, vec![Control::Menu]);
         assert_eq!(controls.inputs_of(Hand::Right, Action::Console).count(), 0);
         assert_eq!(controls.inputs_of(Hand::Right, Action::Scroll).count(), 2);
     }

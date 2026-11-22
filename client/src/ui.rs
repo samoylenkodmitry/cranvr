@@ -135,7 +135,7 @@ pub fn ClientApp() {
                 layout.set(next);
             }
             for fire in hub().take_fires() {
-                run_fire(fire.action, layout, typing, recenters);
+                run_fire(fire.action, layout, typing, recenters, menu_open);
             }
             if let Some(pointer) = &pointer_settings {
                 let streaming = snapshot.get_non_reactive().state == LinkState::Streaming;
@@ -238,15 +238,21 @@ pub fn ClientApp() {
         }
         Behind(backdrop, frames);
     });
-    if !hands_in_game.get() {
+    // A menu that a button opened shows while the hands belong to the game too: the user asked for it
+    if !hands_in_game.get() || menu_open.get() {
         HandPanels(hand, console.get().open);
     }
 }
 
 /// Does a headset action that a button fired (see `controls.rs`). The console opens in the frame
-/// loop, so it is not here.
-fn run_fire(action: ControlAction, layout: MutableState<Layout>, typing: MutableState<bool>, recenters: MutableState<u32>) {
+/// loop, so it is not here. The frame loop also gave the hand that fired a click.
+fn run_fire(action: ControlAction, layout: MutableState<Layout>, typing: MutableState<bool>, recenters: MutableState<u32>, menu_open: MutableState<bool>) {
     match action {
+        ControlAction::Menu => {
+            let open = !menu_open.get_non_reactive();
+            log::info!("a button {} the hand menu", if open { "opens" } else { "closes" });
+            menu_open.set(open);
+        }
         ControlAction::Panels => {
             // The connection panel and the stream numbers hide together, or show together
             let mut next = layout.get_non_reactive();

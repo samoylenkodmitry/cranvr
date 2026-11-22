@@ -1313,6 +1313,8 @@ dependencies = [
 name = "cranvr-common"
 version = "0.1.0"
 dependencies = [
+ "block2 0.6.2",
+ "objc2 0.6.5",
  "serde",
  "serde_json",
 ]

@@ -1221,7 +1221,7 @@ mod tests {
         settings.controls.set(Hand::Right, Control::Secondary, Action::Keyboard);
         let menu: Value = serde_json::from_str(&vr_menu(&settings, &[], None)).unwrap();
         assert_eq!(menu["controls"]["right"]["secondary"], "keyboard");
-        assert_eq!(menu["controls"]["left"]["menu"], "console");
+        assert_eq!(menu["controls"]["left"]["menu"], "menu");
         // The headset sends the whole mapping back as it changed it
         let mut changed = settings.controls;
         assert!(changed.set(Hand::Left, Control::Grip, Action::Recenter));
