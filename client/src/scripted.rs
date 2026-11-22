@@ -57,10 +57,11 @@
 //!   controller holds B, which opens the hand menu, and presses the page's button there: the console
 //!   opens on that page. It presses the first option of the page's first choice that restarts nothing
 //!   and does not hold now, or the other state of its first such toggle. It presses no action. The
-//!   hand menu's Console button hides the console before each page's button opens it anew, because a
-//!   console that grows while it shows does not keep its middle. After the last page the Console
-//!   button shows the main page anew, B closes the hand menu, and the walk opens the first game's
-//!   Options and presses a change there in the same way. `scripted_actions` names actions, as a comma
+//!   hand menu's Console button hides the console before each page's button opens it anew. After the
+//!   last page the Console button shows the main page anew, B closes the hand menu, and the walk
+//!   opens the first game's Options and presses a change there in the same way. Then the console's
+//!   Back shows the main page, which is taller than the game's page, and the walk presses Options
+//!   again: the game's page shows again only if the console kept its middle as it grew. `scripted_actions` names actions, as a comma
 //!   list of their ids, that the walk presses too on the pages that have them, such as `log.watch`. `scripted_pages` names the pages to walk as a comma list of their ids.
 //!   Each press waits 1 s with the ray at rest, as the pointer smooths the
 //!   ray. The log names each aim and each choice ("scripted pages:"), and the host's app saves each
@@ -578,8 +579,7 @@ fn pages_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
     let hold_b = |script: ScriptedController| script.holding(Duration::from_millis(1200), ScriptedButtons { secondary: true, ..rest }).holding(Duration::from_millis(800), rest);
     // Each page: a hold of B opens the hand menu, its Console button hides the console that shows,
     // and the page's button opens the console anew there, at its place in front of the user. The
-    // first change of the page that restarts nothing is pressed. A console that grows while it shows
-    // does not keep its middle, so each page opens anew.
+    // first change of the page that restarts nothing is pressed.
     // `scripted_pages` names the pages to walk, as a comma list of their ids; all by default
     let wanted: Option<Vec<String>> = launch_args().string("scripted_pages").map(|list| list.split(',').map(|id| id.trim().to_string()).collect());
     let actions: Vec<String> = launch_args().string("scripted_actions").map(|list| list.split(',').map(|id| id.trim().to_string()).collect()).unwrap_or_default();
@@ -638,6 +638,12 @@ fn pages_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
             log::info!("scripted pages: on {game} the change {} at {target:?}", change.to_json());
             right = press(right, target);
         }
+        // Back grows the console to the main page. Its middle stays, so Options lies where the main
+        // page's rows put it.
+        let back = key_at(&Shown::Host(game.clone()), &Press::Back)?;
+        let again = key_at(&Shown::Main, &Press::Open(game.clone()))?;
+        log::info!("scripted pages: Back at {back:?}, then the options {game} again at {again:?}");
+        right = press(press(right, back), again);
     }
     Some(right.moving_to(Duration::from_millis(1), (at, away_from(at)), rest))
 }

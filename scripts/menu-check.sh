@@ -26,8 +26,8 @@ seconds=${4:-${default_seconds}} port=${5:-9961}
 root=${0:A:h:h}
 adb_cmd=(adb -s ${serial})
 mkdir -p ${work}/config
-# The standard mapping: a menu with no game and no entry in `controls`
-print '{"games": [], "fps": 120, "game_scale": 1.0, "msaa": 2, "controls": {}}' > ${work}/config/vr-menu.json
+# The standard mapping: a menu with no page and no entry in `controls`
+print '{"pages": [], "controls": {}}' > ${work}/config/vr-menu.json
 rm -f ${work}/input
 mkfifo ${work}/input
 # The host's input stays open for the run, so the host reads each line that the run writes

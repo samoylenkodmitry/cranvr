@@ -7,7 +7,9 @@
 # and the client's lines of the walk.
 #
 # Usage: scripts/pages-check.sh SERIAL WORKDIR [SECONDS] [PORT] [PAGES] [ACTIONS]
-#   SECONDS how long the run lasts (20 by default). Each page takes about 6 s.
+#   SECONDS how long the run lasts (20 by default). Each page takes about 6 s. Keep it below 26: on a
+#           desk the Quest sets its USB configuration again about 30 s after the start, which ends
+#           adb and the link before the window's presses.
 #   PORT    the test app's port (9961 by default)
 #   PAGES   the ids of the pages to walk as a comma list, such as connection,desktop (all by default)
 #   ACTIONS the ids of actions that the walk presses on those pages, such as log.watch (none by default)
