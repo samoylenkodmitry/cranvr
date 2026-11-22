@@ -69,7 +69,8 @@ pub fn text(controls: &Controls, present: [bool; 2], hands: bool, place: MenuPla
         Some(_) => "Point at the ball and pull the trigger".to_string(),
         // A palm turned to the eyes carries a ball, which the other hand's pinch presses
         None if hands => "Show a palm and pinch it with the other hand".to_string(),
-        None => "Open the menu from the cranvr app on the Mac".to_string(),
+        // No input: a look that rests on the ball below (see `gaze.rs`)
+        None => "Look down at this ball for a second".to_string(),
     }
 }
 
@@ -91,8 +92,8 @@ mod tests {
         assert_eq!(text(&none, [true, true], false, left, true), "Point at the ball and pull the trigger");
         assert_eq!(text(&none, [false, true], false, MenuPlace::View, true), "Point at the ball and pull the trigger");
         // No controller: the Mac
-        assert_eq!(text(&none, [false, false], false, MenuPlace::View, true), "Open the menu from the cranvr app on the Mac");
-        assert_eq!(text(&controls, [false, false], false, MenuPlace::View, true), "Open the menu from the cranvr app on the Mac");
+        assert_eq!(text(&none, [false, false], false, MenuPlace::View, true), "Look down at this ball for a second");
+        assert_eq!(text(&controls, [false, false], false, MenuPlace::View, true), "Look down at this ball for a second");
         // Hands without controllers: the palm
         assert_eq!(text(&none, [false, false], true, MenuPlace::View, true), "Show a palm and pinch it with the other hand");
         // A trigger that opens the menu has its side in the name

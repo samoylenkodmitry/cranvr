@@ -6,6 +6,7 @@
 # Usage: scripts/menu-check.sh SERIAL WORKDIR CASE [SECONDS] [PORT]
 #   CASE    right, left or both: the scripted controllers of `scripted_pointer=menu` (client/src/scripted.rs).
 #           palm: the scripted hands of `scripted_pointer=palm`.
+#           gaze: no controller and no hand (`scripted_pointer=none`), with the ball straight ahead.
 #           mac: no scripted press; the run writes `menu open` to the host's input after 8 s.
 #   SECONDS how long the run reads the log (18 by default, 22 for both)
 #   PORT    the test host's port (9961 by default)
@@ -42,6 +43,7 @@ extras=(--es host 127.0.0.1:${port} --ez connect true --ez usb_network false --e
 case ${case} in
     mac) ;;
     palm) extras+=(--es scripted_pointer palm) ;;
+    gaze) extras+=(--es scripted_pointer none --es gaze_pitch 0) ;;
     *) extras+=(--es scripted_pointer menu --es scripted_hands ${case}) ;;
 esac
 ${adb_cmd} shell am start -n dev.cranvr.client/dev.cranpose.android.CranposeActivity ${extras} > /dev/null

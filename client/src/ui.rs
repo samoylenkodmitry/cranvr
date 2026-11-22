@@ -110,7 +110,9 @@ pub fn ClientApp() {
     // An open palm that faces the eyes carries a ball (see `palm.rs`)
     let palm = rememberMutableStateOf(|| None);
     let hands_seen = rememberMutableStateOf(|| false);
-    let hand = HandState { layout, menu_open, place, present, hint, palm, hands: hands_seen, recenter: recenters };
+    let gaze = rememberMutableStateOf(|| false);
+    let looking = rememberMutableStateOf(|| false);
+    let hand = HandState { layout, menu_open, place, present, hint, palm, hands: hands_seen, gaze, looking, recenter: recenters };
     let opened = menu_open.get();
     LaunchedEffect(opened, async move |_| {
         if opened && hint.get_non_reactive() {
@@ -479,11 +481,13 @@ pub(crate) fn text_style(size: f32, color: Color, weight: Option<FontWeight>) ->
 /// loop once for each headset frame. It does no network call: the sender thread wakes and sends.
 #[composable]
 fn HeadsetFrames(hand: HandState) {
-    let HandState { menu_open, place, present, hint, palm, hands, .. } = hand;
+    let HandState { menu_open, place, present, hint, palm, hands, gaze, looking, .. } = hand;
     let reader = remember(|| Rc::new(RefCell::new(FrameReader::default()))).with(Clone::clone);
     let hold = remember(|| Rc::new(RefCell::new(PanelHold::default()))).with(Clone::clone);
     let placer = remember(|| Rc::new(RefCell::new(Placer::default()))).with(Clone::clone);
     let palms = remember(|| Rc::new(RefCell::new(PalmWatch::default()))).with(Clone::clone);
+    let dwell = remember(|| Rc::new(RefCell::new(crate::gaze::Dwell::default()))).with(Clone::clone);
+    let pitch = crate::gaze::pitch();
     SpatialFrameEffect(move |frame| {
         let now = now_ns();
         let mut read = reader.borrow_mut().read(frame, now);
@@ -518,6 +522,21 @@ fn HeadsetFrames(hand: HandState) {
                     log::info!("the left palm's pinch {} the hand menu", if open { "closes" } else { "opens" });
                     menu_open.set(!open);
                 }
+            }
+            // No controller and no hand: a look that rests on the ball below opens the menu
+            let no_input = placer.present() == [false; 2] && !tracked;
+            if no_input != gaze.get_non_reactive() {
+                log::info!("{}", if no_input { "no input is tracked: a look at the ball below opens the hand menu" } else { "an input is tracked again: the ball below goes" });
+                gaze.set(no_input);
+            }
+            let on_ball = no_input && frame.device_pose.is_some_and(|head| crate::gaze::looks_at(&head, pitch));
+            let mut dwell = dwell.borrow_mut();
+            if dwell.update(frame.predicted_display_time, on_ball) {
+                log::info!("a look of {} s on the ball {} the hand menu", crate::gaze::DWELL.as_secs(), if open { "closes" } else { "opens" });
+                menu_open.set(!open);
+            }
+            if dwell.resting() != looking.get_non_reactive() {
+                looking.set(dwell.resting());
             }
             let now_present = placer.present();
             let before = present.get_non_reactive();

@@ -40,6 +40,8 @@
 //!   ball with the point that it hit, so a run reads the panel's place in numbers. Launch it with
 //!   `default_places`, so the user's carries do not move the panels, and with a link to a host that
 //!   has the standard mapping.
+//! - `scripted_pointer=none` plays both controllers as missing, for the look that opens the menu
+//!   (`gaze.rs`). With `gaze_pitch=0` the ball stands straight ahead, where a headset on a desk looks.
 //! - `scripted_pointer=palm` plays two hands and no controller: the left hand holds its open palm
 //!   35 cm ahead of the eyes and 15 cm below them, turned to the eyes, and never pinches. The right
 //!   hand points at the ball that shows in front of that palm and pinches every 2 s, which opens and
@@ -81,6 +83,12 @@ pub fn install_once() {
         }
         if args.string("scripted_pointer") == Some("console") {
             pointing_at_console();
+            return;
+        }
+        if args.string("scripted_pointer") == Some("none") {
+            log::info!("scripted: both controllers are missing");
+            script_controller(missing(Hand::Left));
+            script_controller(missing(Hand::Right));
             return;
         }
         if args.string("scripted_pointer") == Some("palm") {
