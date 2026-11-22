@@ -330,6 +330,33 @@ fn libraries() -> Vec<PathBuf> {
     all
 }
 
+/// The Windows programs that a user may add as games: each program in the top folder of a game's
+/// folder in a Steam library or in `C:\Games`, which no game of `games` starts. Helpers such as
+/// crash reporters, uninstallers and setups stay out. At most `limit` programs, sorted by path. The
+/// headset lists them in place of a file chooser, which it does not have.
+pub fn found_programs(games: &[Game], limit: usize) -> Vec<PathBuf> {
+    let skip = ["crash", "unins", "setup", "redist", "vcredist", "dxsetup", "launcherhelper", "report", "helper", "installer"];
+    let mut roots: Vec<PathBuf> = libraries().into_iter().map(|library| library.join("common")).collect();
+    roots.push(prefix().join("drive_c/Games"));
+    let mut found = Vec::new();
+    for root in roots {
+        let Ok(folders) = fs::read_dir(&root) else { continue };
+        for folder in folders.flatten().map(|entry| entry.path()).filter(|path| path.is_dir()) {
+            let Ok(files) = fs::read_dir(&folder) else { continue };
+            for path in files.flatten().map(|entry| entry.path()) {
+                let name = path.file_name().map(|name| name.to_string_lossy().to_lowercase()).unwrap_or_default();
+                let known = games.iter().any(|game| game.exe.as_deref() == Some(path.as_path()));
+                if name.ends_with(".exe") && path.is_file() && !known && !skip.iter().any(|word| name.contains(word)) {
+                    found.push(path);
+                }
+            }
+        }
+    }
+    found.sort();
+    found.truncate(limit);
+    found
+}
+
 /// C:\... is inside the prefix; Z:\ is the Mac's root.
 fn windows_to_mac(path: &str) -> Option<PathBuf> {
     let (drive, rest) = path.split_once(":\\").or_else(|| path.split_once(':'))?;

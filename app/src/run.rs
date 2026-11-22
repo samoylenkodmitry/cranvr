@@ -81,6 +81,19 @@ pub fn act(settings: &mut Settings, model: &mut Model, request: &Request) {
             }
             Effect::AskPermission(permission) => permission.request(),
             Effect::ToHeadset(request) => backend::send_headset_request(&request),
+            Effect::AddProgram(path) => {
+                let result = steam::add_game(settings, &path, &steam::steam_games());
+                match result {
+                    Ok(()) => {
+                        settings.save();
+                        model.games = steam::games();
+                        model.found_programs = steam::found_programs(&model.games, crate::pages::FOUND_PROGRAMS);
+                    }
+                    Err(e) => model.note_message(e),
+                }
+            }
+            Effect::RunProgram(path) => backend::choose(backend::Chosen::Run(path)),
+            Effect::WatchLog => model.log_until = Some(Instant::now() + crate::pages::LOG_TIME),
             Effect::PermissionSettings(permission) => permission.open_settings(),
             Effect::OpenSteam => {
                 // Steam may need seconds to start: keep the window responsive
@@ -130,6 +143,10 @@ pub fn tick(settings: &mut Settings, model: &mut Model, slow: bool) {
         model.steam_signed_in = steam::signed_in();
         model.games = steam::games();
         model.learned_sizes = backend::learned_game_sizes();
+        model.found_programs = steam::found_programs(&model.games, crate::pages::FOUND_PROGRAMS);
+    }
+    if model.log_until.is_some_and(|until| until <= Instant::now()) {
+        model.log_until = None;
     }
     if model.notice.as_ref().is_some_and(|(_, until)| *until <= Instant::now()) {
         model.notice = None;
