@@ -49,14 +49,10 @@ pub use wire::{Error, Nanos};
 /// change of the wire format or of a message raises it. Both ends are one project and ship from one
 /// commit, so the version tells that they do.
 ///
-/// Version 9 has the displays of the Mac: the client adds and removes displays and asks for the
-/// video of each (`ClientMsg::Display`, `ClientMsg::DisplayWish`), the host lists them and sends
-/// each one's stream parameters (`HostMsg::Displays`, `HostMsg::DisplayStream`) and the cursor of
-/// each (`HostDatagram::DisplayCursor`), the client sends the mouse of each display
-/// (`ClientDatagram::DisplayMouse`), the host says whether a game runs (`HostMsg::GameRuns`), and the
-/// client sends the controllers' input together with the hands that it holds back from the game
-/// (`ClientDatagram::InputHold`). The first display has no messages of its own.
-pub const PROTOCOL_VERSION: u16 = 9;
+/// Version 10 says in the client's capabilities whether the link runs over a USB cable
+/// (`ClientCaps::cable`). The headset's USB network carries UDP, so a TCP-only path no longer
+/// stands for the cable.
+pub const PROTOCOL_VERSION: u16 = 10;
 
 /// The largest datagram, in bytes, sealed: the counter and the tag are in it. A media packet and
 /// any datagram message fit in it. A typical path MTU of 1500 bytes minus the IP and UDP headers

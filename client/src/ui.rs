@@ -635,11 +635,13 @@ fn HostList(found: Vec<Line>, address: TextFieldState) {
     }
 }
 
-/// The Mac behind the USB cable. The cable needs no code, because the Mac trusts a headset on its
-/// own cable.
+/// The Mac behind the USB cable. `adb reverse` needs no code, because the Mac trusts a headset that
+/// reaches it from its own address. On the USB network the Mac asks once for a headset that it does
+/// not know, as over Wi-Fi.
 #[composable]
 fn CableButton(mac: UsbMac) {
     let host = mac.as_found();
+    let detail = if mac.needs_code() { "The Mac shows a code the first time" } else { "No code needed" };
     if let Some(advice) = host.update_advice() {
         Column(
             Modifier::empty().fill_max_width().background(KEY_COLOR).rounded_corners(16.0).padding_symmetric(28.0, 18.0),
@@ -658,7 +660,7 @@ fn CableButton(mac: UsbMac) {
         move || {
             Column(Modifier::empty(), ColumnSpec::default(), move || {
                 Text(CABLE_NAME, Modifier::empty(), text_style(32.0, TEXT_COLOR, Some(FontWeight::BOLD)));
-                Text("No code needed", Modifier::empty(), text_style(20.0, TEXT_COLOR, None));
+                Text(detail, Modifier::empty(), text_style(20.0, TEXT_COLOR, None));
             });
         },
     );

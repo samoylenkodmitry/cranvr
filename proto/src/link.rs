@@ -21,13 +21,13 @@ use crate::{
     MTU, PROTOCOL_VERSION,
 };
 use serde::{de::DeserializeOwned, Serialize};
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use std::{
     collections::hash_map::RandomState,
     hash::{BuildHasher, Hasher},
     io::{self, Read, Write},
     marker::PhantomData,
-    net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket},
+    net::{Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex,
@@ -337,14 +337,35 @@ impl<S: Side> Duplex<S> {
     }
 }
 
-/// A UDP socket with large buffers and a read timeout.
-fn udp_socket(bind: SocketAddr) -> io::Result<UdpSocket> {
-    let socket = Socket::new(Domain::for_address(bind), Type::DGRAM, Some(Protocol::UDP))?;
+/// How a client opens its sockets. [`AnyRoute`] lets the system choose the route. A link over one
+/// network, such as a headset's USB network to the Mac, opens its sockets on that network.
+pub trait Route {
+    /// A TCP connection to `host`. `timeout` bounds the connect.
+    fn connect_tcp(&self, host: SocketAddr, timeout: Duration) -> io::Result<TcpStream>;
+    /// A UDP socket bound to `local`
+    fn bind_udp(&self, local: SocketAddr) -> io::Result<UdpSocket>;
+}
+
+/// The route that the system chooses for each socket.
+pub struct AnyRoute;
+
+impl Route for AnyRoute {
+    fn connect_tcp(&self, host: SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+        TcpStream::connect_timeout(&host, timeout)
+    }
+
+    fn bind_udp(&self, local: SocketAddr) -> io::Result<UdpSocket> {
+        UdpSocket::bind(local)
+    }
+}
+
+/// A UDP socket from `route` with large buffers and a read timeout.
+fn udp_socket(route: &dyn Route, bind: SocketAddr) -> io::Result<UdpSocket> {
+    let udp = route.bind_udp(bind)?;
+    let socket = SockRef::from(&udp);
     // A system may cap the size or refuse it. The default size still works.
     socket.set_recv_buffer_size(SOCKET_BUFFER).ok();
     socket.set_send_buffer_size(SOCKET_BUFFER).ok();
-    socket.bind(&bind.into())?;
-    let udp: UdpSocket = socket.into();
     udp.set_read_timeout(Some(UDP_POLL))?;
     Ok(udp)
 }
@@ -428,6 +449,18 @@ impl HostListener {
     /// it paired with.
     pub fn bind(addr: impl ToSocketAddrs, identity: Identity) -> Result<Self, Error> {
         Ok(Self { listener: TcpListener::bind(addr)?, identity })
+    }
+
+    /// Listens on `port` on every IPv6 address, beside a listener of [`HostListener::bind`] on the
+    /// same port for IPv4. A headset's USB network to the Mac reaches the host here.
+    pub fn bind_ipv6(port: u16, identity: Identity) -> Result<Self, Error> {
+        let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+        // macOS makes an IPv6 socket take IPv4 too, which the IPv4 listener's port refuses
+        socket.set_only_v6(true)?;
+        socket.set_reuse_address(true)?;
+        socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
+        socket.listen(128)?;
+        Ok(Self { listener: socket.into(), identity })
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, Error> {
@@ -529,7 +562,10 @@ impl Pending {
                 if shard_len + crate::media::HEADER_LEN + OVERHEAD > MTU {
                     return Err(Error::TooLarge(shard_len + crate::media::HEADER_LEN + OVERHEAD));
                 }
-                Some(udp_socket(SocketAddr::new(self.tcp.local_addr()?.ip(), 0))?)
+                // The TCP connection's own address keeps the scope of an IPv6 link-local one
+                let mut local = self.tcp.local_addr()?;
+                local.set_port(0);
+                Some(udp_socket(&AnyRoute, local)?)
             }
             MediaMode::Tcp => None,
         };
@@ -639,7 +675,12 @@ pub struct HostProbe {
 /// accepts the connection whether or not a host runs on the Mac, so only bytes from the host prove
 /// that it is there. `timeout` bounds each step.
 pub fn probe_host(host: SocketAddr, timeout: Duration) -> Result<HostProbe, Error> {
-    let mut tcp = TcpStream::connect_timeout(&host, timeout)?;
+    probe_host_via(&AnyRoute, host, timeout)
+}
+
+/// [`probe_host`] with the connection from `route`.
+pub fn probe_host_via(route: &dyn Route, host: SocketAddr, timeout: Duration) -> Result<HostProbe, Error> {
+    let mut tcp = route.connect_tcp(host, timeout)?;
     tcp.set_nodelay(true)?;
     tcp.set_read_timeout(Some(timeout))?;
     tcp.set_write_timeout(Some(timeout))?;
@@ -698,7 +739,20 @@ impl ClientLink {
         timeout: Duration,
         observer: &mut dyn ConnectObserver,
     ) -> Result<Self, Error> {
-        let mut tcp = TcpStream::connect_timeout(&host, timeout)?;
+        Self::connect_via(&AnyRoute, host, caps, identity, expected_host, timeout, observer)
+    }
+
+    /// [`ClientLink::connect_with`] with the sockets from `route`.
+    pub fn connect_via(
+        route: &dyn Route,
+        host: SocketAddr,
+        caps: &ClientCaps,
+        identity: &Identity,
+        expected_host: Option<[u8; KEY_LEN]>,
+        timeout: Duration,
+        observer: &mut dyn ConnectObserver,
+    ) -> Result<Self, Error> {
+        let mut tcp = route.connect_tcp(host, timeout)?;
         tcp.set_nodelay(true)?;
         tcp.set_read_timeout(Some(timeout))?;
         tcp.set_write_timeout(Some(timeout))?;
@@ -761,8 +815,11 @@ impl ClientLink {
         let udp = match welcome.media {
             MediaPlan::Udp { port } => {
                 let bind: SocketAddr = if host.is_ipv4() { ([0, 0, 0, 0], 0).into() } else { ([0u16; 8], 0).into() };
-                let udp = udp_socket(bind)?;
-                udp.connect(SocketAddr::new(host.ip(), port))?;
+                let udp = udp_socket(route, bind)?;
+                // The host's address keeps the scope of an IPv6 link-local one
+                let mut media = host;
+                media.set_port(port);
+                udp.connect(media)?;
                 Some(udp)
             }
             MediaPlan::Tcp => None,

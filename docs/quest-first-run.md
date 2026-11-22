@@ -27,7 +27,13 @@ This list covers a first run with cranvr's Cranpose client on a Quest.
 
 ## The USB cable
 
-A headset that sits on a USB cable at the Mac connects over the cable without a typed address. The cable gives the stream TCP and a steady link. It needs no Wi-Fi. This is how it goes:
+A headset that sits on a USB cable at the Mac connects over the cable without a typed address. It needs no Wi-Fi. The headset's USB network needs no Developer Mode:
+
+1. Plug the headset into the Mac and open the cranvr app in the headset. The headset switches its USB functions to a network over the cable.
+2. The first time, macOS asks "Allow accessory to connect?". Click Allow. macOS remembers the answer for the headset.
+3. The connect panel in the headset lists "This Mac by USB cable" first. Press it. A headset that the Mac does not know shows a code once, as over Wi-Fi. Allow it on the Mac. The Mac window then says "Connected by USB cable".
+
+With Developer Mode on, `adb reverse` runs over the same cable too. The headset prefers its USB network when both answer. This is how `adb reverse` goes:
 
 1. Developer mode must be on for the headset (see "On the Quest"). Plug the headset into the Mac. The headset asks to allow USB debugging: allow it. Until then the Headset card in the Mac window says "Put on the headset and allow USB debugging."
 2. The Mac looks for the adb tool of Android (the PATH, Android Studio's SDK, Homebrew's android-platform-tools). A Mac with none shows the button "Add USB support" in the Settings tab, under Connection. The button downloads Google's Android platform-tools for macOS (about 16 MB) from dl.google.com into cranvr's folder. A Mac that has a headset on the cable but no cranvr app on it does nothing: the Mac counts a device only when `dev.cranvr.client` is installed on it.

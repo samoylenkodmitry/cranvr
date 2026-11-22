@@ -527,3 +527,42 @@ fn a_probe_of_a_port_that_accepts_and_says_nothing_fails() {
     let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
     assert!(probe_host(unused, Duration::from_millis(200)).is_err());
 }
+
+// The headset's USB network has link-local addresses only. The host's IPv6 listener takes the
+// connection, and the media's UDP socket of each side keeps the link as its scope. macOS's loopback
+// has the link-local address fe80::1 on interface 1.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_session_over_a_link_local_address_carries_udp_media() {
+    use std::net::{Ipv6Addr, SocketAddrV6};
+    let listener = HostListener::bind_ipv6(0, host_identity()).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let host = thread::spawn(move || {
+        let pending = listener.accept().unwrap();
+        let stream = negotiate(&wishes(), &pending.caps).unwrap();
+        (pending.peer, pending.accept(stream, MediaMode::Udp, DEFAULT_SHARD_LEN).unwrap())
+    });
+    let address = SocketAddrV6::new(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1), port, 0, 1);
+    let client = ClientLink::connect(address.into(), &caps(), &identity(), None, WAIT).unwrap();
+    let (peer, host) = host.join().unwrap();
+    assert!(matches!(peer, std::net::SocketAddr::V6(peer) if peer.scope_id() == 1), "{peer}");
+    assert!(host.duplex.has_udp() && client.duplex.has_udp());
+    let client = Arc::new(client);
+    let (to_test, inbox) = mpsc::channel();
+    let c = Arc::clone(&client);
+    thread::spawn(move || {
+        let mut receiver = FrameReceiver::new();
+        c.duplex.read_udp(|m| {
+            if let Incoming::Media(packet) = m {
+                if let Some(r) = receiver.push(packet, 1).unwrap() {
+                    to_test.send((r.meta.frame, r.payload().to_vec())).unwrap();
+                }
+            }
+        })
+    });
+    let payload = Rng(4).bytes(40_000);
+    host.send_unit(&meta(7), &payload, &ParityController::new(0.0, 0.0)).unwrap();
+    assert_eq!(inbox.recv_timeout(WAIT).unwrap(), (7, payload));
+    host.duplex.close();
+    client.duplex.close();
+}

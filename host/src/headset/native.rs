@@ -196,6 +196,18 @@ pub fn start(config: Config) -> std::io::Result<(Arc<dyn Headset>, Box<dyn Event
     let listener = HostListener::bind(address, config.identity.clone()).map_err(|e| std::io::Error::other(e.to_string()))?;
     info!("Native protocol: this host's key starts with {}", to_hex(&config.identity.public_key()[..8]));
     info!("Native protocol: listening on {address}");
+    // A headset's USB network to this Mac has IPv6 link-local addresses only. Without this
+    // listener the headset still reaches the host over Wi-Fi and `adb reverse`.
+    let cable_listener = match HostListener::bind_ipv6(config.port, config.identity.clone()) {
+        Ok(listener) => {
+            info!("Native protocol: listening on [::]:{} for a headset's USB network", config.port);
+            Some(listener)
+        }
+        Err(e) => {
+            warn!("Native protocol: no IPv6 listener on port {}: {e}. A headset's USB network cannot reach this host.", config.port);
+            None
+        }
+    };
     if let Some(port) = config.discovery_port {
         start_discovery(port, &config);
     }
@@ -205,6 +217,10 @@ pub fn start(config: Config) -> std::io::Result<(Arc<dyn Headset>, Box<dyn Event
     {
         let shared = Arc::clone(&shared);
         let config = Arc::new(config);
+        if let Some(listener) = cable_listener {
+            let (config, shared) = (Arc::clone(&config), Arc::clone(&shared));
+            thread::Builder::new().name("native-accept-ipv6".into()).spawn(move || accept_loop(listener, config, shared))?;
+        }
         thread::Builder::new().name("native-accept".into()).spawn(move || accept_loop(listener, config, shared))?;
     }
     Ok((Arc::new(Native { shared }), Box::new(Events(receiver))))
@@ -222,6 +238,10 @@ fn start_discovery(port: u16, config: &Config) {
             return;
         }
     };
+    // The headset asks for the Mac on its USB network by IPv6 multicast to every node on the cable
+    let cable_responder = discovery::Responder::bind_ipv6(port)
+        .inspect_err(|e| warn!("Native protocol: no IPv6 discovery on UDP port {port}: {e}. A headset's USB network does not find this Mac."))
+        .ok();
     let answer = discovery::Answer {
         version: PROTOCOL_VERSION,
         port: config.port,
@@ -230,6 +250,10 @@ fn start_discovery(port: u16, config: &Config) {
         name: config.name.clone(),
     };
     info!("Native protocol: answering discovery queries on UDP port {port} as \"{}\"", clean_name(&config.name));
+    if let Some(cable_responder) = cable_responder {
+        let answer = answer.clone();
+        thread::Builder::new().name("native-discovery-ipv6".into()).spawn(move || cable_responder.run(&NEVER, &answer)).ok();
+    }
     thread::Builder::new().name("native-discovery".into()).spawn(move || responder.run(&NEVER, &answer)).ok();
 }
 
@@ -428,7 +452,7 @@ fn start_session(config: &Config, shared: &Arc<Shared>, pending: Pending, name: 
     } else {
         (MediaMode::Udp, DEFAULT_SHARD_LEN)
     };
-    let (peer, caps_views, cable) = (pending.peer, pending.caps.views, pending.caps.tcp_only);
+    let (peer, caps_views, cable) = (pending.peer, pending.caps.views, pending.caps.cable);
     let link = match pending.accept(stream.clone(), mode, shard_len) {
         Ok(link) => link,
         Err(e) => {
@@ -460,7 +484,7 @@ fn run_session(shared: &Shared, session: &Arc<Session>, stream: cranvr_proto::me
         foveated: stream.foveation.is_some(),
         foveation: stream.foveation.map(FoveationConfig::from).unwrap_or_default(),
     };
-    shared.emit(Event::Connected { stream: negotiated, ip: peer.ip() });
+    shared.emit(Event::Connected { stream: negotiated, ip: peer.ip(), cable: session.cable });
     shared.emit(Event::Views(views_config(&views)));
     if let Some(config) = shared.decoder_config.lock().unwrap().clone() {
         session.send_decoder_config(config);

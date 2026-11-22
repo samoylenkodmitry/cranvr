@@ -97,6 +97,7 @@ The launch arguments are intent extras on Android (`adb shell am start -n dev.cr
 | `shown`, `pinned` | A test's panels (`display1,stats`) and the display on the hand (`pinned=2`). They show in the room and in every game, and nothing is saved. |
 | `forget_host_key` | A comma list of addresses with their ports, such as `192.168.1.20:9961,192.168.1.20:9962`: the headset forgets the key of each host at launch. A test that connected to a test host on a network address leaves its key behind, and the headset then refuses the next host on that address. |
 | `usb_port` | The port that the headset asks on the USB cable, for a test host on another port. |
+| `usb_network` | `false`: the headset does not ask for its USB network for this launch, so its USB functions stay as they are. A test of `adb reverse` needs it, because the switch to the USB network cuts adb for a moment. |
 | `desktop`, `desktop_width`, `cursor`, `desktop_pointer_test` | The desktop panel: `desktop false` asks for none, `desktop_width` is the widest picture to ask for. |
 
 The client's modules: `connection.rs` runs the link on its own threads. `hub.rs` hands the numbers to the UI. `tracking.rs` turns Cranpose's `XrFrame` into the protocol's messages. `focus.rs` and `hands.rs` hold the rules for the input focus and for the user's hands. `ui.rs` holds the panels, `console.rs` and `console_panel.rs` the console, `displays.rs` the Mac's displays (their streams, decoders and wishes), `display_panel.rs` their panels, `display_wish.rs` what each asks of the host, `hand_menu.rs` and `menu_model.rs` the hand menu, `panel_layout.rs` which panels show and the ranks of their layers, `hold.rs` and `hover.rs` the hands that a panel holds back from the game, `audio.rs` the sound, `usb.rs` the cable and `phone.rs` the phone mode.
@@ -308,7 +309,24 @@ The protocol has one version, `PROTOCOL_VERSION` in `proto/src/lib.rs`. cranvr h
 
 ## The USB cable
 
-A headset on a USB cable at the Mac connects over the cable without a typed address. The cable gives the stream TCP and a steady link. The Mac looks for the adb tool (the PATH, Android Studio's SDK, Homebrew's android-platform-tools). A Mac with none shows "Add USB support" in the Settings tab, which downloads Google's platform-tools into cranvr's folder. The Mac counts a device only when `dev.cranvr.client` or the phone build is installed on it. The app then sets up `adb reverse` for the host's port. The headset lists "This Mac by USB cable" first (`app/src/usb.rs`, `client/src/usb.rs`, `cranvr_proto::link::probe_host`). The Settings tab has a Connection choice: Automatic, Wi-Fi or USB cable. When the cable comes out, the headset connects to the same Mac over Wi-Fi by itself after about three seconds. A Wi-Fi link never moves to the cable while it runs.
+A headset on a USB cable at the Mac connects over the cable without a typed address. Two ways run over the cable. The headset's USB network needs no Developer Mode. `adb reverse` needs Developer Mode. The headset prefers the USB network when both answer.
+
+**The USB network** (`client/src/usb_network.rs`). The headset app asks Horizon OS for a network of the USB transport without the internet (Cranpose's `request_network`). The headset then switches its USB functions to NCM (2833:5013 becomes 2833:5018; adb stays in the new functions). macOS makes an interface for it, such as `en10`, with an IPv6 link-local address. The headset sends the discovery query to `ff02::1` on its interface `usb0`. The host answers from its IPv6 responder, which joins no multicast group: macOS hands every datagram of its port to such a socket, also on an interface that appears after the host started. The host listens on `[::]:PORT` beside `0.0.0.0:PORT`. The headset binds its sockets to the network and connects to the Mac's link-local address with its scope. The media goes over UDP with parity. The client tells the host in its capabilities that the link runs over the cable (`ClientCaps::cable`, protocol version 10), so the host sends at the cable's bitrate. A headset that the Mac does not know pairs with a code once, as over Wi-Fi, because the Mac cannot tell a link-local peer on a cable from one on another network. The headset asks while it has the focus. Horizon OS keeps a released network for about 30 s before it switches the USB functions back. The first time, macOS asks "Allow accessory to connect?" for the new USB functions. The link waits for that answer. `--ez usb_network false` keeps the USB functions as they are for one launch.
+
+Measured on a Quest 3 with a USB 2 cable (480 Mbps, `scripts/e2e.sh --quest SERIAL --cable usb-network|adb --native-port 9961 --seconds 30`, the host's test scene at 120 Hz, two runs of each way in turn):
+
+| | USB network | `adb reverse` |
+|---|---|---|
+| fps (median) | 119.99, 119.96 | 119.87, 119.98 |
+| late frames (median) | 0.17 %, 0.33 % | 2.33 %, 0.17 % |
+| pose to display (median) | 32.9 ms, 33.0 ms | 34.2 ms, 33.0 ms |
+| network time (median) | 1.23 ms, 1.20 ms | 1.96 ms, 1.96 ms |
+| sent (median) | 34.6 Mbps, 33.6 Mbps (16 to 19 % of it parity) | 28.2 Mbps, 28.2 Mbps |
+| media | UDP | TCP |
+
+Both ways hold 120 fps. The USB network saves about 0.7 ms of network time. The late frames and the time from the pose to the display differ within the noise of two runs. A probe of the link moved 324 to 326 Mbps from the Mac to the headset over TCP.
+
+**`adb reverse`.** The cable gives the stream TCP and a steady link. The Mac looks for the adb tool (the PATH, Android Studio's SDK, Homebrew's android-platform-tools). A Mac with none shows "Add USB support" in the Settings tab, which downloads Google's platform-tools into cranvr's folder. The Mac counts a device only when `dev.cranvr.client` or the phone build is installed on it. The app then sets up `adb reverse` for the host's port. The headset lists "This Mac by USB cable" first (`app/src/usb.rs`, `client/src/usb.rs`, `cranvr_proto::link::probe_host`). The Settings tab has a Connection choice: Automatic, Wi-Fi or USB cable. When the cable comes out, the headset connects to the same Mac over Wi-Fi by itself after about three seconds. A Wi-Fi link never moves to the cable while it runs.
 
 ## The sealed session
 

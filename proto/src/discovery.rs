@@ -18,6 +18,11 @@
 //! listens for answers to the queries that it sent, never for broadcasts, so it needs neither a
 //! multicast lock on Android nor a permission beyond the network. Several hosts on one Mac share
 //! the port ([`Responder::bind`] sets `SO_REUSEPORT`), so each of them hears a broadcast.
+//!
+//! A headset's USB network to the Mac has IPv6 link-local addresses only. There the client sends
+//! the same query to `ff02::1`, the group of every node on the cable's link, and the host's IPv6
+//! responder ([`Responder::bind_ipv6`]) answers from its link-local address. The answer's sender
+//! keeps the cable's interface as its scope, so the client connects over the cable.
 
 use crate::{
     identity::{random_bytes, FINGERPRINT_LEN},
@@ -26,7 +31,7 @@ use crate::{
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     io,
-    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
@@ -149,14 +154,33 @@ pub struct Responder {
 }
 
 impl Responder {
-    /// Listens for queries on `port` on every address. Another responder on the same port, such as
-    /// a second host on this Mac, may share it. Port 0 picks a free one, for tests.
+    /// Listens for queries on `port` on every IPv4 address. Another responder on the same port, such
+    /// as a second host on this Mac, may share it. Port 0 picks a free one, for tests.
     pub fn bind(port: u16) -> io::Result<Self> {
-        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        Self::bind_at(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
+    }
+
+    /// Listens for queries on `port` on every IPv6 address, beside the IPv4 responder of
+    /// [`Responder::bind`]. It hears a query to `ff02::1` on every interface, also on one that
+    /// appears after the start, such as a headset's USB network.
+    ///
+    /// The socket joins no multicast group: macOS hands every datagram for its port to a socket that
+    /// joined none. A socket that joined the group on some interfaces gets the group's datagrams from
+    /// those interfaces only. Every IPv6 interface is in `ff02::1` by itself.
+    pub fn bind_ipv6(port: u16) -> io::Result<Self> {
+        Self::bind_at(SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)))
+    }
+
+    fn bind_at(address: SocketAddr) -> io::Result<Self> {
+        let socket = Socket::new(Domain::for_address(address), Type::DGRAM, Some(Protocol::UDP))?;
         socket.set_reuse_address(true)?;
         #[cfg(unix)]
         socket.set_reuse_port(true)?;
-        socket.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())?;
+        if address.is_ipv6() {
+            // The IPv4 responder holds the same port: this one takes IPv6 only
+            socket.set_only_v6(true)?;
+        }
+        socket.bind(&address.into())?;
         let socket: UdpSocket = socket.into();
         socket.set_read_timeout(Some(Duration::from_millis(200)))?;
         Ok(Self { socket })
@@ -184,15 +208,18 @@ impl Responder {
 /// A host that answered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Found {
-    /// The address that the answer came from. The client connects to it.
-    pub address: IpAddr,
+    /// The address that the answer came from. The client connects to its address. An IPv6
+    /// link-local sender keeps its interface as the scope.
+    pub from: SocketAddr,
     pub answer: Answer,
 }
 
 impl Found {
-    /// The address and port to connect to
+    /// The address and port to connect to: the sender's address, with its scope, at the answer's port
     pub fn socket_addr(&self) -> SocketAddr {
-        SocketAddr::new(self.address, self.answer.port)
+        let mut address = self.from;
+        address.set_port(self.answer.port);
+        address
     }
 }
 
@@ -208,6 +235,12 @@ impl Finder {
     pub fn new(targets: Vec<SocketAddr>) -> io::Result<Self> {
         let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
         socket.set_broadcast(true)?;
+        Self::on(socket, targets)
+    }
+
+    /// A finder that asks each of `targets` from `socket`, such as a socket that the headset's USB
+    /// network made, which reaches the cable's link only.
+    pub fn on(socket: UdpSocket, targets: Vec<SocketAddr>) -> io::Result<Self> {
         let nonce = u64::from_le_bytes(random_bytes()?[..8].try_into().expect("eight bytes"));
         Ok(Self { socket, nonce, targets })
     }
@@ -235,7 +268,7 @@ impl Finder {
             self.socket.set_read_timeout(Some(left)).ok()?;
             let Ok((n, from)) = self.socket.recv_from(&mut buf) else { return None };
             if let Some(answer) = Answer::parse(&buf[..n]).filter(|answer| answer.nonce == self.nonce) {
-                return Some(Found { address: from.ip(), answer });
+                return Some(Found { from, answer });
             }
         }
     }
@@ -267,19 +300,23 @@ fn own_address() -> Option<IpAddr> {
 /// Asks `targets` for `wait`, repeating the query, and returns the hosts that answered, each once
 /// by address and port.
 pub fn find(targets: Vec<SocketAddr>, wait: Duration) -> io::Result<Vec<Found>> {
-    let finder = Finder::new(targets)?;
+    Ok(find_with(&Finder::new(targets)?, wait))
+}
+
+/// Asks with `finder` for `wait` as [`find`] does.
+pub fn find_with(finder: &Finder, wait: Duration) -> Vec<Found> {
     let deadline = Instant::now() + wait;
     let mut found: Vec<Found> = Vec::new();
     while Instant::now() < deadline {
         finder.ask();
         let round = Instant::now() + ASK_EVERY;
         while let Some(host) = finder.receive(round.saturating_duration_since(Instant::now())) {
-            if !found.iter().any(|known| known.address == host.address && known.answer.port == host.answer.port) {
+            if !found.iter().any(|known| known.socket_addr() == host.socket_addr()) {
                 found.push(host);
             }
         }
     }
-    Ok(found)
+    found
 }
 
 #[cfg(test)]

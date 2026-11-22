@@ -22,6 +22,7 @@ fn caps(name: &str) -> ClientCaps {
         decoders: 1,
         foveation: true,
         tcp_only: false,
+        cable: false,
     }
 }
 
@@ -269,10 +270,11 @@ fn a_native_client_connects_and_the_host_serves_it() {
     let client = ClientLink::connect(([127, 0, 0, 1], port).into(), &caps("Test headset"), &identity(), None, Duration::from_secs(10)).unwrap();
     let client = Arc::new(client);
 
-    let Event::Connected { stream, ip } = wait_for(&mut *events, |e| matches!(e, Event::Connected { .. })) else { unreachable!() };
+    let Event::Connected { stream, ip, cable } = wait_for(&mut *events, |e| matches!(e, Event::Connected { .. })) else { unreachable!() };
     assert_eq!((stream.eye_width, stream.eye_height, stream.fps), (2064, 2208, 120.0));
     assert!(stream.foveated && stream.codec == Codec::Hevc);
     assert_eq!(ip, std::net::IpAddr::from([127, 0, 0, 1]));
+    assert!(!cable, "the client said that it is not on a cable");
     let Event::Views(views) = wait_for(&mut *events, |e| matches!(e, Event::Views(_))) else { unreachable!() };
     assert!((views.fov[0].left + 0.9).abs() < 1e-6);
 
@@ -698,6 +700,27 @@ fn a_headset_on_this_mac_needs_no_approval() {
     // `config` does not ask about loopback clients: a USB link and a flat window need no approval
     let client = ClientLink::connect(addr, &caps("USB headset"), &identity(), None, Duration::from_secs(10)).unwrap();
     wait_for(&mut *events, |e| matches!(e, Event::Connected { .. }));
+    client.duplex.close();
+}
+
+// A headset's USB network to the Mac has IPv6 link-local addresses only. The host takes the
+// connection on its IPv6 listener, sends the media over UDP and reports the cable that the client
+// names. macOS's loopback has the link-local address fe80::1 on interface 1.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_headset_on_its_usb_network_reaches_the_host_by_a_link_local_address() {
+    let port = free_port();
+    let mut config = config(port);
+    config.trust_all = true;
+    let (_headset, mut events) = start(config).unwrap();
+    let link_local = std::net::SocketAddrV6::new(std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1), port, 0, 1);
+    let mut cabled = caps("Cabled headset");
+    cabled.cable = true;
+    let client = ClientLink::connect(link_local.into(), &cabled, &identity(), None, Duration::from_secs(10)).unwrap();
+    let Event::Connected { ip, cable, .. } = wait_for(&mut *events, |e| matches!(e, Event::Connected { .. })) else { unreachable!() };
+    assert!(matches!(ip, std::net::IpAddr::V6(ip) if ip.is_unicast_link_local()), "{ip}");
+    assert!(cable);
+    assert!(client.duplex.has_udp(), "the USB network carries the media over UDP");
     client.duplex.close();
 }
 

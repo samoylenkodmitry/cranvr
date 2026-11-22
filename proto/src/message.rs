@@ -86,6 +86,9 @@ pub struct ClientCaps {
     /// The client reaches the host through a TCP-only path, such as `adb reverse` over USB. The
     /// host then sends the media over TCP.
     pub tcp_only: bool,
+    /// The link runs over a USB cable: `adb reverse` or the headset's USB network to the Mac. The
+    /// host then sends at the cable's bitrate.
+    pub cable: bool,
 }
 
 /// The two eyes' field of view and their place relative to the head.

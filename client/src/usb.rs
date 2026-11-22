@@ -1,6 +1,9 @@
-//! The cable to the Mac. The Mac's cranvr app sets up `adb reverse` for a plugged-in headset, so
-//! the Mac's port answers on the headset's own address 127.0.0.1. A thread asks that address while
-//! no link runs. When the Mac answers, the connect panel lists "This Mac by USB cable" first.
+//! The cable to the Mac. Two ways run over it. The headset's USB network (`usb_network.rs`) needs
+//! no Developer Mode: the Mac answers on its link-local address on the cable's link. `adb reverse`
+//! needs Developer Mode: the Mac's cranvr app sets it up for a plugged-in headset, so the Mac's port
+//! answers on the headset's own address 127.0.0.1. A thread asks both while no link runs. The USB
+//! network wins when both answer, because it needs no adb and carries UDP. When the Mac answers,
+//! the connect panel lists "This Mac by USB cable" first.
 //!
 //! An `adb reverse` listener accepts every connection, also when no host runs on the Mac. Only
 //! bytes from the host prove that it is there, so the question is the first part of the handshake
@@ -12,12 +15,16 @@
 //! link that streamed has ended. A cable is preferred to the Wi-Fi entry of the same Mac. A running
 //! Wi-Fi link never moves to the cable: nothing here looks at a link that runs.
 
-use crate::{discovery::FoundHost, hub::Hub};
+use crate::{
+    discovery::FoundHost,
+    hub::Hub,
+    usb_network::{self, NetworkRoute},
+};
 use cranpose::launch_args;
 use cranvr_proto::{
     discovery::DEFAULT_PORT,
     identity::{fingerprint, FINGERPRINT_LEN, KEY_LEN},
-    link::probe_host,
+    link::{probe_host, probe_host_via, AnyRoute, Route},
 };
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -46,6 +53,15 @@ pub fn address() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port())
 }
 
+/// The way over the cable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Way {
+    /// The headset's USB network: the Mac's link-local address on the cable's link
+    UsbNetwork,
+    /// `adb reverse`: the Mac's port on the headset's own address
+    AdbReverse,
+}
+
 /// A Mac that answered through the cable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UsbMac {
@@ -53,12 +69,20 @@ pub struct UsbMac {
     /// The Mac's key. `None` when the host speaks another protocol version than this app.
     pub key: Option<[u8; KEY_LEN]>,
     pub version: u16,
+    pub way: Way,
 }
 
 impl UsbMac {
     /// The start of the hash of the host's key, when the host showed its key
     pub fn fingerprint(&self) -> Option<[u8; FINGERPRINT_LEN]> {
         self.key.map(|key| fingerprint(&key))
+    }
+
+    /// Whether the Mac asks its user for a code before it lets this headset stream. A Mac on the
+    /// other end of `adb reverse` trusts the headset. A Mac on the USB network asks for a headset that
+    /// it does not know, as over Wi-Fi.
+    pub fn needs_code(&self) -> bool {
+        self.way == Way::UsbNetwork && self.fingerprint().is_none_or(|fingerprint| crate::settings::host_key_by_fingerprint(&fingerprint).is_none())
     }
 
     /// The Mac as the Wi-Fi search would list it, for the checks that the two kinds share. The
@@ -77,14 +101,35 @@ impl UsbMac {
 /// What the panel calls the Mac behind the cable
 pub const CABLE_NAME: &str = "This Mac by USB cable";
 
-/// Asks the address behind the cable. `None` when no host answers there.
+/// Asks the cable: the USB network first, then the address of `adb reverse`. `None` when no host
+/// answers on either.
 pub fn probe() -> Option<UsbMac> {
-    probe_at(address())
+    probe_usb_network().or_else(|| probe_at(&AnyRoute, address(), Way::AdbReverse))
 }
 
-fn probe_at(address: SocketAddr) -> Option<UsbMac> {
-    match probe_host(address, PROBE_TIMEOUT) {
-        Ok(probe) => Some(UsbMac { address, key: probe.key, version: probe.version }),
+/// Asks the cable as [`probe`] does, for a connection that starts now. A USB network that came up a
+/// moment ago may not reach the Mac yet: the question then repeats until the Mac answers on it or
+/// the moment is over.
+pub fn probe_settled() -> Option<UsbMac> {
+    loop {
+        let found = probe();
+        if found.as_ref().is_some_and(|mac| mac.way == Way::UsbNetwork) || !usb_network::just_up() {
+            return found;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// The host on the USB network that listens on the cable's port
+fn probe_usb_network() -> Option<UsbMac> {
+    let network = usb_network::network()?;
+    let (address, _) = usb_network::find_hosts(&network).into_iter().find(|(address, _)| address.port() == port())?;
+    probe_at(&NetworkRoute(network), address, Way::UsbNetwork)
+}
+
+fn probe_at(route: &dyn Route, address: SocketAddr, way: Way) -> Option<UsbMac> {
+    match probe_host_via(route, address, PROBE_TIMEOUT) {
+        Ok(probe) => Some(UsbMac { address, key: probe.key, version: probe.version, way }),
         Err(e) => {
             log::debug!("nothing answers behind the cable at {address}: {e}");
             None
@@ -114,7 +159,13 @@ pub fn start(hub: &'static Hub) {
 
 fn run(hub: &'static Hub) {
     loop {
-        if !hub.is_searching() || !hub.device().is_live() {
+        if !hub.device().is_live() {
+            thread::sleep(IDLE);
+            continue;
+        }
+        // The request lives while a link runs too: a link over the USB network needs its network
+        usb_network::keep();
+        if !hub.is_searching() {
             thread::sleep(IDLE);
             continue;
         }
@@ -183,14 +234,35 @@ pub fn is_loopback(address: &str) -> bool {
     text.rsplit_once(':').map_or(text, |(host, _)| host).eq_ignore_ascii_case("localhost")
 }
 
+/// The port of an address as text, or the host's default port when the text names none
+fn port_of(address: &str) -> u16 {
+    let text = address.trim();
+    if let Ok(socket) = text.parse::<SocketAddr>() {
+        return socket.port();
+    }
+    text.rsplit_once(':').and_then(|(_, port)| port.parse().ok()).unwrap_or(DEFAULT_PORT)
+}
+
 /// Where a connection to `aim` goes now, given what the cable and the Wi-Fi search show.
 ///
-/// An aim without a fingerprint goes where it says: nothing tells which Mac it means. With a
+/// An aim at this device's own address means the cable: the way that answers on the cable's port
+/// takes it, the USB network first. Any other aim without a fingerprint goes where it says: nothing
+/// tells which Mac it means. With a
 /// fingerprint, the cable wins when the Mac behind it has the same one. Otherwise the aim goes to
 /// the Wi-Fi entry with that fingerprint, which a USB link falls back to when the cable is out. When
 /// no such entry exists, the aim keeps its address.
 pub fn target(aim: &Aim, usb: Option<&UsbMac>, found: &[FoundHost]) -> Target {
-    let as_aimed = || Target { address: aim.address.clone(), path: if is_loopback(&aim.address) { Path::Usb } else { Path::WiFi } };
+    let as_aimed = || {
+        if !is_loopback(&aim.address) {
+            return Target { address: aim.address.clone(), path: Path::WiFi };
+        }
+        // An aim at this device's own address means the cable: the way that answers on it takes
+        // the aim, the USB network first
+        match usb.filter(|cable| port_of(&aim.address) == cable.address.port()) {
+            Some(cable) => Target { address: cable.address.to_string(), path: Path::Usb },
+            None => Target { address: aim.address.clone(), path: Path::Usb },
+        }
+    };
     let Some(mac) = aim.fingerprint else { return as_aimed() };
     if let Some(cable) = usb.filter(|cable| cable.fingerprint() == Some(mac)) {
         return Target { address: cable.address.to_string(), path: Path::Usb };
@@ -214,7 +286,13 @@ mod tests {
 
     /// A Mac behind the cable whose key has the fingerprint of the first byte's key
     fn cable(key_byte: u8) -> UsbMac {
-        UsbMac { address: address(), key: Some([key_byte; KEY_LEN]), version: PROTOCOL_VERSION }
+        UsbMac { address: address(), key: Some([key_byte; KEY_LEN]), version: PROTOCOL_VERSION, way: Way::AdbReverse }
+    }
+
+    /// The same Mac on the headset's USB network: its link-local address on the cable's link
+    fn usb_network(key_byte: u8) -> UsbMac {
+        let address = std::net::SocketAddrV6::new("fe80::20:c91:c353:87c3".parse().unwrap(), port(), 0, 17);
+        UsbMac { address: address.into(), way: Way::UsbNetwork, ..cable(key_byte) }
     }
 
     fn aim(address: &str, fingerprint: Option<[u8; FINGERPRINT_LEN]>) -> Aim {
@@ -298,7 +376,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         // The host's accept loop sees the probe end before the client's key
         let host = thread::spawn(move || listener.accept().err());
-        let mac = probe_at(address).expect("the host answers");
+        let mac = probe_at(&AnyRoute, address, Way::AdbReverse).expect("the host answers");
         assert_eq!(mac.key, Some(identity.public_key()));
         assert_eq!(mac.fingerprint(), Some(fingerprint(&identity.public_key())));
         assert_eq!(mac.address, address);
@@ -307,11 +385,28 @@ mod tests {
         let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = dead.local_addr().unwrap();
         let acceptor = thread::spawn(move || drop(dead.accept().unwrap()));
-        assert_eq!(probe_at(address), None);
+        assert_eq!(probe_at(&AnyRoute, address, Way::AdbReverse), None);
         acceptor.join().unwrap();
         // Nothing listens: the cable is out
         let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
-        assert_eq!(probe_at(free), None);
+        assert_eq!(probe_at(&AnyRoute, free, Way::AdbReverse), None);
+    }
+
+    #[test]
+    fn an_aim_at_this_device_takes_the_usb_network_when_it_answers() {
+        let network = usb_network(1);
+        let found = [wifi("Mac", [192, 168, 1, 20], network.fingerprint().unwrap())];
+        // The launch's address or the cable's line, with or without the Mac's key known
+        for fingerprint in [None, network.fingerprint()] {
+            let t = target(&aim("127.0.0.1:9950", fingerprint), Some(&network), &found);
+            assert_eq!(t, Target { address: "[fe80::20:c91:c353:87c3%17]:9950".into(), path: Path::Usb });
+        }
+        // The address of the USB network parses back with its scope
+        assert_eq!("[fe80::20:c91:c353:87c3%17]:9950".parse::<SocketAddr>().unwrap(), network.address);
+        // A test host on another port is not the cable's host
+        assert_eq!(target(&aim("127.0.0.1:9962", None), Some(&network), &found), Target { address: "127.0.0.1:9962".into(), path: Path::Usb });
+        // The Wi-Fi entry of the same Mac shows once, as the cable
+        assert_eq!(entries(&found, Some(&network)), [Line::Cable(network)]);
     }
 
     #[test]

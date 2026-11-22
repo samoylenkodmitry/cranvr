@@ -137,6 +137,13 @@
 #                 the cranvr app's host on port 9950: over the cable when the app linked that port
 #                 with `adb reverse`, else at this Mac's address. On a port other than 9950 that
 #                 launch also makes the headset forget the key that it keeps for the run's address.
+#   --cable usb-network|adb  with --quest: the headset reaches the run's host over the USB cable
+#                 instead of Wi-Fi. usb-network: the headset's USB network, with no `adb reverse` for the
+#                 run's port; the host's log must show a link-local IPv6 peer and UDP media. adb: `adb
+#                 reverse` for the run's port, with the headset's USB network not asked for
+#                 (usb_network false); the log must show the peer 127.0.0.1 and TCP media. The headset
+#                 needs a few seconds to change its USB functions between the two, so an adb run right
+#                 after a usb-network run waits for adb to settle.
 #                 Without --quest the client is cranvr-probe on this Mac, over loopback with UDP
 #                 media and parity packets. It simulates a headset's display: it reports the
 #                 frame timing and the loss, and it checks the eye badges of the host's scene.
@@ -169,7 +176,7 @@ displays=1 hold=0 hand_hold=0 displays_in_game=0 display_test=0
 tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 hand_interaction="" openvr_wine=0 openvr_actions="" openvr_overlay=0 openvr_gl=0 steamvr=0 face_source=audio
 game_stall=""
 wine="" wine_args=()
-native_tcp=0 native_drop=0 native_port=9950 pause="" left_trigger="" right_trigger=""
+native_tcp=0 native_drop=0 native_port=9950 pause="" left_trigger="" right_trigger="" cable=""
 more_host_args=() more_probe_args=()
 while (( $# )); do
     case $1 in
@@ -209,6 +216,7 @@ while (( $# )); do
         --native-tcp) native_tcp=1; shift ;;
         --native-drop) native_drop=$2; shift 2 ;;
         --native-port) native_port=$2; shift 2 ;;
+        --cable) cable=$2; shift 2 ;;
         --pause) pause=$2; shift 2 ;;
         --left-trigger) left_trigger=$2; shift 2 ;;
         --right-trigger) right_trigger=$2; shift 2 ;;
@@ -358,7 +366,8 @@ give_back() {
     fi
     [[ -n ${owner} ]] || return 0
     if [[ -n ${mac_ip} ]] && (( native_port != owner_port )); then
-        extras=(--es forget_host_key "${test_host}")
+        # A run over the USB network leaves the key under the cable's name
+        extras=(--es forget_host_key "${test_host},usb-network:${native_port}")
     fi
     if "${adb_cmd[@]}" shell am start -n "${package}/dev.cranpose.android.CranposeActivity" \
         --es host "${owner}" --ez connect true "${extras[@]}" >/dev/null 2>&1; then
@@ -378,6 +387,9 @@ cleanup() {
     fi
     if [[ -n ${package} ]]; then
         "${adb_cmd[@]}" shell am force-stop "${package}" >/dev/null 2>&1 || true
+    fi
+    if [[ ${cable} == adb && ${native_port} != "${owner_port}" ]]; then
+        "${adb_cmd[@]}" reverse --remove "tcp:${native_port}" >/dev/null 2>&1 || true
     fi
     if [[ ${client} == quest && -n ${package} ]]; then
         give_back
@@ -546,8 +558,28 @@ case ${client} in
         # The Cranpose client takes the host's address, the start of the connection and the room
         # from the extras of its launch
         "${adb_cmd[@]}" shell am force-stop "${package}"
+        launch=(--es host "${mac_ip}:${native_port}")
+        case ${cable} in
+            usb-network)
+                "${adb_cmd[@]}" reverse --remove "tcp:${native_port}" >/dev/null 2>&1 || true
+                launch=(--es host "127.0.0.1:${native_port}" --ei usb_port "${native_port}") ;;
+            adb)
+                # A client that held the USB network leaves it up for about 30 s after its stop. The
+                # headset's change back to its old USB functions would cut `adb reverse` in the run,
+                # so the run waits until the headset has no network on usb0, and then for adb, which
+                # is gone for a moment during the change.
+                for i in {1..90}; do
+                    networks=$("${adb_cmd[@]}" shell dumpsys connectivity 2>/dev/null) || networks="usb0 unknown"
+                    [[ ${networks} != *usb0* ]] && break
+                    sleep 1
+                done
+                sleep 3
+                "${adb_cmd[@]}" wait-for-device
+                "${adb_cmd[@]}" reverse "tcp:${native_port}" "tcp:${native_port}" >/dev/null
+                launch=(--es host "127.0.0.1:${native_port}" --ei usb_port "${native_port}" --ez usb_network false) ;;
+        esac
         "${adb_cmd[@]}" shell am start -n "${package}/dev.cranpose.android.CranposeActivity" \
-            --es host "${mac_ip}:${native_port}" --ez connect true --es room scene >/dev/null
+            "${launch[@]}" --ez connect true --es room scene >/dev/null
         for i in {1..120}; do
             headset_connected && break
             sleep 0.5
@@ -559,8 +591,18 @@ case ${client} in
             print "Streaming for ${seconds} seconds"
             # A signal ends the wait at once, so cleanup gives Guardian back without delay
             sleep "${seconds}" & wait $!
-            # What the headset shows, both eyes after its compositor
-            "${adb_cmd[@]}" exec-out screencap -p > "${work}/quest.png" || true
+            if [[ -n ${cable} ]]; then
+                # The host's log names the way that the run took
+                path_line=$(grep -h "Native protocol: .* connected, .* media" "${work}/host.log" "${work}/host.out" 2>/dev/null | tail -1)
+                print "Path: ${path_line##*Native protocol: }"
+                case ${cable} in
+                    usb-network) [[ ${path_line} == *" at [fe80:"*"UDP media"* ]] || { print -u2 "The headset did not stream over its USB network"; client_exit=1; } ;;
+                    adb) [[ ${path_line} == *" at 127.0.0.1:"*"TCP media"* ]] || { print -u2 "The headset did not stream through adb reverse"; client_exit=1; } ;;
+                esac
+            else
+                # What the headset shows, both eyes after its compositor
+                "${adb_cmd[@]}" exec-out screencap -p > "${work}/quest.png" || true
+            fi
         fi
         ;;
 esac
