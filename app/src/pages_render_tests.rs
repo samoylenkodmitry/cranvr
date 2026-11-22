@@ -67,3 +67,30 @@ fn a_made_up_item_shows_in_the_window_with_no_code_of_its_own() {
         assert!(texts.iter().any(|text| text == words), "{words:?} in {texts:?}");
     }
 }
+
+#[test]
+fn the_settings_tab_holds_the_connection_the_stream_the_sound_the_headset_and_the_mac() {
+    let model = Model::default();
+    let settings = Settings::default();
+    let mut robot = RobotTestRule::new(1400, 6000, TestRenderer::default(), {
+        let (settings, model) = (settings.clone(), model.clone());
+        move || {
+            let (settings, model) = (settings.clone(), model.clone());
+            let settings = rememberMutableStateOf(move || settings.clone());
+            let model = rememberMutableStateOf(move || model.clone());
+            super::GeneralSettings(settings, model);
+        }
+    });
+    let texts = robot.get_all_text();
+    let pages = pages::pages(&settings, &model);
+    for id in [pages::CONNECTION, pages::STREAM, pages::SOUND, pages::HEADSET, pages::MAC] {
+        let page = pages.iter().find(|page| page.id == id).unwrap();
+        for item in &page.items {
+            for words in words_of(item) {
+                assert!(texts.iter().any(|text| text == &words), "the Settings tab lacks {words:?} of {id}");
+            }
+        }
+    }
+    // The headset's room and volume, which the Mac keeps for the headset
+    assert!(texts.iter().any(|text| text == "Room") && texts.iter().any(|text| text == "Volume"), "{texts:?}");
+}
