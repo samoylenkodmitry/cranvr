@@ -362,7 +362,8 @@ fn Phone() {
     });
     Box(Modifier::empty().fill_max_size().background(Color(0.0, 0.0, 0.0, 1.0)), BoxSpec::default(), move || {
         PhoneFrames();
-        BoxWithConstraints(Modifier::empty().fill_max_size().clickable(move |_| panels.set(!panels.get())), move |scope| {
+        // A tap on the picture shows or hides the panels: it is no button, so it shows no veil
+        BoxWithConstraints(Modifier::empty().fill_max_size().clickable_with_indication(Indication::NONE, move |_| panels.set(!panels.get())), move |scope| {
             // The layout's size is in dp. The views of the Hello need the screen's pixels.
             let (width, height) = (scope.max_width().0, scope.max_height().0);
             let density = density().density();
@@ -395,9 +396,9 @@ fn PhonePanels(snapshot: MutableState<Snapshot>, address: TextFieldState, panels
         RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(16.0)),
         move || {
             // A panel takes the taps that miss its buttons. They do not reach the picture's tap
-            // handler under it.
+            // handler under it. The panel is no button, so it shows no veil.
             Column(
-                Modifier::empty().weight(1.0).fill_max_height().vertical_scroll(left, false).clickable(|_| {}),
+                Modifier::empty().weight(1.0).fill_max_height().vertical_scroll(left, false).clickable_with_indication(Indication::NONE, |_| {}),
                 ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(16.0)),
                 move || {
                     ConnectBody(snapshot, address, Modifier::empty().fill_max_width(), false, typing);
@@ -405,7 +406,7 @@ fn PhonePanels(snapshot: MutableState<Snapshot>, address: TextFieldState, panels
                 },
             );
             Column(
-                Modifier::empty().weight(1.0).fill_max_height().vertical_scroll(right, false).clickable(|_| {}),
+                Modifier::empty().weight(1.0).fill_max_height().vertical_scroll(right, false).clickable_with_indication(Indication::NONE, |_| {}),
                 ColumnSpec::default(),
                 move || StatsBody(snapshot, Modifier::empty().fill_max_width()),
             );
