@@ -598,9 +598,19 @@ fn pages_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
         }
         // An action that the launch names (`scripted_actions`, a comma list of ids) is pressed too
         for action in actions.iter() {
-            let request = cranvr_common::menu::Request::run(action.as_str());
-            if let Some(target) = menu.page(id).filter(|page| page.find(action, None).is_some()).and_then(|_| key_at(&Shown::Host(id.clone()), &Press::Host(request.clone()))) {
-                log::info!("scripted pages: on {id} the action {action} at {target:?}");
+            // The first button of the page that runs the action, for whatever it names
+            let request = menu.page(id).and_then(|page| {
+                page.items.iter().find_map(|item| match item {
+                    cranvr_common::menu::Item::Buttons(row) => row.buttons.iter().find_map(|button| match &button.press {
+                        cranvr_common::menu::Press::Run { id: run, .. } if run == action => button.press.request(),
+                        _ => None,
+                    }),
+                    _ => None,
+                })
+            });
+            if let Some(request) = request {
+                let target = key_at(&Shown::Host(id.clone()), &Press::Host(request.clone()))?;
+                log::info!("scripted pages: on {id} the action {} at {target:?}", request.to_json());
                 right = press(right, target);
             }
         }

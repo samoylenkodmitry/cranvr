@@ -29,8 +29,10 @@ root=${0:A:h:h}
 adb_cmd=(adb -s ${serial})
 home=${work}/home
 program=${home}/wine/prefix/drive_c/Games/Fake/fake.exe
-mkdir -p ${program:h}
+mkdir -p ${program:h} ${home}/wine/prefix/drive_c/Games/Other
 : > ${program}
+# A program that no game starts: the Add game page lists it
+: > ${home}/wine/prefix/drive_c/Games/Other/other.exe
 # The entries that the walk may change stand in the file, so the check shows their change. A save
 # writes every other entry too, with its standard value.
 print "{\"desktop\": false, \"game_audio\": false, \"game_msaa_limit\": 2, \"connection\": \"Automatic\", \"microphone\": \"Headset\", \"wine\": {\"mac_window\": false}, \"headset_room\": null, \"headset_volume\": null, \"launch\": {}, \"added_games\": [{\"name\": \"Fake\", \"program\": \"${program}\"}]}" > ${home}/app.json
