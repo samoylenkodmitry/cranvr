@@ -282,6 +282,12 @@ pub fn HandPanels(state: HandState, console_open: bool, controls: Controls, stre
     let pinned_shown = on_hand.filter(|stream| layout.shown(PanelId::Display(*stream)));
     let open = state.menu_open.get();
     let hint = (state.hint.get() && !open).then(|| crate::menu_hint::text(&controls, state.present.get(), place, streaming));
+    let said = hint.clone();
+    LaunchedEffect(said.clone(), async move |_| {
+        if let Some(text) = said {
+            log::info!("the menu hint says: {text}");
+        }
+    });
     // The menu closes itself after a while without a pointer over a panel. A test launch that opens it
     // keeps it open: no hand keeps a ray over it on a desk.
     let closes_itself = !open_on_launch();
