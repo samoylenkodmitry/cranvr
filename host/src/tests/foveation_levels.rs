@@ -30,22 +30,33 @@ const EYE: [u32; 2] = [1680, 1760];
 /// The eye that the host takes without foveation at 120 Hz (`default_eye_width`), with the aspect
 /// of the client's eye
 const OFF_EYE: [u32; 2] = [1248, 1308];
-/// The views' tangents: left, right, up, down
-const FOV: [[f32; 4]; 2] = [[-1.0, 0.9, 0.95, -1.15], [-0.9, 1.0, 0.95, -1.15]];
+/// A Quest 3's views as tangents: left, right, up, down. An eye sees 54 degrees out, 40 in, 44 up
+/// and 55 down.
+const FOV: [[f32; 4]; 2] = [[-1.3764, 0.8391, 0.9657, -1.4281], [-0.8391, 1.3764, 0.9657, -1.4281]];
 /// Every fourth frame is compared, after the first few
 const EVERY: usize = 4;
 const SKIP: usize = 8;
 
-/// The regions of an eye's view, in the eye's space from its outer edge (the right eye mirrored).
-/// The center lies where every level keeps the full density.
+/// The regions of an eye's view by the angle from straight ahead on each axis: the center within
+/// 15 degrees, where every level keeps the full density, the edge beyond 35 degrees, and the middle
+/// between them. `mx` runs from the eye's outer edge (the right eye mirrored), `v` from the top.
 fn region(mx: f32, v: f32) -> Region {
-    if (0.47..=0.79).contains(&mx) && (0.40..=0.67).contains(&v) {
+    let [left, right, up, down] = FOV[0];
+    let (tx, ty) = (left + mx * (right - left), up - v * (up - down));
+    let (center, edge) = (15f32.to_radians().tan(), 35f32.to_radians().tan());
+    if tx.abs() <= center && ty.abs() <= center {
         Region::Center
-    } else if !(0.2..=0.9).contains(&mx) || !(0.15..=0.85).contains(&v) {
+    } else if tx.abs() > edge || ty.abs() > edge {
         Region::Edge
     } else {
         Region::Middle
     }
+}
+
+/// The rows of the center's band, where the strips of `Errors` are counted
+fn center_rows(v: f32) -> bool {
+    let [_, _, up, down] = FOV[0];
+    (up - v * (up - down)).abs() <= 15f32.to_radians().tan()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -81,7 +92,7 @@ impl Variant {
 
     fn foveation(self) -> Option<Foveation> {
         match self {
-            Variant::Level(level) => level.config().map(|config| Foveation::new(EYE, &config)),
+            Variant::Level(level) => level.config().map(|config| Foveation::new(EYE, &config.centered(FOV[0]))),
             Variant::EdgeBlur(_) => None,
         }
     }
@@ -269,12 +280,13 @@ fn luma_of(buffer: &mut PixelBuffer) -> Vec<u8> {
     buffer.with_planes_mut(|y, ys, _, _| (0..height).flat_map(|row| y[row * ys..row * ys + width].to_vec()).collect())
 }
 
-/// The squared errors and their count in each region, and the center's pixels for SSIM and crops.
+/// The squared errors and their count in each region, and the SSIM of the center of each eye.
 #[derive(Default)]
 struct Errors {
     sse: [f64; 3],
     count: [u64; 3],
-    /// The squared error of each of 32 strips across the center's rows, from the outer edge
+    /// The squared error of each of 32 strips across the center's rows (within 15 degrees of straight
+    /// ahead), from the outer edge
     strips: [(f64, u64); 32],
     ssim: Vec<f64>,
 }
@@ -368,7 +380,7 @@ fn compare(decoded: &[u8], size: [usize; 2], foveation: Option<&Foveation>, refe
                     center.1.push(want);
                     in_row += 1;
                 }
-                if (0.40..=0.67).contains(&v) {
+                if center_rows(v) {
                     let strip = ((mx * 32.0) as usize).min(31);
                     errors.strips[strip].0 += d * d;
                     errors.strips[strip].1 += 1;
@@ -422,7 +434,7 @@ fn run(variant: Variant, mbps: u64, frames: usize, paced: bool, land: Option<&Pi
     let (unused, _) = mpsc::channel();
     let reference_pool = Encoder::new(&eye_encoder_config([EYE[0] * 2, EYE[1]], fps, true, 1_000_000, false), unused).expect("a pool");
     let mut renderer = Renderer::new().expect("renderer");
-    let medium = Foveation::new(EYE, &FoveationLevel::Medium.config().unwrap());
+    let medium = Foveation::new(EYE, &FoveationLevel::Medium.config().unwrap().centered(FOV[0]));
     let (source_tx, source_rx) = mpsc::channel::<(u64, Vec<u8>)>();
     let label = variant.label();
     let dump = dump.cloned();
@@ -452,14 +464,14 @@ fn run(variant: Variant, mbps: u64, frames: usize, paced: bool, land: Option<&Pi
                     // The reference's left eye once, for the crops of each run
                     let w = EYE[0] as usize;
                     let left: Vec<f32> = (0..EYE[1] as usize).flat_map(|j| reference[j * 2 * w..j * 2 * w + w].iter().map(|&v| f32::from(v))).collect();
-                    write_pgm(&dir.join("reference-center.pgm"), &left, w, 820, 760, 480, 360);
+                    write_pgm(&dir.join("reference-center.pgm"), &left, w, 803, 529, 480, 360);
                     write_pgm(&dir.join("reference-edge.pgm"), &left, w, 0, 1240, 480, 360);
                 }
             }
         }
         if let (Some(dir), Some(left)) = (&dump, last_left) {
             let name = label.replace(' ', "-");
-            write_pgm(&dir.join(format!("{name}-{mbps}-center.pgm")), &left, EYE[0] as usize, 820, 760, 480, 360);
+            write_pgm(&dir.join(format!("{name}-{mbps}-center.pgm")), &left, EYE[0] as usize, 803, 529, 480, 360);
             write_pgm(&dir.join(format!("{name}-{mbps}-edge.pgm")), &left, EYE[0] as usize, 0, 1240, 480, 360);
         }
         (errors, decode_ms, encode_ms, bytes, count)
@@ -578,7 +590,7 @@ fn foveation_levels() {
 /// view, warped by `encoded_to_view` and read back, matches away from the squeezed edges.
 #[test]
 fn the_unwarp_reads_the_view_back() {
-    let f = Foveation::new(EYE, &FoveationLevel::Medium.config().unwrap());
+    let f = Foveation::new(EYE, &FoveationLevel::Medium.config().unwrap().centered(FOV[0]));
     let [ow, oh] = f.optimized.map(|v| v as usize);
     let size = [ow * 2, oh];
     let gradient = |view: [f32; 2]| view[0] * 200.0 + view[1] * 50.0;

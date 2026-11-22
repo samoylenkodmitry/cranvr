@@ -10,7 +10,7 @@ use cranvr_proto::{
     link::{probe_host, ClientLink, ConnectObserver, HostLink, HostListener, Incoming, MediaMode},
     media::{FrameReceiver, DEFAULT_SHARD_LEN},
     message::*,
-    wire::{Codec, Error, Motion, Pose},
+    wire::{Codec, Error, Fov, Motion, Pose},
 };
 use std::{
     io::{Read, Write},
@@ -370,6 +370,24 @@ fn a_foveated_stream_takes_the_clients_eye_size_when_the_host_has_no_width() {
     c.foveation = false;
     let stream = negotiate(&w, &c).unwrap();
     assert_eq!((stream.eye_size[0], stream.foveation.is_none()), (1248, true));
+}
+
+// The host puts the full-density region where the client's eye looks straight ahead: a view that
+// reaches further down than up moves the region up, and the stream carries the moved shift.
+#[test]
+fn the_foveated_region_follows_the_clients_view() {
+    let mut c = caps();
+    let quest_3 = Fov { left: (-54f32).to_radians(), right: 40f32.to_radians(), up: 44f32.to_radians(), down: (-55f32).to_radians() };
+    c.views.fov = [quest_3, Fov { left: -quest_3.right, right: -quest_3.left, ..quest_3 }];
+    let shift = negotiate(&wishes(), &c).unwrap().foveation.unwrap().center_shift;
+    // Straight ahead lies at 62 percent of the width from the outer edge and 40 percent of the height from the top
+    let (c0x, c0y) = ((1.0 - 0.45) / 2.0, (1.0 - 0.4) / 2.0);
+    assert!((0.5 + c0x * shift[0] - 0.621).abs() < 0.01 && (0.5 + c0y * shift[1] - 0.403).abs() < 0.01, "{shift:?}");
+    // A view that is the same on every side keeps the region in the middle
+    let even = Fov { left: -0.8, right: 0.8, up: 0.8, down: -0.8 };
+    c.views.fov = [even, even];
+    let shift = negotiate(&wishes(), &c).unwrap().foveation.unwrap().center_shift;
+    assert!(shift[0].abs() < 1e-5 && shift[1].abs() < 1e-5, "{shift:?}");
 }
 
 /// An observer that tells the test what the client shows, and gives up when the test says so.

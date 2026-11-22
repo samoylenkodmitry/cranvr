@@ -688,7 +688,12 @@ pub fn negotiate(wishes: &HostWishes, caps: &ClientCaps) -> Result<StreamParams,
         .or_else(|| rates.first().copied())
         .ok_or(RejectReason::NoCommonRefreshRate)?;
     let [native_w, native_h] = caps.eye_size;
-    let foveation = wishes.foveation.filter(|_| caps.foveation);
+    // The full-density region goes where the headset's eye looks straight ahead
+    let fov = caps.views.fov[0];
+    let foveation = wishes
+        .foveation
+        .filter(|_| caps.foveation)
+        .map(|f| FoveationConfig::from(f).centered([fov.left.tan(), fov.right.tan(), fov.up.tan(), fov.down.tan()]).into());
     let wished = if wishes.foveation.is_some() && foveation.is_none() && wishes.eye_width_unfoveated != 0 {
         wishes.eye_width_unfoveated
     } else {
