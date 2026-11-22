@@ -51,6 +51,13 @@ fn heading(head: &Pose) -> Option<[f32; 4]> {
     })
 }
 
+/// Whether no input is tracked, so the look's ball shows: no controller is present and no hand is
+/// tracked (left, right). A hand counts while Cranpose's hand pointer points with it, since that
+/// pointer presses the ball in the view, or while its palm joint is located.
+pub fn no_input(controllers: [bool; 2], hands: [bool; 2]) -> bool {
+    controllers == [false; 2] && hands == [false; 2]
+}
+
 /// Whether the head at `head` looks at the ball, which stands `pitch_degrees` below its eyes.
 pub fn looks_at(head: &Pose, pitch_degrees: f32) -> bool {
     let Some(turn) = heading(head) else { return false };
@@ -120,6 +127,16 @@ mod tests {
         }
         // A test on a desk puts the ball straight ahead
         assert!(looks_at(&head([0.0; 3], 0.0, 0.0), 0.0));
+    }
+
+    #[test]
+    fn only_a_headset_with_no_controller_and_no_tracked_hand_has_no_input() {
+        assert!(no_input([false; 2], [false; 2]));
+        assert!(!no_input([true, false], [false; 2]));
+        assert!(!no_input([false, true], [false; 2]));
+        // A hand that the cameras track points with its pinch, palm joint or not
+        assert!(!no_input([false; 2], [false, true]));
+        assert!(!no_input([false; 2], [true, false]));
     }
 
     #[test]

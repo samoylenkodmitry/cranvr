@@ -504,7 +504,11 @@ fn HeadsetFrames(hand: HandState) {
             }
             // The palms of the hands that the cameras track, while no controller is in them
             let palm_frames = [XrHand::Left, XrHand::Right].map(|side| palm_frame(frame.hand(side)));
-            let tracked = palm_frames.iter().any(|frame| frame.palm.is_some());
+            // A hand counts while Cranpose's hand pointer points with it or its palm is located. A
+            // Quest reports a hand as tracking with no located joint while no hand is in view.
+            let pointing = [XrHand::Left, XrHand::Right].map(|side| frame.pointer(side) == Some(InputSource::Hands));
+            let tracked_hands = [0, 1].map(|i| pointing[i] || palm_frames[i].palm.is_some());
+            let tracked = tracked_hands.contains(&true);
             if tracked != hands.get_non_reactive() {
                 hands.set(tracked);
             }
@@ -524,7 +528,7 @@ fn HeadsetFrames(hand: HandState) {
                 }
             }
             // No controller and no hand: a look that rests on the ball below opens the menu
-            let no_input = placer.present() == [false; 2] && !tracked;
+            let no_input = crate::gaze::no_input(placer.present(), tracked_hands);
             if no_input != gaze.get_non_reactive() {
                 log::info!("{}", if no_input { "no input is tracked: a look at the ball below opens the hand menu" } else { "an input is tracked again: the ball below goes" });
                 gaze.set(no_input);

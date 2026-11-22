@@ -397,7 +397,7 @@ fn PalmBall(state: HandState, hand: ControlHand) {
     let modifier = SubspaceModifier::new().size(BALL, BALL).offset(0.0, -PALM_LIFT, 0.0).rotate(90.0, 0.0, 0.0).layer_priority(layer_rank::HAND_MENU);
     FollowingSubspace(FollowTarget::Hand(xr_hand, HandJointType::Palm, FollowMode::Tight(TrackedDimensions::All)), move || {
         SpatialPanel(modifier.clone(), move || {
-            let hovered = hover::hover_modifier(hover::STRIP);
+            let hovered = hover::hover_modifier(hover::PALM);
             Box(Modifier::empty().fill_max_size().then(hovered), BoxSpec::default(), move || {
                 Round(if open { ACCENT_COLOR } else { KEY_COLOR }, RoundPress::Menu, state);
             });
