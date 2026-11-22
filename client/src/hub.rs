@@ -382,6 +382,8 @@ pub struct Hub {
     headset_requests: Mutex<Vec<cranvr_common::menu::Request>>,
     /// The headset's own page that went to the Mac last, with the connection that took it
     headset_page_sent: Mutex<Option<(u64, String)>>,
+    // What the headset's page shows changed since the last page went to the Mac
+    headset_page_changed: AtomicBool,
     /// The connection for which the headset told the Mac its room and volume
     told_choices: AtomicU64,
     /// The saved settings of the console were loaded. A rebuilt composition must not load them
@@ -415,6 +417,7 @@ pub fn hub() -> &'static Hub {
         menu_asked: AtomicBool::new(false),
         headset_requests: Mutex::new(Vec::new()),
         headset_page_sent: Mutex::new(None),
+        headset_page_changed: AtomicBool::new(true),
         told_choices: AtomicU64::new(0),
         settings_loaded: AtomicBool::new(false),
     })
@@ -779,6 +782,20 @@ impl Hub {
         std::mem::take(&mut *self.headset_requests.lock().unwrap())
     }
 
+    /// Whether the headset's page should be made and sent now: the link streams, and what the page
+    /// shows `changed` now or since the last page went, or this link got no page yet. Otherwise the
+    /// page costs nothing.
+    pub fn headset_page_due(&self, changed: bool) -> bool {
+        if changed {
+            self.headset_page_changed.store(true, Ordering::Relaxed);
+        }
+        let id = self.current.load(Ordering::Acquire);
+        if id == 0 || self.snapshot.lock().unwrap().state != LinkState::Streaming {
+            return false;
+        }
+        self.headset_page_changed.load(Ordering::Relaxed) || self.headset_page_sent.lock().unwrap().as_ref().is_none_or(|(sent, _)| *sent != id)
+    }
+
     /// Sends the headset's own page to the Mac when it differs from the one that the link took last,
     /// or when the link is new.
     pub fn send_headset_page(&self, page: &cranvr_common::menu::Page) {
@@ -795,6 +812,7 @@ impl Hub {
         if taken {
             log::info!("the headset's page goes to the Mac: {} items, {} bytes", page.items.len(), text.len());
             *sent = Some((id, text));
+            self.headset_page_changed.store(false, Ordering::Relaxed);
         }
     }
 

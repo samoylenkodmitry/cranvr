@@ -72,7 +72,7 @@ fn usage() -> ! {
          \n  --right-trigger AT:FOR  the same for the right trigger\
          \n  --menu AT          the left controller's menu button goes down at AT seconds for 0.3 s, once\
          \n  --console AT:JSON  at AT seconds send one request of the console in VR, as a press on its button does,\
-         \n                     such as 5:{{\"action\": \"play\", \"game\": \"The Lab\"}}. The host hands it to the cranvr app.\
+         \n                     such as 5:{{\"action\": \"set\", \"id\": \"fps\", \"value\": \"90\"}}. The host hands it to the cranvr app.\
          \n  --display-fps N    with --desktop: each display's wish asks for at most N pictures a second (1 to 60)\
          \n  --microphone       offer a microphone: while the host asks for it, the probe sends a click every 500 ms\
          \n                     and prints the time of each on mach_continuous_time"
@@ -94,7 +94,7 @@ fn parse_pull(text: &str) -> Option<(f32, f32)> {
     (at >= 0.0 && length > 0.0).then_some((at, length))
 }
 
-/// AT:JSON: the seconds and a request of the console, such as `5:{"action": "play", "game": "The Lab"}`
+/// AT:JSON: the seconds and a request of the console, such as `5:{"action": "set", "id": "fps", "value": "90"}`
 fn parse_console(text: &str) -> Option<(f32, String)> {
     let (at, request) = text.split_once(':')?;
     let at = at.parse::<f32>().ok().filter(|at| *at >= 0.0)?;

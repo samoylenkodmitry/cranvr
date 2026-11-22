@@ -159,8 +159,10 @@ fn Client() {
         // What the pointer was last given, so a change of the mapping or of the panels is the only
         // thing that calls it
         let mut given = None;
-        // The headset's own page for the Mac is looked at once a second (`headset_page.rs`)
+        // The headset's own page for the Mac is looked at once a second (`headset_page.rs`). It is
+        // made only when what it shows changed, or for a new link.
         let mut turns = 0u32;
+        let mut page_read = None;
         loop {
             console.set(hub().console());
             let now = hub().backdrop();
@@ -199,10 +201,13 @@ fn Client() {
             }
             turns = turns.wrapping_add(1);
             if turns.is_multiple_of(20) {
-                let shown = layout.get_non_reactive();
-                let listed = displays().menu_view();
-                let input = MenuInput { layout: &shown, console_open: console.get_non_reactive().open, displays: &listed, wishes: Default::default(), place: place.get_non_reactive(), adding: false, pages: &[], costs: false };
-                hub().send_headset_page(&crate::headset_page::page(&menu_model::rows(&input)));
+                let read = (layout.get_non_reactive(), console.get_non_reactive().open, displays().menu_view(), place.get_non_reactive());
+                if hub().headset_page_due(page_read.as_ref() != Some(&read)) {
+                    let (shown, console_open, listed, at) = &read;
+                    let input = MenuInput { layout: shown, console_open: *console_open, displays: listed, wishes: Default::default(), place: *at, adding: false, pages: &[], costs: false };
+                    hub().send_headset_page(&crate::headset_page::page(&menu_model::rows(&input)));
+                }
+                page_read = Some(read);
             }
             if let Some(pointer) = &pointer_settings {
                 let streaming = snapshot.get_non_reactive().state == LinkState::Streaming;
