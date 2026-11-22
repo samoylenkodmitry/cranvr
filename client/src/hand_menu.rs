@@ -47,7 +47,8 @@
 //! - a press on a button gives a short click in the right hand.
 //!
 //! Nothing of the menu composes while it is closed. The strip is the one panel that a game with no
-//! panel shown carries.
+//! panel shown carries. A line under the ball names the ways to open the menu at the first start and
+//! when the tracking falls to one controller (`menu_hint.rs`). It is a panel only while it shows.
 //!
 //! A launch can fix where the panels ride, for a test on a desk: the extra `hand_anchor` with the
 //! value `view` puts the strip, the menu and the hand's display in a subspace that follows the head,
@@ -72,7 +73,7 @@ use cranpose::launch_args;
 use cranpose::prelude::*;
 use cranpose::text::FontWeight;
 use cranpose_xr::{local_spatial_capabilities, FollowMode, FollowTarget, FollowingSubspace, Hand, Pose, SpatialPanel, SubspaceModifier, TrackedDimensions, Vibration};
-use cranvr_common::controls::Hand as ControlHand;
+use cranvr_common::controls::{Controls, Hand as ControlHand};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
@@ -255,13 +256,18 @@ pub struct HandState {
     pub menu_open: MutableState<bool>,
     /// Where the menu stands now (`menu_place.rs`)
     pub place: MutableState<MenuPlace>,
+    /// The controllers that count as present (left, right)
+    pub present: MutableState<[bool; 2]>,
+    /// The line under the ball shows (`menu_hint.rs`)
+    pub hint: MutableState<bool>,
     /// Counts up at each press on Recenter: the room's panels compose again around the head
     pub recenter: MutableState<u32>,
 }
 
-/// The ball with the menu and the hand's display. In a headset only.
+/// The ball with the menu and the hand's display. In a headset only. `controls` is the mapping of
+/// the buttons, and `streaming` says that a link streams, so a button opens the menu with a hold.
 #[composable]
-pub fn HandPanels(state: HandState, console_open: bool) {
+pub fn HandPanels(state: HandState, console_open: bool, controls: Controls, streaming: bool) {
     // A flat window shows no ball. A test that asks for the menu gets it beside the panels instead
     // (see `flat_menu`).
     if !local_spatial_capabilities().current().is_spatial_ui_enabled() {
@@ -275,6 +281,7 @@ pub fn HandPanels(state: HandState, console_open: bool) {
     let on_hand = layout.hand_display();
     let pinned_shown = on_hand.filter(|stream| layout.shown(PanelId::Display(*stream)));
     let open = state.menu_open.get();
+    let hint = (state.hint.get() && !open).then(|| crate::menu_hint::text(&controls, state.present.get(), place, streaming));
     // The menu closes itself after a while without a pointer over a panel. A test launch that opens it
     // keeps it open: no hand keeps a ray over it on a desk.
     let closes_itself = !open_on_launch();
@@ -296,6 +303,9 @@ pub fn HandPanels(state: HandState, console_open: bool) {
     key(place, move || {
         FollowingSubspace(target.clone(), move || {
             Strip(state, frame, on_hand);
+            if let Some(text) = hint.clone() {
+                Hint(text, frame);
+            }
             if open {
                 Menu(state, console_open, frame);
             }
@@ -341,6 +351,24 @@ fn Strip(state: HandState, frame: HandFrame, pinned: Option<u8>) {
                 }
             },
         );
+    });
+}
+
+/// The width and the height of the line under the ball, in dp
+const HINT_SIZE: [f32; 2] = [460.0, 36.0];
+
+/// The line under the ball that names the ways to open the menu.
+#[composable]
+fn Hint(text: String, frame: HandFrame) {
+    let base = frame.base;
+    let y = base[1] + LIFT - BALL / 2.0 - 8.0 - HINT_SIZE[1] / 2.0;
+    SpatialPanel(SubspaceModifier::new().size(HINT_SIZE[0], HINT_SIZE[1]).offset(base[0], y, base[2]).layer_priority(layer_rank::HAND_MENU), move || {
+        Box(Modifier::empty().fill_max_size().background(PANEL_COLOR).rounded_corners(HINT_SIZE[1] / 2.0).padding_symmetric(14.0, 6.0), BoxSpec::default(), {
+            let text = text.clone();
+            move || {
+                Text(text.clone(), Modifier::empty(), text_style(20.0, TEXT_COLOR, None));
+            }
+        });
     });
 }
 
