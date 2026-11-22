@@ -466,9 +466,12 @@ impl Capture {
             move |_now: NonNull<AudioTimeStamp>,
                   input: NonNull<AudioBufferList>,
                   input_time: NonNull<AudioTimeStamp>,
-                  _output: NonNull<AudioBufferList>,
+                  output: NonNull<AudioBufferList>,
                   _output_time: NonNull<AudioTimeStamp>| {
                 let handed = AudioGetCurrentHostTime();
+                // The output device is the aggregate's clock, so the aggregate also has its output
+                // streams. The block plays nothing into them.
+                silence(output);
                 let list = input.as_ref();
                 let count = (list.mNumberBuffers as usize).min(MAX_BUFFERS);
                 let first = list.mBuffers.as_ptr() as *const AudioBuffer;
@@ -510,6 +513,18 @@ impl Capture {
             return Err(format!("the aggregate device did not start ({status})"));
         }
         Ok(capture)
+    }
+}
+
+/// Fills the buffers of a list with zeros.
+unsafe fn silence(list: NonNull<AudioBufferList>) {
+    let list = list.as_ref();
+    let count = (list.mNumberBuffers as usize).min(MAX_BUFFERS);
+    let buffers = std::slice::from_raw_parts(list.mBuffers.as_ptr() as *const AudioBuffer, count);
+    for buffer in buffers {
+        if !buffer.data.is_null() {
+            std::ptr::write_bytes(buffer.data.cast_mut().cast::<u8>(), 0, buffer.bytes as usize);
+        }
     }
 }
 
