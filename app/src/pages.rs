@@ -12,7 +12,8 @@ use crate::{
     backend::{Model, Settings},
     launch::{self, GameOptions, OpenVr},
     pending,
-    steam::{self, Game},
+    setup::{self, Progress, Setup},
+    steam::{self, Game, SteamState},
 };
 use cranvr_common::{
     foveation::FoveationLevel,
@@ -22,6 +23,7 @@ use std::time::Instant;
 
 /// The id of the page of games, which the console shows first
 pub const PLAY: &str = "play";
+pub const STEAM: &str = "steam";
 pub const STREAM: &str = "stream";
 /// The id of a game's page: this prefix and the game's program
 pub const GAME_PAGE: &str = "game:";
@@ -294,7 +296,7 @@ fn busy(model: &Model, request: &pending::Request) -> bool {
 
 /// Every page, in the order of the console's list. The first one is the console's main page.
 pub fn pages(settings: &Settings, model: &Model) -> Vec<Page> {
-    let mut pages = vec![play_page(settings, model), stream_page(settings, model)];
+    let mut pages = vec![play_page(settings, model), steam_page(model), stream_page(settings, model)];
     for game in &model.games {
         if let Some(page) = game_page_of(settings, model, game) {
             pages.push(page);
@@ -306,6 +308,10 @@ pub fn pages(settings: &Settings, model: &Model) -> Vec<Page> {
 /// The games, each with Play, Options and Stop while it runs.
 fn play_page(settings: &Settings, model: &Model) -> Page {
     let mut items = Vec::new();
+    // A Mac that cannot run games yet says so first, with the way to the setup
+    if let Some(words) = steam_trouble(model) {
+        items.push(Item::Buttons(Buttons { title: words.into(), buttons: vec![Button::open("Steam", STEAM)], ..Default::default() }));
+    }
     items.push(Item::Heading { text: "Games".into() });
     if model.games.is_empty() {
         items.push(Item::Text { text: "No games installed in cranvr's Steam".into(), tone: Tone::Muted });
@@ -330,6 +336,108 @@ fn play_page(settings: &Settings, model: &Model) -> Page {
         ..Default::default()
     }));
     Page { id: PLAY.into(), title: "Play".into(), short: "Play".into(), listed: true, items }
+}
+
+/// What keeps this Mac from running games now, in a few words, or `None` when nothing does.
+fn steam_trouble(model: &Model) -> Option<&'static str> {
+    if model.setup.as_ref().is_some_and(Setup::running) {
+        return Some("The setup of games runs");
+    }
+    if !model.rosetta || model.steam == SteamState::NoWine {
+        return Some("This Mac needs a setup for games");
+    }
+    if model.game_support_outdated {
+        return Some("The game support needs an update");
+    }
+    match model.steam {
+        SteamState::NotInstalled => Some("Steam is not installed"),
+        SteamState::NeedsSetup => Some("Steam needs a repair"),
+        _ => None,
+    }
+}
+
+/// Steam and the game support: their state, the setup's steps and the buttons that set up, update,
+/// repair, open and stop. The Rosetta step and the Steam sign-in need the Mac: the page says so.
+fn steam_page(model: &Model) -> Page {
+    let mut items = vec![Item::Heading { text: "Game support".into() }];
+    let newest = steam::game_support_expected();
+    items.push(match (&model.game_support, model.game_support_outdated, model.steam) {
+        (_, _, SteamState::NoWine) => Item::Text { text: "No game support yet: Wine, DXMT and cranvr's runtime are missing".into(), tone: Tone::Warn },
+        (Some(version), false, _) => Item::Text { text: format!("Game support version {version}"), tone: Tone::Good },
+        (Some(version), true, _) => Item::Text { text: format!("Game support version {version}. Version {newest} is available."), tone: Tone::Warn },
+        (None, true, _) => Item::Text { text: format!("The game support is older than version {newest}."), tone: Tone::Warn },
+        (None, false, _) => Item::Text { text: "Game support without a version stamp".into(), tone: Tone::Muted },
+    });
+    if !model.rosetta {
+        items.push(Item::Text { text: "Rosetta 2 is missing. Wine needs it. Its install asks for the Mac's password on the Mac.".into(), tone: Tone::Warn });
+    }
+    items.push(Item::Heading { text: "Steam".into() });
+    let (state, tone) = match model.steam {
+        SteamState::NoWine => ("Steam waits for the game support", Tone::Muted),
+        SteamState::NotInstalled => ("Steam for Windows is not installed", Tone::Warn),
+        SteamState::NeedsSetup => ("Steam's web helper is missing or unknown, so Steam needs a repair", Tone::Warn),
+        SteamState::Ready if model.steam_running => ("Steam is running", Tone::Good),
+        SteamState::Ready => ("Steam is installed and ready", Tone::Good),
+    };
+    items.push(Item::Text { text: state.into(), tone });
+    if model.steam == SteamState::Ready && !model.steam_signed_in {
+        items.push(Item::Text { text: "Sign in to Steam once, in the Steam window on the Mac. Steam remembers you after that.".into(), tone: Tone::Warn });
+    }
+    // The steps of the setup: what each does before it runs, its progress while it runs
+    let setup = model.setup.clone().filter(|setup| setup.running() || setup.failed());
+    let plan = setup::plan(model.rosetta, model.steam, model.game_support_outdated);
+    if setup.is_some() || !plan.is_empty() {
+        items.push(Item::Heading { text: "Setup".into() });
+    }
+    match &setup {
+        Some(setup) => {
+            for (step, progress) in &setup.steps {
+                let (words, tone) = match progress {
+                    Progress::Waiting => ("Waiting".to_string(), Tone::Muted),
+                    Progress::Working(text) => (text.clone(), Tone::Normal),
+                    Progress::Done => ("Done".to_string(), Tone::Good),
+                    Progress::Failed(message) => (format!("Failed: {message}"), Tone::Warn),
+                };
+                items.push(Item::Text { text: format!("{}: {words}", step.title()), tone });
+            }
+        }
+        None => {
+            for step in &plan {
+                items.push(Item::Text { text: format!("{}: {}", step.title(), step.describe(model.steam)), tone: Tone::Muted });
+            }
+        }
+    }
+    let running = setup.as_ref().is_some_and(Setup::running);
+    let failed = setup.as_ref().is_some_and(Setup::failed);
+    if running || !plan.is_empty() {
+        let label = if failed {
+            "Retry"
+        } else if model.steam == SteamState::NoWine || !model.rosetta {
+            "Set up games"
+        } else if model.game_support_outdated {
+            "Update game support"
+        } else if model.steam == SteamState::NeedsSetup {
+            "Repair Steam"
+        } else {
+            "Install Steam"
+        };
+        let hint = if plan.contains(&setup::Step::Steam) {
+            "Keep cranvr open. This takes a few minutes. Steam opens at the end: sign in there once."
+        } else {
+            "Keep cranvr open. Steam and running games stop while this runs. Your games and your Steam login stay."
+        };
+        items.push(Item::Buttons(Buttons { buttons: vec![Button::run(label, "setup.start").styled(Style::Primary).running("Setting up...", running)], hint: hint.into(), ..Default::default() }));
+    }
+    if model.steam == SteamState::Ready && !running {
+        let mut buttons = Vec::new();
+        if !model.steam_running {
+            buttons.push(Button::run("Open Steam", "steam.open").styled(Style::Primary).running("Opening Steam...", busy(model, &pending::Request::OpenSteam)));
+        }
+        buttons.push(Button::run("Stop Steam and games", "steam.stop").styled(Style::Danger).running("Stopping...", busy(model, &pending::Request::StopSteam)));
+        let hint = "Games on another disk: in the Steam window, open Settings, then Storage, and add a folder on that disk (it sits under Z:\\Volumes). The games installed there show up in the list.";
+        items.push(Item::Buttons(Buttons { buttons, hint: hint.into(), ..Default::default() }));
+    }
+    Page { id: STEAM.into(), title: "Steam and game support".into(), short: "Steam".into(), listed: true, items }
 }
 
 /// Whether the game of `program` runs: the host names its program.
@@ -433,6 +541,10 @@ pub enum Effect {
     StopAll,
     /// Forgets the render sizes that the host learned
     ForgetSizes,
+    /// Runs the steps of the setup that this Mac needs: Rosetta, the game support, Steam
+    Setup,
+    /// Starts Steam
+    OpenSteam,
 }
 
 /// What a request did.
@@ -530,6 +642,8 @@ fn run(settings: &mut Settings, games: &[Game], id: &str, subject: Option<&str>)
         },
         "steam.stop" => Outcome { effects: vec![Effect::StopAll], pending: Some(pending::Request::StopSteam), ..Default::default() },
         "sizes.forget" => Outcome { effects: vec![Effect::ForgetSizes], ..Default::default() },
+        "setup.start" => Outcome { effects: vec![Effect::Setup], ..Default::default() },
+        "steam.open" => Outcome { effects: vec![Effect::OpenSteam], pending: Some(pending::Request::OpenSteam), ..Default::default() },
         "game.remove" => match game() {
             Some(game) if game.app_id.is_empty() => {
                 let exe = game.exe.clone().unwrap_or_default();

@@ -4,7 +4,7 @@ use crate::{
     pending::{self, Pending, Request},
     run::{self, PERMISSIONS},
     launch::GameOptions,
-    setup::{self, Progress, Setup},
+    setup::Setup,
     steam::{self, SteamState},
     system,
     usb::{self, Connection, Download},
@@ -588,29 +588,18 @@ fn UsbNote(settings: MutableState<Settings>, model: MutableState<Model>) {
 
 #[composable]
 fn PlayTab(settings: MutableState<Settings>, model: MutableState<Model>) {
-    let (state, rosetta, outdated, setup) = model.with(|m| (m.steam, m.rosetta, m.game_support_outdated, m.setup.clone()));
+    let (state, setup) = model.with(|m| (m.steam, m.setup.clone()));
     let open_program = rememberMutableStateOf(|| false);
-    let plan = setup::plan(rosetta, state, outdated);
-    // Steam cannot start before the setup. An outdated game support starts nothing: the library
-    // shows the Update button alone then.
-    let needs_setup = !rosetta || state != SteamState::Ready;
     let running = setup.as_ref().is_some_and(Setup::running);
+    // Steam's state, the setup and its buttons are the model's (see pages.rs): the headset's console
+    // shows the same page
+    let steam_page = page_of(settings, model, pages::STEAM).map(|page| page.items).unwrap_or_default();
+    // The Steam games show while Steam can start them. An outdated game support starts nothing.
+    let library = model.with(|m| m.rosetta && m.steam == SteamState::Ready && !m.game_support_outdated) && !running;
     Card(move || {
-        Heading("Steam".into());
-        if running {
-            let setup = setup.clone().unwrap_or(Setup { steps: vec![] });
-            let steam_opens = setup.steps.iter().any(|(step, _)| *step == setup::Step::Steam);
-            SetupProgress(setup);
-            Hint(if steam_opens {
-                "Keep cranvr open. This takes a few minutes. Steam opens at the end: sign in there once."
-            } else {
-                "Keep cranvr open. Steam and running games stop while this runs."
-            }
-            .into());
-        } else if needs_setup {
-            SetupStart(model, plan.clone(), setup.clone());
-        } else {
-            SteamLibrary(settings, model, setup.clone());
+        PageItems(steam_page.clone(), settings, model);
+        if library {
+            SteamGames(settings, model);
         }
     });
     // Before the game support step there is no Wine to start a program with or to set up. While a
@@ -665,110 +654,16 @@ fn PlayTab(settings: MutableState<Settings>, model: MutableState<Model>) {
     WineCard(settings, model);
 }
 
-/// The steps of a setup, each with its progress line.
+/// The games of the Steam libraries, each with its row of the Play page. A game that the user added
+/// stands in the card of other programs.
 #[composable]
-fn SetupProgress(setup: Setup) {
-    for (step, progress) in setup.steps {
-        let (text, style) = match progress {
-            Progress::Waiting => ("Waiting".to_string(), dim_style()),
-            Progress::Working(text) => (text, TextStyle::default()),
-            Progress::Done => ("Done".to_string(), colored(110, 200, 140)),
-            Progress::Failed(message) => (format!("Failed: {message}"), colored(240, 170, 90)),
-        };
-        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-            Text(step.title().to_string(), Modifier::empty().width(170.0).padding(8.0), sized(16.0, true));
-            Text(text.clone(), Modifier::empty().padding(8.0), style.clone());
-        });
-    }
-}
-
-/// Before the setup of a Mac that cannot run games yet: what the one button does, and what
-/// stays for the user. After a failed run the failure stays on screen above the button.
-#[composable]
-fn SetupStart(model: MutableState<Model>, plan: Vec<setup::Step>, last: Option<Setup>) {
-    let failed = last.as_ref().is_some_and(Setup::failed);
-    let state = model.with(|m| m.steam);
-    let steam_opens = plan.contains(&setup::Step::Steam);
-    Label(if state == SteamState::NoWine {
-        "This Mac needs a one-time setup before it can run Windows VR games. One button does it."
-    } else {
-        "Steam needs a setup step. One button does it."
-    }
-    .into());
-    match last.filter(|_| failed) {
-        Some(last) => SetupProgress(last),
-        None => {
-            for step in plan {
-                FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
-                    Text(step.title().to_string(), Modifier::empty().width(170.0).padding(8.0), sized(16.0, true));
-                    Text(step.describe(state).to_string(), Modifier::empty().padding(8.0), dim_style());
-                });
-            }
-        }
-    }
-    FlowRow(Modifier::empty(), flow(), move || {
-        Primary(if failed { "Retry".into() } else { "Set up games".into() }, setup::start);
-    });
-    if steam_opens {
-        Hint("When it ends, Steam opens. Sign in to Steam there once. Your installed games show up here afterwards.".into());
-    }
-}
-
-/// The notice of a game support that is older than this app expects, with its one button.
-#[composable]
-fn GameSupportUpdate(installed: Option<String>, last: Option<Setup>) {
-    let newest = steam::game_support_expected();
-    Label(match installed {
-        Some(version) => format!("Your game support is version {version}. Version {newest} is available."),
-        None => format!("Your game support is older than version {newest}."),
-    });
-    if let Some(last) = last.filter(Setup::failed) {
-        SetupProgress(last);
-    }
-    FlowRow(Modifier::empty(), flow(), move || {
-        Primary("Update game support".into(), setup::start);
-    });
-    Hint("The update replaces the OpenXR runtime and DXMT in Wine. It stops Steam and running games first. Your games and your Steam login stay.".into());
-}
-
-#[composable]
-fn SteamLibrary(settings: MutableState<Settings>, model: MutableState<Model>, last: Option<Setup>) {
-    let (running, signed_in, games, outdated, installed) = model.with(|m| {
-        // A game that the user added has no manifest: the card of other programs lists it
-        let steam_games: Vec<steam::Game> = m.games.iter().filter(|game| !game.app_id.is_empty()).cloned().collect();
-        (m.steam_running, m.steam_signed_in, steam_games, m.game_support_outdated, m.game_support.clone())
-    });
-    if outdated {
-        GameSupportUpdate(installed, last);
-        return;
-    }
-    if !signed_in {
-        Label(if running {
-            "Sign in to Steam in the Steam window. Steam remembers you after that.".into()
-        } else {
-            "Open Steam and sign in once. Steam remembers you after that.".into()
-        });
-    }
-    FlowRow(Modifier::empty(), flow(), move || {
-        if running {
-            Text("Steam is running.".to_string(), Modifier::empty().padding(8.0), colored(110, 200, 140));
-        } else {
-            Primary(label_of(model, &Request::OpenSteam, "Open Steam"), move || {
-                note(model, Request::OpenSteam);
-                let result = steam::start();
-                model.update(|m| m.message = result.err());
-            });
-        }
-    });
-    Hint("Games on another disk: in the Steam window, open Settings, then Storage, and add a folder on that disk (it sits under Z:\\Volumes). The games installed there show up here.".into());
+fn SteamGames(settings: MutableState<Settings>, model: MutableState<Model>) {
+    let (signed_in, games) = model.with(|m| (m.steam_signed_in, m.games.iter().filter(|game| !game.app_id.is_empty()).cloned().collect::<Vec<_>>()));
     if games.is_empty() {
-        Hint(if signed_in {
-            "No games installed yet. Install them in the Steam window; they show up here.".into()
-        } else {
-            "Your installed games show up here.".into()
-        });
+        Hint(if signed_in { "No games installed yet. Install them in the Steam window; they show up here.".into() } else { "Your installed games show up here.".into() });
         return;
     }
+    Heading("Games".into());
     Hint("Play starts Steam if needed, then the game. Put on the headset first. Options sets what the game starts with.".into());
     for game in games {
         GameRow(settings, model, game);

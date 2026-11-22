@@ -53,11 +53,12 @@
 //!   the ray points beside the menu first (3000 by default).
 //! - `scripted_pointer=pages` walks the pages of the Mac's settings (launch it with `default_places`).
 //!   The left controller is missing, so the hand menu stands in front of the user. The script waits
-//!   for the host's menu and reads its pages. The right controller then holds B, which opens the hand
-//!   menu, and presses the first page's button there: the console opens on that page. It presses the
-//!   first option of the page's first choice that restarts nothing and does not hold now. It goes
-//!   Back to the main page, opens the first game's Options and presses an option of the game's first
-//!   choice in the same way. Each press waits 1 s with the ray at rest, as the pointer smooths the
+//!   for the host's menu and reads its pages. For each page that the hand menu lists, the right
+//!   controller holds B, which opens the hand menu, and presses the page's button there: the console
+//!   opens on that page. It presses the first option of the page's first choice that restarts nothing
+//!   and does not hold now, or the other state of its first such toggle. It presses no action. After
+//!   the last page it goes Back to the main page, opens the first game's Options and presses a change
+//!   there in the same way. Each press waits 1 s with the ray at rest, as the pointer smooths the
 //!   ray. The log names each aim and each choice ("scripted pages:"), and the host's app saves each
 //!   change in its `app.json`.
 //! - `scripted_pointer=palm` plays two hands and no controller: the left hand holds its open palm
@@ -531,24 +532,24 @@ fn pages_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
     let now = std::time::Instant::now();
     // The hand menu in front of the user: its rows, as `hand_menu.rs` lays them out
     let pages = menu.listed();
-    let (first_id, first_short) = pages.first()?.clone();
     let layout = Layout::default();
     let displays_view = displays().menu_view();
     let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays_view, wishes: Default::default(), place: MenuPlace::View, adding: false, pages: &pages };
     let rows = menu_model::rows(&input);
     let height = menu_model::height(&rows);
-    let mut top = PADDING + TITLE + GAP;
-    let mut page_button = None;
-    for row in &rows {
-        if let Some(index) = row.buttons.iter().position(|button| button.action == menu_model::MenuAction::OpenPage(0)) {
-            let n = row.buttons.len() as f32;
-            let each = (WIDTH - 2.0 * PADDING - (n - 1.0) * GAP) / n;
-            page_button = Some(on_view_menu(height, PADDING + index as f32 * (each + GAP) + each / 2.0, top + ROW / 2.0));
-            break;
+    // The place of the button of the page `index` in the hand menu
+    let page_button = |index: usize| {
+        let mut top = PADDING + TITLE + GAP;
+        for row in &rows {
+            if let Some(at) = row.buttons.iter().position(|button| button.action == menu_model::MenuAction::OpenPage(index as u8)) {
+                let n = row.buttons.len() as f32;
+                let each = (WIDTH - 2.0 * PADDING - (n - 1.0) * GAP) / n;
+                return Some(on_view_menu(height, PADDING + at as f32 * (each + GAP) + each / 2.0, top + ROW / 2.0));
+            }
+            top += ROW + GAP + row.details.len() as f32 * DETAIL;
         }
-        top += ROW + GAP + row.details.len() as f32 * DETAIL;
-    }
-    let page_button = page_button?;
+        None
+    };
     // A press: the ray rests on the point for 1 s, then the trigger goes down and up
     let press = |script: ScriptedController, target: [f32; 3]| {
         script.moving_to(Duration::from_millis(1), (at, target), rest).holding(Duration::from_millis(1000), rest).holding(Duration::from_millis(200), pull).holding(Duration::from_millis(600), rest)
@@ -560,22 +561,31 @@ fn pages_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
         Some(on_console(&rows, x, y))
     };
     let mut right = ScriptedController::new(Hand::Right, at, away_from(at)).holding(Duration::from_millis(500), rest);
-    // The hand menu opens with a hold of B, and its first page's button opens the console there
-    right = right.holding(Duration::from_millis(1200), ScriptedButtons { secondary: true, ..rest }).holding(Duration::from_millis(800), rest);
-    log::info!("scripted pages: the hand menu {height:.0} dp tall; the page {first_short} ({first_id}) at {page_button:?}");
-    right = press(right, page_button);
-    let page = Shown::Host(first_id.clone());
-    if let Some(change) = menu.page(&first_id).and_then(first_change) {
-        let target = key_at(&page, &Press::Host(change.clone()))?;
-        log::info!("scripted pages: on {first_id} the change {} at {target:?}", change.to_json());
+    log::info!("scripted pages: the hand menu {height:.0} dp tall with {} pages", pages.len());
+    // Each page: a hold of B opens the hand menu, the page's button opens the console there, and the
+    // first change of the page that restarts nothing is pressed
+    let mut last = None;
+    for (index, (id, short)) in pages.iter().enumerate() {
+        let target = page_button(index)?;
+        right = right.holding(Duration::from_millis(1200), ScriptedButtons { secondary: true, ..rest }).holding(Duration::from_millis(800), rest);
+        log::info!("scripted pages: the page {short} ({id}) at {target:?}");
         right = press(right, target);
+        let page = Shown::Host(id.clone());
+        if let Some(change) = menu.page(id).and_then(first_change) {
+            let target = key_at(&page, &Press::Host(change.clone()))?;
+            log::info!("scripted pages: on {id} the change {} at {target:?}", change.to_json());
+            right = press(right, target);
+        }
+        last = Some(page);
     }
-    // Back to the main page, and the first game's options there
+    let page = last?;
+    // Back to the main page, and the first game's options there: the first link to a page that the
+    // menus do not list
     right = press(right, key_at(&page, &Press::Back)?);
     let options = menu.main().and_then(|main| {
         main.items.iter().find_map(|item| match item {
             cranvr_common::menu::Item::Buttons(row) => row.buttons.iter().find_map(|button| match &button.press {
-                cranvr_common::menu::Press::Open { page } => Some(page.clone()),
+                cranvr_common::menu::Press::Open { page } if !pages.iter().any(|(id, _)| id == page) => Some(page.clone()),
                 _ => None,
             }),
             _ => None,
