@@ -1038,9 +1038,12 @@ mod tests {
         println!("path file during the game: {during:?}");
         println!("OpenComposite's log: {:?}", refused.lines().filter(|line| line.contains("refused") || line.contains("Steam")).collect::<Vec<_>>());
         println!("Steam's console log: {:?}", console.lines().filter(|line| line.contains("VR") || line.contains("assert") || line.contains("stall")).collect::<Vec<_>>());
-        // An OpenVR program through OpenComposite, from the app's start path
+        // An OpenVR program through OpenComposite, from the app's start path. The game's last stats window does
+        // not count for it.
         let smoke = prefix().join("drive_c/opencomposite/openvr_smoke.exe");
         run_program(&smoke).expect("the program starts");
+        backend::pump(&mut model);
+        model.stats = None;
         let smoke_during = fs::read_to_string(&file).ok();
         let smoke_frames = pump_until(&mut model, Duration::from_secs(30), |_, most| most > 100);
         let smoke_log = fs::read_to_string(&oc_log).unwrap_or_default();
