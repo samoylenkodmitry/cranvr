@@ -1,5 +1,5 @@
-//! The ScreenCaptureKit calls that the desktop view and the game sound share: a display to
-//! capture and the start of a stream. Both need Screen Recording, which macOS asks for on first use.
+//! The ScreenCaptureKit calls of the desktop view: a display to capture and the start of a stream.
+//! They need Screen Recording, which macOS asks for on first use.
 
 use block2::RcBlock;
 use objc2::rc::Retained;
@@ -14,11 +14,6 @@ unsafe impl<T> Send for SendBox<T> {}
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGMainDisplayID() -> u32;
-}
-
-/// The main display, or the first one when ScreenCaptureKit does not list the main display.
-pub fn main_display() -> Result<Retained<SCDisplay>, String> {
-    display(None)
 }
 
 /// The display with this ID, or the main one. A display that macOS just added can take a moment

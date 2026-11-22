@@ -272,24 +272,48 @@ fn default_eye_width(foveation: bool, fps: u32) -> u32 {
     }
 }
 
-/// Starts the capture of the Mac's sound in the background: ScreenCaptureKit takes up to a few
-/// seconds to answer, longer when macOS asks for Screen Recording.
+/// Starts the capture of the Mac's sound in the background. It waits for the System Audio
+/// Recording permission, which the app asks for, and starts again on a new output device.
 fn start_game_audio() {
+    use cranvr_common::system_audio::{self, Access};
     thread::Builder::new()
         .name("game-audio".into())
-        .spawn(|| match game_audio::Capture::start() {
-            Ok(capture) => {
-                info!("Game audio: capturing this Mac's sound for the headset");
-                status::emit(json!({"type": "audio", "ok": true}));
-                // The capture runs as long as the host
-                let _capture = capture;
-                loop {
-                    thread::park();
+        .spawn(|| {
+            let mut told = None;
+            loop {
+                let access = system_audio::access();
+                if access == Access::Granted {
+                    break;
                 }
+                if told != Some(access) {
+                    let message = "cranvr may not record this Mac's sound: allow System Audio Recording for cranvr";
+                    warn!("Game audio: {message} (the permission reads {access:?}); the capture starts once it is allowed");
+                    status::emit(json!({"type": "audio", "ok": false, "message": message}));
+                    told = Some(access);
+                }
+                thread::sleep(Duration::from_secs(1));
             }
-            Err(e) => {
-                warn!("Game audio: {e}");
-                status::emit(json!({"type": "audio", "ok": false, "message": e}));
+            let (changed, change) = std::sync::mpsc::channel();
+            game_audio::watch_default_output(changed.clone());
+            loop {
+                match game_audio::Capture::start(changed.clone()) {
+                    Ok(capture) => {
+                        info!("Game audio: capturing this Mac's sound for the headset with a Core Audio tap: {}", capture.summary);
+                        status::emit(json!({"type": "audio", "ok": true}));
+                        // The capture runs until the output device changes
+                        change.recv().ok();
+                        drop(capture);
+                    }
+                    Err(e) => {
+                        warn!("Game audio: {e}; the capture tries again when the output device changes");
+                        status::emit(json!({"type": "audio", "ok": false, "message": e}));
+                        change.recv().ok();
+                    }
+                }
+                // A change often comes as several messages: one start serves them all
+                thread::sleep(Duration::from_millis(500));
+                while change.try_recv().is_ok() {}
+                info!("Game audio: the output device changed: the capture starts again");
             }
         })
         .ok();

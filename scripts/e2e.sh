@@ -109,7 +109,8 @@
 #                 log shows no press of one button, no scroll in one axis or a press without its
 #                 release. It counts every frame of the right size, since the desktop scene draws no
 #                 eye badges. The run fails when the probe gets the sound for less than 80 percent of
-#                 the stream time. --host-arg --virtual-display
+#                 the stream time. Without System Audio Recording for the terminal app the host sends
+#                 no sound, and the run skips that check. --host-arg --virtual-display
 #                 --host-arg 1920x1080 shows a virtual display instead of the main one.
 #   --displays N  with --desktop's host: the probe shows N displays. It asks the host to add N-1 of them, wishes
 #                 the video of each, decodes each stream, plays the pointer script on each and removes the last one
@@ -859,9 +860,12 @@ if [[ ${done_line} =~ '([0-9]+) received, [0-9]+ decoded \(([0-9]+) good' ]]; th
     extra+=(received=${match[1]} shown=${match[2]})
 fi
 # The seconds of the Mac's sound that reached the probe. The capture sends silence too, so
-# the sound arrives without a sound playing.
+# the sound arrives without a sound playing. A host started from a terminal captures only when the
+# terminal app may record the system sound (System Audio Recording): the run then skips the check.
 audio_line=$(grep -h "probe: audio:" "${work}/probe.log" 2>/dev/null || true)
-if [[ ${audio_line} =~ '([0-9.]+) s of sound in' ]] && (( ! ${host_args[(Ie)--no-game-audio]} )); then
+if grep -q "Game audio: cranvr may not record" "${work}/host.log" 2>/dev/null; then
+    print "The Mac's sound was not checked: the app that started this run may not record the system sound"
+elif [[ ${audio_line} =~ '([0-9.]+) s of sound in' ]] && (( ! ${host_args[(Ie)--no-game-audio]} )); then
     extra+=(audio_seconds=${match[1]})
 fi
 if [[ ${client} == quest ]]; then
