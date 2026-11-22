@@ -57,7 +57,7 @@ The headset shows the Mac's main display in a panel as a second video stream at 
 - To add a display that only the headset shows, pick "Add a display" in the Desktop tab. It sits to the right of the TV. No window moves by itself: drag windows onto it with the Mac's mouse.
 - Point at a window with a controller to move the mouse. Pull the trigger to click. Push the thumbstick to scroll. Type on the Mac's keyboard.
 - To move the panel, point at the handle under it, hold the trigger and move the controller. Push the thumbstick forward or back to move the panel away or near. Push it left or right to resize the panel. The client keeps the panel's place for the next start.
-- Hold the left controller's menu button for a moment to show or hide the console. It has a button for each installed game and buttons for the main settings. A row at its bottom has Close, Disconnect and Exit.
+- Hold the left controller's menu button or B on the right controller for a moment to open the hand menu. Its Console row shows or hides the console. It has a button for each installed game and buttons for the main settings. A row at its bottom has Close, Disconnect and Exit.
 - With an added display, "Main display while the headset is on" moves everything into VR while the headset streams. The menu bar, the Dock and your windows then move from the TV into VR. They go back when the stream ends. "Bring the cranvr window into VR" moves only the cranvr window. Both are off by default.
 
 ## Play

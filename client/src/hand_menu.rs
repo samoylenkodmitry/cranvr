@@ -72,7 +72,7 @@ use crate::place;
 use cranpose::launch_args;
 use cranpose::prelude::*;
 use cranpose::text::FontWeight;
-use cranpose_xr::{local_spatial_capabilities, FollowMode, FollowTarget, FollowingSubspace, Hand, Pose, SpatialPanel, SubspaceModifier, TrackedDimensions, Vibration};
+use cranpose_xr::{local_spatial_capabilities, FollowMode, FollowTarget, FollowingSubspace, Hand, HandJointType, Pose, SpatialPanel, SubspaceModifier, TrackedDimensions, Vibration};
 use cranvr_common::controls::{Controls, Hand as ControlHand};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
@@ -260,6 +260,14 @@ pub struct HandState {
     pub present: MutableState<[bool; 2]>,
     /// The line under the ball shows (`menu_hint.rs`)
     pub hint: MutableState<bool>,
+    /// The palm that carries a ball of its own, while it faces the eyes (`palm.rs`)
+    pub palm: MutableState<Option<ControlHand>>,
+    /// The cameras track a hand
+    pub hands: MutableState<bool>,
+    /// No controller is present and the cameras track no hand: a look opens the menu (`gaze.rs`)
+    pub gaze: MutableState<bool>,
+    /// A look rests on that ball and counts toward a press: the ball shows it
+    pub looking: MutableState<bool>,
     /// Counts up at each press on Recenter: the room's panels compose again around the head
     pub recenter: MutableState<u32>,
 }
@@ -281,7 +289,8 @@ pub fn HandPanels(state: HandState, console_open: bool, controls: Controls, stre
     let on_hand = layout.hand_display();
     let pinned_shown = on_hand.filter(|stream| layout.shown(PanelId::Display(*stream)));
     let open = state.menu_open.get();
-    let hint = (state.hint.get() && !open).then(|| crate::menu_hint::text(&controls, state.present.get(), place, streaming));
+    let gaze = state.gaze.get();
+    let hint = (state.hint.get() && !open).then(|| crate::menu_hint::text(&controls, state.present.get(), state.hands.get(), place, streaming));
     let said = hint.clone();
     LaunchedEffect(said.clone(), async move |_| {
         if let Some(text) = said {
@@ -305,12 +314,23 @@ pub fn HandPanels(state: HandState, console_open: bool, controls: Controls, stre
             }
         }
     });
+    // An open palm that faces the eyes carries a ball of its own, which the other hand presses
+    if let Some(hand) = state.palm.get() {
+        key(hand, move || PalmBall(state, hand));
+    }
+    // With no input at all, the ball that a look presses takes the place of the ball in the view
+    if gaze {
+        let hint = hint.clone();
+        GazeBall(state, hint);
+    }
     // A new place composes its panels anew: each place has its own subspace and its own saved places
     key(place, move || {
         FollowingSubspace(target.clone(), move || {
-            Strip(state, frame, on_hand);
-            if let Some(text) = hint.clone() {
-                Hint(text, frame);
+            if !gaze {
+                Strip(state, frame, on_hand);
+                if let Some(text) = hint.clone() {
+                    Hint(text, frame);
+                }
             }
             if open {
                 Menu(state, console_open, frame);
@@ -357,6 +377,52 @@ fn Strip(state: HandState, frame: HandFrame, pinned: Option<u8>) {
                 }
             },
         );
+    });
+}
+
+/// The ball's distance in front of the palm, in dp
+const PALM_LIFT: f32 = 70.0;
+
+/// The ball on an open palm (see `palm.rs`): it stands in front of the palm and faces away from it,
+/// toward the eyes that the palm faces.
+#[composable]
+fn PalmBall(state: HandState, hand: ControlHand) {
+    let xr_hand = match hand {
+        ControlHand::Left => Hand::Left,
+        ControlHand::Right => Hand::Right,
+    };
+    let open = state.menu_open.get();
+    // A hand joint's +y points out of the back of the hand: the palm's side is -y, and a turn of 90
+    // degrees about x makes the ball face along it
+    let modifier = SubspaceModifier::new().size(BALL, BALL).offset(0.0, -PALM_LIFT, 0.0).rotate(90.0, 0.0, 0.0).layer_priority(layer_rank::HAND_MENU);
+    FollowingSubspace(FollowTarget::Hand(xr_hand, HandJointType::Palm, FollowMode::Tight(TrackedDimensions::All)), move || {
+        SpatialPanel(modifier.clone(), move || {
+            let hovered = hover::hover_modifier(hover::STRIP);
+            Box(Modifier::empty().fill_max_size().then(hovered), BoxSpec::default(), move || {
+                Round(if open { ACCENT_COLOR } else { KEY_COLOR }, RoundPress::Menu, state);
+            });
+        });
+    });
+}
+
+/// The ball that a look presses, low in front of the user (see `gaze.rs`), with the line under it. It
+/// follows the head's place and heading in every frame, so the app knows where it stands.
+#[composable]
+fn GazeBall(state: HandState, hint: Option<String>) {
+    let pitch = crate::gaze::pitch();
+    let [x, y, z] = crate::gaze::offset(pitch);
+    let open = state.menu_open.get() || state.looking.get();
+    // The frame of the line under the ball: its base lies `LIFT` below the ball, as on a hand
+    let frame = HandFrame { base: [x, y - LIFT, z], stand: Stand::Front, menu: "gaze-menu", display: "gaze-display" };
+    FollowingSubspace(FollowTarget::View(FollowMode::Tight(TrackedDimensions::TranslationAndYaw)), move || {
+        // Tilted up by the ball's angle, so it faces the eyes
+        let modifier = SubspaceModifier::new().size(BALL, BALL).offset(x, y, z).rotate(-pitch, 0.0, 0.0).layer_priority(layer_rank::HAND_MENU);
+        SpatialPanel(modifier, move || {
+            Round(if open { ACCENT_COLOR } else { KEY_COLOR }, RoundPress::Menu, state);
+        });
+        if let Some(text) = hint.clone() {
+            Hint(text, frame);
+        }
     });
 }
 

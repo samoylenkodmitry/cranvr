@@ -28,8 +28,9 @@
 //! - The wish ends with the game or the link, and a hand that the cameras lose for a moment keeps
 //!   the answer for a second and a half. The panels come back after that.
 //!
-//! The way out for a user who plays with hands only: the panels stay hidden, and the hand menu opens
-//! with the hold of a menu button of a controller. The user picks one up, and its ray points
+//! The way out for a user who plays with hands only: the panels and the palm's ball stay hidden, and
+//! the hand menu opens with the hold of a menu button of a controller, the left palm's pinch (the
+//! menu gesture) or the Mac's button "Open the menu in the headset". The user picks one up, and its ray points
 //! first. Without a controller the user ends the game in the cranvr app on the Mac, or leaves the
 //! headset app through the system's menu.
 

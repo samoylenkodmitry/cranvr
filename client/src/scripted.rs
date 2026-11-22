@@ -40,6 +40,12 @@
 //!   ball with the point that it hit, so a run reads the panel's place in numbers. Launch it with
 //!   `default_places`, so the user's carries do not move the panels, and with a link to a host that
 //!   has the standard mapping.
+//! - `scripted_pointer=none` plays both controllers as missing, for the look that opens the menu
+//!   (`gaze.rs`). With `gaze_pitch=0` the ball stands straight ahead, where a headset on a desk looks.
+//! - `scripted_pointer=palm` plays two hands and no controller: the left hand holds its open palm
+//!   35 cm ahead of the eyes and 15 cm below them, turned to the eyes, and never pinches. The right
+//!   hand points at the ball that shows in front of that palm and pinches every 2 s, which opens and
+//!   closes the menu in turn.
 
 use crate::{hand_menu, menu_model, place, ui};
 use cranpose::launch_args;
@@ -77,6 +83,16 @@ pub fn install_once() {
         }
         if args.string("scripted_pointer") == Some("console") {
             pointing_at_console();
+            return;
+        }
+        if args.string("scripted_pointer") == Some("none") {
+            log::info!("scripted: both controllers are missing");
+            script_controller(missing(Hand::Left));
+            script_controller(missing(Hand::Right));
+            return;
+        }
+        if args.string("scripted_pointer") == Some("palm") {
+            palm_check();
             return;
         }
         if args.string("scripted_pointer") == Some("menu") {
@@ -415,4 +431,22 @@ fn menu_check(hands: &str) {
             script_controller(right);
         }
     }
+}
+
+/// Where the left palm of `scripted_pointer=palm` stands: 35 cm ahead of the head's start and 15 cm
+/// below it, turned so that its palm faces back toward the head (a turn of -90 degrees about x takes
+/// the joint's +y, the back of the hand, away from the head)
+const PALM: Pose = Pose { position: [-0.1, -0.15, -0.35], orientation: [-std::f32::consts::FRAC_1_SQRT_2, 0.0, 0.0, std::f32::consts::FRAC_1_SQRT_2] };
+
+/// Plays `scripted_pointer=palm` (see the file's notes).
+fn palm_check() {
+    script_controller(missing(Hand::Left));
+    script_controller(missing(Hand::Right));
+    // The ball stands 7 cm in front of the palm, along the palm's side of the joint
+    let ball = PALM.then(&Pose::at([0.0, -0.07, 0.0])).position;
+    let still = PinchCycle { rest: Duration::from_secs(600), closing: Duration::from_millis(1), held: Duration::from_millis(1), opening: Duration::from_millis(1) };
+    let pinch = PinchCycle { rest: Duration::from_millis(1600), closing: Duration::from_millis(150), held: Duration::from_millis(250), opening: Duration::from_millis(150) };
+    log::info!("scripted palm check: the left palm at {:?}, the right hand points at the ball at {ball:?} and pinches every 2.15 s", PALM.position);
+    script_hand(ScriptedHand::pointing(Hand::Left, [-0.15, -0.3, -0.3], [-0.15, -1.3, -0.6], still).with_palm(PALM));
+    script_hand(ScriptedHand::pointing(Hand::Right, [0.15, -0.25, -0.2], ball, pinch));
 }
