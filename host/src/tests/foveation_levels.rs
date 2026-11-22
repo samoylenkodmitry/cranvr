@@ -9,6 +9,8 @@
 //! and at the edges, the SSIM of the center, the bits and the encode and decode times.
 //!
 //! A level `Off` runs at the eye that the host takes without foveation at 120 Hz. The run named
+//! `medium alvr` keeps ALVR's own shift of the region, as the stream had it before the host centered
+//! the region on the view. The run named
 //! `edge blur` stands in for a quantizer per region: VideoToolbox has no public way to give one (see
 //! the PR of #93). It keeps every pixel of the eye and blurs the edges as much as the level Medium
 //! squeezes them, so the encoder spends few bits there.
@@ -70,6 +72,8 @@ enum Region {
 #[derive(Clone, Copy, Debug)]
 enum Variant {
     Level(FoveationLevel),
+    /// A level with ALVR's own shift, as the stream had it before the host centered the region
+    AlvrShift(FoveationLevel),
     /// Every pixel of an eye of this size, with the edges blurred by the level Medium's squeeze
     EdgeBlur([u32; 2]),
 }
@@ -78,6 +82,7 @@ impl Variant {
     fn label(self) -> String {
         match self {
             Variant::Level(level) => level.name().into(),
+            Variant::AlvrShift(level) => format!("{} alvr", level.name()),
             Variant::EdgeBlur(eye) => format!("edge blur {}", eye[0]),
         }
     }
@@ -85,7 +90,7 @@ impl Variant {
     fn eye(self) -> [u32; 2] {
         match self {
             Variant::Level(FoveationLevel::Off) => OFF_EYE,
-            Variant::Level(_) => EYE,
+            Variant::Level(_) | Variant::AlvrShift(_) => EYE,
             Variant::EdgeBlur(eye) => eye,
         }
     }
@@ -93,6 +98,7 @@ impl Variant {
     fn foveation(self) -> Option<Foveation> {
         match self {
             Variant::Level(level) => level.config().map(|config| Foveation::new(EYE, &config.centered(FOV[0]))),
+            Variant::AlvrShift(level) => level.config().map(|config| Foveation::new(EYE, &config)),
             Variant::EdgeBlur(_) => None,
         }
     }
@@ -572,7 +578,10 @@ fn foveation_levels() {
     }
     // `CRANVR_FOV_SCENE=pattern` runs the host's test scene instead of the game's landscape
     let land = (!std::env::var("CRANVR_FOV_SCENE").is_ok_and(|v| v == "pattern")).then(|| landscape(6144, 3072));
-    let variants = FoveationLevel::ALL.map(Variant::Level).into_iter().chain([Variant::EdgeBlur(OFF_EYE), Variant::EdgeBlur(EYE)]);
+    let variants = FoveationLevel::ALL
+        .map(Variant::Level)
+        .into_iter()
+        .chain([Variant::AlvrShift(FoveationLevel::Medium), Variant::EdgeBlur(OFF_EYE), Variant::EdgeBlur(EYE)]);
     let variants: Vec<Variant> = match std::env::var("CRANVR_FOV_ONLY") {
         Ok(only) => variants.filter(|v| only.split(',').any(|o| v.label() == o)).collect(),
         Err(_) => variants.collect(),

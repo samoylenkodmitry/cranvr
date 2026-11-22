@@ -1208,8 +1208,8 @@ fn GeneralSettings(settings: MutableState<Settings>, model: MutableState<Model>)
             match foveation {
                 FoveationLevel::Off => "Every pixel at the same detail. At 120 Hz the eye is smaller, so the center is less sharp.",
                 FoveationLevel::Low => "The center is sharp and the edges lose a little detail. Each frame takes about 2 ms longer to encode and decode than at Medium.",
-                FoveationLevel::Medium => "The center is sharp and the edges lose detail. This is the standard level: it measured best at the cable's 40 Mbps.",
-                FoveationLevel::High => "The center gets the most bits and the edges lose the most detail. The sharp region in the middle of the view is smaller.",
+                FoveationLevel::Medium => "The center is sharp and the edges lose detail. This is the standard level.",
+                FoveationLevel::High => "The center gets the most bits and the edges lose the most detail. The sharp region around straight ahead is smaller.",
             }
             .into(),
         );

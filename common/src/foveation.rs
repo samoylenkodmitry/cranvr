@@ -287,6 +287,14 @@ mod tests {
                 assert!((d[0] - 1.0).abs() < 0.05 && (d[1] - 1.0).abs() < 0.05, "{level:?} at {tx}, {ty}: {d:?}");
             }
             assert!(f.center_shift[1] < 0.0, "{level:?}: the region moves up, toward straight ahead");
+            // The client's unwarp undoes the host's warp across the whole view, both edges included
+            for i in 0..=20 {
+                for j in 0..=20 {
+                    let view = [i as f32 / 20.0, j as f32 / 20.0];
+                    let back = f.encoded_to_view(f.view_to_encoded(view));
+                    assert!((back[0] - view[0]).abs() < 1e-3 && (back[1] - view[1]).abs() < 1e-3, "{level:?} {view:?} -> {back:?}");
+                }
+            }
         }
         // ALVR's own shift: High's region ends right above straight ahead
         let alvr = Foveation::new(eye, &FoveationLevel::High.config().unwrap());
