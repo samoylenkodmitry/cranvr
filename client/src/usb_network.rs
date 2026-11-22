@@ -23,7 +23,10 @@ use cranvr_proto::{
 use std::{
     io,
     net::{Ipv6Addr, SocketAddr, TcpStream, UdpSocket},
-    sync::{Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, OnceLock,
+    },
     time::{Duration, Instant},
 };
 
@@ -49,6 +52,8 @@ struct Held {
 }
 
 static HELD: Mutex<Option<Held>> = Mutex::new(None);
+/// Set once the platform answered a request at once that it hands out no network
+static UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 
 /// Whether this launch asks for the USB network. `--ez usb_network false` keeps the headset's USB
 /// functions as they are, for a test of `adb reverse` that a change of the functions would cut.
@@ -60,7 +65,7 @@ pub fn wanted() -> bool {
 /// Keeps a request for the USB network while the app has the focus. The cable's thread calls it
 /// about once a second.
 pub fn keep() {
-    if !wanted() {
+    if !wanted() || UNSUPPORTED.load(Ordering::Relaxed) {
         return;
     }
     let mut held = HELD.lock().unwrap();
@@ -68,7 +73,15 @@ pub fn keep() {
         *held = None;
     }
     if held.is_none() && focus::current() == Focus::Focused {
-        *held = Some(Held { request: request_network(NetworkRequest::local(NetworkTransport::Usb)), since: Instant::now(), told: None, up_since: None });
+        let request = request_network(NetworkRequest::local(NetworkTransport::Usb));
+        if request.state() == NetworkRequestState::Unavailable {
+            // The platform hands no network to an app, such as a phone without the headset's
+            // backend: no later request would get one
+            log::info!("this device hands out no USB network");
+            UNSUPPORTED.store(true, Ordering::Relaxed);
+            return;
+        }
+        *held = Some(Held { request, since: Instant::now(), told: None, up_since: None });
     }
     if let Some(held) = held.as_mut() {
         let state = held.request.state();
