@@ -451,7 +451,7 @@ fn main() {
             Err(RecvTimeoutError::Disconnected) => break,
         };
         match event {
-            Event::Connected { stream: negotiated, ip: client_ip } => {
+            Event::Connected { stream: negotiated, ip: client_ip, cable } => {
                 watch.connected();
                 console.connected();
                 info!("Headset address: {client_ip}");
@@ -465,8 +465,8 @@ fn main() {
                     error!("Headset connected with codec {:?}, but this host only encodes HEVC", negotiated.codec);
                 }
                 let n = &negotiated;
-                // `ip` tells the app which way the stream travels: loopback is the USB cable
-                status::emit(json!({"type": "headset", "connected": true, "eye": [n.eye_width, n.eye_height], "fps": n.fps, "foveated": n.foveated, "ip": client_ip.to_string()}));
+                // `cable` tells the app which way the stream travels
+                status::emit(json!({"type": "headset", "connected": true, "eye": [n.eye_width, n.eye_height], "fps": n.fps, "foveated": n.foveated, "ip": client_ip.to_string(), "cable": cable}));
                 // games that start from now on render at the stream's eye size
                 let scaled = |v: u32| (v as f32 * options.game_scale).round() as u32;
                 if let Err(e) = link.write_control_file((scaled(n.eye_width), scaled(n.eye_height)), n.fps.round() as u32) {

@@ -65,6 +65,7 @@ pub fn caps() -> ClientCaps {
         decoders: 2,
         foveation: true,
         tcp_only: false,
+        cable: false,
     }
 }
 

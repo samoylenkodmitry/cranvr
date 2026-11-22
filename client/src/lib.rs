@@ -42,6 +42,7 @@ mod tracked;
 mod tracking;
 mod ui;
 mod usb;
+mod usb_network;
 
 pub use ui::{ClientApp, PhoneApp};
 

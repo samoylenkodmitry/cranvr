@@ -3,12 +3,12 @@
 //! ports and no broadcast except the one that checks that two hosts on a Mac both answer it.
 
 use cranvr_proto::{
-    discovery::{find, Answer, Finder, Responder},
+    discovery::{find, find_with, Answer, Finder, Responder},
     identity::{fingerprint, Identity},
     PROTOCOL_VERSION,
 };
 use std::{
-    net::{Ipv4Addr, SocketAddr, UdpSocket},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket},
     sync::{atomic::AtomicBool, Arc},
     thread,
     time::Duration,
@@ -33,7 +33,14 @@ struct Running {
 
 impl Running {
     fn start(port: u16, answer: Answer) -> Running {
-        let responder = Responder::bind(port).unwrap();
+        Self::run(Responder::bind(port).unwrap(), answer)
+    }
+
+    fn start_ipv6(port: u16, answer: Answer) -> Running {
+        Self::run(Responder::bind_ipv6(port).unwrap(), answer)
+    }
+
+    fn run(responder: Responder, answer: Answer) -> Running {
         let port = responder.local_addr().unwrap().port();
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
@@ -61,7 +68,7 @@ fn a_finder_hears_the_name_the_port_and_the_fingerprint_of_a_host() {
     let found = find(vec![loopback(host.port)], Duration::from_millis(600)).unwrap();
     assert_eq!(found.len(), 1, "one host, listed once although the finder asked several times");
     let found = &found[0];
-    assert_eq!(found.address, Ipv4Addr::LOCALHOST);
+    assert_eq!(found.from.ip(), Ipv4Addr::LOCALHOST);
     assert_eq!(found.socket_addr(), loopback(9961));
     assert_eq!(found.answer.name, "Dmitry's MacBook");
     assert_eq!(found.answer.fingerprint, fingerprint(&Identity::from_seed([7; 32]).public_key()));
@@ -95,4 +102,37 @@ fn two_hosts_on_one_port_both_hear_a_broadcast() {
     let mut names: Vec<_> = found.iter().map(|host| host.answer.name.clone()).collect();
     names.sort();
     assert_eq!(names, ["First", "Second"], "{found:?}");
+}
+
+#[test]
+fn an_ipv6_responder_shares_the_port_of_the_ipv4_one_and_answers_on_ipv6() {
+    let v4 = Running::start(0, answer("Mac", 9961, 3));
+    let v6 = Running::start_ipv6(v4.port, answer("Mac", 9961, 3));
+    assert_eq!(v4.port, v6.port);
+    let socket = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).unwrap();
+    let finder = Finder::on(socket, vec![(Ipv6Addr::LOCALHOST, v6.port).into()]).unwrap();
+    let found = find_with(&finder, Duration::from_millis(600));
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].socket_addr(), (Ipv6Addr::LOCALHOST, 9961).into());
+}
+
+/// The interface index of macOS's loopback, which has the link-local address fe80::1
+#[cfg(target_os = "macos")]
+const LOOPBACK_SCOPE: u32 = 1;
+
+// A query to the group of all nodes on a link reaches a responder that joined no group, as the
+// headset's query on the USB network reaches the Mac. The answer keeps the link as its scope.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_query_to_all_nodes_on_a_link_finds_the_host_by_its_link_local_address() {
+    let host = Running::start_ipv6(0, answer("Mac", 9962, 4));
+    let all_nodes = SocketAddrV6::new(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1), host.port, 0, LOOPBACK_SCOPE);
+    let socket = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).unwrap();
+    let finder = Finder::on(socket, vec![all_nodes.into()]).unwrap();
+    let found = find_with(&finder, Duration::from_millis(600));
+    assert_eq!(found.len(), 1, "{found:?}");
+    let SocketAddr::V6(address) = found[0].socket_addr() else { panic!("an IPv6 answer: {found:?}") };
+    assert!(address.ip().is_unicast_link_local(), "{address}");
+    assert_eq!(address.scope_id(), LOOPBACK_SCOPE);
+    assert_eq!(address.port(), 9962);
 }

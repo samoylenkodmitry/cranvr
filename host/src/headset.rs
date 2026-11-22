@@ -41,8 +41,9 @@ pub struct Button {
 }
 
 pub enum Event {
-    /// A headset connected. `stream` is what the two sides agreed on.
-    Connected { stream: Negotiated, ip: IpAddr },
+    /// A headset connected. `stream` is what the two sides agreed on. `cable` says that the link
+    /// runs over a USB cable: `adb reverse` or the headset's USB network.
+    Connected { stream: Negotiated, ip: IpAddr, cable: bool },
     Disconnected,
     /// The headset sent a new tracking sample. The sample time is on the headset's clock. Frames
     /// carry it back.

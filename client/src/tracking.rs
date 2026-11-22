@@ -1090,6 +1090,7 @@ mod tests {
             decoders: 1,
             foveation: false,
             tcp_only: true,
+            cable: true,
         };
         (ClientLink::connect(addr, &caps, &identity, None, Duration::from_secs(10)).unwrap(), inbox)
     }

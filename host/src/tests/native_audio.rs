@@ -51,6 +51,7 @@ fn the_sound_reaches_the_client_in_datagrams_of_five_milliseconds() {
         decoders: 1,
         foveation: true,
         tcp_only: false,
+        cable: false,
     };
     let client = Arc::new(ClientLink::connect(([127, 0, 0, 1], port).into(), &caps, &identity, None, Duration::from_secs(10)).unwrap());
     // The welcome tells the client that sound comes

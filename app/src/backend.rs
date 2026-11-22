@@ -373,7 +373,7 @@ pub struct Headset {
     pub eye: (u32, u32),
     pub fps: f64,
     pub foveated: bool,
-    /// Which way the stream travels, once the host says: the USB cable shows as a loopback address
+    /// Which way the stream travels, once the host says
     pub path: Option<StreamPath>,
 }
 
@@ -385,11 +385,14 @@ pub enum StreamPath {
 }
 
 impl StreamPath {
-    /// From the headset's address in the host's `headset` line. The cable ends at this Mac's own
-    /// address, because `adb reverse` hands the connection to the host from loopback.
-    fn of(ip: &str) -> Option<Self> {
-        let ip: std::net::IpAddr = ip.parse().ok()?;
-        Some(if ip.is_loopback() { StreamPath::Usb } else { StreamPath::WiFi })
+    /// From the `cable` of the host's `headset` line: the headset says whether its link runs over
+    /// the USB cable, through `adb reverse` or its USB network.
+    fn of(cable: bool) -> Self {
+        if cable {
+            StreamPath::Usb
+        } else {
+            StreamPath::WiFi
+        }
     }
 }
 
@@ -521,7 +524,7 @@ impl Model {
                     eye: (v["eye"][0].as_u64().unwrap_or(0) as u32, v["eye"][1].as_u64().unwrap_or(0) as u32),
                     fps: v["fps"].as_f64().unwrap_or(0.0),
                     foveated: v["foveated"].as_bool().unwrap_or(false),
-                    path: v["ip"].as_str().and_then(StreamPath::of),
+                    path: v["cable"].as_bool().map(StreamPath::of),
                 });
                 if self.headset.is_none() {
                     self.stats = None;
@@ -1210,22 +1213,23 @@ mod tests {
         assert!(model.headset.is_none() && model.stats.is_none());
     }
 
-    // The host's `headset` line carries the headset's address. This Mac's own address means that
-    // the stream runs over the USB cable.
+    // The host's `headset` line says whether the link runs over the USB cable. The headset's
+    // address does not tell: its USB network has a link-local address like any network.
     #[test]
     fn the_headset_line_tells_whether_the_stream_uses_the_cable() {
-        let line = |ip: serde_json::Value| serde_json::json!({"type": "headset", "connected": true, "eye": [2064, 2208], "fps": 120.0, "foveated": true, "ip": ip});
-        let path = |ip: serde_json::Value| {
+        let line = |ip: &str, cable: serde_json::Value| {
+            serde_json::json!({"type": "headset", "connected": true, "eye": [2064, 2208], "fps": 120.0, "foveated": true, "ip": ip, "cable": cable})
+        };
+        let path = |ip: &str, cable: serde_json::Value| {
             let mut model = Model::default();
-            model.apply_status(&line(ip));
+            model.apply_status(&line(ip, cable));
             model.headset.unwrap().path
         };
-        assert_eq!(path("127.0.0.1".into()), Some(StreamPath::Usb));
-        assert_eq!(path("::1".into()), Some(StreamPath::Usb));
-        assert_eq!(path("192.168.1.30".into()), Some(StreamPath::WiFi));
-        // A host that does not say, or says nonsense, leaves the path unknown
-        assert_eq!(path(serde_json::Value::Null), None);
-        assert_eq!(path("not an address".into()), None);
+        assert_eq!(path("127.0.0.1", true.into()), Some(StreamPath::Usb));
+        assert_eq!(path("fe80::20:c91:c353:87c3", true.into()), Some(StreamPath::Usb));
+        assert_eq!(path("192.168.1.30", false.into()), Some(StreamPath::WiFi));
+        // A host that does not say leaves the path unknown
+        assert_eq!(path("192.168.1.30", serde_json::Value::Null), None);
     }
 
     #[test]

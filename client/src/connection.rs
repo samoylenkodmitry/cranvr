@@ -18,6 +18,7 @@ use crate::{
     },
     phone, sizing, tracking,
     usb::{self, Aim, Path},
+    usb_network::{self, NetworkRoute},
 };
 use cranpose::{
     AccessUnit, DecodedFrames, DecoderCapabilities, DecoderConfig, DecoderError, DecoderOutput, VideoCodec, VideoDecoder,
@@ -26,7 +27,7 @@ use cranpose_xr::{Hand, StreamCounts, Vibration};
 use cranvr_proto::{
     clock::{now_ns, ClockSync},
     identity::format_code,
-    link::{ClientLink, ClientSide, ConnectObserver, Incoming},
+    link::{AnyRoute, ClientLink, ClientSide, ConnectObserver, Incoming, Route},
     media::{FrameReceiver, Received},
     message::{
         display_index, display_stream, ClientCaps, ClientDatagram, ClientMsg, FrameTiming, HostDatagram, HostMsg, LossReport, Ping, Pong, RejectReason,
@@ -134,7 +135,8 @@ fn eye_for(recommended: [u32; 2], refresh_rates: &[f32], foveation: bool) -> [u3
 /// pictures that its displays take and its refresh rates. A phone reports its screen. The picture
 /// has the screen's shape. The rate is the screen's. The phone takes no foveation, because the flat
 /// picture cannot unwarp it.
-fn device_caps(tcp_only: bool, headset: Option<&HeadsetInfo>, phone: Option<PhoneInfo>, views: Views) -> ClientCaps {
+fn device_caps(path: Media, headset: Option<&HeadsetInfo>, phone: Option<PhoneInfo>, views: Views) -> ClientCaps {
+    let Media { tcp_only, cable } = path;
     if let Some(phone) = phone {
         let refresh_rates = vec![phone.refresh_hz];
         return ClientCaps {
@@ -146,6 +148,7 @@ fn device_caps(tcp_only: bool, headset: Option<&HeadsetInfo>, phone: Option<Phon
             decoders: 1,
             foveation: false,
             tcp_only,
+            cable,
         };
     }
     let (name, recommended, refresh_rates) = match headset {
@@ -170,7 +173,17 @@ fn device_caps(tcp_only: bool, headset: Option<&HeadsetInfo>, phone: Option<Phon
         // The headset's streamed scene unwarps the foveated encoding in its shader
         foveation: true,
         tcp_only,
+        cable,
     }
+}
+
+/// How the link carries the media, as the client tells the host.
+#[derive(Clone, Copy)]
+struct Media {
+    /// The path carries TCP only, as `adb reverse` does
+    tcp_only: bool,
+    /// The link runs over the USB cable, so the host sends at the cable's bitrate
+    cable: bool,
 }
 
 /// A running connection. `stop` ends it.
@@ -302,6 +315,11 @@ fn route(hub: &'static Hub, text: &str, fingerprint: Option<[u8; 8]>) -> (String
     if !hub.device().is_live() {
         return (text.to_string(), None);
     }
+    // A request for the USB network that just went out switches the headset's USB functions. The
+    // cable's ways come back a moment later: the first connection waits for them.
+    while usb_network::settling() {
+        thread::sleep(Duration::from_millis(200));
+    }
     let loopback = usb::is_loopback(text);
     let cable = usb::probe();
     // A Mac that this headset paired with is known by its address. Another Mac behind a typed
@@ -353,6 +371,8 @@ fn run(
         MediaChoice::Udp => false,
         MediaChoice::Tcp => true,
     };
+    // A link to the Mac's link-local address on the USB network binds its sockets to that network
+    let usb_network = usb_network::network_of(&host);
     let headset = hub.headset();
     let device = hub.device();
     let views = match device {
@@ -371,7 +391,7 @@ fn run(
     // A phone that did not measure its screen in time still connects, at an ordinary rate
     let phone_info = (device == Device::Phone).then(|| hub.phone().unwrap_or(PhoneInfo { screen: [1920, 1080], refresh_hz: 60.0 }));
     let identity = crate::settings::identity();
-    let caps = device_caps(tcp_media, headset.as_ref(), phone_info, views);
+    let caps = device_caps(Media { tcp_only: tcp_media, cable: by_cable }, headset.as_ref(), phone_info, views);
     log::info!(
         "Hello: {} with {}x{} pixels an eye, refresh rates {:?}, fov {:?}, eyes at {:?}",
         caps.name,
@@ -393,7 +413,11 @@ fn run(
     } else {
         fingerprint.and_then(|fp| crate::settings::host_key_by_fingerprint(&fp)).or_else(|| crate::settings::host_key(&name))
     };
-    let link = match ClientLink::connect_with(host, &caps, identity, pinned, CONNECT_TIMEOUT, &mut Waiting { hub, id, stop }) {
+    let route: &dyn Route = match &usb_network {
+        Some(network) => &NetworkRoute(network.clone()),
+        None => &AnyRoute,
+    };
+    let link = match ClientLink::connect_via(route, host, &caps, identity, pinned, CONNECT_TIMEOUT, &mut Waiting { hub, id, stop }) {
         Ok(link) => Arc::new(link),
         Err(e) => {
             let message = failure_text(&e, &shown);
@@ -410,7 +434,12 @@ fn run(
     if pinned.is_none() && !host.ip().is_loopback() {
         // The host accepted this headset, so this is the host that the user meant to pair with
         log::info!("paired with the host key {} at {host}", cranvr_proto::identity::to_hex(&link.host_key[..8]));
-        crate::settings::remember_host_key(&name, &link.host_key);
+        if usb_network.is_some() {
+            // The cable's link-local address changes with its interface: the fingerprint finds the key
+            crate::settings::remember_host_fingerprint(&link.host_key);
+        } else {
+            crate::settings::remember_host_key(&name, &link.host_key);
+        }
     }
     hub.learn_mac(id, cranvr_proto::identity::fingerprint(&link.host_key));
     *slot.lock().unwrap() = Some(Arc::clone(&link));
@@ -1287,7 +1316,7 @@ mod tests {
                 find(broadcast_targets(DEFAULT_PORT), Duration::from_secs(1))
                     .unwrap()
                     .into_iter()
-                    .find(|host| host.answer.port == PORT && !host.address.is_loopback())
+                    .find(|host| host.answer.port == PORT && !host.from.ip().is_loopback())
             })
             .expect("a host on port 9962 answers the search from a network address of this Mac");
         assert!(!found.answer.name.is_empty());

@@ -258,6 +258,8 @@ fn caps(tcp: bool, quest_view: bool) -> ClientCaps {
         decoders: 1,
         foveation: true,
         tcp_only: tcp,
+        // The probe's TCP media stands for `adb reverse` over the cable
+        cable: tcp,
     }
 }
 

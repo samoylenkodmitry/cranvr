@@ -170,6 +170,14 @@ pub fn remember_host_key(name: &str, key: &[u8; 32]) {
     }
 }
 
+/// Remembers the key of a host under its fingerprint only, for a host whose address does not last,
+/// such as the Mac's link-local address on the headset's USB network.
+pub fn remember_host_fingerprint(key: &[u8; 32]) {
+    if let Err(e) = preferences().set(&host_fingerprint_entry(&fingerprint(key)), &to_hex(key)) {
+        log::warn!("the host's key was not saved, so the next connection trusts the host's key again: {e}");
+    }
+}
+
 /// Forgets the key of the host at `name`, under its address and under its fingerprint. The next
 /// connection trusts the key that the host shows and remembers it.
 pub fn forget_host_key(name: &str) {
