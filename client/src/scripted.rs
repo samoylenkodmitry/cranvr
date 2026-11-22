@@ -49,7 +49,8 @@
 //!   nothing. It then points at Recenter on the last row, by the handle below the menu, and its pull
 //!   tips the ray onto the handle: the press clicks Recenter and moves nothing. Last it points at
 //!   the handle, pulls and moves 10 cm to the right: the menu moves. The log says each frame in
-//!   which the ray entered a button of the menu ("scripted press:").
+//!   which the ray entered a button of the menu ("scripted press:"). `press_wait_ms` sets how long
+//!   the ray points beside the menu first (3000 by default).
 //! - `scripted_pointer=palm` plays two hands and no controller: the left hand holds its open palm
 //!   35 cm ahead of the eyes and 15 cm below them, turned to the eyes, and never pinches. The right
 //!   hand points at the ball that shows in front of that palm and pinches every 2 s, which opens and
@@ -480,8 +481,11 @@ fn press_check() {
     // handle, which stands below the middle of the menu
     let near_handle = on_view_menu(height, (WIDTH - GAP) / 2.0 - 8.0, row_y(3.0) + ROW / 2.0 - 8.0);
     let carried = [at[0] + 0.1, at[1], at[2]];
+    // A run can wait longer before the first press (`press_wait_ms`), so that a system toast that
+    // covers the screen capture has gone
+    let wait = launch_args().int("press_wait_ms").and_then(|ms| u64::try_from(ms).ok()).unwrap_or(3000);
     let right = ScriptedController::new(Hand::Right, at, away_from(at))
-        .holding(Duration::from_millis(3000), rest)
+        .holding(Duration::from_millis(wait), rest)
         // 3 s: the ray enters the Show button and rests there for a screen capture
         .moving_to(Duration::from_millis(1), (at, show), rest)
         .holding(Duration::from_millis(2000), rest)
