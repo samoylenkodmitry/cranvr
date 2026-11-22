@@ -83,8 +83,10 @@ pub enum SteamState {
     #[default]
     NoWine,
     NotInstalled,
-    /// Installed, but the web helper shim is missing (new install or after a Steam update)
+    /// Installed, but the web helper is missing, or it is neither Valve's helper nor a shim with a
+    /// backup of Valve's helper beside it. Only the setup can repair it.
     NeedsSetup,
+    /// Installed with the web helper shim, or with a helper that [`start`] replaces by the shim
     Ready,
 }
 
@@ -99,11 +101,80 @@ pub fn state() -> SteamState {
     let Some(helper) = web_helper(&dir) else {
         return SteamState::NeedsSetup;
     };
-    let shim = prefix().join("drive_c/basalt/runtime/steamwebhelper_compat.exe");
-    match (fs::read(helper), fs::read(shim)) {
-        (Ok(h), Ok(s)) if h == s => SteamState::Ready,
-        _ => SteamState::NeedsSetup,
+    match helper_state(&helper, &shim()) {
+        Helper::Broken => SteamState::NeedsSetup,
+        Helper::Shim | Helper::Valve | Helper::OldShim => SteamState::Ready,
     }
+}
+
+/// BasaltVR's web helper shim, which the game support installs into the prefix
+fn shim() -> PathBuf {
+    prefix().join("drive_c/basalt/runtime/steamwebhelper_compat.exe")
+}
+
+/// What stands at the place of Steam's web helper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Helper {
+    /// The current shim
+    Shim,
+    /// Valve's helper. Steam's own update or file check put it back.
+    Valve,
+    /// An older shim, with a backup of Valve's helper beside it. An update of the game support
+    /// brought a new shim.
+    OldShim,
+    /// No shim in the prefix, or a helper that is neither Valve's nor a shim with a backup
+    Broken,
+}
+
+/// Where setup-steam.sh keeps Valve's helper. The shim starts it.
+fn helper_backup(helper: &Path) -> PathBuf {
+    helper.with_file_name("steamwebhelper.basalt-original.exe")
+}
+
+/// Valve signs its helper, so the file holds the name of Valve's company. BasaltVR's shim does not.
+fn is_valve_helper(bytes: &[u8]) -> bool {
+    const MARK: &[u8] = b"Valve Corp";
+    bytes.windows(MARK.len()).any(|window| window == MARK)
+}
+
+fn helper_state(helper: &Path, shim: &Path) -> Helper {
+    let (Ok(helper_bytes), Ok(shim_bytes)) = (fs::read(helper), fs::read(shim)) else {
+        return Helper::Broken;
+    };
+    if helper_bytes == shim_bytes {
+        Helper::Shim
+    } else if is_valve_helper(&helper_bytes) {
+        Helper::Valve
+    } else if helper_backup(helper).is_file() {
+        Helper::OldShim
+    } else {
+        Helper::Broken
+    }
+}
+
+/// Puts the shim in place of Steam's web helper, as step 3 of setup-steam.sh does. Valve's helper
+/// goes to the backup, which the shim starts. An older shim gets replaced, and the backup stays.
+/// Steam must not run. The shim goes to a new file first and replaces the helper with a rename, so
+/// a failed copy leaves the helper as it was. Returns a line for the log when it changed a file.
+fn repair_helper(helper: &Path, shim: &Path) -> Result<Option<String>, String> {
+    let found = helper_state(helper, shim);
+    if found == Helper::Shim {
+        return Ok(None);
+    }
+    if found == Helper::Broken {
+        return Err("Steam's web helper needs a repair. Press Set up games in the Play tab.".into());
+    }
+    let fresh = helper.with_file_name("steamwebhelper.cranvr-new.exe");
+    let failed = |e: std::io::Error| format!("cranvr could not put the web helper shim into Steam: {e}");
+    fs::copy(shim, &fresh).map_err(failed)?;
+    if found == Helper::Valve {
+        fs::rename(helper, helper_backup(helper)).map_err(failed)?;
+    }
+    fs::rename(&fresh, helper).map_err(failed)?;
+    Ok(Some(match found {
+        Helper::Valve => "Steam had put Valve's web helper back. cranvr kept it as the backup and put the shim in its place.".into(),
+        _ => "The game support brought a new web helper shim. cranvr put it into Steam.".into(),
+    }))
 }
 
 /// Steam's 64-bit web helper: in cef.win64 in newer clients, in cef.win7x64 in older ones.
@@ -373,7 +444,9 @@ fn log_file(name: &str) -> Stdio {
 }
 
 /// Starts Steam with the flags BasaltVR found to work under Wine on macOS: no update at start
-/// (an update would replace the web helper shim), no file check, no CEF sandbox.
+/// (an update would replace the web helper shim), no file check, no CEF sandbox. Before the start
+/// the shim takes the place of the web helper again, if Valve's helper or an older shim stands
+/// there. Steam's window stays black without the shim.
 pub fn start() -> Result<(), String> {
     require_current_game_support()?;
     match state() {
@@ -385,6 +458,11 @@ pub fn start() -> Result<(), String> {
         return Ok(());
     }
     let dir = steam_dir();
+    if let Some(helper) = web_helper(&dir) {
+        if let Some(line) = repair_helper(&helper, &shim())? {
+            backend::log(line);
+        }
+    }
     wine("steam.exe")
         .args(STEAM_FLAGS)
         .current_dir(&dir)
@@ -738,6 +816,95 @@ mod tests {
         assert_eq!(mac_to_windows(Path::new("/Users/x/a.exe")), "Z:\\Users\\x\\a.exe");
         assert_eq!(windows_to_mac("C:\\Games"), Some(prefix().join("drive_c/Games")));
         assert_eq!(windows_to_mac("Z:\\Volumes\\SSD"), Some(PathBuf::from("/Volumes/SSD")));
+    }
+
+    /// A cef folder with a shim and a helper, in a folder of the test's own
+    fn helper_folder(name: &str, helper: &[u8], backup: Option<&[u8]>) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("cranvr-helper-{name}-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("steamwebhelper_compat.exe");
+        let path = dir.join("steamwebhelper.exe");
+        fs::write(&shim, b"MZ new shim").unwrap();
+        fs::write(&path, helper).unwrap();
+        if let Some(backup) = backup {
+            fs::write(helper_backup(&path), backup).unwrap();
+        }
+        (dir, path, shim)
+    }
+
+    #[test]
+    fn valves_helper_goes_to_the_backup_and_the_shim_takes_its_place() {
+        let valve = b"MZ helper of Valve Corporation, new build";
+        let (dir, helper, shim) = helper_folder("valve", valve, Some(b"MZ helper of Valve Corporation, old build"));
+        assert_eq!(helper_state(&helper, &shim), Helper::Valve);
+        let line = repair_helper(&helper, &shim).unwrap();
+        assert!(line.is_some_and(|line| line.contains("Valve's web helper")));
+        assert_eq!(fs::read(&helper).unwrap(), b"MZ new shim");
+        assert_eq!(fs::read(helper_backup(&helper)).unwrap(), valve);
+        assert!(!helper.with_file_name("steamwebhelper.cranvr-new.exe").exists());
+        assert_eq!(helper_state(&helper, &shim), Helper::Shim);
+        assert_eq!(repair_helper(&helper, &shim).unwrap(), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_older_shim_gets_the_new_one_and_the_backup_stays() {
+        let valve = b"MZ helper of Valve Corporation";
+        let (dir, helper, shim) = helper_folder("old-shim", b"MZ old shim", Some(valve));
+        assert_eq!(helper_state(&helper, &shim), Helper::OldShim);
+        assert!(repair_helper(&helper, &shim).unwrap().is_some_and(|line| line.contains("new web helper shim")));
+        assert_eq!(fs::read(&helper).unwrap(), b"MZ new shim");
+        assert_eq!(fs::read(helper_backup(&helper)).unwrap(), valve);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unknown_helper_without_a_backup_or_a_missing_shim_needs_the_setup() {
+        let (dir, helper, shim) = helper_folder("unknown", b"MZ some other program", None);
+        assert_eq!(helper_state(&helper, &shim), Helper::Broken);
+        assert!(repair_helper(&helper, &shim).is_err());
+        assert_eq!(fs::read(&helper).unwrap(), b"MZ some other program");
+        fs::remove_file(&shim).unwrap();
+        fs::write(helper_backup(&helper), b"MZ helper of Valve Corporation").unwrap();
+        assert_eq!(helper_state(&helper, &shim), Helper::Broken);
+        assert_eq!(helper_state(&dir.join("missing.exe"), &shim), Helper::Broken);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The start path of the app with the user's own prefix: Steam must not run, and the test leaves
+    /// it running. CRANVR_TEST_HELPER names the file that the test puts at the helper's place first,
+    /// such as the backup of Valve's helper. [`start`] must put the shim back, log one line and
+    /// start Steam. Run with `cargo test -p cranvr-app -- --ignored the_start_puts_the_shim_back`.
+    #[test]
+    #[ignore]
+    fn the_start_puts_the_shim_back() {
+        use crate::backend::{self, Model};
+        let source = PathBuf::from(std::env::var("CRANVR_TEST_HELPER").expect("CRANVR_TEST_HELPER names the helper to put in"));
+        assert!(!running(), "Steam must not run");
+        let helper = web_helper(&steam_dir()).expect("Steam has a web helper");
+        let backup = fs::read(helper_backup(&helper)).ok();
+        fs::copy(&source, &helper).unwrap();
+        let put_in = helper_state(&helper, &shim());
+        assert!(matches!(put_in, Helper::Valve | Helper::OldShim), "the test helper is Valve's or an older shim: {put_in:?}");
+        assert_eq!(state(), SteamState::Ready, "the Play tab shows no repair button");
+        start().expect("Steam starts");
+        assert_eq!(helper_state(&helper, &shim()), Helper::Shim);
+        let now = fs::read(helper_backup(&helper)).ok();
+        match put_in {
+            Helper::Valve => assert_eq!(now, fs::read(&source).ok(), "Valve's helper is the backup"),
+            _ => assert_eq!(now, backup, "the backup stays"),
+        }
+        let since = Instant::now();
+        while !running() && since.elapsed() < Duration::from_secs(20) {
+            thread::sleep(Duration::from_millis(500));
+        }
+        assert!(running(), "Steam runs");
+        let mut model = Model::default();
+        backend::pump(&mut model);
+        let lines: Vec<&String> = model.log.iter().filter(|line| line.contains("web helper")).collect();
+        println!("log: {lines:?}");
+        assert_eq!(lines.len(), 1, "one line in the log");
     }
 
     /// A start from the app with the launch option "OpenVR: SteamVR", as the Play tab does it: the app's
