@@ -957,12 +957,15 @@ public:
         *height = g_driver->Height();
     }
     void GetProjectionRaw(EVREye eye, float *left, float *right, float *top, float *bottom) override {
-        // OpenVR's raw projection has its vertical axis downward: the top is the negative tangent of the up angle
+        // SteamVR builds its projection with the top as the lower edge of the view. The top therefore takes the
+        // tangent of the down angle and the bottom the tangent of the up angle, as in OpenComposite. With the other
+        // order on the Quest 3 (44 degrees up, 55 down), SteamVR drew 55 degrees up and 44 down. The lower fifth of
+        // each eye then stayed black.
         EyeFov fov = g_driver->Fov(eye == Eye_Left ? 0 : 1);
         *left = fov.left;
         *right = fov.right;
-        *top = -fov.up;
-        *bottom = -fov.down;
+        *top = fov.down;
+        *bottom = fov.up;
     }
     DistortionCoordinates_t *ComputeDistortion(DistortionCoordinates_t *result, EVREye, float u, float v) override {
         // No lens here: the headset corrects its own
@@ -1892,10 +1895,14 @@ void Frames::Present(SharedTextureHandle_t) {
             if (set) {
                 g_driver->NoteLayerProcess(set->pid);
             }
-            char part[96];
-            snprintf(part, sizeof part, "%s[process %u, %ux%u, bounds %.2f %.2f %.2f %.2f]", sources.empty() ? "" : " ", set ? set->pid : 0,
-                     set ? set->width : 0, set ? set->height : 0, layer.eye[0].bounds.uMin, layer.eye[0].bounds.vMin,
-                     layer.eye[0].bounds.uMax, layer.eye[0].bounds.vMax);
+            // The vertical tangents of the left eye's projection: the part of the view that the layer covers
+            const HmdMatrix44_t &m = layer.eye[0].mProjection;
+            bool projected = std::fabs(m.m[1][1]) > 1e-6f;
+            char part[160];
+            snprintf(part, sizeof part, "%s[process %u, %ux%u, bounds %.2f %.2f %.2f %.2f, view up %.3f down %.3f]", sources.empty() ? "" : " ",
+                     set ? set->pid : 0, set ? set->width : 0, set ? set->height : 0, layer.eye[0].bounds.uMin, layer.eye[0].bounds.vMin,
+                     layer.eye[0].bounds.uMax, layer.eye[0].bounds.vMax, projected ? (m.m[1][2] + 1) / m.m[1][1] : 0.0f,
+                     projected ? (m.m[1][2] - 1) / m.m[1][1] : 0.0f);
             sources += part;
         }
         if (sources != sources_) {
