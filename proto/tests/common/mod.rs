@@ -66,6 +66,7 @@ pub fn caps() -> ClientCaps {
         foveation: true,
         tcp_only: false,
         cable: false,
+        microphone: false,
     }
 }
 

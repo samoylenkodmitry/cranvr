@@ -19,6 +19,7 @@
 pub mod audio;
 pub mod desktop;
 mod displays;
+mod microphone;
 
 use super::{display_lock::{DisplayLock, Report}, Button, Device, Event, EventSource, FramePlan, Headset, OutFrame};
 use crate::{
@@ -93,6 +94,9 @@ pub struct Config {
     pub desktop: desktop::Options,
     /// Send the Mac's sound (see `audio.rs`)
     pub audio: bool,
+    /// The ring of the headset's microphone for games (see `microphone.rs`), or `None` for no
+    /// microphone
+    pub microphone: Option<std::path::PathBuf>,
 }
 
 /// The parity share with no loss. Five percent costs five packets on a frame of a hundred.
@@ -201,6 +205,9 @@ pub fn start(config: Config) -> std::io::Result<(Arc<dyn Headset>, Box<dyn Event
         .map_err(|e| std::io::Error::other(e.to_string()))?
         .share_cable_switch(Arc::clone(&config.cable));
     info!("Native protocol: this host's key starts with {}", to_hex(&config.identity.public_key()[..8]));
+    if let Some(path) = &config.microphone {
+        microphone::start(path);
+    }
     info!("Native protocol: listening on {address}");
     if !config.cable.load(Ordering::Relaxed) {
         info!("Native protocol: the user chose Wi-Fi, so a headset on the USB cable connects over Wi-Fi");
@@ -490,7 +497,7 @@ fn start_session(config: &Config, shared: &Arc<Shared>, pending: Pending, name: 
     } else {
         (MediaMode::Udp, DEFAULT_SHARD_LEN)
     };
-    let (peer, caps_views, cable) = (pending.peer, pending.caps.views, pending.caps.cable);
+    let (peer, caps_views, cable, can_record) = (pending.peer, pending.caps.views, pending.caps.cable, pending.caps.microphone);
     let link = match pending.accept(stream.clone(), mode, shard_len) {
         Ok(link) => link,
         Err(e) => {
@@ -499,11 +506,14 @@ fn start_session(config: &Config, shared: &Arc<Shared>, pending: Pending, name: 
         }
     };
     info!("Native protocol: {name} at {peer} connected, {} media, sealed", if link.duplex.has_udp() { "UDP" } else { "TCP" });
-    let session = Arc::new(Session::new(link, &stream, config.display_lock, cable));
+    let mut session = Session::new(link, &stream, config.display_lock, cable);
+    session.microphone = can_record;
+    let session = Arc::new(session);
     session.displays.set(displays::Displays::start(config.desktop.clone(), Arc::clone(&session))).ok();
     if config.audio {
         audio::attach(&session);
     }
+    microphone::attach(&session);
     *shared.session.lock().unwrap() = Some(Arc::clone(&session));
     let shared = Arc::clone(shared);
     thread::Builder::new()
@@ -542,6 +552,7 @@ fn run_session(shared: &Shared, session: &Arc<Session>, stream: cranvr_proto::me
         displays.stop();
     }
     audio::detach(session);
+    microphone::detach(session);
     *shared.session.lock().unwrap() = None;
     // No panel of a gone headset holds a hand back
     shared.emit(Event::Held([false; 2]));
@@ -661,6 +672,7 @@ fn handle(shared: &Shared, session: &Session, incoming: Incoming<'_, HostSide>) 
                 displays.on_request(request);
             }
         }
+        Incoming::Datagram(ClientDatagram::Microphone(sound)) => microphone::on_datagram(session, sound),
         Incoming::Datagram(ClientDatagram::DisplayMouse { stream, mouse }) => {
             if let Some(displays) = session.displays.get() {
                 displays.on_mouse(stream, mouse);
@@ -1086,6 +1098,8 @@ struct Session {
     /// The displays that the client shows as panels: their streams and pointers. They start after
     /// the session exists, because their threads share the session.
     displays: std::sync::OnceLock<Arc<displays::Displays>>,
+    /// The client can record its microphone for games
+    microphone: bool,
     next_frame: AtomicU32,
     heard: Mutex<Instant>,
     stopped: Mutex<bool>,
@@ -1114,6 +1128,7 @@ impl Session {
             offered: Mutex::new(Features::NONE),
             asked: Mutex::new(None),
             displays: std::sync::OnceLock::new(),
+            microphone: false,
             next_frame: AtomicU32::new(0),
             heard: Mutex::new(Instant::now()),
             stopped: Mutex::new(false),

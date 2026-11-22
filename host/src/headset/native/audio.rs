@@ -80,6 +80,7 @@ pub fn send(pcm: &[u8]) {
     }
     let arrived = now_ns();
     let total_frames = pcm.len() / BYTES_PER_FRAME;
+    super::microphone::log_game_sound_onsets(pcm, total_frames);
     LAST_BUFFER_FRAMES.store(total_frames as u64, Ordering::Relaxed);
     BUFFERS.fetch_add(1, Ordering::Relaxed);
     let mut first_frame = 0;

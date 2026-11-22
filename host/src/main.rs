@@ -119,7 +119,7 @@ impl Default for Views {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: cranvr-host [--native-port PORT] [--fps 72|80|90|120, default 120] [--eye-width PIXELS] [--mbps N] [--trust-all] [--no-cable] [--discovery-port N] [--no-display-lock] [--tcp] [--foveation off|low|medium|high] [--game-scale F] [--strict-rate-control] [--no-game-audio] [--no-hand-controllers] [--desktop] [--desktop-fps N] [--virtual-display WxH] [--vr-main-display] [--pointer-pitch DEG] [--screen-in-view] [--no-desktop-layer] [--config-dir DIR] [--status]\n\
+        "usage: cranvr-host [--native-port PORT] [--fps 72|80|90|120, default 120] [--eye-width PIXELS] [--mbps N] [--trust-all] [--no-cable] [--discovery-port N] [--no-display-lock] [--tcp] [--foveation off|low|medium|high] [--game-scale F] [--strict-rate-control] [--no-game-audio] [--no-microphone] [--no-hand-controllers] [--desktop] [--desktop-fps N] [--virtual-display WxH] [--vr-main-display] [--pointer-pitch DEG] [--screen-in-view] [--no-desktop-layer] [--config-dir DIR] [--status]\n\
          \n  --native-port N   the TCP port to listen on (default 9950)\
          \n  --trust-all       accept any client on the network without a pairing (for tests)\
          \n  A headset that the host does not know waits for the user: the cranvr app on this Mac\
@@ -145,6 +145,8 @@ fn usage() -> ! {
          \n  --strict-rate-control  VideoToolbox's low-latency rate control: even frame sizes, one\
          \n                    frame at a time; slower per frame on an M5 (6.1 ms against 3.6 to 5.0)\
          \n  --no-game-audio   do not send this Mac's sound to the headset (it needs Screen Recording)\
+         \n  --no-microphone   keep no ring of the headset's microphone for games (microphone.pcm in the\
+         \n                    config dir), so the headset never records\
          \n  --no-hand-controllers  a game without hand tracking gets no controllers made of the headset's\
          \n                    tracked hands. By default a tracked hand is the controller of its hand,\
          \n                    while the headset tracks no controller: a pinch is the trigger.\
@@ -188,6 +190,7 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
         game_scale: 0.7,
         strict_rate: false,
         game_audio: true,
+        microphone: true,
         unscale_displays: true,
         hand_controllers: true,
     };
@@ -228,6 +231,7 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
             }
             "--strict-rate-control" => options.strict_rate = true,
             "--no-game-audio" => options.game_audio = false,
+            "--no-microphone" => options.microphone = false,
             "--keep-display-modes" => options.unscale_displays = false,
             "--no-hand-controllers" => options.hand_controllers = false,
             "--desktop" => desktop.enabled = true,
@@ -337,6 +341,7 @@ fn native_config(
         display_lock: options.display_lock,
         desktop,
         audio: options.game_audio,
+        microphone: options.microphone.then(|| config_dir.join("microphone.pcm")),
         tcp_media: options.tcp,
         wishes: HostWishes {
             // A foveated eye takes the size that the headset asks for: its recommended size, within

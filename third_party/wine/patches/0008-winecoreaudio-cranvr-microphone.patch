@@ -1,0 +1,574 @@
+diff --git a/dlls/winecoreaudio.drv/coreaudio.c b/dlls/winecoreaudio.drv/coreaudio.c
+index c7e0dc2..8226035 100644
+--- a/dlls/winecoreaudio.drv/coreaudio.c
++++ b/dlls/winecoreaudio.drv/coreaudio.c
+@@ -48,6 +48,9 @@
+ #include <AudioToolbox/AudioConverter.h>
+ #include <AudioUnit/AudioUnit.h>
+ #include <os/lock.h>
++#include <mach/mach_time.h>
++#include <stdatomic.h>
++#include <sys/mman.h>
+ 
+ #undef LoadResource
+ #undef CompareString
+@@ -100,6 +103,7 @@ struct coreaudio_stream
+     INT32 getbuf_last;
+     WAVEFORMATEX *fmt;
+     BYTE *local_buffer, *cap_buffer, *wrap_buffer, *resamp_buffer, *tmp_buffer;
++    struct cranvr_reader *cranvr;
+ };
+ 
+ static const REFERENCE_TIME def_period = 100000;
+@@ -200,6 +204,321 @@ static BOOL device_has_channels(AudioDeviceID device, EDataFlow flow)
+     return ret;
+ }
+ 
++/* cranvr's microphone. The cranvr app writes the source that the user chose into
++ * <home>/microphone.txt: "headset", "mac <device UID>" or "off". <home> is $CRANVR_HOME, else
++ * ~/Library/Application Support/cranvr. While the file exists, the capture endpoints start with
++ * "cranvr microphone", which is the default capture device. A stream of it reads the file when it
++ * opens. "headset" reads the sound of the headset's microphone, which the cranvr host writes into
++ * the ring <home>/microphone.pcm. "mac <UID>" records from that Mac input device as any other
++ * endpoint does. "off" and any other text record silence. */
++
++static void ca_wrap_buffer(BYTE *dst, UINT32 dst_offs, UINT32 dst_bytes, BYTE *src, UINT32 src_bytes);
++static HRESULT ca_get_audiodesc(AudioStreamBasicDescription *desc, const WAVEFORMATEX *fmt);
++static int muldiv(int a, int b, int c);
++
++#define CRANVR_DEVICE "cranvr:microphone"
++#define CRANVR_RING_MAGIC 0x434d5243 /* "CRMC" */
++#define CRANVR_RING_VERSION 1
++#define CRANVR_RING_RATE 48000
++#define CRANVR_RING_HEADER 64
++/* The reader stays this far behind the newest frame of the ring: the headset sends 10 ms at a
++ * time, and the frames of one datagram arrive at once. */
++#define CRANVR_TARGET_FRAMES 720
++/* The least lag over a window that the reader keeps. Beyond it, the reader skips to the target,
++ * so a late datagram adds no delay for good and the drift between the headset's clock and the
++ * Mac's stays bounded. */
++#define CRANVR_SLACK_FRAMES 480
++#define CRANVR_WINDOW_FRAMES 24000
++/* A lag beyond this skips at once, after a stall of the stream */
++#define CRANVR_MAX_LAG_FRAMES 4800
++
++struct cranvr_ring
++{
++    UINT32 magic;
++    UINT32 version;
++    UINT32 sample_rate;
++    UINT32 capacity;
++    _Atomic UINT64 write_pos;
++    _Atomic UINT64 reader_beat;
++    _Atomic UINT64 reader_frames;
++    _Atomic UINT64 reader_underruns;
++    _Atomic UINT64 reader_skips;
++    UINT64 reserved;
++};
++
++C_ASSERT(sizeof(struct cranvr_ring) == CRANVR_RING_HEADER);
++
++enum cranvr_source { CRANVR_OFF, CRANVR_HEADSET, CRANVR_MAC };
++
++struct cranvr_reader
++{
++    struct cranvr_ring *ring; /* NULL: silence */
++    size_t ring_size;
++    UINT64 read_pos;
++    UINT64 started_ns;
++    UINT64 pulled;
++    UINT64 window_frames;
++    UINT64 min_lag;
++    BYTE *frames; /* one period of the stream's format at the ring's rate */
++    UINT32 frames_size;
++};
++
++static UINT64 cranvr_now_ns(void)
++{
++    static mach_timebase_info_data_t timebase;
++    if (!timebase.denom) mach_timebase_info(&timebase);
++    return mach_continuous_time() * timebase.numer / timebase.denom;
++}
++
++static BOOL cranvr_path(const char *name, char *out, size_t size)
++{
++    const char *home = getenv("CRANVR_HOME");
++    int len;
++    if (home && *home) len = snprintf(out, size, "%s/%s", home, name);
++    else
++    {
++        if (!(home = getenv("HOME"))) return FALSE;
++        len = snprintf(out, size, "%s/Library/Application Support/cranvr/%s", home, name);
++    }
++    return len > 0 && (size_t)len < size;
++}
++
++/* The source that the user chose, and the UID of the Mac device for CRANVR_MAC. FALSE: no file. */
++static BOOL cranvr_source(enum cranvr_source *source, char *uid, size_t uid_size)
++{
++    char path[PATH_MAX], line[512];
++    FILE *file;
++    size_t len;
++
++    if (!cranvr_path("microphone.txt", path, sizeof(path)) || !(file = fopen(path, "r"))) return FALSE;
++    if (!fgets(line, sizeof(line), file)) line[0] = 0;
++    fclose(file);
++    len = strlen(line);
++    while (len && (line[len - 1] == '\n' || line[len - 1] == '\r' || line[len - 1] == ' ')) line[--len] = 0;
++    *source = CRANVR_OFF;
++    if (!strcmp(line, "headset")) *source = CRANVR_HEADSET;
++    else if (!strncmp(line, "mac ", 4) && line[4] && strlen(line + 4) < uid_size)
++    {
++        strcpy(uid, line + 4);
++        *source = CRANVR_MAC;
++    }
++    return TRUE;
++}
++
++static struct cranvr_ring *cranvr_map_ring(size_t *size)
++{
++    char path[PATH_MAX];
++    struct cranvr_ring *ring;
++    struct stat st;
++    int fd;
++
++    if (!cranvr_path("microphone.pcm", path, sizeof(path)) || (fd = open(path, O_RDWR)) < 0) return NULL;
++    if (fstat(fd, &st) || st.st_size < CRANVR_RING_HEADER)
++    {
++        close(fd);
++        return NULL;
++    }
++    ring = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    close(fd);
++    if (ring == MAP_FAILED) return NULL;
++    if (ring->magic != CRANVR_RING_MAGIC || ring->version != CRANVR_RING_VERSION || ring->sample_rate != CRANVR_RING_RATE ||
++        !ring->capacity || (ring->capacity & (ring->capacity - 1)) ||
++        CRANVR_RING_HEADER + (UINT64)ring->capacity * sizeof(INT16) > (UINT64)st.st_size)
++    {
++        WARN("%s is no ring of version %u\n", path, CRANVR_RING_VERSION);
++        munmap(ring, st.st_size);
++        return NULL;
++    }
++    *size = st.st_size;
++    return ring;
++}
++
++/* One sample of the ring in the stream's format, written into every channel of a frame */
++static void cranvr_write_frame(BYTE *out, const WAVEFORMATEX *fmt, float value)
++{
++    const WAVEFORMATEXTENSIBLE *fmtex = (const WAVEFORMATEXTENSIBLE *)fmt;
++    BOOL is_float = fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
++        (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE && IsEqualGUID(&fmtex->SubFormat, &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT));
++    UINT32 bytes = fmt->wBitsPerSample / 8, c;
++    INT32 whole = (INT32)(value * 2147483647.0f);
++
++    if (value >= 1.0f) whole = 0x7fffffff;
++    else if (value <= -1.0f) whole = -0x7fffffff - 1;
++    for (c = 0; c < fmt->nChannels; c++, out += bytes)
++    {
++        if (is_float && bytes == 4) memcpy(out, &value, 4);
++        else if (bytes == 1) out[0] = (BYTE)((whole >> 24) + 128);
++        else if (bytes >= 2) memcpy(out, (BYTE *)&whole + 4 - bytes, bytes); /* the high bytes, little endian */
++    }
++}
++
++/* The frames that are due by now at the ring's rate, read from the ring into reader->frames in the
++ * stream's format. A ring without new frames gives silence. Returns the frames written. */
++static UINT32 cranvr_pull(struct coreaudio_stream *stream, UINT32 room)
++{
++    struct cranvr_reader *reader = stream->cranvr;
++    struct cranvr_ring *ring = reader->ring;
++    const INT16 *samples = ring ? (const INT16 *)((const BYTE *)ring + CRANVR_RING_HEADER) : NULL;
++    UINT64 now = cranvr_now_ns(), due, write_pos = 0, lag, n;
++    UINT32 frames, i, underruns = 0, block = stream->fmt->nBlockAlign;
++
++    if (!reader->started_ns) return 0;
++    due = (now - reader->started_ns) * CRANVR_RING_RATE / 1000000000;
++    if (due <= reader->pulled) return 0;
++    due -= reader->pulled;
++    /* After a stall of the game the frames of more than 100 ms are gone: a burst would only
++     * overflow the stream's buffer and add delay */
++    if (due > CRANVR_RING_RATE / 10)
++    {
++        UINT64 excess = due - CRANVR_RING_RATE / 10;
++        reader->pulled += excess;
++        reader->read_pos += excess;
++        due = CRANVR_RING_RATE / 10;
++    }
++    frames = due < room ? due : room;
++    if (!frames) return 0;
++    if (ring)
++    {
++        write_pos = atomic_load_explicit(&ring->write_pos, memory_order_acquire);
++        /* The host started a new ring, or the reader lies too far behind */
++        if (reader->read_pos > write_pos || write_pos - reader->read_pos > CRANVR_MAX_LAG_FRAMES)
++        {
++            reader->read_pos = write_pos > CRANVR_TARGET_FRAMES ? write_pos - CRANVR_TARGET_FRAMES : 0;
++            atomic_fetch_add_explicit(&ring->reader_skips, 1, memory_order_relaxed);
++        }
++    }
++    for (i = 0; i < frames; i++)
++    {
++        float value = 0.0f;
++        if (ring && reader->read_pos < write_pos)
++            value = samples[reader->read_pos++ & (ring->capacity - 1)] / 32768.0f;
++        else
++            underruns++;
++        cranvr_write_frame(reader->frames + i * block, stream->fmt, value);
++    }
++    reader->pulled += frames;
++    if (ring)
++    {
++        lag = write_pos - reader->read_pos;
++        if (lag < reader->min_lag) reader->min_lag = lag;
++        reader->window_frames += frames;
++        if (reader->window_frames >= CRANVR_WINDOW_FRAMES)
++        {
++            if (reader->min_lag != ~(UINT64)0 && reader->min_lag > CRANVR_TARGET_FRAMES + CRANVR_SLACK_FRAMES)
++            {
++                n = reader->min_lag - CRANVR_TARGET_FRAMES;
++                reader->read_pos += n;
++                atomic_fetch_add_explicit(&ring->reader_skips, 1, memory_order_relaxed);
++            }
++            reader->window_frames = 0;
++            reader->min_lag = ~(UINT64)0;
++        }
++        atomic_fetch_add_explicit(&ring->reader_frames, frames, memory_order_relaxed);
++        if (underruns) atomic_fetch_add_explicit(&ring->reader_underruns, underruns, memory_order_relaxed);
++        atomic_store_explicit(&ring->reader_beat, now, memory_order_relaxed);
++    }
++    return frames;
++}
++
++/* Moves the due frames of the ring into the stream's buffer: straight into the local buffer when
++ * the stream runs at the ring's rate, else into cap_buffer for the converter. */
++static void cranvr_capture(struct coreaudio_stream *stream)
++{
++    UINT32 block = stream->fmt->nBlockAlign, frames;
++    BOOL direct = stream->fmt->nSamplesPerSec == CRANVR_RING_RATE;
++    /* One pull fits into the buffer that it goes to, so it wraps once at most. A timer that runs
++     * late leaves more frames due than a short buffer holds. */
++    UINT32 room = direct ? stream->bufsize_frames : stream->cap_bufsize_frames;
++
++    if (!stream->playing) return;
++    if (room > stream->cranvr->frames_size) room = stream->cranvr->frames_size;
++    while ((frames = cranvr_pull(stream, room)))
++    {
++        if (direct)
++        {
++            ca_wrap_buffer(stream->local_buffer, stream->wri_offs_frames * block, stream->bufsize_frames * block,
++                           stream->cranvr->frames, frames * block);
++            stream->wri_offs_frames = (stream->wri_offs_frames + frames) % stream->bufsize_frames;
++            if (stream->held_frames + frames > stream->bufsize_frames)
++            {
++                /* A full buffer: the oldest frame follows the newest */
++                stream->lcl_offs_frames = stream->wri_offs_frames;
++                stream->held_frames = stream->bufsize_frames;
++            }
++            else
++                stream->held_frames += frames;
++        }
++        else
++        {
++            UINT32 wri = (stream->cap_offs_frames + stream->cap_held_frames) % stream->cap_bufsize_frames;
++            ca_wrap_buffer(stream->cap_buffer, wri * block, stream->cap_bufsize_frames * block, stream->cranvr->frames, frames * block);
++            stream->cap_held_frames += frames;
++            if (stream->cap_held_frames > stream->cap_bufsize_frames)
++            {
++                stream->cap_offs_frames += stream->cap_held_frames % stream->cap_bufsize_frames;
++                stream->cap_offs_frames %= stream->cap_bufsize_frames;
++                stream->cap_held_frames = stream->cap_bufsize_frames;
++            }
++        }
++    }
++}
++
++static void cranvr_release(struct cranvr_reader *reader)
++{
++    if (!reader) return;
++    if (reader->ring) munmap(reader->ring, reader->ring_size);
++    free(reader->frames);
++    free(reader);
++}
++
++static BOOL is_cranvr_device(const char *device)
++{
++    return !strcmp(device, CRANVR_DEVICE);
++}
++
++/* The ring's frames arrive at the ring's rate in the stream's format. A stream at another rate
++ * gets a converter, as a stream of a Mac device does. */
++static HRESULT cranvr_setup(struct coreaudio_stream *stream)
++{
++    AudioStreamBasicDescription desc;
++    BOOL fenv_stored;
++    fenv_t fenv;
++    OSStatus sc;
++    HRESULT hr;
++
++    if(stream->flow != eCapture) return AUDCLNT_E_DEVICE_INVALIDATED;
++    hr = ca_get_audiodesc(&desc, stream->fmt);
++    if(FAILED(hr)) return hr;
++    if(desc.mFormatID != kAudioFormatLinearPCM) return AUDCLNT_E_UNSUPPORTED_FORMAT;
++    stream->dev_desc = desc;
++    stream->dev_desc.mSampleRate = CRANVR_RING_RATE;
++    stream->cranvr->frames_size = CRANVR_RING_RATE / 10;
++    if(!(stream->cranvr->frames = malloc(stream->cranvr->frames_size * stream->fmt->nBlockAlign))) return E_OUTOFMEMORY;
++    if(stream->fmt->nSamplesPerSec == CRANVR_RING_RATE) return S_OK;
++    /* AudioConverterNew requires divide-by-zero SSE exceptions to be masked */
++    fenv_stored = !feholdexcept(&fenv);
++    sc = AudioConverterNew(&stream->dev_desc, &desc, &stream->converter);
++    if(fenv_stored) fesetenv(&fenv);
++    if(sc != noErr){
++        WARN("Couldn't create audio converter: %x\n", (int)sc);
++        return osstatus_to_hresult(sc);
++    }
++    return S_OK;
++}
++
++/* A start of the stream begins at the newest frame of the ring, less the target lag */
++static void cranvr_start(struct cranvr_reader *reader)
++{
++    UINT64 write_pos = reader->ring ? atomic_load_explicit(&reader->ring->write_pos, memory_order_acquire) : 0;
++
++    reader->read_pos = write_pos > CRANVR_TARGET_FRAMES ? write_pos - CRANVR_TARGET_FRAMES : 0;
++    reader->started_ns = cranvr_now_ns();
++    reader->pulled = 0;
++    reader->window_frames = 0;
++    reader->min_lag = ~(UINT64)0;
++    if(reader->ring) atomic_store_explicit(&reader->ring->reader_beat, reader->started_ns, memory_order_relaxed);
++}
++
+ static NTSTATUS unix_get_endpoint_ids(void *args)
+ {
+     struct get_endpoint_ids_params *params = args;
+@@ -216,6 +535,9 @@ static NTSTATUS unix_get_endpoint_ids(void *args)
+     } *info;
+     OSStatus sc;
+     UniChar *ptr;
++    enum cranvr_source cranvr;
++    char cranvr_uid[256];
++    BOOL cranvr_listed = FALSE;
+ 
+     params->num = 0;
+     params->default_idx = 0;
+@@ -246,7 +568,7 @@ static NTSTATUS unix_get_endpoint_ids(void *args)
+ 
+     num_devices = devsize / sizeof(AudioDeviceID);
+     devices = malloc(devsize);
+-    info = malloc(num_devices * sizeof(*info));
++    info = malloc((num_devices + 1) * sizeof(*info));
+     if(!devices || !info){
+         free(info);
+         free(devices);
+@@ -263,6 +585,15 @@ static NTSTATUS unix_get_endpoint_ids(void *args)
+         return STATUS_SUCCESS;
+     }
+ 
++    /* cranvr's microphone comes first, and it is the default capture device */
++    if(params->flow == eCapture && cranvr_source(&cranvr, cranvr_uid, sizeof(cranvr_uid))){
++        info[0].name = CFStringCreateWithCString(NULL, "cranvr microphone", kCFStringEncodingUTF8);
++        info[0].uid = CFStringCreateWithCString(NULL, CRANVR_DEVICE, kCFStringEncodingUTF8);
++        info[0].id = kAudioObjectUnknown;
++        params->num = 1;
++        cranvr_listed = TRUE;
++    }
++
+     addr.mScope = get_scope(params->flow);
+     addr.mElement = 0;
+ 
+@@ -324,6 +655,7 @@ static NTSTATUS unix_get_endpoint_ids(void *args)
+         if(info[i].id == default_id) params->default_idx = i;
+     }
+     free(info);
++    if(cranvr_listed) params->default_idx = 0;
+ 
+     if(needed > params->size){
+         params->size = needed;
+@@ -728,7 +1060,24 @@ static NTSTATUS unix_create_stream(void *args)
+         goto end;
+     }
+ 
+-    stream->dev_id = dev_id_from_device(params->device);
++    if(is_cranvr_device(params->device)){
++        enum cranvr_source source = CRANVR_OFF;
++        char uid[256];
++
++        cranvr_source(&source, uid, sizeof(uid));
++        /* A Mac device that is not connected records silence */
++        if(source == CRANVR_MAC && (stream->dev_id = dev_id_from_device(uid)) == kAudioObjectUnknown)
++            source = CRANVR_OFF;
++        if(source != CRANVR_MAC){
++            if(!(stream->cranvr = calloc(1, sizeof(*stream->cranvr)))){
++                params->result = E_OUTOFMEMORY;
++                goto end;
++            }
++            if(source == CRANVR_HEADSET)
++                stream->cranvr->ring = cranvr_map_ring(&stream->cranvr->ring_size);
++        }
++    }else
++        stream->dev_id = dev_id_from_device(params->device);
+     stream->flow = params->flow;
+     stream->flags = params->flags;
+     stream->share = params->share;
+@@ -737,6 +1086,12 @@ static NTSTATUS unix_create_stream(void *args)
+     if(params->share == AUDCLNT_SHAREMODE_EXCLUSIVE)
+         stream->bufsize_frames -= stream->bufsize_frames % stream->period_frames;
+ 
++    if(stream->cranvr){
++        params->result = cranvr_setup(stream);
++        if(FAILED(params->result)) goto end;
++        goto buffers;
++    }
++
+     if(!(stream->unit = get_audiounit(stream->flow, stream->dev_id))){
+         params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+         goto end;
+@@ -777,6 +1132,7 @@ static NTSTATUS unix_create_stream(void *args)
+         goto end;
+     }
+ 
++buffers:
+     size = stream->bufsize_frames * stream->fmt->nBlockAlign;
+     if(NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer, zero_bits,
+                                &size, MEM_COMMIT, PAGE_READWRITE)){
+@@ -795,6 +1151,7 @@ end:
+     if(FAILED(params->result)){
+         if(stream->converter) AudioConverterDispose(stream->converter);
+         if(stream->unit) AudioComponentInstanceDispose(stream->unit);
++        cranvr_release(stream->cranvr);
+         free(stream->fmt);
+         free(stream);
+     } else {
+@@ -823,6 +1180,7 @@ static NTSTATUS unix_release_stream( void *args )
+     }
+ 
+     if(stream->converter) AudioConverterDispose(stream->converter);
++    cranvr_release(stream->cranvr);
+     free(stream->resamp_buffer);
+     free(stream->wrap_buffer);
+     free(stream->cap_buffer);
+@@ -996,10 +1354,25 @@ static NTSTATUS unix_get_mix_format(void *args)
+     UInt32 size;
+     OSStatus sc;
+     int i;
+-    const AudioDeviceID dev_id = dev_id_from_device(params->device);
++    const AudioDeviceID dev_id = is_cranvr_device(params->device) ? kAudioObjectUnknown : dev_id_from_device(params->device);
+ 
+     params->fmt->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+ 
++    /* cranvr's microphone: one channel at the ring's rate */
++    if(is_cranvr_device(params->device)){
++        params->fmt->Format.nChannels = 1;
++        params->fmt->dwChannelMask = SPEAKER_FRONT_CENTER;
++        params->fmt->Format.nSamplesPerSec = CRANVR_RING_RATE;
++        params->fmt->Format.wBitsPerSample = 32;
++        params->fmt->SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
++        params->fmt->Format.nBlockAlign = 4;
++        params->fmt->Format.nAvgBytesPerSec = CRANVR_RING_RATE * 4;
++        params->fmt->Samples.wValidBitsPerSample = 32;
++        params->fmt->Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
++        params->result = S_OK;
++        return STATUS_SUCCESS;
++    }
++
+     addr.mScope = get_scope(params->flow);
+     addr.mElement = 0;
+     addr.mSelector = kAudioDevicePropertyPreferredChannelLayout;
+@@ -1095,8 +1468,16 @@ static NTSTATUS unix_is_format_supported(void *args)
+     AudioStreamBasicDescription dev_desc;
+     AudioConverterRef converter;
+     AudioComponentInstance unit;
+-    const AudioDeviceID dev_id = dev_id_from_device(params->device);
++    AudioDeviceID dev_id;
+ 
++    /* cranvr's microphone writes linear PCM of any rate and any number of channels */
++    if(is_cranvr_device(params->device)){
++        params->result = ca_get_audiodesc(&dev_desc, params->fmt_in);
++        if(SUCCEEDED(params->result) && dev_desc.mFormatID != kAudioFormatLinearPCM)
++            params->result = AUDCLNT_E_UNSUPPORTED_FORMAT;
++        return STATUS_SUCCESS;
++    }
++    dev_id = dev_id_from_device(params->device);
+     unit = get_audiounit(params->flow, dev_id);
+ 
+     converter = NULL;
+@@ -1121,13 +1502,6 @@ static NTSTATUS unix_get_device_period(void *args)
+     return STATUS_SUCCESS;
+ }
+ 
+-static UINT buf_ptr_diff(UINT left, UINT right, UINT bufsize)
+-{
+-    if(left <= right)
+-        return right - left;
+-    return bufsize - (left - right);
+-}
+-
+ /* place data from cap_buffer into provided AudioBufferList */
+ static OSStatus feed_cb(AudioConverterRef converter, UInt32 *nframes, AudioBufferList *data,
+                         AudioStreamPacketDescription **packets, void *user)
+@@ -1179,6 +1553,11 @@ static void capture_resample(struct coreaudio_stream *stream)
+                                          stream->fmt->nSamplesPerSec);
+     OSStatus sc;
+ 
++    if(stream->cranvr){
++        cranvr_capture(stream);
++        if(!stream->converter) return;
++    }
++
+     /* the resampling process often needs more source frames than we'd
+      * guess from a straight conversion using the sample rate ratio. so
+      * only convert if we have extra source data. */
+@@ -1213,8 +1592,9 @@ static void capture_resample(struct coreaudio_stream *stream)
+         stream->wri_offs_frames += wanted_frames;
+         stream->wri_offs_frames %= stream->bufsize_frames;
+         if(stream->held_frames + wanted_frames > stream->bufsize_frames){
+-            stream->lcl_offs_frames += buf_ptr_diff(stream->lcl_offs_frames, stream->wri_offs_frames,
+-                                                    stream->bufsize_frames);
++            /* A full buffer: the oldest frame follows the newest. The offset stays inside the
++             * buffer, which GetBuffer's copy needs. */
++            stream->lcl_offs_frames = stream->wri_offs_frames;
+             stream->held_frames = stream->bufsize_frames;
+         }else
+             stream->held_frames += wanted_frames;
+@@ -1295,6 +1675,13 @@ static NTSTATUS unix_get_latency(void *args)
+ 
+     os_unfair_lock_lock(&stream->lock);
+ 
++    if(stream->cranvr){
++        *params->latency = muldiv(CRANVR_TARGET_FRAMES, 10000000, CRANVR_RING_RATE) + stream->period;
++        os_unfair_lock_unlock(&stream->lock);
++        params->result = S_OK;
++        return STATUS_SUCCESS;
++    }
++
+     addr.mScope = get_scope(stream->flow);
+     addr.mSelector = kAudioDevicePropertyLatency;
+     addr.mElement = 0;
+@@ -1353,6 +1740,9 @@ static void unix_timer_loop(void *args)
+     next.QuadPart = last.QuadPart + stream->period;
+ 
+     while(!stream->please_quit){
++        /* The host records from the headset while a stream of cranvr's microphone runs */
++        if(stream->cranvr && stream->cranvr->ring && stream->playing)
++            atomic_store_explicit(&stream->cranvr->ring->reader_beat, cranvr_now_ns(), memory_order_relaxed);
+         NtSetEvent(stream->event, NULL);
+         NtDelayExecution(FALSE, &delay);
+         NtQueryPerformanceCounter(&last, NULL);
+@@ -1382,6 +1772,7 @@ static NTSTATUS unix_start(void *args)
+         params->result = AUDCLNT_E_NOT_STOPPED;
+     else{
+         stream->playing = TRUE;
++        if(stream->cranvr) cranvr_start(stream->cranvr);
+         params->result = S_OK;
+     }
+ 
+@@ -1749,7 +2140,7 @@ static NTSTATUS unix_set_event_handle(void *args)
+     HRESULT hr = S_OK;
+ 
+     os_unfair_lock_lock(&stream->lock);
+-    if(!stream->unit)
++    if(!stream->unit && !stream->cranvr)
+         hr = AUDCLNT_E_DEVICE_INVALIDATED;
+     else if(!(stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK))
+         hr = AUDCLNT_E_EVENTHANDLE_NOT_EXPECTED;

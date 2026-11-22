@@ -1091,6 +1091,7 @@ mod tests {
             foveation: false,
             tcp_only: true,
             cable: true,
+            microphone: false,
         };
         (ClientLink::connect(addr, &caps, &identity, None, Duration::from_secs(10)).unwrap(), inbox)
     }

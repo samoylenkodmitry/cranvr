@@ -9,7 +9,8 @@
 // rotation from its motion sensors. That asks the person for nothing. The declaration brings the
 // sensor's Java class and the permission for fast sampling. The headset's app asks for its USB
 // network to the Mac (`src/usb_network.rs`), which brings the class of Cranpose's network requests
-// and the permission to change the network state.
+// and the permission to change the network state. It records the headset's microphone for the
+// host's games (`src/microphone.rs`), which brings the microphone's permission and its class.
 use cranpose_capabilities::{declare, Use};
 
 fn main() {
@@ -23,6 +24,7 @@ fn main() {
             Use::eye_tracking(),
             Use::controller_models(),
             Use::network_request(),
+            Use::microphone("Games on your Mac hear your voice through the headset's microphone."),
         ])
         .emit();
     }

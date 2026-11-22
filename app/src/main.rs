@@ -4,6 +4,7 @@
 mod backend;
 mod black_eye;
 mod launch;
+mod microphone;
 mod openvr;
 mod setup;
 mod steam;
@@ -15,6 +16,11 @@ mod vr_window;
 use cranpose::AppLauncher;
 
 fn main() {
+    // Wine's driver reads the microphone's source from a file: it holds the choice from the start
+    let settings = backend::Settings::load();
+    if let Err(e) = microphone::write_choice(&backend::config_dir(), &settings.microphone) {
+        eprintln!("cranvr: the microphone's choice is not written: {e}");
+    }
     let result = AppLauncher::new().with_title("cranvr").with_size(820, 760).try_run(ui::CranvrApp);
     backend::stop_host();
     if let Err(error) = result {
