@@ -36,9 +36,9 @@ const STEP: f32 = 48.0;
 const START_OFFSET: [f32; 3] = [0.0, -400.0, 400.0];
 const START_TILT_DEGREES: f32 = 34.0;
 
-/// Gives the buttons of the controllers one frame of the headset (see `controls.rs`). A hold of the
-/// menu button opens the console, as the standard mapping says. The frame loop calls it. A headset
-/// action that fires gives the hand that fired it a click, so the user knows that the press took.
+/// Gives the buttons of the controllers one frame of the headset (see `controls.rs`). A button that
+/// the mapping gives the console opens it here. The frame loop calls it. A headset action that fires
+/// gives the hand that fired it a click, so the user knows that the press took.
 pub fn on_frame(read: &Read, now: Nanos) {
     let input = read.frame.as_ref().map_or_else(Default::default, |frame| frame.input);
     #[cfg(all(feature = "scripted-hand", target_os = "android"))]

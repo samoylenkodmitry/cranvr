@@ -12,8 +12,9 @@
 //! belong to the game, and the panels that stand in the room do not show.** That covers the connect
 //! panel and the stats panel. It covers the ball above the left controller as well. Cranpose gives a
 //! panel that is not composed no hit, so no pinch can press it, and the app needs no switch of the
-//! pointer. The console stays. The user opens it on purpose with a hold of the left menu button.
-//! Its Close button hides it again.
+//! pointer. The console stays. The hand menu shows too once a button opens it: the user asks for it
+//! on purpose with a hold of the left menu button or of B, as the mapping says. The console's Close
+//! button and the menu's button hide them again.
 //!
 //! Why this rule and not another one:
 //! - The wish is the host's own word for "a pinch is input of the game". It comes from the runtime
@@ -27,8 +28,8 @@
 //! - The wish ends with the game or the link, and a hand that the cameras lose for a moment keeps
 //!   the answer for a second and a half. The panels come back after that.
 //!
-//! The way out for a user who plays with hands only: the panels stay hidden, and the console opens
-//! with the hold of the left menu button of a controller. The user picks one up, and its ray points
+//! The way out for a user who plays with hands only: the panels stay hidden, and the hand menu opens
+//! with the hold of a menu button of a controller. The user picks one up, and its ray points
 //! first. Without a controller the user ends the game in the cranvr app on the Mac, or leaves the
 //! headset app through the system's menu.
 

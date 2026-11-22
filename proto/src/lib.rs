@@ -62,7 +62,10 @@ pub use wire::{Error, Nanos};
 ///
 /// Version 13 names each game's VR system in the console's menu (`HostMsg::Menu`, the key `vr` of a
 /// game), and the console sets it with a `set` request that names the game and its `openvr`.
-pub const PROTOCOL_VERSION: u16 = 13;
+///
+/// Version 14 adds the action `menu` to the controls of the console's menu: a button that opens the
+/// hand menu.
+pub const PROTOCOL_VERSION: u16 = 14;
 
 /// The largest datagram, in bytes, sealed: the counter and the tag are in it. A media packet and
 /// any datagram message fit in it. A typical path MTU of 1500 bytes minus the IP and UDP headers
