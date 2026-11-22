@@ -199,7 +199,7 @@ impl FrameReader {
 /// that counted as a controller would hide the missing one from the host. The game would then
 /// get a pose and a trigger when no hand is in view. The user's hands reach a game with hand code
 /// through the hand tracking that the game asked for (`tracked.rs`).
-fn held(controller: &Controller) -> Option<&Controller> {
+pub(crate) fn held(controller: &Controller) -> Option<&Controller> {
     (!matches!(controller.profile, Some(InteractionProfile::ExtHand | InteractionProfile::MicrosoftHand))).then_some(controller)
 }
 

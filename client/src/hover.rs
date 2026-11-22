@@ -96,6 +96,21 @@ pub fn hands() -> [bool; 2] {
     [left | other != 0, right | other != 0]
 }
 
+/// The bits of the hand menu and of its ball
+const MENU_BITS: u64 = 1 << MENU | 1 << STRIP;
+
+/// Whether the left hand's and the right hand's pointers are over a panel of the app other than the
+/// hand menu and its ball. A pointer that names no hand counts for both.
+pub fn hands_off_menu() -> [bool; 2] {
+    let other = HOVERED[2].load(Ordering::Relaxed) & !MENU_BITS;
+    [0, 1].map(|slot| (HOVERED[slot].load(Ordering::Relaxed) & !MENU_BITS) | other != 0)
+}
+
+/// Whether any pointer is over the hand menu or its ball.
+pub fn on_menu() -> bool {
+    HOVERED.iter().any(|slot| slot.load(Ordering::Relaxed) & MENU_BITS != 0)
+}
+
 /// Forgets every hover: the app lost the input focus, so no pointer points at anything.
 pub fn clear() {
     for slot in &HOVERED {
@@ -126,6 +141,13 @@ pub fn hover_modifier(id: u32) -> Modifier {
                     let event = events.await_pointer_event().await;
                     if let Some(hovered) = hover_of(event.kind) {
                         set(id, event.id.0, hovered);
+                    }
+                    // The log says where a ray enters the hand menu or its ball, so a test reads the
+                    // panel's place from the point that the ray was aimed at
+                    if event.kind == PointerEventKind::Enter && (id == MENU || id == STRIP) {
+                        let hand = ["the left", "the right", "a"][slot_of(event.id.0)];
+                        let what = if id == MENU { "menu" } else { "ball" };
+                        log::info!("{hand} pointer enters the hand {what} at {:.0}, {:.0} dp", event.position.x, event.position.y);
                     }
                 }
             })
@@ -159,6 +181,13 @@ mod tests {
         set(STATS, 2, true);
         clear();
         assert_eq!(hands(), [false, false]);
+        // The menu and its ball do not count as other panels
+        set(MENU, 1, true);
+        assert!(on_menu() && hands_off_menu() == [false, false] && hands() == [true, false]);
+        set(CONNECTION, 2, true);
+        assert_eq!(hands_off_menu(), [false, true]);
+        clear();
+        assert!(!on_menu());
         assert_eq!(idle_for(5000), None);
         mark(1000);
         assert_eq!(idle_for(5000), Some(std::time::Duration::from_secs(4)));

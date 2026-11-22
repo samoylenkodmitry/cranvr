@@ -30,8 +30,18 @@
 //!   console for 4 seconds and away from every panel for 4 seconds, again and again. Once a game runs
 //!   the script opens the console, which a game's start closes. The log then shows the right
 //!   controller's model as it shows and hides (see `models.rs`).
+//! - `scripted_pointer=menu` checks where the hand menu stands for the controllers that a user has
+//!   (`menu_place.rs`). `scripted_hands` names them: `right` or `left` plays that controller alone,
+//!   and the other one is missing; `both` plays both, and the left one goes missing for 4 s in the
+//!   middle. The present controller waits 6 s for the link and its mapping, holds the button that
+//!   opens the menu (B on the right, the menu button on the left) for 1.2 s, then aims its ray at
+//!   the middle of the menu where the code puts it, then at the ball, and pulls its trigger on the
+//!   ball, which closes the menu. The log names each place, and each ray that enters the menu or the
+//!   ball with the point that it hit, so a run reads the panel's place in numbers. Launch it with
+//!   `default_places`, so the user's carries do not move the panels, and with a link to a host that
+//!   has the standard mapping.
 
-use crate::{place, ui};
+use crate::{hand_menu, menu_model, place, ui};
 use cranpose::launch_args;
 use cranpose_xr::{script_controller, script_hand, Hand, PinchCycle, Pose, ScriptedButtons, ScriptedController, ScriptedHand, SubspaceModifier};
 use std::{sync::Once, time::Duration};
@@ -67,6 +77,10 @@ pub fn install_once() {
         }
         if args.string("scripted_pointer") == Some("console") {
             pointing_at_console();
+            return;
+        }
+        if args.string("scripted_pointer") == Some("menu") {
+            menu_check(args.string("scripted_hands").unwrap_or("both"));
             return;
         }
         let hand = if args.string("scripted_hand") == Some("left") { Hand::Left } else { Hand::Right };
@@ -299,4 +313,96 @@ fn desktop_pointers(pitch: f32) {
     log::info!("scripted controllers point at the desktop panel: left {left_at:?}, right {right_at:?}");
     script_controller(left);
     script_controller(right);
+}
+
+/// The time that a menu check waits for the link and the host's mapping before its first press
+const MENU_WAIT: Duration = Duration::from_secs(6);
+/// Where the menu check's right controller stands, in meters from the head's start
+const MENU_RIGHT_AT: [f32; 3] = [0.15, -0.3, -0.3];
+
+/// The height of the menu that a host with no display gives: the console, the connection, the
+/// stream's numbers and the row of actions.
+fn empty_menu_height() -> f32 {
+    use crate::{displays::DisplaysView, menu_place::MenuPlace, panel_layout::Layout};
+    let layout = Layout::default();
+    let displays = DisplaysView::default();
+    let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays, wishes: Default::default(), place: MenuPlace::View };
+    menu_model::height(&menu_model::rows(&input))
+}
+
+/// A place straight down and ahead of `at`, where a ray hits no panel
+fn away_from(at: [f32; 3]) -> [f32; 3] {
+    [at[0], at[1] - 1.0, at[2] - 0.3]
+}
+
+/// The script of a controller that is missing for the whole run.
+fn missing(hand: Hand) -> ScriptedController {
+    ScriptedController::new(hand, [0.0; 3], [0.0, 0.0, -1.0]).untracked(Duration::from_millis(1))
+}
+
+/// Plays `scripted_pointer=menu` (see the file's notes).
+fn menu_check(hands: &str) {
+    let rest = ScriptedButtons::default();
+    let pull = ScriptedButtons { trigger: 1.0, ..rest };
+    let height = empty_menu_height();
+    // The soft subspace in front of the user has its origin a meter ahead of the head, and the head on
+    // a desk stays where it started
+    let view = Pose::at([0.0, 0.0, -1.0]);
+    let view_menu = view.then(&hand_menu::menu_start(hand_menu::IN_VIEW, height)).position;
+    let base = hand_menu::IN_VIEW.base;
+    let view_ball = view.then(&Pose::at([base[0], base[1] + hand_menu::LIFT, base[2]])).position;
+    let alone = |hand: Hand, at: [f32; 3], open: ScriptedButtons| {
+        ScriptedController::new(hand, at, away_from(at))
+            .holding(MENU_WAIT, rest)
+            .holding(Duration::from_millis(1200), open)
+            .holding(Duration::from_millis(800), rest)
+            .moving_to(Duration::from_millis(1), (at, view_menu), rest)
+            .holding(Duration::from_millis(1500), rest)
+            .moving_to(Duration::from_millis(1), (at, view_ball), rest)
+            .holding(Duration::from_millis(500), rest)
+            .holding(Duration::from_millis(300), pull)
+            .holding(Duration::from_millis(1000), rest)
+            .moving_to(Duration::from_millis(1), (at, away_from(at)), rest)
+    };
+    log::info!("scripted menu check with {hands}: a menu {height:.0} dp tall, in front of the user at {view_menu:?} with its ball at {view_ball:?}");
+    match hands {
+        "right" => {
+            script_controller(missing(Hand::Left));
+            script_controller(alone(Hand::Right, MENU_RIGHT_AT, ScriptedButtons { secondary: true, ..rest }));
+        }
+        "left" => {
+            script_controller(missing(Hand::Right));
+            script_controller(alone(Hand::Left, LEFT_AT, ScriptedButtons { menu: true, ..rest }));
+        }
+        _ => {
+            // The left controller's ray is level and straight ahead, so its pose has no turn
+            let left = Pose::at(LEFT_AT);
+            let hand_menu = left.then(&hand_menu::menu_start(hand_menu::ON_LEFT, height)).position;
+            let hand_ball = left.then(&Pose::at([0.0, hand_menu::LIFT / 1000.0, 0.0])).position;
+            log::info!("scripted menu check: the menu on the left hand at {hand_menu:?} with its ball at {hand_ball:?}; the left controller goes missing from 10 s to 14 s");
+            script_controller(ScriptedController::new(Hand::Left, LEFT_AT, LEVEL_TO).holding(Duration::from_secs(10), rest).untracked(Duration::from_secs(4)).holding(Duration::from_secs(60), rest));
+            let at = MENU_RIGHT_AT;
+            let right = ScriptedController::new(Hand::Right, at, away_from(at))
+                .holding(MENU_WAIT, rest)
+                .holding(Duration::from_millis(1200), ScriptedButtons { secondary: true, ..rest })
+                .holding(Duration::from_millis(800), rest)
+                // 8 s: the menu on the left hand
+                .moving_to(Duration::from_millis(1), (at, hand_menu), rest)
+                .holding(Duration::from_millis(1500), rest)
+                .moving_to(Duration::from_millis(1), (at, away_from(at)), rest)
+                // The left controller goes missing at 10 s, and the menu stands in front of the user from 12 s
+                .holding(Duration::from_millis(3000), rest)
+                .moving_to(Duration::from_millis(1), (at, view_menu), rest)
+                .holding(Duration::from_millis(1000), rest)
+                .moving_to(Duration::from_millis(1), (at, away_from(at)), rest)
+                // The left controller is back at 14 s, and the menu on its hand from 14.3 s
+                .holding(Duration::from_millis(1500), rest)
+                .moving_to(Duration::from_millis(1), (at, hand_ball), rest)
+                .holding(Duration::from_millis(500), rest)
+                .holding(Duration::from_millis(300), pull)
+                .holding(Duration::from_millis(1000), rest)
+                .moving_to(Duration::from_millis(1), (at, away_from(at)), rest);
+            script_controller(right);
+        }
+    }
 }

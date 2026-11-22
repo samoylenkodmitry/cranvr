@@ -262,15 +262,7 @@ fn Surface(stream: u8, modifier: SubspaceModifier, width: MutableState<f32>) {
     });
 }
 
-/// The pose of the hand's display before the user carries it: above the ball and a little to the
-/// right of the hand, with its bottom edge above the ball. `height` is the surface's height in dp.
-pub fn hand_display_start(frame: HandFrame, height: f32) -> Pose {
-    let base = frame.base;
-    let y = base[1] + hand_menu::LIFT + hand_menu::BALL / 2.0 + hand_menu::CLEARANCE + height / 2.0;
-    SubspaceModifier::new().offset(base[0] + hand_menu::HAND_DISPLAY_X, y, base[2]).pose()
-}
-
-/// The display that rides on the left hand, in the hand's `frame` (see `hand_menu.rs`). The panel is
+/// The display that rides with the hand menu, in the menu's `frame` (see `hand_menu.rs`). The panel is
 /// small, so it asks for a smaller picture (see `display_wish.rs`). The user can resize it with the
 /// corner sphere. The sphere under it carries it: the carry sets its offset from the controller,
 /// which `place.rs` keeps under the frame's name for the display.
@@ -306,7 +298,7 @@ pub fn HandDisplay(stream: u8, frame: HandFrame) {
         }
     });
     let saved = remember(move || place::saved_pose(name)).with(|pose: &Option<Pose>| *pose);
-    let pose = saved.unwrap_or_else(|| hand_display_start(frame, surface_height));
+    let pose = saved.unwrap_or_else(|| hand_menu::hand_display_start(frame, [surface_width, surface_height]));
     let modifier = place::movable(name, SubspaceModifier::new().size(surface_width, surface_height).resizable_with(limits, resize), pose, |_| {});
     Surface(stream, modifier, width);
 }

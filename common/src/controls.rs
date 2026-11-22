@@ -184,6 +184,58 @@ impl<'de> Deserialize<'de> for ModelsInGame {
     }
 }
 
+/// The hand on which the hand menu rides while the headset tracks both controllers. The other hand
+/// points at it. With one controller the menu stands in front of the user, whatever the choice says
+/// (see `client/src/menu_place.rs`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum MenuHand {
+    Left,
+    Right,
+    /// The hand that does not point: the one that did not last pull its trigger on a panel
+    #[default]
+    Auto,
+}
+
+impl MenuHand {
+    pub const ALL: [MenuHand; 3] = [MenuHand::Left, MenuHand::Right, MenuHand::Auto];
+
+    /// The name in the files and messages
+    pub fn key(self) -> &'static str {
+        match self {
+            MenuHand::Left => "left",
+            MenuHand::Right => "right",
+            MenuHand::Auto => "auto",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|choice| choice.key() == key)
+    }
+
+    /// The text of the choice's button
+    pub fn label(self) -> &'static str {
+        match self {
+            MenuHand::Left => "Left hand",
+            MenuHand::Right => "Right hand",
+            MenuHand::Auto => "Auto",
+        }
+    }
+}
+
+impl Serialize for MenuHand {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.key())
+    }
+}
+
+/// A name that is no choice is an error.
+impl<'de> Deserialize<'de> for MenuHand {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let key = String::deserialize(deserializer)?;
+        Self::from_key(&key).ok_or_else(|| serde::de::Error::custom(format!("no menu hand is named {key}")))
+    }
+}
+
 /// The two controllers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Hand {
@@ -362,17 +414,24 @@ impl HandControls {
     }
 }
 
-/// The actions of both controllers, and when the headset draws its models of them in a game.
+/// The actions of both controllers, when the headset draws its models of them in a game, and the
+/// hand that carries the hand menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct Controls {
     pub left: HandControls,
     pub right: HandControls,
     pub models_in_game: ModelsInGame,
+    pub menu_hand: MenuHand,
 }
 
 impl Default for Controls {
     fn default() -> Self {
-        Self { left: HandControls::standard(Hand::Left), right: HandControls::standard(Hand::Right), models_in_game: ModelsInGame::default() }
+        Self {
+            left: HandControls::standard(Hand::Left),
+            right: HandControls::standard(Hand::Right),
+            models_in_game: ModelsInGame::default(),
+            menu_hand: MenuHand::default(),
+        }
     }
 }
 
@@ -411,6 +470,7 @@ struct PartialControls {
     left: Option<PartialHand>,
     right: Option<PartialHand>,
     models_in_game: Option<ModelsInGame>,
+    menu_hand: Option<MenuHand>,
 }
 
 impl<'de> Deserialize<'de> for Controls {
@@ -420,6 +480,7 @@ impl<'de> Deserialize<'de> for Controls {
             left: partial.left.unwrap_or_default().over(HandControls::standard(Hand::Left)),
             right: partial.right.unwrap_or_default().over(HandControls::standard(Hand::Right)),
             models_in_game: partial.models_in_game.unwrap_or_default(),
+            menu_hand: partial.menu_hand.unwrap_or_default(),
         })
     }
 }
@@ -512,6 +573,19 @@ mod tests {
         assert_eq!(Controls::from_json(r#"{"models_in_game":"never"}"#).unwrap().models_in_game, ModelsInGame::Never);
         // A name that is no choice makes the mapping unreadable, as a wrong action does
         assert_eq!(Controls::from_json(r#"{"models_in_game":"sometimes"}"#), None);
+    }
+
+    #[test]
+    fn the_menu_hand_is_auto_unless_the_text_names_another_choice() {
+        assert_eq!(Controls::default().menu_hand, MenuHand::Auto);
+        assert_eq!(Controls::from_json("{}").unwrap().menu_hand, MenuHand::Auto);
+        for choice in MenuHand::ALL {
+            let controls = Controls { menu_hand: choice, ..Controls::default() };
+            assert_eq!(Controls::from_json(&controls.to_json()), Some(controls));
+            assert_eq!(MenuHand::from_key(choice.key()), Some(choice));
+        }
+        assert_eq!(Controls::from_json(r#"{"menu_hand":"right"}"#).unwrap().menu_hand, MenuHand::Right);
+        assert_eq!(Controls::from_json(r#"{"menu_hand":"middle"}"#), None);
     }
 
     #[test]

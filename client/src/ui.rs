@@ -19,6 +19,7 @@ use crate::{
     hands,
     hold::{HoldFrame, PanelHold},
     hover,
+    menu_place::{self, MenuPlace, PlaceFrame, Placer},
     hub::{hub, DecoderView, Device, LinkState, Snapshot, Stats},
     panel_layout::{layers, Layout, PanelId},
     phone::{self, PhoneFrames},
@@ -98,7 +99,9 @@ pub fn ClientApp() {
     // Counts the Recenter actions, from a button or from the hand menu. Each count makes the panels'
     // subspace snap in front of the head again.
     let recenters = rememberMutableStateOf(|| 0u32);
-    let hand = HandState { layout, menu_open, recenter: recenters };
+    // Where the hand menu stands: the frame loop follows the controllers (see `menu_place.rs`)
+    let place = rememberMutableStateOf(hand_menu::current_place);
+    let hand = HandState { layout, menu_open, place, recenter: recenters };
     // The hands belong to the game while the host asks for them (see `hands.rs`): then no panel
     // stands where a pinch could press it
     let hands_in_game = rememberMutableStateOf(|| false);
@@ -205,7 +208,7 @@ pub fn ClientApp() {
     // default pose in that frame, so the first start opens in front of the user. A saved pose is in
     // the same frame (see `place.rs`).
     FollowingSubspace(FollowTarget::View(FollowMode::Snap(TrackedDimensions::TranslationAndYaw)), move || {
-        HeadsetFrames(menu_open);
+        HeadsetFrames(menu_open, place);
         // A flat window shows the panels in this order, side by side. In a headset each panel has
         // its own place. The hand menu shows and hides them. While no link runs the connect panel
         // shows anyway, so a user always sees how to connect and sees the code that the Mac asks
@@ -234,7 +237,7 @@ pub fn ClientApp() {
         });
         ConsolePanel(console, snapshot);
         if hand_menu::flat_menu() {
-            hand_menu::Menu(hand, console.get().open, hand_menu::ON_CONTROLLER);
+            hand_menu::Menu(hand, console.get().open, hand_menu::ON_LEFT);
         }
         Behind(backdrop, frames);
     });
@@ -450,15 +453,29 @@ pub(crate) fn text_style(size: f32, color: Color, weight: Option<FontWeight>) ->
 /// Hands each frame of the headset to the sender of the tracking. The callback runs on the frame
 /// loop once for each headset frame. It does no network call: the sender thread wakes and sends.
 #[composable]
-fn HeadsetFrames(menu_open: MutableState<bool>) {
+fn HeadsetFrames(menu_open: MutableState<bool>, place: MutableState<MenuPlace>) {
     let reader = remember(|| Rc::new(RefCell::new(FrameReader::default()))).with(Clone::clone);
     let hold = remember(|| Rc::new(RefCell::new(PanelHold::default()))).with(Clone::clone);
+    let placer = remember(|| Rc::new(RefCell::new(Placer::default()))).with(Clone::clone);
     SpatialFrameEffect(move |frame| {
         let now = now_ns();
         let mut read = reader.borrow_mut().read(frame, now);
+        let open = menu_open.get_non_reactive();
+        // A system menu over the app takes the controllers' poses away: that loses no controller
+        if frame.focused {
+            let mut placer = placer.borrow_mut();
+            let next = placer.update(hub().controls().menu_hand, &place_frame(frame, open));
+            if next != place.get_non_reactive() {
+                let [left, right] = placer.present().map(|present| if present { "tracked" } else { "lost" });
+                log::info!("the hand menu moves {}: the left controller is {left}, the right one {right}", next.label());
+                hand_menu::set_place(next);
+                place.set(next);
+            }
+        }
         // The hands that a panel holds back from the game: the host gives the game rest values for them
         if let Some(sent) = read.frame.as_mut() {
-            sent.held = held_hands(&mut hold.borrow_mut(), frame, now, menu_open.get_non_reactive());
+            let workers = if open { menu_place::workers(place.get_non_reactive(), placer.borrow().present()) } else { [false; 2] };
+            sent.held = held_hands(&mut hold.borrow_mut(), frame, now, workers);
         }
         // The hands, body, face and eyes go in before the frame, so the sender finds them when it wakes
         reader.borrow_mut().push_tracked(frame, &read, &hub().feed);
@@ -467,9 +484,24 @@ fn HeadsetFrames(menu_open: MutableState<bool>) {
     });
 }
 
+/// What the frame says about the controllers, for the hand menu's place (see `menu_place.rs`). A hand
+/// that the cameras track is no controller.
+fn place_frame(frame: &cranpose_xr::XrFrame, menu_open: bool) -> PlaceFrame {
+    let controller = |hand: XrHand| crate::tracking::held(frame.controller(hand)).filter(|controller| controller.aim.is_some());
+    let hands = [XrHand::Left, XrHand::Right];
+    PlaceFrame {
+        time: frame.predicted_display_time,
+        tracked: hands.map(|hand| controller(hand).is_some()),
+        trigger: hands.map(|hand| controller(hand).map_or(0.0, |controller| controller.trigger.value)),
+        on_panel: hover::hands_off_menu(),
+        menu_busy: menu_open || hover::on_menu(),
+    }
+}
+
 /// The hands that the app holds back from the game in this frame (see `hold.rs`). An app without the
-/// input focus has no pointer, so nothing is held then.
-fn held_hands(hold: &mut PanelHold, frame: &cranpose_xr::XrFrame, now: u64, menu_open: bool) -> [bool; 2] {
+/// input focus has no pointer, so nothing is held then. `menu_workers` are the hands that work the
+/// open hand menu.
+fn held_hands(hold: &mut PanelHold, frame: &cranpose_xr::XrFrame, now: u64, menu_workers: [bool; 2]) -> [bool; 2] {
     if !frame.focused {
         hold.reset();
         hover::clear();
@@ -489,7 +521,7 @@ fn held_hands(hold: &mut PanelHold, frame: &cranpose_xr::XrFrame, now: u64, menu
         hover,
         handle: hover::handle_held(),
         trigger: [trigger(XrHand::Left), trigger(XrHand::Right)],
-        menu_open,
+        menu_workers,
     });
     // Each change goes to the log, so a run shows when a panel held a hand back
     static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);

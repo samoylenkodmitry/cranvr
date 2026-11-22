@@ -18,7 +18,7 @@ use crate::{
 use cranpose::prelude::*;
 use cranpose::text::FontWeight;
 use cranpose_xr::{FollowMode, FollowTarget, TrackedDimensions, FollowingSubspace, Hand, Pose, SpatialPanel, SubspaceModifier, Vibration};
-use cranvr_common::controls::{Control, Controls, Hand as ControlHand, ModelsInGame};
+use cranvr_common::controls::{Control, Controls, Hand as ControlHand, MenuHand, ModelsInGame};
 use cranvr_proto::wire::Nanos;
 use std::time::Duration;
 
@@ -106,7 +106,7 @@ fn OpenConsole(view: View, state: LinkState) {
             ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(size::GAP)),
             move || match (shown, &menu) {
                 (Page::Controls(hand), _) => ControlsPage(page, hand, controls, editable),
-                (Page::Main, Some(menu)) => MenuRows(menu.clone(), room, volume, controls.models_in_game, page),
+                (Page::Main, Some(menu)) => MenuRows(menu.clone(), room, volume, controls, page),
                 (Page::Main, None) => NoMenu(state.clone(), room, volume, page),
             },
         );
@@ -133,7 +133,7 @@ fn NoMenu(state: LinkState, room: Room, volume: Volume, page: MutableState<Page>
 }
 
 #[composable]
-fn MenuRows(menu: Menu, room: Room, volume: Volume, models: ModelsInGame, page: MutableState<Page>) {
+fn MenuRows(menu: Menu, room: Room, volume: Volume, controls: Controls, page: MutableState<Page>) {
     let status = menu.status.clone();
     let stream = if status.refresh > 0.0 {
         let latency = status.latency_ms.map_or(String::new(), |ms| format!(", {ms:.0} ms"));
@@ -173,7 +173,7 @@ fn MenuRows(menu: Menu, room: Room, volume: Volume, models: ModelsInGame, page: 
         vec![("Limit 2x".into(), Press::Host(Action::Msaa(2)), menu.msaa == 2), ("No limit".into(), Press::Host(Action::Msaa(0)), menu.msaa == 0)],
     );
     ClientSettings(room, volume);
-    ModelsSetting(models);
+    ModelsSetting(controls.models_in_game);
     Text(
         "Refresh and game size restart the stream",
         Modifier::empty().height(size::TEXT),
@@ -188,6 +188,30 @@ fn MenuRows(menu: Menu, room: Room, volume: Volume, models: ModelsInGame, page: 
 fn ClientSettings(room: Room, volume: Volume) {
     Setting("Room", Room::ALL.iter().map(|&choice| (choice.label().into(), Press::Room(choice), room == choice)).collect());
     Setting("Volume", Volume::ALL.iter().map(|&choice| (choice.label(), Press::Volume(choice), volume == choice)).collect());
+}
+
+/// The hand that carries the hand menu while both controllers are tracked. The Mac keeps the choice
+/// with the controls.
+#[composable]
+fn MenuHandSetting(current: MenuHand) {
+    Text("Hand menu with two controllers", Modifier::empty().height(size::TEXT), text_style(22.0, TEXT_COLOR, None));
+    Row(
+        Modifier::empty().fill_max_width(),
+        RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(size::GAP)),
+        move || {
+            for choice in MenuHand::ALL {
+                let color = if choice == current { ACCENT_COLOR } else { KEY_COLOR };
+                Button(
+                    Modifier::empty().height(size::BUTTON).background(color).rounded_corners(12.0).weight(1.0),
+                    ButtonSpec::default(),
+                    move || run(&Press::MenuHand(choice)),
+                    move || {
+                        Text(choice.label(), Modifier::empty(), bold(18.0));
+                    },
+                );
+            }
+        },
+    );
 }
 
 /// When the controllers' models show in a game. The Mac keeps the choice with the controls. The
@@ -282,6 +306,7 @@ fn run(press: &Press) {
         Press::Room(room) => hub().choose_room(*room),
         Press::Volume(volume) => hub().choose_volume(*volume),
         Press::Models(choice) => hub().choose_models(*choice),
+        Press::MenuHand(choice) => hub().choose_menu_hand(*choice),
     }
 }
 
@@ -358,6 +383,7 @@ fn ControlsPage(page: MutableState<Page>, hand: ControlHand, controls: Controls,
     for control in Control::ALL {
         ControlRow(hand, control, controls, editable);
     }
+    MenuHandSetting(controls.menu_hand);
     let (first, second) = if editable {
         ("A game still gets every button.", "A mouse action works on the Mac's desktop.")
     } else {

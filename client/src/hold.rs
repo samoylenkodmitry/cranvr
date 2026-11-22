@@ -29,8 +29,8 @@ pub const RELEASE_DELAY: Duration = Duration::from_millis(150);
 /// A pull counts as a pull on a panel when the ray was on a panel this long before it. The pull of a
 /// trigger turns the controller, and Cranpose takes the point from just before the pull.
 const PULL_LOOKBACK: Duration = Duration::from_millis(250);
-/// While the hand menu is open, the hand that does not carry it stays held this long after the ray
-/// left the menu: the user works the menu with it, and the pause between two presses is not a game.
+/// While the hand menu is open, the hand that works it stays held this long after the ray left the
+/// menu: the pause between two presses is not a game.
 pub const MENU_GRACE: Duration = Duration::from_millis(1500);
 
 /// What the app knows in one frame of the headset.
@@ -44,8 +44,10 @@ pub struct HoldFrame {
     pub handle: bool,
     /// How far each hand's trigger is pulled, or how far its index finger pinches, from 0 to 1
     pub trigger: [f32; 2],
-    /// The hand menu is open. It rides on the left hand, so the right hand works it.
-    pub menu_open: bool,
+    /// The hands that work the open hand menu, left then right: the other hand of a menu on a hand,
+    /// or the hands that point at a menu in front of the user (`menu_place::workers`). None while the
+    /// menu is closed.
+    pub menu_workers: [bool; 2],
 }
 
 /// The state of the rule across frames.
@@ -79,7 +81,7 @@ impl PanelHold {
             if !self.down[hand] {
                 self.pressing[hand] = false;
             }
-            let delay = if frame.menu_open && hand == 1 { MENU_GRACE } else { RELEASE_DELAY };
+            let delay = if frame.menu_workers[hand] { MENU_GRACE } else { RELEASE_DELAY };
             // A grab of a handle holds the hands whose triggers are down: Cranpose names no hand for it
             let carrying = frame.handle && self.down[hand];
             held[hand] = self.pressing[hand] || carrying || hover_within(hand, delay);
@@ -98,7 +100,7 @@ mod tests {
     use super::*;
 
     fn frame(ms: u64, hover: [bool; 2], trigger: [f32; 2]) -> HoldFrame {
-        HoldFrame { time: Duration::from_millis(ms), hover, handle: false, trigger, menu_open: false }
+        HoldFrame { time: Duration::from_millis(ms), hover, handle: false, trigger, menu_workers: [false; 2] }
     }
 
     const NONE: [bool; 2] = [false, false];
@@ -188,10 +190,10 @@ mod tests {
     }
 
     #[test]
-    fn the_right_hand_stays_held_a_moment_while_the_menu_is_open() {
+    fn the_hand_that_works_the_open_menu_stays_held_a_moment() {
         let mut hold = PanelHold::default();
         let mut f = frame(0, RIGHT, [0.0, 0.0]);
-        f.menu_open = true;
+        f.menu_workers = RIGHT;
         assert_eq!(hold.update(&f), RIGHT);
         f.hover = NONE;
         f.time = Duration::from_millis(1000);
@@ -202,5 +204,13 @@ mod tests {
         let mut hold = PanelHold::default();
         hold.update(&frame(0, RIGHT, [0.0, 0.0]));
         assert_eq!(hold.update(&frame(1000, NONE, [0.0, 0.0])), NONE);
+        // A menu on the right hand: the left hand works it
+        let mut hold = PanelHold::default();
+        let mut f = frame(0, LEFT, [0.0, 0.0]);
+        f.menu_workers = LEFT;
+        hold.update(&f);
+        f.hover = NONE;
+        f.time = Duration::from_millis(1000);
+        assert_eq!(hold.update(&f), LEFT);
     }
 }

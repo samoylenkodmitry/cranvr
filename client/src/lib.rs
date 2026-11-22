@@ -29,6 +29,7 @@ mod hands;
 mod hold;
 mod hover;
 mod menu_model;
+mod menu_place;
 mod microphone;
 mod models;
 mod hub;
