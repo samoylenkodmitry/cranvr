@@ -7,6 +7,7 @@
 #   CASE    right, left or both: the scripted controllers of `scripted_pointer=menu` (client/src/scripted.rs).
 #           palm: the scripted hands of `scripted_pointer=palm`.
 #           gaze: no controller and no hand (`scripted_pointer=none`), with the ball straight ahead.
+#           ball: the scripted right hand of `scripted_point=ball` pinches the ball of `hand_anchor=view`.
 #           mac: no scripted press; the run writes `menu open` to the host's input after 8 s.
 #   SECONDS how long the run reads the log (18 by default, 22 for both)
 #   PORT    the test host's port (9961 by default)
@@ -44,6 +45,7 @@ case ${case} in
     mac) ;;
     palm) extras+=(--es scripted_pointer palm) ;;
     gaze) extras+=(--es scripted_pointer none --es gaze_pitch 0) ;;
+    ball) extras+=(--es scripted_point ball --es hand_anchor view) ;;
     *) extras+=(--es scripted_pointer menu --es scripted_hands ${case}) ;;
 esac
 ${adb_cmd} shell am start -n dev.cranvr.client/dev.cranpose.android.CranposeActivity ${extras} > /dev/null

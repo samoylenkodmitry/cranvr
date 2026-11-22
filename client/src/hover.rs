@@ -27,6 +27,8 @@ pub const CONNECTION: u32 = 1;
 pub const STATS: u32 = 2;
 pub const MENU: u32 = 3;
 pub const STRIP: u32 = 4;
+/// The ball on an open palm (`palm.rs`)
+pub const PALM: u32 = 5;
 /// The first bit of the displays: the display of stream `s` has bit `DISPLAY + s`
 pub const DISPLAY: u32 = 8;
 
@@ -96,8 +98,8 @@ pub fn hands() -> [bool; 2] {
     [left | other != 0, right | other != 0]
 }
 
-/// The bits of the hand menu and of its ball
-const MENU_BITS: u64 = 1 << MENU | 1 << STRIP;
+/// The bits of the hand menu and of its balls
+const MENU_BITS: u64 = 1 << MENU | 1 << STRIP | 1 << PALM;
 
 /// Whether the left hand's and the right hand's pointers are over a panel of the app other than the
 /// hand menu and its ball. A pointer that names no hand counts for both.
@@ -149,7 +151,7 @@ pub fn hover_modifier(id: u32) -> Modifier {
                         PointerEventKind::Down => Some("presses"),
                         _ => None,
                     };
-                    if let Some(verb) = verb.filter(|_| id == MENU || id == STRIP) {
+                    if let Some(verb) = verb.filter(|_| [MENU, STRIP, PALM].contains(&id)) {
                         let hand = ["the left", "the right", "a"][slot_of(event.id.0)];
                         let what = if id == MENU { "menu" } else { "ball" };
                         log::info!("{hand} pointer {verb} the hand {what} at {:.0}, {:.0} dp", event.position.x, event.position.y);
