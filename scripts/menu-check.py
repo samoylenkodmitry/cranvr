@@ -6,8 +6,10 @@ For each line the time counts from the client's line "scripted menu check" (or f
 of the menu for a run without a script). The script prints:
 - each move of the menu between the hands and the view, with the time;
 - each opening and closing of the menu and what asked for it;
-- each ray that entered the menu or its ball, with the point that it hit and its distance in mm
-  from the middle that the script aimed at (a dp is a millimeter);
+- each ray that entered or pressed the menu or its ball, with the point that it hit and its
+  distance in mm from the middle that the script aimed at (a dp is a millimeter). Cranpose's
+  pointer smooths the ray, so an entry lies on the ray's way in, and a press, which the script
+  makes after the ray rested for a second, lies where the ray rests;
 - each change of the line under the ball;
 - the panels that the app composed, and the host's lines about the menu.
 """
@@ -17,7 +19,7 @@ from datetime import datetime
 
 TIME = re.compile(r"^(\d\d-\d\d \d\d:\d\d:\d\d\.\d\d\d)")
 CHECK = re.compile(r"scripted menu check with (\w+): a menu (\d+) dp tall")
-ENTER = re.compile(r"(the left|the right|a) pointer enters the hand (menu|ball) at (-?\d+), (-?\d+) dp")
+ENTER = re.compile(r"(the left|the right|a) pointer (enters|presses) the hand (menu|ball) at (-?\d+), (-?\d+) dp")
 MOVE = re.compile(r"the hand menu moves (.*?): the left controller is (\w+), the right one (\w+)")
 OPEN = re.compile(r"(a button (opens|closes) the hand menu|the hand menu (opens|closes)\b.*|the Mac opens the hand menu.*|the Mac asks to open the hand menu|the hand menu closes: .*)")
 HINT = re.compile(r"(the menu hint (shows|goes).*)")
@@ -46,13 +48,13 @@ with open(sys.argv[1], errors="replace") as log:
             continue
         m = ENTER.search(line)
         if m:
-            x, y = int(m.group(3)), int(m.group(4))
-            if m.group(2) == "menu" and height:
+            x, y = int(m.group(4)), int(m.group(5))
+            if m.group(3) == "menu" and height:
                 aim = (MENU_WIDTH / 2, height / 2)
             else:
                 aim = (BALL / 2, BALL / 2)
             off = ((x - aim[0]) ** 2 + (y - aim[1]) ** 2) ** 0.5
-            events.append((at, f"{m.group(1)} ray enters the {m.group(2)} at {x}, {y} dp: {off:.0f} mm from its aimed middle"))
+            events.append((at, f"{m.group(1)} ray {m.group(2)} the {m.group(3)} at {x}, {y} dp: {off:.0f} mm from its aimed middle"))
             continue
         for pattern in (MOVE, OPEN, HINT, LAYERS):
             m = pattern.search(line)

@@ -37,7 +37,7 @@ logcat=$!
 ${adb_cmd} reverse tcp:${port} tcp:${port} > /dev/null
 ${adb_cmd} shell am force-stop dev.cranvr.client
 ${adb_cmd} shell am broadcast -a com.oculus.vrpowermanager.prox_close > /dev/null
-extras=(--es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room scene --ez default_places true --ez first_start true --es forget_host_key 127.0.0.1:${port})
+extras=(--es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room scene --ez default_places true --ez first_start true --ez log_poses true --es forget_host_key 127.0.0.1:${port})
 [[ ${case} != mac ]] && extras+=(--es scripted_pointer menu --es scripted_hands ${case})
 ${adb_cmd} shell am start -n dev.cranvr.client/dev.cranpose.android.CranposeActivity ${extras} > /dev/null
 if [[ ${case} == mac ]]; then
