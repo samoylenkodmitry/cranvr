@@ -101,7 +101,22 @@ pub fn ClientApp() {
     let recenters = rememberMutableStateOf(|| 0u32);
     // Where the hand menu stands: the frame loop follows the controllers (see `menu_place.rs`)
     let place = rememberMutableStateOf(hand_menu::current_place);
-    let hand = HandState { layout, menu_open, place, recenter: recenters };
+    let present = rememberMutableStateOf(|| [true; 2]);
+    // The line under the ball shows at the first start and when the tracking falls to one
+    // controller. It goes when the menu opens (see `menu_hint.rs`).
+    let hint = rememberMutableStateOf(crate::menu_hint::wanted_at_start);
+    let hand = HandState { layout, menu_open, place, present, hint, recenter: recenters };
+    let opened = menu_open.get();
+    LaunchedEffect(opened, async move |_| {
+        if opened && hint.get_non_reactive() {
+            log::info!("the menu hint goes: the menu opened");
+            hint.set(false);
+            crate::menu_hint::mark_seen();
+        }
+    });
+    if hint.get() {
+        LaunchedEffect((), async move |_| log::info!("the menu hint shows"));
+    }
     // The hands belong to the game while the host asks for them (see `hands.rs`): then no panel
     // stands where a pinch could press it
     let hands_in_game = rememberMutableStateOf(|| false);
@@ -212,7 +227,7 @@ pub fn ClientApp() {
     // default pose in that frame, so the first start opens in front of the user. A saved pose is in
     // the same frame (see `place.rs`).
     FollowingSubspace(FollowTarget::View(FollowMode::Snap(TrackedDimensions::TranslationAndYaw)), move || {
-        HeadsetFrames(menu_open, place);
+        HeadsetFrames(menu_open, place, present, hint);
         // A flat window shows the panels in this order, side by side. In a headset each panel has
         // its own place. The hand menu shows and hides them. While no link runs the connect panel
         // shows anyway, so a user always sees how to connect and sees the code that the Mac asks
@@ -247,7 +262,8 @@ pub fn ClientApp() {
     });
     // A menu that a button opened shows while the hands belong to the game too: the user asked for it
     if !hands_in_game.get() || menu_open.get() {
-        HandPanels(hand, console.get().open);
+        let view = console.get();
+        HandPanels(hand, view.open, view.controls, snapshot.get().state == LinkState::Streaming);
     }
 }
 
@@ -457,7 +473,7 @@ pub(crate) fn text_style(size: f32, color: Color, weight: Option<FontWeight>) ->
 /// Hands each frame of the headset to the sender of the tracking. The callback runs on the frame
 /// loop once for each headset frame. It does no network call: the sender thread wakes and sends.
 #[composable]
-fn HeadsetFrames(menu_open: MutableState<bool>, place: MutableState<MenuPlace>) {
+fn HeadsetFrames(menu_open: MutableState<bool>, place: MutableState<MenuPlace>, present: MutableState<[bool; 2]>, hint: MutableState<bool>) {
     let reader = remember(|| Rc::new(RefCell::new(FrameReader::default()))).with(Clone::clone);
     let hold = remember(|| Rc::new(RefCell::new(PanelHold::default()))).with(Clone::clone);
     let placer = remember(|| Rc::new(RefCell::new(Placer::default()))).with(Clone::clone);
@@ -474,6 +490,16 @@ fn HeadsetFrames(menu_open: MutableState<bool>, place: MutableState<MenuPlace>) 
                 log::info!("the hand menu moves {}: the left controller is {left}, the right one {right}", next.label());
                 hand_menu::set_place(next);
                 place.set(next);
+            }
+            let now_present = placer.present();
+            let before = present.get_non_reactive();
+            if now_present != before {
+                // The other hand's buttons are gone: the line names what works now
+                if before == [true; 2] && now_present.iter().filter(|p| **p).count() == 1 && !open {
+                    log::info!("the menu hint shows: the tracking fell to one controller");
+                    hint.set(true);
+                }
+                present.set(now_present);
             }
         }
         // The hands that a panel holds back from the game: the host gives the game rest values for them
