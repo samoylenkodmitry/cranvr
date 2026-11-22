@@ -7,7 +7,7 @@
 //! [`Runner::update`] reads one frame's input and gives the headset actions that fired in this
 //! frame ([`Fire`]): show or hide the panels, open the console, recenter, the keyboard. While no
 //! link streams, the press fires the action. While the link streams, only a hold of [`HOLD_NS`]
-//! does, so a short press stays with the game, as the menu button's hold always did. The host's
+//! does, so a short press stays with the game. The host's
 //! word that a game runs is not enough for the rule: a game that the host does not report would
 //! lose its buttons to a short press.
 //!

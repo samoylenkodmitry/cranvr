@@ -46,7 +46,8 @@ const POLL: Duration = Duration::from_millis(250);
 /// How often the UI looks for a new decoder. The decoder drops pictures that nobody takes, so the
 /// streamed scene must start soon after the decoder does.
 const STREAM_POLL: Duration = Duration::from_millis(16);
-/// How often the UI looks at the console's state. A hold of the menu button should show it soon.
+/// How often the UI looks at the console's state and the hand menu's requests. A hold of a button
+/// should show them soon.
 const CONSOLE_POLL: Duration = Duration::from_millis(50);
 /// How often the UI tells the displays what it wishes
 const WISH_POLL: Duration = Duration::from_millis(100);

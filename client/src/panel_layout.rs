@@ -19,7 +19,7 @@
 //! it in the hand menu.
 //!
 //! The console's own state is the hub's (see `console.rs`): its opening follows the host's menu and
-//! the hold of the left menu button. This file only names it, so the menu can list it.
+//! the buttons that the mapping gives the console. This file only names it, so the menu can list it.
 //!
 //! The ranks of the panels for the headset's layers are here too (`layer_rank`).
 

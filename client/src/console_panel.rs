@@ -1,5 +1,6 @@
 //! The console as a Cranpose panel: the games to play and the main settings, over the host's
-//! menu (see `console.rs`). A hold of the left menu button shows or hides it. A press on a button
+//! menu (see `console.rs`). The Console row of the hand menu shows or hides it, and so does a button
+//! that the mapping gives the console. A press on a button
 //! sends the request to the host.
 //!
 //! Each opening of the console puts it in front of the head, in a `FollowingSubspace` of its own
