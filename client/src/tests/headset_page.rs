@@ -65,3 +65,21 @@ fn a_press_of_the_mac_does_what_the_menus_button_does() {
         assert_eq!(remote(&wrong), None, "{wrong:?}");
     }
 }
+
+#[test]
+fn the_cost_of_a_display_does_not_change_what_the_headsets_page_reads() {
+    let before = displays();
+    let mut after = displays();
+    after.displays[0].measured.received_fps = 31.0;
+    after.displays[0].measured.mbps = 4.5;
+    after.displays[1].streaming = true;
+    assert_ne!(before, after);
+    assert_eq!(before.clone().without_costs(), after.clone().without_costs());
+    // The page from the view without costs is the page from the full view
+    let layout = Layout::default();
+    assert_eq!(page(&input_rows(&layout, &before)), page(&input_rows(&layout, &after.without_costs())));
+    // A display that the user hides changes what the page reads
+    let mut hidden = Layout::default();
+    hidden.set_shown(PanelId::Display(DESKTOP_STREAM), false);
+    assert_ne!(page(&input_rows(&layout, &before)), page(&input_rows(&hidden, &before)));
+}

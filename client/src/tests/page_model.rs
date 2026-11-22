@@ -49,7 +49,7 @@ fn play() -> Page {
 }
 
 fn menu() -> Menu {
-    Menu { pages: vec![play(), stream()], status: Status::default(), notice: None, controls: Controls::default(), headset: Default::default() }
+    Menu { pages: vec![play(), stream()].into(), status: Status::default(), notice: None, controls: Controls::default(), headset: Default::default() }
 }
 
 #[test]

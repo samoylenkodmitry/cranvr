@@ -76,7 +76,7 @@ fn a_change_runs_until_the_menu_shows_its_value_or_a_new_notice() {
     assert_eq!(pending.progress(&menu, start + ANSWER_TIME + Duration::from_secs(1)), Progress::NoAnswer);
     // The Mac took it: the menu shows the new value
     let mut taken = menu.clone();
-    if let Some(Item::Choice(choice)) = taken.pages[1].items.first_mut() {
+    if let Some(Item::Choice(choice)) = Arc::make_mut(&mut taken.pages)[1].items.first_mut() {
         choice.value = "90".into();
     }
     assert_eq!(pending.progress(&taken, start), Progress::Done);
@@ -94,7 +94,7 @@ fn an_action_runs_while_the_mac_marks_its_button_and_briefly_before_the_mac_can_
     let pending = Pending::new(play.clone(), None, start);
     assert_eq!(pending.progress(&menu, start + Duration::from_secs(1)), Progress::Running, "the Mac's menu is on its way");
     assert_eq!(pending.progress(&menu, start + ECHO_TIME + Duration::from_millis(1)), Progress::Done, "a quick action is done");
-    let Some(Item::Buttons(row)) = menu.pages[0].items.first_mut() else { panic!() };
+    let Some(Item::Buttons(row)) = Arc::make_mut(&mut menu.pages)[0].items.first_mut() else { panic!() };
     row.buttons[0].busy = true;
     assert_eq!(pending.progress(&menu, start + Duration::from_secs(30)), Progress::Running, "the Mac starts the game");
     assert_eq!(pending.progress(&menu, start + ANSWER_TIME + Duration::from_secs(1)), Progress::NoAnswer);
