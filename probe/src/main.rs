@@ -70,7 +70,8 @@ fn usage() -> ! {
          \n                     pointer at a time, such as a menu, then has its left controller pressed for the\
          \n                     first time at AT.\
          \n  --right-trigger AT:FOR  the same for the right trigger\
-         \n  --menu AT          the left controller's menu button goes down at AT seconds for 0.3 s, once"
+         \n  --menu AT          the left controller's menu button goes down at AT seconds for 0.3 s, once\
+         \n  --display-fps N    with --desktop: each display's wish asks for at most N pictures a second (1 to 60)"
     );
     std::process::exit(2);
 }
@@ -100,6 +101,7 @@ fn main() {
         desktop: false,
         displays: 1,
         displays_in_game: false,
+        display_fps: None,
         hold_script: false,
         hold_hands: false,
         tracking: false,
@@ -125,6 +127,7 @@ fn main() {
             "--desktop" => options.desktop = true,
             "--displays" => options.displays = value().parse().ok().filter(|n| (1..=cranvr_proto::message::MAX_DISPLAYS).contains(n)).unwrap_or_else(|| usage()),
             "--displays-in-game" => options.displays_in_game = true,
+            "--display-fps" => options.display_fps = Some(value().parse().ok().filter(|fps| (1..=60).contains(fps)).unwrap_or_else(|| usage())),
             "--hold-script" => options.hold_script = true,
             "--hold-hands" => options.hold_hands = true,
             "--tracking" => options.tracking = true,

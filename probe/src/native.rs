@@ -64,6 +64,8 @@ pub struct Options {
     /// Against a game that runs: wish no display for the first seconds, show the displays for a
     /// while, then hide them (see `displays.rs`)
     pub displays_in_game: bool,
+    /// The most pictures a second of each display's wish, in place of the client's rule
+    pub display_fps: Option<u8>,
     /// The right hand points at a panel in every other window of its script: its input is the
     /// panel's press, which the host must hold back from the game. The fake game checks that none
     /// of it arrives (`--expect-held`).
@@ -314,7 +316,7 @@ pub fn run(o: Options) -> i32 {
         rng: Mutex::new(Rng(0x9E37_79B9_7F4A_7C15)),
         stop: AtomicBool::new(false),
         desktop: (o.desktop || o.displays > 1 || o.displays_in_game).then(|| DesktopProbe::new(DESKTOP_STREAM)),
-        displays: DisplaySet::new(DisplayPlan { wanted: o.displays.max(1), in_game: o.displays_in_game }),
+        displays: DisplaySet::new(DisplayPlan { wanted: o.displays.max(1), in_game: o.displays_in_game, max_fps: o.display_fps }),
         hold_script: o.hold_script,
         hold_hands: o.hold_hands,
         game_runs: AtomicBool::new(false),

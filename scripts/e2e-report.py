@@ -44,8 +44,9 @@ def stat_lines(path):
 def summary(lines):
     numbers = {}
     for line in lines:
-        for key in ("fps", "render_ms", "encode_ms"):
-            numbers.setdefault(key, []).append(line[key])
+        for key in ("fps", "render_ms", "encode_ms", "encode_p95_ms"):
+            if key in line:
+                numbers.setdefault(key, []).append(line[key])
         for key, value in (line.get("latency") or {}).items():
             if key != "frames":
                 numbers.setdefault(f"latency.{key}", []).append(value)

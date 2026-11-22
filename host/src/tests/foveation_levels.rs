@@ -70,7 +70,7 @@ enum Region {
 
 /// What one run encodes.
 #[derive(Clone, Copy, Debug)]
-enum Variant {
+pub(crate) enum Variant {
     Level(FoveationLevel),
     /// A level with ALVR's own shift, as the stream had it before the host centered the region
     AlvrShift(FoveationLevel),
@@ -95,7 +95,7 @@ impl Variant {
         }
     }
 
-    fn foveation(self) -> Option<Foveation> {
+    pub(crate) fn foveation(self) -> Option<Foveation> {
         match self {
             Variant::Level(level) => level.config().map(|config| Foveation::new(EYE, &config.centered(FOV[0]))),
             Variant::AlvrShift(level) => level.config().map(|config| Foveation::new(EYE, &config)),
@@ -104,7 +104,7 @@ impl Variant {
     }
 
     /// The size of one eye in the encoded frame
-    fn picture(self) -> [u32; 2] {
+    pub(crate) fn picture(self) -> [u32; 2] {
         self.foveation().map_or(self.eye(), |f| f.optimized)
     }
 }
@@ -121,7 +121,7 @@ impl Rng {
 
 /// A landscape with detail at every scale, larger than an eye: a sky with clouds, hills, grass with
 /// fine noise, posts with hard edges and thin wires.
-fn landscape(width: usize, height: usize) -> PixelBuffer {
+pub(crate) fn landscape(width: usize, height: usize) -> PixelBuffer {
     let mut rng = Rng(11);
     const GRID: usize = 256;
     let grid: Vec<f32> = (0..GRID * GRID).map(|_| (rng.next() % 1000) as f32 / 1000.0).collect();
@@ -213,7 +213,7 @@ fn pattern_params(seconds: f32, eye: [u32; 2], foveation: Option<&Foveation>) ->
 
 /// Draws the frame at `seconds` of the run's scene into `out`: the landscape of a game, or the
 /// host's test scene when there is no landscape.
-fn draw(renderer: &mut Renderer, out: &PixelBuffer, land: Option<&PixelBuffer>, seconds: f32, eye: [u32; 2], foveation: Option<&Foveation>) {
+pub(crate) fn draw(renderer: &mut Renderer, out: &PixelBuffer, land: Option<&PixelBuffer>, seconds: f32, eye: [u32; 2], foveation: Option<&Foveation>) {
     match land {
         Some(land) => renderer.compose(out, land, land, &compose_params(seconds, eye, foveation)).expect("compose"),
         None => renderer.render(out, &pattern_params(seconds, eye, foveation)).expect("render"),

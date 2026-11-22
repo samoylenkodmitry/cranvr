@@ -690,7 +690,7 @@ fn eye_bitrate(setting_bps: u64, frame_bits: Option<f64>, fps: f32) -> u64 {
 /// The encoder of the eye stream: frames of `width` x `height` at `fps` and `bitrate_bps` on average,
 /// a key frame at least every 10 s.
 fn eye_encoder_config([width, height]: [u32; 2], fps: f32, full_range: bool, bitrate_bps: u64, strict_rate: bool) -> EncoderConfig {
-    EncoderConfig { width, height, fps, bitrate_bps, full_range, strict_rate, key_every: Some(cranvr_vt::KEY_EVERY), max_qp: None }
+    EncoderConfig { width, height, fps, bitrate_bps, full_range, strict_rate, key_every: Some(cranvr_vt::KEY_EVERY), max_qp: None, real_time: true }
 }
 
 /// Where the eye stream's frames stand on the encoder's time line: each frame stands after the one
@@ -952,6 +952,9 @@ fn frame_loop(
     // Encoder time of the frames encoded since the last stats line, and their count
     let encoder_time_us = Arc::new(AtomicU64::new(0));
     let encoded_frames = Arc::new(AtomicU64::new(0));
+    // Each frame's encoder time in microseconds since the last stats line, for the line's p95. The
+    // Vec keeps its room from window to window.
+    let encode_times = Arc::new(Mutex::new(Vec::<u32>::with_capacity(1024)));
     // The bytes of the encoded frames since the last stats line, for the bitrate that the stream sends
     let encoded_bytes = Arc::new(AtomicU64::new(0));
     // What the video-send thread needs to know about each frame besides the encoder's output. The
@@ -962,6 +965,7 @@ fn frame_loop(
         let headset = Arc::clone(&headset);
         let notes = Arc::clone(&notes);
         let (encoder_time_us, encoded_frames, encoded_bytes) = (Arc::clone(&encoder_time_us), Arc::clone(&encoded_frames), Arc::clone(&encoded_bytes));
+        let encode_times = Arc::clone(&encode_times);
         thread::Builder::new()
             .name("video-send".into())
             .spawn(move || {
@@ -970,6 +974,7 @@ fn frame_loop(
                 for frame in receiver {
                     encoder_time_us.fetch_add(frame.encode_time.as_micros() as u64, Ordering::Relaxed);
                     encoded_frames.fetch_add(1, Ordering::Relaxed);
+                    encode_times.lock().unwrap().push(frame.encode_time.as_micros().min(u128::from(u32::MAX)) as u32);
                     encoded_bytes.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
                     if let Some(config) = frame.config_nals {
                         if last_config.as_ref() != Some(&config) {
@@ -1196,6 +1201,7 @@ fn frame_loop(
                 (count, game_count, gpu_ms, gpu_exec_ms, since) = (0, 0, 0.0, 0.0, Instant::now());
                 encoded_frames.store(0, Ordering::Relaxed);
                 encoder_time_us.store(0, Ordering::Relaxed);
+                encode_times.lock().unwrap().clear();
                 encoded_bytes.store(0, Ordering::Relaxed);
                 paused_frames = 0;
             }
@@ -1415,6 +1421,13 @@ fn frame_loop(
             let n = count.max(1) as f64;
             let encoded = encoded_frames.swap(0, Ordering::Relaxed).max(1) as f64;
             let encode_ms = encoder_time_us.swap(0, Ordering::Relaxed) as f64 / 1000.0 / encoded;
+            let encode_p95_ms = {
+                let mut times = encode_times.lock().unwrap();
+                times.sort_unstable();
+                let p95 = times.get((times.len() * 95 / 100).min(times.len().saturating_sub(1))).copied().unwrap_or(0);
+                times.clear();
+                f64::from(p95) / 1000.0
+            };
             let sent_mbps = encoded_bytes.swap(0, Ordering::Relaxed) as f64 * 8.0 / secs / 1e6;
             let latency = headset.take_stats();
             if let Some(l) = &latency {
@@ -1457,6 +1470,7 @@ fn frame_loop(
                 "game_frames": game_count,
                 "render_ms": gpu_ms / n,
                 "encode_ms": encode_ms,
+                "encode_p95_ms": encode_p95_ms,
                 "mbps": bitrate / 1_000_000,
                 "mbps_set": mbps,
                 "sent_mbps": sent_mbps,
@@ -1464,7 +1478,7 @@ fn frame_loop(
                 "latency": latency,
             }));
             info!(
-                "{:.1} fps ({game_count} game frames), render {:.2} ms (GPU {:.2} ms), encode {:.2} ms, {sent_mbps:.1} Mbps of {} Mbps target, skipped: {no_sample} no new pose, {paused_frames} loop turns while the headset's app had no focus, {no_buffer} no buffer, {busy} encoder busy, {dropped} game frames replaced, {missing} unknown images; desktop layer {layer_fps:.1} fps; poses {poses}",
+                "{:.1} fps ({game_count} game frames), render {:.2} ms (GPU {:.2} ms), encode {:.2} ms (p95 {encode_p95_ms:.2} ms), {sent_mbps:.1} Mbps of {} Mbps target, skipped: {no_sample} no new pose, {paused_frames} loop turns while the headset's app had no focus, {no_buffer} no buffer, {busy} encoder busy, {dropped} game frames replaced, {missing} unknown images; desktop layer {layer_fps:.1} fps; poses {poses}",
                 count as f64 / secs,
                 gpu_ms / n,
                 gpu_exec_ms / n,

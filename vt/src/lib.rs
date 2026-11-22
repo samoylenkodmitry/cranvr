@@ -198,6 +198,12 @@ pub struct EncoderConfig {
     /// The highest quantizer that a frame may use, for a floor under the quality. `None` leaves it to
     /// the rate control. It holds for the whole session.
     pub max_qp: Option<u8>,
+    /// The session runs in real time. The Mac has one engine for HEVC encodes, and the sessions of
+    /// every process take turns on it. A session out of real time lets the real-time ones go first:
+    /// in a test of the host's eye stream at 120 Hz beside a display of 2560 x 1440 at 30 pictures a
+    /// second, the eye frames that took longer than 8.33 ms fell from 8 to 11 percent to under
+    /// 0.5 percent (`encoder_sharing.rs` in the host).
+    pub real_time: bool,
 }
 
 /// The key frame interval of the eye stream
@@ -283,7 +289,7 @@ impl Encoder {
             }
 
             let encoder = Self { session, output, full_range: config.full_range, strict_rate: config.strict_rate };
-            encoder.set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)?;
+            encoder.set(kVTCompressionPropertyKey_RealTime, if config.real_time { kCFBooleanTrue } else { kCFBooleanFalse })?;
             encoder.set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel)?;
             encoder.set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse)?;
             encoder.set(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue).ok();
@@ -321,6 +327,12 @@ impl Encoder {
         let r = self.set(key, n);
         CFRelease(n);
         r
+    }
+
+    /// Whether the session runs in real time (see [`EncoderConfig::real_time`]). A test turns it back
+    /// on for a display's session to compare the two.
+    pub fn set_real_time(&self, real_time: bool) -> Result<(), String> {
+        unsafe { self.set(kVTCompressionPropertyKey_RealTime, if real_time { kCFBooleanTrue } else { kCFBooleanFalse }) }
     }
 
     pub fn set_bitrate(&self, bitrate_bps: u64) {
@@ -772,7 +784,7 @@ mod tests {
     fn encode_then_decode_keeps_left_and_right_colors() {
         let (tx, rx) = mpsc::channel();
         let config =
-            EncoderConfig { width: 1024, height: 512, fps: 90.0, bitrate_bps: 30_000_000, full_range: true, strict_rate: false, key_every: Some(KEY_EVERY), max_qp: None };
+            EncoderConfig { width: 1024, height: 512, fps: 90.0, bitrate_bps: 30_000_000, full_range: true, strict_rate: false, key_every: Some(KEY_EVERY), max_qp: None, real_time: true };
         let encoder = Encoder::new(&config, tx).expect("encoder");
         for i in 0..5 {
             let mut buffer = encoder.pixel_buffer().expect("pixel buffer");

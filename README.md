@@ -432,6 +432,24 @@ The stream of a display:
 - macOS asks for two permissions on first use. Screen Recording lets the host capture the display. Accessibility lets the controller move the mouse. Without Accessibility the panel still shows. The app asks for each missing permission when it starts. A card at the top of its window has a button for each.
 - `--desktop-fps` sets how often the host captures the display (default 30). Each capture of a 6K display costs the window server about 3 ms of GPU time.
 
+
+The displays and the eye stream share the Mac's video encoder:
+- The Mac has one engine for HEVC encodes. Every session of every process takes turns on it. A display's picture of 3840 x 2160 holds the engine for about 9 ms, longer than an eye frame at 120 Hz takes (8.33 ms). An eye frame that comes while a display's picture encodes waits for it.
+- A display's session runs out of real time (`EncoderConfig::real_time`). The eye stream's real-time session then goes first.
+- The host's stats line gives the eye frames' encode time as a mean and a 95th percentile (`encode_p95_ms` in the status line).
+- `host/src/tests/encoder_sharing.rs` runs the eye stream at 120 Hz (the level Medium for the Quest 3's eye of 1680 x 1760, a frame of 1984 x 928, 40 Mbps) beside a display at 40 Mbps through the host's own encoders, with nothing else on the encoder: `cargo test --release -p cranvr-host encoder_sharing -- --ignored --nocapture`. The table gives two runs of 20 s each on an M5, before and after the change. The display's desktop has a spinner and a line of text that change in every picture.
+
+| Display beside the eye stream | Eye encode mean, ms | p95, ms | Eye frames over 8.33 ms | Before: mean, p95, over |
+|---|---|---|---|---|
+| none | 4.1 to 4.5 | 6.3 to 6.5 | 0 to 0.1 % | |
+| 2560 x 1440 at 30, as in a game | 4.5 to 4.6 | 6.7 to 7.1 | 0.2 to 0.4 % | 4.3, 10.9 to 11.5, 8 to 11 % |
+| 3840 x 2160 at 30 | 4.4 to 4.6 | 8.9 to 9.7 | 7 to 12 % | 4.1 to 5.2, 10.4 to 12.1, 12 to 17 % |
+| 3840 x 2160 at 60, as with one display and no game | 5.7 to 7.3 | 11.1 to 11.7 | 20 to 41 % | 6.2 to 7.5, 12.9 to 13.6, 24 to 45 % |
+
+- The level Medium does not slow the eye stream. The level Off encodes a frame of 2496 x 1308 and takes 7.2 ms (p95 13.6 ms) with no display.
+- In a game the client asks for a display of 2560 x 1440 at 30 pictures a second (`client/src/display_wish.rs`). The eye stream then keeps its time. With one display and no game the client asks for 3840 x 2160 at 60, and a fifth to two fifths of the eye frames still take longer than 8.33 ms. The host then counts them as "encoder busy". With its Room setting at Passthrough the headset shows no eye stream while no game runs, so these frames are not seen.
+- A run of `scripts/e2e.sh --desktop --probe-arg --display-fps --probe-arg N` measures the whole host with the probe as the headset. The probe asks for a larger eye (2064 x 2208, a frame of 2432 x 1152) and decodes both streams on the Mac. Its eye took 6.2 ms (p95 11.4 ms) with no display, 6.2 ms (p95 12.3 ms) beside the Mac's display at 22 pictures a second, and 8.9 ms (p95 26 ms) at 43 pictures a second, where the eye stream fell to 112 frames a second.
+
 The sound:
 - The host captures what this Mac plays, from every app but the host (`host/src/game_audio.rs`). It sends the sound as PCM: 48 kHz, 16 bits, stereo, in datagrams of 240 frames (5 ms, 960 bytes). That is 1.54 Mbps on top of a video stream of 40 to 100 Mbps. PCM adds no encode or decode time and needs no codec on the Quest. A datagram carries the host's clock for its first sample, so the client can tell how old the sound is.
 - The capture takes the sound before the Mac's volume, so the Mac can stay muted while the headset plays it. It needs Screen Recording. "Game sound in the headset" in the settings turns it off. `--no-game-audio` does the same. The headset's microphone does not reach the Mac.
