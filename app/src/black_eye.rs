@@ -247,7 +247,7 @@ mod tests {
 
     #[test]
     fn the_first_report_restarts_the_game_and_later_reports_do_not() {
-        let game = Game { app_id: "1".into(), name: "Some Game".into(), exe: Some(PathBuf::from("/Users/x/game.exe")) };
+        let game = Game { app_id: "1".into(), name: "Some Game".into(), exe: Some(PathBuf::from("/Users/x/game.exe")), ..Default::default() };
         let program = "Z:\\Users\\x\\game.exe";
         let mut launch = BTreeMap::new();
         let first = respond(&mut launch, std::slice::from_ref(&game), Some(program), "right");
@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     fn the_name_is_the_listed_game_or_the_program_file() {
-        let game = Game { app_id: "1".into(), name: "Some Game".into(), exe: Some(PathBuf::from("/Users/x/game.exe")) };
+        let game = Game { app_id: "1".into(), name: "Some Game".into(), exe: Some(PathBuf::from("/Users/x/game.exe")), ..Default::default() };
         assert_eq!(name(std::slice::from_ref(&game), "Z:\\Users\\x\\game.exe"), "Some Game");
         assert_eq!(name(&[game], "C:\\Other\\Thing.exe"), "Thing.exe");
         assert_eq!(name(&[], "Thing.exe"), "Thing.exe");

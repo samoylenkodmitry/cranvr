@@ -50,6 +50,9 @@ pub struct GameOptions {
     /// The OpenVR runtime of the program (see openvr.rs): its own choice, or None to follow
     /// [`WineOptions::openvr`]
     pub openvr: Option<OpenVr>,
+    /// Why `openvr` holds what it holds, when cranvr chose it: a game that drew nothing through OpenComposite
+    /// gets SteamVR (vr_system.rs). The Play tab shows it. A change by the user clears it.
+    pub openvr_reason: String,
 }
 
 /// The runtime that answers a game's OpenVR calls. An OpenXR game ignores the choice.
@@ -67,6 +70,21 @@ pub enum OpenVr {
 }
 
 impl OpenVr {
+    pub const ALL: [OpenVr; 3] = [OpenVr::OpenComposite, OpenVr::SteamVr, OpenVr::Off];
+
+    /// The word of app.json and of the console in VR
+    pub fn key(self) -> &'static str {
+        match self {
+            OpenVr::OpenComposite => "opencomposite",
+            OpenVr::SteamVr => "steamvr",
+            OpenVr::Off => "off",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|choice| choice.key() == key)
+    }
+
     /// The name that the Play tab shows
     pub fn label(self) -> &'static str {
         match self {
@@ -89,6 +107,9 @@ impl GameOptions {
         }
         if !plain.eye_one_pass {
             plain.eye_one_pass_reason.clear();
+        }
+        if plain.openvr.is_none() {
+            plain.openvr_reason.clear();
         }
         plain == Self::default()
     }
@@ -239,6 +260,14 @@ mod tests {
         assert!(wine.mac_window && wine.openvr == OpenVr::OpenComposite);
         let game: GameOptions = serde_json::from_str(r#"{"args": "-x"}"#).unwrap();
         assert_eq!(game.openvr, None);
+        // The words of app.json are the console's words
+        for choice in OpenVr::ALL {
+            assert_eq!(serde_json::to_string(&choice).unwrap(), format!("\"{}\"", choice.key()));
+            assert_eq!(OpenVr::from_key(choice.key()), Some(choice));
+        }
+        assert_eq!(OpenVr::from_key("SteamVR"), None);
+        // A reason without a choice of the game's own is a leftover
+        assert!(GameOptions { openvr_reason: "because".into(), ..Default::default() }.is_default());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Windows Steam in cranvr's Wine prefix: its state, its game library, and starting games.
 
 use crate::{
+    appinfo,
     backend::{self, config_dir},
     game_run, launch, openvr,
 };
@@ -216,14 +217,19 @@ pub fn running() -> bool {
     Command::new("lsof").arg("-t").arg(steam_dir().join("steam.exe")).output().is_ok_and(|o| !o.stdout.is_empty())
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct Game {
     /// The app ID of the game's Steam manifest. A game that the user added from a folder (see
     /// [`added_games`]) has none: it is empty, and the program's launch options may name an ID.
     pub app_id: String,
     pub name: String,
-    /// The program to start, found in the install folder
+    /// The program to start: the one of the game's launch entry in Steam's app cache (appinfo.rs), else the one
+    /// that [`find_exe`] finds in the install folder
     pub exe: Option<PathBuf>,
+    /// The arguments of the launch entry. The program's launch options add their own after them.
+    pub args: Vec<String>,
+    /// The folder that the launch entry starts the program in. None: the program's own folder.
+    pub working_dir: Option<PathBuf>,
 }
 
 /// Installed games from every Steam library in the prefix, then the games that the user added from a
@@ -251,7 +257,7 @@ pub fn added_games(settings: &backend::Settings) -> Vec<Game> {
     settings
         .added_games
         .iter()
-        .map(|added| Game { app_id: String::new(), name: added.name.clone(), exe: Some(added.program.clone()) })
+        .map(|added| Game { name: added.name.clone(), exe: Some(added.program.clone()), ..Default::default() })
         .collect()
 }
 
@@ -270,8 +276,15 @@ pub fn steam_games() -> Vec<Game> {
             if name.starts_with("Steamworks") || name.contains("Redistributable") || name.starts_with("Proton") || app_id == STEAMVR_APP_ID {
                 continue;
             }
-            let exe = find_exe(&steamapps.join("common").join(&installdir), &installdir);
-            games.push(Game { app_id: app_id.to_string(), name, exe });
+            let folder = steamapps.join("common").join(&installdir);
+            // The program that Steam starts, with its arguments and folder. A game that Steam's cache does not know
+            // gets the program that the folder shows.
+            let launch = app_id.parse().ok().and_then(|app| appinfo::entries(&steam_dir().join("appcache/appinfo.vdf"), app)).and_then(|entries| appinfo::choose(&entries, &folder));
+            let game = match launch {
+                Some(launch) => Game { app_id: app_id.to_string(), name, exe: Some(launch.program), args: launch.arguments, working_dir: Some(launch.working_dir) },
+                None => Game { app_id: app_id.to_string(), name, exe: find_exe(&folder, &installdir), ..Default::default() },
+            };
+            games.push(game);
         }
     }
     games.sort_by_key(|a| a.name.to_lowercase());
@@ -387,13 +400,14 @@ pub fn wine(program: &str) -> Command {
 /// A game's Wine command: `wine` with the options for every program and the program's own, which
 /// the Play tab shows. Steam does not get them. The OpenVR choice goes into the prefix's OpenVR path
 /// file now, because the game reads that file when it starts: the game's run begins (game_run.rs), and
-/// its end puts the file back. Returns the command and the run's number, which [`spawn_game`] takes.
-fn game_wine(program: &str) -> (Command, Option<u64>) {
+/// its end puts the file back. `steam_args` are the arguments of the game's launch entry in Steam, which go
+/// before the program's own. Returns the command and the run's number, which [`spawn_game`] takes.
+fn game_wine(program: &str, steam_args: &[String]) -> (Command, Option<u64>) {
     let settings = backend::Settings::load();
     let options = settings.launch.get(program).cloned().unwrap_or_default();
     let choice = launch::openvr(&settings.wine, &options);
     let steamvr = steamvr();
-    let run = game_run::begin(&prefix(), choice, steamvr.as_ref()).map_err(backend::notify).ok();
+    let run = game_run::begin(&prefix(), program, choice, steamvr.as_ref()).map_err(backend::notify).ok();
     if choice == launch::OpenVr::SteamVr && steamvr.is_some() {
         match openvr::unblock_driver(&steam_dir().join("config/steamvr.vrsettings")) {
             Ok(true) => backend::log("SteamVR had turned cranvr's driver off after a crash. cranvr turned it on again.".into()),
@@ -402,7 +416,7 @@ fn game_wine(program: &str) -> (Command, Option<u64>) {
         }
     }
     let mut command = wine_with(program, settings.game_msaa_limit);
-    command.envs(launch::environment(&settings.wine, &options)).args(launch::arguments(&options));
+    command.envs(launch::environment(&settings.wine, &options)).args(steam_args).args(launch::arguments(&options));
     // cranvr's SteamVR driver finds the game's render size in game-sizes.txt by the game's program. SteamVR,
     // which the game starts, inherits the variable.
     command.env("CRANVR_GAME", program);
@@ -411,11 +425,11 @@ fn game_wine(program: &str) -> (Command, Option<u64>) {
 
 /// Starts a game's command and watches its run until the game ends (game_run.rs). A start that fails ends
 /// the run at once, so the path file goes back.
-fn spawn_game(mut command: Command, run: Option<u64>, program: &str) -> Result<(), String> {
+fn spawn_game(mut command: Command, run: Option<u64>) -> Result<(), String> {
     let child = command.stdout(log_file("game.log")).stderr(log_file("game.err.log")).spawn();
     match (child, run) {
         (Ok(child), Some(run)) => {
-            game_run::watch(&prefix(), run, child, game_run::folder_of(program));
+            game_run::watch(&prefix(), run, child);
             Ok(())
         }
         (Ok(_), None) => Ok(()),
@@ -521,12 +535,13 @@ pub fn play(game: &Game) -> Result<(), String> {
     } else if !wine_ready() {
         return Err("Set up game support first".into());
     }
-    let (mut command, run) = game_wine(&program);
+    let (mut command, run) = game_wine(&program, &game.args);
     if let Some(id) = &app_id {
         command.env("SteamAppId", id).env("SteamGameId", id);
     }
-    command.current_dir(exe.parent().unwrap_or(Path::new("/")));
-    spawn_game(command, run, &program)
+    // The folder of Steam's launch entry, else the program's own
+    command.current_dir(game.working_dir.as_deref().or(exe.parent()).unwrap_or(Path::new("/")));
+    spawn_game(command, run)
 }
 
 /// Starts any Windows program (a Mac path) with cranvr's environment.
@@ -536,12 +551,12 @@ pub fn run_program(path: &Path) -> Result<(), String> {
     }
     require_current_game_support()?;
     let program = mac_to_windows(path);
-    let (mut command, run) = game_wine(&program);
+    let (mut command, run) = game_wine(&program, &[]);
     if let Some(id) = steam_id(&program, backend::steam_app_id(path.parent().unwrap_or(path)).as_deref()) {
         command.env("SteamAppId", &id).env("SteamGameId", &id);
     }
     command.current_dir(path.parent().unwrap_or(Path::new("/")));
-    spawn_game(command, run, &program)
+    spawn_game(command, run)
 }
 
 /// Ends a running program and starts it again with the launch options that are saved now. The
@@ -557,8 +572,10 @@ pub fn restart(program: &str) -> Result<(), String> {
     }
 }
 
-/// Ends the Windows program with this file name and waits until its process is gone.
+/// Ends the Windows program with this file name and waits until its process is gone. The end is cranvr's, so
+/// the game's run gives no verdict for it (game_run.rs).
 fn end_program(name: &str) {
+    game_run::stopping();
     wine("taskkill").args(["/IM", name, "/F"]).stdout(Stdio::null()).stderr(Stdio::null()).status().ok();
     for _ in 0..30 {
         if !program_running(name) {
@@ -656,6 +673,7 @@ fn copy_of<'a>(program: &Path, games: &'a [Game]) -> Option<&'a Game> {
 
 /// Ends Steam and every game in the prefix.
 pub fn stop_all() {
+    game_run::stopping();
     Command::new(config_dir().join("wine/engine/bin/wineserver"))
         .arg("-k")
         .env("WINEPREFIX", prefix())
@@ -739,13 +757,13 @@ mod tests {
         let copy = folder("copy", &["Some Game.exe", "Some Game_Data/", "UnityPlayer.dll", "MonoBleedingEdge/", "Crash.exe", "Plugins/", "winhttp.dll"]);
         let other = folder("other", &["Some Game.exe", "readme.txt", "data.pak"]);
         let renamed = folder("renamed", &["Other.exe", "Some Game_Data/", "UnityPlayer.dll", "MonoBleedingEdge/", "Crash.exe"]);
-        let steam = [Game { app_id: "620".into(), name: "Some Game".into(), exe: Some(original.join("Some Game.exe")) }];
+        let steam = [Game { app_id: "620".into(), name: "Some Game".into(), exe: Some(original.join("Some Game.exe")), ..Default::default() }];
         assert_eq!(copy_of(&copy.join("Some Game.exe"), &steam), Some(&steam[0]));
         // The same program name alone is no copy: another game may call its program the same
         assert_eq!(copy_of(&other.join("Some Game.exe"), &steam), None);
         assert_eq!(copy_of(&renamed.join("Other.exe"), &steam), None);
         // A game without an app ID (one that the user added) is no original
-        let added = [Game { app_id: String::new(), name: "Added".into(), exe: steam[0].exe.clone() }];
+        let added = [Game { name: "Added".into(), exe: steam[0].exe.clone(), ..Default::default() }];
         assert_eq!(copy_of(&copy.join("Some Game.exe"), &added), None);
         for dir in [original, copy, other, renamed] {
             fs::remove_dir_all(dir).ok();
@@ -756,7 +774,7 @@ mod tests {
     fn adding_a_copy_of_a_modded_game_fills_in_its_steam_app_id_and_no_override() {
         let original = folder("add-original", &["Some Game.exe", "Some Game_Data/", "UnityPlayer.dll", "MonoBleedingEdge/"]);
         let copy = folder("add-copy", &["Some Game.exe", "Some Game_Data/", "UnityPlayer.dll", "MonoBleedingEdge/", "winhttp.dll", "Plugins/"]);
-        let steam = [Game { app_id: "620".into(), name: "Some Game".into(), exe: Some(original.join("Some Game.exe")) }];
+        let steam = [Game { app_id: "620".into(), name: "Some Game".into(), exe: Some(original.join("Some Game.exe")), ..Default::default() }];
         let mut settings = backend::Settings::default();
         let program = copy.join("Some Game.exe");
         assert_eq!(add_game(&mut settings, &program, &steam), Ok(()));
@@ -1040,6 +1058,158 @@ mod tests {
         assert!(smoke_frames > 100, "the OpenVR program draws through OpenComposite: {smoke_frames}");
         assert!(smoke_log.contains("C:\\opencomposite\\opencomposite.ini"), "OpenComposite ran the program");
         assert!(smoke_back, "the program's end puts the path file back");
+    }
+
+    /// The lit samples of the host's last eye check line in the window's log, as (left, right) of 256
+    fn last_eye_check(model: &crate::backend::Model) -> Option<(u32, u32)> {
+        let line = model.log.iter().rev().find(|line| line.contains("Eye check:"))?;
+        let numbers: Vec<u32> = line.split(|c: char| !c.is_ascii_digit()).filter_map(|n| n.parse().ok()).collect();
+        // "Eye check: 88 of 256 samples lit in the left eye, 87 in the right eye", after the time of day
+        let at = numbers.iter().position(|n| *n == 256)?;
+        Some((numbers[at - 1], *numbers.get(at + 1)?))
+    }
+
+    /// Starts the probe again for the next part of a test: the host takes one headset at a time.
+    fn next_probe(old: &mut std::process::Child, args: &[&str]) -> std::process::Child {
+        old.kill().ok();
+        old.wait().ok();
+        thread::sleep(Duration::from_secs(1));
+        let release = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/release");
+        Command::new(release.join("cranvr-probe"))
+            .args(["--tcp", "--connect", "127.0.0.1:9962", "--quest-view", "--any-picture"])
+            .args(args)
+            .stdout(log_file("probe.log"))
+            .spawn()
+            .expect("probe runs")
+    }
+
+    /// Waits until no process of the game's folder runs and the path file says `text` again.
+    fn run_ends(folder: &str, text: &Option<String>) -> bool {
+        let since = Instant::now();
+        while since.elapsed() < Duration::from_secs(30) && crate::game_run::active() {
+            thread::sleep(Duration::from_millis(250));
+        }
+        !crate::game_run::active() && path_file_becomes(text, Duration::from_secs(5)) && !program_running(folder)
+    }
+
+    /// #113 from the app's own paths. A scratch `CRANVR_HOME` whose `wine` links to the user's, with no launch
+    /// options for the game, the user's Steam running, a test host on port 9962 and the probe as the headset:
+    /// 1. The game (CRANVR_TEST_GAME, The Lab) is listed with the program, the arguments and the folder of its
+    ///    launch entry in Steam's app cache.
+    /// 2. [`play`], as the Play tab does: the game follows the setting, OpenComposite. It must draw nothing
+    ///    through OpenComposite, and the verdict (game_run.rs) must set SteamVR with its reason and start the
+    ///    game again, as the window does. The game must then draw through SteamVR, both eyes lit.
+    /// 3. A request of the console from the probe (`--console`), as the headset's console sends it: the game
+    ///    starts through SteamVR at once and draws.
+    /// 4. A game added from a folder (CRANVR_TEST_ADDED, a Mac path of its program) starts and draws as before.
+    ///
+    /// A host started with CRANVR_EYE_DUMP=FOLDER keeps the eyes of the game's newest frame there. Needs `cargo
+    /// build --release`. Run with `cargo test --release -p cranvr-app -- --ignored a_game_that_drew_nothing`.
+    #[test]
+    #[ignore]
+    fn a_game_that_drew_nothing_through_opencomposite_starts_through_steamvr() {
+        use crate::{
+            backend::{self, ConsoleRequest, Model, Settings},
+            game_run, vr_system,
+        };
+        let home = PathBuf::from(std::env::var("CRANVR_HOME").expect("CRANVR_HOME names a scratch folder"));
+        assert!(home.join("wine").is_symlink(), "the scratch folder's wine is a link to the user's");
+        let name = std::env::var("CRANVR_TEST_GAME").expect("CRANVR_TEST_GAME names the Steam game");
+        let added = PathBuf::from(std::env::var("CRANVR_TEST_ADDED").expect("CRANVR_TEST_ADDED names a program to add"));
+        assert!(running(), "the user's Steam runs: the game's Steam check needs it");
+        assert!(steamvr().is_some(), "the Steam library has SteamVR");
+        let mut settings = Settings::load();
+        settings.launch.clear();
+        settings.added_games.clear();
+        settings.wine = Default::default();
+        settings.save();
+        let file = openvr::path_file(&prefix()).unwrap();
+        let before = fs::read_to_string(&file).ok();
+        let mut probe = test_host(400);
+        let mut model = Model::default();
+
+        // 1. Steam's launch entry
+        let game = games().into_iter().find(|game| game.name == name).expect("the game is installed");
+        let program = self::program(&game).unwrap();
+        let folder = crate::game_run::folder_of(&program);
+        println!("{name}: {program} {:?} in {:?}", game.args, game.working_dir.as_deref().map(mac_to_windows));
+
+        // 2. The Play tab's start through OpenComposite, the verdict and the start through SteamVR
+        let started = Instant::now();
+        play(&game).expect("the game starts");
+        let mut verdict = None;
+        while verdict.is_none() && started.elapsed() < Duration::from_secs(120) {
+            thread::sleep(Duration::from_millis(200));
+            backend::pump(&mut model);
+            verdict = game_run::take_verdicts().into_iter().next();
+        }
+        let verdict = verdict.expect("a verdict that the game drew nothing through OpenComposite");
+        println!("verdict after {:.1} s: {verdict:?}", started.elapsed().as_secs_f64());
+        let mut settings = Settings::load();
+        let response = vr_system::respond(&mut settings.launch, &games(), &verdict.program, verdict.why, true);
+        settings.save();
+        println!("notice: {}", response.notice.window);
+        let restart_program = response.restart.clone().expect("the game starts again");
+        restart(&restart_program).expect("the game starts through SteamVR");
+        let restarted = Instant::now();
+        let first = pump_until(&mut model, Duration::from_secs(120), |model, most| most > 100 && last_eye_check(model).is_some_and(|(l, r)| l >= 8 && r >= 8));
+        let first_eyes = last_eye_check(&model);
+        let first_game = model.game.clone();
+        println!("through SteamVR: {first} game frames in a stats window, eyes {first_eyes:?}, game {first_game:?}, {:.0} s after the restart", restarted.elapsed().as_secs_f64());
+        end_program(program.rsplit('\\').next().unwrap());
+        let first_back = run_ends(&folder, &before);
+
+        // 3. The console's request
+        let request = format!(r#"3:{{"action": "play", "game": "{name}"}}"#);
+        probe = next_probe(&mut probe, &["--seconds", "200", "--console", &request]);
+        let asked = Instant::now();
+        let mut console_started = false;
+        while !console_started && asked.elapsed() < Duration::from_secs(20) {
+            thread::sleep(Duration::from_millis(200));
+            backend::pump(&mut model);
+            for request in std::mem::take(&mut model.vr_requests) {
+                if let ConsoleRequest::Play(game) = backend::console_request(&Settings::load(), &games(), &request) {
+                    play(&game).expect("the console's game starts");
+                    console_started = true;
+                }
+            }
+        }
+        model.log.clear();
+        let second = pump_until(&mut model, Duration::from_secs(120), |model, most| most > 100 && last_eye_check(model).is_some_and(|(l, r)| l >= 8 && r >= 8));
+        let second_eyes = last_eye_check(&model);
+        println!("from the console: {second} game frames in a stats window, eyes {second_eyes:?}, {:.0} s after the request", asked.elapsed().as_secs_f64());
+        end_program(program.rsplit('\\').next().unwrap());
+        let second_back = run_ends(&folder, &before);
+
+        // 4. A game added from a folder
+        let mut settings = Settings::load();
+        add_game(&mut settings, &added, &steam_games()).expect("the program is added");
+        settings.save();
+        let added_game = added_games(&settings).into_iter().next().unwrap();
+        probe = next_probe(&mut probe, &["--seconds", "120"]);
+        play(&added_game).expect("the added game starts");
+        model.log.clear();
+        let third = pump_until(&mut model, Duration::from_secs(90), |model, most| most > 100 && last_eye_check(model).is_some_and(|(l, r)| l >= 8 && r >= 8));
+        let third_eyes = last_eye_check(&model);
+        println!("added game: {third} game frames in a stats window, eyes {third_eyes:?}");
+        end_program(added.file_name().unwrap().to_str().unwrap());
+        let third_back = run_ends(&game_run::folder_of(&mac_to_windows(&added)), &before);
+        probe.kill().ok();
+        probe.wait().ok();
+        backend::stop_host();
+        let options = Settings::load().launch.get(&program).cloned().unwrap_or_default();
+
+        assert!(program.to_ascii_lowercase().ends_with(r"\thelab\win64\thelab.exe") || std::env::var_os("CRANVR_TEST_ANY_PROGRAM").is_some(), "Steam's program: {program}");
+        assert_eq!(verdict.program.to_ascii_lowercase(), program.to_ascii_lowercase());
+        assert_eq!(options.openvr, Some(launch::OpenVr::SteamVr));
+        assert_eq!(options.openvr_reason, vr_system::REASON);
+        assert!(first > 100 && first_eyes.is_some_and(|(l, r)| l >= 8 && r >= 8), "the game draws through SteamVR");
+        assert!(first_back, "the run's end puts the path file back");
+        assert!(console_started, "the console's request starts the game");
+        assert!(second > 100 && second_eyes.is_some_and(|(l, r)| l >= 8 && r >= 8), "the console's start draws");
+        assert!(second_back);
+        assert!(third > 100, "the added game draws: {third}");
+        assert!(third_back);
     }
 
     /// A start from the app with the launch option "OpenVR: SteamVR", as the Play tab does it: the app's

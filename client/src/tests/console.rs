@@ -1,6 +1,6 @@
 use super::*;
 
-const MENU: &str = r#"{"games":[{"name":"Beat Saber","program":"Beat Saber.exe"},{"name":"Half-Life: Alyx","program":"hlvr.exe"}],
+const MENU: &str = r#"{"games":[{"name":"Beat Saber","program":"Beat Saber.exe","vr":"opencomposite"},{"name":"Half-Life: Alyx","program":"hlvr.exe","vr":"steamvr"}],
     "fps":120,"game_scale":0.6,"msaa":2,"controls":{},
     "status":{"refresh":120,"fps":119.4,"game_fps":117,"latency_ms":46.2,"game":"Beat Saber.exe"}}"#;
 
@@ -16,7 +16,13 @@ fn menu(game: Option<&str>) -> Menu {
 #[test]
 fn the_menu_comes_from_the_hosts_json() {
     let menu = Menu::parse(MENU).unwrap();
-    assert_eq!(menu.games, [Game { name: "Beat Saber".into(), program: "Beat Saber.exe".into() }, Game { name: "Half-Life: Alyx".into(), program: "hlvr.exe".into() }]);
+    assert_eq!(
+        menu.games,
+        [
+            Game { name: "Beat Saber".into(), program: "Beat Saber.exe".into(), vr: VrSystem::OpenComposite },
+            Game { name: "Half-Life: Alyx".into(), program: "hlvr.exe".into(), vr: VrSystem::SteamVr }
+        ]
+    );
     assert_eq!((menu.fps, menu.msaa), (120, 2));
     assert!((menu.game_scale - 0.6).abs() < 1e-6);
     assert_eq!(menu.status, Status { refresh: 120.0, fps: 119.4, game_fps: 117.0, latency_ms: Some(46.2), game: Some("Beat Saber.exe".into()) });
@@ -30,6 +36,22 @@ fn the_menu_comes_from_the_hosts_json() {
     for lacking in [r#"{"games":[],"game_scale":1.0,"msaa":0,"controls":{}}"#, r#"{"games":[],"fps":90,"msaa":0,"controls":{}}"#, r#"{"games":[],"fps":90,"game_scale":1.0,"controls":{}}"#, r#"{"games":[],"fps":90,"game_scale":1.0,"msaa":0}"#, r#"{"games":[],"fps":90,"game_scale":1.0,"msaa":0,"controls":5}"#] {
         assert_eq!(Menu::parse(lacking), None, "{lacking}");
     }
+    // Each game names its VR system with a word that the console knows
+    for game in [r#"{"name":"A","program":"a.exe"}"#, r#"{"name":"A","program":"a.exe","vr":"oculus"}"#] {
+        assert_eq!(Menu::parse(&format!(r#"{{"games":[{game}],"fps":90,"game_scale":1.0,"msaa":0,"controls":{{}}}}"#)), None, "{game}");
+    }
+}
+
+#[test]
+fn a_press_on_a_game_s_vr_system_asks_for_the_next_one() {
+    assert_eq!(VrSystem::OpenComposite.next(), VrSystem::SteamVr);
+    assert_eq!(VrSystem::SteamVr.next(), VrSystem::Off);
+    assert_eq!(VrSystem::Off.next(), VrSystem::OpenComposite);
+    for system in VrSystem::ALL {
+        assert_eq!(VrSystem::from_key(system.key()), Some(system));
+    }
+    let request = Action::VrSystem("The Lab".into(), VrSystem::SteamVr).request();
+    assert_eq!(serde_json::from_str::<Value>(&request).unwrap(), json!({"action": "set", "game": "The Lab", "openvr": "steamvr"}));
 }
 
 #[test]
@@ -58,9 +80,9 @@ fn requests_are_the_json_that_the_app_reads() {
 fn the_height_grows_with_the_games_up_to_the_limit() {
     let mut menu = menu(None);
     let two = height(Some(&menu));
-    menu.games.push(Game { name: "Third".into(), program: "third.exe".into() });
+    menu.games.push(Game { name: "Third".into(), program: "third.exe".into(), ..Default::default() });
     assert!((height(Some(&menu)) - two - (size::BUTTON + size::GAP)).abs() < 1e-3);
-    menu.games.extend((0..10).map(|i| Game { name: format!("Game {i}"), program: format!("g{i}.exe") }));
+    menu.games.extend((0..10).map(|i| Game { name: format!("Game {i}"), program: format!("g{i}.exe"), ..Default::default() }));
     assert_eq!(menu.listed().len(), MAX_GAMES);
     assert!(height(Some(&menu)) < 1000.0, "{}", height(Some(&menu)));
     // A console without a menu is short, and a menu without games keeps a line for the note
@@ -317,7 +339,7 @@ fn the_console_follows_the_game_and_the_setting_into_its_backdrop() {
 #[test]
 fn the_new_settings_fit_the_consoles_height() {
     let mut menu = menu(None);
-    menu.games.extend((0..10).map(|i| Game { name: format!("Game {i}"), program: format!("g{i}.exe") }));
+    menu.games.extend((0..10).map(|i| Game { name: format!("Game {i}"), program: format!("g{i}.exe"), ..Default::default() }));
     assert_eq!(menu.listed().len(), MAX_GAMES);
     // Five games, six settings, the note and the buttons: about 990 dp, a little under a meter
     let tall = height(Some(&menu));

@@ -1292,6 +1292,7 @@ dependencies = [
  "cranvr-proto",
  "cranvr-vt",
  "glam",
+ "serde_json",
 ]
 
 [[package]]

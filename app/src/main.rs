@@ -1,6 +1,7 @@
 //! cranvr: the window for cranvr-host. It starts and stops the host, pairs headsets, sets the
 //! stream quality, shows the Mac desktop in VR, and starts Windows games under Wine.
 
+mod appinfo;
 mod backend;
 mod black_eye;
 mod game_run;
@@ -12,6 +13,7 @@ mod steam;
 mod system;
 mod ui;
 mod usb;
+mod vr_system;
 mod vr_window;
 
 use cranpose::AppLauncher;
