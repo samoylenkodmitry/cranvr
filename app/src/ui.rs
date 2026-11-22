@@ -426,7 +426,8 @@ fn Window() {
             if let Some(message) = model.with(|m| m.message.clone()) {
                 Text(message, Modifier::empty(), colored(240, 170, 90));
             }
-            if let Some((notice, _)) = model.with(|m| m.notice.clone()) {
+            // A notice that only the console in VR shows has no text for the window
+            if let Some((notice, _)) = model.with(|m| m.notice.clone()).filter(|(notice, _)| !notice.window.is_empty()) {
                 Text(notice.window, Modifier::empty(), colored(240, 170, 90));
             }
             let current = tab.get();

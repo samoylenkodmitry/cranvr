@@ -46,8 +46,8 @@
 //!   user (launch it with `hand_menu=open` and `default_places`). The left controller is missing. The
 //!   right one stands 60 cm from the menu. It points beside the menu, then at the Show button of the
 //!   stream's numbers, and pulls with a ray that strays 3 mm on the panel: the press clicks and moves
-//!   nothing. It then points at Recenter on the last row and tips its ray 6 degrees down onto the
-//!   menu's handle while it pulls: the press clicks Recenter and moves nothing. Last it points at
+//!   nothing. It then points at Recenter on the last row, by the handle below the menu, and its pull
+//!   tips the ray onto the handle: the press clicks Recenter and moves nothing. Last it points at
 //!   the handle, pulls and moves 10 cm to the right: the menu moves. The log says each frame in
 //!   which the ray entered a button of the menu ("scripted press:").
 //! - `scripted_pointer=palm` plays two hands and no controller: the left hand holds its open palm
@@ -471,20 +471,14 @@ fn press_check() {
     let row_y = |row: f32| PADDING + TITLE + GAP + row * (ROW + GAP) + ROW / 2.0;
     // The Show button of the stream's numbers, at the right end of the third row
     let show = on_view_menu(height, WIDTH - PADDING - BUTTON / 2.0, row_y(2.0));
-    // Recenter, the first of the two buttons of the last row
-    let recenter = on_view_menu(height, PADDING + (WIDTH - 2.0 * PADDING - GAP) / 4.0, row_y(3.0));
     let menu = Pose::at([0.0, 0.0, -1.0]).then(&hand_menu::menu_start(hand_menu::IN_VIEW, height));
     let handle = ScriptedController::handle_of(&menu, [WIDTH, height]);
     let at = PRESS_AT;
     // The Show button's point 3 mm to its right: a dp is a millimeter
     let strayed = on_view_menu(height, WIDTH - PADDING - BUTTON / 2.0 + 3.0, row_y(2.0));
-    // The ray to Recenter tipped 6 degrees down about the controller
-    let tipped = {
-        let to = [recenter[0] - at[0], recenter[1] - at[1], recenter[2] - at[2]];
-        let flat = (to[0] * to[0] + to[2] * to[2]).sqrt();
-        let pitch = (to[1] / flat).atan() - 6f32.to_radians();
-        [recenter[0], at[1] + flat * pitch.tan(), recenter[2]]
-    };
+    // Recenter, the first of the two buttons of the last row, 8 dp inside its corner nearest the
+    // handle, which stands below the middle of the menu
+    let near_handle = on_view_menu(height, (WIDTH - GAP) / 2.0 - 8.0, row_y(3.0) + ROW / 2.0 - 8.0);
     let carried = [at[0] + 0.1, at[1], at[2]];
     let right = ScriptedController::new(Hand::Right, at, away_from(at))
         .holding(Duration::from_millis(3000), rest)
@@ -498,13 +492,16 @@ fn press_check() {
         .moving_to(Duration::from_millis(40), (at, strayed), pull)
         .moving_to(Duration::from_millis(40), (at, show), pull)
         .holding(Duration::from_millis(1000), rest)
-        // 6.2 s: Recenter, then a pull that tips the ray onto the handle in 80 ms
-        .moving_to(Duration::from_millis(1), (at, recenter), rest)
+        // 6.2 s: Recenter by the handle, then a pull whose start tips the ray onto the handle in
+        // 80 ms. The trigger at 0.4 has left its rest and does not press yet, and the smoothed ray
+        // reaches the handle in the next 300 ms. The press comes 380 ms after the last frame of rest.
+        .moving_to(Duration::from_millis(1), (at, near_handle), rest)
         .holding(Duration::from_millis(1000), rest)
-        .moving_to(Duration::from_millis(80), (at, tipped), ScriptedButtons { trigger: 0.4, ..rest })
+        .moving_to(Duration::from_millis(80), (at, handle), ScriptedButtons { trigger: 0.4, ..rest })
+        .holding(Duration::from_millis(300), ScriptedButtons { trigger: 0.4, ..rest })
         .holding(Duration::from_millis(300), pull)
         .holding(Duration::from_millis(1000), rest)
-        // 8.6 s: the handle, a pull and a carry 10 cm to the right
+        // 8.9 s: the handle, a pull and a carry 10 cm to the right
         .moving_to(Duration::from_millis(1), (at, handle), rest)
         .holding(Duration::from_millis(1000), rest)
         .holding(Duration::from_millis(100), pull)
@@ -512,7 +509,7 @@ fn press_check() {
         .holding(Duration::from_millis(200), pull)
         .holding(Duration::from_millis(500), rest)
         .moving_to(Duration::from_millis(1), (carried, away_from(carried)), rest);
-    log::info!("scripted press: a menu {height:.0} dp tall; Show at {show:?}, Recenter at {recenter:?}, the handle at {handle:?}, the tipped ray toward {tipped:?}");
+    log::info!("scripted press: a menu {height:.0} dp tall; Show at {show:?}, Recenter by the handle at {near_handle:?}, the handle at {handle:?}");
     script_controller(missing(Hand::Left));
     script_controller(right);
 }

@@ -502,6 +502,16 @@ pub struct Model {
     pub pending: Option<crate::pending::Pending>,
 }
 
+impl Model {
+    /// Takes a message of the window. Each one tells of a request that failed, so the console in VR
+    /// shows it too for a while: a start that the headset asked for ends there as well.
+    pub fn note_message(&mut self, text: String) {
+        let notice = crate::black_eye::Notice { window: String::new(), headset: text.clone() };
+        self.notice = Some((notice, Instant::now() + crate::black_eye::NOTICE_TIME));
+        self.message = Some(text);
+    }
+}
+
 const LOG_LINES: usize = 200;
 
 /// The render sizes that the host learned for games: each program's file name and its share
@@ -934,7 +944,7 @@ pub fn pump(model: &mut Model) {
                     model.native = None;
                 }
             }
-            HostLine::Message(text) => model.message = Some(text),
+            HostLine::Message(text) => model.note_message(text),
         }
     }
     model.running = host_running();
@@ -1068,6 +1078,16 @@ mod tests {
         "wine": {"mac_window": true},
         "added_games": [{"name": "Mods", "program": "/Games/Mods/game.exe"}]
     }"#;
+
+    #[test]
+    fn a_failed_request_shows_in_the_window_once_and_in_the_console_in_vr() {
+        let mut model = Model::default();
+        model.note_message("The game did not start: wine exited with 1".into());
+        assert_eq!(model.message.as_deref(), Some("The game did not start: wine exited with 1"));
+        let (notice, until) = model.notice.expect("the console shows it");
+        assert_eq!((notice.window.as_str(), notice.headset.as_str()), ("", "The game did not start: wine exited with 1"));
+        assert!(until > Instant::now());
+    }
 
     #[test]
     fn a_wrong_action_name_costs_only_its_entry() {

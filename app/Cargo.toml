@@ -11,8 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 # The same Cranpose revision as the headset client (client/Cargo.toml)
-cranpose = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "2fb1cf4796d9d082c7cfe63cfc84fbed5b048364", features = ["desktop", "renderer-wgpu"] }
-cranpose-core = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "2fb1cf4796d9d082c7cfe63cfc84fbed5b048364" }
+cranpose = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "bab0e9893cdfc45f85fcf9d291e05568f96a9ead", features = ["desktop", "renderer-wgpu"] }
+cranpose-core = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "bab0e9893cdfc45f85fcf9d291e05568f96a9ead" }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 cranvr-common.workspace = true
@@ -26,6 +26,6 @@ dispatch2 = "0.3"
 
 [dev-dependencies]
 # A test moves the mouse over the window's buttons with a headless shell and reads what they draw
-cranpose-testing = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "2fb1cf4796d9d082c7cfe63cfc84fbed5b048364" }
-cranpose-render-common = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "2fb1cf4796d9d082c7cfe63cfc84fbed5b048364" }
-cranpose-ui-graphics = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "2fb1cf4796d9d082c7cfe63cfc84fbed5b048364" }
+cranpose-testing = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "bab0e9893cdfc45f85fcf9d291e05568f96a9ead" }
+cranpose-render-common = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "bab0e9893cdfc45f85fcf9d291e05568f96a9ead" }
+cranpose-ui-graphics = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "bab0e9893cdfc45f85fcf9d291e05568f96a9ead" }
