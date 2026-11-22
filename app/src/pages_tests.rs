@@ -1,5 +1,8 @@
 use super::*;
-use crate::backend::{vr_menu, Model, Settings};
+use crate::{
+    backend::{vr_menu, Model, Settings},
+    setup::Setup,
+};
 use cranvr_common::{
     controls::{Action, Control, Controls, Hand, ModelsInGame},
     menu::{Item, Page, Request},
@@ -24,13 +27,13 @@ fn page<'a>(pages: &'a [Page], id: &str) -> &'a Page {
 }
 
 #[test]
-fn the_console_lists_the_play_page_first_then_the_stream_page_and_a_page_for_each_game() {
+fn the_console_lists_the_play_page_first_then_steam_and_the_stream_and_a_page_for_each_game() {
     let settings = Settings::default();
     let model = model_with(vec![lab(), added()]);
     let pages = pages(&settings, &model);
     let ids: Vec<&str> = pages.iter().map(|page| page.id.as_str()).collect();
     let lab_program = steam::program(&lab()).unwrap();
-    assert_eq!(ids[..2], [PLAY, STREAM]);
+    assert_eq!(ids[..3], [PLAY, STEAM, STREAM]);
     assert!(ids.contains(&game_page(&lab_program).as_str()));
     // A game's page is reached from its row, so the menus do not list it
     assert!(pages.iter().filter(|page| page.id.starts_with(GAME_PAGE)).all(|page| !page.listed));
@@ -191,4 +194,76 @@ fn the_menu_carries_the_pages_and_the_notice_only_while_there_is_one() {
     shown.iter_mut().for_each(|page| page.items.iter_mut().for_each(Item::drop_hint));
     assert_eq!(pages, shown);
     assert!(!read(&model).to_string().contains("\"hint\""));
+}
+
+fn steam_words(model: &Model) -> (Vec<String>, Vec<String>) {
+    let pages = pages(&Settings::default(), model);
+    let steam = page(&pages, STEAM);
+    let mut texts = Vec::new();
+    let mut buttons = Vec::new();
+    for item in &steam.items {
+        match item {
+            Item::Text { text, .. } => texts.push(text.clone()),
+            Item::Buttons(row) => buttons.extend(row.buttons.iter().map(|button| button.words().to_string())),
+            _ => {}
+        }
+    }
+    (texts, buttons)
+}
+
+#[test]
+fn the_steam_page_offers_the_setup_that_this_mac_needs() {
+    // A new Mac: no Rosetta, no Wine
+    let mut model = Model::default();
+    let (texts, buttons) = steam_words(&model);
+    assert_eq!(buttons, ["Set up games"]);
+    assert!(texts.iter().any(|text| text.starts_with("Rosetta 2 is missing")), "{texts:?}");
+    assert!(texts.iter().any(|text| text.starts_with("Game support: Wine runs Windows games")), "{texts:?}");
+    // The play page says what keeps the games away and links the Steam page
+    let pages = pages(&Settings::default(), &model);
+    let Item::Buttons(row) = &page(&pages, PLAY).items[0] else { panic!() };
+    assert_eq!((row.title.as_str(), row.buttons[0].press.clone()), ("This Mac needs a setup for games", cranvr_common::menu::Press::Open { page: STEAM.into() }));
+    // An older game support gets its update, a broken Steam its repair
+    model.rosetta = true;
+    model.steam = SteamState::Ready;
+    model.game_support = Some("2026.11.20.1".into());
+    model.game_support_outdated = true;
+    assert_eq!(steam_words(&model).1, ["Update game support", "Open Steam", "Stop Steam and games"]);
+    model.game_support_outdated = false;
+    model.steam = SteamState::NeedsSetup;
+    assert_eq!(steam_words(&model).1, ["Repair Steam"]);
+    // A ready Steam opens and stops, and a user who never signed in is told where
+    model.steam = SteamState::Ready;
+    let (texts, buttons) = steam_words(&model);
+    assert_eq!(buttons, ["Open Steam", "Stop Steam and games"]);
+    assert!(texts.iter().any(|text| text.starts_with("Sign in to Steam once")));
+    model.steam_running = true;
+    model.steam_signed_in = true;
+    let (texts, buttons) = steam_words(&model);
+    assert_eq!(buttons, ["Stop Steam and games"]);
+    assert!(texts.contains(&"Steam is running".to_string()) && !texts.iter().any(|text| text.starts_with("Sign in")));
+    assert!(page(&super::pages(&Settings::default(), &model), PLAY).items.iter().all(|item| !matches!(item, Item::Buttons(row) if row.buttons.iter().any(|b| b.press == cranvr_common::menu::Press::Open { page: STEAM.into() }))));
+}
+
+#[test]
+fn a_running_setup_shows_its_steps_and_a_failed_one_offers_retry() {
+    use crate::setup::{Progress, Step};
+    let mut model = Model { rosetta: true, ..Default::default() };
+    model.setup = Some(Setup { steps: vec![(Step::GameSupport, Progress::Working("Downloading 40%".into())), (Step::Steam, Progress::Waiting)] });
+    let (texts, buttons) = steam_words(&model);
+    assert_eq!(buttons, ["Setting up..."]);
+    assert!(texts.contains(&"Game support: Downloading 40%".to_string()) && texts.contains(&"Steam for Windows: Waiting".to_string()), "{texts:?}");
+    model.setup = Some(Setup { steps: vec![(Step::GameSupport, Progress::Failed("The download did not reach its server".into())), (Step::Steam, Progress::Waiting)] });
+    let (texts, buttons) = steam_words(&model);
+    assert_eq!(buttons, ["Retry"]);
+    assert!(texts.contains(&"Game support: Failed: The download did not reach its server".to_string()));
+}
+
+#[test]
+fn setup_and_open_steam_are_actions_of_either_app() {
+    let mut settings = Settings::default();
+    assert_eq!(apply(&mut settings, &[], &Request::run("setup.start")).effects, [Effect::Setup]);
+    let out = apply(&mut settings, &[], &Request::run("steam.open"));
+    assert_eq!((out.effects, out.pending), (vec![Effect::OpenSteam], Some(pending::Request::OpenSteam)));
+    assert!(!out.changed);
 }

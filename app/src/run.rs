@@ -66,6 +66,15 @@ pub fn act(settings: &mut Settings, model: &mut Model, request: &Request) {
                 backend::forget_game_sizes();
                 model.learned_sizes = backend::learned_game_sizes();
             }
+            Effect::Setup => crate::setup::start(),
+            Effect::OpenSteam => {
+                // Steam may need seconds to start: keep the window responsive
+                thread::spawn(|| {
+                    if let Err(e) = steam::start() {
+                        backend::notify(e);
+                    }
+                });
+            }
         }
     }
 }
