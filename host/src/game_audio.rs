@@ -304,6 +304,21 @@ fn object<T: Message>(value: Retained<T>) -> Retained<AnyObject> {
     unsafe { Retained::cast_unchecked(value) }
 }
 
+/// The description of a stereo tap of every process but `excluded`, visible to this process alone,
+/// with its UUID. Making it needs no permission: the tap itself does.
+fn tap_description(excluded: &[AudioObjectID]) -> Result<(Retained<AnyObject>, Retained<NSUUID>), String> {
+    let class = AnyClass::get(c"CATapDescription").ok_or("macOS lacks Core Audio taps (macOS 14.2 or later has them)")?;
+    let excluded: Vec<Retained<NSNumber>> = excluded.iter().copied().map(NSNumber::new_u32).collect();
+    let excluded = NSArray::from_retained_slice(&excluded);
+    unsafe {
+        let description: Retained<AnyObject> = msg_send![msg_send![class, alloc], initStereoGlobalTapButExcludeProcesses: &*excluded];
+        let _: () = msg_send![&*description, setName: &*NSString::from_str("cranvr game sound")];
+        let _: () = msg_send![&*description, setPrivate: true];
+        let uuid: Retained<NSUUID> = msg_send![&*description, UUID];
+        Ok((description, uuid))
+    }
+}
+
 type ListenerBlock = RcBlock<dyn Fn(u32, NonNull<AudioObjectPropertyAddress>)>;
 
 /// Sends a message on `changed` each time the default output device changes, for the life of
@@ -361,14 +376,7 @@ impl Capture {
         }
         let output_uid = get_string(output, kAudioDevicePropertyDeviceUID).map_err(|e| format!("the output device has no UID ({e})"))?;
 
-        let class = AnyClass::get(c"CATapDescription").ok_or("macOS lacks Core Audio taps (macOS 14.2 or later has them)")?;
-        let excluded: Vec<Retained<NSNumber>> = own_processes().into_iter().map(NSNumber::new_u32).collect();
-        let excluded = NSArray::from_retained_slice(&excluded);
-        let description: Retained<AnyObject> = msg_send![msg_send![class, alloc], initStereoGlobalTapButExcludeProcesses: &*excluded];
-        let _: () = msg_send![&*description, setName: &*NSString::from_str("cranvr game sound")];
-        // Only this process sees the tap
-        let _: () = msg_send![&*description, setPrivate: true];
-        let uuid: Retained<NSUUID> = msg_send![&*description, UUID];
+        let (description, uuid) = tap_description(&own_processes())?;
         let mut tap: AudioObjectID = 0;
         let status = AudioHardwareCreateProcessTap(Retained::as_ptr(&description).cast_mut(), &mut tap);
         if status != 0 || tap == 0 {

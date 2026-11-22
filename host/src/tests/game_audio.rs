@@ -1,4 +1,6 @@
-use super::{clock_ppm, interleave, AudioBuffer, Resampler, StreamDescription, FORMAT_FLAG_FLOAT, FORMAT_FLAG_NON_INTERLEAVED};
+use super::{clock_ppm, interleave, own_processes, tap_description, AudioBuffer, Resampler, StreamDescription, FORMAT_FLAG_FLOAT, FORMAT_FLAG_NON_INTERLEAVED};
+use objc2::{msg_send, rc::Retained, runtime::Bool};
+use objc2_foundation::{NSArray, NSNumber, NSString};
 use objc2_core_audio::AudioConvertNanosToHostTime;
 
 fn samples(bytes: &[u8]) -> Vec<i16> {
@@ -75,4 +77,23 @@ fn the_clock_reads_its_ppm_after_ten_seconds() {
     let ppm = clock_ppm(first, Some((ticks(15.0), 481_048.0)), 48_000.0).unwrap();
     assert!((ppm - 100.0).abs() < 1.0, "{ppm}");
     assert_eq!(clock_ppm(first, Some((ticks(9.0), 200_000.0)), 48_000.0), None);
+}
+
+// The description takes no permission, so a test can check the calls that the tap's start makes:
+// in a debug build objc2 checks each selector and its argument types.
+#[test]
+fn the_tap_description_leaves_out_the_host() {
+    let own = own_processes();
+    // A test uses Core Audio here first, which gives it a process object
+    assert_eq!(own.len(), 1, "{own:?}");
+    let (description, uuid) = tap_description(&own).unwrap();
+    let processes: Retained<NSArray<NSNumber>> = unsafe { msg_send![&*description, processes] };
+    assert_eq!(processes.iter().map(|n| n.as_u32()).collect::<Vec<_>>(), own);
+    let exclusive: Bool = unsafe { msg_send![&*description, isExclusive] };
+    let private: Bool = unsafe { msg_send![&*description, isPrivate] };
+    let mono: Bool = unsafe { msg_send![&*description, isMono] };
+    assert!(exclusive.as_bool() && private.as_bool() && !mono.as_bool());
+    let name: Retained<NSString> = unsafe { msg_send![&*description, name] };
+    assert_eq!(name.to_string(), "cranvr game sound");
+    assert_eq!(uuid.UUIDString().len(), 36);
 }

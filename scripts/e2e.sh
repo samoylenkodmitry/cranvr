@@ -863,7 +863,7 @@ fi
 # the sound arrives without a sound playing. A host started from a terminal captures only when the
 # terminal app may record the system sound (System Audio Recording): the run then skips the check.
 audio_line=$(grep -h "probe: audio:" "${work}/probe.log" 2>/dev/null || true)
-if grep -q "Game audio: cranvr may not record" "${work}/host.log" 2>/dev/null; then
+if grep -qh "Game audio: cranvr may not record" "${work}/host.log" "${work}/host.out" 2>/dev/null; then
     print "The Mac's sound was not checked: the app that started this run may not record the system sound"
 elif [[ ${audio_line} =~ '([0-9.]+) s of sound in' ]] && (( ! ${host_args[(Ie)--no-game-audio]} )); then
     extra+=(audio_seconds=${match[1]})
