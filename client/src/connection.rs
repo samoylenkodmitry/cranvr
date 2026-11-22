@@ -313,8 +313,9 @@ fn resolve(text: &str) -> Result<SocketAddr, String> {
 /// within about 0.2 s of the app's start.
 const DEVICE_WAIT: Duration = Duration::from_secs(2);
 /// How long an aim at the cable waits for an answer behind it. The headset's USB network comes up
-/// about a second after the app asks for it.
-const CABLE_WAIT: Duration = Duration::from_secs(5);
+/// about a second after the app asks for it. A stop of the app a moment before may have switched the
+/// headset's USB functions back. The switch to the USB network then takes a few seconds more.
+const CABLE_WAIT: Duration = Duration::from_secs(10);
 
 /// Where a connection to `text` goes and which path that is. A phone or a headset asks the cable
 /// now: the panel's list may be old, and a link that ended connects again through here. A flat
@@ -338,9 +339,10 @@ fn route(hub: &'static Hub, text: &str, fingerprint: Option<[u8; 8]>) -> (String
     let mut probed = usb::probe_settled();
     // An aim at the cable with no Mac known, as a launch with `127.0.0.1:PORT` gives, may come
     // before the cable's ways answer: the USB network comes up about a second after the app's
-    // start. In 7 of 23 test runs the connection came first, got a refusal at 127.0.0.1 and never
-    // tried again. It asks the cable again for a few seconds. An aim with a known Mac falls back to
-    // that Mac's Wi-Fi entry at once when the cable is out.
+    // start. The connection sometimes came first in test runs with quick launches one after
+    // another. It got a refusal at 127.0.0.1 and never tried again. It now asks the cable again for
+    // some seconds. An aim with a known Mac falls back to that Mac's Wi-Fi entry at once when the
+    // cable is out.
     if loopback && fingerprint.is_none() && probed.is_none() {
         log::info!("nothing answers behind the USB cable yet; the connection asks again for up to {CABLE_WAIT:?}");
         while probed.is_none() && launched.elapsed() < CABLE_WAIT {
