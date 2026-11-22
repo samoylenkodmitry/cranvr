@@ -199,8 +199,11 @@ carries the mapping's name, the description and the size, so another process ope
 
 `0014-keyed-mutex-orders-shared-textures.patch`: a texture made with `SHARED_KEYEDMUTEX` answers a query for
 `IDXGIKeyedMutex`. SteamVR orders the access to the frames that its processes share with these mutexes, and Chromium's
-GPU process asks for them too. `ReleaseSync` returns once the GPU has finished the device's commands before it, so the
-reader finds the writer's draws. `AcquireSync` returns at once.
+GPU process asks for them too. The GPU keeps the order, as on Windows: the processes of a texture share a Metal shared
+event and a count of releases in a small section of shared memory. `ReleaseSync` has the GPU set the event to the next
+count after the caller's commands, and `AcquireSync` has the GPU wait for the last count before the caller's next
+commands. Neither call waits for the GPU. A first version waited in `ReleaseSync` until the GPU had finished. The Lab
+and SteamVR's compositor then lost 8.5 ms of each frame there, and SteamVR made about 50 frames a second at 72 Hz.
 
 `0015-dxgi-usage-from-bind-flags.patch`: `IDXGIResource::GetUsage` follows the bind flags and the usage, as on Windows.
 It returned 0. ANGLE in Chromium reads it for a texture that another process shared.
@@ -216,4 +219,5 @@ swapchain not supported yet"). SteamVR's web panels use only the textures that C
 `OpenSharedResource1` gets a kernel allocation of its own with the private data of the shared one, so the process can
 share it again, as on Windows. SteamVR's web helper passes the textures of Chromium's GPU process on to the
 compositor. Without the patch each of them failed with `VROverlayError_InvalidTexture`, and SteamVR's panels and
-controller hints stayed away from the headset.
+controller hints stayed away from the headset. The private data comes from opening the shared resource: the query of
+it gives only the size.

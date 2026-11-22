@@ -14,7 +14,8 @@
 #     context and compile its legacy GLSL; wininet.dll, whose handles a game with requests on several
 #     threads closed in a race; ntdll.so, which gives a program with high-entropy addresses its memory above
 #     4 GB as Windows does, so MonoMod's detours in Unity mods find free pages near their code; wtsapi32.dll,
-#     which reports the session as unlocked, so SteamVR's compositor shows the picture
+#     which reports the session as unlocked, so SteamVR's compositor shows the picture; user32.dll, which exports
+#     the function that SteamVR's dashboard needs to start
 #
 # The BasaltVR checkout must have run, in this order:
 #   runtime/scripts/test-dxmt.zsh          (downloads Wine 11.10 and stock DXMT)
@@ -109,7 +110,7 @@ done
 # system32, and the loader takes that one. An engine that exists already is not cloned again, so each file
 # is copied in by name.
 if [[ -f ${wine_bin}/wined3d.dll ]]; then
-    for dll in wined3d.dll wininet.dll wtsapi32.dll; do
+    for dll in wined3d.dll wininet.dll wtsapi32.dll user32.dll; do
         cp "${wine_bin}/${dll}" "${wine_root}/lib/wine/x86_64-windows/${dll}"
         cp "${wine_bin}/${dll}" "${prefix}/drive_c/windows/system32/${dll}"
     done

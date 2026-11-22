@@ -324,8 +324,18 @@ fn game_wine(program: &str) -> Command {
     if let Err(e) = openvr::apply(&prefix(), choice, steamvr.as_ref()) {
         backend::notify(format!("cranvr could not set the OpenVR runtime: {e}"));
     }
+    if steamvr.is_some() {
+        match openvr::unblock_driver(&steam_dir().join("config/steamvr.vrsettings")) {
+            Ok(true) => backend::log("SteamVR had turned cranvr's driver off after a crash. cranvr turned it on again.".into()),
+            Ok(false) => {}
+            Err(e) => backend::notify(format!("cranvr could not turn its SteamVR driver on again: {e}")),
+        }
+    }
     let mut command = wine_with(program, settings.game_msaa_limit);
     command.envs(launch::environment(&settings.wine, &options)).args(launch::arguments(&options));
+    // cranvr's SteamVR driver finds the game's render size in game-sizes.txt by the game's program. SteamVR,
+    // which the game starts, inherits the variable.
+    command.env("CRANVR_GAME", program);
     command
 }
 
@@ -728,5 +738,69 @@ mod tests {
         assert_eq!(mac_to_windows(Path::new("/Users/x/a.exe")), "Z:\\Users\\x\\a.exe");
         assert_eq!(windows_to_mac("C:\\Games"), Some(prefix().join("drive_c/Games")));
         assert_eq!(windows_to_mac("Z:\\Volumes\\SSD"), Some(PathBuf::from("/Volumes/SSD")));
+    }
+
+    /// A start from the app with the launch option "OpenVR: SteamVR", as the Play tab does it: the app's
+    /// host on port 9962, the probe as the headset, then [`run_program`] with the game's options. The
+    /// game's frames must reach the host through SteamVR and cranvr's driver. Needs `cargo build
+    /// --release`, CRANVR_HOME set to a test copy of the game support with SteamVR and the game, and
+    /// CRANVR_TEST_PROGRAM set to the game's program (a Mac path). The probe asks for the desktop too,
+    /// so its log shows the peak level of the sound that reached it. Run with `cargo test --release -p
+    /// cranvr-app -- --ignored a_game_starts_through_steamvr`.
+    #[test]
+    #[ignore]
+    fn a_game_starts_through_steamvr_from_the_app() {
+        use crate::backend::{self, Model, Settings};
+        let program = PathBuf::from(std::env::var("CRANVR_TEST_PROGRAM").expect("CRANVR_TEST_PROGRAM names the game"));
+        assert!(std::env::var_os("CRANVR_HOME").is_some(), "CRANVR_HOME names a test copy, not the user's own");
+        let release = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/release");
+        std::env::set_var("CRANVR_HOST_BIN", release.join("cranvr-host"));
+        std::env::set_var("CRANVR_TEST_TRUST_ALL", "1");
+        // The user's host keeps port 9950, and the probe's pointer script moves no real mouse
+        std::env::set_var("CRANVR_NATIVE_PORT", "9962");
+        std::env::set_var("CRANVR_POINTER_DRY_RUN", "1");
+        let name = program.file_name().unwrap().to_string_lossy().into_owned();
+        let windows = mac_to_windows(&program);
+        let mut settings = Settings::load();
+        let before = settings.clone();
+        settings.fps = 72;
+        settings.desktop = true;
+        settings.virtual_display = None;
+        settings.unscale_displays = false;
+        settings.game_audio = true;
+        settings.launch.entry(windows.clone()).or_default().openvr = Some(launch::OpenVr::SteamVr);
+        settings.save();
+        backend::start_host(&settings).expect("host starts");
+        thread::sleep(Duration::from_secs(2));
+        let mut probe = Command::new(release.join("cranvr-probe"))
+            .args(["--seconds", "100", "--tcp", "--connect", "127.0.0.1:9962", "--quest-view", "--any-picture", "--desktop"])
+            .stdout(log_file("probe.log"))
+            .spawn()
+            .expect("probe runs");
+        run_program(&program).expect("the game starts");
+        let mut model = Model::default();
+        let (mut game_frames, mut game) = (0u64, None);
+        let since = Instant::now();
+        let probe_status = loop {
+            thread::sleep(Duration::from_millis(200));
+            backend::pump(&mut model);
+            game_frames = game_frames.max(model.stats.as_ref().map_or(0, |s| s.game_frames));
+            game = game.or(model.game.clone());
+            if let Some(status) = probe.try_wait().unwrap() {
+                break status;
+            }
+            assert!(since.elapsed() < Duration::from_secs(130), "the probe did not end");
+        };
+        let audio = model.audio.clone();
+        end_program(&name);
+        backend::stop_host();
+        before.save();
+        assert!(probe_status.success(), "the probe saw a good stream");
+        assert!(game_frames > 100, "the game's frames reached the host: {game_frames} in a stats window");
+        assert!(game.is_some(), "the host named the game");
+        assert!(matches!(audio, Some((true, _))), "the host captures the sound: {audio:?}");
+        let settings = fs::read_to_string(steam_dir().join("config/steamvr.vrsettings")).unwrap_or_default();
+        let settings: serde_json::Value = serde_json::from_str(&settings).unwrap_or_default();
+        assert_ne!(settings["driver_cranvr"]["blocked_by_safe_mode"], true, "SteamVR loads the driver");
     }
 }

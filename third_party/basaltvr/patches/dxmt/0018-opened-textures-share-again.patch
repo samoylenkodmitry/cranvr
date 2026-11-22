@@ -4,7 +4,8 @@ On Windows a process can share a texture that another process shared with it. St
 textures of Chromium's GPU process and passes them on to SteamVR's compositor ("SetOverlayTexture failure
 (VROverlayError_InvalidTexture)"). OpenSharedResource and OpenSharedResource1 now give the opened texture a kernel
 allocation of its own with the private data of the shared one. GetSharedHandle and CreateSharedHandle then work on it,
-and the next process opens the same memory.
+and the next process opens the same memory. The query of the shared resource gives only the size of the private data,
+so the data comes from opening the resource, as ImportSharedTexture does.
 ---
 diff --git a/src/d3d11/d3d11_device.cpp b/src/d3d11/d3d11_device.cpp
 index 6a8caca..85f3b8f 100644
@@ -57,7 +58,7 @@ index 80927e5..f840b52 100644
      MTLD3D11Device *pDevice, LPCWSTR lpName, DWORD dwDesiredAccess, REFIID riid, void **ppTexture
  );
 diff --git a/src/d3d11/d3d11_texture_device.cpp b/src/d3d11/d3d11_texture_device.cpp
-index 55ee999..85cd09c 100644
+index 55ee999..191132b 100644
 --- a/src/d3d11/d3d11_texture_device.cpp
 +++ b/src/d3d11/d3d11_texture_device.cpp
 @@ -312,6 +312,13 @@ public:
@@ -74,7 +75,7 @@ index 55ee999..85cd09c 100644
  };
  
  struct SharedResourceData {
-@@ -692,4 +699,67 @@ ImportSharedTextureByName(
+@@ -692,4 +699,95 @@ ImportSharedTextureByName(
  
  #pragma endregion
  
@@ -95,29 +96,57 @@ index 55ee999..85cd09c 100644
 +  resource->GetType(&dimension);
 +  if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER || dimension == D3D11_RESOURCE_DIMENSION_UNKNOWN)
 +    return;
++  // The query gives the size of the private data, and opening the resource gives the data
 +  char data[512];
 +  UINT size = 0;
++  D3DKMT_HANDLE opened = 0;
++  D3DDDI_OPENALLOCATIONINFO2 allocation = {};
 +  if (NtHandle) {
 +    D3DKMT_QUERYRESOURCEINFOFROMNTHANDLE query = {};
 +    query.hDevice = pDevice->GetLocalD3DKMT();
 +    query.hNtHandle = hResource;
-+    query.pPrivateRuntimeData = data;
-+    query.PrivateRuntimeDataSize = sizeof(data);
 +    if (D3DKMTQueryResourceInfoFromNtHandle(&query))
 +      return;
 +    size = query.PrivateRuntimeDataSize;
++    if (!size || size > sizeof(data))
++      return;
++    D3DKMT_OPENRESOURCEFROMNTHANDLE open = {};
++    char dummy;
++    open.hDevice = pDevice->GetLocalD3DKMT();
++    open.hNtHandle = hResource;
++    open.NumAllocations = 1;
++    open.pOpenAllocationInfo2 = &allocation;
++    open.pPrivateRuntimeData = data;
++    open.PrivateRuntimeDataSize = size;
++    open.pTotalPrivateDriverDataBuffer = &dummy;
++    open.TotalPrivateDriverDataBufferSize = 0;
++    if (D3DKMTOpenResourceFromNtHandle(&open))
++      return;
++    opened = open.hResource;
 +  } else {
 +    D3DKMT_QUERYRESOURCEINFO query = {};
 +    query.hDevice = pDevice->GetLocalD3DKMT();
 +    query.hGlobalShare = static_cast<D3DKMT_HANDLE>(reinterpret_cast<uintptr_t>(hResource));
-+    query.pPrivateRuntimeData = data;
-+    query.PrivateRuntimeDataSize = sizeof(data);
 +    if (D3DKMTQueryResourceInfo(&query))
 +      return;
 +    size = query.PrivateRuntimeDataSize;
++    if (!size || size > sizeof(data))
++      return;
++    D3DKMT_OPENRESOURCE open = {};
++    open.hDevice = pDevice->GetLocalD3DKMT();
++    open.hGlobalShare = query.hGlobalShare;
++    open.NumAllocations = 1;
++    open.pOpenAllocationInfo2 = &allocation;
++    open.pPrivateRuntimeData = data;
++    open.PrivateRuntimeDataSize = size;
++    if (D3DKMTOpenResource2(&open))
++      return;
++    opened = open.hResource;
 +  }
-+  if (!size || size > sizeof(data))
-+    return;
++  D3DKMT_DESTROYALLOCATION destroy = {};
++  destroy.hDevice = pDevice->GetLocalD3DKMT();
++  destroy.hResource = opened;
++  D3DKMTDestroyAllocation(&destroy);
 +
 +  D3DKMT_CREATEALLOCATION create = {};
 +  create.hDevice = pDevice->GetLocalD3DKMT();

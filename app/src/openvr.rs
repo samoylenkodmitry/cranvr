@@ -121,6 +121,30 @@ pub fn apply(prefix: &Path, choice: OpenVr, steamvr: Option<&SteamVr>) -> io::Re
     Ok(choice)
 }
 
+/// Turns cranvr's driver on again in SteamVR's settings file (steamvr.vrsettings in Steam's config folder)
+/// and says whether it was off. After a crash of its server SteamVR marks the drivers there with
+/// `blocked_by_safe_mode` and loads them no more. Without cranvr's driver SteamVR has no headset. A file
+/// that is missing or holds no such mark stays as it is.
+pub fn unblock_driver(settings: &Path) -> io::Result<bool> {
+    let Ok(text) = fs::read_to_string(settings) else {
+        return Ok(false);
+    };
+    let Ok(mut values) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Ok(false);
+    };
+    let Some(driver) = values.get_mut("driver_cranvr").and_then(|d| d.as_object_mut()) else {
+        return Ok(false);
+    };
+    if driver.remove("blocked_by_safe_mode").is_none_or(|v| v != serde_json::Value::Bool(true)) {
+        return Ok(false);
+    }
+    if driver.is_empty() {
+        values.as_object_mut().map(|all| all.remove("driver_cranvr"));
+    }
+    fs::write(settings, serde_json::to_string_pretty(&values).map_err(io::Error::other)?)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +170,28 @@ mod tests {
             config: r"C:\Program Files (x86)\Steam\config".into(),
             log: r"C:\Program Files (x86)\Steam\logs".into(),
         }
+    }
+
+    #[test]
+    fn a_driver_that_safe_mode_blocked_is_turned_on_again() {
+        let dir = prefix("unblock", "someone");
+        let settings = dir.join("steamvr.vrsettings");
+        assert!(!unblock_driver(&settings).unwrap(), "a missing file stays missing");
+        assert!(!settings.exists());
+        fs::write(&settings, r#"{"driver_cranvr": {"blocked_by_safe_mode": true}, "steamvr": {"enableHomeApp": false}}"#).unwrap();
+        assert!(unblock_driver(&settings).unwrap());
+        let values: serde_json::Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        assert!(values.get("driver_cranvr").is_none());
+        assert_eq!(values["steamvr"]["enableHomeApp"], false);
+        assert!(!unblock_driver(&settings).unwrap(), "a second call finds nothing to do");
+        fs::write(&settings, r#"{"driver_cranvr": {"blocked_by_safe_mode": false, "enable": true}}"#).unwrap();
+        assert!(!unblock_driver(&settings).unwrap());
+        fs::write(&settings, r#"{"driver_cranvr": {"blocked_by_safe_mode": true, "enable": true}}"#).unwrap();
+        assert!(unblock_driver(&settings).unwrap());
+        let values: serde_json::Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(values["driver_cranvr"]["enable"], true);
+        assert!(values["driver_cranvr"].get("blocked_by_safe_mode").is_none());
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
