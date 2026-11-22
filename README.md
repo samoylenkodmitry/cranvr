@@ -7,7 +7,7 @@ The goal is to play Windows SteamVR games on a Quest from a Mac. Windows games r
 ## What works
 
 - A head-tracked test scene for a headset on a desk.
-- Foveated encoding. The host encodes about a third of the pixels of an eye. The client unwarps them. It makes the full Quest 3 eye size fit at 120 Hz.
+- Foveated encoding at four levels: Off, Low, Medium and High. The host keeps the full pixel density around the direction straight ahead of each eye and squeezes the edges. The client unwarps them. Medium, the default, encodes about a third of the pixels of an eye and makes the full Quest 3 eye size fit at 120 Hz (see "Foveated encoding").
 - Windows OpenXR games under Wine. Head pose, controller poses, buttons and haptics pass both ways.
 - Windows OpenVR games under Wine, through OpenComposite. The app has a choice for it in the Settings tab, in the Wine card and in each game's options. OpenGL games too: Google Earth VR draws its picture in a test host (see "Not tested yet").
 - The Mac desktop as a panel in the headset, with the controller as the mouse. The Mac's sound plays in the headset.
@@ -114,7 +114,38 @@ The client's modules: `connection.rs` runs the link on its own threads. `hub.rs`
 
 ### The eye size and the decoder
 
-The client asks for the headset's recommended eye size. The host takes it unless `--eye-width` says otherwise. The client asks Cranpose for the decoder's limits (`VideoDecoder::capabilities`) before the Hello. It asks for the recommended size unless the frame that the host would encode lies beyond the decoder's largest picture or beyond its frame rate at the refresh rate. It then takes a smaller eye, down to half the recommended size. A client that takes no foveation gets a smaller eye: 1248 pixels at 120 Hz, 1504 at 90 Hz and 1728 at 72 Hz, unless `--eye-width` says otherwise.
+The client asks for the headset's recommended eye size. The host takes it unless `--eye-width` says otherwise. The client asks Cranpose for the decoder's limits (`VideoDecoder::capabilities`) before the Hello. It asks for the recommended size unless the frame that the host would encode lies beyond the decoder's largest picture or beyond its frame rate at the refresh rate. It then takes a smaller eye, down to half the recommended size. The client learns the host's foveation level only with the stream, so it sizes the eye for the level Low, whose frame is the largest of the foveated levels. A Quest 3's decoder takes it at the recommended size. A client that takes no foveation, and every client of a host at the level Off, gets a smaller eye: 1248 pixels at 120 Hz, 1504 at 90 Hz and 1728 at 72 Hz, unless `--eye-width` says otherwise.
+
+### Foveated encoding
+
+The Settings tab of the Mac app picks the level: Off, Low, Medium or High (`--foveation` of the host). A change restarts the host. The app saves it as `foveation_level`. Each level keeps the full pixel density in a region of each eye and squeezes the edges by an edge ratio. The math follows ALVR (`common/src/foveation.rs`). The host sends the layout in the stream's parameters, and the client's stream layer (Cranpose's `FoveatedEncoding`) unwarps any layout on the GPU. The Quest 3 has no eye tracking, so the region stays fixed. The host centers it on the direction straight ahead of the eye, from the view in the headset's Hello (`FoveationConfig::centered`). A Quest 3's eye sees 54 degrees out, 40 in, 44 up and 55 down, so straight ahead lies at 62 percent of the width from the outer edge and 40 percent of the height from the top. ALVR's own shift put the region's middle at 53 percent of the height: the view 15 degrees above straight ahead was squeezed.
+
+| Level | Full-density region (share of the view) | Edge ratio | Frame for a 1680x1760 eye | Pixels of an eye |
+|---|---|---|---|---|
+| Off | the whole view, at an eye of 1248x1308 | 1 | 2496x1308 | 55 percent of 1680x1760 |
+| Low | 60 x 55 percent | 2.5, 3 | 2560x1248 | 54 percent |
+| Medium | 45 x 40 percent | 4, 5 | 1984x928 | 31 percent |
+| High | 35 x 30 percent | 5, 6 | 1600x736 | 20 percent |
+
+**Measured on the Mac** (`host/src/tests/foveation_levels.rs`, `cargo test --release -p cranvr-host foveation_levels -- --ignored --nocapture`). The test runs the host's own encoder and a VideoToolbox decoder at 120 Hz for 240 frames, undoes the warp as the headset does and compares the view with the same eyes drawn at the full eye size with no foveation. The PSNR of the Y plane counts in three regions by the angle from straight ahead on each axis: the center within 15 degrees, the ring from 15 to 35 degrees and the edge beyond. The game scene is a landscape with fine detail that pans at about 60 degrees a second, as `compose` takes a game's eyes. The test scene is the host's own scene with a head that turns. The stream sent 70 percent of the target, as the eye stream does. The encode and decode times are medians on an M5 while the cranvr app's host streamed to a headset.
+
+| Level | Mbps | Game: center | ring | edge | SSIM center | Test scene: center | ring | edge | Encode ms | Decode ms |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Off | 40 | 27.6 | 27.6 | 27.2 | 0.944 | 29.8 | 33.0 | 36.1 | 3.8 | 2.6 |
+| Low | 40 | 33.2 | 33.3 | 22.6 | 0.968 | 36.0 | 38.1 | 35.6 | 3.5 | 2.6 |
+| Medium | 40 | 37.5 | 26.4 | 19.2 | 0.978 | 37.7 | 34.5 | 31.3 | 2.3 | 1.6 |
+| High | 40 | 38.9 | 23.0 | 18.6 | 0.983 | 38.6 | 30.9 | 29.1 | 1.7 | 1.2 |
+| Off | 12 | 26.3 | 26.5 | 26.0 | 0.906 | 29.4 | 32.2 | 35.2 | 3.6 | 2.6 |
+| Low | 12 | 30.2 | 30.4 | 21.9 | 0.931 | 32.8 | 35.0 | 33.9 | 3.5 | 2.6 |
+| Medium | 12 | 32.3 | 25.5 | 19.0 | 0.943 | 33.7 | 32.6 | 30.3 | 2.3 | 1.5 |
+| High | 12 | 33.3 | 22.6 | 18.5 | 0.952 | 34.2 | 29.9 | 28.5 | 1.7 | 1.1 |
+
+The test also counts the PSNR of 32 strips across the rows within 15 degrees of straight ahead. It rises and falls smoothly from the edges to the center at every level. Dips of up to 0.8 dB below both neighbors show at the same strips with Off, which has no warp, so the picture makes them. No other dip exceeds 0.6 dB, and none lies at the end of a full-density region: the warp shows no seam. The squeezed edges lose fine detail, and stripes of 6 pixels show moire at the edges of Medium and High.
+
+**A quantizer per region.** VideoToolbox has no public way to give the encoder a quantizer per region: its public frame options are a key frame, a base QP for the whole frame and the long-term references. The HEVC encoder lists a private property `EnableUserQPMap` and takes it. Maps of one value given with the private frame keys `QPMap` and `QPMapSize` changed the frame sizes by less than 1 percent between QP 10 and QP 50, so the way is not usable. A quantizer map would also need every pixel of the eye in the frame. The row `edge blur` of the test keeps every pixel of a 1680x1760 eye and blurs the edges as much as Medium squeezes them, so the encoder spends few bits there. Its center matches Medium (37.3 dB at 40 Mbps), but its frame of 5.9 megapixels takes 6.1 ms to encode and 5.1 ms to decode on the Mac, against 2.3 and 1.6 ms. A warp keeps the encoder's and the decoder's work small, which a map of quantizers cannot do.
+
+QUEST_TABLE
+
 
 ### The console
 
@@ -709,7 +740,7 @@ A test with nobody in the headset can press the buttons of a game's menu. `CRANV
 - The eye stream's frames stand on the encoder's time line at the real time between them, at most two frames apart after a pause. VideoToolbox's rate control gives a frame the bits of that time. Before, the frames stood 1 ms apart, so the stream sent 5 to 8 percent of its bitrate (issue #90).
 - The link limits the bitrate that the user set: 40 Mbps at 120 Hz over the cable and 12 Mbps at 120 Hz over a network, the same bits a frame at other rates. The stream sends about 70 percent of the target, under the data rate limit of each second. On a Quest 3 over the cable a target of 100 Mbps made 3 to 7 percent of the frames late in bursts, and 40 kept them at 0.2 percent. Over a Wi-Fi 6 network late frames rose from 4 percent at the old 8.5 Mbps to 18 percent at 28 Mbps sent, so a network keeps the old rate until the host adapts the bitrate to the link (issue #97). `host/src/tests/eye_quality.rs` measures the quality on the Mac: a moving game picture at 120 Hz rose from 34.5 dB (8.5 Mbps) to 39.5 dB at the cable's limit and 43.4 dB at 70 Mbps. The window shows what the stream sends and the link's limit.
 - The encoder overlaps up to two frames. A data rate limit over each second keeps the stream at or under the bitrate target. `--strict-rate-control` switches to VideoToolbox's low-latency rate control: even frame sizes, one frame at a time, slower per frame on an M5 (6.1 ms against 3.6 to 5.0).
-- `--no-foveation` encodes every pixel at full density. It needs a smaller eye size.
+- `--foveation off|low|medium|high` sets the level of the foveated encoding (see "Foveated encoding"). Off encodes every pixel at full density, with a smaller eye.
 - `--pointer-pitch DEG` tilts the pointing ray down from the controller's handle (default -40). It applies to a client that sends no aim pose. A client's aim pose gives the ray as it is.
 - A headset with Tailscale that accepts a subnet route for its own network sends its UDP to the Mac through the subnet router, which changes the sender address. The stream may then not arrive. The handshake still works over TCP, so the headset connects, gets no video and leaves after about 5 seconds, again and again. The host reports it after two such connections in a row. The fix is on the headset: exclude the cranvr app from the VPN, or stop using the subnet route there. The host also warns when this Mac reaches the headset through a VPN tunnel of its own. `--tcp` sends the media over TCP to every headset.
 

@@ -309,23 +309,24 @@ fn resolve(text: &str) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("{text} has no address"))
 }
 
-/// How long a connection waits for the cable's thread to ask for the USB network. The app gets the
-/// focus about 0.2 s after its start.
+/// How long a connection at the launch waits for the hub to learn the device and for the cable's
+/// thread to ask for the USB network. Both come within about 0.2 s of the app's start.
 const ASK_WAIT: Duration = Duration::from_secs(2);
 
 /// Where a connection to `text` goes and which path that is. A phone or a headset asks the cable
 /// now: the panel's list may be old, and a link that ended connects again through here. A flat
 /// window goes where the text says, because a host beside it is no cable.
 fn route(hub: &'static Hub, text: &str, fingerprint: Option<[u8; 8]>) -> (String, Option<Path>) {
+    // A connection that the launch starts may come before the hub knows that this is a headset, and
+    // before the cable's thread asks for the USB network. In 7 of 23 test runs it did: it took the
+    // address as typed, got a refusal at 127.0.0.1 and never tried again. It now waits for both. A
+    // flat window on a computer is never a headset, so only an Android build waits.
+    let launched = Instant::now();
+    while cfg!(target_os = "android") && launched.elapsed() < ASK_WAIT && (!hub.device().is_live() || usb_network::not_asked_yet()) {
+        thread::sleep(Duration::from_millis(50));
+    }
     if !hub.device().is_live() {
         return (text.to_string(), None);
-    }
-    // The cable's thread asks for the USB network once the app has the focus. A connection that
-    // the launch starts came first in 5 of 17 test runs: it found no cable, connected to 127.0.0.1,
-    // got a refusal and never tried again. It now waits for the request.
-    let launched = Instant::now();
-    while usb_network::not_asked_yet() && launched.elapsed() < ASK_WAIT {
-        thread::sleep(Duration::from_millis(50));
     }
     // A request for the USB network that just went out switches the headset's USB functions. The
     // cable's ways come back a moment later: the first connection waits for them.
