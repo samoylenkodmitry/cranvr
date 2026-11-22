@@ -24,6 +24,8 @@ use std::time::Duration;
 
 /// The width of a setting's name, in dp
 const LABEL: f32 = 150.0;
+/// The width of a game's VR system button, in dp
+const VR_SYSTEM: f32 = 170.0;
 /// The width of an input's name on the Controls page, and of the buttons that step through its actions
 const CONTROL_LABEL: f32 = 210.0;
 const STEP: f32 = 48.0;
@@ -218,7 +220,8 @@ fn Heading(text: &'static str) {
     Text(text, Modifier::empty().height(size::HEADING), text_style(26.0, MUTED_COLOR, Some(FontWeight::BOLD)));
 }
 
-/// A game's button, with a Stop button beside it while it runs.
+/// A game's button, its VR system and a Stop button beside it while it runs. A press on the VR system picks the
+/// next one: the cranvr app saves it for the game's next start.
 #[composable]
 fn GameRow(game: Game, running: bool) {
     Row(
@@ -226,6 +229,15 @@ fn GameRow(game: Game, running: bool) {
         RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(size::GAP)),
         move || {
             Choice(game.name.clone(), running, Press::Host(Action::Play(game.name.clone())), ACCENT_COLOR, true);
+            let next = Press::Host(Action::VrSystem(game.name.clone(), game.vr.next()));
+            Button(
+                Modifier::empty().width(VR_SYSTEM).height(size::BUTTON).background(KEY_COLOR).rounded_corners(12.0),
+                ButtonSpec::default(),
+                move || run(&next),
+                move || {
+                    Text(game.vr.label(), Modifier::empty(), bold(18.0));
+                },
+            );
             if running {
                 Choice("Stop".into(), false, Press::Host(Action::Stop), STOP_COLOR, false);
             }

@@ -103,6 +103,9 @@ pub struct Options {
     pub menu: Option<f32>,
     /// Pulls the right trigger once, in the same way
     pub right_trigger: Option<(f32, f32)>,
+    /// Sends one request of the console at this many seconds, as a press on a button of the headset's console
+    /// does: a JSON object such as `{"action": "play", "game": "The Lab"}`
+    pub console: Option<(f32, String)>,
 }
 
 /// The probe's clock runs this far ahead of the process clock, as a headset's clock has its own
@@ -209,6 +212,7 @@ struct Shared {
     left_trigger: Option<(f32, f32)>,
     menu: Option<f32>,
     right_trigger: Option<(f32, f32)>,
+    console: Option<(f32, String)>,
     /// Frames of the eye stream that arrived, for the pause test
     units_seen: AtomicU64,
     /// What the pause test measured: frames that arrived in the first 0.3 s of the pause, frames
@@ -337,6 +341,7 @@ pub fn run(o: Options) -> i32 {
         left_trigger: o.left_trigger,
         menu: o.menu,
         right_trigger: o.right_trigger,
+        console: o.console.clone(),
         units_seen: AtomicU64::new(0),
         pause_result: Mutex::new(None),
     });
@@ -743,8 +748,13 @@ fn tracking_loop(shared: &Shared, period_ns: u64, vsync_origin: u64) {
     // The pause test: the counts of arrived frames at the points of the script
     let (mut paused, mut counts): (bool, Vec<(f32, u64)>) = (false, Vec::new());
     let mut before = (0.0f32, 0u64);
+    let mut console = shared.console.clone();
     while !shared.stop.load(Ordering::Relaxed) {
         let t = origin.elapsed().as_secs_f32();
+        if let Some((_, request)) = console.take_if(|(at, _)| t >= *at) {
+            println!("probe: {t:.2} s: the console asks the host: {request}");
+            shared.link.duplex.send_control(&ClientMsg::Console(request)).ok();
+        }
         if let Some((at, length)) = shared.pause {
             let seen = shared.units_seen.load(Ordering::Relaxed);
             let now_paused = t >= at && t < at + length;

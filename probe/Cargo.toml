@@ -10,3 +10,4 @@ cranvr-common.workspace = true
 cranvr-vt.workspace = true
 cranvr-proto.workspace = true
 glam.workspace = true
+serde_json.workspace = true

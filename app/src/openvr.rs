@@ -84,6 +84,12 @@ pub fn path_file(prefix: &Path) -> Option<PathBuf> {
     Some(user_folder(prefix)?.join("AppData/Local/openvr/openvrpaths.vrpath"))
 }
 
+/// OpenComposite's log in the prefix. Each process that loads OpenComposite starts it anew, and its lines name
+/// the program's folder (OpenComposite looks there for its settings file).
+pub fn opencomposite_log(prefix: &Path) -> Option<PathBuf> {
+    Some(user_folder(prefix)?.join("AppData/Local/OpenComposite/logs/opencomposite.log"))
+}
+
 /// Whether a path file names OpenComposite as the runtime. Steam rewrites the file in its own layout, so the
 /// test looks for the folder, not for cranvr's text.
 fn names_opencomposite(text: &str) -> bool {

@@ -195,24 +195,27 @@ put_vrpath() {
     fi
 }
 names_opencomposite() { [[ -f ${vrpath} ]] && grep -qF 'C:\\opencomposite' "${vrpath}" }
+# What goes back at the end, byte for byte: a copy of the file from before, or the file for the time without a game
+# in place of OpenComposite that a run left over. No copy: no file.
 saved_vrpath=""
-had_vrpath=false
 if [[ -n ${user_dir} ]]; then
     vrpath=${user_dir}/AppData/Local/openvr/openvrpaths.vrpath
-    # What goes back at the end: the file from before, or the file for the time without a game in place of
-    # OpenComposite that a run left over
     if names_opencomposite; then
-        saved_vrpath=$(steamvr_text)
-        [[ -n ${saved_vrpath} ]] && had_vrpath=true
+        idle=$(steamvr_text)
+        if [[ -n ${idle} ]]; then
+            saved_vrpath=$(mktemp)
+            print -r -- "${idle}" > "${saved_vrpath}"
+        fi
     elif [[ -f ${vrpath} ]]; then
-        saved_vrpath=$(<"${vrpath}")
-        had_vrpath=true
+        saved_vrpath=$(mktemp)
+        cp -p "${vrpath}" "${saved_vrpath}"
     fi
     if ${steam}; then
         if names_opencomposite; then
-            put_vrpath "${saved_vrpath}"
+            if [[ -n ${saved_vrpath} ]]; then cp "${saved_vrpath}" "${vrpath}"; else rm -f "${vrpath}"; fi
             print "OpenVR: Steam gets ${${saved_vrpath:+SteamVR}:-no runtime} in place of OpenComposite (${vrpath})"
         fi
+        [[ -n ${saved_vrpath} ]] && rm -f "${saved_vrpath}"
     else
         case ${openvr} in
             opencomposite)
@@ -261,7 +264,13 @@ if ${steam} || [[ -z ${user_dir} ]]; then
 fi
 # A game's end puts the file from before its start back
 restore_vrpath() {
-    if ${had_vrpath}; then put_vrpath "${saved_vrpath}"; else put_vrpath ""; fi
+    if [[ -n ${saved_vrpath} ]]; then
+        mkdir -p "${vrpath:h}"
+        cp "${saved_vrpath}" "${vrpath}"
+        rm -f "${saved_vrpath}"
+    else
+        put_vrpath ""
+    fi
 }
 "${wine_root}/bin/wine" "${program}" "$@" &
 child=$!

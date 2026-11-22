@@ -294,9 +294,9 @@ pub enum HostMsg {
     /// The host changed the stream, for example the foveation or the eye size
     StreamUpdate(StreamParams),
     Bye,
-    /// The console's menu as a JSON object: the games and the settings that the cranvr app
-    /// offers (its `vr-menu.json`) and the stream's state as `status`. The host sends it when the
-    /// client connects and again when it changes, at most once a second.
+    /// The console's menu as a JSON object: the games, each with its VR system (`vr`), and the settings
+    /// that the cranvr app offers (its `vr-menu.json`) and the stream's state as `status`. The host sends it
+    /// when the client connects and again when it changes, at most once a second.
     Menu(String),
     /// The host does not know this client. It holds the connection until its user allows or denies
     /// the client. `commit` is the hash of a random number that the host keeps secret until the

@@ -57,11 +57,57 @@ pub struct Status {
     pub game: Option<String>,
 }
 
-/// An installed game: its name and its program's file name.
+/// The VR system of a game on the Mac: the runtime that its OpenVR calls reach. The cranvr app keeps it in the
+/// game's launch options and sends it with the menu. An OpenXR game ignores it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VrSystem {
+    /// OpenComposite turns the game's OpenVR calls into OpenXR calls to cranvr's runtime
+    #[default]
+    OpenComposite,
+    /// The game runs in SteamVR on the Mac, with cranvr's driver
+    SteamVr,
+    /// No OpenVR runtime: a game with an OpenXR mode takes that
+    Off,
+}
+
+impl VrSystem {
+    pub const ALL: [VrSystem; 3] = [VrSystem::OpenComposite, VrSystem::SteamVr, VrSystem::Off];
+
+    /// The word of the menu and of the request, as the app's app.json has it
+    pub fn key(self) -> &'static str {
+        match self {
+            VrSystem::OpenComposite => "opencomposite",
+            VrSystem::SteamVr => "steamvr",
+            VrSystem::Off => "off",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|system| system.key() == key)
+    }
+
+    /// The button's text
+    pub fn label(self) -> &'static str {
+        match self {
+            VrSystem::OpenComposite => "OpenComposite",
+            VrSystem::SteamVr => "SteamVR",
+            VrSystem::Off => "No OpenVR",
+        }
+    }
+
+    /// The choice after this one, for a press on the button
+    pub fn next(self) -> Self {
+        let at = Self::ALL.iter().position(|system| *system == self).unwrap_or(0);
+        Self::ALL[(at + 1) % Self::ALL.len()]
+    }
+}
+
+/// An installed game: its name, its program's file name and its VR system.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Game {
     pub name: String,
     pub program: String,
+    pub vr: VrSystem,
 }
 
 /// What the console shows: the app's games and settings and the host's state.
@@ -81,8 +127,9 @@ pub struct Menu {
 }
 
 impl Menu {
-    /// The menu from the host's text. `None` for a text that is no menu: it lacks the games, a
-    /// setting or the controls. The status is the host's own and is missing while no headset streams.
+    /// The menu from the host's text. `None` for a text that is no menu: it lacks the games, a game's
+    /// name or VR system, a setting or the controls. The status is the host's own and is missing while no
+    /// headset streams.
     pub fn parse(text: &str) -> Option<Self> {
         let v: Value = serde_json::from_str(text).ok()?;
         let s = &v["status"];
@@ -91,8 +138,14 @@ impl Menu {
             games: v["games"]
                 .as_array()?
                 .iter()
-                .filter_map(|g| Some(Game { name: g["name"].as_str()?.to_string(), program: g["program"].as_str().unwrap_or_default().to_string() }))
-                .collect(),
+                .map(|g| {
+                    Some(Game {
+                        name: g["name"].as_str()?.to_string(),
+                        program: g["program"].as_str().unwrap_or_default().to_string(),
+                        vr: VrSystem::from_key(g["vr"].as_str()?)?,
+                    })
+                })
+                .collect::<Option<Vec<Game>>>()?,
             fps: v["fps"].as_u64()? as u32,
             game_scale: number(&v["game_scale"])?,
             msaa: v["msaa"].as_u64()? as u32,
@@ -127,6 +180,8 @@ pub enum Action {
     Fps(u32),
     Scale(f32),
     Msaa(u32),
+    /// A game's VR system, by the game's name
+    VrSystem(String, VrSystem),
 }
 
 impl Action {
@@ -138,6 +193,7 @@ impl Action {
             Action::Fps(fps) => json!({"action": "set", "fps": fps}),
             Action::Scale(scale) => json!({"action": "set", "game_scale": scale}),
             Action::Msaa(samples) => json!({"action": "set", "msaa": samples}),
+            Action::VrSystem(game, system) => json!({"action": "set", "game": game, "openvr": system.key()}),
         }
         .to_string()
     }

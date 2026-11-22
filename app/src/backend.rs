@@ -451,6 +451,8 @@ pub struct Model {
     pub running: bool,
     pub headset: Option<Headset>,
     pub game: Option<String>,
+    /// The program of the game that is connected, as the runtime or cranvr's SteamVR driver names it
+    pub game_program: Option<String>,
     pub desktop: Option<(bool, String)>,
     /// Whether the host captures this Mac's sound for the headset, and why not
     pub audio: Option<(bool, String)>,
@@ -543,7 +545,9 @@ impl Model {
                 }
             }
             Some("game") => {
-                self.game = v["connected"].as_bool().unwrap_or(false).then(|| v["name"].as_str().unwrap_or("game").to_string());
+                let connected = v["connected"].as_bool().unwrap_or(false);
+                self.game = connected.then(|| v["name"].as_str().unwrap_or("game").to_string());
+                self.game_program = v["program"].as_str().filter(|_| connected).map(str::to_string);
             }
             Some("desktop") => {
                 self.desktop = Some((v["ok"].as_bool().unwrap_or(false), v["message"].as_str().unwrap_or("").to_string()));
@@ -794,13 +798,15 @@ pub fn write_vr_menu(settings: &Settings, games: &[crate::steam::Game], notice: 
     }
 }
 
-/// The text of vr-menu.json.
+/// The text of vr-menu.json. Each game carries its VR system: the runtime that its OpenVR calls reach.
 fn vr_menu(settings: &Settings, games: &[crate::steam::Game], notice: Option<&str>) -> String {
     let games: Vec<Value> = games
         .iter()
         .filter_map(|g| {
             let program = g.exe.as_ref()?.file_name()?.to_string_lossy().to_string();
-            Some(serde_json::json!({"name": g.name, "program": program}))
+            let options = crate::steam::program(g).and_then(|key| settings.launch.get(&key).cloned()).unwrap_or_default();
+            let vr = crate::launch::openvr(&settings.wine, &options).key();
+            Some(serde_json::json!({"name": g.name, "program": program, "vr": vr}))
         })
         .collect();
     let mut menu = serde_json::json!({
@@ -816,9 +822,47 @@ fn vr_menu(settings: &Settings, games: &[crate::steam::Game], notice: Option<&st
     menu.to_string()
 }
 
+/// What a request of the console in VR asks the app for.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConsoleRequest {
+    /// Start this game, as its Play button does
+    Play(crate::steam::Game),
+    /// End every game and Steam
+    Stop,
+    /// Save these settings
+    Set(Box<Settings>),
+    /// A request for a game that is not installed, or one that the app does not know
+    Refused(String),
+}
+
+/// Reads a request of the console in VR (`vr_request` of the host). The window runs it, and so does a test.
+pub fn console_request(settings: &Settings, games: &[crate::steam::Game], request: &Value) -> ConsoleRequest {
+    match request["action"].as_str() {
+        Some("play") => {
+            let name = request["game"].as_str().unwrap_or_default();
+            match games.iter().find(|g| g.name == name) {
+                Some(game) => ConsoleRequest::Play(game.clone()),
+                None => ConsoleRequest::Refused(format!("The console asked for {name}, which is not installed")),
+            }
+        }
+        Some("stop") => ConsoleRequest::Stop,
+        Some("set") => ConsoleRequest::Set(Box::new(apply_set_request(settings.clone(), request, games))),
+        other => ConsoleRequest::Refused(format!("The console asked for {other:?}, which this app does not know")),
+    }
+}
+
 /// The settings after a request of the console in VR with the action "set". A field that the
-/// request lacks keeps its value. A `controls` value that is no mapping changes nothing.
-pub fn apply_set_request(mut settings: Settings, request: &Value) -> Settings {
+/// request lacks keeps its value. A `controls` value that is no mapping changes nothing. A `game` with an
+/// `openvr` sets that game's VR system, as its row in the Play tab does: the choice is the user's, so cranvr's
+/// reason goes.
+pub fn apply_set_request(mut settings: Settings, request: &Value, games: &[crate::steam::Game]) -> Settings {
+    let game = request["game"].as_str().and_then(|name| games.iter().find(|g| g.name == name));
+    let choice = request["openvr"].as_str().and_then(crate::launch::OpenVr::from_key);
+    if let (Some(program), Some(choice)) = (game.and_then(crate::steam::program), choice) {
+        let options = settings.launch.entry(program.clone()).or_default();
+        options.openvr = Some(choice);
+        options.openvr_reason.clear();
+    }
     if let Some(fps) = request["fps"].as_u64() {
         settings.fps = fps as u32;
     }
@@ -859,11 +903,16 @@ pub fn pump(model: &mut Model) {
     let receiver = channel().1.lock().unwrap();
     for line in receiver.try_iter() {
         match line {
-            HostLine::Status(v) => model.apply_status(&v),
+            HostLine::Status(v) => {
+                // The game's run watches the game's sessions and frames (game_run.rs)
+                crate::game_run::note_status(&v);
+                model.apply_status(&v);
+            }
             HostLine::Log(l) => model.log(l),
             HostLine::Exited => {
                 model.headset = None;
                 model.game = None;
+                model.game_program = None;
                 model.stats = None;
                 // The line of an old host can arrive after the first line of its successor
                 if !host_running() {
@@ -1177,20 +1226,20 @@ mod tests {
         let mut changed = settings.controls;
         assert!(changed.set(Hand::Left, Control::Grip, Action::Recenter));
         let request = serde_json::json!({"action": "set", "controls": changed});
-        let after = apply_set_request(settings.clone(), &request);
+        let after = apply_set_request(settings.clone(), &request, &[]);
         assert_eq!(after.controls.left.grip, Action::Recenter);
         assert_eq!(after.controls.right.secondary, Action::Keyboard);
         assert_eq!((after.fps, after.game_scale), (settings.fps, settings.game_scale));
         // A value that is no mapping, and a request without one, change nothing
-        assert_eq!(apply_set_request(settings.clone(), &serde_json::json!({"controls": 5})), settings);
-        assert_eq!(apply_set_request(settings.clone(), &serde_json::json!({"action": "set"})), settings);
+        assert_eq!(apply_set_request(settings.clone(), &serde_json::json!({"controls": 5}), &[]), settings);
+        assert_eq!(apply_set_request(settings.clone(), &serde_json::json!({"action": "set"}), &[]), settings);
         // The other settings travel in the same request
-        let both = apply_set_request(settings.clone(), &serde_json::json!({"fps": 72, "controls": changed}));
+        let both = apply_set_request(settings.clone(), &serde_json::json!({"fps": 72, "controls": changed}), &[]);
         assert_eq!((both.fps, both.controls), (72, changed));
         // The choice of the controller models in a game travels with the mapping both ways
         assert_eq!(menu["controls"]["models_in_game"], "while_pointing");
         let never = Controls { models_in_game: cranvr_common::controls::ModelsInGame::Never, ..changed };
-        let after = apply_set_request(settings.clone(), &serde_json::json!({"action": "set", "controls": never}));
+        let after = apply_set_request(settings.clone(), &serde_json::json!({"action": "set", "controls": never}), &[]);
         assert_eq!(after.controls, never);
         let menu: Value = serde_json::from_str(&vr_menu(&after, &[], None)).unwrap();
         assert_eq!(menu["controls"]["models_in_game"], "never");
@@ -1243,6 +1292,32 @@ mod tests {
         assert!(read(None).get("notice").is_none());
         assert_eq!(read(Some("The right eye stayed black. The game restarts."))["notice"], "The right eye stayed black. The game restarts.");
         assert_eq!(read(None)["fps"], Settings::default().fps);
+    }
+
+    #[test]
+    fn the_console_shows_and_sets_each_game_s_vr_system_and_starts_a_game_by_name() {
+        use crate::{launch::OpenVr, steam::Game};
+        let lab = Game { app_id: "450390".into(), name: "The Lab".into(), exe: Some(PathBuf::from("/Users/x/The Lab/TheLab.exe")), ..Default::default() };
+        let plain = Game { name: "Plain".into(), exe: Some(PathBuf::from("/Users/x/Plain/plain.exe")), ..Default::default() };
+        let games = [lab.clone(), plain];
+        let mut settings = Settings::default();
+        let program = crate::steam::program(&lab).unwrap();
+        settings.launch.insert(program.clone(), crate::launch::GameOptions { openvr: Some(OpenVr::SteamVr), openvr_reason: "why".into(), ..Default::default() });
+        let menu: Value = serde_json::from_str(&vr_menu(&settings, &games, None)).unwrap();
+        assert_eq!(menu["games"][0]["vr"], "steamvr");
+        assert_eq!(menu["games"][1]["vr"], "opencomposite", "a game without its own choice follows the setting");
+        // The console sets The Lab back to OpenComposite: the choice is the user's now
+        let request = serde_json::json!({"action": "set", "game": "The Lab", "openvr": "opencomposite"});
+        let ConsoleRequest::Set(after) = console_request(&settings, &games, &request) else { panic!("a set request") };
+        assert_eq!(after.launch[&program].openvr, Some(OpenVr::OpenComposite));
+        assert!(after.launch[&program].openvr_reason.is_empty());
+        // A word that is no VR system, or a game that is not installed, changes nothing
+        for request in [serde_json::json!({"action": "set", "game": "The Lab", "openvr": "oculus"}), serde_json::json!({"action": "set", "game": "Gone", "openvr": "off"})] {
+            assert_eq!(console_request(&settings, &games, &request), ConsoleRequest::Set(Box::new(settings.clone())));
+        }
+        assert_eq!(console_request(&settings, &games, &serde_json::json!({"action": "play", "game": "The Lab"})), ConsoleRequest::Play(lab));
+        assert!(matches!(console_request(&settings, &games, &serde_json::json!({"action": "play", "game": "Gone"})), ConsoleRequest::Refused(_)));
+        assert_eq!(console_request(&settings, &games, &serde_json::json!({"action": "stop"})), ConsoleRequest::Stop);
     }
 
     // The host's latency report has the `total_ms` field that the window reads.

@@ -168,6 +168,7 @@ fn refresh(settings: MutableState<Settings>, model: MutableState<Model>, slow: b
     vr_requests(settings, &mut next, requests);
     let reports = std::mem::take(&mut next.black_eyes);
     black_eye_reports(settings, &mut next, reports);
+    vr_system_verdicts(settings, &mut next, crate::game_run::take_verdicts());
     for chosen in backend::take_chosen() {
         chosen_program(settings, &mut next, chosen);
     }
@@ -238,6 +239,32 @@ fn black_eye_reports(settings: MutableState<Settings>, next: &mut Model, reports
     }
 }
 
+/// Answers the verdicts of game runs that drew nothing through OpenComposite (see vr_system.rs): a game that
+/// follows the setting gets SteamVR and starts again with it.
+fn vr_system_verdicts(settings: MutableState<Settings>, next: &mut Model, verdicts: Vec<crate::game_run::Verdict>) {
+    if verdicts.is_empty() {
+        return;
+    }
+    let steamvr = steam::steamvr().is_some();
+    for verdict in verdicts {
+        let games = if next.games.is_empty() { steam::games() } else { next.games.clone() };
+        let mut response = None;
+        settings.update(|s| response = Some(crate::vr_system::respond(&mut s.launch, &games, &verdict.program, verdict.why, steamvr)));
+        let Some(crate::vr_system::Response { notice, restart }) = response else { continue };
+        next.log(notice.window.clone());
+        next.notice = Some((notice, Instant::now() + black_eye::NOTICE_TIME));
+        if let Some(program) = restart {
+            // The new start reads the saved options
+            settings.with(Settings::save);
+            thread::spawn(move || {
+                if let Err(e) = steam::restart(&program) {
+                    backend::notify(e);
+                }
+            });
+        }
+    }
+}
+
 /// Opens the file chooser for a program on a thread of its own. A chooser that runs inside the
 /// window's event handler makes winit panic ("tried to handle event while another event is currently
 /// being handled") and the app ends. The window takes the choice on its next refresh (`chosen_program`).
@@ -284,28 +311,23 @@ fn chosen_program(settings: MutableState<Settings>, next: &mut Model, chosen: ba
 /// Runs the requests of the console in VR, as the window's own buttons would.
 fn vr_requests(settings: MutableState<Settings>, next: &mut Model, requests: Vec<serde_json::Value>) {
     for request in requests {
-        match request["action"].as_str() {
-            Some("play") => {
-                let name = request["game"].as_str().unwrap_or_default().to_string();
-                let games = if next.games.is_empty() { steam::games() } else { next.games.clone() };
-                match games.into_iter().find(|g| g.name == name) {
-                    // Steam may need seconds to start: keep the window responsive
-                    Some(game) => {
-                        thread::spawn(move || {
-                            if let Err(e) = steam::play(&game) {
-                                backend::notify(e);
-                            }
-                        });
+        let games = if next.games.is_empty() { steam::games() } else { next.games.clone() };
+        let before = settings.with(Clone::clone);
+        match backend::console_request(&before, &games, &request) {
+            backend::ConsoleRequest::Play(game) => {
+                // Steam may need seconds to start: keep the window responsive
+                thread::spawn(move || {
+                    if let Err(e) = steam::play(&game) {
+                        backend::notify(e);
                     }
-                    None => next.message = Some(format!("The console asked for {name}, which is not installed")),
-                }
+                });
             }
-            Some("stop") => {
+            backend::ConsoleRequest::Stop => {
                 thread::spawn(steam::stop_all);
             }
-            Some("set") => {
-                let before = settings.with(Clone::clone);
-                let after = backend::apply_set_request(before.clone(), &request);
+            backend::ConsoleRequest::Refused(why) => next.message = Some(why),
+            backend::ConsoleRequest::Set(after) => {
+                let after = *after;
                 if after == before {
                     continue;
                 }
@@ -319,7 +341,6 @@ fn vr_requests(settings: MutableState<Settings>, next: &mut Model, requests: Vec
                     }
                 }
             }
-            _ => {}
         }
     }
 }
@@ -871,9 +892,17 @@ fn LaunchOptions(settings: MutableState<Settings>, program: String) {
                     (OpenVr::Off.label().to_owned(), Some(OpenVr::Off)),
                 ] {
                     let key = key.clone();
-                    Choice(label, own == choice, move || edit_launch(settings, &key, |o| o.openvr = choice));
+                    Choice(label, own == choice, move || {
+                        edit_launch(settings, &key, |o| {
+                            o.openvr = choice;
+                            o.openvr_reason.clear();
+                        })
+                    });
                 }
             });
+            if options.openvr.is_some() && !options.openvr_reason.is_empty() {
+                Hint(options.openvr_reason.clone());
+            }
             Hint(OPENVR_HINT.into());
             if shown {
                 OptionField("Wine DLL overrides", dll);
