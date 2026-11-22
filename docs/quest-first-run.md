@@ -4,7 +4,7 @@ This list covers a first run with cranvr's Cranpose client on a Quest.
 
 ## On the Quest
 
-1. Turn on developer mode for the Quest in the Meta Horizon app on your phone. Connect the Quest to the Mac by USB. Allow USB debugging in the headset. The cable is optional for the stream: see "The USB cable" below.
+1. Turn on developer mode for the Quest in the Meta Horizon app on your phone. The install of a test build needs it. Connect the Quest to the Mac by USB. Allow USB debugging in the headset. The cable is optional for the stream, and the stream over the cable needs no developer mode: see "The USB cable" below.
 2. In the cranvr folder, run `scripts/build-client.sh --install`. Add the Quest's serial from `adb devices` when another device is attached.
 3. Connect the Quest to the same Wi-Fi as the Mac, on 5 GHz or 6 GHz.
 
@@ -67,7 +67,7 @@ The headset shows the Mac's main display in a panel as a second video stream at 
 
 ## When something goes wrong
 
-- The headset does not list "This Mac by USB cable": the Mac window must say "The headset is on the USB cable." (Headset card, no headset connected). It does not when the Connection choice in the Settings tab is Wi-Fi, when the headset has no developer mode, when the cranvr app is not installed on the headset, when this Mac has no adb tool (press "Add USB support") or when the headset waits for you to allow USB debugging. The Log tab lines that start with "USB:" show what the Mac did. A cable that the headset cannot reach shows no line at all, because the headset asks the Mac itself and a closed link gives no answer.
+- The headset does not list "This Mac by USB cable": the headset's USB network needs the cranvr app in front in the headset and the Allow of macOS's question "Allow accessory to connect?". The headset's log says "the USB network is up on usb0" when the network works. Without it the cable line comes from `adb reverse`: the Mac window must say "The headset is on the USB cable." (Headset card, no headset connected). It does not when the Connection choice in the Settings tab is Wi-Fi, when the headset has no developer mode, when the cranvr app is not installed on the headset, when this Mac has no adb tool (press "Add USB support") or when the headset waits for you to allow USB debugging. The Log tab lines that start with "USB:" show what the Mac did. A cable that the headset cannot reach shows no line at all, because the headset asks the Mac itself and a closed link gives no answer.
 
 - The panel in the headset shows a code and "Allow it on the Mac": look at the cranvr window on the Mac and press Allow. The headset says "Nobody answered on the Mac" after three minutes. Press the Mac again to ask once more. It says "The Mac denied this headset" after a Deny.
 - The list in the headset stays empty: check that the Mac and the headset use the same Wi-Fi. A router with client isolation blocks the search. Check that cranvr may use the local network in System Settings, under Privacy & Security. Check that the host runs: the cranvr window says "Host running". Use "Enter an address" as the way around.
