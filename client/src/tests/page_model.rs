@@ -7,7 +7,7 @@ use cranvr_common::{
 use std::time::Duration;
 
 fn local() -> Local {
-    Local { link: true }
+    Local { link: true, interface: Interface::Flat }
 }
 
 fn stream() -> Page {
@@ -54,13 +54,13 @@ fn menu() -> Menu {
 
 #[test]
 fn a_short_choice_takes_one_row_and_a_long_one_puts_its_options_in_rows_of_their_own() {
-    let rows = page_rows(&stream(), None);
+    let rows = page_rows(&stream(), None, Interface::ThreeD);
     let lines: Vec<&Line> = rows.iter().map(|row| &row.line).collect();
     assert!(matches!(lines[0], Line::Heading(_)));
-    assert!(matches!(lines[1], Line::Keys { name: Name::Setting(label), keys } if label == "Refresh rate" && keys.len() == 3));
+    assert!(matches!(lines[1], Line::Keys { name: Name::Setting(label), keys, form: Form::Steps } if label == "Refresh rate" && keys.len() == 3));
     // The long first option does not fit beside the name: the name has a line, the options their rows
     assert!(matches!(lines[2], Line::Text { text, .. } if text == "OpenVR"));
-    let Line::Keys { name: Name::None, keys } = lines[3] else { panic!("{:?}", lines[3]) };
+    let Line::Keys { name: Name::None, keys, .. } = lines[3] else { panic!("{:?}", lines[3]) };
     assert_eq!(keys[0].label, "As in Settings (OpenComposite)");
     let packed: usize = rows[3..].iter().take_while(|row| matches!(row.line, Line::Keys { name: Name::None, .. })).map(|row| match &row.line {
         Line::Keys { keys, .. } => keys.len(),
@@ -69,15 +69,22 @@ fn a_short_choice_takes_one_row_and_a_long_one_puts_its_options_in_rows_of_their
     assert_eq!(packed, 4, "every option has a key");
     // A toggle has its name and the keys On and Off, the current one selected
     let toggle = rows.iter().find(|row| matches!(&row.line, Line::Keys { name: Name::Title { title, .. }, .. } if title == "Game sound in the headset")).unwrap();
-    let Line::Keys { keys, .. } = &toggle.line else { panic!() };
+    let Line::Keys { keys, form, .. } = &toggle.line else { panic!() };
     assert_eq!((keys[0].label.as_str(), keys[0].look, keys[1].look), ("On", Look::Selected, Look::Normal));
+    // The 3D form draws the toggle as a switch and the rate as a slider, which needs a line of values
+    assert_eq!(*form, Form::Switch);
+    assert_eq!(rows[1].height, size::BUTTON + crate::spatial_ui::STEP_LABELS);
+    // The flat form keeps the rate's keys in a row of a key's height
+    let flat = page_rows(&stream(), None, Interface::Flat);
+    assert!(matches!(&flat[1].line, Line::Keys { form: Form::Keys, .. }));
+    assert_eq!(flat[1].height, size::BUTTON);
     // A long line takes two lines of text
     assert_eq!(rows.last().unwrap().height, 2.0 * size::TEXT);
 }
 
 #[test]
 fn the_selected_option_is_the_value_and_a_press_sends_its_value() {
-    let rows = page_rows(&stream(), None);
+    let rows = page_rows(&stream(), None, Interface::Flat);
     let Line::Keys { keys, .. } = &rows[1].line else { panic!() };
     assert_eq!(keys.iter().map(|key| key.look).collect::<Vec<_>>(), [Look::Normal, Look::Normal, Look::Selected]);
     assert_eq!(keys[1].press, Press::Host(Request::set("fps", "90")));
@@ -88,16 +95,16 @@ fn a_pressed_option_says_changing_and_a_pressed_action_says_its_running_words() 
     let now = Instant::now();
     let menu = menu();
     let change = Pending::new(Request::set("fps", "90"), None, now);
-    let rows = page_rows(&stream(), Some((&change, change.progress(&menu, now))));
+    let rows = page_rows(&stream(), Some((&change, change.progress(&menu, now))), Interface::Flat);
     let Line::Keys { keys, .. } = &rows[1].line else { panic!() };
     assert_eq!(keys[1].label, "Changing...");
     let start = Pending::new(Request::run("game.play").of("C:\\bs.exe"), None, now);
-    let rows = page_rows(&play(), Some((&start, start.progress(&menu, now))));
+    let rows = page_rows(&play(), Some((&start, start.progress(&menu, now))), Interface::Flat);
     let Line::Keys { keys, .. } = &rows[0].line else { panic!() };
     assert_eq!(keys[0].label, "Starting...");
     // No answer for a long time: the key says so
     let late = now + crate::console::ANSWER_TIME + Duration::from_secs(1);
-    let rows = page_rows(&stream(), Some((&change, change.progress(&menu, late))));
+    let rows = page_rows(&stream(), Some((&change, change.progress(&menu, late))), Interface::Flat);
     let Line::Keys { keys, .. } = &rows[1].line else { panic!() };
     assert_eq!(keys[1].label, "90 Hz: no answer");
 }
@@ -113,7 +120,7 @@ fn the_main_page_has_the_games_the_links_to_the_pages_the_clients_settings_and_t
     assert!(matches!(&rows[row - 1].line, Line::Heading(text) if text == "Settings"));
     assert!(find_key(&rows, &Press::Disconnect).is_some());
     // Without a link the bottom has no Disconnect
-    let rows = console_rows(Some(&menu), &Shown::Main, Local { link: false }, "", None, Instant::now());
+    let rows = console_rows(Some(&menu), &Shown::Main, Local { link: false, interface: Interface::Flat }, "", None, Instant::now());
     assert!(find_key(&rows, &Press::Disconnect).is_none());
 }
 
@@ -155,7 +162,7 @@ fn the_height_and_the_place_of_each_key_follow_from_the_rows() {
 
 #[test]
 fn the_console_without_a_menu_says_why_and_keeps_its_buttons() {
-    let rows = console_rows(None, &Shown::Main, Local { link: false }, "Not connected to a host.", None, Instant::now());
+    let rows = console_rows(None, &Shown::Main, Local { link: false, interface: Interface::Flat }, "Not connected to a host.", None, Instant::now());
     assert!(matches!(&rows[1].line, Line::Text { text, .. } if text == "Not connected to a host."));
     assert!(find_key(&rows, &Press::Exit).is_some());
     assert!(find_key(&rows, &Press::Disconnect).is_none());

@@ -13,7 +13,8 @@
 //!
 //! The headset shows no hints: they are the Mac window's long words.
 
-use crate::console::{size, Menu, Pending, Press, Progress, Shown};
+use crate::console::{size, Interface, Menu, Pending, Press, Progress, Shown};
+use crate::spatial_ui::STEP_LABELS;
 use cranvr_common::menu::{Buttons, Choice, Item, Page, Press as Link, Request, Style, Toggle, Tone, OFF, ON};
 use std::time::Instant;
 
@@ -66,6 +67,18 @@ pub enum Name {
     Title { title: String, detail: String, width: f32 },
 }
 
+/// What form a row of keys takes in 3D (`spatial_ui.rs`). The flat form draws keys for all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Form {
+    /// Keys side by side
+    Keys,
+    /// A toggle's On and Off: one switch over both keys
+    Switch,
+    /// A choice of numbers in one row: a slider over the keys with a stop for each value, and the
+    /// values' words under it
+    Steps,
+}
+
 /// What a row draws.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Line {
@@ -73,7 +86,7 @@ pub enum Line {
     Title { text: String, status: String },
     Heading(String),
     Text { text: String, tone: Tone },
-    Keys { name: Name, keys: Vec<Key> },
+    Keys { name: Name, keys: Vec<Key>, form: Form },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -89,6 +102,7 @@ impl Row {
             Line::Heading(_) => size::HEADING,
             Line::Text { text, .. } => size::TEXT * lines_of(text) as f32,
             Line::Keys { name: Name::Title { detail, .. }, .. } if !detail.is_empty() => size::BUTTON + DETAIL_EXTRA,
+            Line::Keys { form: Form::Steps, .. } => size::BUTTON + STEP_LABELS,
             Line::Keys { .. } => size::BUTTON,
         };
         Self { line, height }
@@ -97,7 +111,7 @@ impl Row {
     /// The middle of each key across the row, in dp from the row's left edge.
     #[cfg_attr(not(any(test, all(feature = "scripted-hand", target_os = "android"))), allow(dead_code))]
     pub fn key_centers(&self) -> Vec<f32> {
-        let Line::Keys { name, keys } = &self.line else { return Vec::new() };
+        let Line::Keys { name, keys, .. } = &self.line else { return Vec::new() };
         let n = keys.len() as f32;
         let gap = size::GAP;
         match name {
@@ -153,17 +167,17 @@ fn label_of(request: &Request, own: &str, running: &str, busy: bool, pending: Op
 }
 
 /// The rows of one item of a host's page.
-fn item_rows(item: &Item, pending: Option<(&Pending, Progress)>, rows: &mut Vec<Row>) {
+fn item_rows(item: &Item, pending: Option<(&Pending, Progress)>, interface: Interface, rows: &mut Vec<Row>) {
     match item {
         Item::Heading { text } => rows.push(Row::new(Line::Heading(text.clone()))),
         Item::Text { text, tone } => rows.push(Row::new(Line::Text { text: text.clone(), tone: *tone })),
-        Item::Choice(choice) => choice_rows(choice, pending, rows),
+        Item::Choice(choice) => choice_rows(choice, pending, interface, rows),
         Item::Toggle(toggle) => rows.push(toggle_row(toggle, pending)),
         Item::Buttons(row) => buttons_rows(row, pending, rows),
     }
 }
 
-fn choice_rows(choice: &Choice, pending: Option<(&Pending, Progress)>, rows: &mut Vec<Row>) {
+fn choice_rows(choice: &Choice, pending: Option<(&Pending, Progress)>, interface: Interface, rows: &mut Vec<Row>) {
     let keys: Vec<Key> = choice
         .options
         .iter()
@@ -177,11 +191,18 @@ fn choice_rows(choice: &Choice, pending: Option<(&Pending, Progress)>, rows: &mu
     let n = keys.len().max(1) as f32;
     let share = (INNER - LABEL - n * size::GAP) / n;
     if keys.len() <= ROW_KEYS && choice.options.iter().all(|option| key_width(&option.label) <= share) {
-        rows.push(Row::new(Line::Keys { name: Name::Setting(choice.label.clone()), keys }));
+        let form = if interface.is_3d() && steps(choice) { Form::Steps } else { Form::Keys };
+        rows.push(Row::new(Line::Keys { name: Name::Setting(choice.label.clone()), keys, form }));
         return;
     }
     rows.push(Row::new(Line::Text { text: choice.label.clone(), tone: Tone::Normal }));
     pack(keys, rows);
+}
+
+/// Whether a choice reads as values in order: three or more options whose words start with a
+/// number, such as rates and percents. The 3D form draws them as a slider.
+fn steps(choice: &Choice) -> bool {
+    choice.options.len() >= 3 && choice.options.iter().all(|option| option.label.trim_start().starts_with(|c: char| c.is_ascii_digit()))
 }
 
 /// Puts keys into rows of their own, as many side by side as their words fit.
@@ -195,12 +216,12 @@ fn pack(keys: Vec<Key>, rows: &mut Vec<Row>) {
         if fits || row.is_empty() {
             row = next;
         } else {
-            rows.push(Row::new(Line::Keys { name: Name::None, keys: std::mem::take(&mut row) }));
+            rows.push(Row::new(Line::Keys { name: Name::None, keys: std::mem::take(&mut row), form: Form::Keys }));
             row.push(key);
         }
     }
     if !row.is_empty() {
-        rows.push(Row::new(Line::Keys { name: Name::None, keys: row }));
+        rows.push(Row::new(Line::Keys { name: Name::None, keys: row, form: Form::Keys }));
     }
 }
 
@@ -213,7 +234,7 @@ fn toggle_row(toggle: &Toggle, pending: Option<(&Pending, Progress)>) -> Row {
             Key { label, press: Press::Host(request), look: if toggle.on == on { Look::Selected } else { Look::Normal } }
         })
         .collect();
-    Row::new(Line::Keys { name: Name::Title { title: toggle.label.clone(), detail: String::new(), width: SWITCH }, keys })
+    Row::new(Line::Keys { name: Name::Title { title: toggle.label.clone(), detail: String::new(), width: SWITCH }, keys, form: Form::Switch })
 }
 
 fn buttons_rows(row: &Buttons, pending: Option<(&Pending, Progress)>, rows: &mut Vec<Row>) {
@@ -241,24 +262,26 @@ fn buttons_rows(row: &Buttons, pending: Option<(&Pending, Progress)>, rows: &mut
     } else if keys.is_empty() {
         rows.push(Row::new(Line::Text { text: row.title.clone(), tone: Tone::Normal }));
     } else {
-        rows.push(Row::new(Line::Keys { name: Name::Title { title: row.title.clone(), detail: row.detail.clone(), width: KEY }, keys }));
+        rows.push(Row::new(Line::Keys { name: Name::Title { title: row.title.clone(), detail: row.detail.clone(), width: KEY }, keys, form: Form::Keys }));
     }
 }
 
-/// The rows of a host's page.
-pub fn page_rows(page: &Page, pending: Option<(&Pending, Progress)>) -> Vec<Row> {
+/// The rows of a host's page, in the form of `interface`.
+pub fn page_rows(page: &Page, pending: Option<(&Pending, Progress)>, interface: Interface) -> Vec<Row> {
     let mut rows = Vec::new();
     for item in &page.items {
-        item_rows(item, pending, &mut rows);
+        item_rows(item, pending, interface, &mut rows);
     }
     rows
 }
 
-/// What the console needs besides the menu: the link.
+/// What the console needs besides the menu: the link and how the menus draw.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Local {
     /// A link runs, so Disconnect has a meaning
     pub link: bool,
+    /// The 3D form draws a choice of numbers as a slider, with a line of values under it
+    pub interface: Interface,
 }
 
 fn key(label: &str, press: Press, look: Look) -> Key {
@@ -273,7 +296,7 @@ fn bottom(local: Local) -> Row {
         keys.push(key("Disconnect", Press::Disconnect, Look::Danger));
     }
     keys.push(key("Exit", Press::Exit, Look::Danger));
-    Row::new(Line::Keys { name: Name::None, keys })
+    Row::new(Line::Keys { name: Name::None, keys, form: Form::Keys })
 }
 
 /// The rows of the console on `shown` with this menu. `status` is the stream's state for the title.
@@ -293,8 +316,8 @@ pub fn console_rows(menu: Option<&Menu>, shown: &Shown, local: Local, no_menu: &
         if let Some(notice) = &menu.notice {
             rows.push(Row::new(Line::Text { text: notice.clone(), tone: Tone::Warn }));
         }
-        rows.extend(page_rows(page, pending));
-        rows.push(Row::new(Line::Keys { name: Name::None, keys: vec![key("Back", Press::Back, Look::Normal), key("Close", Press::Close, Look::Normal)] }));
+        rows.extend(page_rows(page, pending, local.interface));
+        rows.push(Row::new(Line::Keys { name: Name::None, keys: vec![key("Back", Press::Back, Look::Normal), key("Close", Press::Close, Look::Normal)], form: Form::Keys }));
         return rows;
     }
     let status = &menu.status;
@@ -314,13 +337,13 @@ pub fn console_rows(menu: Option<&Menu>, shown: &Shown, local: Local, no_menu: &
         rows.push(Row::new(Line::Text { text: notice.clone(), tone: Tone::Warn }));
     }
     if let Some(main) = menu.main() {
-        rows.extend(page_rows(main, pending));
+        rows.extend(page_rows(main, pending, local.interface));
     }
     let links: Vec<Key> = menu.listed().into_iter().map(|(id, short)| key(&short, Press::Open(id), Look::Normal)).collect();
     if !links.is_empty() {
         rows.push(Row::new(Line::Heading("Settings".into())));
         for chunk in links.chunks(LINKS) {
-            rows.push(Row::new(Line::Keys { name: Name::None, keys: chunk.to_vec() }));
+            rows.push(Row::new(Line::Keys { name: Name::None, keys: chunk.to_vec(), form: Form::Keys }));
         }
     }
     rows.push(bottom(local));

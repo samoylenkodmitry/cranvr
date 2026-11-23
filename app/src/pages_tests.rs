@@ -389,22 +389,26 @@ fn the_wine_page_has_the_options_of_every_program_and_the_mac_page_restarts_the_
 }
 
 #[test]
-fn the_headsets_room_and_volume_wait_for_the_headsets_own_choice_and_travel_with_the_menu() {
+fn the_headsets_room_volume_and_interface_wait_for_the_headsets_own_choice_and_travel_with_the_menu() {
     let mut settings = Settings::default();
     let model = Model::default();
     let read = |settings: &Settings| serde_json::from_str::<Value>(&vr_menu(settings, &Model::default())).unwrap();
     // A Mac that never heard the headset's choice has none: the menu says null, and the page selects nothing
-    assert_eq!(read(&settings)["headset"], serde_json::json!({"room": null, "volume": null}));
+    assert_eq!(read(&settings)["headset"], serde_json::json!({"room": null, "volume": null, "interface": null}));
     assert_eq!(page(&pages(&settings, &model), HEADSET).find("headset_room", None).and_then(Item::value), Some(""));
+    assert_eq!(page(&pages(&settings, &model), HEADSET).find("headset_interface", None).and_then(Item::value), Some(""));
     // The headset tells its choice, and later the user changes it in either app
     assert!(apply(&mut settings, &model, &Request::set("headset_room", "scene")).changed);
     assert!(apply(&mut settings, &model, &Request::set("headset_volume", "200")).changed);
-    assert_eq!(read(&settings)["headset"], serde_json::json!({"room": "scene", "volume": 200}));
+    assert!(apply(&mut settings, &model, &Request::set("headset_interface", "3d")).changed);
+    assert!(apply(&mut settings, &model, &Request::set("headset_interface", "flat")).changed);
+    assert_eq!(read(&settings)["headset"], serde_json::json!({"room": "scene", "volume": 200, "interface": "flat"}));
     assert!(apply(&mut settings, &model, &Request::set("headset_volume", "175")).refused.is_some());
+    assert!(apply(&mut settings, &model, &Request::set("headset_interface", "round")).refused.is_some());
     // The values read back from the file
     let text = settings.file_text(None).unwrap();
     let back = Settings::read(&text).settings;
-    assert_eq!((back.headset_room.as_deref(), back.headset_volume), (Some("scene"), Some(200)));
+    assert_eq!((back.headset_room.as_deref(), back.headset_volume, back.headset_interface.as_deref()), (Some("scene"), Some(200), Some("flat")));
 }
 
 #[test]

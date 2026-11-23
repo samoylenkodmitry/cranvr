@@ -8,7 +8,7 @@
 use crate::{
     audio,
     connection::Connection,
-    console::{Backdrop, Console, Menu, Room, View as ConsoleView, Volume},
+    console::{Backdrop, Console, Interface, Menu, Room, View as ConsoleView, Volume},
     controls::{Fire, Runner},
     displays::displays,
     discovery::FoundHost,
@@ -708,12 +708,12 @@ impl Hub {
     /// headset's own: it goes to the Mac once for each connection. A choice of the Mac applies here
     /// and stays for the time without a link.
     fn take_choices(&self, id: u64, choices: crate::console::HeadsetChoices) {
-        let (room, volume) = {
+        let (room, volume, interface) = {
             let console = self.console.lock().unwrap();
             let view = console.view();
-            (view.room, view.volume)
+            (view.room, view.volume, view.interface)
         };
-        if (choices.room.is_none() || choices.volume.is_none()) && self.told_choices.swap(id, Ordering::AcqRel) != id {
+        if (choices.room.is_none() || choices.volume.is_none() || choices.interface.is_none()) && self.told_choices.swap(id, Ordering::AcqRel) != id {
             use cranvr_common::menu::Request;
             if choices.room.is_none() {
                 self.send_request(&Request::set("headset_room", room.key()));
@@ -721,6 +721,14 @@ impl Hub {
             if choices.volume.is_none() {
                 self.send_request(&Request::set("headset_volume", volume.key()));
             }
+            if choices.interface.is_none() {
+                self.send_request(&Request::set("headset_interface", interface.key()));
+            }
+        }
+        // A launch that fixes the interface keeps it for the test
+        if let Some(chosen) = choices.interface.filter(|chosen| *chosen != interface && !settings::interface_fixed()) {
+            log::info!("the Mac sets the interface to {}", chosen.key());
+            self.choose_interface(chosen);
         }
         if let Some(chosen) = choices.room.filter(|chosen| *chosen != room) {
             self.choose_room(chosen);
@@ -922,6 +930,7 @@ impl Hub {
             let mut console = self.console.lock().unwrap();
             console.set_room(room);
             console.set_volume(volume);
+            console.set_interface(settings::interface());
             if let Some(controls) = settings::controls() {
                 console.set_controls(controls);
             }
@@ -934,6 +943,19 @@ impl Hub {
         log::info!("the Mac sets the room to {}", room.key());
         self.console.lock().unwrap().set_room(room);
         settings::remember_room(room);
+    }
+
+    /// How the headset draws its menus, as the Mac keeps it.
+    pub fn choose_interface(&self, interface: Interface) {
+        self.console.lock().unwrap().set_interface(interface);
+        settings::remember_interface(interface);
+    }
+
+    /// The user picks the interface in the headset: it applies at once, and the Mac keeps it.
+    pub fn pick_interface(&self, interface: Interface) {
+        log::info!("the user picks the {} interface", interface.key());
+        self.choose_interface(interface);
+        self.send_request(&cranvr_common::menu::Request::set("headset_interface", interface.key()));
     }
 
     /// How loud the sound plays, as the Mac keeps it.

@@ -125,6 +125,8 @@ fn Client() {
     let hands_seen = rememberMutableStateOf(|| false);
     let gaze = rememberMutableStateOf(|| false);
     let looking = rememberMutableStateOf(|| false);
+    // A controller's model shows, so the headset draws its 3D scene anyway (see `menu_tray.rs`)
+    let models_shown = rememberMutableStateOf(|| false);
     let hand = HandState { layout, menu_open, place, present, hint, palm, hands: hands_seen, gaze, looking, recenter: recenters };
     let opened = menu_open.get();
     LaunchedEffect(opened, async move |_| {
@@ -243,6 +245,10 @@ fn Client() {
                             hand.set_enabled(want);
                         }
                     }
+                    let any = wanted.contains(&true);
+                    if models_shown.get_non_reactive() != any {
+                        models_shown.set(any);
+                    }
                 }
             }
             delay(CONSOLE_POLL).await;
@@ -314,7 +320,12 @@ fn Client() {
     // A menu that a button opened shows while the hands belong to the game too: the user asked for it
     if !hands_in_game.get() || menu_open.get() {
         let view = console.get();
-        HandPanels(hand, view.open, view.controls, snapshot.get().state == LinkState::Streaming);
+        // The 3D ball joins a scene that draws anyway: outside a game, or while a model shows or the
+        // menu is open. A game with no model shown keeps the flat ball, so the closed menu adds no
+        // 3D scene to a game.
+        let interface = view.interface;
+        let ball_3d = interface.is_3d() && (!backdrop.get().game_runs || models_shown.get() || menu_open.get());
+        HandPanels(hand, (view.open, hand_menu::Look { interface, ball_3d }), view.controls, snapshot.get().state == LinkState::Streaming);
     }
 }
 
@@ -367,7 +378,7 @@ fn Behind(backdrop: MutableState<Backdrop>, frames: MutableState<Option<DecodedF
             environment.set_preferred_passthrough_opacity(Some(if room { 1.0 } else { 0.0 }));
         }
     });
-    if !room {
+    if !room && !settings::bare_room() {
         Stream(frames);
     }
 }

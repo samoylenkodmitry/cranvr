@@ -106,6 +106,9 @@ pub struct Settings {
     /// How loud the headset plays the sound, in percent of what the host sends. None until the
     /// headset tells its own choice once.
     pub headset_volume: Option<u32>,
+    /// How the headset draws its menus: "3d" or "flat". None until the headset tells its own choice
+    /// once.
+    pub headset_interface: Option<String>,
 }
 
 impl Default for Settings {
@@ -134,6 +137,7 @@ impl Default for Settings {
             microphone: Default::default(),
             headset_room: None,
             headset_volume: None,
+            headset_interface: None,
         }
     }
 }
@@ -869,7 +873,7 @@ pub fn vr_menu(settings: &Settings, model: &Model) -> String {
     }
     let mut menu = serde_json::json!({
         // The headset applies these two itself, and it tells its own choice while they are null
-        "headset": {"room": settings.headset_room, "volume": settings.headset_volume},
+        "headset": {"room": settings.headset_room, "volume": settings.headset_volume, "interface": settings.headset_interface},
         "pages": pages,
         "controls": settings.controls,
     });
