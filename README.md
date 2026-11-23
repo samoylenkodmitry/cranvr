@@ -849,6 +849,10 @@ A test with nobody in the headset can press the buttons of a game's menu. `CRANV
 
 `scripts/ui3d-check.sh SERIAL WORKDIR [CAPTURES]` runs the walk of the 3D menus (`scripted_pointer=ui3d`) in the same way and takes a screen capture while the hand menu is open and while the console shows each page. `scripts/capture-check.py` checks each capture before anyone sees it: it keeps a picture only when at least 40% of its pixels are exact black and at most 15% are other grey pixels, so a picture of the room never stays. `scripts/ui3d-budget.sh SERIAL WORKDIR` measures the Flat and the 3D interface with the hand menu closed and open, with a test host that streams its scene at 120 Hz: the frame rate, the stale frames, the compositor's time, the app's GPU time and the layer count from the runtime's VrApi line (`scripts/vrapi-summary.py`).
 
+### Client starts in scripts
+
+A script counts a start of the headset client only when the same client process still runs 3 s after it links to its host (`scripts/client-start.zsh`). A link line alone proves nothing: on 2026-11-23 a client linked, crashed 1 s later and left the user's stream dark for 16 minutes (#145). Every script that starts the client puts the user's client back on 9950 at its end, also after a failure or a stop: `scripts/give-back.sh SERIAL [APK]` installs APK first when it is given, starts the client and checks it the same way. `CRANVR_GIVE_BACK_APK` names that APK for the check scripts. `scripts/start-check.sh SERIAL WORKDIR STARTS [STOP_AFTER] [PORT]` starts the client against a test app again and again and counts the starts that held, crashed, ended with no crash or never linked. It prints the top frames of each crash.
+
 ## Other settings of the host
 
 - The eye stream's frames stand on the encoder's time line at the real time between them, at most two frames apart after a pause. VideoToolbox's rate control gives a frame the bits of that time. Before, the frames stood 1 ms apart, so the stream sent 5 to 8 percent of its bitrate (issue #90).

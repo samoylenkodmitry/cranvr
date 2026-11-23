@@ -8,11 +8,21 @@
 # host on PORT (9961 by default) with its own folder in WORKDIR, so the user's host, its files and its
 # panel layout stay as they are. It starts the client against that host with log_poses, keeps the
 # headset awake (prox_close), reads the log for SECONDS (20 by default) and stops the host.
-# Install the normal build again afterwards.
+# Hold the Quest lock. At the end the script puts the user's
+# client back on 9950 (scripts/give-back.sh), also after a failure. CRANVR_GIVE_BACK_APK names a
+# build that give-back.sh installs first, such as the normal build.
 set -u
 serial=$1 work=$2 seconds=${3:-20} port=${4:-9961}
 root=${0:A:h:h}
 adb_cmd=(adb -s ${serial})
+# The user's client goes back on its host at the end, also when the run fails or stops early
+finish() {
+    kill ${host:-} ${logcat:-} 2> /dev/null
+    ${adb_cmd} shell am force-stop dev.cranvr.client
+    ${root}/scripts/give-back.sh ${serial} ${CRANVR_GIVE_BACK_APK:-}
+}
+trap finish EXIT
+trap 'exit 130' INT TERM
 mkdir -p ${work}/config
 ${root}/target/release/cranvr-host --status --config-dir ${work}/config --native-port ${port} --trust-all --no-game-audio > ${work}/host.out 2> ${work}/host.log &
 host=$!

@@ -377,9 +377,11 @@ give_back() {
         # A run over the USB network leaves the key under the cable's name
         extras=(--es forget_host_key "${test_host},usb-network:${native_port}")
     fi
-    if "${adb_cmd[@]}" shell am start -n "${package}/dev.cranpose.android.CranposeActivity" \
-        --es host "${owner}" --ez connect true "${extras[@]}" >/dev/null 2>&1; then
-        print "The headset connects to ${owner} again${extras:+ and forgets the key of ${test_host}}"
+    # The client counts as back when it still runs 3 s after its link (scripts/give-back.sh)
+    if CRANVR_OWNER_HOST=${owner} "${root}/scripts/give-back.sh" "${serial}" -- "${extras[@]}"; then
+        print "The headset runs on ${owner} again${extras:+ and forgets the key of ${test_host}}"
+    else
+        print -u2 "The headset did not come back on ${owner}"
     fi
 }
 
