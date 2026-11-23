@@ -129,6 +129,8 @@ fn a_page_of_the_host_has_its_title_its_items_and_back() {
     let menu = menu();
     let rows = console_rows(Some(&menu), &Shown::Host("stream".into()), local(), "", None, Instant::now());
     assert!(matches!(&rows[0].line, Line::Title { text, .. } if text == "Stream"));
+    // The page's heading of its own title shows once, as the title
+    assert!(!rows.iter().any(|row| matches!(&row.line, Line::Heading(text) if text == "Stream")));
     assert!(find_key(&rows, &Press::Back).is_some());
     assert!(find_key(&rows, &Press::Host(Request::set("fps", "72"))).is_some());
     // A page that the menu lacks shows the main page
@@ -143,14 +145,14 @@ fn the_height_and_the_place_of_each_key_follow_from_the_rows() {
     let total = height(&rows);
     let sum: f32 = rows.iter().map(|row| row.height).sum::<f32>() + (rows.len() - 1) as f32 * size::GAP + 2.0 * size::PADDING;
     assert!((total - sum).abs() < 1e-3);
-    // The refresh rate's row is the third: title, heading, then the choice. Its keys share the room
-    // right of the name.
+    // The refresh rate's row is the second: the title, then the choice, as the page's heading of its
+    // own title shows as the title. Its keys share the room right of the name.
     let (row, key) = find_key(&rows, &Press::Host(Request::set("fps", "72"))).unwrap();
-    assert_eq!((row, key), (2, 0));
+    assert_eq!((row, key), (1, 0));
     let [x, y] = key_point(&rows, row, key).unwrap();
     let each = (INNER - LABEL - 3.0 * size::GAP) / 3.0;
     assert!((x - (size::PADDING + LABEL + size::GAP + each / 2.0)).abs() < 1e-3, "{x}");
-    let top = size::PADDING + size::TITLE + size::GAP + size::HEADING + size::GAP;
+    let top = size::PADDING + size::TITLE + size::GAP;
     assert!((y - (top + size::BUTTON / 2.0)).abs() < 1e-3, "{y}");
     // A title's keys stand at the right end
     let main = console_rows(Some(&menu), &Shown::Main, local(), "", None, Instant::now());
@@ -174,4 +176,16 @@ fn a_long_line_breaks_at_words() {
     assert_eq!(lines_of("short"), 1);
     assert_eq!(lines_of(&"word ".repeat(20)), 3);
     assert_eq!(lines_of(""), 1);
+}
+
+#[test]
+fn a_toggle_whose_name_fits_beside_its_keys_takes_one_row_and_a_longer_one_takes_a_row_above_them() {
+    let toggle = |label: &str| Item::Toggle(Toggle { id: "t".into(), label: label.into(), on: true, ..Default::default() });
+    let page = Page { id: "p".into(), title: "P".into(), short: "P".into(), listed: true, items: vec![toggle("Game sound in the headset"), toggle("Panel pixels while a game runs")] };
+    let rows = page_rows(&page, None, Interface::ThreeD);
+    let lines: Vec<&Line> = rows.iter().map(|row| &row.line).collect();
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(matches!(lines[0], Line::Keys { name: Name::Title { title, .. }, form: Form::Switch, .. } if title == "Game sound in the headset"));
+    assert!(matches!(lines[1], Line::Text { text, .. } if text == "Panel pixels while a game runs"));
+    assert!(matches!(lines[2], Line::Keys { name: Name::Title { title, width, .. }, keys, form: Form::Switch } if title.is_empty() && *width == SWITCH && keys.len() == 2));
 }

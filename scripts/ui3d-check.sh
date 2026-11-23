@@ -5,12 +5,14 @@
 # (`scripted_pointer=ui3d`, client/src/scripted.rs). A test app with no window (`cranvr --headless`)
 # answers the requests and saves each change in its own app.json. The script prints the entries of
 # that app.json that changed, the client's lines of the walk, and takes a screen capture while the
-# menu is open, while the console shows each page. Each capture goes through
+# menu is open, while the right controller's model stands in front of the open menu, and while the
+# console shows each page. The client starts with `room=none`: its virtual room with nothing behind
+# the panels, so the captures are black around them. Each capture goes through
 # scripts/capture-check.py, which keeps it in CAPTURES only when it shows no room.
 #
 # Usage: scripts/ui3d-check.sh SERIAL WORKDIR [CAPTURES] [SECONDS] [PORT]
 #   CAPTURES where the captures that pass go (none are kept without it)
-#   SECONDS  how long the run lasts (26 by default; the walk takes about 24 s after the link)
+#   SECONDS  how long the run lasts (32 by default; the walk takes about 29 s after the link)
 #   PORT     the test app's port (9961 by default)
 #
 # The client starts with `interface=3d`, `save_choices=false`, its own set of panels (`shown`) and
@@ -20,7 +22,7 @@
 # the normal build.
 set -u
 serial=$1 work=$2
-captures=${3:-} seconds=${4:-26} port=${5:-9961}
+captures=${3:-} seconds=${4:-32} port=${5:-9961}
 root=${0:A:h:h}
 adb_cmd=(adb -s ${serial})
 home=${work}/home
@@ -37,10 +39,10 @@ logcat=$!
 ${adb_cmd} reverse tcp:${port} tcp:${port} > /dev/null
 ${adb_cmd} shell am force-stop dev.cranvr.client
 ${adb_cmd} shell am broadcast -a com.oculus.vrpowermanager.prox_close > /dev/null
-extras=(--es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room none --es interface 3d --ei walk_wait_ms 5000 --ez default_places true --ez save_choices false --ez first_start true --es shown none --es scripted_pointer ui3d --es forget_host_key 127.0.0.1:${port})
+extras=(--es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room none --es interface 3d --ei walk_wait_ms 5000 --ez log_poses true --ez default_places true --ez save_choices false --ez first_start true --es shown none --es scripted_pointer ui3d --es forget_host_key 127.0.0.1:${port})
 ${adb_cmd} shell am start -n dev.cranvr.client/dev.cranpose.android.CranposeActivity ${extras} > /dev/null
 # A capture a moment after each of these lines: the menu has shown, the console has shown its page
-marks=("the hand menu opens:0.7:menu" "the console shows the page stream:1.4:stream" "the console shows the page headset:1.4:headset")
+marks=("the hand menu opens:0.7:menu" "the hand menu opens:0.6:front" "the console shows the page stream:1.4:stream" "the console shows the page headset:1.4:headset")
 end=$((SECONDS + seconds))
 taken=()
 while (( SECONDS < end )); do

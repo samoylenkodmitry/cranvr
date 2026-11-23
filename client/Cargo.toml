@@ -42,20 +42,20 @@ cranvr-proto = { path = "../proto" }
 # The foveated layout that the host encodes: the client derives the same sizes
 cranvr-common = { path = "../common" }
 # One Cranpose revision for every Cranpose crate: the main branch of the Cranpose repository
-cranpose = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0317feafe48f43948ddec4e7e048050c50dcc70e", features = ["embedded-default-font"] }
-cranpose-xr = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0317feafe48f43948ddec4e7e048050c50dcc70e" }
+cranpose = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "bf34264319c485fca32f782aa3c09a94a8cc9b2b", features = ["embedded-default-font"] }
+cranpose-xr = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "bf34264319c485fca32f782aa3c09a94a8cc9b2b" }
 # The output device and the queue for the host's sound (see src/audio.rs)
-cranpose-audio = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0317feafe48f43948ddec4e7e048050c50dcc70e" }
+cranpose-audio = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "bf34264319c485fca32f782aa3c09a94a8cc9b2b" }
 log = "0.4"
 serde_json = "1"
 env_logger = { version = "0.11", optional = true }
 
 [dev-dependencies]
 # A test composes the console's rows in a headless shell and reads the words on the screen
-cranpose-testing = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0317feafe48f43948ddec4e7e048050c50dcc70e" }
+cranpose-testing = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "bf34264319c485fca32f782aa3c09a94a8cc9b2b" }
 
 [build-dependencies]
-cranpose-capabilities = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0317feafe48f43948ddec4e7e048050c50dcc70e" }
+cranpose-capabilities = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "bf34264319c485fca32f782aa3c09a94a8cc9b2b" }
 
 # The Reed-Solomon code of the protocol is about ten times slower without optimization.
 [profile.dev.package.reed-solomon-simd]

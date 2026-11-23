@@ -21,6 +21,9 @@
 //!   ahead for 4 seconds, turns it 35 degrees to the right and 25 degrees up in 1 second, holds that
 //!   for 4 seconds and turns back in 1 second, again and again. With `hand_menu=open` the menu at the
 //!   left hand shows that the hand's panels move and turn with the controller.
+//! - `scripted_pointer=holding` holds the left controller still where `hand` starts, level and
+//!   straight ahead, and the right controller is missing: the hand menu's ball rides the left
+//!   controller, whose model shows, for a measure of what the closed menu costs.
 //! - `scripted_pointer=models` holds both controllers still in front of the head, their rays away
 //!   from the panels. The right controller presses its inputs in turn, each for 4 seconds with 5
 //!   seconds of rest between: the trigger, A, the grip, the thumbstick forward and the thumbstick to
@@ -67,9 +70,11 @@
 //!   ray. The log names each aim and each choice ("scripted pages:"), and the host's app saves each
 //!   change in its `app.json`.
 //! - `scripted_pointer=ui3d` walks the 3D menus (#111, launch it with `interface=3d` and
-//!   `default_places`). The left controller is missing, so the hand menu stands in front of the
-//!   user. The right controller presses the 3D ball, which opens the menu, and the menu's key of the
-//!   page Stream, which opens the console there. On that page it presses the key of the first
+//!   `default_places`). The left controller stands level below the eyes and holds the hand menu
+//!   with its middle 45 cm ahead of the eyes. The right controller presses the 3D ball, which opens
+//!   the menu, then stands 30 cm ahead of the eyes in front of the menu's middle for 4 s, so its
+//!   model covers words of the menu. It presses the menu's key of the page Stream, which opens the
+//!   console there. On that page it presses the key of the first
 //!   choice that restarts nothing and flips the first toggle that restarts nothing. Back on the main
 //!   page it opens the first page with a slider that restarts nothing, takes the slider's knob at the
 //!   value that holds and drags it to the next value. `walk_wait_ms` sets the wait before the first
@@ -110,6 +115,10 @@ pub fn install_once() {
             turning_left_hand();
             return;
         }
+        if args.string("scripted_pointer") == Some("holding") {
+            holding_left_hand();
+            return;
+        }
         if args.string("scripted_pointer") == Some("models") {
             pressing_right_hand();
             return;
@@ -137,7 +146,9 @@ pub fn install_once() {
             return;
         }
         if args.string("scripted_pointer") == Some("ui3d") {
-            walk_after_menu("ui3d", ui3d_script);
+            let rest = ScriptedButtons::default();
+            let to = [UI3D_LEFT_AT[0], UI3D_LEFT_AT[1], UI3D_LEFT_AT[2] - 1.0];
+            walk_after_menu("ui3d", ScriptedController::new(Hand::Left, UI3D_LEFT_AT, to).holding(Duration::from_secs(120), rest), ui3d_script);
             return;
         }
         if args.string("scripted_pointer") == Some("menu") {
@@ -168,6 +179,13 @@ const LEFT_AT: [f32; 3] = [-0.15, -0.3, -0.45];
 const LEVEL_TO: [f32; 3] = [-0.15, -0.3, -1.45];
 const TURNED_AT: [f32; 3] = [-0.05, -0.25, -0.45];
 const TURNED_TO: [f32; 3] = [-0.05 + 0.520, -0.25 + 0.423, -0.45 - 0.742];
+
+/// Plays `scripted_pointer=holding`: the left controller stands still where the turn starts.
+fn holding_left_hand() {
+    log::info!("scripted: the left controller stands still at {LEFT_AT:?}, level, and the right one is missing");
+    script_controller(missing(Hand::Right));
+    script_controller(ScriptedController::new(Hand::Left, LEFT_AT, LEVEL_TO).holding(Duration::from_secs(600), ScriptedButtons::default()));
+}
 
 /// Plays the left controller of `scripted_pointer=hand`, in a turn of 10 seconds that repeats.
 fn turning_left_hand() {
@@ -510,13 +528,13 @@ fn first_change(page: &cranvr_common::menu::Page) -> Option<cranvr_common::menu:
 /// Plays `scripted_pointer=pages` (see the file's notes). The steps need the host's pages, so a thread
 /// waits for the menu and installs the right controller's script then.
 fn pages_check() {
-    walk_after_menu("pages", pages_script);
+    walk_after_menu("pages", missing(Hand::Left), pages_script);
 }
 
 /// Plays the walk that `script` makes of the host's menu, once the menu and the headset's choices
 /// came. The left controller is missing. `name` names the walk in the log.
-fn walk_after_menu(name: &'static str, script: fn(&crate::console::Menu) -> Option<ScriptedController>) {
-    script_controller(missing(Hand::Left));
+fn walk_after_menu(name: &'static str, left: ScriptedController, script: fn(&crate::console::Menu) -> Option<ScriptedController>) {
+    script_controller(left);
     std::thread::spawn(move || {
         let since = std::time::Instant::now();
         let menu = loop {
@@ -667,6 +685,11 @@ fn pages_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
     Some(right.moving_to(Duration::from_millis(1), (at, away_from(at)), rest))
 }
 
+/// Where the left controller of `scripted_pointer=ui3d` stands, level and pointing ahead: a menu of
+/// about 570 dp, the height that a host with one display gives, then has its middle 45 cm ahead of
+/// the eyes and 12 cm below them
+const UI3D_LEFT_AT: [f32; 3] = [-0.21, -0.57, -0.52];
+
 /// The walk of `scripted_pointer=ui3d` (see the file's notes).
 fn ui3d_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
     use crate::{
@@ -686,16 +709,22 @@ fn ui3d_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
     let pages = menu.listed();
     let layout = Layout::default();
     let displays_view = displays().menu_view();
-    let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays_view, wishes: Default::default(), place: MenuPlace::View, adding: false, pages: &pages, costs: true };
+    let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays_view, wishes: Default::default(), place: MenuPlace::Hand(cranvr_common::controls::Hand::Left), adding: false, pages: &pages, costs: true };
     let rows = menu_model::rows(&input);
     let height = menu_model::height(&rows);
+    // The left controller holds the menu at its usual distance (`UI3D_LEFT_AT`)
+    let left_at = UI3D_LEFT_AT;
+    let left = Pose::at(left_at);
+    let on_menu = |x: f32, y: f32| left.then(&hand_menu::menu_start(hand_menu::ON_LEFT, height)).then(&Pose::at([(x - WIDTH / 2.0) / 1000.0, (height / 2.0 - y) / 1000.0, 0.0])).position;
+    let menu_middle = left.then(&hand_menu::menu_start(hand_menu::ON_LEFT, height)).position;
+    log::info!("scripted ui3d: the left controller at {left_at:?} holds the menu, {height:.0} dp tall, with its middle at {menu_middle:?}");
     let page_button = |index: usize| {
         let mut top = PADDING + TITLE + GAP;
         for row in &rows {
             if let Some(at) = row.buttons.iter().position(|button| button.action == menu_model::MenuAction::OpenPage(index as u8)) {
                 let n = row.buttons.len() as f32;
                 let each = (WIDTH - 2.0 * PADDING - (n - 1.0) * GAP) / n;
-                return Some(on_view_menu(height, PADDING + at as f32 * (each + GAP) + each / 2.0, top + ROW / 2.0));
+                return Some(on_menu(PADDING + at as f32 * (each + GAP) + each / 2.0, top + ROW / 2.0));
             }
             top += ROW + GAP + row.details.len() as f32 * DETAIL;
         }
@@ -710,9 +739,8 @@ fn ui3d_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
         let [x, y] = key_point(&rows, row, key)?;
         Some((on_console(&rows, x, y), rows[row].line.clone()))
     };
-    // The 3D ball in front of the user, where `hand_menu::IN_VIEW` puts it
-    let [x, y, z] = hand_menu::IN_VIEW.base;
-    let ball = Pose::at([0.0, 0.0, -1.0]).then(&Pose::at([x / 1000.0, (y + hand_menu::LIFT) / 1000.0, z / 1000.0])).position;
+    // The 3D ball above the left controller, where `hand_menu::ON_LEFT` puts it
+    let ball = left.then(&Pose::at([0.0, hand_menu::LIFT / 1000.0, 0.0])).position;
     let stream = pages.iter().position(|(id, _)| id == "stream")?;
     // A run can wait before the first press (`walk_wait_ms`), so that a system toast that covers the
     // screen captures has gone
@@ -720,6 +748,11 @@ fn ui3d_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
     let mut right = ScriptedController::new(Hand::Right, at, away_from(at)).holding(Duration::from_millis(wait), rest);
     log::info!("scripted ui3d: the ball at {ball:?}");
     right = press(right, ball);
+    // The right controller then stands 30 cm ahead of the eyes, in front of the open menu's middle,
+    // so its model covers the words there
+    let front = [menu_middle[0] + 0.03, menu_middle[1] * 0.66, -0.30];
+    log::info!("scripted ui3d: the right controller stands in front of the menu at {front:?} from 0.8 s to 4.8 s after it opens");
+    right = right.moving_to(Duration::from_millis(1), (front, [front[0] - 0.05, front[1] + 0.3, front[2] - 1.0]), rest).holding(Duration::from_millis(4000), rest);
     let target = page_button(stream)?;
     log::info!("scripted ui3d: the menu's key Stream at {target:?}");
     right = press(right, target);
@@ -890,3 +923,4 @@ fn palm_check() {
     script_hand(ScriptedHand::pointing(Hand::Left, [-0.15, -0.3, -0.3], [-0.15, -1.3, -0.6], still).with_palm(PALM));
     script_hand(ScriptedHand::pointing(Hand::Right, [0.15, -0.25, -0.2], ball, pinch));
 }
+

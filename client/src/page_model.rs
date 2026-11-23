@@ -28,6 +28,8 @@ pub const KEY: f32 = 130.0;
 pub const SWITCH: f32 = 96.0;
 /// The space that a character of 22 sp text takes on average, and the padding of a key's words, in dp
 const CHAR: f32 = 11.5;
+/// The space that a character of a bold 22 sp title takes on average, in dp
+const TITLE_CHAR: f32 = 12.5;
 const KEY_PAD: f32 = 28.0;
 /// The characters of a line of 22 sp text across the console
 const LINE_CHARS: usize = 46;
@@ -172,7 +174,7 @@ fn item_rows(item: &Item, pending: Option<(&Pending, Progress)>, interface: Inte
         Item::Heading { text } => rows.push(Row::new(Line::Heading(text.clone()))),
         Item::Text { text, tone } => rows.push(Row::new(Line::Text { text: text.clone(), tone: *tone })),
         Item::Choice(choice) => choice_rows(choice, pending, interface, rows),
-        Item::Toggle(toggle) => rows.push(toggle_row(toggle, pending)),
+        Item::Toggle(toggle) => toggle_rows(toggle, pending, rows),
         Item::Buttons(row) => buttons_rows(row, pending, rows),
     }
 }
@@ -225,7 +227,7 @@ fn pack(keys: Vec<Key>, rows: &mut Vec<Row>) {
     }
 }
 
-fn toggle_row(toggle: &Toggle, pending: Option<(&Pending, Progress)>) -> Row {
+fn toggle_row(toggle: &Toggle, pending: Option<(&Pending, Progress)>) -> Line {
     let keys = [(ON, "On", true), (OFF, "Off", false)]
         .into_iter()
         .map(|(value, words, on)| {
@@ -234,7 +236,23 @@ fn toggle_row(toggle: &Toggle, pending: Option<(&Pending, Progress)>) -> Row {
             Key { label, press: Press::Host(request), look: if toggle.on == on { Look::Selected } else { Look::Normal } }
         })
         .collect();
-    Row::new(Line::Keys { name: Name::Title { title: toggle.label.clone(), detail: String::new(), width: SWITCH }, keys, form: Form::Switch })
+    Line::Keys { name: Name::Title { title: toggle.label.clone(), detail: String::new(), width: SWITCH }, keys, form: Form::Switch }
+}
+
+/// The rows of a toggle: its name beside its keys On and Off when the name fits one line there,
+/// else the name in a row of its own above them, so a long name never runs over the keys or into the
+/// next row.
+fn toggle_rows(toggle: &Toggle, pending: Option<(&Pending, Progress)>, rows: &mut Vec<Row>) {
+    let line = toggle_row(toggle, pending);
+    let room = INNER - 2.0 * (SWITCH + size::GAP);
+    if toggle.label.chars().count() as f32 * TITLE_CHAR <= room {
+        rows.push(Row::new(line));
+        return;
+    }
+    rows.push(Row::new(Line::Text { text: toggle.label.clone(), tone: Tone::Normal }));
+    if let Line::Keys { keys, form, .. } = line {
+        rows.push(Row::new(Line::Keys { name: Name::Title { title: String::new(), detail: String::new(), width: SWITCH }, keys, form }));
+    }
 }
 
 fn buttons_rows(row: &Buttons, pending: Option<(&Pending, Progress)>, rows: &mut Vec<Row>) {
@@ -316,7 +334,10 @@ pub fn console_rows(menu: Option<&Menu>, shown: &Shown, local: Local, no_menu: &
         if let Some(notice) = &menu.notice {
             rows.push(Row::new(Line::Text { text: notice.clone(), tone: Tone::Warn }));
         }
-        rows.extend(page_rows(page, pending, local.interface));
+        // The Mac's pages start with a heading of their own title, which the title row shows already
+        let page_rows = page_rows(page, pending, local.interface);
+        let repeats = page_rows.first().is_some_and(|row| matches!(&row.line, Line::Heading(text) if *text == page.title));
+        rows.extend(page_rows.into_iter().skip(usize::from(repeats)));
         rows.push(Row::new(Line::Keys { name: Name::None, keys: vec![key("Back", Press::Back, Look::Normal), key("Close", Press::Close, Look::Normal)], form: Form::Keys }));
         return rows;
     }
