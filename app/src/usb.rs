@@ -4,6 +4,9 @@
 //! 127.0.0.1 (see client/src/usb.rs). With the setting at Wi-Fi the thread takes that reverse away.
 //!
 //! The thread does the adb work, so the window never waits for adb. The window reads `status()`.
+//! An adb call that hangs ends after 8 s together with every process that it started. One call
+//! with the same arguments runs at a time, and the thread asks less often while adb hangs: the wait
+//! doubles up to a minute until adb answers again.
 //! The adb tool comes from the Mac (PATH, Android Studio's SDK, Homebrew). A Mac with none gets a
 //! button that downloads Google's platform-tools into the cranvr folder.
 
@@ -16,13 +19,13 @@ use std::{
     fs,
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpStream},
-    os::unix::fs::PermissionsExt,
+    os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicU8, Ordering},
         mpsc::{self, RecvTimeoutError, Sender},
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
@@ -40,6 +43,8 @@ const POLL: Duration = Duration::from_secs(3);
 const APP_RECHECK: Duration = Duration::from_secs(15);
 /// The time that one adb call may take. The first call starts adb's server, which takes a moment.
 const ADB_TIMEOUT: Duration = Duration::from_secs(8);
+/// The longest wait between two looks while adb hangs
+const MAX_POLL: Duration = Duration::from_secs(60);
 
 /// How the stream reaches the headset: the Connection setting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -255,31 +260,122 @@ fn own_adb_in(dir: &Path) -> PathBuf {
 // ---------------------------------------------------------------------------------------------
 // Running adb
 
-/// Runs adb with a time limit and returns what it printed on stdout. `None` when it failed or
-/// took too long.
-fn adb(tool: &Path, args: &[&str], limit: Duration) -> Option<String> {
-    let mut child = Command::new(tool).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
-    let mut stdout = child.stdout.take()?;
+/// Why an adb call gave no answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unanswered {
+    /// adb did not start, or ended with an error
+    Failed,
+    /// adb ran past its time limit: it and every process that it started were stopped
+    Hung,
+    /// The same call still runs from before, so no second adb started
+    Busy,
+}
+
+/// The adb calls that run now, by their arguments
+static RUNNING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The place of one running adb call in `RUNNING`. It frees the place when it drops.
+struct Slot(String);
+
+impl Slot {
+    fn take(call: String) -> Option<Self> {
+        let mut running = RUNNING.lock().unwrap();
+        if running.contains(&call) {
+            return None;
+        }
+        running.push(call.clone());
+        Some(Self(call))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        RUNNING.lock().unwrap().retain(|call| call != &self.0);
+    }
+}
+
+/// Runs adb with a time limit and returns what it printed on stdout. One call with the same
+/// arguments runs at a time: a hung adb keeps its place until it ends, so hung calls cannot pile up.
+fn adb(tool: &Path, args: &[&str], limit: Duration) -> Result<String, Unanswered> {
+    let slot = Arc::new(Slot::take(args.join(" ")).ok_or(Unanswered::Busy)?);
+    // Its own process group, so the time limit ends adb with every process that adb started. A
+    // half-started adb server that hung would hold the output pipe and stay forever.
+    let mut child = Command::new(tool)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map_err(|_| Unanswered::Failed)?;
+    let mut stdout = child.stdout.take().ok_or(Unanswered::Failed)?;
     let (sender, receiver) = mpsc::channel();
+    // The output ends when every process that holds the pipe has ended. The call keeps its place
+    // until then.
+    let reading = Arc::clone(&slot);
     thread::spawn(move || {
         let mut text = String::new();
         stdout.read_to_string(&mut text).ok();
+        drop(reading);
         sender.send(text).ok();
     });
+    let pid = child.id();
     let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < limit => thread::sleep(Duration::from_millis(20)),
-            _ => {
-                child.kill().ok();
-                child.wait().ok();
-                return None;
+    while started.elapsed() < limit {
+        if has_ended(pid) {
+            if let Ok(text) = receiver.recv_timeout(Duration::from_secs(1)) {
+                let status = child.wait().map_err(|_| Unanswered::Failed)?;
+                return if status.success() { Ok(text) } else { Err(Unanswered::Failed) };
+            }
+            // A process that adb started still holds the output: the group's end below takes it
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    // The group's id is adb's pid, and nobody has waited for adb yet, so that pid belongs to no
+    // other process and the signal reaches only adb's group. A running adb server left the group
+    // when it started (setsid), so it keeps running.
+    unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
+    // A process that waits in the kernel ends only when that call returns. The call keeps its
+    // place until then, so no second adb of the same call starts meanwhile.
+    thread::spawn(move || {
+        child.wait().ok();
+        drop(slot);
+    });
+    Err(Unanswered::Hung)
+}
+
+/// Whether adb has ended. It leaves adb unwaited for, so adb's pid stays adb's (WNOWAIT).
+fn has_ended(pid: u32) -> bool {
+    // SAFETY: waitid writes only into `info`, which lives on this stack
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let found = unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
+    found == 0 && info.si_pid != 0
+}
+
+/// The adb calls of one look. It notes whether one of them hung.
+struct Calls<'a> {
+    tool: &'a Path,
+    hung: bool,
+}
+
+impl Calls<'_> {
+    fn run(&mut self, args: &[&str]) -> Option<String> {
+        match adb(self.tool, args, ADB_TIMEOUT) {
+            Ok(text) => Some(text),
+            Err(Unanswered::Failed) => None,
+            Err(Unanswered::Hung | Unanswered::Busy) => {
+                self.hung = true;
+                None
             }
         }
-    };
-    let text = receiver.recv_timeout(Duration::from_secs(1)).ok()?;
-    status.success().then_some(text)
+    }
+}
+
+/// The wait before the next look. Each look in a row in which adb hung doubles it, up to a minute,
+/// so a hung adb costs one call a minute instead of one every few seconds.
+fn poll_wait(hung_looks: u32) -> Duration {
+    POLL.saturating_mul(1 << hung_looks.min(5)).min(MAX_POLL)
 }
 
 /// The version of the adb server that runs on this Mac, or `None` when none runs. It asks the
@@ -355,6 +451,7 @@ fn run(port: u16, wake: mpsc::Receiver<()>) {
     // setting says Wi-Fi
     let mut cleanup = true;
     let mut last = Connection::from_code(CHOICE.load(Ordering::Relaxed));
+    let mut hung_looks = 0;
     loop {
         let choice = Connection::from_code(CHOICE.load(Ordering::Relaxed));
         if choice != last {
@@ -365,7 +462,13 @@ fn run(port: u16, wake: mpsc::Receiver<()>) {
         update(|s| s.adb = tool.clone());
         match tool.filter(|_| choice.allows_usb() || cleanup) {
             Some(tool) => {
-                look(&tool, choice, port, &mut known);
+                let hung = look(&tool, choice, port, &mut known);
+                if hung && hung_looks == 0 {
+                    crate::backend::log("USB: adb does not answer. The app asks it less often until it answers.".into());
+                } else if !hung && hung_looks > 0 {
+                    crate::backend::log("USB: adb answers again".into());
+                }
+                hung_looks = if hung { hung_looks + 1 } else { 0 };
                 cleanup = false;
             }
             None => update(|s| {
@@ -376,7 +479,7 @@ fn run(port: u16, wake: mpsc::Receiver<()>) {
         }
         update(|s| s.looked = true);
         // Wi-Fi needs no polling once the link is gone. A change of the setting wakes the thread.
-        let wait = if choice.allows_usb() { POLL } else { Duration::from_secs(60) };
+        let wait = if choice.allows_usb() { poll_wait(hung_looks) } else { Duration::from_secs(60) };
         match wake.recv_timeout(wait) {
             Ok(()) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
@@ -384,29 +487,31 @@ fn run(port: u16, wake: mpsc::Receiver<()>) {
     }
 }
 
-/// One look: the devices, the headsets among them, and the calls that `plan` asks for.
-fn look(tool: &Path, choice: Connection, port: u16, known: &mut HashMap<String, Known>) {
+/// One look: the devices, the headsets among them, and the calls that `plan` asks for. True when
+/// an adb call of the look hung.
+fn look(tool: &Path, choice: Connection, port: u16, known: &mut HashMap<String, Known>) -> bool {
+    let mut calls = Calls { tool, hung: false };
     // A copy of adb that cranvr downloaded must not meet a server of another version: the client
     // would stop that server, and with it the user's other tools
     if tool == own_adb_in(&config_dir()) {
-        let ours = adb(tool, &["version"], ADB_TIMEOUT).as_deref().and_then(parse_adb_version);
+        let ours = calls.run(&["version"]).as_deref().and_then(parse_adb_version);
         if let (Some(server), Some(ours)) = (running_server_version(), ours) {
             if server != ours {
                 update(|s| {
                     s.headsets.clear();
                     s.blocked = Some("Another adb tool runs on this Mac. Close it, then cranvr can use the cable.".into());
                 });
-                return;
+                return calls.hung;
             }
         }
     }
     update(|s| s.blocked = None);
-    let Some(text) = adb(tool, &["devices", "-l"], ADB_TIMEOUT) else {
+    let Some(text) = calls.run(&["devices", "-l"]) else {
         update(|s| {
             s.headsets.clear();
             s.unauthorized = false;
         });
-        return;
+        return calls.hung;
     };
     let listed: Vec<Listed> = parse_devices(&text).into_iter().filter(|d| d.usb).collect();
     known.retain(|serial, _| listed.iter().any(|d| &d.serial == serial));
@@ -417,7 +522,7 @@ fn look(tool: &Path, choice: Connection, port: u16, known: &mut HashMap<String, 
         if device.state == DeviceState::Device {
             let fresh = known.get(&device.serial).is_some_and(|k| k.has_app || k.asked.elapsed() < APP_RECHECK);
             if !fresh {
-                let packages = adb(tool, &["-s", &device.serial, "shell", "pm", "list", "packages", HEADSET_APPS[0]], ADB_TIMEOUT)
+                let packages = calls.run(&["-s", &device.serial, "shell", "pm", "list", "packages", HEADSET_APPS[0]])
                     .map(|text| parse_packages(&text));
                 if let Some(packages) = packages {
                     known.insert(device.serial.clone(), Known { has_app: has_headset_app(&packages), asked: Instant::now() });
@@ -425,7 +530,7 @@ fn look(tool: &Path, choice: Connection, port: u16, known: &mut HashMap<String, 
             }
             has_app = known.get(&device.serial).map(|k| k.has_app);
             if has_app == Some(true) {
-                reversed = adb(tool, &["-s", &device.serial, "reverse", "--list"], ADB_TIMEOUT).is_some_and(|list| reverse_has(&list, port));
+                reversed = calls.run(&["-s", &device.serial, "reverse", "--list"]).is_some_and(|list| reverse_has(&list, port));
             }
         }
         facts.push(Facts { serial: device.serial.clone(), state: device.state.clone(), usb: device.usb, has_app, reversed });
@@ -434,14 +539,14 @@ fn look(tool: &Path, choice: Connection, port: u16, known: &mut HashMap<String, 
     for action in plan(choice, &facts) {
         match &action {
             Action::Add(serial) => {
-                let done = adb(tool, &["-s", serial, "reverse", &link, &link], ADB_TIMEOUT).is_some();
+                let done = calls.run(&["-s", serial, "reverse", &link, &link]).is_some();
                 crate::backend::log(format!("USB: {} for {serial}", if done { "the host's port reaches the headset" } else { "adb reverse failed" }));
                 if let Some(f) = facts.iter_mut().find(|f| &f.serial == serial) {
                     f.reversed = done;
                 }
             }
             Action::Remove(serial) => {
-                let done = adb(tool, &["-s", serial, "reverse", "--remove", &link], ADB_TIMEOUT).is_some();
+                let done = calls.run(&["-s", serial, "reverse", "--remove", &link]).is_some();
                 crate::backend::log(format!("USB: {} for {serial}", if done { "the host's port no longer reaches the headset" } else { "adb reverse --remove failed" }));
                 if done {
                     if let Some(f) = facts.iter_mut().find(|f| &f.serial == serial) {
@@ -459,6 +564,7 @@ fn look(tool: &Path, choice: Connection, port: u16, known: &mut HashMap<String, 
             .collect();
         s.unauthorized = facts.iter().any(|f| f.state == DeviceState::Unauthorized);
     });
+    calls.hung
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -553,7 +659,7 @@ fn fetch_tools(dir: &Path, url: &str, protocols: &str) -> Result<(), String> {
     fs::remove_dir_all(&unpacked).ok();
     moved.map_err(|e| format!("The platform-tools are not in the zip: {e}"))?;
     // The tool must run before the window offers it as ready
-    match adb(&own_adb_in(dir), &["version"], ADB_TIMEOUT).as_deref().and_then(parse_adb_version) {
+    match adb(&own_adb_in(dir), &["version"], ADB_TIMEOUT).ok().as_deref().and_then(parse_adb_version) {
         Some(version) => {
             crate::backend::log(format!("USB support: adb {version} is in {}", tools.display()));
             Ok(())
@@ -727,5 +833,95 @@ emulator-5554          device product:sdk_gphone64 model:sdk device:emu64 transp
         let refused = fetch_tools(&home, "https://example.invalid/x.zip", "=file").unwrap_err();
         assert!(refused.starts_with("The download failed"), "{refused}");
         fs::remove_dir_all(&root).ok();
+    }
+
+    // A fake adb at `dir` that writes its pid and the pid of a child to `pids` and then hangs. The
+    // child holds the output pipe, as an adb server that started and hung does.
+    fn hanging_adb(dir: &Path) -> (PathBuf, PathBuf) {
+        fs::create_dir_all(dir).unwrap();
+        let (tool, pids) = (dir.join("adb"), dir.join("pids"));
+        fs::write(&tool, format!("#!/bin/sh\necho $$ >> '{0}'\nsleep 600 &\necho $! >> '{0}'\nwait\n", pids.display())).unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        (tool, pids)
+    }
+
+    fn running(pid: &str) -> bool {
+        Command::new("/bin/kill").args(["-0", pid]).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+    }
+
+    #[test]
+    fn a_hung_adb_ends_at_its_time_limit_with_every_process_that_it_started() {
+        let dir = env::temp_dir().join(format!("cranvr-usb-hang-{}", std::process::id()));
+        let (tool, pids) = hanging_adb(&dir);
+        let started = Instant::now();
+        assert_eq!(adb(&tool, &["hang", "test"], Duration::from_millis(400)), Err(Unanswered::Hung));
+        assert!(started.elapsed() < Duration::from_millis(1500), "{:?}", started.elapsed());
+        thread::sleep(Duration::from_millis(200));
+        let pids = fs::read_to_string(&pids).unwrap();
+        let left: Vec<&str> = pids.lines().filter(|pid| running(pid)).collect();
+        assert_eq!(pids.lines().count(), 2);
+        assert!(left.is_empty(), "adb processes still run: {left:?}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // adb that ends at once but leaves a child holding the output, as a client that gave up on a
+    // hung server does: the call ends within a second and takes the child with it
+    #[test]
+    fn an_adb_that_leaves_a_child_with_its_output_takes_the_child_along() {
+        let dir = env::temp_dir().join(format!("cranvr-usb-left-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (tool, pids) = (dir.join("adb"), dir.join("pids"));
+        fs::write(&tool, format!("#!/bin/sh\nsleep 600 &\necho $! >> '{}'\necho started\n", pids.display())).unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        let started = Instant::now();
+        assert_eq!(adb(&tool, &["left", "test"], Duration::from_secs(5)), Err(Unanswered::Hung));
+        assert!(started.elapsed() < Duration::from_millis(2000), "{:?}", started.elapsed());
+        thread::sleep(Duration::from_millis(200));
+        let child = fs::read_to_string(&pids).unwrap();
+        assert!(!running(child.trim()), "the child of adb still runs");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // A slow adb that the poll thread and the download's check ask at once: the second call of the
+    // same arguments starts no adb while the first runs, and the place frees when it ends.
+    #[test]
+    fn one_adb_call_with_the_same_arguments_runs_at_a_time() {
+        let dir = env::temp_dir().join(format!("cranvr-usb-busy-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (tool, starts) = (dir.join("adb"), dir.join("starts"));
+        fs::write(&tool, format!("#!/bin/sh\necho start >> '{}'\nsleep 0.6\necho answer\n", starts.display())).unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        let first = {
+            let tool = tool.clone();
+            thread::spawn(move || adb(&tool, &["busy", "test"], Duration::from_secs(5)))
+        };
+        thread::sleep(Duration::from_millis(200));
+        let asked = Instant::now();
+        assert_eq!(adb(&tool, &["busy", "test"], Duration::from_secs(5)), Err(Unanswered::Busy));
+        assert!(asked.elapsed() < Duration::from_millis(100));
+        // Another call runs beside it
+        assert_eq!(adb(&tool, &["busy", "other"], Duration::from_secs(5)).as_deref(), Ok("answer\n"));
+        assert_eq!(first.join().unwrap().as_deref(), Ok("answer\n"));
+        assert_eq!(adb(&tool, &["busy", "test"], Duration::from_secs(5)).as_deref(), Ok("answer\n"));
+        assert_eq!(fs::read_to_string(&starts).unwrap().lines().count(), 3);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // A hung call keeps its place until its process ends, and the look that met it counts as hung
+    #[test]
+    fn a_look_that_meets_a_hung_adb_counts_as_hung() {
+        let dir = env::temp_dir().join(format!("cranvr-usb-look-{}", std::process::id()));
+        let (tool, _) = hanging_adb(&dir);
+        let mut calls = Calls { tool: &tool, hung: false };
+        let _held = Slot::take("devices -l".into()).unwrap();
+        assert_eq!(calls.run(&["devices", "-l"]), None);
+        assert!(calls.hung);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_wait_between_looks_doubles_while_adb_hangs_up_to_a_minute() {
+        let waits: Vec<u64> = (0..8).map(|hung| poll_wait(hung).as_secs()).collect();
+        assert_eq!(waits, [3, 6, 12, 24, 48, 60, 60, 60]);
     }
 }
