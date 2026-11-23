@@ -5,7 +5,7 @@
 //! (`adb shell am start ... --es host 192.168.1.20:9950 --ez connect true`) and the command line
 //! on the desktop (`--host=192.168.1.20:9950 --connect`).
 
-use crate::console::{Room, Volume};
+use crate::console::{Interface, Room, Volume};
 use crate::hub::MediaChoice;
 use cranpose::{launch_args, preferences};
 use cranvr_common::controls::{Controls, Hand};
@@ -17,6 +17,7 @@ const IDENTITY_KEY: &str = "identity";
 const ROOM_KEY: &str = "room";
 const VOLUME_KEY: &str = "volume";
 const CONTROLS_KEY: &str = "controls";
+const INTERFACE_KEY: &str = "interface";
 /// The address that works over USB with `adb reverse tcp:9950 tcp:9950`, and on the same Mac
 const DEFAULT_HOST: &str = "127.0.0.1:9950";
 
@@ -45,7 +46,16 @@ pub fn room() -> Room {
     if let Some(room) = launch_args().string("room").and_then(Room::from_key) {
         return room;
     }
+    if bare_room() {
+        return Room::Scene;
+    }
     preferences().get(ROOM_KEY).and_then(|text| Room::from_key(&text)).unwrap_or_default()
+}
+
+/// Whether the launch asks for nothing behind the panels (`room=none`), for a screen capture: the
+/// app's black background shows, with neither the room nor the host's picture.
+pub fn bare_room() -> bool {
+    launch_args().string("room") == Some("none")
 }
 
 /// Whether the choices that a Mac sends are saved for the time without a link. The launch extra
@@ -76,6 +86,30 @@ pub fn remember_volume(volume: Volume) {
     }
     if let Err(e) = preferences().set(VOLUME_KEY, &volume.key()) {
         log::warn!("the volume setting was not saved: {e}");
+    }
+}
+
+/// How the headset draws its menus. The launch argument `interface` (`3d` or `flat`) decides for one
+/// launch and saves nothing, for a test. Without it the saved choice counts. A missing or unknown
+/// value gives 3D.
+pub fn interface() -> Interface {
+    if let Some(interface) = launch_args().string("interface").and_then(Interface::from_key) {
+        return interface;
+    }
+    preferences().get(INTERFACE_KEY).and_then(|text| Interface::from_key(&text)).unwrap_or_default()
+}
+
+/// Whether the launch fixes the interface for a test.
+pub fn interface_fixed() -> bool {
+    launch_args().string("interface").is_some()
+}
+
+pub fn remember_interface(interface: Interface) {
+    if !saves_choices() || interface_fixed() {
+        return;
+    }
+    if let Err(e) = preferences().set(INTERFACE_KEY, interface.key()) {
+        log::warn!("the interface setting was not saved: {e}");
     }
 }
 

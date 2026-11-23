@@ -66,6 +66,15 @@
 //!   Each press waits 1 s with the ray at rest, as the pointer smooths the
 //!   ray. The log names each aim and each choice ("scripted pages:"), and the host's app saves each
 //!   change in its `app.json`.
+//! - `scripted_pointer=ui3d` walks the 3D menus (#111, launch it with `interface=3d` and
+//!   `default_places`). The left controller is missing, so the hand menu stands in front of the
+//!   user. The right controller presses the 3D ball, which opens the menu, and the menu's key of the
+//!   page Stream, which opens the console there. On that page it presses the key of the first
+//!   choice that restarts nothing and flips the first toggle that restarts nothing. Back on the main
+//!   page it opens the first page with a slider that restarts nothing, takes the slider's knob at the
+//!   value that holds and drags it to the next value. `walk_wait_ms` sets the wait before the first
+//!   press (500 by default). The log names each aim ("scripted ui3d:"),
+//!   and the host's app saves each change in its `app.json`.
 //! - `scripted_pointer=palm` plays two hands and no controller: the left hand holds its open palm
 //!   35 cm ahead of the eyes and 15 cm below them, turned to the eyes, and never pinches. The right
 //!   hand points at the ball that shows in front of that palm and pinches every 2 s, which opens and
@@ -125,6 +134,10 @@ pub fn install_once() {
         }
         if args.string("scripted_pointer") == Some("pages") {
             pages_check();
+            return;
+        }
+        if args.string("scripted_pointer") == Some("ui3d") {
+            walk_after_menu("ui3d", ui3d_script);
             return;
         }
         if args.string("scripted_pointer") == Some("menu") {
@@ -497,15 +510,21 @@ fn first_change(page: &cranvr_common::menu::Page) -> Option<cranvr_common::menu:
 /// Plays `scripted_pointer=pages` (see the file's notes). The steps need the host's pages, so a thread
 /// waits for the menu and installs the right controller's script then.
 fn pages_check() {
+    walk_after_menu("pages", pages_script);
+}
+
+/// Plays the walk that `script` makes of the host's menu, once the menu and the headset's choices
+/// came. The left controller is missing. `name` names the walk in the log.
+fn walk_after_menu(name: &'static str, script: fn(&crate::console::Menu) -> Option<ScriptedController>) {
     script_controller(missing(Hand::Left));
-    std::thread::spawn(|| {
+    std::thread::spawn(move || {
         let since = std::time::Instant::now();
         let menu = loop {
             if let Some(menu) = crate::hub::hub().console().menu {
                 break menu;
             }
             if since.elapsed() > Duration::from_secs(30) {
-                log::warn!("scripted pages: no menu came from the host in 30 s");
+                log::warn!("scripted {name}: no menu came from the host in 30 s");
                 return;
             }
             std::thread::sleep(Duration::from_millis(200));
@@ -521,9 +540,9 @@ fn pages_check() {
             }
             std::thread::sleep(Duration::from_millis(200));
         };
-        match pages_script(&menu) {
+        match script(&menu) {
             Some(right) => script_controller(right),
-            None => log::warn!("scripted pages: the menu has no page with a change to press"),
+            None => log::warn!("scripted {name}: the menu has no page with a change to press"),
         }
     });
 }
@@ -540,7 +559,7 @@ fn pages_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
     let rest = ScriptedButtons::default();
     let pull = ScriptedButtons { trigger: 1.0, ..rest };
     let at = MENU_RIGHT_AT;
-    let local = Local { link: true };
+    let local = Local { link: true, interface: crate::hub::hub().console().interface };
     let now = std::time::Instant::now();
     // The hand menu in front of the user: its rows, as `hand_menu.rs` lays them out
     let pages = menu.listed();
@@ -644,6 +663,113 @@ fn pages_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
         let again = key_at(&Shown::Main, &Press::Open(game.clone()))?;
         log::info!("scripted pages: Back at {back:?}, then the options {game} again at {again:?}");
         right = press(press(right, back), again);
+    }
+    Some(right.moving_to(Duration::from_millis(1), (at, away_from(at)), rest))
+}
+
+/// The walk of `scripted_pointer=ui3d` (see the file's notes).
+fn ui3d_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
+    use crate::{
+        console::{Press, Shown},
+        displays::displays,
+        menu_place::MenuPlace,
+        page_model::{console_rows, find_key, key_point, Form, Line, Local},
+        panel_layout::Layout,
+    };
+    use cranvr_common::menu::{Item, Request, OFF, ON};
+    use menu_model::size::{DETAIL, GAP, PADDING, ROW, TITLE, WIDTH};
+    let rest = ScriptedButtons::default();
+    let pull = ScriptedButtons { trigger: 1.0, ..rest };
+    let at = MENU_RIGHT_AT;
+    let local = Local { link: true, interface: crate::hub::hub().console().interface };
+    let now = std::time::Instant::now();
+    let pages = menu.listed();
+    let layout = Layout::default();
+    let displays_view = displays().menu_view();
+    let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays_view, wishes: Default::default(), place: MenuPlace::View, adding: false, pages: &pages, costs: true };
+    let rows = menu_model::rows(&input);
+    let height = menu_model::height(&rows);
+    let page_button = |index: usize| {
+        let mut top = PADDING + TITLE + GAP;
+        for row in &rows {
+            if let Some(at) = row.buttons.iter().position(|button| button.action == menu_model::MenuAction::OpenPage(index as u8)) {
+                let n = row.buttons.len() as f32;
+                let each = (WIDTH - 2.0 * PADDING - (n - 1.0) * GAP) / n;
+                return Some(on_view_menu(height, PADDING + at as f32 * (each + GAP) + each / 2.0, top + ROW / 2.0));
+            }
+            top += ROW + GAP + row.details.len() as f32 * DETAIL;
+        }
+        None
+    };
+    let press = |script: ScriptedController, target: [f32; 3]| {
+        script.moving_to(Duration::from_millis(1), (at, target), rest).holding(Duration::from_millis(1000), rest).holding(Duration::from_millis(200), pull).holding(Duration::from_millis(800), rest)
+    };
+    let point_of = |shown: &Shown, wanted: &Press| {
+        let rows = console_rows(Some(menu), shown, local, "", None, now);
+        let (row, key) = find_key(&rows, wanted)?;
+        let [x, y] = key_point(&rows, row, key)?;
+        Some((on_console(&rows, x, y), rows[row].line.clone()))
+    };
+    // The 3D ball in front of the user, where `hand_menu::IN_VIEW` puts it
+    let [x, y, z] = hand_menu::IN_VIEW.base;
+    let ball = Pose::at([0.0, 0.0, -1.0]).then(&Pose::at([x / 1000.0, (y + hand_menu::LIFT) / 1000.0, z / 1000.0])).position;
+    let stream = pages.iter().position(|(id, _)| id == "stream")?;
+    // A run can wait before the first press (`walk_wait_ms`), so that a system toast that covers the
+    // screen captures has gone
+    let wait = launch_args().int("walk_wait_ms").and_then(|ms| u64::try_from(ms).ok()).unwrap_or(500);
+    let mut right = ScriptedController::new(Hand::Right, at, away_from(at)).holding(Duration::from_millis(wait), rest);
+    log::info!("scripted ui3d: the ball at {ball:?}");
+    right = press(right, ball);
+    let target = page_button(stream)?;
+    log::info!("scripted ui3d: the menu's key Stream at {target:?}");
+    right = press(right, target);
+    let stream_id = pages[stream].0.clone();
+    let page = menu.page(&stream_id)?;
+    // A key: the first choice that restarts nothing
+    if let Some(change) = first_change(page) {
+        let (target, _) = point_of(&Shown::Host(stream_id.clone()), &Press::Host(change.clone()))?;
+        log::info!("scripted ui3d: the key {} at {target:?}", change.to_json());
+        right = press(right, target);
+    }
+    // A switch: the first toggle that restarts nothing
+    let flip = page.items.iter().find_map(|item| match item {
+        Item::Toggle(toggle) if !toggle.restarts => Some(Request::Set { id: toggle.id.clone(), subject: toggle.subject.clone(), value: if toggle.on { OFF } else { ON }.into() }),
+        _ => None,
+    });
+    if let Some(flip) = flip {
+        let (target, line) = point_of(&Shown::Host(stream_id.clone()), &Press::Host(flip.clone()))?;
+        let switch = matches!(line, Line::Keys { form: Form::Switch, .. });
+        log::info!("scripted ui3d: the switch {} at {target:?} (a switch: {switch})", flip.to_json());
+        right = press(right, target);
+    }
+    // A slider: the first choice of numbers that restarts nothing, on any page that the main page
+    // links. The knob is taken at the value that holds and dragged to the next one.
+    let slider = menu.pages.iter().filter(|page| pages.iter().any(|(id, _)| *id == page.id)).find_map(|page| {
+        page.items.iter().find_map(|item| match item {
+            Item::Choice(choice) if !choice.restarts => {
+                let from = choice.options.iter().position(|option| option.value == choice.value)?;
+                let to = if from + 1 < choice.options.len() { from + 1 } else { from.checked_sub(1)? };
+                let set = |index: usize| Press::Host(Request::Set { id: choice.id.clone(), subject: choice.subject.clone(), value: choice.options[index].value.clone() });
+                let shown = Shown::Host(page.id.clone());
+                let (start, line) = point_of(&shown, &set(from))?;
+                let (end, _) = point_of(&shown, &set(to))?;
+                matches!(line, Line::Keys { form: Form::Steps, .. }).then(|| (page.id.clone(), start, end, choice.options[to].value.clone()))
+            }
+            _ => None,
+        })
+    });
+    if let Some((id, start, end, value)) = slider {
+        let (back, _) = point_of(&Shown::Host(stream_id.clone()), &Press::Back)?;
+        let (link, _) = point_of(&Shown::Main, &Press::Open(id.clone()))?;
+        log::info!("scripted ui3d: Back at {back:?}, the page {id} at {link:?}, the slider from {start:?} to {end:?} for {value}");
+        right = press(press(right, back), link);
+        right = right
+            .moving_to(Duration::from_millis(1), (at, start), rest)
+            .holding(Duration::from_millis(1000), rest)
+            .holding(Duration::from_millis(500), pull)
+            .moving_to(Duration::from_millis(800), (at, end), pull)
+            .holding(Duration::from_millis(300), pull)
+            .holding(Duration::from_millis(800), rest);
     }
     Some(right.moving_to(Duration::from_millis(1), (at, away_from(at)), rest))
 }

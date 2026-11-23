@@ -98,7 +98,7 @@ fn OpenConsole(view: View, state: LinkState) {
     });
     let _ = tick.get();
     let shown = page.get();
-    let local = Local { link: matches!(state, LinkState::Streaming | LinkState::Connecting) };
+    let local = Local { link: matches!(state, LinkState::Streaming | LinkState::Connecting), interface: view.interface };
     let no_menu = match state {
         LinkState::Streaming => "The host offers no menu. Start the cranvr app on the Mac.",
         _ => "Not connected to a host.",
@@ -127,6 +127,11 @@ fn OpenConsole(view: View, state: LinkState) {
     let modifier = SubspaceModifier::new().size(size::WIDTH, height).layer_priority(crate::panel_layout::layer_rank::TEXT);
     let (controls, editable) = (view.controls, view.controls_editable);
     let notice = view.menu.as_ref().and_then(|menu| menu.notice.clone());
+    // The 3D form draws the rows of the pages on a tray. The Controls page keeps its flat form.
+    if view.interface.is_3d() && !matches!(shown, Shown::Controls(_)) {
+        crate::console_tray::ConsoleTray(place::movable("console", modifier, start, |_| {}), rows, page, (pending, notice));
+        return;
+    }
     SpatialPanel(place::movable("console", modifier, start, |_| {}), move || {
         // The pointer over the console holds the pointing hand back from the game (see `hold.rs`)
         let hovered = crate::hover::hover_modifier(crate::hover::CONSOLE);
@@ -148,16 +153,39 @@ fn OpenConsole(view: View, state: LinkState) {
     });
 }
 
-fn bold(size: f32) -> TextStyle {
+pub(crate) fn bold(size: f32) -> TextStyle {
     text_style(size, TEXT_COLOR, Some(FontWeight::BOLD))
 }
 
-fn tone_color(tone: Tone) -> Color {
+pub(crate) fn tone_color(tone: Tone) -> Color {
     match tone {
         Tone::Normal => TEXT_COLOR,
         Tone::Muted => MUTED_COLOR,
         Tone::Good => GOOD_COLOR,
         Tone::Warn => WARN_COLOR,
+    }
+}
+
+/// The name at the start of a row of keys: a setting's label, or a title with its detail. It gives
+/// the width of each key after a title, which stand at the row's end.
+#[composable]
+pub fn RowName(name: &Name) -> Option<f32> {
+    match name {
+        Name::None => None,
+        Name::Setting(label) => {
+            Text(label.clone(), Modifier::empty().width(LABEL).padding_symmetric(0.0, 8.0), text_style(22.0, TEXT_COLOR, None));
+            None
+        }
+        Name::Title { title, detail, width } => {
+            let (title, detail) = (title.clone(), detail.clone());
+            Column(Modifier::empty().weight(1.0), ColumnSpec::default(), move || {
+                Text(title.clone(), Modifier::empty(), text_style(22.0, TEXT_COLOR, Some(FontWeight::BOLD)));
+                if !detail.is_empty() {
+                    Text(detail.clone(), Modifier::empty(), text_style(18.0, MUTED_COLOR, None));
+                }
+            });
+            Some(*width)
+        }
     }
 }
 
@@ -180,28 +208,12 @@ fn RowView(row: Row, page: MutableState<Shown>, pending: MutableState<Option<Pen
         Line::Text { text, tone } => {
             Text(text, Modifier::empty().fill_max_width().height(height), text_style(22.0, tone_color(tone), None));
         }
-        Line::Keys { name, keys } => {
+        Line::Keys { name, keys, .. } => {
             Row(
                 Modifier::empty().fill_max_width().height(height),
                 RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(size::GAP)),
                 move || {
-                    let width = match &name {
-                        Name::None => None,
-                        Name::Setting(label) => {
-                            Text(label.clone(), Modifier::empty().width(LABEL).padding_symmetric(0.0, 8.0), text_style(22.0, TEXT_COLOR, None));
-                            None
-                        }
-                        Name::Title { title, detail, width } => {
-                            let (title, detail) = (title.clone(), detail.clone());
-                            Column(Modifier::empty().weight(1.0), ColumnSpec::default(), move || {
-                                Text(title.clone(), Modifier::empty(), text_style(22.0, TEXT_COLOR, Some(FontWeight::BOLD)));
-                                if !detail.is_empty() {
-                                    Text(detail.clone(), Modifier::empty(), text_style(18.0, MUTED_COLOR, None));
-                                }
-                            });
-                            Some(*width)
-                        }
-                    };
+                    let width = RowName(&name);
                     for key in keys.clone() {
                         KeyView(key, width, page, pending, notice.clone());
                     }
@@ -238,7 +250,7 @@ fn KeyView(key: Key, width: Option<f32>, page: MutableState<Shown>, pending: Mut
 
 /// Does what a key says: asks the host, opens a page or changes a setting of the client. A request
 /// to the host shows on its key until the menu shows its result.
-fn run(press: &Press, page: MutableState<Shown>, pending: MutableState<Option<Pending>>, notice: Option<String>) {
+pub(crate) fn run(press: &Press, page: MutableState<Shown>, pending: MutableState<Option<Pending>>, notice: Option<String>) {
     match press {
         Press::Host(request) => {
             pending.set(Some(Pending::new(request.clone(), notice, Instant::now())));
@@ -428,7 +440,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let rows = page_model::page_rows(&page, None);
+        let rows = page_model::page_rows(&page, None, crate::console::Interface::Flat);
         let mut robot = RobotTestRule::new(700, 1200, TestRenderer::default(), move || {
             let page = rememberMutableStateOf(Shown::default);
             let pending = rememberMutableStateOf(|| None::<Pending>);

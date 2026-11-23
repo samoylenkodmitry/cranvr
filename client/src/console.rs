@@ -64,6 +64,7 @@ pub struct Status {
 pub struct HeadsetChoices {
     pub room: Option<Room>,
     pub volume: Option<Volume>,
+    pub interface: Option<Interface>,
 }
 
 /// What the console shows: the app's pages and the host's state. The UI takes a copy of it many
@@ -123,6 +124,7 @@ impl Menu {
             headset: HeadsetChoices {
                 room: v["headset"]["room"].as_str().and_then(Room::from_key),
                 volume: v["headset"]["volume"].as_u64().and_then(|percent| Volume::from_key(&percent.to_string())),
+                interface: v["headset"]["interface"].as_str().and_then(Interface::from_key),
             },
         })
     }
@@ -235,6 +237,36 @@ impl Room {
 
     pub fn from_key(key: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|room| room.key() == key.trim())
+    }
+}
+
+/// How the headset draws the hand menu and the console.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Interface {
+    /// Trays of 3D keys, switches and sliders under the words (`spatial_ui.rs`)
+    #[default]
+    ThreeD,
+    /// Flat panels
+    Flat,
+}
+
+impl Interface {
+    pub const ALL: [Interface; 2] = [Interface::ThreeD, Interface::Flat];
+
+    /// The text under which `settings.rs` saves the choice, and the Mac's value
+    pub fn key(self) -> &'static str {
+        match self {
+            Interface::ThreeD => "3d",
+            Interface::Flat => "flat",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|interface| interface.key() == key.trim())
+    }
+
+    pub fn is_3d(self) -> bool {
+        self == Interface::ThreeD
     }
 }
 
@@ -366,6 +398,7 @@ pub struct View {
     pub menu: Option<Menu>,
     pub room: Room,
     pub volume: Volume,
+    pub interface: Interface,
     /// What the buttons do. The mapping that the Mac last sent, or the headset's copy of it while
     /// no link runs.
     pub controls: Controls,
@@ -394,6 +427,7 @@ pub struct Console {
     /// The client's own settings. The hub loads the saved ones when the app starts.
     room: Room,
     volume: Volume,
+    interface: Interface,
 }
 
 impl Console {
@@ -403,6 +437,7 @@ impl Console {
             menu: self.menu.clone(),
             room: self.room,
             volume: self.volume,
+            interface: self.interface,
             controls: self.controls,
             controls_editable: self.menu.is_some(),
         }
@@ -474,6 +509,10 @@ impl Console {
 
     pub fn set_volume(&mut self, volume: Volume) {
         self.volume = volume;
+    }
+
+    pub fn set_interface(&mut self, interface: Interface) {
+        self.interface = interface;
     }
 
     /// What decides the room behind the panels. `desktop_hides` is the host's hiding of the desktop

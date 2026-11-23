@@ -60,6 +60,7 @@
 //! start and keeps it open, for a test with no hand that would keep a ray over it.
 
 use crate::{
+    console::Interface,
     displays::displays,
     hover,
     hub::hub,
@@ -102,7 +103,7 @@ const FRONT_REACH: f32 = 1000.0 - FRONT_Z;
 /// game must not lose the right hand's buttons
 const MENU_IDLE: Duration = Duration::from_secs(20);
 /// How often the menu looks at the displays' list while it is open
-const MENU_POLL: Duration = Duration::from_millis(250);
+pub(crate) const MENU_POLL: Duration = Duration::from_millis(250);
 
 /// How the menu and the hand's display stand around the ball.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -259,10 +260,17 @@ pub struct HandState {
     pub recenter: MutableState<u32>,
 }
 
+/// How the hand's panels draw: the interface, and whether the ball is a 3D ball (see `menu_tray.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Look {
+    pub interface: Interface,
+    pub ball_3d: bool,
+}
+
 /// The ball with the menu and the hand's display. In a headset only. `controls` is the mapping of
 /// the buttons, and `streaming` says that a link streams, so a button opens the menu with a hold.
 #[composable]
-pub fn HandPanels(state: HandState, console_open: bool, controls: Controls, streaming: bool) {
+pub fn HandPanels(state: HandState, (console_open, look): (bool, Look), controls: Controls, streaming: bool) {
     // A flat window shows no ball. A test that asks for the menu gets it beside the panels instead
     // (see `flat_menu`).
     if !local_spatial_capabilities().current().is_spatial_ui_enabled() {
@@ -314,12 +322,18 @@ pub fn HandPanels(state: HandState, console_open: bool, controls: Controls, stre
     key(place, move || {
         FollowingSubspace(target.clone(), move || {
             if !gaze {
-                Strip(state, frame, on_hand);
+                if look.ball_3d {
+                    crate::menu_tray::Strip3d(state, frame, on_hand);
+                } else {
+                    Strip(state, frame, on_hand);
+                }
                 if let Some(text) = hint.clone() {
                     Hint(text, frame);
                 }
             }
-            if open {
+            if look.interface.is_3d() {
+                crate::menu_tray::MenuTray(state, console_open, frame, open);
+            } else if open {
                 Menu(state, console_open, frame);
             }
             if let Some(stream) = pinned_shown {
@@ -459,13 +473,13 @@ fn Round(fill: Color, press: RoundPress, state: HandState) {
     );
 }
 
-fn toggle_menu(state: HandState) {
+pub(crate) fn toggle_menu(state: HandState) {
     let open = !state.menu_open.get_non_reactive();
     log::info!("the hand menu {}", if open { "opens" } else { "closes" });
     state.menu_open.set(open);
 }
 
-fn toggle_hand_display(state: HandState, stream: u8) {
+pub(crate) fn toggle_hand_display(state: HandState, stream: u8) {
     let mut layout = state.layout.get_non_reactive();
     layout.toggle(PanelId::Display(stream));
     log::info!("the display on the hand {}", if layout.shown(PanelId::Display(stream)) { "shows" } else { "hides" });
@@ -519,7 +533,18 @@ pub fn Menu(state: HandState, console_open: bool, frame: HandFrame) {
             Modifier::empty().fill_max_size().then(hovered).background(PANEL_COLOR).rounded_corners(24.0).padding(menu_model::size::PADDING),
             ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(menu_model::size::GAP)),
             move || {
-                Text("cranvr", Modifier::empty().height(menu_model::size::TITLE), text_style(32.0, TEXT_COLOR, Some(FontWeight::BOLD)));
+                Row(Modifier::empty().fill_max_width().height(menu_model::size::TITLE), RowSpec::default(), || {
+                    Text("cranvr", Modifier::empty().weight(1.0), text_style(32.0, TEXT_COLOR, Some(FontWeight::BOLD)));
+                    // One press gives the 3D menus back
+                    Button(
+                        Modifier::empty().width(menu_model::size::BUTTON).fill_max_height().background(KEY_COLOR).rounded_corners(12.0),
+                        ButtonSpec::default(),
+                        || hub().pick_interface(Interface::ThreeD),
+                        || {
+                            Text("3D", Modifier::empty(), text_style(22.0, TEXT_COLOR, Some(FontWeight::BOLD)));
+                        },
+                    );
+                });
                 for row in rows.clone() {
                     RowView(row, state, adding);
                 }
@@ -531,7 +556,7 @@ pub fn Menu(state: HandState, console_open: bool, frame: HandFrame) {
 /// A display that the user asked the Mac for: how many the host listed then, its notice then and
 /// when.
 #[derive(Clone, PartialEq)]
-struct Adding {
+pub(crate) struct Adding {
     listed: usize,
     notice: Option<String>,
     since: Instant,
@@ -546,7 +571,7 @@ impl Adding {
     }
 
     /// Whether the Mac still adds the display: the host lists no new display and says nothing new.
-    fn runs(&self, view: &crate::displays::DisplaysView) -> bool {
+    pub(crate) fn runs(&self, view: &crate::displays::DisplaysView) -> bool {
         view.displays.len() <= self.listed && view.notice == self.notice && self.since.elapsed() < ADD_TIME
     }
 }
@@ -597,7 +622,7 @@ pub fn perform_remote(action: MenuAction, state: HandState) {
 
 /// Does what a button of the menu says. `adding` is the menu's note of a display that the user
 /// added, when the menu is open.
-fn perform(action: MenuAction, state: HandState, adding: Option<MutableState<Option<Adding>>>) {
+pub(crate) fn perform(action: MenuAction, state: HandState, adding: Option<MutableState<Option<Adding>>>) {
     let mut layout = state.layout.get_non_reactive();
     match action {
         MenuAction::TogglePanel(PanelId::Console) => {

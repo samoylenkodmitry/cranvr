@@ -366,7 +366,7 @@ const WINE_SETTINGS: &[Setting] = &[
     },
 ];
 
-/// The headset's own two settings. The headset applies them, the Mac keeps them. A value that the
+/// The headset's own settings. The headset applies them, the Mac keeps them. A value that the
 /// headset has not told yet shows no option.
 const HEADSET_SETTINGS: &[Setting] = &[
     Setting {
@@ -389,6 +389,17 @@ const HEADSET_SETTINGS: &[Setting] = &[
             options: |_, _| numbers(&[100, 150, 200, 300], "%"),
             get: |s| s.headset_volume.map(|v| v.to_string()).unwrap_or_default(),
             set: |s, _, v| s.headset_volume = v.parse().ok(),
+        },
+    },
+    Setting {
+        id: "headset_interface",
+        label: "Interface",
+        restarts: false,
+        hint: |_| "How the headset draws its hand menu and its console: as 3D trays with keys that sink, switches that flip and sliders, or as flat panels.",
+        kind: Kind::Choice {
+            options: |_, _| vec![Opt::new("3d", "3D"), Opt::new("flat", "Flat")],
+            get: |s| s.headset_interface.clone().unwrap_or_default(),
+            set: |s, _, v| s.headset_interface = Some(v.into()),
         },
     },
 ];
@@ -772,7 +783,7 @@ fn wine_page(settings: &Settings, model: &Model) -> Page {
 fn headset_page(settings: &Settings, model: &Model) -> Page {
     let mut items = vec![Item::Heading { text: "Headset".into() }];
     items.extend(HEADSET_SETTINGS.iter().map(|setting| setting.item(settings, model)));
-    if settings.headset_room.is_none() || settings.headset_volume.is_none() {
+    if settings.headset_room.is_none() || settings.headset_volume.is_none() || settings.headset_interface.is_none() {
         items.push(Item::Text { text: "The headset tells its own choice when it connects.".into(), tone: Tone::Muted });
     }
     Page { id: HEADSET.into(), title: "Headset".into(), short: "Headset".into(), listed: true, items }
