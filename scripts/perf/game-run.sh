@@ -61,10 +61,11 @@ guardian_pause adb || { echo "cannot read Guardian's value"; exit 1; }
 launch_extras=(--ez connect true)
 [[ -n $CRANVR_HOST ]] && launch_extras+=(--es host $CRANVR_HOST)
 adb shell am force-stop dev.cranvr.client
-adb shell am start -n dev.cranvr.client/dev.cranpose.android.CranposeActivity $launch_extras > /dev/null
-for i in {1..120}; do tail -n +$skip "$log" | grep -q "Headset connected" && break; sleep 1; done
-tail -n +$skip "$log" | grep -q "Headset connected" || { echo "no headset"; exit 1; }
-sleep 3
+# The client counts as started when it still runs 3 s after its link (scripts/client-start.zsh)
+adb_cmd=(adb)
+source $repo/scripts/client-start.zsh
+CLIENT_LINK_WAIT=120 client_start "$log" $launch_extras
+[[ $client_result == alive ]] || { echo "the headset did not start: $client_result"; [[ -n $client_crash ]] && print -l -- ${(f)client_crash}; exit 1; }
 if [[ -n $HZ ]]; then
     paced_hz=$(awk '{ print $5 }' "$config/runtime-control.txt")
     set_pacing $HZ

@@ -16,8 +16,9 @@
 # script starts a test host with its own folder in WORKDIR and the standard mapping, so the user's
 # host, its files and its mapping stay as they are. The client starts with `default_places` and
 # `first_start`, so it ignores and keeps no carried place and saves no state of the menu's hint. It
-# reaches the host through `adb reverse`, with its USB network off. Hold the Quest lock, start the
-# user's client again afterwards and install the normal build.
+# reaches the host through `adb reverse`, with its USB network off. Hold the Quest lock. At the end the script puts the user's
+# client back on 9950 (scripts/give-back.sh), also after a failure. CRANVR_GIVE_BACK_APK names a
+# build that give-back.sh installs first, such as the normal build.
 set -u
 serial=$1 work=$2 case=$3
 default_seconds=18
@@ -25,6 +26,14 @@ default_seconds=18
 seconds=${4:-${default_seconds}} port=${5:-9961}
 root=${0:A:h:h}
 adb_cmd=(adb -s ${serial})
+# The user's client goes back on its host at the end, also when the run fails or stops early
+finish() {
+    kill ${host:-} ${logcat:-} 2> /dev/null
+    ${adb_cmd} shell am force-stop dev.cranvr.client
+    ${root}/scripts/give-back.sh ${serial} ${CRANVR_GIVE_BACK_APK:-}
+}
+trap finish EXIT
+trap 'exit 130' INT TERM
 mkdir -p ${work}/config
 # The standard mapping: a menu with no page and no entry in `controls`
 print '{"pages": [], "controls": {}}' > ${work}/config/vr-menu.json

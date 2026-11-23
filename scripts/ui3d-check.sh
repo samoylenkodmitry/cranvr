@@ -18,13 +18,22 @@
 # The client starts with `interface=3d`, `save_choices=false`, its own set of panels (`shown`) and
 # `first_start`, so it saves nothing over the user's choices, layout or menu hint. The Quest must run a
 # build from `scripts/build-client.sh --scripted-hand`, and `cargo build --release` must have built
-# cranvr and cranvr-host. Hold the Quest lock, start the user's client again afterwards and install
-# the normal build.
+# cranvr and cranvr-host. Hold the Quest lock. At the end the script puts the user's
+# client back on 9950 (scripts/give-back.sh), also after a failure. CRANVR_GIVE_BACK_APK names a
+# build that give-back.sh installs first, such as the normal build.
 set -u
 serial=$1 work=$2
 captures=${3:-} seconds=${4:-32} port=${5:-9961}
 root=${0:A:h:h}
 adb_cmd=(adb -s ${serial})
+# The user's client goes back on its host at the end, also when the run fails or stops early
+finish() {
+    kill ${app:-} ${logcat:-} 2> /dev/null
+    ${adb_cmd} shell am force-stop dev.cranvr.client
+    ${root}/scripts/give-back.sh ${serial} ${CRANVR_GIVE_BACK_APK:-}
+}
+trap finish EXIT
+trap 'exit 130' INT TERM
 home=${work}/home
 mkdir -p ${home}
 # The entries that the walk changes stand in the file, so the check shows their change

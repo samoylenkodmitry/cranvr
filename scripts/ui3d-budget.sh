@@ -21,19 +21,36 @@
 #
 # The client must be a build of `scripts/build-client.sh --scripted-hand`, and `cargo build --release`
 # must have built cranvr-host and cranvr-fake-game. It starts with `save_choices=false`, its own set
-# of panels (`shown`) and `first_start`, so it saves nothing of the user's. Hold the Quest lock and
-# start the user's client again afterwards.
+# of panels (`shown`) and `first_start`, so it saves nothing of the user's. A case counts only when
+# the client still runs 3 s after its link (scripts/client-start.zsh). Hold the Quest lock. At the
+# end the script puts the user's client back on 9950 (scripts/give-back.sh), also after a failure.
+# CRANVR_GIVE_BACK_APK names a build that give-back.sh installs first, such as the normal build.
 set -u
 serial=$1 work=$2
 secs=${3:-3} port=${4:-9961}
 root=${0:A:h:h}
 adb_cmd=(adb -s ${serial})
+source ${root}/scripts/client-start.zsh
 mkdir -p ${work}/host
 ${root}/target/release/cranvr-host --native-port ${port} --trust-all --fps 120 --config-dir ${work}/host --discovery-port 0 --no-game-audio --no-microphone --no-hand-controllers > ${work}/host.log 2>&1 &
 host=$!
-sleep 1
-${adb_cmd} reverse tcp:${port} tcp:${port} > /dev/null
 game=""
+finish() {
+    ${adb_cmd} shell am force-stop ${CLIENT_PACKAGE}
+    [[ -n ${game} ]] && kill ${game} 2> /dev/null
+    kill ${host} 2> /dev/null
+    wait 2> /dev/null
+    ${adb_cmd} reverse --remove tcp:${port} > /dev/null 2>&1
+    ${root}/scripts/give-back.sh ${serial} ${CRANVR_GIVE_BACK_APK:-}
+}
+trap finish EXIT
+trap 'exit 130' INT TERM
+sleep 1
+# A change of the headset's USB functions drops the test port's reverse: set it while the client waits
+client_waiting() {
+    ${adb_cmd} reverse tcp:${port} tcp:${port} > /dev/null 2>&1
+}
+client_waiting
 # The first start after an install shows the system's notice for a few seconds, so a start that
 # nobody measures comes first.
 cases=(${=CASES:-flat:closed:none 3d:closed:none flat:open:none 3d:open:none flat:closed:holding 3d:closed:holding game:flat:holding game:3d:holding})
@@ -54,24 +71,22 @@ for case in warm:closed:none ${cases}; do
     extras=(--es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room scene --es interface ${interface} --ez save_choices false --ez first_start true --es shown ${panels} --es forget_host_key 127.0.0.1:${port} --es scripted_pointer ${pointer})
     [[ ${menu} == open ]] && extras+=(--es hand_menu open)
     # A change of the headset's USB functions drops the test port's `adb reverse` and ends the link.
-    # The script sets the port again until the client links, and runs a case once more when its
-    # link ended.
+    # The client counts as started when it still runs 3 s after its link. A case runs once more when
+    # its start did not hold or its link ended.
     for attempt in 1 2; do
-        ${adb_cmd} shell am force-stop dev.cranvr.client
+        ${adb_cmd} shell am force-stop ${CLIENT_PACKAGE}
         ${adb_cmd} shell am broadcast -a com.oculus.vrpowermanager.prox_close > /dev/null
         ${adb_cmd} logcat -c
-        linked=$(grep -c "Headset connected" ${work}/host.log)
-        ${adb_cmd} shell am start -n dev.cranvr.client/dev.cranpose.android.CranposeActivity ${extras} > /dev/null
-        for i in {1..15}; do
-            sleep 1
-            (( $(grep -c "Headset connected" ${work}/host.log) > linked )) && break
-            ${adb_cmd} reverse tcp:${port} tcp:${port} > /dev/null
-        done
+        client_start ${work}/host.log ${extras}
         ended=$(grep -c "Headset disconnected" ${work}/host.log)
-        sleep $((secs + 3))
-        streamed=1
-        (( $(grep -c "Headset connected" ${work}/host.log) > linked )) || streamed=0
-        (( $(grep -c "Headset disconnected" ${work}/host.log) > ended )) && streamed=0
+        streamed=0
+        if [[ ${client_result} == alive ]]; then
+            sleep ${secs}
+            (( $(grep -c "Headset disconnected" ${work}/host.log) == ended )) && streamed=1
+        else
+            print "the start did not hold (${client_result})"
+            [[ -n ${client_crash} ]] && print -l -- "  "${(f)^client_crash}
+        fi
         (( streamed )) && break
     done
     [[ ${parts[1]} == warm ]] && continue
@@ -82,10 +97,5 @@ for case in warm:closed:none ${cases}; do
     grep -E 'fps received' ${work}/logcat-${case//:/-}.txt | tail -1 | sed -E 's/.*connection: //' | cut -c1-90
     (( streamed )) || print "the stream did not run through the case"
 done
-${adb_cmd} shell am force-stop dev.cranvr.client
 print "The host's game frames while the fake game ran:"
 grep -E '[0-9.]+ fps \([0-9]+ game frames\)' ${work}/host.log | tail -2 | sed -E 's/.*INFO\] //' | cut -c1-80
-[[ -n ${game} ]] && kill ${game} 2> /dev/null
-kill ${host}
-wait 2> /dev/null
-${adb_cmd} reverse --remove tcp:${port} > /dev/null 2>&1
