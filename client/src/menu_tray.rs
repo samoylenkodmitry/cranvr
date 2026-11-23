@@ -8,8 +8,9 @@
 //!
 //! The menu's tray shows as it opens and hides as it closes. After the hide it composes nothing:
 //! no panel, no meshes and no look at the displays, so a closed menu costs nothing. The ball's
-//! meshes join the scene that the controllers' models draw. While a game runs and no model shows,
-//! the scene has nothing else, so the flat ball stands in for the 3D one (`ball_3d`).
+//! meshes join the scene that the controllers' models draw. While no model shows and the menu is
+//! closed, the scene would draw for the ball alone, so the flat ball stands in for the 3D one
+//! (`ball_3d`), in a game and outside one.
 
 use crate::{
     console::Interface,
