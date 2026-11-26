@@ -67,8 +67,10 @@ pub fn start_for(ceiling: u64, cable: bool, fps: f32) -> u64 {
 /// Wi-Fi limit before #97 sent about 8.5 Mbps at 120 Hz.
 pub const FLOOR_BPS: u64 = 10_000_000;
 /// A second needs reports of at least this share of the refresh rate to count. A headset that shows
-/// no stream (Room at Passthrough, no game) reports nothing, and one without input focus gets no
-/// frames.
+/// no stream (Room at Passthrough, no game) reports nothing while the host sends. A slow game, such
+/// as one that loads, sends fewer frames than that and gets as few reports: such a second tells
+/// nothing either way. A headset without input focus gets no frames, and the frame loop then does
+/// not tick.
 const MIN_FRAMES_SHARE: f64 = 0.25;
 /// After this many seconds without reports the target falls to the floor: nobody sees the picture,
 /// and its bits cost the Mac's encoder, the link and the headset's decoder (#97: the headset decoded
@@ -211,7 +213,12 @@ impl Control {
     pub fn tick(&mut self, second: Option<Second>) -> Option<Change> {
         self.probe_in = self.probe_in.saturating_sub(1);
         let Some(second) = second.filter(|s| s.frames >= self.min_frames) else {
-            return self.silence();
+            // Frames went out and the headset reported few: it shows no stream. Few frames went out:
+            // a slow game, which says nothing.
+            return match second {
+                Some(s) if s.sent >= self.min_frames => self.silence(),
+                _ => None,
+            };
         };
         if self.silent >= SILENT_TICKS {
             let from = self.target;
@@ -241,6 +248,14 @@ impl Control {
         }
         self.calm = 0;
         self.raise()
+    }
+
+    /// The stream paused, as while the headset's app has no input focus. The next seconds decide
+    /// nothing, as at a start, and the target stays.
+    pub fn hold(&mut self) {
+        self.hold = self.hold.max(START_TICKS);
+        self.span.clear();
+        self.calm = 0;
     }
 
     fn silence(&mut self) -> Option<Change> {

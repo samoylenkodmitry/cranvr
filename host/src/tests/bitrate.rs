@@ -157,7 +157,7 @@ fn a_headset_that_shows_no_stream_gets_the_floor_and_the_start_again_when_it_sho
     for _ in 0..60 {
         assert_eq!(control.tick(unseen), None);
         assert_eq!(control.tick(None), None);
-        assert_eq!(control.tick(Some(second(10, 10))), None, "a few reports are no stream shown");
+        assert_eq!(control.tick(Some(Second { frames: 10, missed: 10, sent: 120, network_ms: 1.0 })), None, "a few reports are no stream shown");
     }
     assert_eq!(control.target(), FLOOR_BPS);
     // A game starts and the headset shows it. Its first reports also count the frames that the
@@ -224,4 +224,39 @@ fn a_session_over_a_network_starts_lower_than_over_the_cable() {
     assert_eq!(start_for(200 * MBPS, false, 72.0), 60 * MBPS);
     // A setting under the start stays
     assert_eq!(start_for(50 * MBPS, false, 120.0), 50 * MBPS);
+}
+
+#[test]
+fn a_slow_game_is_no_hidden_stream() {
+    let mut control = Control::new(200 * MBPS, 200 * MBPS, FPS);
+    for _ in 0..5 {
+        control.tick(calm());
+    }
+    // A game that loads makes 25 frames a second at 120 Hz, and the headset shows them all
+    for _ in 0..10 {
+        assert_eq!(control.tick(Some(second(25, 0))), None);
+    }
+    assert_eq!(control.target(), 200 * MBPS);
+    // When it runs again, no restart: the control goes on
+    for _ in 0..5 {
+        assert_eq!(control.tick(calm()), None);
+    }
+    assert_eq!(control.target(), 200 * MBPS);
+}
+
+#[test]
+fn the_seconds_after_a_pause_decide_nothing_and_keep_the_target() {
+    let mut control = Control::new(200 * MBPS, 100 * MBPS, FPS);
+    for _ in 0..5 {
+        control.tick(calm());
+    }
+    let before = control.target();
+    // The headset's app had no input focus. Its first reports after the pause also count the frames
+    // that it never showed.
+    control.hold();
+    assert_eq!(control.tick(Some(second(120, 31))), None);
+    assert_eq!(control.tick(Some(second(120, 20))), None);
+    assert_eq!(control.target(), before);
+    // After that the control judges again
+    assert!(matches!(control.tick(Some(second(120, 30))), Some(Change::Cut { .. })));
 }
