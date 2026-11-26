@@ -8,6 +8,7 @@ mod display_modes;
 mod eye_check;
 mod game_audio;
 mod game_sizes;
+mod gpu_health;
 mod hand_controller;
 mod hand_interaction;
 mod hand_mask;
@@ -36,7 +37,7 @@ use cranvr_vt::{EncodedFrame, Encoder, EncoderConfig, PixelBuffer};
 use headset::{Device, Event, FrameSlice, Headset, OutFrame};
 use log::{error, info, warn};
 use pose::Pose;
-use render::{ComposeParams, Params, Renderer};
+use render::{ComposeParams, Params, RenderError, Renderer};
 use runtime_link::{GameEvent, GameFrame, RuntimeLink, Swapchains};
 use serde_json::json;
 use session::{Negotiated, Options};
@@ -951,6 +952,25 @@ fn watch_eyes(watch: &mut eye_check::Watch, program: Option<&str>, frame: &GameF
     }
 }
 
+/// Ends the host because the GPU no longer draws its frames. The cranvr app starts a new host,
+/// which macOS lets use the GPU again (issue #148).
+fn end_for_gpu(reason: &str) -> ! {
+    error!("Render: {reason}. The host ends. The cranvr app starts a new one");
+    status::emit(json!({"type": "gpu", "ok": false, "message": reason}));
+    std::process::exit(gpu_health::EXIT_GPU)
+}
+
+/// Ends the host when a frame waits for the GPU longer than macOS takes to stop a hung command
+/// buffer. The GPU then does not come back for this host. The frame loop would wait forever.
+fn watch_gpu_waits(wait: render::GpuWait) {
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_millis(250));
+        if let Some(waited) = wait.waited().filter(|w| *w > gpu_health::MAX_GPU_WAIT) {
+            end_for_gpu(&format!("a frame has waited {:.1} s for the GPU", waited.as_secs_f64()));
+        }
+    });
+}
+
 /// Encodes one frame per game frame while a game runs, and one test scene frame per headset
 /// frame otherwise.
 fn frame_loop(
@@ -970,6 +990,8 @@ fn frame_loop(
         }
     };
     info!("Rendering on {}", renderer.device_name());
+    watch_gpu_waits(renderer.gpu_wait());
+    let mut gpu_health = gpu_health::GpuHealth::default();
 
     let capture = desktop_options
         .enabled
@@ -1403,10 +1425,34 @@ fn frame_loop(
             }
         };
         match drawn {
-            Ok(true) => {}
+            Ok(true) => {
+                if let Some(line) = gpu_health.drew(renderer.last_wall_s * 1000.0, renderer.last_gpu_s * 1000.0, Instant::now()) {
+                    warn!("{line}");
+                }
+            }
             Ok(false) => continue,
-            Err(e) => {
+            Err(RenderError::Setup(e)) => {
                 error!("Render: {e}");
+                continue;
+            }
+            Err(RenderError::Gpu(e)) => {
+                let (verdict, line) = gpu_health.failed(&e, Instant::now());
+                if let Some(line) = line {
+                    error!("{line}");
+                }
+                match verdict {
+                    gpu_health::Verdict::Continue => {}
+                    gpu_health::Verdict::NewQueues => {
+                        warn!("Render: macOS ignores the GPU work of this host; the host tries new command queues");
+                        if let Err(e) = renderer.renew_queues() {
+                            end_for_gpu(&format!("no new command queue: {e}"));
+                        }
+                        // A desktop copy may have failed while macOS ignored the host: the next
+                        // frame copies the newest capture again
+                        desktop_seq = 0;
+                    }
+                    gpu_health::Verdict::Exit(reason) => end_for_gpu(&reason),
+                }
                 continue;
             }
         }

@@ -9,10 +9,78 @@ use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState,
-    MTLBlitCommandEncoder, MTLCommandBufferStatus, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLOrigin,
-    MTLPixelFormat, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
+    MTLBlitCommandEncoder, MTLCommandBufferError, MTLCommandBufferStatus, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLLibrary, MTLOrigin, MTLPixelFormat, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
-use std::{ffi::c_void, ptr, ptr::NonNull};
+use std::{
+    ffi::c_void,
+    fmt,
+    ptr,
+    ptr::NonNull,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
+
+/// A frame that the GPU did not draw.
+#[derive(Debug)]
+pub enum RenderError {
+    /// The frame's textures or command buffer could not be made
+    Setup(String),
+    /// The GPU stopped the frame's command buffer
+    Gpu(GpuError),
+}
+
+impl fmt::Display for RenderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RenderError::Setup(e) => f.write_str(e),
+            RenderError::Gpu(e) => e.fmt(f),
+        }
+    }
+}
+
+impl From<String> for RenderError {
+    fn from(e: String) -> Self {
+        RenderError::Setup(e)
+    }
+}
+
+impl From<&str> for RenderError {
+    fn from(e: &str) -> Self {
+        RenderError::Setup(e.to_string())
+    }
+}
+
+/// The error of a command buffer that the GPU stopped, with the times of the command buffer.
+#[derive(Debug)]
+pub struct GpuError {
+    /// Metal's code (`MTLCommandBufferError`)
+    pub code: usize,
+    /// Metal's text. macOS puts the reason in it, for example "Impacting Interactivity" or
+    /// "Caused GPU Hang Error".
+    pub text: String,
+    /// The time from the commit to the end of the command buffer, in milliseconds
+    pub wall_ms: f64,
+    /// The time from the GPU's start to its end of the command buffer, in milliseconds
+    pub gpu_ms: f64,
+}
+
+impl GpuError {
+    /// macOS ignores all GPU work of a process that caused GPU errors too often: "Ignored (for
+    /// causing prior/excessive GPU errors)". Metal names it access revoked.
+    pub fn ignored(&self) -> bool {
+        self.code == MTLCommandBufferError::AccessRevoked.0
+    }
+}
+
+impl fmt::Display for GpuError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "GPU error {}: {} (the command buffer took {:.0} ms, {:.1} ms of it on the GPU)", self.code, self.text, self.wall_ms, self.gpu_ms)
+    }
+}
 
 /// Must match `Params` in pattern.metal. Every field is 16 bytes or a group of four u32.
 #[repr(C)]
@@ -100,6 +168,17 @@ pub struct Renderer {
     upload: Option<(Upload, Retained<ProtocolObject<dyn MTLTexture>>)>,
     /// GPU execution time of the last dispatch, in seconds
     pub last_gpu_s: f64,
+    /// The time from the commit to the end of the last dispatch, in seconds
+    pub last_wall_s: f64,
+    /// While a dispatch waits for the GPU: the time of its commit, in milliseconds after `epoch`,
+    /// plus one. Zero while none waits. A watchdog reads it (see `GpuWait`).
+    waiting_since: Arc<AtomicU64>,
+    epoch: Instant,
+    /// For a test of the host's watch over the GPU: when one frame's command buffer starts to wait
+    /// for an event that nobody signals, as on a GPU that does not come back. Only this process
+    /// waits: macOS stops such a command buffer after 5 s with a timeout. No other process sees
+    /// it. `CRANVR_TEST_GPU_STALL` holds the seconds from the renderer's start.
+    stall_at: Option<Instant>,
     /// GPU time of desktop copies since the caller last reset it, in seconds, and their count
     pub upload_gpu_s: f64,
     pub uploads: u32,
@@ -175,9 +254,29 @@ impl Renderer {
             spare: None,
             upload: None,
             last_gpu_s: 0.0,
+            last_wall_s: 0.0,
+            waiting_since: Arc::new(AtomicU64::new(0)),
+            epoch: Instant::now(),
+            stall_at: std::env::var("CRANVR_TEST_GPU_STALL")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|s| Instant::now() + std::time::Duration::from_secs_f64(s)),
             upload_gpu_s: 0.0,
             uploads: 0,
         })
+    }
+
+    /// Makes new command queues on the same device. macOS may ignore the work of the old queues
+    /// after GPU errors (see `gpu_health.rs`). A desktop copy in flight finishes on its old queue.
+    pub fn renew_queues(&mut self) -> Result<(), String> {
+        self.queue = self.device.newCommandQueue().ok_or("no command queue")?;
+        self.upload_queue = self.device.newCommandQueue().ok_or("no command queue")?;
+        Ok(())
+    }
+
+    /// The watch of this renderer's waits for the GPU, for a thread of its own.
+    pub fn gpu_wait(&self) -> GpuWait {
+        GpuWait { waiting_since: Arc::clone(&self.waiting_since), epoch: self.epoch }
     }
 
     /// Starts copying a new desktop capture into GPU memory, with mipmaps. Returns false and
@@ -233,7 +332,7 @@ impl Renderer {
 
     /// Draws the scene into `out` and waits for the GPU. The screen in `params` shows the last
     /// image given to `set_desktop`.
-    pub fn render(&mut self, out: &PixelBuffer, params: &Params) -> Result<(), String> {
+    pub fn render(&mut self, out: &PixelBuffer, params: &Params) -> Result<(), RenderError> {
         self.finish_upload();
         let (pipeline, desktop) = (self.pattern.clone(), self.desktop.clone());
         self.run(&pipeline, out, &[], &[&desktop], bytes_of(params))
@@ -241,7 +340,7 @@ impl Renderer {
 
     /// Copies the two eyes of a game frame into `out` and waits for the GPU. After this returns,
     /// the game may reuse its images.
-    pub fn compose(&mut self, out: &PixelBuffer, left: &PixelBuffer, right: &PixelBuffer, params: &ComposeParams) -> Result<(), String> {
+    pub fn compose(&mut self, out: &PixelBuffer, left: &PixelBuffer, right: &PixelBuffer, params: &ComposeParams) -> Result<(), RenderError> {
         let pipeline = self.compose.clone();
         self.run(&pipeline, out, &[left, right], &[], bytes_of(params))
     }
@@ -265,7 +364,7 @@ impl Renderer {
         sources: &[&PixelBuffer],
         textures_after: &[&ProtocolObject<dyn MTLTexture>],
         params: &[u8],
-    ) -> Result<(), String> {
+    ) -> Result<(), RenderError> {
         let (w, h) = (out.width(), out.height());
         let mut keep = CvTextures(Vec::new());
         let mut textures = vec![
@@ -279,6 +378,12 @@ impl Renderer {
         textures.extend(textures_after.iter().map(|t| *t as *const ProtocolObject<dyn MTLTexture>));
         let result = unsafe {
             let commands = self.queue.commandBuffer().ok_or("no command buffer")?;
+            if self.stall_at.is_some_and(|at| Instant::now() >= at) {
+                self.stall_at = None;
+                let never = self.device.newSharedEvent().ok_or("no shared event")?;
+                log::warn!("Render: a test makes this frame wait for an event that nobody signals");
+                commands.encodeWaitForEvent_value(ProtocolObject::from_ref(&*never), 1);
+            }
             let encoder = commands.computeCommandEncoder().ok_or("no compute encoder")?;
             encoder.setComputePipelineState(pipeline);
             for (i, t) in textures.iter().enumerate() {
@@ -288,17 +393,42 @@ impl Renderer {
             let grid = MTLSize { width: w.div_ceil(2), height: h.div_ceil(2), depth: 1 };
             encoder.dispatchThreads_threadsPerThreadgroup(grid, MTLSize { width: 16, height: 16, depth: 1 });
             encoder.endEncoding();
+            let committed = Instant::now();
+            self.waiting_since.store(committed.duration_since(self.epoch).as_millis() as u64 + 1, Ordering::Relaxed);
             commands.commit();
             commands.waitUntilCompleted();
+            self.waiting_since.store(0, Ordering::Relaxed);
+            self.last_wall_s = committed.elapsed().as_secs_f64();
             self.last_gpu_s = commands.GPUEndTime() - commands.GPUStartTime();
             match commands.error() {
-                Some(e) => Err(format!("GPU error: {e}")),
+                Some(e) => Err(RenderError::Gpu(GpuError {
+                    code: e.code() as usize,
+                    text: e.localizedDescription().to_string(),
+                    wall_ms: self.last_wall_s * 1000.0,
+                    gpu_ms: self.last_gpu_s * 1000.0,
+                })),
                 None => Ok(()),
             }
         };
         drop(keep);
         unsafe { CVMetalTextureCacheFlush(self.texture_cache, 0) };
         result
+    }
+}
+
+/// Tells how long a dispatch of a renderer has waited for the GPU, from any thread.
+pub struct GpuWait {
+    waiting_since: Arc<AtomicU64>,
+    epoch: Instant,
+}
+
+impl GpuWait {
+    /// How long the dispatch that waits now has waited, or `None` while none waits.
+    pub fn waited(&self) -> Option<std::time::Duration> {
+        match self.waiting_since.load(Ordering::Relaxed) {
+            0 => None,
+            since => Some(self.epoch.elapsed().saturating_sub(std::time::Duration::from_millis(since - 1))),
+        }
     }
 }
 

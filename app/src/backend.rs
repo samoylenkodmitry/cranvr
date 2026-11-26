@@ -17,11 +17,12 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
+        atomic::{AtomicU32, Ordering},
         mpsc::{self, Receiver, Sender},
         Arc, Mutex, OnceLock,
     },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 /// The TCP port of the native protocol, `cranvr-host`'s default for `--native-port`.
@@ -475,6 +476,9 @@ pub struct Model {
     /// The virtual display is the main display now: a headset streams
     pub vr_main: bool,
     pub stats: Option<Stats>,
+    /// The last stats line of the host, or the headset's connection before the first one. The
+    /// host sends one every 5 s while a headset streams, also while the stream pauses.
+    pub stats_at: Option<Instant>,
     /// The host's state in native mode, once it has said it
     pub native: Option<Native>,
     /// This Mac's addresses on the local network: the headset connects to one of them
@@ -560,6 +564,13 @@ pub fn forget_game_sizes() {
 }
 
 impl Model {
+    /// A headset streams with no game. The host sent no stats line for `STALL`: its frame loop
+    /// stopped. A game may hold the picture for a long time while it loads. A connected game
+    /// therefore leaves the host alone.
+    pub fn stream_stalled(&self, now: Instant) -> bool {
+        self.headset.is_some() && self.game.is_none() && self.stats_at.is_some_and(|at| now.duration_since(at) > STALL)
+    }
+
     pub fn log(&mut self, line: String) {
         if self.log.len() == LOG_LINES {
             self.log.pop_front();
@@ -582,6 +593,7 @@ impl Model {
                     foveation: v["foveation"].as_str().and_then(FoveationLevel::parse).filter(|level| *level != FoveationLevel::Off),
                     path: v["cable"].as_bool().map(StreamPath::of),
                 });
+                self.stats_at = self.headset.is_some().then(Instant::now);
                 if self.headset.is_none() {
                     self.stats = None;
                     self.vr_main = false;
@@ -631,6 +643,7 @@ impl Model {
             Some("headset_page") => self.headset_page = serde_json::from_value(v["page"].clone()).ok(),
             Some("black_eye") => self.black_eyes.push(v.clone()),
             Some("stats") => {
+                self.stats_at = Some(Instant::now());
                 self.stats = Some(Stats {
                     fps: v["fps"].as_f64().unwrap_or(0.0),
                     game_frames: v["game_frames"].as_u64().unwrap_or(0),
@@ -689,6 +702,102 @@ pub fn take_chosen() -> Vec<Chosen> {
 }
 
 static HOST: Mutex<Option<Child>> = Mutex::new(None);
+/// The process ID of the last host whose output ended: all its lines are in the channel then
+static LAST_EXITED: AtomicU32 = AtomicU32::new(0);
+static WATCH: Mutex<Watch> = Mutex::new(Watch { started: None, quick_ends: 0, ended_at: None });
+
+/// A host that sends no stats line this long while a headset streams is stuck (`Model::stream_stalled`)
+const STALL: Duration = Duration::from_secs(15);
+/// A host that ran this long ended for a reason of its own time, not of its start
+const QUICK_END: Duration = Duration::from_secs(60);
+/// After this many quick ends in a row the app stops starting the host: it cannot start
+const MAX_QUICK_ENDS: u32 = 5;
+
+/// The app's watch over the host that it started (issue #148). A host that ends by itself, for
+/// example when macOS ignores its GPU work, starts again at once. A host whose frame loop stopped
+/// starts again too. Hosts that end soon after their start, again and again, wait longer each time
+/// (see `Watch::delay`).
+struct Watch {
+    /// The start of the current host, by the user or by the watch
+    started: Option<Instant>,
+    /// The hosts in a row that ended within `QUICK_END` of their start
+    quick_ends: u32,
+    /// When the watch saw the current host's end
+    ended_at: Option<Instant>,
+}
+
+impl Watch {
+    /// How long a new start waits after the end of a host that ran `lived`, or `None` when the app
+    /// gives up. A host that ran long starts again at once. The first quick end starts again at
+    /// once too. Each further quick end in a row waits twice as long as the one before, from 2 s.
+    fn delay(&self, lived: Duration) -> Option<Duration> {
+        if lived >= QUICK_END {
+            return Some(Duration::ZERO);
+        }
+        match self.quick_ends + 1 {
+            ends if ends >= MAX_QUICK_ENDS => None,
+            1 => Some(Duration::ZERO),
+            ends => Some(Duration::from_secs(1 << (ends - 1))),
+        }
+    }
+
+    /// Counts the end of a host that ran `lived`.
+    fn count(&mut self, lived: Duration) {
+        self.quick_ends = if lived >= QUICK_END { 0 } else { self.quick_ends + 1 };
+    }
+}
+
+/// The app wants a host: one runs, or one ended by itself and the watch starts it again. False
+/// after `stop_host` and after the watch gave up.
+pub fn host_wanted() -> bool {
+    HOST.lock().unwrap().is_some()
+}
+
+/// Starts the host again when it ended by itself or its stream stalled (see [`Watch`]). Returns
+/// what the watch did, for the log.
+pub fn watch_host(settings: &Settings, model: &Model) -> Option<String> {
+    let now = Instant::now();
+    let mut watch = WATCH.lock().unwrap();
+    let reason = {
+        let mut host = HOST.lock().unwrap();
+        let child = host.as_mut()?;
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let ended_at = *watch.ended_at.get_or_insert(now);
+                // The old host's last lines come first. They then do not mix with the new host's.
+                // A host whose output stays open (a helper that took it) gets 2 s.
+                if LAST_EXITED.load(Ordering::Relaxed) != child.id() && now.duration_since(ended_at) < Duration::from_secs(2) {
+                    return None;
+                }
+                format!("the host ended by itself ({status})")
+            }
+            _ if model.stream_stalled(now) => format!("the host sent no numbers for {} s while the headset streamed", STALL.as_secs()),
+            _ => return None,
+        }
+    };
+    let ended_at = *watch.ended_at.get_or_insert(now);
+    let lived = watch.started.map_or(Duration::MAX, |started| ended_at.duration_since(started));
+    let Some(delay) = watch.delay(lived) else {
+        watch.quick_ends = 0;
+        drop(watch);
+        stop_host();
+        return Some(format!("cranvr: {reason}, {MAX_QUICK_ENDS} times within a minute of its start. Start it again with Restart the host."));
+    };
+    if now.duration_since(ended_at) < delay {
+        return None;
+    }
+    watch.count(lived);
+    drop(watch);
+    Some(match start_host(settings) {
+        Ok(()) => {
+            let line = format!("cranvr: {reason}; the app started it again");
+            HostLog::note(&line);
+            line
+        }
+        Err(e) => format!("cranvr: {reason}; the app could not start it again: {e}"),
+    })
+}
+
 /// The host's input. The user's answers to a headset's request go there.
 static HOST_INPUT: Mutex<Option<ChildStdin>> = Mutex::new(None);
 
@@ -803,11 +912,18 @@ pub fn start_host(settings: &Settings) -> Result<(), String> {
     let mut command = Command::new(host_binary()?);
     command.args(host_args(settings, &config_dir(), env::var_os("CRANVR_TEST_TRUST_ALL").is_some()));
     let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
+    let pid = child.id();
+    {
+        let mut watch = WATCH.lock().unwrap();
+        watch.started = Some(Instant::now());
+        watch.ended_at = None;
+    }
     *HOST_INPUT.lock().unwrap() = child.stdin.take();
     let sender = channel().0.clone();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let log = HostLog::create();
+    *CURRENT_LOG.lock().unwrap() = Some(log.clone());
     {
         let sender = sender.clone();
         let log = log.clone();
@@ -821,6 +937,7 @@ pub fn start_host(settings: &Settings) -> Result<(), String> {
                 sender.send(msg).ok();
             }
             sender.send(HostLine::Exited).ok();
+            LAST_EXITED.store(pid, Ordering::Relaxed);
         });
     }
     thread::spawn(move || {
@@ -842,10 +959,24 @@ struct HostLog {
     started: Instant,
 }
 
+/// The log of the host that runs now
+static CURRENT_LOG: Mutex<Option<HostLog>> = Mutex::new(None);
+
 impl HostLog {
+    /// A new, empty `host.log`. The last host's log stays as `host-previous.log`: the watch starts a
+    /// new host after an end. The old log says why it ended.
     fn create() -> Self {
-        let file = fs::File::create(config_dir().join("host.log")).ok().map(|f| Arc::new(Mutex::new(f)));
+        let path = config_dir().join("host.log");
+        fs::rename(&path, config_dir().join("host-previous.log")).ok();
+        let file = fs::File::create(path).ok().map(|f| Arc::new(Mutex::new(f)));
         Self { file, started: Instant::now() }
+    }
+
+    /// Writes a line of the app into the log of the host that runs now.
+    fn note(line: &str) {
+        if let Some(log) = CURRENT_LOG.lock().unwrap().as_ref() {
+            log.write(line);
+        }
     }
 
     fn write(&self, line: &str) {
@@ -890,6 +1021,10 @@ pub fn vr_menu(settings: &Settings, model: &Model) -> String {
 pub fn stop_host() {
     HOST_INPUT.lock().unwrap().take();
     if let Some(mut child) = HOST.lock().unwrap().take() {
+        // A host that ended by itself needs no signal
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
         // SIGTERM first. The host has no handler, so it ends at once. A host that is still there after 1.5 s is killed.
         Command::new("kill").args(["-TERM", &child.id().to_string()]).status().ok();
         for _ in 0..30 {
@@ -1179,6 +1314,45 @@ mod tests {
         model.apply_status(&udp);
         model.apply_status(&serde_json::json!({"type": "network", "problem": "vpn_route", "message": "tunnel"}));
         assert_eq!(model.network, ["no UDP", "tunnel"]);
+    }
+
+    /// A host that ran long starts again at once. So does the first quick end. Each further quick end
+    /// in a row waits twice as long. At the fifth the app gives up.
+    #[test]
+    fn the_watch_waits_longer_after_each_quick_end() {
+        let mut watch = Watch { started: None, quick_ends: 0, ended_at: None };
+        let long = Duration::from_secs(600);
+        assert_eq!(watch.delay(long), Some(Duration::ZERO));
+        let quick = Duration::from_secs(3);
+        let mut delays = Vec::new();
+        while let Some(delay) = watch.delay(quick) {
+            delays.push(delay.as_secs());
+            watch.count(quick);
+        }
+        assert_eq!(delays, [0, 2, 4, 8]);
+        // A host that runs long again counts from zero
+        watch.count(long);
+        assert_eq!(watch.delay(quick), Some(Duration::ZERO));
+    }
+
+    /// The stream counts as stalled only while a headset streams with no game and no stats line
+    /// came for 15 s.
+    #[test]
+    fn a_stream_without_stats_for_15_s_stalls() {
+        let mut model = Model::default();
+        let now = Instant::now();
+        assert!(!model.stream_stalled(now + Duration::from_secs(60)), "no headset");
+        model.apply_status(&serde_json::json!({"type": "headset", "connected": true, "eye": [1248, 1306], "fps": 120.0}));
+        assert!(!model.stream_stalled(now + Duration::from_secs(10)));
+        assert!(model.stream_stalled(now + Duration::from_secs(16)));
+        model.apply_status(&serde_json::json!({"type": "stats", "fps": 0.0, "paused": true}));
+        let stats_at = model.stats_at.unwrap();
+        assert!(!model.stream_stalled(stats_at + Duration::from_secs(14)), "a paused stream sends stats too");
+        model.game = Some("Beat Saber".into());
+        assert!(!model.stream_stalled(stats_at + Duration::from_secs(60)), "a game may hold the picture while it loads");
+        model.game = None;
+        model.apply_status(&serde_json::json!({"type": "headset", "connected": false}));
+        assert!(!model.stream_stalled(stats_at + Duration::from_secs(60)), "no headset");
     }
 
     fn host_options(settings: &Settings) -> Vec<String> {
