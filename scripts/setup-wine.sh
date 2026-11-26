@@ -17,7 +17,8 @@
 #     which reports the session as unlocked, so SteamVR's compositor shows the picture; user32.dll, which exports
 #     the function that SteamVR's dashboard needs to start; winecoreaudio.so, which gives games the capture
 #     device "cranvr microphone" (the headset's microphone, a Mac input device or silence, as cranvr's
-#     microphone.txt says)
+#     microphone.txt says); winevulkan.so, which lets the runtime put a Vulkan game's swapchain images on
+#     IOSurfaces
 #
 # The BasaltVR checkout must have run, in this order:
 #   runtime/scripts/test-dxmt.zsh          (downloads Wine 11.10 and stock DXMT)
@@ -116,13 +117,13 @@ if [[ -f ${wine_bin}/wined3d.dll ]]; then
         cp "${wine_bin}/${dll}" "${wine_root}/lib/wine/x86_64-windows/${dll}"
         cp "${wine_bin}/${dll}" "${prefix}/drive_c/windows/system32/${dll}"
     done
-    for lib in winemac.so opengl32.so ntdll.so winecoreaudio.so; do
+    for lib in winemac.so opengl32.so ntdll.so winecoreaudio.so winevulkan.so; do
         cp "${wine_bin}/${lib}" "${wine_root}/lib/wine/x86_64-unix/${lib}"
     done
     mkdir -p "${prefix}/drive_c/wine-patched"
     cp "${wine_bin}/hlsl_compile.exe" "${wine_bin}/isnan.hlsl" "${wine_bin}/gl_compat_check.exe" \
         "${wine_bin}/far_jump_check.exe" "${wine_bin}/stack_sample_check.exe" "${wine_bin}/session_check.exe" \
-        "${wine_bin}/microphone_check.exe" "${prefix}/drive_c/wine-patched/"
+        "${wine_bin}/microphone_check.exe" "${wine_bin}/metal_texture_check.exe" "${prefix}/drive_c/wine-patched/"
 else
     print "No patched Wine files in ${wine_bin}: Wine's HLSL compiler lacks isnan, OpenGL games get no compatibility profile, and MonoMod's far detours can miss."
 fi
@@ -130,7 +131,7 @@ fi
 runtime_dir=${prefix}/drive_c/basalt/runtime
 mkdir -p "${runtime_dir}"
 cp "${runtime_bin}/basalt_openxr.dll" "${runtime_bin}/basalt_openxr.json" "${runtime_bin}/loader_smoke.exe" "${runtime_dir}/"
-for extra in d3d11_runtime_smoke.exe tracking_smoke.exe hand_interaction_smoke.exe steamwebhelper_compat.exe; do
+for extra in d3d11_runtime_smoke.exe tracking_smoke.exe hand_interaction_smoke.exe vulkan_runtime_smoke.exe steamwebhelper_compat.exe; do
     if [[ -e ${runtime_bin}/${extra} ]]; then
         cp "${runtime_bin}/${extra}" "${runtime_dir}/"
     fi
@@ -228,6 +229,15 @@ if [[ -f ${prefix}/drive_c/wine-patched/microphone_check.exe ]]; then
     if [[ ${mic_out} != *"default capture device: Microphone (cranvr microphone)"* ]]; then
         print -u2 "FAIL: microphone_check.exe --list (run it by hand for details):"
         print -u2 -r -- "${mic_out}"
+        exit 1
+    fi
+fi
+if [[ -f ${prefix}/drive_c/wine-patched/metal_texture_check.exe ]]; then
+    print "Checking that a Vulkan image can lie on a Metal texture of an IOSurface"
+    metal_out=$(cd "${prefix}/drive_c/wine-patched" && MVK_CONFIG_LOG_LEVEL=0 "${wine_root}/bin/wine" ./metal_texture_check.exe 2>&1 || true)
+    if [[ ${metal_out} != *"metal_texture_check: PASS"* ]]; then
+        print -u2 "FAIL: metal_texture_check.exe (run it by hand for details):"
+        print -u2 -r -- "${metal_out}"
         exit 1
     fi
 fi

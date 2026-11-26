@@ -1,0 +1,2519 @@
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index 1c28889..cfaa298 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -35,6 +35,21 @@ set(INSTALL_TO_ARCHITECTURE_PREFIXES OFF CACHE BOOL "" FORCE)
+ 
+ FetchContent_MakeAvailable(openxr_sdk)
+ 
++# cranvr: Khronos Vulkan-Headers v1.4.350, peeled commit 8864cdc896bbc2a9b6eb36b3218fc9ef57908d77, for the
++# Vulkan sessions of the runtime and their test program. Only the headers: SOURCE_SUBDIR names no CMake
++# project, so nothing of it builds.
++FetchContent_Declare(
++    vulkan_headers
++    URL https://github.com/KhronosGroup/Vulkan-Headers/archive/8864cdc896bbc2a9b6eb36b3218fc9ef57908d77.tar.gz
++    URL_HASH SHA256=35824117f649befc664a12622bc801eddbba036ac03d906db400ee1c1e7903e9
++    DOWNLOAD_EXTRACT_TIMESTAMP FALSE
++    SOURCE_SUBDIR headers-only
++)
++FetchContent_MakeAvailable(vulkan_headers)
++add_library(basalt_vulkan_headers INTERFACE)
++target_include_directories(basalt_vulkan_headers INTERFACE "${vulkan_headers_SOURCE_DIR}/include")
++target_compile_definitions(basalt_vulkan_headers INTERFACE VK_NO_PROTOTYPES)
++
+ # OpenXR-SDK 1.1.61 uses this Windows partition macro in a preprocessor test.
+ # MinGW does not define it, while the SDK enables -Werror=undef.
+ if(MINGW)
+diff --git a/runtime/pe/CMakeLists.txt b/runtime/pe/CMakeLists.txt
+index 744ab8b..9c142ab 100644
+--- a/runtime/pe/CMakeLists.txt
++++ b/runtime/pe/CMakeLists.txt
+@@ -13,15 +13,17 @@ add_library(
+     swapchain.cpp
+     system.cpp
+     tracking.cpp
++    vulkan.cpp
+ )
+ 
+ target_include_directories(basalt_openxr PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+-target_link_libraries(basalt_openxr PRIVATE OpenXR::headers d3d11 dxgi dxguid ws2_32)
++target_link_libraries(basalt_openxr PRIVATE OpenXR::headers basalt_vulkan_headers d3d11 dxgi dxguid ws2_32)
+ target_compile_definitions(
+     basalt_openxr
+     PRIVATE
+         XR_NO_PROTOTYPES
+         XR_USE_GRAPHICS_API_D3D11
++        XR_USE_GRAPHICS_API_VULKAN
+ )
+ target_compile_options(
+     basalt_openxr
+diff --git a/runtime/pe/control.cpp b/runtime/pe/control.cpp
+index 76cb3ec..1dd5c6b 100644
+--- a/runtime/pe/control.cpp
++++ b/runtime/pe/control.cpp
+@@ -192,9 +192,8 @@ CONDITION_VARIABLE gFrameDeliveryCondition = CONDITION_VARIABLE_INIT;
+ bool gWsaStarted = false;
+ SOCKET gSocket = INVALID_SOCKET;
+ XrSession gControlSession = XR_NULL_HANDLE;
+-ID3D11DeviceContext4* gContext4 = nullptr;
+-ID3D11Fence* gFence = nullptr;
+-HANDLE gFenceEvent = nullptr;
++// cranvr: the GPU side of the frame handoff, for Direct3D 11 or Vulkan
++basalt::FrameSync* gFrameSync = nullptr;
+ HANDLE gWaiterThread = nullptr;
+ HANDLE gWaiterWake = nullptr;
+ HANDLE gReceiverThread = nullptr;
+@@ -1172,9 +1171,7 @@ struct DisconnectState {
+     HANDLE waiterThread = nullptr;
+     HANDLE receiverThread = nullptr;
+     HANDLE waiterWake = nullptr;
+-    HANDLE fenceEvent = nullptr;
+-    ID3D11Fence* fence = nullptr;
+-    ID3D11DeviceContext4* context4 = nullptr;
++    basalt::FrameSync* sync = nullptr;
+     SOCKET socket = INVALID_SOCKET;
+ };
+ 
+@@ -1187,16 +1184,12 @@ DisconnectState beginDisconnectLocked() {
+     state.waiterThread = gWaiterThread;
+     state.receiverThread = gReceiverThread;
+     state.waiterWake = gWaiterWake;
+-    state.fenceEvent = gFenceEvent;
+-    state.fence = gFence;
+-    state.context4 = gContext4;
++    state.sync = gFrameSync;
+     state.socket = gSocket;
+     gWaiterThread = nullptr;
+     gReceiverThread = nullptr;
+     gWaiterWake = nullptr;
+-    gFenceEvent = nullptr;
+-    gFence = nullptr;
+-    gContext4 = nullptr;
++    gFrameSync = nullptr;
+     gSocket = INVALID_SOCKET;
+     gControlSession = XR_NULL_HANDLE;
+     gReceiverFailed = false;
+@@ -1244,11 +1237,9 @@ void finishDisconnect(DisconnectState& state, bool sendTeardown) {
+     if (state.waiterWake != nullptr) {
+         CloseHandle(state.waiterWake);
+     }
+-    if (state.fenceEvent != nullptr) {
+-        CloseHandle(state.fenceEvent);
+-    }
+-    release(state.fence);
+-    release(state.context4);
++    // The waiter has ended, so no thread waits on the sync any more
++    basalt::destroyFrameSync(state.sync);
++    state.sync = nullptr;
+ }
+ 
+ // The waiter thread: pops queued frames in order, waits the fence value on
+@@ -1264,8 +1255,7 @@ DWORD WINAPI waiterThreadProc(LPVOID) {
+         }
+         PendingFrame frame;
+         bool haveFrame = false;
+-        ID3D11Fence* fence = gFence;
+-        HANDLE fenceEvent = gFenceEvent;
++        basalt::FrameSync* sync = gFrameSync;
+         HANDLE wake = gWaiterWake;
+         if (gPendingCount > 0) {
+             frame = gPendingFrames[gPendingHead];
+@@ -1283,9 +1273,7 @@ DWORD WINAPI waiterThreadProc(LPVOID) {
+             continue;
+         }
+ 
+-        if (fence == nullptr || fenceEvent == nullptr ||
+-            FAILED(fence->SetEventOnCompletion(frame.frameNumber, fenceEvent)) ||
+-            WaitForSingleObject(fenceEvent, kFenceWaitMilliseconds) != WAIT_OBJECT_0) {
++        if (sync == nullptr || !sync->wait(sync, frame.frameNumber, kFenceWaitMilliseconds)) {
+             // The frame-done contract broke; stop sending rather than lie.
+             AcquireSRWLockExclusive(&gControlLock);
+             const bool stopping = gWaiterStop;
+@@ -1479,6 +1467,55 @@ void adapterDescription(ID3D11Device* device, char* buffer, size_t capacity) {
+     adapter->Release();
+ }
+ 
++// The frame handoff of a Direct3D 11 session: a D3D11 fence on the immediate context. A two-slice
++// swapchain's slice goes into its IOSurface texture with CopySubresourceRegion.
++struct D3D11FrameSync {
++    basalt::FrameSync base;
++    ID3D11DeviceContext4* context;
++    ID3D11Fence* fence;
++    HANDLE event;
++};
++
++bool d3d11PrepareView(basalt::FrameSync* sync, basalt::ControlFrameView* view) {
++    return basalt::prepareSwapchainViewForExport(reinterpret_cast<D3D11FrameSync*>(sync)->context, view);
++}
++
++bool d3d11Signal(basalt::FrameSync* sync, uint64_t frameNumber) {
++    auto* d3d = reinterpret_cast<D3D11FrameSync*>(sync);
++    const HRESULT result = d3d->context->Signal(d3d->fence, frameNumber);
++    d3d->context->Flush();
++    return SUCCEEDED(result);
++}
++
++bool d3d11Wait(basalt::FrameSync* sync, uint64_t frameNumber, DWORD milliseconds) {
++    auto* d3d = reinterpret_cast<D3D11FrameSync*>(sync);
++    return SUCCEEDED(d3d->fence->SetEventOnCompletion(frameNumber, d3d->event)) &&
++           WaitForSingleObject(d3d->event, milliseconds) == WAIT_OBJECT_0;
++}
++
++void d3d11Destroy(basalt::FrameSync* sync) {
++    auto* d3d = reinterpret_cast<D3D11FrameSync*>(sync);
++    CloseHandle(d3d->event);
++    release(d3d->fence);
++    release(d3d->context);
++    std::free(d3d);
++}
++
++basalt::FrameSync* makeD3D11FrameSync(ID3D11DeviceContext4* context, ID3D11Fence* fence, HANDLE event) {
++    auto* d3d = static_cast<D3D11FrameSync*>(std::calloc(1, sizeof(D3D11FrameSync)));
++    if (d3d == nullptr) {
++        CloseHandle(event);
++        release(fence);
++        release(context);
++        return nullptr;
++    }
++    d3d->base = {d3d11PrepareView, d3d11Signal, d3d11Wait, d3d11Destroy};
++    d3d->context = context;
++    d3d->fence = fence;
++    d3d->event = event;
++    return &d3d->base;
++}
++
+ }  // namespace
+ 
+ namespace basalt {
+@@ -1570,12 +1607,6 @@ void controlSessionCreated(XrSession session, ID3D11Device* device) {
+         return;
+     }
+ 
+-    uint16_t port = 0;
+-    char token[BASALT_CONTROL_TOKEN_LENGTH + 1]{};
+-    if (!readControlFile(&port, token, nullptr, nullptr)) {
+-        return;
+-    }
+-
+     ID3D11Device5* device5 = nullptr;
+     if (FAILED(device->QueryInterface(IID_ID3D11Device5,
+                                       reinterpret_cast<void**>(&device5)))) {
+@@ -1599,20 +1630,38 @@ void controlSessionCreated(XrSession session, ID3D11Device* device) {
+         context4->Release();
+         return;
+     }
++    const HANDLE fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++    if (fenceEvent == nullptr) {
++        release(fence);
++        release(context4);
++        return;
++    }
++
++    char renderer[kMaxRendererLength]{};
++    adapterDescription(device, renderer, sizeof(renderer));
++    controlSessionCreatedWith(session, makeD3D11FrameSync(context4, fence, fenceEvent), renderer);
++}
++
++void controlSessionCreatedWith(XrSession session, FrameSync* sync, const char* rendererName) {
++    uint16_t port = 0;
++    char token[BASALT_CONTROL_TOKEN_LENGTH + 1]{};
++    if (sync == nullptr || !basaltGateEnabled() || !readControlFile(&port, token, nullptr, nullptr)) {
++        destroyFrameSync(sync);
++        return;
++    }
+ 
+     // cranvr: name the game for cranvr-host before the Hello reaches it
+     writeGameProgram();
+ 
+     char renderer[kMaxRendererLength]{};
+-    adapterDescription(device, renderer, sizeof(renderer));
++    std::snprintf(renderer, sizeof(renderer), "%s", rendererName != nullptr ? rendererName : "");
+     const size_t rendererLength = std::strlen(renderer);
+ 
+     AcquireSRWLockExclusive(&gControlLock);
+     if (gControlSession != XR_NULL_HANDLE) {
+         // Never tear down an existing connection from a stray create.
+         ReleaseSRWLockExclusive(&gControlLock);
+-        release(fence);
+-        release(context4);
++        destroyFrameSync(sync);
+         return;
+     }
+     bool connected = false;
+@@ -1653,8 +1702,7 @@ void controlSessionCreated(XrSession session, ID3D11Device* device) {
+         }
+ 
+         gWaiterWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+-        gFenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+-        if (gWaiterWake == nullptr || gFenceEvent == nullptr) {
++        if (gWaiterWake == nullptr) {
+             break;
+         }
+         gWaiterStop = false;
+@@ -1664,10 +1712,8 @@ void controlSessionCreated(XrSession session, ID3D11Device* device) {
+         gAckFailed = false;
+         resetTrackingStateLocked();
+         gControlSession = session;
+-        gContext4 = context4;
+-        gFence = fence;
+-        context4 = nullptr;
+-        fence = nullptr;
++        gFrameSync = sync;
++        sync = nullptr;
+         gNextFrameNumber = 1;
+         gLastConsumedFrameNumber = 0;
+         gPendingHead = 0;
+@@ -1688,8 +1734,7 @@ void controlSessionCreated(XrSession session, ID3D11Device* device) {
+         DisconnectState state = beginDisconnectLocked();
+         ReleaseSRWLockExclusive(&gControlLock);
+         finishDisconnect(state, false);
+-        release(fence);
+-        release(context4);
++        destroyFrameSync(sync);
+         return;
+     }
+     ReleaseSRWLockExclusive(&gControlLock);
+@@ -2000,8 +2045,7 @@ void controlFrameReady(
+     }
+ 
+     AcquireSRWLockExclusive(&gControlLock);
+-    if (gSocket == INVALID_SOCKET || gReceiverFailed ||
+-        gFence == nullptr || gContext4 == nullptr) {
++    if (gSocket == INVALID_SOCKET || gReceiverFailed || gFrameSync == nullptr) {
+         ReleaseSRWLockExclusive(&gControlLock);
+         return;
+     }
+@@ -2009,8 +2053,7 @@ void controlFrameReady(
+     ControlFrameView preparedViews[kMaxFrameViews]{};
+     for (uint32_t index = 0; index < viewCount; ++index) {
+         preparedViews[index] = views[index];
+-        if (!prepareSwapchainViewForExport(
+-                gContext4, &preparedViews[index])) {
++        if (!gFrameSync->prepareView(gFrameSync, &preparedViews[index])) {
+             DisconnectState state = beginDisconnectLocked();
+             ReleaseSRWLockExclusive(&gControlLock);
+             finishDisconnect(state, false);
+@@ -2061,14 +2104,10 @@ void controlFrameReady(
+     slot->frameNumber = frameNumber;
+     slot->payloadLength = static_cast<uint32_t>(writer.length());
+ 
+-    // Caller is the xrEndFrame thread, which owns the immediate context per
+-    // the D3D11 binding contract, so Signal/Flush here is safe.
+-    ID3D11Fence* fence = gFence;
+-    ID3D11DeviceContext4* context4 = gContext4;
++    // Caller is the xrEndFrame thread, which owns the immediate context (D3D11)
++    // or may use the binding's queue (Vulkan), so the signal here is safe.
+     HANDLE wake = gWaiterWake;
+-    const HRESULT signalResult = context4->Signal(fence, frameNumber);
+-    context4->Flush();
+-    if (FAILED(signalResult)) {
++    if (!gFrameSync->signal(gFrameSync, frameNumber)) {
+         DisconnectState state = beginDisconnectLocked();
+         ReleaseSRWLockExclusive(&gControlLock);
+         finishDisconnect(state, false);
+diff --git a/runtime/pe/control.hpp b/runtime/pe/control.hpp
+index f0201d3..d0f6927 100644
+--- a/runtime/pe/control.hpp
++++ b/runtime/pe/control.hpp
+@@ -25,9 +25,36 @@ void note(const char* format, ...);
+ // Queries the Basalt DXMT fork's IOSurfaceID for a texture; 0 when absent.
+ uint32_t queryTextureIOSurfaceId(ID3D11Texture2D* texture);
+ 
++struct ControlFrameView;
++
++// cranvr: the GPU side of the frame handoff of one session. The runtime sends a frame to the
++// host only after the GPU has finished the game's commands for it. The functions are plain
++// pointers, not virtual functions: a C++ class with virtual functions links the C++ runtime's type
++// information and exceptions, which need libwinpthread-1.dll, and Wine has no such DLL.
++struct FrameSync {
++    // Called on the xrEndFrame thread for each view before signal: copies a slice of a two-slice
++    // swapchain into its exported image and rewrites the image index to the registered surface.
++    bool (*prepareView)(FrameSync* sync, ControlFrameView* view);
++    // Called on the xrEndFrame thread: marks the end of the game's commands for the frame.
++    bool (*signal)(FrameSync* sync, uint64_t frameNumber);
++    // Called on the waiter thread: true once the GPU has passed the frame's mark.
++    bool (*wait)(FrameSync* sync, uint64_t frameNumber, DWORD milliseconds);
++    // Frees the sync and what it holds; null is no sync
++    void (*destroy)(FrameSync* sync);
++};
++
++inline void destroyFrameSync(FrameSync* sync) {
++    if (sync != nullptr) {
++        sync->destroy(sync);
++    }
++}
++
+ // Third capability probe plus daemon handshake; called after session
+ // creation succeeds. Headless on any failure.
+ void controlSessionCreated(XrSession session, ID3D11Device* device);
++// cranvr: the daemon handshake for a session whose graphics API has its own frame sync (Vulkan).
++// The control session owns `sync` from here on, also when the handshake fails.
++void controlSessionCreatedWith(XrSession session, FrameSync* sync, const char* renderer);
+ void controlSessionDestroyed(XrSession session);
+ 
+ // True only while the daemon handshake is complete for the live session.
+diff --git a/runtime/pe/graphics.cpp b/runtime/pe/graphics.cpp
+index 573de12..ba35fb2 100644
+--- a/runtime/pe/graphics.cpp
++++ b/runtime/pe/graphics.cpp
+@@ -23,6 +23,8 @@ uintptr_t gNextSessionHandle = kFirstSessionHandle;
+ XrSession gLiveSession = XR_NULL_HANDLE;
+ XrInstance gSessionInstance = XR_NULL_HANDLE;
+ ID3D11Device* gSessionDevice = nullptr;
++// cranvr: the Vulkan state of a live Vulkan session
++basalt::VulkanSession* gSessionVulkan = nullptr;
+ 
+ INIT_ONCE gCapabilityOnce = INIT_ONCE_STATIC_INIT;
+ bool gD3D11RuntimeAvailable = false;
+@@ -275,6 +277,33 @@ XrResult XRAPI_CALL getD3D11GraphicsRequirements(
+     return XR_SUCCESS;
+ }
+ 
++// cranvr: a session on a Vulkan device
++XrResult createVulkanSessionHandle(
++    XrInstance instance,
++    const XrGraphicsBindingVulkanKHR* binding,
++    XrSession* session) {
++    VulkanSession* vulkan = nullptr;
++    const XrResult result = createVulkanSession(instance, binding, &vulkan);
++    if (XR_FAILED(result)) {
++        return result;
++    }
++    AcquireSRWLockExclusive(&gGraphicsLock);
++    if (gLiveSession != XR_NULL_HANDLE || gNextSessionHandle > UINTPTR_MAX - kSessionHandleStride) {
++        ReleaseSRWLockExclusive(&gGraphicsLock);
++        destroyVulkanSession(vulkan);
++        return XR_ERROR_LIMIT_REACHED;
++    }
++    gLiveSession = reinterpret_cast<XrSession>(gNextSessionHandle);
++    gNextSessionHandle += kSessionHandleStride;
++    gSessionInstance = instance;
++    gSessionVulkan = vulkan;
++    *session = gLiveSession;
++    ReleaseSRWLockExclusive(&gGraphicsLock);
++    initializeSessionLifecycle(instance, *session);
++    vulkanControlSessionCreated(*session, vulkan);
++    return XR_SUCCESS;
++}
++
+ XrResult XRAPI_CALL createSession(
+     XrInstance instance,
+     const XrSessionCreateInfo* createInfo,
+@@ -293,6 +322,12 @@ XrResult XRAPI_CALL createSession(
+     if (createInfo->systemId != kSystemId) {
+         return XR_ERROR_SYSTEM_INVALID;
+     }
++    // cranvr: a Vulkan game binds its device with XR_KHR_vulkan_enable or XR_KHR_vulkan_enable2
++    const XrGraphicsBindingVulkanKHR* vulkanBinding = findVulkanBinding(createInfo->next);
++    if (vulkanBinding != nullptr && findD3D11Binding(createInfo->next) == nullptr &&
++        (isVulkanEnableEnabled(instance) || isVulkanEnable2Enabled(instance))) {
++        return createVulkanSessionHandle(instance, vulkanBinding, session);
++    }
+     if (!isD3D11ExtensionEnabled(instance)) {
+         return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+     }
+@@ -358,9 +393,11 @@ XrResult XRAPI_CALL destroySession(XrSession session) {
+         return XR_ERROR_HANDLE_INVALID;
+     }
+     ID3D11Device* device = gSessionDevice;
++    VulkanSession* vulkan = gSessionVulkan;
+     gLiveSession = XR_NULL_HANDLE;
+     gSessionInstance = XR_NULL_HANDLE;
+     gSessionDevice = nullptr;
++    gSessionVulkan = nullptr;
+     ReleaseSRWLockExclusive(&gGraphicsLock);
+     controlSessionDestroyed(session);
+     invalidateSessionLifecycle(session);
+@@ -369,6 +406,8 @@ XrResult XRAPI_CALL destroySession(XrSession session) {
+     invalidateInputForSession(session);
+     invalidateTrackersForSession(session);
+     release(device);
++    // The swapchains' images are gone, and the game still holds its device
++    destroyVulkanSession(vulkan);
+     return XR_SUCCESS;
+ }
+ 
+@@ -396,13 +435,16 @@ ID3D11Device* retainSessionDevice(XrSession session) {
+ void invalidateSessionForInstance(XrInstance instance) {
+     XrSession session = XR_NULL_HANDLE;
+     ID3D11Device* device = nullptr;
++    VulkanSession* vulkan = nullptr;
+     AcquireSRWLockExclusive(&gGraphicsLock);
+     if (gSessionInstance == instance) {
+         session = gLiveSession;
+         device = gSessionDevice;
++        vulkan = gSessionVulkan;
+         gLiveSession = XR_NULL_HANDLE;
+         gSessionInstance = XR_NULL_HANDLE;
+         gSessionDevice = nullptr;
++        gSessionVulkan = nullptr;
+     }
+     if (gRequirementsInstance == instance) {
+         gRequirementsInstance = XR_NULL_HANDLE;
+@@ -418,6 +460,14 @@ void invalidateSessionForInstance(XrInstance instance) {
+         invalidateTrackersForSession(session);
+     }
+     release(device);
++    destroyVulkanSession(vulkan);
++}
++
++VulkanSession* sessionVulkan(XrSession session) {
++    AcquireSRWLockShared(&gGraphicsLock);
++    VulkanSession* vulkan = session != XR_NULL_HANDLE && session == gLiveSession ? gSessionVulkan : nullptr;
++    ReleaseSRWLockShared(&gGraphicsLock);
++    return vulkan;
+ }
+ 
+ }  // namespace basalt
+diff --git a/runtime/pe/runtime.cpp b/runtime/pe/runtime.cpp
+index e947ac7..da74a2a 100644
+--- a/runtime/pe/runtime.cpp
++++ b/runtime/pe/runtime.cpp
+@@ -16,6 +16,9 @@ SRWLOCK gInstanceLock = SRWLOCK_INIT;
+ uintptr_t gNextInstanceHandle = kFirstInstanceHandle;
+ XrInstance gLiveInstance = XR_NULL_HANDLE;
+ bool gD3D11ExtensionEnabled = false;
++// cranvr: XR_KHR_vulkan_enable and XR_KHR_vulkan_enable2
++bool gVulkanEnableEnabled = false;
++bool gVulkanEnable2Enabled = false;
+ bool gDisplayRefreshRateEnabled = false;
+ bool gHandInteractionEnabled = false;
+ 
+@@ -32,18 +35,22 @@ XrResult XRAPI_CALL basaltEnumerateInstanceExtensionProperties(
+     }
+ 
+     const bool d3d11Available = basalt::isD3D11RuntimeAvailable();
++    // cranvr: Vulkan through winevulkan, MoltenVK and the IOSurface textures of cranvr's DXMT fork
++    const bool vulkanAvailable = basalt::isVulkanRuntimeOffered();
++    const bool graphicsAvailable = d3d11Available || vulkanAvailable;
+     // cranvr: the tracking extensions that the headset's features allow. Without a headset's
+     // file this adds none, and the list is the one of the stock runtime.
+     const uint32_t trackingCount = basalt::offeredTrackingExtensionCount();
+     // cranvr: XR_FB_display_refresh_rate tells a game the rate that cranvr-host runs at. It is offered
+     // with the graphics extension: a runtime that offers no graphics offers nothing (negotiation_smoke).
+-    const uint32_t displayCount = d3d11Available ? 1u : 0u;
++    const uint32_t displayCount = graphicsAvailable ? 1u : 0u;
+     // cranvr: XR_EXT_hand_interaction is served by a tracked hand and by a controller alike (the
+     // extension asks a runtime with controllers to map them), so it needs no headset feature. It
+     // comes with the graphics extension, as the refresh rate does.
+-    const uint32_t handInteractionCount = d3d11Available ? 1u : 0u;
++    const uint32_t handInteractionCount = graphicsAvailable ? 1u : 0u;
++    const uint32_t vulkanCount = vulkanAvailable ? 2u : 0u;
+     const uint32_t total =
+-        (d3d11Available ? 1u : 0u) + trackingCount + displayCount + handInteractionCount;
++        (d3d11Available ? 1u : 0u) + vulkanCount + trackingCount + displayCount + handInteractionCount;
+     *propertyCountOutput = total;
+     if (propertyCapacityInput == 0) {
+         return XR_SUCCESS;
+@@ -72,6 +79,16 @@ XrResult XRAPI_CALL basaltEnumerateInstanceExtensionProperties(
+         properties[next].extensionVersion = XR_KHR_D3D11_enable_SPEC_VERSION;
+         ++next;
+     }
++    if (vulkanAvailable) {
++        std::strncpy(properties[next].extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_MAX_EXTENSION_NAME_SIZE - 1);
++        properties[next].extensionName[XR_MAX_EXTENSION_NAME_SIZE - 1] = '\0';
++        properties[next].extensionVersion = XR_KHR_vulkan_enable_SPEC_VERSION;
++        ++next;
++        std::strncpy(properties[next].extensionName, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME, XR_MAX_EXTENSION_NAME_SIZE - 1);
++        properties[next].extensionName[XR_MAX_EXTENSION_NAME_SIZE - 1] = '\0';
++        properties[next].extensionVersion = XR_KHR_vulkan_enable2_SPEC_VERSION;
++        ++next;
++    }
+     for (uint32_t index = 0; index < trackingCount; ++index) {
+         const char* name = nullptr;
+         uint32_t version = 0;
+@@ -153,6 +170,8 @@ XrResult XRAPI_CALL basaltCreateInstance(
+         return XR_ERROR_API_VERSION_UNSUPPORTED;
+     }
+     bool enableD3D11 = false;
++    bool enableVulkan = false;
++    bool enableVulkan2 = false;
+     bool enableDisplayRefreshRate = false;
+     bool enableHandInteraction = false;
+     uint32_t enabledTracking = 0;
+@@ -173,10 +192,19 @@ XrResult XRAPI_CALL basaltCreateInstance(
+             continue;
+         }
+         if (std::strcmp(extensionName, XR_EXT_HAND_INTERACTION_EXTENSION_NAME) == 0 &&
+-            basalt::isD3D11RuntimeAvailable()) {
++            (basalt::isD3D11RuntimeAvailable() || basalt::isVulkanRuntimeOffered())) {
+             enableHandInteraction = true;
+             continue;
+         }
++        if (std::strcmp(extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0 ||
++            std::strcmp(extensionName, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME) == 0) {
++            if (!basalt::isVulkanRuntimeOffered()) {
++                std::fprintf(stderr, "Basalt OpenXR: Vulkan needs vulkan-1.dll and winemetal.dll\n");
++                return XR_ERROR_EXTENSION_NOT_PRESENT;
++            }
++            (std::strcmp(extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0 ? enableVulkan : enableVulkan2) = true;
++            continue;
++        }
+         if (std::strcmp(extensionName, XR_KHR_D3D11_ENABLE_EXTENSION_NAME) != 0) {
+             std::fprintf(stderr, "Basalt OpenXR: unsupported enabled extension '%s'\n", extensionName);
+             return XR_ERROR_EXTENSION_NOT_PRESENT;
+@@ -199,6 +227,8 @@ XrResult XRAPI_CALL basaltCreateInstance(
+     }
+     gLiveInstance = reinterpret_cast<XrInstance>(gNextInstanceHandle);
+     gD3D11ExtensionEnabled = enableD3D11;
++    gVulkanEnableEnabled = enableVulkan;
++    gVulkanEnable2Enabled = enableVulkan2;
+     gDisplayRefreshRateEnabled = enableDisplayRefreshRate;
+     gHandInteractionEnabled = enableHandInteraction;
+     gNextInstanceHandle += kInstanceHandleStride;
+@@ -220,6 +250,8 @@ XrResult XRAPI_CALL basaltDestroyInstance(XrInstance instance) {
+     }
+     gLiveInstance = XR_NULL_HANDLE;
+     gD3D11ExtensionEnabled = false;
++    gVulkanEnableEnabled = false;
++    gVulkanEnable2Enabled = false;
+     gHandInteractionEnabled = false;
+     gDisplayRefreshRateEnabled = false;
+     ReleaseSRWLockExclusive(&gInstanceLock);
+@@ -361,6 +393,26 @@ bool isD3D11ExtensionEnabled(XrInstance instance) {
+     return enabled;
+ }
+ 
++bool isVulkanEnableEnabled(XrInstance instance) {
++    if (instance == XR_NULL_HANDLE) {
++        return false;
++    }
++    AcquireSRWLockShared(&gInstanceLock);
++    const bool enabled = instance == gLiveInstance && gVulkanEnableEnabled;
++    ReleaseSRWLockShared(&gInstanceLock);
++    return enabled;
++}
++
++bool isVulkanEnable2Enabled(XrInstance instance) {
++    if (instance == XR_NULL_HANDLE) {
++        return false;
++    }
++    AcquireSRWLockShared(&gInstanceLock);
++    const bool enabled = instance == gLiveInstance && gVulkanEnable2Enabled;
++    ReleaseSRWLockShared(&gInstanceLock);
++    return enabled;
++}
++
+ XrResult XRAPI_CALL getInstanceProcAddr(
+     XrInstance instance,
+     const char* name,
+@@ -448,6 +500,22 @@ XrResult XRAPI_CALL getInstanceProcAddr(
+     } else if (std::strcmp(name, "xrGetD3D11GraphicsRequirementsKHR") == 0 &&
+                isD3D11ExtensionEnabled(instance)) {
+         *function = asVoidFunction(getD3D11GraphicsRequirements);
++    } else if (std::strcmp(name, "xrGetVulkanInstanceExtensionsKHR") == 0 && isVulkanEnableEnabled(instance)) {
++        *function = asVoidFunction(getVulkanInstanceExtensions);
++    } else if (std::strcmp(name, "xrGetVulkanDeviceExtensionsKHR") == 0 && isVulkanEnableEnabled(instance)) {
++        *function = asVoidFunction(getVulkanDeviceExtensions);
++    } else if (std::strcmp(name, "xrGetVulkanGraphicsDeviceKHR") == 0 && isVulkanEnableEnabled(instance)) {
++        *function = asVoidFunction(getVulkanGraphicsDevice);
++    } else if (std::strcmp(name, "xrGetVulkanGraphicsRequirementsKHR") == 0 && isVulkanEnableEnabled(instance)) {
++        *function = asVoidFunction(getVulkanGraphicsRequirements);
++    } else if (std::strcmp(name, "xrGetVulkanGraphicsRequirements2KHR") == 0 && isVulkanEnable2Enabled(instance)) {
++        *function = asVoidFunction(getVulkanGraphicsRequirements2);
++    } else if (std::strcmp(name, "xrCreateVulkanInstanceKHR") == 0 && isVulkanEnable2Enabled(instance)) {
++        *function = asVoidFunction(createVulkanInstance);
++    } else if (std::strcmp(name, "xrGetVulkanGraphicsDevice2KHR") == 0 && isVulkanEnable2Enabled(instance)) {
++        *function = asVoidFunction(getVulkanGraphicsDevice2);
++    } else if (std::strcmp(name, "xrCreateVulkanDeviceKHR") == 0 && isVulkanEnable2Enabled(instance)) {
++        *function = asVoidFunction(createVulkanDevice);
+     } else if (std::strcmp(name, "xrEnumerateDisplayRefreshRatesFB") == 0 &&
+                isDisplayRefreshRateEnabled(instance)) {
+         *function = asVoidFunction(enumerateDisplayRefreshRates);
+diff --git a/runtime/pe/runtime.hpp b/runtime/pe/runtime.hpp
+index f44d6b5..4d7fe97 100644
+--- a/runtime/pe/runtime.hpp
++++ b/runtime/pe/runtime.hpp
+@@ -6,6 +6,9 @@
+ 
+ #include <cstdint>
+ 
++// cranvr: Vulkan sessions (vulkan.cpp). The runtime loads Vulkan's functions at run time.
++#include <vulkan/vulkan.h>
++
+ #include <openxr/openxr.h>
+ #include <openxr/openxr_platform.h>
+ 
+@@ -61,6 +64,53 @@ bool getSpacePoseInLocal(XrSpace space, XrTime time, XrSession* session, XrPosef
+ 
+ bool isValidInstance(XrInstance instance);
+ bool isD3D11ExtensionEnabled(XrInstance instance);
++// cranvr: XR_KHR_vulkan_enable and XR_KHR_vulkan_enable2 (vulkan.cpp)
++bool isVulkanEnableEnabled(XrInstance instance);
++bool isVulkanEnable2Enabled(XrInstance instance);
++bool isVulkanRuntimeOffered();
++struct ControlFrameView;
++struct VulkanSession;
++struct VulkanSwapchainImages;
++constexpr uint32_t kVulkanSwapchainImageCount = 3;
++XrResult XRAPI_CALL getVulkanInstanceExtensions(
++    XrInstance instance, XrSystemId systemId, uint32_t capacity, uint32_t* countOutput, char* buffer);
++XrResult XRAPI_CALL getVulkanDeviceExtensions(
++    XrInstance instance, XrSystemId systemId, uint32_t capacity, uint32_t* countOutput, char* buffer);
++XrResult XRAPI_CALL getVulkanGraphicsDevice(
++    XrInstance instance, XrSystemId systemId, VkInstance vulkanInstance, VkPhysicalDevice* physicalDevice);
++XrResult XRAPI_CALL getVulkanGraphicsRequirements(
++    XrInstance instance, XrSystemId systemId, XrGraphicsRequirementsVulkanKHR* requirements);
++XrResult XRAPI_CALL getVulkanGraphicsRequirements2(
++    XrInstance instance, XrSystemId systemId, XrGraphicsRequirementsVulkanKHR* requirements);
++XrResult XRAPI_CALL createVulkanInstance(
++    XrInstance instance, const XrVulkanInstanceCreateInfoKHR* createInfo, VkInstance* vulkanInstance,
++    VkResult* vulkanResult);
++XrResult XRAPI_CALL getVulkanGraphicsDevice2(
++    XrInstance instance, const XrVulkanGraphicsDeviceGetInfoKHR* getInfo, VkPhysicalDevice* physicalDevice);
++XrResult XRAPI_CALL createVulkanDevice(
++    XrInstance instance, const XrVulkanDeviceCreateInfoKHR* createInfo, VkDevice* vulkanDevice,
++    VkResult* vulkanResult);
++const XrGraphicsBindingVulkanKHR* findVulkanBinding(const void* next);
++XrResult createVulkanSession(
++    XrInstance instance, const XrGraphicsBindingVulkanKHR* binding, VulkanSession** session);
++void destroyVulkanSession(VulkanSession* session);
++// The daemon handshake of a Vulkan session, with its fence on the binding's queue
++void vulkanControlSessionCreated(XrSession session, VulkanSession* state);
++// The Vulkan state of a live session; null for a Direct3D 11 session (graphics.cpp)
++VulkanSession* sessionVulkan(XrSession session);
++const VkFormat* vulkanSwapchainFormats(uint32_t* count);
++bool isVulkanSwapchainFormat(int64_t format);
++// Fills iosurfaceIds with kVulkanSwapchainImageCount * arraySize IDs
++XrResult createVulkanSwapchainImages(
++    VulkanSession* session, const XrSwapchainCreateInfo* createInfo, VulkanSwapchainImages** images,
++    uint32_t* iosurfaceIds);
++void destroyVulkanSwapchainImages(VulkanSwapchainImages* images);
++VkImage vulkanSwapchainImage(const VulkanSwapchainImages* images, uint32_t index);
++uint32_t vulkanSwapchainArraySize(const VulkanSwapchainImages* images);
++// swapchain.cpp: the images and the slice of one submitted view of a Vulkan swapchain. It rewrites
++// the view's image index to the registered surface, as prepareSwapchainViewForExport does.
++bool vulkanSwapchainViewForExport(
++    ControlFrameView* view, VulkanSwapchainImages** images, uint32_t* image, uint32_t* slice);
+ bool isDisplayRefreshRateEnabled(XrInstance instance);
+ // cranvr: XR_EXT_hand_interaction, which input.cpp serves
+ bool isHandInteractionEnabled(XrInstance instance);
+diff --git a/runtime/pe/swapchain.cpp b/runtime/pe/swapchain.cpp
+index 7f4666a..d61f542 100644
+--- a/runtime/pe/swapchain.cpp
++++ b/runtime/pe/swapchain.cpp
+@@ -15,6 +15,7 @@ namespace {
+ constexpr uintptr_t kFirstSwapchainHandle = static_cast<uintptr_t>(0x30000);
+ constexpr uintptr_t kSwapchainHandleStride = static_cast<uintptr_t>(0x10);
+ constexpr uint32_t kSwapchainImageCount = 3;
++static_assert(kSwapchainImageCount == basalt::kVulkanSwapchainImageCount, "one image count for both APIs");
+ constexpr uint32_t kMaxArraySize = 2;
+ 
+ // cranvr: BASALT_MAX_ARRAY_SIZE=1 rejects two-slice swapchains, as this runtime
+@@ -60,6 +61,8 @@ struct SwapchainRecord {
+     uint32_t arraySize = 0;
+     bool everReleased = false;
+     uint32_t lastReleasedIndex = 0;
++    // cranvr: the images of a Vulkan session's swapchain (vulkan.cpp); null for Direct3D 11
++    basalt::VulkanSwapchainImages* vulkan = nullptr;
+ };
+ 
+ SRWLOCK gSwapchainLock = SRWLOCK_INIT;
+@@ -127,6 +130,68 @@ SwapchainRecord* findSwapchainLocked(XrSwapchain swapchain) {
+ 
+ namespace basalt {
+ 
++namespace {
++
++// cranvr: a swapchain of a Vulkan session. Its images lie on IOSurfaces (vulkan.cpp).
++XrResult createVulkanSwapchain(
++    XrSession session,
++    VulkanSession* vulkanSession,
++    const XrSwapchainCreateInfo* createInfo,
++    XrSwapchain* swapchain) {
++    VulkanSwapchainImages* images = nullptr;
++    std::array<uint32_t, kSwapchainImageCount * kMaxArraySize> iosurfaceIds{};
++    const XrResult result = createVulkanSwapchainImages(vulkanSession, createInfo, &images, iosurfaceIds.data());
++    if (XR_FAILED(result)) {
++        return result;
++    }
++
++    AcquireSRWLockExclusive(&gSwapchainLock);
++    if (!isValidSession(session)) {
++        ReleaseSRWLockExclusive(&gSwapchainLock);
++        destroyVulkanSwapchainImages(images);
++        return XR_ERROR_HANDLE_INVALID;
++    }
++    SwapchainRecord* available = nullptr;
++    for (SwapchainRecord& record : gSwapchains) {
++        if (record.handle == XR_NULL_HANDLE) {
++            available = &record;
++            break;
++        }
++    }
++    if (available == nullptr ||
++        gNextSwapchainHandle > UINTPTR_MAX - kSwapchainHandleStride) {
++        ReleaseSRWLockExclusive(&gSwapchainLock);
++        destroyVulkanSwapchainImages(images);
++        return XR_ERROR_LIMIT_REACHED;
++    }
++    available->handle = reinterpret_cast<XrSwapchain>(gNextSwapchainHandle);
++    gNextSwapchainHandle += kSwapchainHandleStride;
++    available->session = session;
++    available->vulkan = images;
++    available->imageStates.fill(ImageState::Available);
++    available->nextAcquireIndex = 0;
++    available->width = createInfo->width;
++    available->height = createInfo->height;
++    available->arraySize = createInfo->arraySize;
++    available->everReleased = false;
++    available->lastReleasedIndex = 0;
++    *swapchain = available->handle;
++    ReleaseSRWLockExclusive(&gSwapchainLock);
++
++    if (controlActive(session)) {
++        controlRegisterSwapchain(
++            *swapchain,
++            createInfo->width,
++            createInfo->height,
++            createInfo->format,
++            iosurfaceIds.data(),
++            kSwapchainImageCount * createInfo->arraySize);
++    }
++    return XR_SUCCESS;
++}
++
++}  // namespace
++
+ XrResult XRAPI_CALL enumerateSwapchainFormats(
+     XrSession session,
+     uint32_t formatCapacityInput,
+@@ -139,6 +204,25 @@ XrResult XRAPI_CALL enumerateSwapchainFormats(
+         return XR_ERROR_VALIDATION_FAILURE;
+     }
+ 
++    if (sessionVulkan(session) != nullptr) {
++        uint32_t count = 0;
++        const VkFormat* vulkanFormats = vulkanSwapchainFormats(&count);
++        *formatCountOutput = count;
++        if (formatCapacityInput == 0) {
++            return XR_SUCCESS;
++        }
++        if (formats == nullptr) {
++            return XR_ERROR_VALIDATION_FAILURE;
++        }
++        if (formatCapacityInput < count) {
++            return XR_ERROR_SIZE_INSUFFICIENT;
++        }
++        for (uint32_t index = 0; index < count; ++index) {
++            formats[index] = static_cast<int64_t>(vulkanFormats[index]);
++        }
++        return XR_SUCCESS;
++    }
++
+     *formatCountOutput = static_cast<uint32_t>(kSupportedFormats.size());
+     if (formatCapacityInput == 0) {
+         return XR_SUCCESS;
+@@ -175,12 +259,17 @@ XrResult XRAPI_CALL createSwapchain(
+         createInfo->sampleCount != 1) {
+         return XR_ERROR_VALIDATION_FAILURE;
+     }
+-    if (!isSupportedFormat(createInfo->format)) {
++    VulkanSession* vulkanSession = sessionVulkan(session);
++    if (vulkanSession != nullptr ? !isVulkanSwapchainFormat(createInfo->format)
++                                 : !isSupportedFormat(createInfo->format)) {
+         return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
+     }
+     if ((createInfo->usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0) {
+         return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
+     }
++    if (vulkanSession != nullptr) {
++        return createVulkanSwapchain(session, vulkanSession, createInfo, swapchain);
++    }
+ 
+     ID3D11Device* device = retainSessionDevice(session);
+     if (device == nullptr) {
+@@ -319,6 +408,7 @@ XrResult XRAPI_CALL destroySwapchain(XrSwapchain swapchain) {
+     }
+     textures = record->textures;
+     exportTextures = record->exportTextures;
++    VulkanSwapchainImages* vulkanImages = record->vulkan;
+     record->textures.fill(nullptr);
+     for (auto& image : record->exportTextures) {
+         image.fill(nullptr);
+@@ -330,6 +420,7 @@ XrResult XRAPI_CALL destroySwapchain(XrSwapchain swapchain) {
+     controlUnregisterSwapchain(swapchain);
+     releaseTextures(textures);
+     releaseExportTextures(exportTextures);
++    destroyVulkanSwapchainImages(vulkanImages);
+     return XR_SUCCESS;
+ }
+ 
+@@ -362,6 +453,21 @@ XrResult XRAPI_CALL enumerateSwapchainImages(
+         return XR_ERROR_SIZE_INSUFFICIENT;
+     }
+ 
++    if (record->vulkan != nullptr) {
++        auto* vulkanImages = reinterpret_cast<XrSwapchainImageVulkanKHR*>(images);
++        for (uint32_t index = 0; index < kSwapchainImageCount; ++index) {
++            if (vulkanImages[index].type != XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR) {
++                ReleaseSRWLockShared(&gSwapchainLock);
++                return XR_ERROR_VALIDATION_FAILURE;
++            }
++        }
++        for (uint32_t index = 0; index < kSwapchainImageCount; ++index) {
++            vulkanImages[index].image = vulkanSwapchainImage(record->vulkan, index);
++        }
++        ReleaseSRWLockShared(&gSwapchainLock);
++        return XR_SUCCESS;
++    }
++
+     auto* d3dImages = reinterpret_cast<XrSwapchainImageD3D11KHR*>(images);
+     for (uint32_t index = 0; index < kSwapchainImageCount; ++index) {
+         if (d3dImages[index].type != XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR) {
+@@ -507,7 +613,7 @@ bool prepareSwapchainViewForExport(
+         reinterpret_cast<XrSwapchain>(static_cast<uintptr_t>(view->swapchainId));
+     AcquireSRWLockShared(&gSwapchainLock);
+     const SwapchainRecord* record = findSwapchainLocked(swapchain);
+-    if (record == nullptr || view->imageArrayIndex >= record->arraySize) {
++    if (record == nullptr || record->vulkan != nullptr || view->imageArrayIndex >= record->arraySize) {
+         ReleaseSRWLockShared(&gSwapchainLock);
+         return false;
+     }
+@@ -531,6 +637,32 @@ bool prepareSwapchainViewForExport(
+     return true;
+ }
+ 
++bool vulkanSwapchainViewForExport(
++    ControlFrameView* view,
++    VulkanSwapchainImages** images,
++    uint32_t* image,
++    uint32_t* slice) {
++    if (view == nullptr || view->imageIndex >= kSwapchainImageCount) {
++        return false;
++    }
++    const XrSwapchain swapchain =
++        reinterpret_cast<XrSwapchain>(static_cast<uintptr_t>(view->swapchainId));
++    AcquireSRWLockShared(&gSwapchainLock);
++    const SwapchainRecord* record = findSwapchainLocked(swapchain);
++    if (record == nullptr || record->vulkan == nullptr || view->imageArrayIndex >= record->arraySize) {
++        ReleaseSRWLockShared(&gSwapchainLock);
++        return false;
++    }
++    // The images stay until the swapchain's destruction, which waits for every submitted frame
++    *images = record->vulkan;
++    *image = view->imageIndex;
++    *slice = view->imageArrayIndex;
++    view->imageIndex = view->imageIndex * record->arraySize + view->imageArrayIndex;
++    view->imageArrayIndex = 0;
++    ReleaseSRWLockShared(&gSwapchainLock);
++    return true;
++}
++
+ void invalidateSwapchainForSession(XrSession session) {
+     std::array<
+         std::array<ID3D11Texture2D*, kSwapchainImageCount>,
+@@ -543,6 +675,7 @@ void invalidateSwapchainForSession(XrSession session) {
+         kMaxSwapchains>
+         exportTextures{};
+     std::array<XrSwapchain, kMaxSwapchains> handles{};
++    std::array<VulkanSwapchainImages*, kMaxSwapchains> vulkanImages{};
+     size_t textureSetCount = 0;
+     AcquireSRWLockExclusive(&gSwapchainLock);
+     for (SwapchainRecord& record : gSwapchains) {
+@@ -550,6 +683,7 @@ void invalidateSwapchainForSession(XrSession session) {
+             textures[textureSetCount] = record.textures;
+             exportTextures[textureSetCount] = record.exportTextures;
+             handles[textureSetCount] = record.handle;
++            vulkanImages[textureSetCount] = record.vulkan;
+             ++textureSetCount;
+             record.textures.fill(nullptr);
+             for (auto& image : record.exportTextures) {
+@@ -565,6 +699,7 @@ void invalidateSwapchainForSession(XrSession session) {
+         controlUnregisterSwapchain(handles[index]);
+         releaseTextures(textures[index]);
+         releaseExportTextures(exportTextures[index]);
++        destroyVulkanSwapchainImages(vulkanImages[index]);
+     }
+ }
+ 
+diff --git a/runtime/pe/vulkan.cpp b/runtime/pe/vulkan.cpp
+new file mode 100644
+index 0000000..74533f6
+--- /dev/null
++++ b/runtime/pe/vulkan.cpp
+@@ -0,0 +1,1003 @@
++// cranvr: Vulkan sessions (XR_KHR_vulkan_enable and XR_KHR_vulkan_enable2).
++//
++// A Vulkan game under Wine renders through winevulkan and MoltenVK. Each swapchain image is a
++// VkImage on a Metal texture that lies on a global IOSurface: cranvr's DXMT fork makes the texture
++// (winemetal.dll, MTLDevice_newTextureFromIOSurface) and the game's device imports it with
++// VkImportMetalTextureInfoEXT, which cranvr's Wine patch 0009 passes to MoltenVK. The game renders
++// into the IOSurface itself, and cranvr-host reads it by its ID. No pixel goes through the CPU.
++//
++// A swapchain with two slices stays private to the game's device, as with Direct3D 11: at
++// xrEndFrame a GPU copy puts each slice into an IOSurface image of its own.
++//
++// The frame handoff: xrEndFrame submits a fence to the binding's queue after the game's commands.
++// The control waiter sends the frame to the host once the fence has signaled.
++
++#include "runtime.hpp"
++
++#include "control.hpp"
++
++#include <vulkan/vulkan_metal.h>
++
++#include <windows.h>
++
++#include <array>
++#include <cstddef>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <new>
++
++namespace {
++
++// A Vulkan structure with its type and every other member zero
++template <typename T>
++T vkStruct(VkStructureType type) {
++    T value{};
++    value.sType = type;
++    return value;
++}
++
++// --- winemetal.dll of cranvr's DXMT fork ------------------------------------------------------
++
++typedef uint64_t ObjHandle;
++
++// Mirrors struct WMTTextureInfo of DXMT v0.80 (src/winemetal/winemetal.h). The DXMT fork and
++// this runtime ship together in cranvr's game support.
++struct WmtTextureInfo {
++    uint32_t pixelFormat;
++    uint32_t width;
++    uint32_t height;
++    uint32_t depth;
++    uint32_t arrayLength;
++    uint32_t type : 8;
++    uint32_t mipmapLevelCount : 8;
++    uint32_t sampleCount : 8;
++    uint32_t usage : 8;
++    uint64_t options;
++    uint32_t reserved;  // out: the global IOSurfaceID
++    uint32_t machPort;  // in: 0 makes a new IOSurface
++    uint64_t gpuResourceId;
++};
++static_assert(sizeof(WmtTextureInfo) == 48, "WMTTextureInfo of DXMT v0.80");
++static_assert(offsetof(WmtTextureInfo, options) == 24, "WMTTextureInfo of DXMT v0.80");
++static_assert(offsetof(WmtTextureInfo, reserved) == 32, "WMTTextureInfo of DXMT v0.80");
++
++constexpr uint32_t kWmtPixelFormatBgra8Unorm = 80;
++constexpr uint32_t kWmtPixelFormatBgra8UnormSrgb = 81;
++constexpr uint32_t kWmtTextureType2D = 2;
++constexpr uint32_t kWmtUsageShaderRead = 1;
++constexpr uint32_t kWmtUsageShaderWrite = 2;
++constexpr uint32_t kWmtUsageRenderTarget = 4;
++constexpr uint32_t kWmtUsagePixelFormatView = 16;
++constexpr uint64_t kWmtStorageModeShared = 0;
++
++struct WineMetal {
++    ObjHandle (*copyAllDevices)() = nullptr;
++    ObjHandle (*arrayObject)(ObjHandle, uint64_t) = nullptr;
++    uint64_t (*arrayCount)(ObjHandle) = nullptr;
++    ObjHandle (*newTextureFromIOSurface)(ObjHandle, WmtTextureInfo*) = nullptr;
++    ObjHandle device = 0;
++};
++
++INIT_ONCE gLoadOnce = INIT_ONCE_STATIC_INIT;
++bool gLoaded = false;
++PFN_vkGetInstanceProcAddr gGetInstanceProcAddr = nullptr;
++WineMetal gMetal;
++
++// Loads vulkan-1.dll and winemetal.dll at the first Vulkan call, so a Direct3D 11 game loads
++// neither.
++BOOL CALLBACK loadLibraries(PINIT_ONCE, PVOID, PVOID*) {
++    HMODULE vulkan = LoadLibraryA("vulkan-1.dll");
++    HMODULE metal = LoadLibraryA("winemetal.dll");
++    if (vulkan == nullptr || metal == nullptr) {
++        std::fprintf(stderr, "Basalt OpenXR: Vulkan needs vulkan-1.dll and winemetal.dll (%s missing)\n",
++                     vulkan == nullptr ? "vulkan-1.dll" : "winemetal.dll");
++        return TRUE;
++    }
++    gGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
++        reinterpret_cast<void*>(GetProcAddress(vulkan, "vkGetInstanceProcAddr")));
++    gMetal.copyAllDevices = reinterpret_cast<ObjHandle (*)()>(
++        reinterpret_cast<void*>(GetProcAddress(metal, "WMTCopyAllDevices")));
++    gMetal.arrayObject = reinterpret_cast<ObjHandle (*)(ObjHandle, uint64_t)>(
++        reinterpret_cast<void*>(GetProcAddress(metal, "NSArray_object")));
++    gMetal.arrayCount = reinterpret_cast<uint64_t (*)(ObjHandle)>(
++        reinterpret_cast<void*>(GetProcAddress(metal, "NSArray_count")));
++    gMetal.newTextureFromIOSurface = reinterpret_cast<ObjHandle (*)(ObjHandle, WmtTextureInfo*)>(
++        reinterpret_cast<void*>(GetProcAddress(metal, "MTLDevice_newTextureFromIOSurface")));
++    if (gGetInstanceProcAddr == nullptr || gMetal.copyAllDevices == nullptr || gMetal.arrayObject == nullptr ||
++        gMetal.arrayCount == nullptr || gMetal.newTextureFromIOSurface == nullptr) {
++        std::fprintf(stderr, "Basalt OpenXR: winemetal.dll is not cranvr's DXMT fork, or vulkan-1.dll is broken\n");
++        return TRUE;
++    }
++    // A Mac with Apple silicon has one GPU: MoltenVK's device and DXMT's device are the same Metal device
++    const ObjHandle devices = gMetal.copyAllDevices();
++    if (devices == 0 || gMetal.arrayCount(devices) == 0) {
++        std::fprintf(stderr, "Basalt OpenXR: no Metal device\n");
++        return TRUE;
++    }
++    gMetal.device = gMetal.arrayObject(devices, 0);
++    gLoaded = gMetal.device != 0;
++    return TRUE;
++}
++
++bool librariesLoaded() {
++    InitOnceExecuteOnce(&gLoadOnce, loadLibraries, nullptr, nullptr);
++    return gLoaded;
++}
++
++// --- requirements and devices ----------------------------------------------------------------
++
++SRWLOCK gVulkanLock = SRWLOCK_INIT;
++XrInstance gRequirementsInstance = XR_NULL_HANDLE;
++// The Vulkan instance that the game asked a physical device for: xrCreateVulkanDeviceKHR finds
++// vkCreateDevice through it.
++VkInstance gGameVulkanInstance = VK_NULL_HANDLE;
++
++constexpr std::array<VkFormat, 2> kSwapchainFormats = {
++    // The same order and the same bytes as the Direct3D 11 formats: cranvr-host wraps BGRA IOSurfaces
++    VK_FORMAT_B8G8R8A8_UNORM,
++    VK_FORMAT_B8G8R8A8_SRGB,
++};
++
++XrResult checkInstanceAndSystem(XrInstance instance, XrSystemId systemId, bool enable2) {
++    if (!basalt::isValidInstance(instance)) {
++        return XR_ERROR_HANDLE_INVALID;
++    }
++    if (enable2 ? !basalt::isVulkanEnable2Enabled(instance) : !basalt::isVulkanEnableEnabled(instance)) {
++        return XR_ERROR_FUNCTION_UNSUPPORTED;
++    }
++    if (systemId != basalt::kSystemId) {
++        return XR_ERROR_SYSTEM_INVALID;
++    }
++    return XR_SUCCESS;
++}
++
++XrResult fillRequirements(XrInstance instance, XrGraphicsRequirementsVulkanKHR* requirements) {
++    if (requirements == nullptr || requirements->type != XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR) {
++        return XR_ERROR_VALIDATION_FAILURE;
++    }
++    if (!librariesLoaded()) {
++        return XR_ERROR_RUNTIME_FAILURE;
++    }
++    // MoltenVK 1.4 under Wine 11.10
++    requirements->minApiVersionSupported = XR_MAKE_VERSION(1, 0, 0);
++    requirements->maxApiVersionSupported = XR_MAKE_VERSION(1, 4, 0);
++    AcquireSRWLockExclusive(&gVulkanLock);
++    gRequirementsInstance = instance;
++    ReleaseSRWLockExclusive(&gVulkanLock);
++    return XR_SUCCESS;
++}
++
++// The first physical device of the game's instance: MoltenVK lists the Mac's one GPU
++XrResult firstPhysicalDevice(VkInstance vulkanInstance, VkPhysicalDevice* physicalDevice) {
++    if (vulkanInstance == VK_NULL_HANDLE || physicalDevice == nullptr) {
++        return XR_ERROR_VALIDATION_FAILURE;
++    }
++    if (!librariesLoaded()) {
++        return XR_ERROR_RUNTIME_FAILURE;
++    }
++    auto enumerate = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
++        gGetInstanceProcAddr(vulkanInstance, "vkEnumeratePhysicalDevices"));
++    if (enumerate == nullptr) {
++        return XR_ERROR_RUNTIME_FAILURE;
++    }
++    uint32_t count = 1;
++    VkPhysicalDevice first = VK_NULL_HANDLE;
++    const VkResult result = enumerate(vulkanInstance, &count, &first);
++    if ((result != VK_SUCCESS && result != VK_INCOMPLETE) || count == 0 || first == VK_NULL_HANDLE) {
++        return XR_ERROR_RUNTIME_FAILURE;
++    }
++    AcquireSRWLockExclusive(&gVulkanLock);
++    gGameVulkanInstance = vulkanInstance;
++    ReleaseSRWLockExclusive(&gVulkanLock);
++    *physicalDevice = first;
++    return XR_SUCCESS;
++}
++
++// The runtime asks for no Vulkan extension: an empty space-separated list
++XrResult writeExtensionList(uint32_t capacity, uint32_t* countOutput, char* buffer) {
++    if (countOutput == nullptr) {
++        return XR_ERROR_VALIDATION_FAILURE;
++    }
++    *countOutput = 1;
++    if (capacity == 0) {
++        return XR_SUCCESS;
++    }
++    if (buffer == nullptr) {
++        return XR_ERROR_VALIDATION_FAILURE;
++    }
++    buffer[0] = '\0';
++    return XR_SUCCESS;
++}
++
++}  // namespace
++
++namespace basalt {
++
++// --- the session ------------------------------------------------------------------------------
++
++struct VulkanSession {
++    VkInstance instance = VK_NULL_HANDLE;
++    VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
++    VkDevice device = VK_NULL_HANDLE;
++    uint32_t queueFamilyIndex = 0;
++    VkQueue queue = VK_NULL_HANDLE;
++    VkPhysicalDeviceMemoryProperties memory{};
++    char renderer[256]{};
++
++    PFN_vkCreateImage createImage = nullptr;
++    PFN_vkDestroyImage destroyImage = nullptr;
++    PFN_vkGetImageMemoryRequirements getImageMemoryRequirements = nullptr;
++    PFN_vkAllocateMemory allocateMemory = nullptr;
++    PFN_vkFreeMemory freeMemory = nullptr;
++    PFN_vkBindImageMemory bindImageMemory = nullptr;
++    PFN_vkCreateCommandPool createCommandPool = nullptr;
++    PFN_vkDestroyCommandPool destroyCommandPool = nullptr;
++    PFN_vkAllocateCommandBuffers allocateCommandBuffers = nullptr;
++    PFN_vkResetCommandBuffer resetCommandBuffer = nullptr;
++    PFN_vkBeginCommandBuffer beginCommandBuffer = nullptr;
++    PFN_vkEndCommandBuffer endCommandBuffer = nullptr;
++    PFN_vkCmdPipelineBarrier cmdPipelineBarrier = nullptr;
++    PFN_vkCmdCopyImage cmdCopyImage = nullptr;
++    PFN_vkQueueSubmit queueSubmit = nullptr;
++    PFN_vkCreateFence createFence = nullptr;
++    PFN_vkDestroyFence destroyFence = nullptr;
++    PFN_vkWaitForFences waitForFences = nullptr;
++    PFN_vkResetFences resetFences = nullptr;
++};
++
++struct VulkanSwapchainImages {
++    VulkanSession* session = nullptr;
++    uint32_t width = 0;
++    uint32_t height = 0;
++    uint32_t arraySize = 1;
++    VkFormat format = VK_FORMAT_UNDEFINED;
++    // The images that the game renders into: on IOSurfaces for one slice, private for two
++    std::array<VkImage, kVulkanSwapchainImageCount> images{};
++    std::array<VkDeviceMemory, kVulkanSwapchainImageCount> memory{};
++    // For two slices: one IOSurface image per slice of each image
++    std::array<std::array<VkImage, 2>, kVulkanSwapchainImageCount> exports{};
++    std::array<std::array<VkDeviceMemory, 2>, kVulkanSwapchainImageCount> exportMemory{};
++    // The pool's textures that the images lie on
++    std::array<size_t, kVulkanSwapchainImageCount * 2> pooledTextures{};
++    uint32_t pooledCount = 0;
++};
++
++}  // namespace basalt
++
++namespace {
++
++// --- IOSurface textures -----------------------------------------------------------------------
++//
++// winemetal keeps a Mach send right to each IOSurface that it makes, and that right holds the
++// surface until the game ends: a released texture does not free its IOSurface. A game recreates
++// its swapchains at each session restart (OpenComposite restarts twice at a game's start). The
++// runtime therefore keeps every texture that it made and gives it to the next swapchain of the same
++// size and format. The memory stays at the largest set of swapchains that the game had at a time.
++
++struct PooledTexture {
++    uint32_t width = 0;
++    uint32_t height = 0;
++    uint32_t pixelFormat = 0;
++    uint32_t usage = 0;
++    ObjHandle texture = 0;
++    uint32_t iosurfaceId = 0;
++    bool inUse = false;
++};
++
++// Four swapchains of three images with two slices each are 24 textures at a time. The runtime has
++// no exceptions: a fixed pool, and a swapchain that finds it full fails.
++constexpr size_t kPoolCapacity = 64;
++SRWLOCK gPoolLock = SRWLOCK_INIT;
++std::array<PooledTexture, kPoolCapacity> gPool{};
++size_t gPoolCount = 0;
++
++// A texture on an IOSurface, from the pool or new. Returns the pool index or SIZE_MAX.
++size_t takeTexture(uint32_t width, uint32_t height, uint32_t pixelFormat, uint32_t usage) {
++    AcquireSRWLockExclusive(&gPoolLock);
++    for (size_t index = 0; index < gPoolCount; ++index) {
++        PooledTexture& pooled = gPool[index];
++        if (!pooled.inUse && pooled.width == width && pooled.height == height &&
++            pooled.pixelFormat == pixelFormat && (pooled.usage & usage) == usage) {
++            pooled.inUse = true;
++            ReleaseSRWLockExclusive(&gPoolLock);
++            return index;
++        }
++    }
++    const bool full = gPoolCount == kPoolCapacity;
++    ReleaseSRWLockExclusive(&gPoolLock);
++    if (full) {
++        return SIZE_MAX;
++    }
++
++    WmtTextureInfo info{};
++    info.pixelFormat = pixelFormat;
++    info.width = width;
++    info.height = height;
++    info.depth = 1;
++    info.arrayLength = 1;
++    info.type = kWmtTextureType2D;
++    info.mipmapLevelCount = 1;
++    info.sampleCount = 1;
++    info.usage = usage;
++    info.options = kWmtStorageModeShared;
++    const ObjHandle texture = gMetal.newTextureFromIOSurface(gMetal.device, &info);
++    if (texture == 0 || info.reserved == 0) {
++        return SIZE_MAX;
++    }
++    AcquireSRWLockExclusive(&gPoolLock);
++    if (gPoolCount == kPoolCapacity) {
++        // Another thread took the last place: the texture stays alive with its IOSurface
++        ReleaseSRWLockExclusive(&gPoolLock);
++        return SIZE_MAX;
++    }
++    const size_t index = gPoolCount++;
++    gPool[index] = {width, height, pixelFormat, usage, texture, info.reserved, true};
++    ReleaseSRWLockExclusive(&gPoolLock);
++    return index;
++}
++
++PooledTexture pooledTexture(size_t index) {
++    AcquireSRWLockShared(&gPoolLock);
++    const PooledTexture pooled = gPool[index];
++    ReleaseSRWLockShared(&gPoolLock);
++    return pooled;
++}
++
++void returnTexture(size_t index) {
++    AcquireSRWLockExclusive(&gPoolLock);
++    gPool[index].inUse = false;
++    ReleaseSRWLockExclusive(&gPoolLock);
++}
++
++template <typename Function>
++bool loadDevice(PFN_vkGetDeviceProcAddr getDeviceProcAddr, VkDevice device, const char* name, Function* function) {
++    *function = reinterpret_cast<Function>(getDeviceProcAddr(device, name));
++    return *function != nullptr;
++}
++
++uint32_t memoryType(const VkPhysicalDeviceMemoryProperties& memory, uint32_t bits) {
++    // Device memory that the CPU cannot see: MoltenVK allocates nothing for an image on its own texture
++    const VkMemoryPropertyFlags unwantedFlags[] = {VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, 0};
++    for (VkMemoryPropertyFlags unwanted : unwantedFlags) {
++        for (uint32_t index = 0; index < memory.memoryTypeCount; ++index) {
++            const VkMemoryPropertyFlags flags = memory.memoryTypes[index].propertyFlags;
++            if ((bits & (1u << index)) != 0 && (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 &&
++                (flags & unwanted) == 0) {
++                return index;
++            }
++        }
++    }
++    return UINT32_MAX;
++}
++
++bool bindMemory(basalt::VulkanSession* session, VkImage image, VkDeviceMemory* memory) {
++    VkMemoryRequirements requirements{};
++    session->getImageMemoryRequirements(session->device, image, &requirements);
++    auto allocateInfo = vkStruct<VkMemoryAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
++    allocateInfo.allocationSize = requirements.size;
++    allocateInfo.memoryTypeIndex = memoryType(session->memory, requirements.memoryTypeBits);
++    if (allocateInfo.memoryTypeIndex == UINT32_MAX ||
++        session->allocateMemory(session->device, &allocateInfo, nullptr, memory) != VK_SUCCESS) {
++        *memory = VK_NULL_HANDLE;
++        return false;
++    }
++    return session->bindImageMemory(session->device, image, *memory, 0) == VK_SUCCESS;
++}
++
++VkImageUsageFlags imageUsage(XrSwapchainUsageFlags usage) {
++    VkImageUsageFlags flags = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++    if ((usage & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) != 0) {
++        flags |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++    }
++    if ((usage & XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT) != 0) {
++        flags |= VK_IMAGE_USAGE_STORAGE_BIT;
++    }
++    if ((usage & XR_SWAPCHAIN_USAGE_SAMPLED_BIT) != 0) {
++        flags |= VK_IMAGE_USAGE_SAMPLED_BIT;
++    }
++    if ((usage & XR_SWAPCHAIN_USAGE_INPUT_ATTACHMENT_BIT_KHR) != 0) {
++        flags |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
++    }
++    return flags;
++}
++
++// An image on an IOSurface texture of the pool. Its Vulkan usage follows the Metal texture's
++// usage, which MoltenVK reads from the texture.
++bool createSurfaceImage(
++    basalt::VulkanSession* session,
++    const XrSwapchainCreateInfo* createInfo,
++    VkImageUsageFlags usage,
++    VkImageCreateFlags flags,
++    basalt::VulkanSwapchainImages* owner,
++    VkImage* image,
++    VkDeviceMemory* memory,
++    uint32_t* iosurfaceId) {
++    uint32_t metalUsage = kWmtUsageShaderRead | kWmtUsageRenderTarget | kWmtUsagePixelFormatView;
++    if ((usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0) {
++        metalUsage |= kWmtUsageShaderWrite;
++    }
++    const uint32_t pixelFormat = createInfo->format == VK_FORMAT_B8G8R8A8_SRGB
++        ? kWmtPixelFormatBgra8UnormSrgb : kWmtPixelFormatBgra8Unorm;
++    const size_t index = takeTexture(createInfo->width, createInfo->height, pixelFormat, metalUsage);
++    if (index == SIZE_MAX) {
++        return false;
++    }
++    owner->pooledTextures[owner->pooledCount++] = index;
++    const PooledTexture texture = pooledTexture(index);
++
++    auto import = vkStruct<VkImportMetalTextureInfoEXT>(VK_STRUCTURE_TYPE_IMPORT_METAL_TEXTURE_INFO_EXT);
++    import.plane = VK_IMAGE_ASPECT_PLANE_0_BIT;
++    import.mtlTexture = reinterpret_cast<MTLTexture_id>(static_cast<uintptr_t>(texture.texture));
++    auto imageInfo = vkStruct<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
++    imageInfo.pNext = &import;
++    imageInfo.flags = flags;
++    imageInfo.imageType = VK_IMAGE_TYPE_2D;
++    imageInfo.format = static_cast<VkFormat>(createInfo->format);
++    imageInfo.extent = {createInfo->width, createInfo->height, 1};
++    imageInfo.mipLevels = 1;
++    imageInfo.arrayLayers = 1;
++    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
++    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
++    imageInfo.usage = usage;
++    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    if (session->createImage(session->device, &imageInfo, nullptr, image) != VK_SUCCESS) {
++        *image = VK_NULL_HANDLE;
++        return false;
++    }
++    *iosurfaceId = texture.iosurfaceId;
++    return bindMemory(session, *image, memory);
++}
++
++// --- the frame handoff ------------------------------------------------------------------------
++
++// A plain struct with the functions of basalt::FrameSync (see control.hpp for why not a class)
++struct FrameSlot {
++    VkCommandBuffer commands;
++    VkFence fence;
++    bool submitted;
++    // Set by the waiter once it has passed the slot's frame
++    volatile LONG waited;
++    uint64_t frameNumber;
++    LARGE_INTEGER signaledAt;
++};
++
++// Eight slots: the frame budget keeps at most three frames unconsumed, so the slot of a frame
++// eight frames back is always free
++constexpr uint32_t kFrameSlots = 8;
++
++struct VulkanFrameSync {
++    basalt::FrameSync base;
++    basalt::VulkanSession* session;
++    VkCommandPool pool;
++    FrameSlot slots[kFrameSlots];
++    uint64_t next;
++    bool recording;
++    // The waiter's counts for the note; submitSeconds comes from the xrEndFrame thread and is read
++    // without a lock, as a rough figure
++    uint64_t waitedFrames;
++    double submitSeconds;
++    double gpuSum;
++    double gpuMax;
++};
++
++LARGE_INTEGER counterNow() {
++    LARGE_INTEGER counter{};
++    QueryPerformanceCounter(&counter);
++    return counter;
++}
++
++double secondsBetween(LARGE_INTEGER from, LARGE_INTEGER to) {
++    LARGE_INTEGER frequency{};
++    QueryPerformanceFrequency(&frequency);
++    return static_cast<double>(to.QuadPart - from.QuadPart) / static_cast<double>(frequency.QuadPart);
++}
++
++bool slotReusable(FrameSlot& slot) {
++    return !slot.submitted || InterlockedCompareExchange(&slot.waited, 0, 0) != 0;
++}
++
++// One slice of the game's private two-slice image into its IOSurface image. The game releases
++// the image as a color attachment, and gets it back the same way.
++void recordSliceCopy(basalt::VulkanSession* session, VkCommandBuffer commands,
++                     const basalt::VulkanSwapchainImages& images, uint32_t image, uint32_t slice) {
++    VkImageMemoryBarrier barriers[2] = {vkStruct<VkImageMemoryBarrier>(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER),
++                                        vkStruct<VkImageMemoryBarrier>(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)};
++    barriers[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++    barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++    barriers[0].oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++    barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    barriers[0].srcQueueFamilyIndex = barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barriers[0].image = images.images[image];
++    barriers[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, slice, 1};
++    barriers[1].srcAccessMask = 0;
++    barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++    barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++    barriers[1].srcQueueFamilyIndex = barriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barriers[1].image = images.exports[image][slice];
++    barriers[1].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++    session->cmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
++    VkImageCopy region{};
++    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, slice, 1};
++    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++    region.extent = {images.width, images.height, 1};
++    session->cmdCopyImage(commands, images.images[image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                          images.exports[image][slice], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
++    VkImageMemoryBarrier back = barriers[0];
++    back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++    back.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++    back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    back.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++    session->cmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &back);
++}
++
++bool vulkanPrepareView(basalt::FrameSync* base, basalt::ControlFrameView* view) {
++    auto* sync = reinterpret_cast<VulkanFrameSync*>(base);
++    basalt::VulkanSwapchainImages* images = nullptr;
++    uint32_t image = 0;
++    uint32_t slice = 0;
++    if (!basalt::vulkanSwapchainViewForExport(view, &images, &image, &slice)) {
++        return false;
++    }
++    if (images == nullptr || images->arraySize == 1) {
++        return true;
++    }
++    FrameSlot& slot = sync->slots[sync->next % kFrameSlots];
++    if (!slotReusable(slot)) {
++        return false;
++    }
++    basalt::VulkanSession* session = sync->session;
++    if (!sync->recording) {
++        auto beginInfo = vkStruct<VkCommandBufferBeginInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
++        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++        if (session->resetCommandBuffer(slot.commands, 0) != VK_SUCCESS ||
++            session->beginCommandBuffer(slot.commands, &beginInfo) != VK_SUCCESS) {
++            return false;
++        }
++        sync->recording = true;
++    }
++    recordSliceCopy(session, slot.commands, *images, image, slice);
++    return true;
++}
++
++bool vulkanSignal(basalt::FrameSync* base, uint64_t frameNumber) {
++    auto* sync = reinterpret_cast<VulkanFrameSync*>(base);
++    basalt::VulkanSession* session = sync->session;
++    if (frameNumber != sync->next) {
++        return false;
++    }
++    FrameSlot& slot = sync->slots[sync->next % kFrameSlots];
++    if (!slotReusable(slot)) {
++        return false;
++    }
++    const LARGE_INTEGER start = counterNow();
++    if (slot.submitted && session->resetFences(session->device, 1, &slot.fence) != VK_SUCCESS) {
++        return false;
++    }
++    auto submitInfo = vkStruct<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);
++    if (sync->recording) {
++        sync->recording = false;
++        if (session->endCommandBuffer(slot.commands) != VK_SUCCESS) {
++            return false;
++        }
++        submitInfo.commandBufferCount = 1;
++        submitInfo.pCommandBuffers = &slot.commands;
++    }
++    // A submission without command buffers signals its fence once every earlier submission to the
++    // queue has finished: the game's commands for this frame
++    const VkResult result = session->queueSubmit(
++        session->queue, submitInfo.commandBufferCount == 0 ? 0 : 1, &submitInfo, slot.fence);
++    InterlockedExchange(&slot.waited, 0);
++    slot.submitted = true;
++    slot.frameNumber = frameNumber;
++    slot.signaledAt = counterNow();
++    sync->submitSeconds += secondsBetween(start, slot.signaledAt);
++    ++sync->next;
++    return result == VK_SUCCESS;
++}
++
++bool vulkanWait(basalt::FrameSync* base, uint64_t frameNumber, DWORD milliseconds) {
++    auto* sync = reinterpret_cast<VulkanFrameSync*>(base);
++    basalt::VulkanSession* session = sync->session;
++    FrameSlot& slot = sync->slots[frameNumber % kFrameSlots];
++    if (!slot.submitted || slot.frameNumber != frameNumber) {
++        return false;
++    }
++    const VkResult result = session->waitForFences(
++        session->device, 1, &slot.fence, VK_TRUE, static_cast<uint64_t>(milliseconds) * 1000000ull);
++    const double gpuSeconds = secondsBetween(slot.signaledAt, counterNow());
++    InterlockedExchange(&slot.waited, 1);
++    if (result != VK_SUCCESS) {
++        return false;
++    }
++    // The cost of the handoff, every 600 frames: the CPU time of the fence's submission in
++    // xrEndFrame, and how long after it the GPU finished the frame
++    sync->gpuSum += gpuSeconds;
++    sync->gpuMax = gpuSeconds > sync->gpuMax ? gpuSeconds : sync->gpuMax;
++    if (++sync->waitedFrames % 600 == 0) {
++        basalt::note(
++            "Basalt OpenXR: Vulkan frames: %llu sent; in the last 600 the fence's submission took %.3f ms on average, and the GPU "
++            "finished a frame %.2f ms after xrEndFrame on average (%.2f ms at most)\n",
++            static_cast<unsigned long long>(sync->waitedFrames), sync->submitSeconds / 600.0 * 1000.0,
++            sync->gpuSum / 600.0 * 1000.0, sync->gpuMax * 1000.0);
++        sync->submitSeconds = 0.0;
++        sync->gpuSum = 0.0;
++        sync->gpuMax = 0.0;
++    }
++    return true;
++}
++
++void vulkanDestroy(basalt::FrameSync* base) {
++    auto* sync = reinterpret_cast<VulkanFrameSync*>(base);
++    basalt::VulkanSession* session = sync->session;
++    for (FrameSlot& slot : sync->slots) {
++        if (slot.fence == VK_NULL_HANDLE) {
++            continue;
++        }
++        // A fence must not be destroyed while its submission runs
++        if (slot.submitted) {
++            session->waitForFences(session->device, 1, &slot.fence, VK_TRUE, 1000000000ull);
++        }
++        session->destroyFence(session->device, slot.fence, nullptr);
++    }
++    if (sync->pool != VK_NULL_HANDLE) {
++        // The pool frees its command buffers
++        session->destroyCommandPool(session->device, sync->pool, nullptr);
++    }
++    std::free(sync);
++}
++
++basalt::FrameSync* makeVulkanFrameSync(basalt::VulkanSession* session) {
++    auto* sync = static_cast<VulkanFrameSync*>(std::calloc(1, sizeof(VulkanFrameSync)));
++    if (sync == nullptr) {
++        return nullptr;
++    }
++    sync->base = {vulkanPrepareView, vulkanSignal, vulkanWait, vulkanDestroy};
++    sync->session = session;
++    sync->next = 1;
++    auto poolInfo = vkStruct<VkCommandPoolCreateInfo>(VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO);
++    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++    poolInfo.queueFamilyIndex = session->queueFamilyIndex;
++    bool ok = session->createCommandPool(session->device, &poolInfo, nullptr, &sync->pool) == VK_SUCCESS;
++    for (FrameSlot& slot : sync->slots) {
++        auto bufferInfo = vkStruct<VkCommandBufferAllocateInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO);
++        bufferInfo.commandPool = sync->pool;
++        bufferInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++        bufferInfo.commandBufferCount = 1;
++        auto fenceInfo = vkStruct<VkFenceCreateInfo>(VK_STRUCTURE_TYPE_FENCE_CREATE_INFO);
++        slot.waited = 1;
++        ok = ok && session->allocateCommandBuffers(session->device, &bufferInfo, &slot.commands) == VK_SUCCESS &&
++             session->createFence(session->device, &fenceInfo, nullptr, &slot.fence) == VK_SUCCESS;
++    }
++    if (!ok) {
++        vulkanDestroy(&sync->base);
++        return nullptr;
++    }
++    return &sync->base;
++}
++
++}  // namespace
++
++namespace basalt {
++
++bool isVulkanRuntimeOffered() {
++    // A file check only: the libraries load at the first Vulkan call
++    char path[MAX_PATH];
++    return SearchPathA(nullptr, "vulkan-1.dll", nullptr, MAX_PATH, path, nullptr) != 0 &&
++           SearchPathA(nullptr, "winemetal.dll", nullptr, MAX_PATH, path, nullptr) != 0;
++}
++
++const VkFormat* vulkanSwapchainFormats(uint32_t* count) {
++    *count = static_cast<uint32_t>(kSwapchainFormats.size());
++    return kSwapchainFormats.data();
++}
++
++bool isVulkanSwapchainFormat(int64_t format) {
++    for (VkFormat supported : kSwapchainFormats) {
++        if (format == static_cast<int64_t>(supported)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++XrResult XRAPI_CALL getVulkanInstanceExtensions(
++    XrInstance instance, XrSystemId systemId, uint32_t capacity, uint32_t* countOutput, char* buffer) {
++    const XrResult check = checkInstanceAndSystem(instance, systemId, false);
++    return XR_FAILED(check) ? check : writeExtensionList(capacity, countOutput, buffer);
++}
++
++XrResult XRAPI_CALL getVulkanDeviceExtensions(
++    XrInstance instance, XrSystemId systemId, uint32_t capacity, uint32_t* countOutput, char* buffer) {
++    const XrResult check = checkInstanceAndSystem(instance, systemId, false);
++    return XR_FAILED(check) ? check : writeExtensionList(capacity, countOutput, buffer);
++}
++
++XrResult XRAPI_CALL getVulkanGraphicsDevice(
++    XrInstance instance, XrSystemId systemId, VkInstance vulkanInstance, VkPhysicalDevice* physicalDevice) {
++    const XrResult check = checkInstanceAndSystem(instance, systemId, false);
++    return XR_FAILED(check) ? check : firstPhysicalDevice(vulkanInstance, physicalDevice);
++}
++
++XrResult XRAPI_CALL getVulkanGraphicsRequirements(
++    XrInstance instance, XrSystemId systemId, XrGraphicsRequirementsVulkanKHR* requirements) {
++    const XrResult check = checkInstanceAndSystem(instance, systemId, false);
++    return XR_FAILED(check) ? check : fillRequirements(instance, requirements);
++}
++
++XrResult XRAPI_CALL getVulkanGraphicsRequirements2(
++    XrInstance instance, XrSystemId systemId, XrGraphicsRequirementsVulkanKHR* requirements) {
++    const XrResult check = checkInstanceAndSystem(instance, systemId, true);
++    return XR_FAILED(check) ? check : fillRequirements(instance, requirements);
++}
++
++XrResult XRAPI_CALL createVulkanInstance(
++    XrInstance instance,
++    const XrVulkanInstanceCreateInfoKHR* createInfo,
++    VkInstance* vulkanInstance,
++    VkResult* vulkanResult) {
++    if (createInfo == nullptr || createInfo->type != XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR ||
++        createInfo->createFlags != 0 || createInfo->pfnGetInstanceProcAddr == nullptr ||
++        createInfo->vulkanCreateInfo == nullptr || vulkanInstance == nullptr || vulkanResult == nullptr) {
++        return XR_ERROR_VALIDATION_FAILURE;
++    }
++    const XrResult check = checkInstanceAndSystem(instance, createInfo->systemId, true);
++    if (XR_FAILED(check)) {
++        return check;
++    }
++    auto create = reinterpret_cast<PFN_vkCreateInstance>(
++        createInfo->pfnGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance"));
++    if (create == nullptr) {
++        return XR_ERROR_RUNTIME_FAILURE;
++    }
++    // The runtime needs no instance extension: the game's own create info goes as it is
++    *vulkanResult = create(createInfo->vulkanCreateInfo, createInfo->vulkanAllocator, vulkanInstance);
++    return XR_SUCCESS;
++}
++
++XrResult XRAPI_CALL getVulkanGraphicsDevice2(
++    XrInstance instance, const XrVulkanGraphicsDeviceGetInfoKHR* getInfo, VkPhysicalDevice* physicalDevice) {
++    if (getInfo == nullptr || getInfo->type != XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR) {
++        return XR_ERROR_VALIDATION_FAILURE;
++    }
++    const XrResult check = checkInstanceAndSystem(instance, getInfo->systemId, true);
++    return XR_FAILED(check) ? check : firstPhysicalDevice(getInfo->vulkanInstance, physicalDevice);
++}
++
++XrResult XRAPI_CALL createVulkanDevice(
++    XrInstance instance,
++    const XrVulkanDeviceCreateInfoKHR* createInfo,
++    VkDevice* vulkanDevice,
++    VkResult* vulkanResult) {
++    if (createInfo == nullptr || createInfo->type != XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR ||
++        createInfo->createFlags != 0 || createInfo->pfnGetInstanceProcAddr == nullptr ||
++        createInfo->vulkanCreateInfo == nullptr || createInfo->vulkanPhysicalDevice == VK_NULL_HANDLE ||
++        vulkanDevice == nullptr || vulkanResult == nullptr) {
++        return XR_ERROR_VALIDATION_FAILURE;
++    }
++    const XrResult check = checkInstanceAndSystem(instance, createInfo->systemId, true);
++    if (XR_FAILED(check)) {
++        return check;
++    }
++    AcquireSRWLockShared(&gVulkanLock);
++    const VkInstance gameInstance = gGameVulkanInstance;
++    ReleaseSRWLockShared(&gVulkanLock);
++    if (gameInstance == VK_NULL_HANDLE) {
++        // The extension asks the game for xrGetVulkanGraphicsDevice2KHR first
++        return XR_ERROR_VALIDATION_FAILURE;
++    }
++    auto create = reinterpret_cast<PFN_vkCreateDevice>(
++        createInfo->pfnGetInstanceProcAddr(gameInstance, "vkCreateDevice"));
++    if (create == nullptr) {
++        return XR_ERROR_RUNTIME_FAILURE;
++    }
++    // The runtime needs no device extension: winevulkan passes the IOSurface import of patch 0009
++    // without one
++    *vulkanResult = create(createInfo->vulkanPhysicalDevice, createInfo->vulkanCreateInfo,
++                           createInfo->vulkanAllocator, vulkanDevice);
++    return XR_SUCCESS;
++}
++
++const XrGraphicsBindingVulkanKHR* findVulkanBinding(const void* next) {
++    const auto* structure = static_cast<const XrBaseInStructure*>(next);
++    while (structure != nullptr) {
++        if (structure->type == XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR) {
++            return reinterpret_cast<const XrGraphicsBindingVulkanKHR*>(structure);
++        }
++        structure = structure->next;
++    }
++    return nullptr;
++}
++
++XrResult createVulkanSession(
++    XrInstance instance, const XrGraphicsBindingVulkanKHR* binding, VulkanSession** session) {
++    *session = nullptr;
++    AcquireSRWLockShared(&gVulkanLock);
++    const bool requirementsQueried = gRequirementsInstance == instance;
++    ReleaseSRWLockShared(&gVulkanLock);
++    if (!requirementsQueried) {
++        return XR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING;
++    }
++    if (binding->instance == VK_NULL_HANDLE || binding->physicalDevice == VK_NULL_HANDLE ||
++        binding->device == VK_NULL_HANDLE || !librariesLoaded()) {
++        return XR_ERROR_GRAPHICS_DEVICE_INVALID;
++    }
++    auto* state = static_cast<VulkanSession*>(std::calloc(1, sizeof(VulkanSession)));
++    if (state != nullptr) {
++        ::new (state) VulkanSession();
++    }
++    if (state == nullptr) {
++        return XR_ERROR_OUT_OF_MEMORY;
++    }
++    state->instance = binding->instance;
++    state->physicalDevice = binding->physicalDevice;
++    state->device = binding->device;
++    state->queueFamilyIndex = binding->queueFamilyIndex;
++
++    auto getDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
++        gGetInstanceProcAddr(binding->instance, "vkGetDeviceProcAddr"));
++    auto getMemoryProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
++        gGetInstanceProcAddr(binding->instance, "vkGetPhysicalDeviceMemoryProperties"));
++    auto getProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
++        gGetInstanceProcAddr(binding->instance, "vkGetPhysicalDeviceProperties"));
++    auto getQueueFamilies = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
++        gGetInstanceProcAddr(binding->instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
++    PFN_vkGetDeviceQueue getDeviceQueue = nullptr;
++    const VkDevice device = binding->device;
++    const bool loaded = getDeviceProcAddr != nullptr && getMemoryProperties != nullptr && getProperties != nullptr &&
++        getQueueFamilies != nullptr &&
++        loadDevice(getDeviceProcAddr, device, "vkGetDeviceQueue", &getDeviceQueue) &&
++        loadDevice(getDeviceProcAddr, device, "vkCreateImage", &state->createImage) &&
++        loadDevice(getDeviceProcAddr, device, "vkDestroyImage", &state->destroyImage) &&
++        loadDevice(getDeviceProcAddr, device, "vkGetImageMemoryRequirements", &state->getImageMemoryRequirements) &&
++        loadDevice(getDeviceProcAddr, device, "vkAllocateMemory", &state->allocateMemory) &&
++        loadDevice(getDeviceProcAddr, device, "vkFreeMemory", &state->freeMemory) &&
++        loadDevice(getDeviceProcAddr, device, "vkBindImageMemory", &state->bindImageMemory) &&
++        loadDevice(getDeviceProcAddr, device, "vkCreateCommandPool", &state->createCommandPool) &&
++        loadDevice(getDeviceProcAddr, device, "vkDestroyCommandPool", &state->destroyCommandPool) &&
++        loadDevice(getDeviceProcAddr, device, "vkAllocateCommandBuffers", &state->allocateCommandBuffers) &&
++        loadDevice(getDeviceProcAddr, device, "vkResetCommandBuffer", &state->resetCommandBuffer) &&
++        loadDevice(getDeviceProcAddr, device, "vkBeginCommandBuffer", &state->beginCommandBuffer) &&
++        loadDevice(getDeviceProcAddr, device, "vkEndCommandBuffer", &state->endCommandBuffer) &&
++        loadDevice(getDeviceProcAddr, device, "vkCmdPipelineBarrier", &state->cmdPipelineBarrier) &&
++        loadDevice(getDeviceProcAddr, device, "vkCmdCopyImage", &state->cmdCopyImage) &&
++        loadDevice(getDeviceProcAddr, device, "vkQueueSubmit", &state->queueSubmit) &&
++        loadDevice(getDeviceProcAddr, device, "vkCreateFence", &state->createFence) &&
++        loadDevice(getDeviceProcAddr, device, "vkDestroyFence", &state->destroyFence) &&
++        loadDevice(getDeviceProcAddr, device, "vkWaitForFences", &state->waitForFences) &&
++        loadDevice(getDeviceProcAddr, device, "vkResetFences", &state->resetFences);
++    if (!loaded) {
++        std::free(state);
++        return XR_ERROR_GRAPHICS_DEVICE_INVALID;
++    }
++    uint32_t familyCount = 0;
++    getQueueFamilies(binding->physicalDevice, &familyCount, nullptr);
++    if (binding->queueFamilyIndex >= familyCount) {
++        std::free(state);
++        return XR_ERROR_GRAPHICS_DEVICE_INVALID;
++    }
++    getDeviceQueue(device, binding->queueFamilyIndex, binding->queueIndex, &state->queue);
++    if (state->queue == VK_NULL_HANDLE) {
++        std::free(state);
++        return XR_ERROR_GRAPHICS_DEVICE_INVALID;
++    }
++    getMemoryProperties(binding->physicalDevice, &state->memory);
++    VkPhysicalDeviceProperties properties{};
++    getProperties(binding->physicalDevice, &properties);
++    std::snprintf(state->renderer, sizeof(state->renderer), "Vulkan %u.%u on %s (MoltenVK, IOSurface images)",
++                  VK_API_VERSION_MAJOR(properties.apiVersion), VK_API_VERSION_MINOR(properties.apiVersion),
++                  properties.deviceName);
++    *session = state;
++    return XR_SUCCESS;
++}
++
++void destroyVulkanSession(VulkanSession* session) {
++    // Plain data: calloc'd memory, as the runtime links no C++ allocator
++    std::free(session);
++}
++
++void vulkanControlSessionCreated(XrSession session, VulkanSession* state) {
++    FrameSync* sync = makeVulkanFrameSync(state);
++    if (sync != nullptr) {
++        controlSessionCreatedWith(session, sync, state->renderer);
++    }
++}
++
++XrResult createVulkanSwapchainImages(
++    VulkanSession* session,
++    const XrSwapchainCreateInfo* createInfo,
++    VulkanSwapchainImages** imagesOutput,
++    uint32_t* iosurfaceIds) {
++    *imagesOutput = nullptr;
++    auto* images = static_cast<VulkanSwapchainImages*>(std::calloc(1, sizeof(VulkanSwapchainImages)));
++    if (images != nullptr) {
++        ::new (images) VulkanSwapchainImages();
++    }
++    if (images == nullptr) {
++        return XR_ERROR_OUT_OF_MEMORY;
++    }
++    images->session = session;
++    images->width = createInfo->width;
++    images->height = createInfo->height;
++    images->arraySize = createInfo->arraySize;
++    images->format = static_cast<VkFormat>(createInfo->format);
++    const VkImageUsageFlags usage = imageUsage(createInfo->usageFlags);
++    const VkImageCreateFlags flags =
++        (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT) != 0 ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
++    bool ok = true;
++    for (uint32_t image = 0; image < kVulkanSwapchainImageCount && ok; ++image) {
++        if (createInfo->arraySize == 1) {
++            ok = createSurfaceImage(session, createInfo, usage, flags, images, &images->images[image],
++                                    &images->memory[image], &iosurfaceIds[image]);
++            continue;
++        }
++        // Two slices: a private image for the game, an IOSurface image for each slice
++        auto imageInfo = vkStruct<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
++        imageInfo.flags = flags;
++        imageInfo.imageType = VK_IMAGE_TYPE_2D;
++        imageInfo.format = images->format;
++        imageInfo.extent = {createInfo->width, createInfo->height, 1};
++        imageInfo.mipLevels = 1;
++        imageInfo.arrayLayers = createInfo->arraySize;
++        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
++        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
++        imageInfo.usage = usage;
++        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++        ok = session->createImage(session->device, &imageInfo, nullptr, &images->images[image]) == VK_SUCCESS &&
++             bindMemory(session, images->images[image], &images->memory[image]);
++        for (uint32_t slice = 0; slice < createInfo->arraySize && ok; ++slice) {
++            ok = createSurfaceImage(session, createInfo, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0,
++                                    images, &images->exports[image][slice],
++                                    &images->exportMemory[image][slice],
++                                    &iosurfaceIds[image * createInfo->arraySize + slice]);
++        }
++    }
++    if (!ok) {
++        destroyVulkanSwapchainImages(images);
++        return XR_ERROR_RUNTIME_FAILURE;
++    }
++    *imagesOutput = images;
++    return XR_SUCCESS;
++}
++
++void destroyVulkanSwapchainImages(VulkanSwapchainImages* images) {
++    if (images == nullptr) {
++        return;
++    }
++    VulkanSession* session = images->session;
++    for (uint32_t image = 0; image < kVulkanSwapchainImageCount; ++image) {
++        if (images->images[image] != VK_NULL_HANDLE) {
++            session->destroyImage(session->device, images->images[image], nullptr);
++        }
++        if (images->memory[image] != VK_NULL_HANDLE) {
++            session->freeMemory(session->device, images->memory[image], nullptr);
++        }
++        for (uint32_t slice = 0; slice < 2; ++slice) {
++            if (images->exports[image][slice] != VK_NULL_HANDLE) {
++                session->destroyImage(session->device, images->exports[image][slice], nullptr);
++            }
++            if (images->exportMemory[image][slice] != VK_NULL_HANDLE) {
++                session->freeMemory(session->device, images->exportMemory[image][slice], nullptr);
++            }
++        }
++    }
++    for (uint32_t index = 0; index < images->pooledCount; ++index) {
++        returnTexture(images->pooledTextures[index]);
++    }
++    std::free(images);
++}
++
++VkImage vulkanSwapchainImage(const VulkanSwapchainImages* images, uint32_t index) {
++    return images->images[index];
++}
++
++uint32_t vulkanSwapchainArraySize(const VulkanSwapchainImages* images) {
++    return images->arraySize;
++}
++
++}  // namespace basalt
+diff --git a/runtime/tests/CMakeLists.txt b/runtime/tests/CMakeLists.txt
+index abf542e..df29531 100644
+--- a/runtime/tests/CMakeLists.txt
++++ b/runtime/tests/CMakeLists.txt
+@@ -152,3 +152,9 @@ if(BASALT_BUILD_KHR_HELLO_XR)
+     target_link_options(
+         khr_hello_xr_d3d11 PRIVATE -static -static-libgcc -static-libstdc++)
+ endif()
++
++# cranvr: an OpenXR program that renders with Vulkan into IOSurface images (XR_KHR_vulkan_enable2 or enable)
++add_executable(vulkan_runtime_smoke vulkan_runtime_smoke.cpp)
++target_link_libraries(vulkan_runtime_smoke PRIVATE OpenXR::openxr_loader basalt_vulkan_headers)
++target_compile_options(vulkan_runtime_smoke PRIVATE -Wall -Wextra -Wpedantic)
++target_link_options(vulkan_runtime_smoke PRIVATE -static -static-libgcc -static-libstdc++)
+diff --git a/runtime/tests/vulkan_runtime_smoke.cpp b/runtime/tests/vulkan_runtime_smoke.cpp
+new file mode 100644
+index 0000000..f8f9990
+--- /dev/null
++++ b/runtime/tests/vulkan_runtime_smoke.cpp
+@@ -0,0 +1,561 @@
++// cranvr: an OpenXR program that renders with Vulkan, as a Vulkan game under Wine does.
++//
++// It enables XR_KHR_vulkan_enable2 (or XR_KHR_vulkan_enable with --enable1), lets the runtime make
++// its Vulkan instance and device, and draws a known picture into each eye for --seconds seconds at
++// the runtime's pace. Each eye is exact black with a dim gray band down its left edge and a bright
++// block in its upper half: orange in the left eye, blue in the right eye. A swap of the red and blue
++// channels, a swap of the eyes and a picture upside down all show in a copy of the host's eyes.
++// --array draws both eyes into one swapchain with two slices.
++//
++// It prints "vulkan_runtime_smoke: PASS" with the frame count, the rate and the CPU time of
++// xrEndFrame, or "FAIL ..." with the call that failed.
++
++#include <vulkan/vulkan.h>
++#include <windows.h>
++
++#define XR_USE_GRAPHICS_API_VULKAN
++#include <openxr/openxr.h>
++#include <openxr/openxr_platform.h>
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++namespace {
++
++template <typename T>
++T vkStruct(VkStructureType type) {
++    T value{};
++    value.sType = type;
++    return value;
++}
++
++template <typename T>
++T xrStruct(XrStructureType type) {
++    T value{};
++    value.type = type;
++    return value;
++}
++
++int fail(const char* what, long long result) {
++    std::printf("vulkan_runtime_smoke: FAIL %s (%lld)\n", what, result);
++    std::fflush(stdout);
++    return 1;
++}
++
++double now() {
++    LARGE_INTEGER counter{}, frequency{};
++    QueryPerformanceCounter(&counter);
++    QueryPerformanceFrequency(&frequency);
++    return static_cast<double>(counter.QuadPart) / static_cast<double>(frequency.QuadPart);
++}
++
++struct Vk {
++    PFN_vkGetInstanceProcAddr getInstanceProcAddr = nullptr;
++    PFN_vkGetDeviceProcAddr getDeviceProcAddr = nullptr;
++    PFN_vkGetDeviceQueue getDeviceQueue = nullptr;
++    PFN_vkGetPhysicalDeviceQueueFamilyProperties getQueueFamilies = nullptr;
++    PFN_vkCreateImageView createImageView = nullptr;
++    PFN_vkCreateRenderPass createRenderPass = nullptr;
++    PFN_vkCreateFramebuffer createFramebuffer = nullptr;
++    PFN_vkCreateCommandPool createCommandPool = nullptr;
++    PFN_vkAllocateCommandBuffers allocateCommandBuffers = nullptr;
++    PFN_vkBeginCommandBuffer beginCommandBuffer = nullptr;
++    PFN_vkEndCommandBuffer endCommandBuffer = nullptr;
++    PFN_vkResetCommandBuffer resetCommandBuffer = nullptr;
++    PFN_vkCmdBeginRenderPass cmdBeginRenderPass = nullptr;
++    PFN_vkCmdEndRenderPass cmdEndRenderPass = nullptr;
++    PFN_vkCmdClearAttachments cmdClearAttachments = nullptr;
++    PFN_vkQueueSubmit queueSubmit = nullptr;
++    PFN_vkCreateFence createFence = nullptr;
++    PFN_vkWaitForFences waitForFences = nullptr;
++    PFN_vkResetFences resetFences = nullptr;
++    PFN_vkDeviceWaitIdle deviceWaitIdle = nullptr;
++};
++
++struct Target {
++    VkImage image = VK_NULL_HANDLE;
++    VkFramebuffer framebuffer = VK_NULL_HANDLE;
++};
++
++// The picture of one eye: black, a gray band at the left edge, a bright block in the upper half
++void recordEye(const Vk& vk, VkCommandBuffer commands, VkRenderPass renderPass, VkFramebuffer framebuffer,
++               uint32_t width, uint32_t height, int eye) {
++    VkClearValue black{};
++    black.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
++    auto begin = vkStruct<VkRenderPassBeginInfo>(VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO);
++    begin.renderPass = renderPass;
++    begin.framebuffer = framebuffer;
++    begin.renderArea = {{0, 0}, {width, height}};
++    begin.clearValueCount = 1;
++    begin.pClearValues = &black;
++    vk.cmdBeginRenderPass(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
++    VkClearAttachment band{};
++    band.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    band.colorAttachment = 0;
++    band.clearValue.color = {{0.16f, 0.16f, 0.16f, 1.0f}};
++    VkClearRect bandRect{{{0, 0}, {std::max(1u, width / 16), height}}, 0, 1};
++    vk.cmdClearAttachments(commands, 1, &band, 1, &bandRect);
++    VkClearAttachment block = band;
++    block.clearValue.color = eye == 0 ? VkClearColorValue{{0.90f, 0.35f, 0.0f, 1.0f}}
++                                      : VkClearColorValue{{0.0f, 0.35f, 0.90f, 1.0f}};
++    VkClearRect blockRect{{{static_cast<int32_t>(width / 4), static_cast<int32_t>(height / 8)},
++                           {width / 2, height / 4}}, 0, 1};
++    vk.cmdClearAttachments(commands, 1, &block, 1, &blockRect);
++    vk.cmdEndRenderPass(commands);
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++    double seconds = 10.0;
++    bool enable1 = false;
++    bool array = false;
++    for (int index = 1; index < argc; ++index) {
++        if (std::strcmp(argv[index], "--seconds") == 0 && index + 1 < argc) {
++            seconds = std::atof(argv[++index]);
++        } else if (std::strcmp(argv[index], "--enable1") == 0) {
++            enable1 = true;
++        } else if (std::strcmp(argv[index], "--array") == 0) {
++            array = true;
++        } else {
++            std::printf("usage: vulkan_runtime_smoke.exe [--seconds N] [--enable1] [--array]\n");
++            return 2;
++        }
++    }
++
++    Vk vk;
++    HMODULE vulkanModule = LoadLibraryA("vulkan-1.dll");
++    if (vulkanModule == nullptr) {
++        return fail("LoadLibrary(vulkan-1.dll)", 0);
++    }
++    vk.getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
++        reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkGetInstanceProcAddr")));
++
++    const char* extension = enable1 ? XR_KHR_VULKAN_ENABLE_EXTENSION_NAME : XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME;
++    auto instanceInfo = xrStruct<XrInstanceCreateInfo>(XR_TYPE_INSTANCE_CREATE_INFO);
++    std::strncpy(instanceInfo.applicationInfo.applicationName, "cranvr Vulkan smoke", XR_MAX_APPLICATION_NAME_SIZE - 1);
++    instanceInfo.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
++    instanceInfo.enabledExtensionCount = 1;
++    instanceInfo.enabledExtensionNames = &extension;
++    XrInstance instance = XR_NULL_HANDLE;
++    XrResult result = xrCreateInstance(&instanceInfo, &instance);
++    if (XR_FAILED(result)) {
++        return fail("xrCreateInstance", result);
++    }
++    auto systemInfo = xrStruct<XrSystemGetInfo>(XR_TYPE_SYSTEM_GET_INFO);
++    systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
++    XrSystemId system = XR_NULL_SYSTEM_ID;
++    if (XR_FAILED(result = xrGetSystem(instance, &systemInfo, &system))) {
++        return fail("xrGetSystem", result);
++    }
++    uint32_t viewCount = 0;
++    XrViewConfigurationView viewConfigs[2] = {xrStruct<XrViewConfigurationView>(XR_TYPE_VIEW_CONFIGURATION_VIEW),
++                                              xrStruct<XrViewConfigurationView>(XR_TYPE_VIEW_CONFIGURATION_VIEW)};
++    if (XR_FAILED(result = xrEnumerateViewConfigurationViews(instance, system, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
++                                                             2, &viewCount, viewConfigs)) || viewCount != 2) {
++        return fail("xrEnumerateViewConfigurationViews", result);
++    }
++    const uint32_t width = viewConfigs[0].recommendedImageRectWidth;
++    const uint32_t height = viewConfigs[0].recommendedImageRectHeight;
++
++    // The runtime's Vulkan device: through its own calls (enable2) or by the lists that it asks for (enable1)
++    auto requirements = xrStruct<XrGraphicsRequirementsVulkanKHR>(XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR);
++    const char* requirementsName = enable1 ? "xrGetVulkanGraphicsRequirementsKHR" : "xrGetVulkanGraphicsRequirements2KHR";
++    PFN_xrGetVulkanGraphicsRequirementsKHR getRequirements = nullptr;
++    xrGetInstanceProcAddr(instance, requirementsName, reinterpret_cast<PFN_xrVoidFunction*>(&getRequirements));
++    if (getRequirements == nullptr || XR_FAILED(result = getRequirements(instance, system, &requirements))) {
++        return fail(requirementsName, result);
++    }
++    auto appInfo = vkStruct<VkApplicationInfo>(VK_STRUCTURE_TYPE_APPLICATION_INFO);
++    appInfo.pApplicationName = "cranvr Vulkan smoke";
++    appInfo.apiVersion = VK_API_VERSION_1_1;
++    auto vkInstanceInfo = vkStruct<VkInstanceCreateInfo>(VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO);
++    vkInstanceInfo.pApplicationInfo = &appInfo;
++    VkInstance vkInstance = VK_NULL_HANDLE;
++    VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
++    VkDevice device = VK_NULL_HANDLE;
++    float priority = 1.0f;
++    auto queueInfo = vkStruct<VkDeviceQueueCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO);
++    queueInfo.queueCount = 1;
++    queueInfo.pQueuePriorities = &priority;
++    auto deviceInfo = vkStruct<VkDeviceCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO);
++    deviceInfo.queueCreateInfoCount = 1;
++    deviceInfo.pQueueCreateInfos = &queueInfo;
++    if (enable1) {
++        PFN_xrGetVulkanInstanceExtensionsKHR instanceExtensions = nullptr;
++        PFN_xrGetVulkanDeviceExtensionsKHR deviceExtensions = nullptr;
++        PFN_xrGetVulkanGraphicsDeviceKHR graphicsDevice = nullptr;
++        xrGetInstanceProcAddr(instance, "xrGetVulkanInstanceExtensionsKHR", reinterpret_cast<PFN_xrVoidFunction*>(&instanceExtensions));
++        xrGetInstanceProcAddr(instance, "xrGetVulkanDeviceExtensionsKHR", reinterpret_cast<PFN_xrVoidFunction*>(&deviceExtensions));
++        xrGetInstanceProcAddr(instance, "xrGetVulkanGraphicsDeviceKHR", reinterpret_cast<PFN_xrVoidFunction*>(&graphicsDevice));
++        uint32_t length = 0;
++        if (instanceExtensions == nullptr || deviceExtensions == nullptr || graphicsDevice == nullptr ||
++            XR_FAILED(result = instanceExtensions(instance, system, 0, &length, nullptr))) {
++            return fail("xrGetVulkanInstanceExtensionsKHR", result);
++        }
++        std::vector<char> names(length + 1);
++        instanceExtensions(instance, system, length, &length, names.data());
++        std::printf("vulkan_runtime_smoke: the runtime asks for instance extensions \"%s\"\n", names.data());
++        auto create = reinterpret_cast<PFN_vkCreateInstance>(vk.getInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance"));
++        VkResult vkResult = create(&vkInstanceInfo, nullptr, &vkInstance);
++        if (vkResult != VK_SUCCESS) {
++            return fail("vkCreateInstance", vkResult);
++        }
++        if (XR_FAILED(result = graphicsDevice(instance, system, vkInstance, &physicalDevice))) {
++            return fail("xrGetVulkanGraphicsDeviceKHR", result);
++        }
++        deviceExtensions(instance, system, 0, &length, nullptr);
++        names.assign(length + 1, '\0');
++        deviceExtensions(instance, system, length, &length, names.data());
++        std::printf("vulkan_runtime_smoke: the runtime asks for device extensions \"%s\"\n", names.data());
++        auto createDevice = reinterpret_cast<PFN_vkCreateDevice>(vk.getInstanceProcAddr(vkInstance, "vkCreateDevice"));
++        if ((vkResult = createDevice(physicalDevice, &deviceInfo, nullptr, &device)) != VK_SUCCESS) {
++            return fail("vkCreateDevice", vkResult);
++        }
++    } else {
++        PFN_xrCreateVulkanInstanceKHR createInstance = nullptr;
++        PFN_xrGetVulkanGraphicsDevice2KHR graphicsDevice = nullptr;
++        PFN_xrCreateVulkanDeviceKHR createDevice = nullptr;
++        xrGetInstanceProcAddr(instance, "xrCreateVulkanInstanceKHR", reinterpret_cast<PFN_xrVoidFunction*>(&createInstance));
++        xrGetInstanceProcAddr(instance, "xrGetVulkanGraphicsDevice2KHR", reinterpret_cast<PFN_xrVoidFunction*>(&graphicsDevice));
++        xrGetInstanceProcAddr(instance, "xrCreateVulkanDeviceKHR", reinterpret_cast<PFN_xrVoidFunction*>(&createDevice));
++        if (createInstance == nullptr || graphicsDevice == nullptr || createDevice == nullptr) {
++            return fail("the functions of XR_KHR_vulkan_enable2", 0);
++        }
++        auto createInfo = xrStruct<XrVulkanInstanceCreateInfoKHR>(XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR);
++        createInfo.systemId = system;
++        createInfo.pfnGetInstanceProcAddr = vk.getInstanceProcAddr;
++        createInfo.vulkanCreateInfo = &vkInstanceInfo;
++        VkResult vkResult = VK_SUCCESS;
++        if (XR_FAILED(result = createInstance(instance, &createInfo, &vkInstance, &vkResult)) || vkResult != VK_SUCCESS) {
++            return fail("xrCreateVulkanInstanceKHR", XR_FAILED(result) ? static_cast<long long>(result) : static_cast<long long>(vkResult));
++        }
++        auto getInfo = xrStruct<XrVulkanGraphicsDeviceGetInfoKHR>(XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR);
++        getInfo.systemId = system;
++        getInfo.vulkanInstance = vkInstance;
++        if (XR_FAILED(result = graphicsDevice(instance, &getInfo, &physicalDevice))) {
++            return fail("xrGetVulkanGraphicsDevice2KHR", result);
++        }
++        auto deviceCreate = xrStruct<XrVulkanDeviceCreateInfoKHR>(XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR);
++        deviceCreate.systemId = system;
++        deviceCreate.pfnGetInstanceProcAddr = vk.getInstanceProcAddr;
++        deviceCreate.vulkanPhysicalDevice = physicalDevice;
++        deviceCreate.vulkanCreateInfo = &deviceInfo;
++        if (XR_FAILED(result = createDevice(instance, &deviceCreate, &device, &vkResult)) || vkResult != VK_SUCCESS) {
++            return fail("xrCreateVulkanDeviceKHR", XR_FAILED(result) ? static_cast<long long>(result) : static_cast<long long>(vkResult));
++        }
++    }
++
++#define LOAD_DEVICE(member, name) vk.member = reinterpret_cast<PFN_##name>(vk.getDeviceProcAddr(device, #name))
++    vk.getDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(vk.getInstanceProcAddr(vkInstance, "vkGetDeviceProcAddr"));
++    LOAD_DEVICE(getDeviceQueue, vkGetDeviceQueue);
++    LOAD_DEVICE(createImageView, vkCreateImageView);
++    LOAD_DEVICE(createRenderPass, vkCreateRenderPass);
++    LOAD_DEVICE(createFramebuffer, vkCreateFramebuffer);
++    LOAD_DEVICE(createCommandPool, vkCreateCommandPool);
++    LOAD_DEVICE(allocateCommandBuffers, vkAllocateCommandBuffers);
++    LOAD_DEVICE(beginCommandBuffer, vkBeginCommandBuffer);
++    LOAD_DEVICE(endCommandBuffer, vkEndCommandBuffer);
++    LOAD_DEVICE(resetCommandBuffer, vkResetCommandBuffer);
++    LOAD_DEVICE(cmdBeginRenderPass, vkCmdBeginRenderPass);
++    LOAD_DEVICE(cmdEndRenderPass, vkCmdEndRenderPass);
++    LOAD_DEVICE(cmdClearAttachments, vkCmdClearAttachments);
++    LOAD_DEVICE(queueSubmit, vkQueueSubmit);
++    LOAD_DEVICE(createFence, vkCreateFence);
++    LOAD_DEVICE(waitForFences, vkWaitForFences);
++    LOAD_DEVICE(resetFences, vkResetFences);
++    LOAD_DEVICE(deviceWaitIdle, vkDeviceWaitIdle);
++#undef LOAD_DEVICE
++    VkQueue queue = VK_NULL_HANDLE;
++    vk.getDeviceQueue(device, 0, 0, &queue);
++
++    auto binding = xrStruct<XrGraphicsBindingVulkanKHR>(XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR);
++    binding.instance = vkInstance;
++    binding.physicalDevice = physicalDevice;
++    binding.device = device;
++    binding.queueFamilyIndex = 0;
++    binding.queueIndex = 0;
++    auto sessionInfo = xrStruct<XrSessionCreateInfo>(XR_TYPE_SESSION_CREATE_INFO);
++    sessionInfo.next = &binding;
++    sessionInfo.systemId = system;
++    XrSession session = XR_NULL_HANDLE;
++    if (XR_FAILED(result = xrCreateSession(instance, &sessionInfo, &session))) {
++        return fail("xrCreateSession", result);
++    }
++
++    // The first format that the runtime offers: a BGRA one
++    uint32_t formatCount = 0;
++    xrEnumerateSwapchainFormats(session, 0, &formatCount, nullptr);
++    std::vector<int64_t> formats(formatCount);
++    if (formatCount == 0 || XR_FAILED(result = xrEnumerateSwapchainFormats(session, formatCount, &formatCount, formats.data()))) {
++        return fail("xrEnumerateSwapchainFormats", result);
++    }
++    const VkFormat format = static_cast<VkFormat>(formats[0]);
++    if (format != VK_FORMAT_B8G8R8A8_UNORM && format != VK_FORMAT_B8G8R8A8_SRGB) {
++        return fail("a BGRA swapchain format", format);
++    }
++
++    VkAttachmentDescription attachment{};
++    attachment.format = format;
++    attachment.samples = VK_SAMPLE_COUNT_1_BIT;
++    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++    attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++    attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++    attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    attachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++    VkAttachmentReference reference{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
++    VkSubpassDescription subpass{};
++    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
++    subpass.colorAttachmentCount = 1;
++    subpass.pColorAttachments = &reference;
++    auto renderPassInfo = vkStruct<VkRenderPassCreateInfo>(VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO);
++    renderPassInfo.attachmentCount = 1;
++    renderPassInfo.pAttachments = &attachment;
++    renderPassInfo.subpassCount = 1;
++    renderPassInfo.pSubpasses = &subpass;
++    VkRenderPass renderPass = VK_NULL_HANDLE;
++    vk.createRenderPass(device, &renderPassInfo, nullptr, &renderPass);
++
++    // One swapchain per eye, or one with a slice per eye
++    const uint32_t swapchainCount = array ? 1 : 2;
++    XrSwapchain swapchains[2]{};
++    // targets[swapchain][image][slice]
++    std::vector<std::vector<Target>> targets[2];
++    for (uint32_t chain = 0; chain < swapchainCount; ++chain) {
++        auto swapchainInfo = xrStruct<XrSwapchainCreateInfo>(XR_TYPE_SWAPCHAIN_CREATE_INFO);
++        swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
++        swapchainInfo.format = format;
++        swapchainInfo.sampleCount = 1;
++        swapchainInfo.width = width;
++        swapchainInfo.height = height;
++        swapchainInfo.faceCount = 1;
++        swapchainInfo.arraySize = array ? 2 : 1;
++        swapchainInfo.mipCount = 1;
++        if (XR_FAILED(result = xrCreateSwapchain(session, &swapchainInfo, &swapchains[chain]))) {
++            return fail("xrCreateSwapchain", result);
++        }
++        uint32_t imageCount = 0;
++        xrEnumerateSwapchainImages(swapchains[chain], 0, &imageCount, nullptr);
++        std::vector<XrSwapchainImageVulkanKHR> images(imageCount, xrStruct<XrSwapchainImageVulkanKHR>(XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR));
++        if (XR_FAILED(result = xrEnumerateSwapchainImages(swapchains[chain], imageCount, &imageCount,
++                                                          reinterpret_cast<XrSwapchainImageBaseHeader*>(images.data())))) {
++            return fail("xrEnumerateSwapchainImages", result);
++        }
++        targets[chain].resize(imageCount);
++        for (uint32_t image = 0; image < imageCount; ++image) {
++            for (uint32_t slice = 0; slice < swapchainInfo.arraySize; ++slice) {
++                auto viewInfo = vkStruct<VkImageViewCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO);
++                viewInfo.image = images[image].image;
++                viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
++                viewInfo.format = format;
++                viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, slice, 1};
++                VkImageView view = VK_NULL_HANDLE;
++                VkResult vkResult = vk.createImageView(device, &viewInfo, nullptr, &view);
++                auto framebufferInfo = vkStruct<VkFramebufferCreateInfo>(VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO);
++                framebufferInfo.renderPass = renderPass;
++                framebufferInfo.attachmentCount = 1;
++                framebufferInfo.pAttachments = &view;
++                framebufferInfo.width = width;
++                framebufferInfo.height = height;
++                framebufferInfo.layers = 1;
++                Target target;
++                target.image = images[image].image;
++                if (vkResult != VK_SUCCESS ||
++                    (vkResult = vk.createFramebuffer(device, &framebufferInfo, nullptr, &target.framebuffer)) != VK_SUCCESS) {
++                    return fail("the eye's framebuffer", vkResult);
++                }
++                targets[chain][image].push_back(target);
++            }
++        }
++    }
++
++    auto poolInfo = vkStruct<VkCommandPoolCreateInfo>(VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO);
++    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++    VkCommandPool pool = VK_NULL_HANDLE;
++    vk.createCommandPool(device, &poolInfo, nullptr, &pool);
++    constexpr uint32_t kSlots = 3;
++    VkCommandBuffer commands[kSlots]{};
++    VkFence fences[kSlots]{};
++    auto bufferInfo = vkStruct<VkCommandBufferAllocateInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO);
++    bufferInfo.commandPool = pool;
++    bufferInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++    bufferInfo.commandBufferCount = kSlots;
++    vk.allocateCommandBuffers(device, &bufferInfo, commands);
++    for (VkFence& fence : fences) {
++        auto fenceInfo = vkStruct<VkFenceCreateInfo>(VK_STRUCTURE_TYPE_FENCE_CREATE_INFO);
++        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
++        vk.createFence(device, &fenceInfo, nullptr, &fence);
++    }
++
++    auto spaceInfo = xrStruct<XrReferenceSpaceCreateInfo>(XR_TYPE_REFERENCE_SPACE_CREATE_INFO);
++    spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
++    spaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
++    XrSpace space = XR_NULL_HANDLE;
++    if (XR_FAILED(result = xrCreateReferenceSpace(session, &spaceInfo, &space))) {
++        return fail("xrCreateReferenceSpace", result);
++    }
++
++    std::printf("vulkan_runtime_smoke: %s, %ux%u per eye, %s, format %d\n", extension, width, height,
++                array ? "one swapchain with two slices" : "a swapchain per eye", format);
++    std::fflush(stdout);
++
++    bool running = false;
++    bool focused = false;
++    bool done = false;
++    uint64_t frames = 0;
++    double endFrameSeconds = 0.0;
++    double firstFrame = 0.0;
++    double lastFrame = 0.0;
++    const double start = now();
++    while (!done) {
++        auto event = xrStruct<XrEventDataBuffer>(XR_TYPE_EVENT_DATA_BUFFER);
++        while (xrPollEvent(instance, &event) == XR_SUCCESS) {
++            if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
++                const auto& changed = *reinterpret_cast<XrEventDataSessionStateChanged*>(&event);
++                if (changed.state == XR_SESSION_STATE_READY) {
++                    auto beginInfo = xrStruct<XrSessionBeginInfo>(XR_TYPE_SESSION_BEGIN_INFO);
++                    beginInfo.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
++                    if (XR_FAILED(result = xrBeginSession(session, &beginInfo))) {
++                        return fail("xrBeginSession", result);
++                    }
++                    running = true;
++                } else if (changed.state == XR_SESSION_STATE_FOCUSED) {
++                    focused = true;
++                } else if (changed.state == XR_SESSION_STATE_STOPPING) {
++                    xrEndSession(session);
++                    running = false;
++                    done = true;
++                } else if (changed.state == XR_SESSION_STATE_EXITING || changed.state == XR_SESSION_STATE_LOSS_PENDING) {
++                    done = true;
++                }
++            }
++            event = xrStruct<XrEventDataBuffer>(XR_TYPE_EVENT_DATA_BUFFER);
++        }
++        if (done) {
++            break;
++        }
++        if (now() - start > seconds) {
++            if (running) {
++                xrRequestExitSession(session);
++            }
++            if (now() - start > seconds + 5.0) {
++                break;
++            }
++        }
++        if (!running) {
++            Sleep(10);
++            if (now() - start > seconds + 5.0) {
++                break;
++            }
++            continue;
++        }
++
++        auto frameState = xrStruct<XrFrameState>(XR_TYPE_FRAME_STATE);
++        auto waitInfo = xrStruct<XrFrameWaitInfo>(XR_TYPE_FRAME_WAIT_INFO);
++        if (XR_FAILED(result = xrWaitFrame(session, &waitInfo, &frameState))) {
++            return fail("xrWaitFrame", result);
++        }
++        auto beginFrame = xrStruct<XrFrameBeginInfo>(XR_TYPE_FRAME_BEGIN_INFO);
++        if (XR_FAILED(result = xrBeginFrame(session, &beginFrame))) {
++            return fail("xrBeginFrame", result);
++        }
++        XrView views[2] = {xrStruct<XrView>(XR_TYPE_VIEW), xrStruct<XrView>(XR_TYPE_VIEW)};
++        auto locateInfo = xrStruct<XrViewLocateInfo>(XR_TYPE_VIEW_LOCATE_INFO);
++        locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
++        locateInfo.displayTime = frameState.predictedDisplayTime;
++        locateInfo.space = space;
++        auto viewState = xrStruct<XrViewState>(XR_TYPE_VIEW_STATE);
++        uint32_t located = 0;
++        xrLocateViews(session, &locateInfo, &viewState, 2, &located, views);
++
++        XrCompositionLayerProjectionView projectionViews[2] = {
++            xrStruct<XrCompositionLayerProjectionView>(XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW),
++            xrStruct<XrCompositionLayerProjectionView>(XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW)};
++        auto layer = xrStruct<XrCompositionLayerProjection>(XR_TYPE_COMPOSITION_LAYER_PROJECTION);
++        const XrCompositionLayerBaseHeader* layers[1] = {reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer)};
++        uint32_t layerCount = 0;
++        if (frameState.shouldRender) {
++            const uint32_t slot = static_cast<uint32_t>(frames % kSlots);
++            vk.waitForFences(device, 1, &fences[slot], VK_TRUE, 2000000000ull);
++            vk.resetFences(device, 1, &fences[slot]);
++            vk.resetCommandBuffer(commands[slot], 0);
++            auto beginInfo = vkStruct<VkCommandBufferBeginInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
++            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++            vk.beginCommandBuffer(commands[slot], &beginInfo);
++            uint32_t acquired[2]{};
++            for (uint32_t chain = 0; chain < swapchainCount; ++chain) {
++                auto acquireInfo = xrStruct<XrSwapchainImageAcquireInfo>(XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO);
++                if (XR_FAILED(result = xrAcquireSwapchainImage(swapchains[chain], &acquireInfo, &acquired[chain]))) {
++                    return fail("xrAcquireSwapchainImage", result);
++                }
++                auto imageWait = xrStruct<XrSwapchainImageWaitInfo>(XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO);
++                imageWait.timeout = XR_INFINITE_DURATION;
++                if (XR_FAILED(result = xrWaitSwapchainImage(swapchains[chain], &imageWait))) {
++                    return fail("xrWaitSwapchainImage", result);
++                }
++            }
++            for (int eye = 0; eye < 2; ++eye) {
++                const uint32_t chain = array ? 0 : static_cast<uint32_t>(eye);
++                const uint32_t slice = array ? static_cast<uint32_t>(eye) : 0;
++                recordEye(vk, commands[slot], renderPass, targets[chain][acquired[chain]][slice].framebuffer, width, height, eye);
++                projectionViews[eye].pose = views[eye].pose;
++                projectionViews[eye].fov = views[eye].fov;
++                projectionViews[eye].subImage.swapchain = swapchains[chain];
++                projectionViews[eye].subImage.imageRect = {{0, 0}, {static_cast<int32_t>(width), static_cast<int32_t>(height)}};
++                projectionViews[eye].subImage.imageArrayIndex = slice;
++            }
++            vk.endCommandBuffer(commands[slot]);
++            auto submit = vkStruct<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);
++            submit.commandBufferCount = 1;
++            submit.pCommandBuffers = &commands[slot];
++            vk.queueSubmit(queue, 1, &submit, fences[slot]);
++            for (uint32_t chain = 0; chain < swapchainCount; ++chain) {
++                auto releaseInfo = xrStruct<XrSwapchainImageReleaseInfo>(XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO);
++                if (XR_FAILED(result = xrReleaseSwapchainImage(swapchains[chain], &releaseInfo))) {
++                    return fail("xrReleaseSwapchainImage", result);
++                }
++            }
++            layer.space = space;
++            layer.viewCount = 2;
++            layer.views = projectionViews;
++            layerCount = 1;
++        }
++        auto endInfo = xrStruct<XrFrameEndInfo>(XR_TYPE_FRAME_END_INFO);
++        endInfo.displayTime = frameState.predictedDisplayTime;
++        endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
++        endInfo.layerCount = layerCount;
++        endInfo.layers = layers;
++        const double endStart = now();
++        if (XR_FAILED(result = xrEndFrame(session, &endInfo))) {
++            return fail("xrEndFrame", result);
++        }
++        if (layerCount != 0) {
++            endFrameSeconds += now() - endStart;
++            if (frames == 0) {
++                firstFrame = now();
++            }
++            lastFrame = now();
++            ++frames;
++        }
++    }
++    vk.deviceWaitIdle(device);
++    xrDestroySession(session);
++    xrDestroyInstance(instance);
++
++    const double span = lastFrame - firstFrame;
++    const double rate = frames > 1 && span > 0.0 ? static_cast<double>(frames - 1) / span : 0.0;
++    std::printf("vulkan_runtime_smoke: %llu frames in %.1f s, %.1f a second, xrEndFrame took %.3f ms on average, %s\n",
++                static_cast<unsigned long long>(frames), span, rate,
++                frames > 0 ? endFrameSeconds / static_cast<double>(frames) * 1000.0 : 0.0,
++                focused ? "the session was focused" : "the session never reached FOCUSED");
++    if (frames == 0 || !focused) {
++        return fail("no frame reached a focused session", static_cast<long long>(frames));
++    }
++    std::printf("vulkan_runtime_smoke: PASS\n");
++    std::fflush(stdout);
++    return 0;
++}

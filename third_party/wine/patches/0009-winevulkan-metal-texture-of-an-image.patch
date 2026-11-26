@@ -1,0 +1,44 @@
+diff --git a/dlls/winevulkan/vulkan_thunks.c b/dlls/winevulkan/vulkan_thunks.c
+index d081d7c..08e5228 100644
+--- a/dlls/winevulkan/vulkan_thunks.c
++++ b/dlls/winevulkan/vulkan_thunks.c
+@@ -27,6 +27,18 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
+ 
++/* cranvr: VkImportMetalTextureInfoEXT of VK_EXT_metal_objects. winevulkan offers the extension to no program, so
++ * the generated headers lack the structure. A 64-bit program may chain it to VkImageCreateInfo, and MoltenVK reads
++ * it there without the extension. */
++#define CRANVR_STRUCTURE_TYPE_IMPORT_METAL_TEXTURE_INFO_EXT ((VkStructureType)1000311007)
++struct cranvr_import_metal_texture_info
++{
++    VkStructureType sType;
++    const void *pNext;
++    VkImageAspectFlagBits plane;
++    MTLTexture_id mtlTexture;
++};
++
+ typedef struct VkGeometryAABBNV32
+ {
+     VkStructureType sType;
+@@ -26335,6 +26347,20 @@ static void convert_VkImageCreateInfo_win64_to_host(struct conversion_context *c
+ 
+     for (in_header = (void *)in->pNext; in_header; in_header = (void *)in_header->pNext)
+     {
++        if (in_header->sType == CRANVR_STRUCTURE_TYPE_IMPORT_METAL_TEXTURE_INFO_EXT)
++        {
++            /* cranvr: an OpenXR runtime in the program gives its swapchain image a Metal texture on a shared
++             * IOSurface. MoltenVK then renders into memory that another Mac process reads. */
++            struct cranvr_import_metal_texture_info *out_ext = conversion_context_alloc(ctx, sizeof(*out_ext));
++            const struct cranvr_import_metal_texture_info *in_ext = (const struct cranvr_import_metal_texture_info *)in_header;
++            out_ext->sType = CRANVR_STRUCTURE_TYPE_IMPORT_METAL_TEXTURE_INFO_EXT;
++            out_ext->pNext = NULL;
++            out_ext->plane = in_ext->plane;
++            out_ext->mtlTexture = in_ext->mtlTexture;
++            out_header->pNext = (void *)out_ext;
++            out_header = (void *)out_ext;
++            continue;
++        }
+         switch (in_header->sType)
+         {
+         case VK_STRUCTURE_TYPE_DATA_GRAPH_OPTICAL_FLOW_IMAGE_FORMAT_INFO_ARM:
