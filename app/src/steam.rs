@@ -231,6 +231,9 @@ pub struct Game {
     /// The folder that the launch entry starts the program in: its `workingdir`, else the program's own folder.
     /// None for a game that Steam's cache does not know: the program's own folder too.
     pub working_dir: Option<PathBuf>,
+    /// The engine that the program's files show (see [`launch::engine`]). It gives the arguments of the
+    /// graphics choice in the game's options.
+    pub engine: Option<launch::Engine>,
 }
 
 /// Installed games from every Steam library in the prefix, then the games that the user added from a
@@ -258,7 +261,7 @@ pub fn added_games(settings: &backend::Settings) -> Vec<Game> {
     settings
         .added_games
         .iter()
-        .map(|added| Game { name: added.name.clone(), exe: Some(added.program.clone()), ..Default::default() })
+        .map(|added| Game { name: added.name.clone(), exe: Some(added.program.clone()), engine: launch::engine(&added.program), ..Default::default() })
         .collect()
 }
 
@@ -281,10 +284,11 @@ pub fn steam_games() -> Vec<Game> {
             // The program that Steam starts, with its arguments and folder. A game that Steam's cache does not know
             // gets the program that the folder shows.
             let launch = app_id.parse().ok().and_then(|app| appinfo::entries(&steam_dir().join("appcache/appinfo.vdf"), app)).and_then(|entries| appinfo::choose(&entries, &folder));
-            let game = match launch {
-                Some(launch) => Game { app_id: app_id.to_string(), name, exe: Some(launch.program), args: launch.arguments, working_dir: Some(launch.working_dir) },
+            let mut game = match launch {
+                Some(launch) => Game { app_id: app_id.to_string(), name, exe: Some(launch.program), args: launch.arguments, working_dir: Some(launch.working_dir), engine: None },
                 None => Game { app_id: app_id.to_string(), name, exe: find_exe(&folder, &installdir), ..Default::default() },
             };
+            game.engine = game.exe.as_deref().and_then(launch::engine);
             games.push(game);
         }
     }
@@ -429,8 +433,9 @@ pub fn wine(program: &str) -> Command {
 /// the Play tab shows. Steam does not get them. The OpenVR choice goes into the prefix's OpenVR path
 /// file now, because the game reads that file when it starts: the game's run begins (game_run.rs), and
 /// its end puts the file back. `steam_args` are the arguments of the game's launch entry in Steam, which go
-/// before the program's own. Returns the command and the run's number, which [`spawn_game`] takes.
-fn game_wine(program: &str, steam_args: &[String]) -> (Command, Option<u64>) {
+/// before the program's own. `engine` gives the arguments of the graphics choice. Returns the command and the
+/// run's number, which [`spawn_game`] takes.
+fn game_wine(program: &str, steam_args: &[String], engine: Option<launch::Engine>) -> (Command, Option<u64>) {
     let settings = backend::Settings::load();
     let options = settings.launch.get(program).cloned().unwrap_or_default();
     let choice = launch::openvr(&settings.wine, &options);
@@ -444,7 +449,7 @@ fn game_wine(program: &str, steam_args: &[String]) -> (Command, Option<u64>) {
         }
     }
     let mut command = wine_with(program, settings.game_msaa_limit);
-    command.envs(launch::environment(&settings.wine, &options)).args(steam_args).args(launch::arguments(&options));
+    command.envs(launch::environment(&settings.wine, &options)).args(steam_args).args(launch::arguments(&options, engine));
     // cranvr's SteamVR driver finds the game's render size in game-sizes.txt by the game's program. SteamVR,
     // which the game starts, inherits the variable.
     command.env("CRANVR_GAME", program);
@@ -563,7 +568,7 @@ pub fn play(game: &Game) -> Result<(), String> {
     } else if !wine_ready() {
         return Err("Set up game support first".into());
     }
-    let (mut command, run) = game_wine(&program, &game.args);
+    let (mut command, run) = game_wine(&program, &game.args, game.engine);
     if let Some(id) = &app_id {
         command.env("SteamAppId", id).env("SteamGameId", id);
     }
@@ -579,7 +584,7 @@ pub fn run_program(path: &Path) -> Result<(), String> {
     }
     require_current_game_support()?;
     let program = mac_to_windows(path);
-    let (mut command, run) = game_wine(&program, &[]);
+    let (mut command, run) = game_wine(&program, &[], launch::engine(path));
     if let Some(id) = steam_id(&program, backend::steam_app_id(path.parent().unwrap_or(path)).as_deref()) {
         command.env("SteamAppId", &id).env("SteamGameId", &id);
     }

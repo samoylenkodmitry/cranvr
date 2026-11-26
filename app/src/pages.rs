@@ -10,7 +10,7 @@
 
 use crate::{
     backend::{Model, Settings, StreamPath},
-    launch::{self, GameOptions, OpenVr},
+    launch::{self, GameOptions, Graphics, OpenVr},
     microphone::MicrophoneSource,
     pending,
     setup::{self, Progress, Setup},
@@ -465,8 +465,23 @@ enum GameKind {
 
 /// The value of a game's VR system that follows the choice for every program
 const AS_SETTINGS: &str = "default";
+/// The value of a game's graphics choice that adds no argument: the game draws with what it picks itself
+const GAME_S_OWN: &str = "own";
 
 const GAME_SETTINGS: &[GameSetting] = &[
+    GameSetting {
+        id: "game.graphics",
+        label: "Graphics",
+        kind: GameKind::Choice {
+            options: |_| {
+                let mut options = vec![Opt::new(GAME_S_OWN, "Game's own")];
+                options.extend(Graphics::ALL.iter().map(|choice| Opt::new(choice.key(), choice.label())));
+                options
+            },
+            get: |o| o.graphics.map_or(GAME_S_OWN, Graphics::key).to_string(),
+            set: |o, v| o.graphics = Graphics::from_key(v),
+        },
+    },
     GameSetting {
         id: "game.openvr",
         label: "OpenVR",
@@ -518,6 +533,28 @@ const GAME_SETTINGS: &[GameSetting] = &[
         },
     },
 ];
+
+const GRAPHICS_HINT: &str = "For a game that draws with Vulkan or with Direct3D 11 as an argument tells it. Game's own adds no argument. Vulkan runs on the Mac's GPU through MoltenVK, Direct3D 11 through DXMT: try the other one for a game that draws wrong or slowly. cranvr adds the argument of the game's engine when the game's files show the engine. For another game, type the argument under Advanced in the Mac's window. A game that was built without the API does not start with it: its log says so. It applies when the game starts.";
+
+/// The line under a game's graphics choice: which argument the choice adds and where it comes from
+fn graphics_line(options: &GameOptions, engine: Option<launch::Engine>) -> String {
+    let added = launch::graphics_arguments(options, engine);
+    match (options.graphics, engine) {
+        (None, Some(engine)) => format!(
+            "cranvr found a game of {} ({} next to the program): Vulkan adds {}, Direct3D 11 adds {}.",
+            engine.name, engine.sign, engine.vulkan, engine.direct3d
+        ),
+        (None, None) => String::new(),
+        (Some(graphics), _) if added.is_empty() => format!(
+            "cranvr does not know the argument for {} of this game. Type it under Advanced in the Mac's window.",
+            graphics.label()
+        ),
+        (Some(graphics), Some(engine)) if added == engine.arguments(graphics) => {
+            format!("The game gets {added}, the argument of {} games ({} next to the program).", engine.name, engine.sign)
+        }
+        (Some(_), _) => format!("The game gets {added}, as typed under Advanced."),
+    }
+}
 
 const EYE_HINT: &str = "For a game whose picture stays black, in the right eye or in both eyes. \"Each eye in its own pass\": the runtime refuses two-eye images, so the game draws each eye apart. This costs frames. \"Both eyes in one pass\": the runtime tells the game that a vertex shader may choose the eye, as a game that draws both eyes in one pass needs, or that draws both eyes into a picture of its own, as a Unity game with the OpenVR provider does.";
 
@@ -909,8 +946,15 @@ fn game_page_of(settings: &Settings, model: &Model, game: &Game) -> Option<Page>
 /// The launch options of the program `program` as a page: its VR system, the eye options, cranvr's
 /// reasons and what the program starts with. A game's page has them, and so has the program that the
 /// window started last with "Choose a program".
-pub fn options_page(settings: &Settings, _model: &Model, program: &str) -> Page {
+pub fn options_page(settings: &Settings, model: &Model, program: &str) -> Page {
     let options = settings.launch.get(program).cloned().unwrap_or_default();
+    // The engine of a game in the list was found with the list. The program that the window started last
+    // gets a look at its folder.
+    let engine = match model.games.iter().find(|game| steam::program(game).as_deref() == Some(program)) {
+        Some(game) => game.engine,
+        None if settings.game.starts_with('/') => launch::engine(std::path::Path::new(&settings.game)),
+        None => None,
+    };
     let mut items = Vec::new();
     for setting in GAME_SETTINGS {
         items.push(match &setting.kind {
@@ -920,7 +964,11 @@ pub fn options_page(settings: &Settings, _model: &Model, program: &str) -> Page 
                 label: setting.label.into(),
                 options: offered(settings),
                 value: get(&options),
-                hint: if setting.id == "game.openvr" { OPENVR_HINT.into() } else { String::new() },
+                hint: match setting.id {
+                    "game.openvr" => OPENVR_HINT.into(),
+                    "game.graphics" => GRAPHICS_HINT.into(),
+                    _ => String::new(),
+                },
                 restarts: false,
                 shape: ChoiceShape::Keys,
             }),
@@ -935,16 +983,17 @@ pub fn options_page(settings: &Settings, _model: &Model, program: &str) -> Page 
         });
         // cranvr's reason for a value that it chose stands under the setting
         let reason = match setting.id {
-            "game.openvr" if options.openvr.is_some() => &options.openvr_reason,
-            "game.eye_per_pass" if options.eye_per_pass => &options.eye_per_pass_reason,
-            "game.eye_one_pass" if options.eye_one_pass => &options.eye_one_pass_reason,
-            _ => "",
+            "game.graphics" => graphics_line(&options, engine),
+            "game.openvr" if options.openvr.is_some() => options.openvr_reason.clone(),
+            "game.eye_per_pass" if options.eye_per_pass => options.eye_per_pass_reason.clone(),
+            "game.eye_one_pass" if options.eye_one_pass => options.eye_one_pass_reason.clone(),
+            _ => String::new(),
         };
         if !reason.is_empty() {
-            items.push(Item::Text { text: reason.to_string(), tone: Tone::Muted });
+            items.push(Item::Text { text: reason, tone: Tone::Muted });
         }
     }
-    let summary = launch::summary(&settings.wine, &options);
+    let summary = launch::summary(&settings.wine, &options, engine);
     items.push(Item::Text { text: if summary.is_empty() { "The game starts with nothing added.".into() } else { format!("The game starts with: {summary}") }, tone: Tone::Muted });
     Page { id: game_page(program), title: program.rsplit('\\').next().unwrap_or(program).to_string(), short: "Options".into(), listed: false, items }
 }

@@ -13,8 +13,8 @@
 # runs two of its Python scripts, which split the OpenVR headers and generate the interface stubs.
 #
 # Vulkan games: the build takes Khronos' Vulkan headers (downloaded at a pinned commit and checked by
-# their SHA-256) and an import library of Wine's vulkan-1.dll, which dlltool of MinGW-w64 makes from
-# third_party/opencomposite/vulkan-1.def. The upstream build takes both from the Vulkan SDK for Windows.
+# their SHA-256) and a delay-load import library of Wine's vulkan-1.dll, which dlltool of MinGW-w64 makes
+# from third_party/opencomposite/vulkan-1.def. The upstream build takes both from the Vulkan SDK for Windows.
 
 set -euo pipefail
 
@@ -68,15 +68,15 @@ for (( i = 1; i <= ${#patch_files}; i++ )); do
 done
 
 # The Vulkan headers and the import library of vulkan-1.dll
-vulkan_headers=${build:h}/vulkan-headers
+vulkan_headers=${build}/vulkan-headers
 if [[ ! -f ${vulkan_headers}/include/vulkan/vulkan.h ]]; then
     mkdir -p "${vulkan_headers}"
-    curl -sSfL -o "${build:h}/vulkan-headers.tar.gz" "${vulkan_headers_url}"
-    if [[ $(shasum -a 256 "${build:h}/vulkan-headers.tar.gz" | awk '{print $1}') != ${vulkan_headers_sha256} ]]; then
+    curl -sSfL -o "${build}/vulkan-headers.tar.gz" "${vulkan_headers_url}"
+    if [[ $(shasum -a 256 "${build}/vulkan-headers.tar.gz" | awk '{print $1}') != ${vulkan_headers_sha256} ]]; then
         print -u2 "FAIL: the Vulkan headers from ${vulkan_headers_url} have another SHA-256"
         exit 1
     fi
-    tar -xzf "${build:h}/vulkan-headers.tar.gz" -C "${vulkan_headers}" --strip-components 1
+    tar -xzf "${build}/vulkan-headers.tar.gz" -C "${vulkan_headers}" --strip-components 1
 fi
 mkdir -p "${build}"
 # A delay-load library: a Direct3D game never loads vulkan-1.dll, a Vulkan game loads it at its first call here

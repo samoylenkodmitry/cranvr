@@ -110,6 +110,39 @@ fn a_game_s_page_shows_and_sets_its_vr_system_and_its_eyes_and_cranvrs_reason() 
 }
 
 #[test]
+fn a_game_s_graphics_choice_adds_its_engine_s_argument_and_says_where_it_comes_from() {
+    let unity = launch::Engine { name: "Unity", sign: "UnityPlayer.dll or the Data folder", vulkan: "-force-vulkan", direct3d: "-force-d3d11" };
+    let games = [Game { engine: Some(unity), ..lab() }, added()];
+    let program = steam::program(&lab()).unwrap();
+    let plain = steam::program(&added()).unwrap();
+    let mut settings = Settings::default();
+    let texts = |settings: &Settings, program: &str| -> Vec<String> {
+        let pages = pages(settings, &model_with(games.to_vec()));
+        page(&pages, &game_page(program)).items.iter().filter_map(|item| match item { Item::Text { text, .. } => Some(text.clone()), _ => None }).collect()
+    };
+    let pages_now = pages(&settings, &model_with(games.to_vec()));
+    assert_eq!(page(&pages_now, &game_page(&program)).find("game.graphics", Some(&program)).and_then(Item::value), Some("own"));
+    assert!(texts(&settings, &program).iter().any(|text| text.contains("Vulkan adds -force-vulkan, Direct3D 11 adds -force-d3d11")));
+    // A game of no known engine says nothing until the user chooses
+    assert!(!texts(&settings, &plain).iter().any(|text| text.contains("adds")));
+    let out = apply(&mut settings, &model_with(games.to_vec()), &Request::set("game.graphics", "vulkan").of(program.clone()));
+    assert!(out.changed && !out.restart);
+    assert_eq!(settings.launch[&program].graphics, Some(Graphics::Vulkan));
+    let lines = texts(&settings, &program);
+    assert!(lines.iter().any(|text| text.starts_with("The game gets -force-vulkan, the argument of Unity games")), "{lines:?}");
+    assert!(lines.iter().any(|text| text == "The game starts with: DXMT_SKIP_PRESENT=1 -force-vulkan"), "{lines:?}");
+    // Without an engine the line asks for the argument, and a typed one wins
+    apply(&mut settings, &model_with(games.to_vec()), &Request::set("game.graphics", "vulkan").of(plain.clone()));
+    assert!(texts(&settings, &plain).iter().any(|text| text.starts_with("cranvr does not know the argument for Vulkan")));
+    settings.launch.get_mut(&plain).unwrap().vulkan_args = "+gfx_strAPI VLK".into();
+    assert!(texts(&settings, &plain).iter().any(|text| text == "The game gets +gfx_strAPI VLK, as typed under Advanced."));
+    // The game's own choice again leaves no entry, and a word that is no API changes nothing
+    apply(&mut settings, &model_with(games.to_vec()), &Request::set("game.graphics", "own").of(program.clone()));
+    assert!(!settings.launch.contains_key(&program));
+    assert!(apply(&mut settings, &model_with(games.to_vec()), &Request::set("game.graphics", "opengl").of(program.clone())).refused.is_some());
+}
+
+#[test]
 fn play_starts_a_game_by_its_program_and_stop_ends_steam_and_games() {
     let games = [lab(), added()];
     let program = steam::program(&lab()).unwrap();
