@@ -12,6 +12,11 @@
 //!   2.5 seconds. It needs `hand_anchor=view`, which puts the ball where a head-mounted test can
 //!   reach it. A pinch that closes while the ray is on the ball presses it and opens or closes the
 //!   menu. The hand also shows that a hand on a panel is held back from the game (see `hold.rs`).
+//!   With `hologram` and no controller the hand points at the object of the first change of the
+//!   console's page `walk_page` (`stream` by default) that restarts nothing, and pinches in a cycle of
+//!   2 s: a hand alone presses a hologram (#111). Launch it with `interface=3d`, `console=true`,
+//!   `console_page` and `default_places`. The log names the change ("scripted pinch:"), and the
+//!   host's app saves it in its `app.json`.
 //! - `scripted_hand` is the hand (`left` or `right`, default right).
 //! - `scripted_pointer=desktop` plays both controllers over the Mac's first display instead, with
 //!   buttons: it shows that both hands point at once and that right clicks, middle clicks and scroll
@@ -89,7 +94,9 @@
 //!   of the toggle: an object of a choice, an arrow of a stepper or a capsule. After a change that
 //!   restarts the host it waits `walk_restart_ms` (9000 by default), so the link and the menu come
 //!   back before the next press. The log names each aim ("scripted hologram:") and each value that
-//!   the menu then shows, and the host's app saves each change in its `app.json`.
+//!   the menu then shows, and the host's app saves each change in its `app.json`. `walk_page` names
+//!   another page to walk, and `walk_items` limits the walk to the items of a comma list of ids,
+//!   such as `walk_page=headset walk_items=headset_theme` for the Theme row.
 //! - `scripted_pointer=palm` plays two hands and no controller: the left hand holds its open palm
 //!   35 cm ahead of the eyes and 15 cm below them, turned to the eyes, and never pinches. The right
 //!   hand points at the ball that shows in front of that palm and pinches every 2 s, which opens and
@@ -190,6 +197,8 @@ pub fn install_once() {
         } else if args.string("scripted_point") == Some("ball") {
             log::info!("a scripted {hand:?} hand points at the hand menu's ball");
             script_hand(ScriptedHand::pointing(hand, HAND_AT, BALL_AT, cycle));
+        } else if args.string("scripted_point") == Some("hologram") {
+            std::thread::spawn(move || hologram_pinch(hand, cycle));
         }
     });
 }
@@ -438,7 +447,7 @@ fn empty_menu_height() -> f32 {
     let layout = Layout::default();
     let displays = DisplaysView::default();
     let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays, wishes: Default::default(), place: MenuPlace::View, adding: false, pages: &[], costs: true };
-    menu_model::height(&menu_model::rows(&input))
+    menu_model::height(&menu_model::rows(&input), crate::hub::hub().console().interface)
 }
 
 /// A place straight down and ahead of `at`, where a ray hits no panel
@@ -597,7 +606,7 @@ fn pages_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
         page_model::{console_rows, find_key, key_point, Local},
         panel_layout::Layout,
     };
-    use menu_model::size::{DETAIL, GAP, PADDING, ROW, TITLE, WIDTH};
+    use menu_model::size::{GAP, PADDING, ROW, TITLE, WIDTH};
     let rest = ScriptedButtons::default();
     let pull = ScriptedButtons { trigger: 1.0, ..rest };
     let at = MENU_RIGHT_AT;
@@ -609,19 +618,11 @@ fn pages_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
     let displays_view = displays().menu_view();
     let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays_view, wishes: Default::default(), place: MenuPlace::View, adding: false, pages: &pages, costs: true };
     let rows = menu_model::rows(&input);
-    let height = menu_model::height(&rows);
+    let height = menu_model::height(&rows, local.interface);
     // The place of the button of the page `index` in the hand menu
     let page_button = |index: usize| {
-        let mut top = PADDING + TITLE + GAP;
-        for row in &rows {
-            if let Some(at) = row.buttons.iter().position(|button| button.action == menu_model::MenuAction::OpenPage(index as u8)) {
-                let n = row.buttons.len() as f32;
-                let each = (WIDTH - 2.0 * PADDING - (n - 1.0) * GAP) / n;
-                return Some(on_view_menu(height, PADDING + at as f32 * (each + GAP) + each / 2.0, top + ROW / 2.0));
-            }
-            top += ROW + GAP + row.details.len() as f32 * DETAIL;
-        }
-        None
+        let [x, y] = menu_model::button_center(&rows, menu_model::MenuAction::OpenPage(index as u8), local.interface)?;
+        Some(on_view_menu(height, x, y))
     };
     // A press: the ray rests on the point for 1 s, then the trigger goes down and up
     let press = |script: ScriptedController, target: [f32; 3]| {
@@ -724,7 +725,7 @@ fn ui3d_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
         panel_layout::Layout,
     };
     use cranvr_common::menu::{Item, Request, OFF, ON};
-    use menu_model::size::{DETAIL, GAP, PADDING, ROW, TITLE, WIDTH};
+    use menu_model::size::WIDTH;
     let rest = ScriptedButtons::default();
     let pull = ScriptedButtons { trigger: 1.0, ..rest };
     let at = MENU_RIGHT_AT;
@@ -735,7 +736,7 @@ fn ui3d_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
     let displays_view = displays().menu_view();
     let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays_view, wishes: Default::default(), place: MenuPlace::Hand(cranvr_common::controls::Hand::Left), adding: false, pages: &pages, costs: true };
     let rows = menu_model::rows(&input);
-    let height = menu_model::height(&rows);
+    let height = menu_model::height(&rows, local.interface);
     // The left controller holds the menu at its usual distance (`UI3D_LEFT_AT`)
     let left_at = UI3D_LEFT_AT;
     let left = Pose::at(left_at);
@@ -743,16 +744,8 @@ fn ui3d_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
     let menu_middle = left.then(&hand_menu::menu_start(hand_menu::ON_LEFT, height)).position;
     log::info!("scripted ui3d: the left controller at {left_at:?} holds the menu, {height:.0} dp tall, with its middle at {menu_middle:?}");
     let page_button = |index: usize| {
-        let mut top = PADDING + TITLE + GAP;
-        for row in &rows {
-            if let Some(at) = row.buttons.iter().position(|button| button.action == menu_model::MenuAction::OpenPage(index as u8)) {
-                let n = row.buttons.len() as f32;
-                let each = (WIDTH - 2.0 * PADDING - (n - 1.0) * GAP) / n;
-                return Some(on_menu(PADDING + at as f32 * (each + GAP) + each / 2.0, top + ROW / 2.0));
-            }
-            top += ROW + GAP + row.details.len() as f32 * DETAIL;
-        }
-        None
+        let [x, y] = menu_model::button_center(&rows, menu_model::MenuAction::OpenPage(index as u8), local.interface)?;
+        Some(on_menu(x, y))
     };
     let press = |script: ScriptedController, target: [f32; 3]| {
         script.moving_to(Duration::from_millis(1), (at, target), rest).holding(Duration::from_millis(1000), rest).holding(Duration::from_millis(200), pull).holding(Duration::from_millis(800), rest)
@@ -858,39 +851,51 @@ fn hologram_walk() {
         page_model::{console_rows, find_key, key_point, Line, Local},
     };
     use cranvr_common::menu::{Item, Request};
+    // The page and the items that the walk changes: the Stream page's every item by default
+    let page_id = launch_args().string("walk_page").unwrap_or(HOLOGRAM_PAGE).to_owned();
+    let items: Vec<String> = launch_args().string("walk_items").map(|ids| ids.split(',').map(str::to_owned).collect()).unwrap_or_default();
     let since = std::time::Instant::now();
     let menu = loop {
-        if let Some(menu) = hub().console().menu.filter(|menu| menu.page(HOLOGRAM_PAGE).is_some() && menu.headset.theme.is_some()) {
+        if let Some(menu) = hub().console().menu.filter(|menu| menu.page(&page_id).is_some() && menu.headset.theme.is_some()) {
             break menu;
         }
         if since.elapsed() > Duration::from_secs(30) {
-            log::warn!("scripted hologram: no menu with the page {HOLOGRAM_PAGE} came from the host in 30 s");
+            log::warn!("scripted hologram: no menu with the page {page_id} came from the host in 30 s");
             return;
         }
         std::thread::sleep(Duration::from_millis(200));
     };
-    let Some(page) = menu.page(HOLOGRAM_PAGE) else { return };
+    let Some(page) = menu.page(&page_id) else {
+        return;
+    };
     let rest = ScriptedButtons::default();
     let pull = ScriptedButtons { trigger: 1.0, ..rest };
     let at = MENU_RIGHT_AT;
     let restart = Duration::from_millis(launch_args().int("walk_restart_ms").and_then(|ms| u64::try_from(ms).ok()).unwrap_or(9000));
     let wait = Duration::from_millis(launch_args().int("walk_wait_ms").and_then(|ms| u64::try_from(ms).ok()).unwrap_or(1500));
     let local = Local { link: true, interface: hub().console().interface };
-    let rows = console_rows(Some(&menu), &Shown::Host(HOLOGRAM_PAGE.into()), local, "", None, std::time::Instant::now());
-    if !rows.first().is_some_and(|row| matches!(row.line, Line::Header(_))) {
-        log::warn!("scripted hologram: the page {HOLOGRAM_PAGE} does not draw as a hologram");
+    let rows = console_rows(Some(&menu), &Shown::Host(page_id.clone()), local, "", None, std::time::Instant::now());
+    if !rows.first().is_some_and(|row| matches!(row.line, Line::Header { .. })) {
+        log::warn!("scripted hologram: the page {page_id} does not draw as a hologram");
     }
     let mut right = ScriptedController::new(Hand::Right, at, away_from(at)).holding(wait, rest);
     // Each press and when it lands, in seconds from the walk's start, to check the menu after it
     let mut planned: Vec<(Request, f32)> = Vec::new();
     let mut clock = wait.as_secs_f32();
     for item in &page.items {
-        let Some((change, restarts)) = next_change(item) else { continue };
+        let Some((change, restarts)) = next_change(item) else {
+            continue;
+        };
+        if !items.is_empty() && !matches!(&change, Request::Set { id, .. } if items.contains(id)) {
+            continue;
+        }
         let Some((row, key)) = find_key(&rows, &Press::Host(change.clone())) else {
             log::warn!("scripted hologram: no key does {}", change.to_json());
             continue;
         };
-        let Some([x, y]) = key_point(&rows, row, key) else { continue };
+        let Some([x, y]) = key_point(&rows, row, key) else {
+            continue;
+        };
         let target = on_console(&rows, x, y);
         let form = match &rows[row].line {
             Line::Keys { form, .. } => format!("{form:?}"),
@@ -912,7 +917,9 @@ fn hologram_walk() {
     script_controller(right.moving_to(Duration::from_millis(1), (at, away_from(at)), rest));
     let start = std::time::Instant::now();
     for (change, at) in planned {
-        let Request::Set { id, subject, value } = change else { continue };
+        let Request::Set { id, subject, value } = change else {
+            continue;
+        };
         // The menu after the press and the host's answer: the press lands at its time, a restart
         // takes the time of the wait after it
         let check = Duration::from_secs_f32(at + 1.5);
@@ -920,7 +927,7 @@ fn hologram_walk() {
         let mut shown = None;
         let until = std::time::Instant::now() + restart;
         while std::time::Instant::now() < until {
-            shown = hub().console().menu.and_then(|menu| menu.page(HOLOGRAM_PAGE).and_then(|page| page.find(&id, subject.as_deref()).and_then(Item::value).map(str::to_owned)));
+            shown = hub().console().menu.and_then(|menu| menu.page(&page_id).and_then(|page| page.find(&id, subject.as_deref()).and_then(Item::value).map(str::to_owned)));
             if shown.as_deref() == Some(value.as_str()) {
                 break;
             }
@@ -930,6 +937,48 @@ fn hologram_walk() {
         log::info!("scripted hologram: {id} shows {shown:?} after the press for {value} ({})", if held { "changed" } else { "NOT changed" });
     }
     log::info!("scripted hologram: done");
+}
+
+/// Plays `scripted_point=hologram`: the hand points at the object of the first
+/// change of the console's page `walk_page` (the Stream page by default) and pinches in `cycle`, so a
+/// hand alone presses a hologram's object. A thread waits for the host's menu to find the object.
+fn hologram_pinch(hand: Hand, cycle: PinchCycle) {
+    use crate::{
+        console::{Press, Shown},
+        hub::hub,
+        page_model::{console_rows, find_key, key_point, Local},
+    };
+    let page_id = launch_args().string("walk_page").unwrap_or(HOLOGRAM_PAGE).to_owned();
+    let since = std::time::Instant::now();
+    let menu = loop {
+        if let Some(menu) = hub().console().menu.filter(|menu| menu.page(&page_id).is_some()) {
+            break menu;
+        }
+        if since.elapsed() > Duration::from_secs(30) {
+            log::warn!("scripted pinch: no menu with the page {page_id} came from the host in 30 s");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let Some(page) = menu.page(&page_id) else {
+        return;
+    };
+    let Some(change) = first_change(page) else {
+        return;
+    };
+    let local = Local { link: true, interface: hub().console().interface };
+    let rows = console_rows(Some(&menu), &Shown::Host(page_id.clone()), local, "", None, std::time::Instant::now());
+    let Some((row, key)) = find_key(&rows, &Press::Host(change.clone())) else {
+        return;
+    };
+    let Some([x, y]) = key_point(&rows, row, key) else {
+        return;
+    };
+    let target = on_console(&rows, x, y);
+    log::info!("scripted pinch: the {hand:?} hand points at {} at {target:?} and pinches", change.to_json());
+    // No controller script here: a scripted controller, even a missing one, makes the runtime's
+    // hands count as controllers, so the hand's pinch would press nothing
+    script_hand(ScriptedHand::pointing(hand, HAND_AT, target, cycle));
 }
 
 /// Where the right controller of the press check stands, in meters from the head's start: below the

@@ -10,6 +10,7 @@
 //! the controls.
 
 use crate::{
+    console::Interface,
     display_wish::{cost_lines, Place},
     displays::DisplaysView,
     menu_place::MenuPlace,
@@ -170,10 +171,53 @@ pub fn place_of(layout: &Layout, stream: u8) -> Place {
 }
 
 /// The menu's height in dp for these rows: the title, then each row with its detail and its gaps.
-pub fn height(rows: &[MenuRow]) -> f32 {
+pub fn height(rows: &[MenuRow], interface: Interface) -> f32 {
     use size::*;
-    let body: f32 = rows.iter().map(|row| ROW + GAP + row.details.len() as f32 * DETAIL).sum();
+    let body: f32 = rows.iter().map(|row| row_height(row, interface) + GAP).sum();
     2.0 * PADDING + TITLE + GAP + body
+}
+
+/// The height of a row of page links in the 3D menu, where each link is a gem over its name
+pub const LINKS_3D: f32 = 84.0;
+
+impl MenuRow {
+    /// Whether the row holds only links to pages
+    pub fn is_links(&self) -> bool {
+        self.title.is_empty() && !self.buttons.is_empty() && self.buttons.iter().all(|button| matches!(button.action, MenuAction::OpenPage(_)))
+    }
+}
+
+/// The middle of the first button that does `action`, in dp from the menu's top left corner, in
+/// the menu of `interface`. A row with a title has its buttons at its end; a row without one shares
+/// its width among them, with no gap between the gems of a row of links in 3D.
+#[cfg_attr(not(all(feature = "scripted-hand", target_os = "android")), allow(dead_code))]
+pub fn button_center(rows: &[MenuRow], action: MenuAction, interface: Interface) -> Option<[f32; 2]> {
+    use size::*;
+    let mut top = PADDING + TITLE + GAP;
+    for row in rows {
+        let body = row_height(row, interface) - row.details.len() as f32 * DETAIL;
+        if let Some(at) = row.buttons.iter().position(|button| button.action == action) {
+            let (n, at) = (row.buttons.len() as f32, at as f32);
+            let inner = WIDTH - 2.0 * PADDING;
+            let x = if !row.title.is_empty() {
+                WIDTH - PADDING - (n - at) * BUTTON - (n - at - 1.0) * GAP + BUTTON / 2.0
+            } else if interface.is_3d() && row.is_links() {
+                PADDING + (at + 0.5) * inner / n
+            } else {
+                let each = (inner - (n - 1.0) * GAP) / n;
+                PADDING + at * (each + GAP) + each / 2.0
+            };
+            return Some([x, top + body / 2.0]);
+        }
+        top += row_height(row, interface) + GAP;
+    }
+    None
+}
+
+/// The height of `row` in the menu of `interface`, with its lines of detail.
+pub fn row_height(row: &MenuRow, interface: Interface) -> f32 {
+    let body = if interface.is_3d() && row.is_links() { LINKS_3D } else { size::ROW };
+    body + row.details.len() as f32 * size::DETAIL
 }
 
 #[cfg(test)]
@@ -304,10 +348,12 @@ mod tests {
         let layout = Layout::default();
         let few = view(vec![info(1, "Mac display", false)], true);
         let many = view((1..=4).map(|s| info(s, "Display", s > 1)).collect(), false);
-        let h = |d: &DisplaysView| height(&rows(&input(&layout, d)));
-        assert!(h(&few) < h(&many));
-        // Four displays still make a menu that is under 80 cm tall
-        assert!(h(&many) < 800.0, "{}", h(&many));
+        for interface in [Interface::Flat, Interface::ThreeD] {
+            let h = |d: &DisplaysView| height(&rows(&input(&layout, d)), interface);
+            assert!(h(&few) < h(&many));
+            // Four displays still make a menu that is under 80 cm tall
+            assert!(h(&many) < 800.0, "{}", h(&many));
+        }
         assert_eq!(place_of(&layout, 1), Place::Room);
     }
 }

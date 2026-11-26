@@ -1,31 +1,42 @@
-//! The hologram form of the 3D interface (#111): the Stream page and the hand menu as objects of
+//! The 3D interface as holograms (#111): the console's pages and the hand menu as objects of
 //! glowing glass that float with no panel behind them (Cranpose's `SpatialHologram`).
 //!
-//! A page draws as a hologram when its choices carry shapes (`ChoiceShape`), which the Mac gives the
-//! Stream page's settings: each option is an object whose form shows its value. The rows are those
-//! of `page_model.rs`, with the same heights and places, so a scripted aim at a key of the model
-//! presses the same object. The words float on the hologram's panel at the compositor's full
-//! resolution, with no plate behind them. In passthrough a faint dark glass stands behind each line
-//! of words, so they stay readable over a bright room.
+//! The rows are those of `page_model.rs`, with the same heights and places, so a scripted aim at a
+//! key of the model presses the same object. A choice whose options have shapes (`ChoiceShape`),
+//! which the Mac gives the Stream page's settings, draws each option as an object whose form shows
+//! its value, with its name over it. A key is a pill of glass, a toggle a capsule whose lit half
+//! slides and a choice of numbers a groove with a crystal knob. A page's title stands on a band of
+//! glass beside an emblem, with a wave of light points at the band's end.
+//!
+//! The words float on the hologram's panel at the compositor's full resolution, with no plate
+//! behind them. In passthrough a faint dark glass stands behind each line of words, so they stay
+//! readable over a bright room.
 
 use crate::{
     console::{size, Pending, Room, Shown, Theme},
-    console_panel::{run, tone_color, RowName},
-    page_model::{Form, Key, Line, Look, Row},
+    console_panel::{run, tone_color},
+    page_model::{Form, Key, Line, Look, Name, Row, LABEL},
+    spatial_ui::{Steps3d, KEY_DANGER},
     ui::{text_style, MUTED_COLOR, TEXT_COLOR},
 };
 use cranpose::prelude::*;
 use cranpose::text::FontWeight;
 use cranpose_xr::{
-    ButtonShape, ChoiceForm, HologramColors, HologramStage, SpatialButton, SpatialChoiceGroup, SpatialEmblem, SpatialHologram, SpatialRibbon, SpatialSwitch,
-    SubspaceModifier, SwitchColors,
+    ButtonShape, ChoiceForm, HologramColors, HologramStage, SpatialButton, SpatialChoiceGroup, SpatialEmblem, SpatialHologram, SpatialParticleWave, SpatialRibbon, SpatialSwitch, SubspaceModifier,
+    SwitchColors,
 };
 use cranvr_common::menu::ChoiceShape;
 
 /// The glass behind words in passthrough
 const BACKING: Color = Color(0.0, 0.0, 0.0, 0.55);
-/// The side of a hologram page's emblem, in dp
-const EMBLEM: f32 = 64.0;
+/// The side of a page's emblem, in dp
+const EMBLEM: f32 = 76.0;
+/// The height of the band of glass behind a page's title, and the size of the wave at its end
+const BAND: f32 = 64.0;
+const WAVE: [f32; 2] = [190.0, 56.0];
+/// The wave's width for each dp of a header's height: a small header, such as the hand menu's, gets
+/// a short wave, so its title keeps room
+const WAVE_PER_HEIGHT: f32 = 2.2;
 
 /// The colors of a theme.
 pub fn colors(theme: Theme) -> HologramColors {
@@ -56,28 +67,18 @@ pub fn Label(words: Words, text: String, style: TextStyle) {
 
 /// The console's page as a hologram, at the place and size that `modifier` gives.
 #[composable]
-pub fn HologramConsole(
-    modifier: SubspaceModifier,
-    rows: Vec<Row>,
-    page: MutableState<Shown>,
-    (pending, notice): (MutableState<Option<Pending>>, Option<String>),
-    (theme, words): (Theme, Words),
-) {
+pub fn HologramConsole(modifier: SubspaceModifier, rows: Vec<Row>, page: MutableState<Shown>, (pending, notice): (MutableState<Option<Pending>>, Option<String>), (theme, words): (Theme, Words)) {
     let colors = colors(theme);
     SpatialHologram(modifier, true, colors, HologramStage::PAGE, move || {
         // The pointer over the console holds the pointing hand back from the game (see `hold.rs`)
         let hovered = crate::hover::hover_modifier(crate::hover::CONSOLE);
         let rows = rows.clone();
         let notice = notice.clone();
-        Column(
-            Modifier::empty().fill_max_size().then(hovered).padding(size::PADDING),
-            ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(size::GAP)),
-            move || {
-                for row in rows.clone() {
-                    HologramRow(row, page, (pending, notice.clone()), (colors, words));
-                }
-            },
-        );
+        Column(Modifier::empty().fill_max_size().then(hovered).padding(size::PADDING), ColumnSpec::default().vertical_arrangement(LinearArrangement::spaced_by(size::GAP)), move || {
+            for row in rows.clone() {
+                HologramRow(row, page, (pending, notice.clone()), (colors, words));
+            }
+        });
     });
 }
 
@@ -92,25 +93,47 @@ fn form_of(shape: ChoiceShape) -> ChoiceForm {
     }
 }
 
+/// A title on a band of glass beside an emblem, with the stream's state under it and a wave of light
+/// points at the band's end.
+#[composable]
+pub fn Header(text: String, status: String, (height, emblem): (f32, f32), (colors, words): (HologramColors, Words)) {
+    Row(
+        Modifier::empty().fill_max_width().height(height),
+        RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(16.0)).vertical_alignment(VerticalAlignment::CenterVertically),
+        move || {
+            SpatialEmblem(Modifier::empty().width(emblem).height(emblem), move || PlaySign(colors.chosen, emblem * 0.34));
+            let (text, status) = (text.clone(), status.clone());
+            let band = (height * 0.7).min(BAND);
+            SpatialRibbon(Modifier::empty().weight(1.0).height(band).padding_symmetric(18.0, 0.0), move || {
+                let (text, status) = (text.clone(), status.clone());
+                Row(Modifier::empty().fill_max_size(), RowSpec::default().vertical_alignment(VerticalAlignment::CenterVertically), move || {
+                    let (text, status) = (text.clone(), status.clone());
+                    Column(Modifier::empty().weight(1.0), ColumnSpec::default(), move || {
+                        Label(words, text.clone(), text_style((height * 0.36).clamp(24.0, 32.0), TEXT_COLOR, Some(FontWeight::BOLD)));
+                        if !status.is_empty() {
+                            Label(words, status.clone(), text_style(17.0, MUTED_COLOR, None));
+                        }
+                    });
+                    SpatialParticleWave(Modifier::empty().width((height * WAVE_PER_HEIGHT).min(WAVE[0])).height(band.min(WAVE[1])));
+                });
+            });
+        },
+    );
+}
+
 #[composable]
 fn HologramRow(row: Row, page: MutableState<Shown>, (pending, notice): (MutableState<Option<Pending>>, Option<String>), (colors, words): (HologramColors, Words)) {
     let height = row.height;
     match row.line {
-        Line::Header(text) | Line::Title { text, .. } => {
-            Row(
-                Modifier::empty().fill_max_width().height(height),
-                RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(18.0)).vertical_alignment(VerticalAlignment::CenterVertically),
-                move || {
-                    SpatialEmblem(Modifier::empty().width(EMBLEM).height(EMBLEM), move || PlaySign(colors.chosen));
-                    let text = text.clone();
-                    SpatialRibbon(Modifier::empty().weight(1.0).height(52.0).padding_symmetric(18.0, 0.0), move || {
-                        Label(words, text.clone(), text_style(34.0, TEXT_COLOR, Some(FontWeight::BOLD)));
-                    });
-                },
-            );
+        Line::Header { text, status } | Line::Title { text, status } => Header(text, status, (height, EMBLEM), (colors, words)),
+        // The name of a choice stands at the bottom of its row, over its objects, clear of the row above
+        Line::Label(text) => {
+            Box(Modifier::empty().fill_max_width().height(height), BoxSpec::default().content_alignment(Alignment::BOTTOM_START), move || {
+                Label(words, text.clone(), text_style(23.0, TEXT_COLOR, None));
+            });
         }
         Line::Heading(text) => {
-            Box(Modifier::empty().height(height), BoxSpec::default().content_alignment(Alignment::CENTER_START), move || {
+            Box(Modifier::empty().height(height), BoxSpec::default().content_alignment(Alignment::BOTTOM_START), move || {
                 Label(words, text.clone(), text_style(24.0, MUTED_COLOR, Some(FontWeight::BOLD)));
             });
         }
@@ -139,39 +162,52 @@ fn HologramRow(row: Row, page: MutableState<Shown>, (pending, notice): (MutableS
                         if let Some(key) = said.get(index) {
                             let chosen = key.look == Look::Selected;
                             let color = if chosen { TEXT_COLOR } else { MUTED_COLOR };
-                            // A stepper shows one option's words over its crystal, on dark glass so the
-                            // crystal's bright edges do not cross them
-                            let over_crystal = shape == ChoiceShape::Stepper;
-                            let size = if over_crystal { 20.0 } else { 17.0 };
-                            let words = Words { backed: words.backed || over_crystal };
+                            let size = if shape == ChoiceShape::Stepper { 20.0 } else { 18.0 };
                             Label(words, key.label.clone(), text_style(size, color, chosen.then_some(FontWeight::BOLD)));
                         }
                     },
                 );
             }
             Form::Switch if keys.len() == 2 => {
-                Row(
-                    Modifier::empty().fill_max_width().height(height),
-                    RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(size::GAP)),
-                    move || {
-                        let width = RowName(&name);
-                        let span = width.map_or(Modifier::empty().weight(1.0), |width| Modifier::empty().width(2.0 * width + size::GAP));
-                        let checked = keys[0].look == Look::Selected;
-                        let keys = keys.clone();
-                        let notice = notice.clone();
-                        Capsule(checked, span.height(size::BUTTON), colors, move |on| {
-                            let key = &keys[if on { 0 } else { 1 }];
+                // A toggle stands on a band of glass: its name, and its switch at the band's end
+                SpatialRibbon(Modifier::empty().fill_max_width().height(height), move || {
+                    let (name, keys, notice) = (name.clone(), keys.clone(), notice.clone());
+                    Row(
+                        Modifier::empty().fill_max_size(),
+                        RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(size::GAP)).vertical_alignment(VerticalAlignment::CenterVertically),
+                        move || {
+                            let width = HologramName(&name, words);
+                            let span = width.map_or(Modifier::empty().weight(1.0), |width| Modifier::empty().width(2.0 * width + size::GAP));
+                            let checked = keys[0].look == Look::Selected;
+                            let keys = keys.clone();
+                            let notice = notice.clone();
+                            Capsule(checked, span.height(size::BUTTON), colors, move |on| {
+                                let key = &keys[if on { 0 } else { 1 }];
+                                run(&key.press, page, pending, notice.clone());
+                            });
+                        },
+                    );
+                });
+            }
+            Form::Steps => {
+                Row(Modifier::empty().fill_max_width().height(height), RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(size::GAP)), move || {
+                    HologramName(&name, words);
+                    let labels = keys.iter().map(|key| key.label.clone()).collect();
+                    let selected = keys.iter().position(|key| key.look == Look::Selected);
+                    let (keys, notice) = (keys.clone(), notice.clone());
+                    Steps3d(labels, selected, Modifier::empty().weight(1.0), move |index| {
+                        if let Some(key) = keys.get(index) {
                             run(&key.press, page, pending, notice.clone());
-                        });
-                    },
-                );
+                        }
+                    });
+                });
             }
             _ => {
                 Row(
                     Modifier::empty().fill_max_width().height(height),
-                    RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(size::GAP)),
+                    RowSpec::default().horizontal_arrangement(LinearArrangement::spaced_by(size::GAP)).vertical_alignment(VerticalAlignment::CenterVertically),
                     move || {
-                        let width = RowName(&name);
+                        let width = HologramName(&name, words);
                         for key in keys.clone() {
                             GlassKey(key, width, colors, page, (pending, notice.clone()));
                         }
@@ -182,10 +218,39 @@ fn HologramRow(row: Row, page: MutableState<Shown>, (pending, notice): (MutableS
     }
 }
 
-/// A glowing triangle that points right, the sign of the stream.
+/// The name at the start of a row of keys, vertically in the middle of the row: a setting's name, or
+/// a title with its detail. It gives the width of each key after a title, which stand at the row's
+/// end, as `page_model.rs` lays them out.
 #[composable]
-fn PlaySign(color: Color) {
-    Canvas(Modifier::empty().width(24.0).height(26.0), move |scope| {
+fn HologramName(name: &Name, words: Words) -> Option<f32> {
+    match name {
+        Name::None => None,
+        Name::Setting(label) => {
+            let label = label.clone();
+            Box(Modifier::empty().width(LABEL).fill_max_height(), BoxSpec::default().content_alignment(Alignment::CENTER_START), move || {
+                Label(words, label.clone(), text_style(22.0, TEXT_COLOR, None));
+            });
+            None
+        }
+        Name::Title { title, detail, width } => {
+            let (title, detail) = (title.clone(), detail.clone());
+            Column(Modifier::empty().weight(1.0), ColumnSpec::default().vertical_arrangement(LinearArrangement::Center), move || {
+                if !title.is_empty() {
+                    Label(words, title.clone(), text_style(21.0, TEXT_COLOR, None));
+                }
+                if !detail.is_empty() {
+                    Label(words, detail.clone(), text_style(17.0, MUTED_COLOR, None));
+                }
+            });
+            Some(*width)
+        }
+    }
+}
+
+/// A glowing triangle that points right, the sign of the stream, `side` dp high.
+#[composable]
+fn PlaySign(color: Color, side: f32) {
+    Canvas(Modifier::empty().width(side * 0.92).height(side), move |scope| {
         let size = scope.size();
         let mut path = Path::new();
         path.move_to(Point::new(size.width * 0.12, 0.0));
@@ -215,7 +280,16 @@ pub fn Capsule(checked: bool, modifier: Modifier, colors: HologramColors, on_cha
     });
 }
 
-/// A key of glass with its words, `width` wide or a share of the row.
+/// The glass of a key of `look`.
+pub fn key_color(look: Look, colors: HologramColors) -> Color {
+    match look {
+        Look::Normal => colors.glass,
+        Look::Selected | Look::Primary => colors.chosen,
+        Look::Danger => KEY_DANGER,
+    }
+}
+
+/// A pill of glass with its words, `width` wide or a share of the row.
 #[composable]
 fn GlassKey(key: Key, width: Option<f32>, colors: HologramColors, page: MutableState<Shown>, (pending, notice): (MutableState<Option<Pending>>, Option<String>)) {
     let modifier = match width {
@@ -224,9 +298,15 @@ fn GlassKey(key: Key, width: Option<f32>, colors: HologramColors, page: MutableS
     }
     .height(size::BUTTON);
     let press = key.press.clone();
-    let color = if key.look == Look::Selected { colors.chosen } else { colors.glass };
     let label = key.label.clone();
-    SpatialButton(move || run(&press, page, pending, notice.clone()), modifier, true, ButtonShape::Key, color, move || {
-        Text(label.clone(), Modifier::empty(), text_style(19.0, TEXT_COLOR, Some(FontWeight::BOLD)));
-    });
+    SpatialButton(
+        move || run(&press, page, pending, notice.clone()),
+        modifier,
+        true,
+        ButtonShape::Key,
+        key_color(key.look, colors),
+        move || {
+            Text(label.clone(), Modifier::empty(), text_style(19.0, TEXT_COLOR, Some(FontWeight::BOLD)));
+        },
+    );
 }
