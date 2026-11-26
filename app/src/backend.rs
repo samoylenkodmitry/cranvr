@@ -109,6 +109,9 @@ pub struct Settings {
     /// How the headset draws its menus: "3d" or "flat". None until the headset tells its own choice
     /// once.
     pub headset_interface: Option<String>,
+    /// The colors of the headset's 3D menus: "cyan" or "amber". None until the headset tells its
+    /// own choice once.
+    pub headset_theme: Option<String>,
 }
 
 impl Default for Settings {
@@ -138,6 +141,7 @@ impl Default for Settings {
             headset_room: None,
             headset_volume: None,
             headset_interface: None,
+            headset_theme: None,
         }
     }
 }
@@ -873,7 +877,7 @@ pub fn vr_menu(settings: &Settings, model: &Model) -> String {
     }
     let mut menu = serde_json::json!({
         // The headset applies these two itself, and it tells its own choice while they are null
-        "headset": {"room": settings.headset_room, "volume": settings.headset_volume, "interface": settings.headset_interface},
+        "headset": {"room": settings.headset_room, "volume": settings.headset_volume, "interface": settings.headset_interface, "theme": settings.headset_theme},
         "pages": pages,
         "controls": settings.controls,
     });

@@ -260,11 +260,14 @@ pub struct HandState {
     pub recenter: MutableState<u32>,
 }
 
-/// How the hand's panels draw: the interface, and whether the ball is a 3D ball (see `menu_tray.rs`).
+/// How the hand's panels draw: the interface, whether the ball is a 3D crystal (see `menu_tray.rs`),
+/// the 3D theme and the room behind the words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Look {
     pub interface: Interface,
     pub ball_3d: bool,
+    pub theme: crate::console::Theme,
+    pub room: crate::console::Room,
 }
 
 /// The ball with the menu and the hand's display. In a headset only. `controls` is the mapping of
@@ -323,7 +326,7 @@ pub fn HandPanels(state: HandState, (console_open, look): (bool, Look), controls
         FollowingSubspace(target.clone(), move || {
             if !gaze {
                 if look.ball_3d {
-                    crate::menu_tray::Strip3d(state, frame, on_hand);
+                    crate::menu_tray::Strip3d(state, frame, on_hand, look);
                 } else {
                     Strip(state, frame, on_hand);
                 }
@@ -332,7 +335,7 @@ pub fn HandPanels(state: HandState, (console_open, look): (bool, Look), controls
                 }
             }
             if look.interface.is_3d() {
-                crate::menu_tray::MenuTray(state, console_open, frame, open);
+                crate::menu_tray::MenuTray(state, console_open, frame, (open, look));
             } else if open {
                 Menu(state, console_open, frame);
             }

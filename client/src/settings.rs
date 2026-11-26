@@ -5,7 +5,7 @@
 //! (`adb shell am start ... --es host 192.168.1.20:9950 --ez connect true`) and the command line
 //! on the desktop (`--host=192.168.1.20:9950 --connect`).
 
-use crate::console::{Interface, Room, Volume};
+use crate::console::{Interface, Room, Theme, Volume};
 use crate::hub::MediaChoice;
 use cranpose::{launch_args, preferences};
 use cranvr_common::controls::{Controls, Hand};
@@ -18,6 +18,7 @@ const ROOM_KEY: &str = "room";
 const VOLUME_KEY: &str = "volume";
 const CONTROLS_KEY: &str = "controls";
 const INTERFACE_KEY: &str = "interface";
+const THEME_KEY: &str = "theme";
 /// The address that works over USB with `adb reverse tcp:9950 tcp:9950`, and on the same Mac
 const DEFAULT_HOST: &str = "127.0.0.1:9950";
 
@@ -113,6 +114,30 @@ pub fn remember_interface(interface: Interface) {
     }
 }
 
+/// The colors of the 3D menus. The launch argument `theme` (`cyan` or `amber`) decides for one launch
+/// and saves nothing, for a test. Without it the saved choice counts. A missing or unknown value
+/// gives cyan.
+pub fn theme() -> Theme {
+    if let Some(theme) = launch_args().string("theme").and_then(Theme::from_key) {
+        return theme;
+    }
+    preferences().get(THEME_KEY).and_then(|text| Theme::from_key(&text)).unwrap_or_default()
+}
+
+/// Whether the launch fixes the theme for a test.
+pub fn theme_fixed() -> bool {
+    launch_args().string("theme").is_some()
+}
+
+pub fn remember_theme(theme: Theme) {
+    if !saves_choices() || theme_fixed() {
+        return;
+    }
+    if let Err(e) = preferences().set(THEME_KEY, theme.key()) {
+        log::warn!("the theme setting was not saved: {e}");
+    }
+}
+
 /// What the buttons of the controllers did when a Mac last sent the mapping. The Mac's app keeps the
 /// mapping (`app.json`). The headset keeps this copy for the time without a link. `None` before any
 /// link: the standard mapping then holds.
@@ -154,9 +179,17 @@ pub fn connect_on_launch() -> bool {
 }
 
 /// Whether the launch asks for the console open and kept open, with `--console` or the extra
-/// `console`. A headset on a desk has no controller that could hold the menu button.
-pub fn console_on_launch() -> bool {
-    launch_args().boolean("console").unwrap_or(false)
+/// `console` true, or closed until a press opens it, with the extra `console` false. A headset on a
+/// desk has no controller that could hold the menu button, and a capture of the hand menu needs the
+/// console out of the way. `None` without the extra: the console opens with the first menu.
+pub fn console_on_launch() -> Option<bool> {
+    launch_args().boolean("console")
+}
+
+/// The host's page that the console opens on at the launch, with `--console_page=stream` or the
+/// extra `console_page`: a test or a capture of a page needs it open with no press.
+pub fn console_page_on_launch() -> Option<String> {
+    launch_args().string("console_page").map(str::to_owned)
 }
 
 /// Whether the launch asks for the console to open on the Controls page, with `--controls_page=left`

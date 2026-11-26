@@ -389,12 +389,12 @@ fn the_wine_page_has_the_options_of_every_program_and_the_mac_page_restarts_the_
 }
 
 #[test]
-fn the_headsets_room_volume_and_interface_wait_for_the_headsets_own_choice_and_travel_with_the_menu() {
+fn the_headsets_room_volume_interface_and_theme_wait_for_the_headsets_own_choice_and_travel_with_the_menu() {
     let mut settings = Settings::default();
     let model = Model::default();
     let read = |settings: &Settings| serde_json::from_str::<Value>(&vr_menu(settings, &Model::default())).unwrap();
     // A Mac that never heard the headset's choice has none: the menu says null, and the page selects nothing
-    assert_eq!(read(&settings)["headset"], serde_json::json!({"room": null, "volume": null, "interface": null}));
+    assert_eq!(read(&settings)["headset"], serde_json::json!({"room": null, "volume": null, "interface": null, "theme": null}));
     assert_eq!(page(&pages(&settings, &model), HEADSET).find("headset_room", None).and_then(Item::value), Some(""));
     assert_eq!(page(&pages(&settings, &model), HEADSET).find("headset_interface", None).and_then(Item::value), Some(""));
     // The headset tells its choice, and later the user changes it in either app
@@ -402,13 +402,18 @@ fn the_headsets_room_volume_and_interface_wait_for_the_headsets_own_choice_and_t
     assert!(apply(&mut settings, &model, &Request::set("headset_volume", "200")).changed);
     assert!(apply(&mut settings, &model, &Request::set("headset_interface", "3d")).changed);
     assert!(apply(&mut settings, &model, &Request::set("headset_interface", "flat")).changed);
-    assert_eq!(read(&settings)["headset"], serde_json::json!({"room": "scene", "volume": 200, "interface": "flat"}));
+    assert!(apply(&mut settings, &model, &Request::set("headset_theme", "amber")).changed);
+    assert_eq!(read(&settings)["headset"], serde_json::json!({"room": "scene", "volume": 200, "interface": "flat", "theme": "amber"}));
+    assert!(apply(&mut settings, &model, &Request::set("headset_theme", "green")).refused.is_some());
     assert!(apply(&mut settings, &model, &Request::set("headset_volume", "175")).refused.is_some());
     assert!(apply(&mut settings, &model, &Request::set("headset_interface", "round")).refused.is_some());
     // The values read back from the file
     let text = settings.file_text(None).unwrap();
     let back = Settings::read(&text).settings;
-    assert_eq!((back.headset_room.as_deref(), back.headset_volume, back.headset_interface.as_deref()), (Some("scene"), Some(200), Some("flat")));
+    assert_eq!(
+        (back.headset_room.as_deref(), back.headset_volume, back.headset_interface.as_deref(), back.headset_theme.as_deref()),
+        (Some("scene"), Some(200), Some("flat"), Some("amber"))
+    );
 }
 
 #[test]

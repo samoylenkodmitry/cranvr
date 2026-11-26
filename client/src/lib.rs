@@ -30,6 +30,7 @@ mod hand_menu;
 mod hands;
 mod headset_page;
 mod hold;
+mod hologram_ui;
 mod hover;
 mod menu_hint;
 mod menu_model;

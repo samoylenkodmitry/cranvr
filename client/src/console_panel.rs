@@ -61,8 +61,14 @@ pub fn on_frame(read: &Read, now: Nanos) {
 }
 
 /// Where the console starts in its subspace: the place of the user's last carry, else the default.
+/// The launch argument `console_place=ahead` puts the default a meter straight ahead of the head and
+/// upright, for a capture that shows the whole page.
 pub fn start_place() -> Pose {
-    let default = SubspaceModifier::new().offset(START_OFFSET[0], START_OFFSET[1], START_OFFSET[2]).rotate(-START_TILT_DEGREES, 0.0, 0.0).pose();
+    let default = if cranpose::launch_args().string("console_place") == Some("ahead") {
+        Pose::IDENTITY
+    } else {
+        SubspaceModifier::new().offset(START_OFFSET[0], START_OFFSET[1], START_OFFSET[2]).rotate(-START_TILT_DEGREES, 0.0, 0.0).pose()
+    };
     place::start_pose("console", default)
 }
 
@@ -82,7 +88,12 @@ pub fn ConsolePanel(view: MutableState<View>, snapshot: MutableState<Snapshot>) 
 fn OpenConsole(view: View, state: LinkState) {
     // The request to the Mac that runs, from its press until the menu shows its result
     let pending = rememberMutableStateOf(|| None::<Pending>);
-    let page = rememberMutableStateOf(|| console::take_page_request().or_else(|| settings::controls_page_on_launch().map(Shown::Controls)).unwrap_or_default());
+    let page = rememberMutableStateOf(|| {
+        console::take_page_request()
+            .or_else(|| settings::controls_page_on_launch().map(Shown::Controls))
+            .or_else(|| settings::console_page_on_launch().map(Shown::Host))
+            .unwrap_or_default()
+    });
     // The time moves a request that runs to "no answer" or to its end: a tick composes the rows
     // again while one runs
     let tick = rememberMutableStateOf(|| 0u32);
@@ -127,7 +138,13 @@ fn OpenConsole(view: View, state: LinkState) {
     let modifier = SubspaceModifier::new().size(size::WIDTH, height).layer_priority(crate::panel_layout::layer_rank::TEXT);
     let (controls, editable) = (view.controls, view.controls_editable);
     let notice = view.menu.as_ref().and_then(|menu| menu.notice.clone());
-    // The 3D form draws the rows of the pages on a tray. The Controls page keeps its flat form.
+    // A page whose choices have shapes is a hologram in the 3D form (its rows start with a header)
+    if rows.first().is_some_and(|row| matches!(row.line, Line::Header(_))) {
+        let looks = (view.theme, crate::hologram_ui::Words::of(view.room));
+        crate::hologram_ui::HologramConsole(place::movable("console", modifier, start, |_| {}), rows, page, (pending, notice), looks);
+        return;
+    }
+    // The 3D form draws the rows of the other pages on a tray. The Controls page keeps its flat form.
     if view.interface.is_3d() && !matches!(shown, Shown::Controls(_)) {
         crate::console_tray::ConsoleTray(place::movable("console", modifier, start, |_| {}), rows, page, (pending, notice));
         return;
@@ -201,6 +218,10 @@ fn RowView(row: Row, page: MutableState<Shown>, pending: MutableState<Option<Pen
                     Text(status.clone(), Modifier::empty(), text_style(22.0, MUTED_COLOR, None));
                 }
             });
+        }
+        // Only a hologram draws its title beside an emblem: elsewhere it is a title
+        Line::Header(text) => {
+            Text(text, Modifier::empty().height(height), bold(34.0));
         }
         Line::Heading(text) => {
             Text(text, Modifier::empty().height(height), text_style(26.0, MUTED_COLOR, Some(FontWeight::BOLD)));

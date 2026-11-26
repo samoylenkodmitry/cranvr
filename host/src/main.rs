@@ -1157,8 +1157,8 @@ fn frame_loop(
             // Without a headset nobody sees the desktop. A running capture would make WindowServer
             // work on every change of the screen (issue #118): it ran from the host's start until
             // the first headset came.
-            if let Some(c) = &capture {
-                c.set_running(false);
+            if let Some(c) = capture.as_ref().filter(|c| c.set_running(false)) {
+                info!("Desktop: no headset streams, so the capture of display {} stops", c.display_id);
             }
             continue;
         };

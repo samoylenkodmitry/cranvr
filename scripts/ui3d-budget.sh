@@ -4,7 +4,9 @@
 # and the client's own count of layers. A test host on PORT streams its scene at 120 Hz, which fills
 # the view as a game's stream does. Each case starts the client anew:
 #   - the Flat and the 3D interface with the hand menu closed and open (`hand_menu=open`), with no
-#     controller (`scripted_pointer=none`), as the first table of #111 had them;
+#     controller (`scripted_pointer=none`), as the first table of #111 had them. The console stays
+#     closed (`console=false`);
+#   - the Stream page open in the console (`stream`), which the 3D interface draws as a hologram;
 #   - the closed menu of both interfaces with the left controller held still (`scripted_pointer=holding`).
 #     While the stream runs with no panel, the beams hide and the model with them, so the 3D ball
 #     stays flat. Before the client links, its own panels show, the model shows and the 3D ball rides
@@ -20,7 +22,7 @@
 #   PORT     the test host's port (9961 by default)
 #
 # The client must be a build of `scripts/build-client.sh --scripted-hand`, and `cargo build --release`
-# must have built cranvr-host and cranvr-fake-game. It starts with `save_choices=false`, its own set
+# must have built cranvr, cranvr-host and cranvr-fake-game. It starts with `save_choices=false`, its own set
 # of panels (`shown`) and `first_start`, so it saves nothing of the user's. A case counts only when
 # the client still runs 3 s after its link (scripts/client-start.zsh). Hold the Quest lock. At the
 # end the script puts the user's client back on 9950 (scripts/give-back.sh), also after a failure.
@@ -31,9 +33,17 @@ secs=${3:-3} port=${4:-9961}
 root=${0:A:h:h}
 adb_cmd=(adb -s ${serial})
 source ${root}/scripts/client-start.zsh
-mkdir -p ${work}/host
-${root}/target/release/cranvr-host --native-port ${port} --trust-all --fps 120 --config-dir ${work}/host --discovery-port 0 --no-game-audio --no-microphone --no-hand-controllers > ${work}/host.log 2>&1 &
+# A client start after a restart of the test host can take more than 20 s to link
+export CLIENT_LINK_WAIT=${CLIENT_LINK_WAIT:-40}
+# A test app with no window (`cranvr --headless`) runs the host and gives it the menu's pages, so the
+# console can show the Stream page
+home=${work}/host
+mkdir -p ${home}
+print '{"fps": 120, "desktop": false, "game_audio": false, "hand_controllers": false, "microphone": "Headset", "connection": "Automatic", "launch": {}}' > ${home}/app.json
+CRANVR_HOME=${home} CRANVR_NATIVE_PORT=${port} CRANVR_TEST_TRUST_ALL=1 CRANVR_HOST_BIN=${root}/target/release/cranvr-host \
+    ${root}/target/release/cranvr --headless < /dev/null > ${work}/app.log 2>&1 &
 host=$!
+host_log=${home}/host.log
 game=""
 finish() {
     ${adb_cmd} shell am force-stop ${CLIENT_PACKAGE}
@@ -45,7 +55,10 @@ finish() {
 }
 trap finish EXIT
 trap 'exit 130' INT TERM
-sleep 1
+# A test app has a new key at each run, and a client may find it on the Mac's Wi-Fi address too
+lan=$(ipconfig getifaddr en0 || ipconfig getifaddr en1)
+forget=127.0.0.1:${port}${lan:+,${lan}:${port}}
+sleep 2
 # A change of the headset's USB functions drops the test port's reverse: set it while the client waits
 client_waiting() {
     ${adb_cmd} reverse tcp:${port} tcp:${port} > /dev/null 2>&1
@@ -53,14 +66,14 @@ client_waiting() {
 client_waiting
 # The first start after an install shows the system's notice for a few seconds, so a start that
 # nobody measures comes first.
-cases=(${=CASES:-flat:closed:none 3d:closed:none flat:open:none 3d:open:none flat:closed:holding 3d:closed:holding game:flat:holding game:3d:holding})
+cases=(${=CASES:-flat:closed:none 3d:closed:none flat:stream:none 3d:stream:none flat:open:none 3d:open:none flat:closed:holding 3d:closed:holding})
 for case in warm:closed:none ${cases}; do
     parts=(${(s.:.)case})
     panels=none
     if [[ ${parts[1]} == game ]]; then
         interface=${parts[2]} menu=closed pointer=${parts[3]}
         if [[ -z ${game} ]]; then
-            ${root}/target/release/cranvr-fake-game --control ${work}/host/runtime-control.txt --fps 120 --seconds 120 > ${work}/game.log 2>&1 &
+            ${root}/target/release/cranvr-fake-game --control ${home}/runtime-control.txt --fps 120 --seconds 120 > ${work}/game.log 2>&1 &
             game=$!
             sleep 2
         fi
@@ -68,8 +81,12 @@ for case in warm:closed:none ${cases}; do
         interface=${parts[1]} menu=${parts[2]} pointer=${parts[3]} panels=${parts[4]:-none}
     fi
     [[ ${interface} == warm ]] && interface=flat
-    extras=(--es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room scene --es interface ${interface} --ez save_choices false --ez first_start true --es shown ${panels} --es forget_host_key 127.0.0.1:${port} --es scripted_pointer ${pointer})
-    [[ ${menu} == open ]] && extras+=(--es hand_menu open)
+    extras=(--es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room scene --es interface ${interface} --ez save_choices false --ez first_start true --es shown ${panels} --es forget_host_key ${forget} --es scripted_pointer ${pointer})
+    case ${menu} in
+        open) extras+=(--ez console false --es hand_menu open) ;;
+        stream) extras+=(--ez console true --es console_page stream) ;;
+        *) extras+=(--ez console false) ;;
+    esac
     # A change of the headset's USB functions drops the test port's `adb reverse` and ends the link.
     # The client counts as started when it still runs 3 s after its link. A case runs once more when
     # its start did not hold or its link ended.
@@ -77,12 +94,12 @@ for case in warm:closed:none ${cases}; do
         ${adb_cmd} shell am force-stop ${CLIENT_PACKAGE}
         ${adb_cmd} shell am broadcast -a com.oculus.vrpowermanager.prox_close > /dev/null
         ${adb_cmd} logcat -c
-        client_start ${work}/host.log ${extras}
-        ended=$(grep -c "Headset disconnected" ${work}/host.log)
+        client_start ${host_log} ${extras}
+        ended=$(grep -c "Headset disconnected" ${host_log})
         streamed=0
         if [[ ${client_result} == alive ]]; then
             sleep ${secs}
-            (( $(grep -c "Headset disconnected" ${work}/host.log) == ended )) && streamed=1
+            (( $(grep -c "Headset disconnected" ${host_log}) == ended )) && streamed=1
         else
             print "the start did not hold (${client_result})"
             [[ -n ${client_crash} ]] && print -l -- "  "${(f)^client_crash}
@@ -98,4 +115,4 @@ for case in warm:closed:none ${cases}; do
     (( streamed )) || print "the stream did not run through the case"
 done
 print "The host's game frames while the fake game ran:"
-grep -E '[0-9.]+ fps \([0-9]+ game frames\)' ${work}/host.log | tail -2 | sed -E 's/.*INFO\] //' | cut -c1-80
+grep -E '[0-9.]+ fps \([0-9]+ game frames\)' ${host_log} | tail -2 | sed -E 's/.*INFO\] //' | cut -c1-80

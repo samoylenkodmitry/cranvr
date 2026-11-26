@@ -212,13 +212,15 @@ impl Capture {
     }
 
     /// Stops or restarts the capture. A stopped capture costs the Mac nothing, and `latest` keeps
-    /// the last frame. The call does not wait for ScreenCaptureKit.
-    pub fn set_running(&self, run: bool) {
+    /// the last frame. The call does not wait for ScreenCaptureKit. Returns whether it asked
+    /// ScreenCaptureKit for the change: false when the capture is in that state already or waits
+    /// after a failure.
+    pub fn set_running(&self, run: bool) -> bool {
         if self.running.load(std::sync::atomic::Ordering::Relaxed) == run {
-            return;
+            return false;
         }
         if self.failed_at.lock().unwrap().is_some_and(|at| at.elapsed() < RETRY_AFTER) {
-            return;
+            return false;
         }
         self.running.store(run, std::sync::atomic::Ordering::Relaxed);
         // A start right after a stop may fail while the stop still runs
@@ -242,6 +244,7 @@ impl Capture {
                 self._stream.0.stopCaptureWithCompletionHandler(Some(&done));
             }
         }
+        true
     }
 
     /// The newest frame of the display and its number, once the first one arrived.
