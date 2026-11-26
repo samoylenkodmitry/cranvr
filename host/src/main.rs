@@ -1278,6 +1278,18 @@ fn frame_loop(
         // An app without the input focus gets no pictures, and its tracking does not come. The game
         // keeps running: its frames go back at once, as the frames of a stream that is not wanted.
         let paused = shared.paused.load(Ordering::Relaxed);
+        // The bitrate's control learns nothing from a pause. Its first second after the pause would
+        // hold the frames from before it and the reports of frames that the headset never showed,
+        // so the control starts its next second fresh and holds as at a start. The target stays: the
+        // link did not change.
+        if was_paused && !paused {
+            if headset.take_link_window().is_some_and(|w| w.first) {
+                control = bitrate::Control::new(ceiling, bitrate::start_for(ceiling, headset.link_is_cable().unwrap_or(false), stream.fps), stream.fps);
+            }
+            control.hold();
+            tick_sent = 0;
+            tick_at = Instant::now();
+        }
         if was_paused && !paused && game.connected {
             // A game that waits for the headset's poses sends no frame during the pause. It counts as
             // running when the focus returns, so the loop does not draw its own scene for the frames
