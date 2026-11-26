@@ -829,6 +829,10 @@ const PAUSED_TURN: Duration = Duration::from_millis(4);
 /// A game that sent no frame for this long no longer counts as running at the headset's rate: the stats
 /// leave its slow windows out. The headset still shows the game's last picture (see `GAME_STALL`).
 const GAME_IDLE: Duration = Duration::from_millis(500);
+/// A stream whose last stats line is this old gets a line that says that its frames stopped. It is
+/// one second more than the window of the stats line after frames. A stream with frames therefore
+/// never gets one.
+const NO_FRAME_STATS: Duration = Duration::from_secs(6);
 /// A planned frame's wait ends this long before its start, and the loop spins until the start. A
 /// timer wakes the thread up to a millisecond late: the lateness counted as part of the frame's need
 /// and widened its spread.
@@ -1184,6 +1188,26 @@ fn frame_loop(
             }
             continue;
         };
+        // The stats line at the end of the loop comes only after a frame that went out. A stream
+        // whose frames stopped (no new pose, no free buffer, a busy encoder) gets a line too, with
+        // the frames of its window and the reasons. The cranvr app starts a new host when such
+        // lines or the silence of a stuck loop last 15 s (issue #148).
+        if since.elapsed() >= NO_FRAME_STATS {
+            let secs = since.elapsed().as_secs_f64();
+            info!(
+                "The stream sent {count} frames in {secs:.0} s and none in its last second; skipped: {no_sample} no new pose, {no_buffer} no buffer, {busy} encoder busy, {missing} unknown images"
+            );
+            status::emit(json!({
+                "type": "stats", "fps": count as f64 / secs, "game_frames": game_count, "render_ms": 0.0, "encode_ms": 0.0,
+                "mbps": bitrate / 1_000_000, "audio_s": 0.0, "latency": null, "stopped": true,
+            }));
+            (count, game_count, gpu_ms, gpu_exec_ms, since) = (0, 0, 0.0, 0.0, Instant::now());
+            (no_sample, no_buffer, busy, dropped, missing) = (0, 0, 0, 0, 0);
+            encoded_frames.store(0, Ordering::Relaxed);
+            encoder_time_us.store(0, Ordering::Relaxed);
+            encode_times.lock().unwrap().clear();
+            encoded_bytes.store(0, Ordering::Relaxed);
+        }
         if encoder.as_ref().is_none_or(|(_, n, _)| *n != stream) {
             let foveation = stream
                 .foveated
