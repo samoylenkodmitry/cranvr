@@ -1,7 +1,7 @@
 #!/bin/zsh
 # Packs cranvr's game support into one archive that another Mac can install without building:
 # Wine 11.10 with cranvr's DXMT fork and cranvr's patched Wine files (wined3d.dll, wininet.dll, wtsapi32.dll,
-# user32.dll, winemac.so, opengl32.so, ntdll.so and winecoreaudio.so), BasaltVR's OpenXR runtime with cranvr's patches, OpenComposite, which runs
+# user32.dll, winemac.so, opengl32.so, ntdll.so, winecoreaudio.so and winevulkan.so), BasaltVR's OpenXR runtime with cranvr's patches, OpenComposite, which runs
 # OpenVR games on that runtime, and cranvr's SteamVR driver, which runs OpenVR games in SteamVR for Windows.
 #
 # Usage: scripts/package-game-support.sh [OUT_DIR]
@@ -25,20 +25,21 @@
 # The archive holds:
 #   engine/      Wine 11.10 (Gcenx's macOS build), with DXMT's DLLs and the patched Wine files in place
 #   dxmt/        DXMT's DLLs again, for the Wine prefix's system32
-#   runtime/     the OpenXR runtime, its manifest, its checks (hand_interaction_smoke.exe among them) and the Steam web
-#                helper shim
+#   runtime/     the OpenXR runtime, its manifest, its checks (hand_interaction_smoke.exe and vulkan_runtime_smoke.exe
+#                among them) and the Steam web helper shim
 #   opencomposite/  OpenComposite's vrclient_x64.dll, its empty version.txt and openvr_smoke.exe, cranvr's
 #                OpenVR test program
 #   steamvr-driver/  cranvr's SteamVR driver as SteamVR loads it: driver.vrdrivermanifest, bin/win64/driver_cranvr.dll
 #                and resources/settings/default.vrsettings
-#   wine-patched/  Wine's wined3d.dll, wininet.dll, wtsapi32.dll, user32.dll, winemac.so, opengl32.so, ntdll.so and
-#                winecoreaudio.so with cranvr's patches,
+#   wine-patched/  Wine's wined3d.dll, wininet.dll, wtsapi32.dll, user32.dll, winemac.so, opengl32.so, ntdll.so,
+#                winecoreaudio.so and winevulkan.so with cranvr's patches,
 #                hlsl_compile.exe (cranvr's test program for the HLSL compiler) with the shader that it compiles,
 #                gl_compat_check.exe (cranvr's test program for an OpenGL program like Google Earth VR),
 #                far_jump_check.exe (cranvr's test program for the far jump of MonoMod's detours),
 #                stack_sample_check.exe (cranvr's test program for a sampling profiler's stack copy),
-#                session_check.exe (cranvr's test program for the session's state, as SteamVR asks for it) and
-#                microphone_check.exe (cranvr's test program for the microphone that games hear)
+#                session_check.exe (cranvr's test program for the session's state, as SteamVR asks for it),
+#                microphone_check.exe (cranvr's test program for the microphone that games hear) and
+#                metal_texture_check.exe (cranvr's test program for a Vulkan image on a Metal texture of an IOSurface)
 #   SOURCE/      opencomposite-source.tar.xz and wine-source.tar.xz: the sources of those files (see below)
 #   LICENSES/    the licenses of Wine, DXMT, BasaltVR, the OpenXR SDK and OpenComposite with its parts
 #   SOURCES.md   where each part comes from and which patches it carries
@@ -62,7 +63,8 @@ wine_support=${cranvr}/third_party/wine
 driver_build=${CRANVR_STEAMVR_DRIVER_DIR:-${cranvr}/target/steamvr-driver/cranvr}
 
 for f in "${wine_app}/bin/wine" "${fork}/x86_64-windows/d3d11.dll" "${fork}/x86_64-unix/winemetal.so" \
-         "${runtime_bin}/basalt_openxr.dll" "${runtime_bin}/steamwebhelper_compat.exe" "${runtime_bin}/hand_interaction_smoke.exe"; do
+         "${runtime_bin}/basalt_openxr.dll" "${runtime_bin}/steamwebhelper_compat.exe" "${runtime_bin}/hand_interaction_smoke.exe" \
+         "${runtime_bin}/vulkan_runtime_smoke.exe"; do
     if [[ ! -e ${f} ]]; then
         print -u2 "Missing ${f}. Run scripts/build-basaltvr.sh first."
         exit 1
@@ -95,8 +97,9 @@ if [[ ${oc_support}/tests/openvr_smoke.cpp -nt ${oc_build}/bin/openvr_smoke.exe 
     exit 1
 fi
 
-wine_files=(wined3d.dll wininet.dll wtsapi32.dll user32.dll winemac.so opengl32.so ntdll.so winecoreaudio.so hlsl_compile.exe
-    isnan.hlsl gl_compat_check.exe far_jump_check.exe stack_sample_check.exe session_check.exe microphone_check.exe)
+wine_files=(wined3d.dll wininet.dll wtsapi32.dll user32.dll winemac.so opengl32.so ntdll.so winecoreaudio.so winevulkan.so
+    hlsl_compile.exe isnan.hlsl gl_compat_check.exe far_jump_check.exe stack_sample_check.exe session_check.exe microphone_check.exe
+    metal_texture_check.exe)
 for f in "${wine_files[@]/#/${wine_build}/bin/}" "${wine_src}/.git"; do
     if [[ ! -e ${f} ]]; then
         print -u2 "Missing ${f}. Run scripts/build-wine.sh first."
@@ -104,7 +107,7 @@ for f in "${wine_files[@]/#/${wine_build}/bin/}" "${wine_src}/.git"; do
     fi
 done
 # A file older than the patches, the build or its test program was built before the last change
-for file in wined3d.dll wininet.dll wtsapi32.dll user32.dll winemac.so opengl32.so ntdll.so winecoreaudio.so; do
+for file in wined3d.dll wininet.dll wtsapi32.dll user32.dll winemac.so opengl32.so ntdll.so winecoreaudio.so winevulkan.so; do
     for source in "${wine_support}"/patches/*.patch "${cranvr}/scripts/build-wine.sh"; do
         if [[ ${source} -nt ${wine_build}/bin/${file} ]]; then
             print -u2 "${source:t} is newer than ${file}. Run scripts/build-wine.sh first."
@@ -114,7 +117,7 @@ for file in wined3d.dll wininet.dll wtsapi32.dll user32.dll winemac.so opengl32.
 done
 for pair in hlsl_compile.cpp:hlsl_compile.exe isnan.hlsl:hlsl_compile.exe gl_compat_check.cpp:gl_compat_check.exe \
     far_jump_check.cpp:far_jump_check.exe stack_sample_check.cpp:stack_sample_check.exe session_check.cpp:session_check.exe \
-    microphone_check.cpp:microphone_check.exe; do
+    microphone_check.cpp:microphone_check.exe metal_texture_check.cpp:metal_texture_check.exe; do
     if [[ ${wine_support}/tests/${pair%%:*} -nt ${wine_build}/bin/${pair##*:} ]]; then
         print -u2 "${pair%%:*} is newer than ${pair##*:}. Run scripts/build-wine.sh first."
         exit 1
@@ -155,7 +158,8 @@ cp "${fork}/x86_64-unix/winemetal.so" "${root}/engine/lib/wine/x86_64-unix/winem
 cp "${fork}/x86_64-unix/winemetal.so" "${root}/dxmt/x86_64-unix/winemetal.so"
 
 print "Copying the OpenXR runtime"
-for f in basalt_openxr.dll basalt_openxr.json loader_smoke.exe d3d11_runtime_smoke.exe tracking_smoke.exe hand_interaction_smoke.exe steamwebhelper_compat.exe; do
+for f in basalt_openxr.dll basalt_openxr.json loader_smoke.exe d3d11_runtime_smoke.exe tracking_smoke.exe hand_interaction_smoke.exe \
+    vulkan_runtime_smoke.exe steamwebhelper_compat.exe; do
     cp "${runtime_bin}/${f}" "${root}/runtime/${f}"
 done
 
@@ -165,7 +169,7 @@ cp "${wine_files[@]/#/${wine_build}/bin/}" "${root}/wine-patched/"
 cp "${wine_build}/bin/wined3d.dll" "${wine_build}/bin/wininet.dll" "${wine_build}/bin/wtsapi32.dll" "${wine_build}/bin/user32.dll" \
     "${root}/engine/lib/wine/x86_64-windows/"
 cp "${wine_build}/bin/winemac.so" "${wine_build}/bin/opengl32.so" "${wine_build}/bin/ntdll.so" "${wine_build}/bin/winecoreaudio.so" \
-    "${root}/engine/lib/wine/x86_64-unix/"
+    "${wine_build}/bin/winevulkan.so" "${root}/engine/lib/wine/x86_64-unix/"
 # The patched files are Wine's (LGPL 2.1 or later; wined3d.dll holds vkd3d-shader). Their source goes with them:
 # the pinned tag's tree as it is on winehq.org, cranvr's patches and the steps of the build.
 wine_commit=$(git -C "${wine_src}" rev-parse HEAD)
@@ -176,10 +180,12 @@ git -C "${wine_src}" archive --format=tar HEAD | tar -x -C "${wine_tree}/Wine"
 cp -R "${wine_support}/patches" "${wine_tree}/cranvr/"
 cp "${wine_support}/tests/hlsl_compile.cpp" "${wine_support}/tests/isnan.hlsl" "${wine_support}/tests/gl_compat_check.cpp" \
     "${wine_support}/tests/far_jump_check.cpp" "${wine_support}/tests/stack_sample_check.cpp" \
-    "${wine_support}/tests/session_check.cpp" "${wine_support}/tests/microphone_check.cpp" "${wine_tree}/cranvr/tests/"
+    "${wine_support}/tests/session_check.cpp" "${wine_support}/tests/microphone_check.cpp" \
+    "${wine_support}/tests/metal_texture_check.cpp" "${wine_tree}/cranvr/tests/"
 cp "${cranvr}/scripts/build-wine.sh" "${wine_tree}/cranvr/scripts/"
 {
-    print "Source of wined3d.dll, wininet.dll, wtsapi32.dll, user32.dll, winemac.so, opengl32.so, ntdll.so and winecoreaudio.so"
+    print "Source of wined3d.dll, wininet.dll, wtsapi32.dll, user32.dll, winemac.so, opengl32.so, ntdll.so, winecoreaudio.so and"
+    print "winevulkan.so"
     print "in cranvr's game support"
     print "(Wine 11.10, LGPL 2.1 or later, see Wine/COPYING.LIB and Wine/libs/vkd3d/COPYING)"
     print
@@ -202,15 +208,19 @@ cp "${cranvr}/scripts/build-wine.sh" "${wine_tree}/cranvr/scripts/"
     print "                 without the import (vrdesktop.dll),"
     print "                 0008 gives winecoreaudio the capture device \"cranvr microphone\", the default one, while cranvr's"
     print "                 microphone.txt names a source: it records the headset's microphone from a ring in shared memory"
-    print "                 that cranvr's host writes, a Mac input device, or silence (dlls/winecoreaudio.drv/coreaudio.c)."
-    print "cranvr/tests     hlsl_compile.cpp, gl_compat_check.cpp, far_jump_check.cpp, stack_sample_check.cpp, session_check.cpp and"
-    print "                 microphone_check.cpp, the test"
+    print "                 that cranvr's host writes, a Mac input device, or silence (dlls/winecoreaudio.drv/coreaudio.c),"
+    print "                 0009 makes winevulkan pass VkImportMetalTextureInfoEXT of vkCreateImage on to MoltenVK"
+    print "                 (dlls/winevulkan/vulkan_thunks.c, a generated file): the OpenXR runtime puts a Vulkan game's"
+    print "                 swapchain images on Metal textures of IOSurfaces with it, and the stock thunk dropped the struct."
+    print "cranvr/tests     hlsl_compile.cpp, gl_compat_check.cpp, far_jump_check.cpp, stack_sample_check.cpp, session_check.cpp,"
+    print "                 microphone_check.cpp and metal_texture_check.cpp, the test"
     print "                 programs that are next to the files (they are not part of Wine). isnan.hlsl is the shader that"
     print "                 hlsl_compile.exe compiles."
     print "cranvr/scripts/build-wine.sh  the build: git apply, configure (under Rosetta 2 on an Apple Silicon Mac, with"
-    print "                 MinGW-w64 for the Windows files and macOS 10.15 as the oldest system), then make for the eight"
+    print "                 MinGW-w64 for the Windows files and macOS 10.15 as the oldest system), then make for the nine"
     print "                 files. They appear under dlls/ in the build folder. It needs flex, bison 3 or later and mingw-w64"
-    print "                 (Homebrew), and Xcode's command line tools."
+    print "                 (Homebrew), and Xcode's command line tools. metal_texture_check.cpp needs the Vulkan headers, which"
+    print "                 the build downloads from https://github.com/KhronosGroup/Vulkan-Headers (Apache 2.0 or MIT)."
 } > "${wine_tree}/README.txt"
 tar -C "${stage}" -cf - "${wine_name}" | xz -T0 -9 > "${root}/SOURCE/wine-source.tar.xz"
 cp "${root}/SOURCE/wine-source.tar.xz" "${out}/cranvr-wine-source.tar.xz"
@@ -234,7 +244,7 @@ git -C "${oc_src}" archive --format=tar HEAD | tar -x -C "${oc_tree}/OpenComposi
 git -C "${oc_src}/libs/glm" archive --format=tar HEAD | tar -x -C "${oc_tree}/OpenComposite/libs/glm"
 git -C "${oc_src}/libs/openxr-sdk" archive --format=tar HEAD | tar -x -C "${oc_tree}/OpenComposite/libs/openxr-sdk"
 cp -R "${oc_support}/patches" "${oc_support}/shim" "${oc_tree}/cranvr/"
-cp "${oc_support}/mingw-x86_64.cmake" "${oc_tree}/cranvr/"
+cp "${oc_support}/mingw-x86_64.cmake" "${oc_support}/vulkan-1.def" "${oc_tree}/cranvr/"
 cp "${oc_support}/tests/openvr_smoke.cpp" "${oc_tree}/cranvr/tests/"
 cp "${cranvr}/scripts/build-opencomposite.sh" "${oc_tree}/cranvr/scripts/"
 {
@@ -267,13 +277,19 @@ cp "${cranvr}/scripts/build-opencomposite.sh" "${oc_tree}/cranvr/scripts/"
     print "                 0010 sends the button events of the legacy controller state (VREvent_ButtonPress and its kin) to a"
     print "                 game that reads that state: the OpenXR port sent none, and Google Earth VR saw no press,"
     print "                 0011 refuses every application type but a scene with an init error and one log line, never a message"
-    print "                 box (Steam's VR watchdog got a box that stopped Steam), and answers the symbols of its init errors."
+    print "                 box (Steam's VR watchdog got a box that stopped Steam), and answers the symbols of its init errors,"
+    print "                 0012 runs a Vulkan game: the session takes the game's Vulkan device (XR_KHR_vulkan_enable), and each"
+    print "                 eye image goes into the runtime's Vulkan image on the GPU, by a copy, a blit for another format or"
+    print "                 a resolve of an MSAA image."
     print "cranvr/shim      atlbase.h: the part of ATL that OpenComposite uses, for MinGW-w64."
     print "cranvr/mingw-x86_64.cmake  the CMake toolchain file of the build."
+    print "cranvr/vulkan-1.def  the Vulkan functions that OpenComposite calls: the build makes a delay-load import library"
+    print "                 of vulkan-1.dll from it, so a Direct3D game loads no Vulkan."
     print "cranvr/tests/openvr_smoke.cpp  the test program that is next to the DLL (it is not part of the DLL)."
     print "cranvr/scripts/build-opencomposite.sh  the build: git apply, then cmake and ninja with"
     print "                 -DOC_D3D_ONLY=ON and the toolchain file. It needs cmake, ninja, python 3 and mingw-w64"
-    print "                 (Homebrew). The DLL appears at build/bin/vrclient_x64.dll."
+    print "                 (Homebrew). It downloads the Vulkan headers from https://github.com/KhronosGroup/Vulkan-Headers"
+    print "                 (Apache 2.0 or MIT). The DLL appears at build/bin/vrclient_x64.dll."
 } > "${oc_tree}/README.txt"
 tar -C "${stage}" -cf - "${oc_name}" | xz -T0 -9 > "${root}/SOURCE/opencomposite-source.tar.xz"
 mkdir -p "${out}"
@@ -296,6 +312,7 @@ cp "${cranvr}/third_party/licenses/LGPL-2.1.txt" "${root}/LICENSES/Wine-LGPL-2.1
 cp "${wine_src}/LICENSE" "${root}/LICENSES/Wine-LICENSE.txt"
 cp "${wine_src}/libs/vkd3d/COPYING" "${root}/LICENSES/Wine-vkd3d-LGPL-2.1.txt"
 cp "${wine_src}/libs/vkd3d/AUTHORS" "${root}/LICENSES/Wine-vkd3d-AUTHORS.txt"
+cp "${oc_build}/vulkan-headers/LICENSE.md" "${root}/LICENSES/Vulkan-Headers-Apache-2.0-or-MIT.md"
 
 basalt_commit=$(git -C "${basalt}" rev-parse HEAD)
 dxmt_commit=$(git -C "${runtime}/build/dxmt/src" rev-parse HEAD)
@@ -303,12 +320,13 @@ dxmt_commit=$(git -C "${runtime}/build/dxmt/src" rev-parse HEAD)
     print "# Sources of cranvr's game support"
     print
     print -r -- "- Wine 11.10: Gcenx's macOS build, https://github.com/Gcenx/macOS_Wine_builds/releases/tag/11.10 (LGPL 2.1 or later; source at https://gitlab.winehq.org/wine/wine/-/tags/wine-11.10). Unchanged, apart from DXMT's DLLs and the patched Wine files (next line)."
-    print -r -- "- wined3d.dll, wininet.dll, wtsapi32.dll, user32.dll, winemac.so, opengl32.so, ntdll.so and winecoreaudio.so of Wine 11.10 (LGPL 2.1 or later), built from https://gitlab.winehq.org/wine/wine at the tag wine-11.10, commit ${wine_commit}, with cranvr's patches 0001 (the HLSL intrinsic isnan in vkd3d-shader), 0002 (a core OpenGL context for a request of the compatibility profile), 0003 (legacy GLSL in a core context), 0004 (wininet's handles closed on several threads), 0005 (memory above 4 GB for a program with high-entropy addresses on macOS), 0006 (an unlocked local session for SteamVR), 0007 (DwmGetDxSharedSurface for SteamVR's dashboard) and 0008 (the capture device \"cranvr microphone\", which records the headset's microphone, a Mac input device or silence). They replace the files in the engine, and the DLLs also in the Wine prefix. Their source, the patches and the build are in SOURCE/wine-source.tar.xz of this archive and in the file cranvr-wine-source.tar.xz of the release. wine-patched/hlsl_compile.exe, wine-patched/gl_compat_check.exe, wine-patched/far_jump_check.exe, wine-patched/stack_sample_check.exe, wine-patched/session_check.exe and wine-patched/microphone_check.exe are cranvr's own test programs (MIT)."
+    print -r -- "- wined3d.dll, wininet.dll, wtsapi32.dll, user32.dll, winemac.so, opengl32.so, ntdll.so, winecoreaudio.so and winevulkan.so of Wine 11.10 (LGPL 2.1 or later), built from https://gitlab.winehq.org/wine/wine at the tag wine-11.10, commit ${wine_commit}, with cranvr's patches 0001 (the HLSL intrinsic isnan in vkd3d-shader), 0002 (a core OpenGL context for a request of the compatibility profile), 0003 (legacy GLSL in a core context), 0004 (wininet's handles closed on several threads), 0005 (memory above 4 GB for a program with high-entropy addresses on macOS), 0006 (an unlocked local session for SteamVR), 0007 (DwmGetDxSharedSurface for SteamVR's dashboard), 0008 (the capture device \"cranvr microphone\", which records the headset's microphone, a Mac input device or silence) and 0009 (a Vulkan image on a Metal texture of an IOSurface). They replace the files in the engine, and the DLLs also in the Wine prefix. Their source, the patches and the build are in SOURCE/wine-source.tar.xz of this archive and in the file cranvr-wine-source.tar.xz of the release. wine-patched/hlsl_compile.exe, wine-patched/gl_compat_check.exe, wine-patched/far_jump_check.exe, wine-patched/stack_sample_check.exe, wine-patched/session_check.exe, wine-patched/microphone_check.exe and wine-patched/metal_texture_check.exe are cranvr's own test programs (MIT)."
     print -r -- "- DXMT v0.80 (MIT), https://github.com/3Shain/dxmt, with BasaltVR's patches 0001 to 0004 and cranvr's patches 0005 to 0018. Tree commit ${dxmt_commit}."
     print -r -- "- steamvr-driver/: cranvr's SteamVR driver (MIT), built from steamvr/driver_cranvr.cpp of cranvr with MinGW-w64. It includes Valve's openvr_driver.h of OpenVR 2.15.6 (BSD 3-Clause, LICENSES/SteamVR-driver-OpenVR-headers-BSD-3-Clause.txt). SteamVR itself is not part of this archive: it comes from the user's Steam library."
     print -r -- "- BasaltVR (MIT), https://github.com/Stooovie/BasaltVR at ${basalt_commit}, with cranvr's runtime patches."
     print -r -- "- The OpenXR SDK loader in the runtime's checks (Apache 2.0)."
-    print -r -- "- OpenComposite (GPL 3), https://gitlab.com/znixian/OpenOVR at ${oc_commit}, with cranvr's patches 0001 to 0011. Its source, the patches and the build are in SOURCE/opencomposite-source.tar.xz of this archive and in the file cranvr-opencomposite-source.tar.xz of the release. It is a separate program: games load it as an OpenVR runtime (opencomposite/vrclient_x64.dll) and it calls the OpenXR runtime above. It contains the OpenXR SDK loader (Apache 2.0), jsoncpp (MIT), glm (MIT), inih (BSD), Valve's OpenVR headers (BSD 3-Clause) and hand models of Oculus (CC BY 4.0): their licenses are in LICENSES/."
+    print -r -- "- The Vulkan headers (Apache 2.0 or MIT), https://github.com/KhronosGroup/Vulkan-Headers: the runtime and OpenComposite are built with them (LICENSES/Vulkan-Headers-Apache-2.0-or-MIT.md)."
+    print -r -- "- OpenComposite (GPL 3), https://gitlab.com/znixian/OpenOVR at ${oc_commit}, with cranvr's patches 0001 to 0012. Its source, the patches and the build are in SOURCE/opencomposite-source.tar.xz of this archive and in the file cranvr-opencomposite-source.tar.xz of the release. It is a separate program: games load it as an OpenVR runtime (opencomposite/vrclient_x64.dll) and it calls the OpenXR runtime above. It contains the OpenXR SDK loader (Apache 2.0), jsoncpp (MIT), glm (MIT), inih (BSD), Valve's OpenVR headers (BSD 3-Clause) and hand models of Oculus (CC BY 4.0): their licenses are in LICENSES/."
     print
     print "cranvr's DXMT patches add a limit on MSAA samples, an MSAA resolve without a sample store, an"
     print "optional skip of the Mac window's present, a silent Discard hint (patch 0009) and an optional report of render-target"
@@ -332,6 +350,8 @@ dxmt_commit=$(git -C "${runtime}/build/dxmt/src" rev-parse HEAD)
     print "Patch 0012 offers XR_EXT_hand_interaction: the hand interaction profile with its four poses and three gestures,"
     print "made by cranvr-host from a tracked hand's joints or mapped from a Touch controller, and the pinch and poke poses on"
     print "every profile of the hands. Each hand takes the profile of what the user holds."
+    print "Patch 0013 runs a Vulkan game (XR_KHR_vulkan_enable and XR_KHR_vulkan_enable2): the swapchain images are Vulkan"
+    print "images on Metal textures of IOSurfaces, so cranvr-host encodes the game's picture without a copy through the CPU."
 } > "${root}/SOURCES.md"
 
 print -r -- "${version}" > "${root}/VERSION"

@@ -694,13 +694,19 @@ fn GameRow(settings: MutableState<Settings>, model: MutableState<Model>, game: s
 #[composable]
 fn LaunchOptions(settings: MutableState<Settings>, model: MutableState<Model>, program: String) {
     let options = settings.with(|s| s.launch.get(&program).cloned().unwrap_or_default());
-    let raw_fields_set =
-        !(options.dll_overrides.is_empty() && options.env.is_empty() && options.args.is_empty() && options.steam_app_id.is_empty());
+    let raw_fields_set = !(options.dll_overrides.is_empty()
+        && options.env.is_empty()
+        && options.args.is_empty()
+        && options.steam_app_id.is_empty()
+        && options.vulkan_args.is_empty()
+        && options.direct3d_args.is_empty());
     let advanced = rememberMutableStateOf(move || raw_fields_set);
     let dll = cranpose_core::remember(|| TextFieldState::new(&options.dll_overrides)).with(|state| *state);
     let steam_id = cranpose_core::remember(|| TextFieldState::new(&options.steam_app_id)).with(|state| *state);
     let env = cranpose_core::remember(|| TextFieldState::new(&options.env)).with(|state| *state);
     let args = cranpose_core::remember(|| TextFieldState::new(&options.args)).with(|state| *state);
+    let vulkan_args = cranpose_core::remember(|| TextFieldState::new(&options.vulkan_args)).with(|state| *state);
+    let direct3d_args = cranpose_core::remember(|| TextFieldState::new(&options.direct3d_args)).with(|state| *state);
     // The game's page without the buttons that its row in the list has already
     let items: Vec<Item> = settings
         .with(|s| model.with(|m| pages::options_page(s, m, &program)))
@@ -734,6 +740,9 @@ fn LaunchOptions(settings: MutableState<Settings>, model: MutableState<Model>, p
                 OptionField("Environment", env);
                 Hint("NAME=value entries, separated by spaces.".into());
                 OptionField("Arguments", args);
+                OptionField("Vulkan arguments", vulkan_args);
+                OptionField("Direct3D 11 arguments", direct3d_args);
+                Hint("What the Graphics choice adds for this game, such as +gfx_strAPI VLK. Empty: the argument of the game's engine, when cranvr knows the engine.".into());
                 let key = program.clone();
                 FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
                     let key = key.clone();
@@ -748,6 +757,8 @@ fn LaunchOptions(settings: MutableState<Settings>, model: MutableState<Model>, p
                             o.steam_app_id = steam_text;
                             o.env = env.text().trim().to_owned();
                             o.args = args.text().trim().to_owned();
+                            o.vulkan_args = vulkan_args.text().trim().to_owned();
+                            o.direct3d_args = direct3d_args.text().trim().to_owned();
                         })
                     });
                 });

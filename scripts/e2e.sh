@@ -7,7 +7,8 @@
 #                       [--quest [SERIAL] | --native-tcp] [--native-drop PERCENT] [--native-port PORT]
 #                       [--host-arg ARG]... [--probe-arg ARG]... [--report FILE]
 #                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine | --hand-interaction [hand|both]
-#                        | --openvr-wine | --openvr-actions MODE | --openvr-overlay | --openvr-gl | --steamvr]
+#                        | --openvr-wine | --openvr-actions MODE | --openvr-overlay | --openvr-gl | --openvr-vulkan | --steamvr
+#                        | --xr-vulkan [enable2|enable1|array]] [--openvr-arg ARG]...
 #                       [--displays N] [--hold] [--hand-hold] [--displays-in-game]
 #                       [--game-stall AT:FOR] [--moving]
 #                       [--pause AT:FOR] [--left-trigger AT:FOR] [--right-trigger AT:FOR]
@@ -67,6 +68,20 @@
 #                 compatibility profile, draws with a shader of GLSL 1.10 and submits one OpenGL texture with both eyes
 #                 side by side. OpenComposite copies it into the runtime's Direct3D 11 images. The run checks the
 #                 picture of each eye in the host the same way. Implies --openvr-wine.
+#   --openvr-vulkan  the same program with Vulkan, as a Vulkan game draws (openvr_smoke.exe --vulkan): the device of
+#                 GetOutputDevice and an R8G8B8A8 image per eye, which OpenComposite blits into the runtime's B8G8R8A8
+#                 images on the GPU. Each eye is exact black with a gray band down its left edge and a block of the
+#                 eye's color in its upper half. --openvr-arg --format --openvr-arg bgra takes B8G8R8A8 images, which
+#                 OpenComposite copies as they are, and --openvr-arg --samples --openvr-arg 4 multisampled ones, which it
+#                 resolves. Implies --openvr-wine.
+#   --openvr-arg ARG  one more argument of openvr_smoke.exe in the --openvr-* runs
+#   --xr-vulkan [enable2|enable1|array]  an OpenXR program that renders with Vulkan: C:\basalt\runtime\vulkan_runtime_smoke.exe
+#                 runs in Wine with XR_KHR_vulkan_enable2 (the default), with XR_KHR_vulkan_enable (enable1) or with one
+#                 swapchain of two slices (array). It draws the picture of --openvr-vulkan into the runtime's IOSurface
+#                 images. The run checks the program's verdict, the host's count of game frames (90 percent of the rate
+#                 in the windows after the first) and the colors of each eye in the host's copy of the eyes. It works with
+#                 --quest too. Set CRANVR_HOME to a stack that scripts/setup-wine.sh built with the runtime and the Wine
+#                 files to test.
 #   --steamvr     the same program through SteamVR for Windows and cranvr's driver (steamvr/driver_cranvr.cpp):
 #                 scripts/run-game.sh writes the OpenVR path file for CRANVR_OPENVR=steamvr, and the program's
 #                 VR_Init starts SteamVR from the prefix's Steam library. The checks are those of --openvr-wine. The
@@ -181,6 +196,7 @@ source "${root}/scripts/guardian.sh"
 seconds=20 fps=120 fps_given=0 game=0 desktop=0 sound=0 client=mac serial="" report=""
 displays=1 hold=0 hand_hold=0 displays_in_game=0 display_test=0
 tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 hand_interaction="" openvr_wine=0 openvr_actions="" openvr_overlay=0 openvr_gl=0 steamvr=0 face_source=audio
+openvr_vulkan=0 openvr_args=() xr_vulkan=""
 game_stall="" moving=0
 wine="" wine_args=()
 native_tcp=0 native_drop=0 native_port=9950 pause="" left_trigger="" right_trigger="" cable=""
@@ -204,6 +220,12 @@ while (( $# )); do
         --openvr-wine) openvr_wine=1; shift ;;
         --openvr-overlay) openvr_wine=1 openvr_overlay=1; shift ;;
         --openvr-gl) openvr_wine=1 openvr_gl=1; shift ;;
+        --openvr-vulkan) openvr_wine=1 openvr_vulkan=1; shift ;;
+        --openvr-arg) openvr_args+=("$2"); shift 2 ;;
+        --xr-vulkan)
+            xr_vulkan=enable2; shift
+            if (( $# )) && [[ $1 != --* ]]; then xr_vulkan=$1; shift; fi
+            [[ ${xr_vulkan} == (enable2|enable1|array) ]] || { print -u2 "--xr-vulkan takes enable2, enable1 or array"; exit 2; } ;;
         --steamvr) openvr_wine=1 steamvr=1; shift ;;
         --openvr-actions)
             openvr_wine=1 openvr_actions=$2; shift 2
@@ -272,6 +294,8 @@ if (( openvr_wine )); then
     [[ -z ${openvr_actions} ]] || wine_args+=(--actions "${openvr_actions}")
     (( ! openvr_overlay )) || wine_args+=(--overlay)
     (( ! openvr_gl )) || wine_args+=(--gl)
+    (( ! openvr_vulkan )) || wine_args+=(--vulkan)
+    wine_args+=("${openvr_args[@]}")
     # The run tests the path of an OpenVR program, not the rate. On a Mac that other builds keep busy (a
     # load average above 20) the program loses frames to the scheduler: the report of its second-by-second
     # frame counts shows 120 in the quiet seconds and 60 to 100 in the busy ones. The rest of the loss was
@@ -280,6 +304,15 @@ if (( openvr_wine )); then
     (( fps_given )) || fps=72
     # What the runtime tells the game about the display must be the rate that the host runs at
     wine_args+=(--expect-hz "${fps}")
+fi
+if [[ -n ${xr_vulkan} ]]; then
+    # The program ends a few seconds before the run, so its verdict is in the log. The host's second 5-second
+    # window lies inside the program's run, which starts about 2 s after the host.
+    (( seconds >= 16 )) || seconds=16
+    wine='C:\basalt\runtime\vulkan_runtime_smoke.exe'
+    wine_args=(--seconds $(( seconds - 3 )))
+    [[ ${xr_vulkan} == enable1 ]] && wine_args+=(--enable1)
+    [[ ${xr_vulkan} == array ]] && wine_args+=(--array)
 fi
 if (( tracking_wine )); then
     # The Windows program waits for the headset's features, starts a session and reads the data
@@ -470,7 +503,7 @@ if [[ ${client} == quest && -f ${identity} ]]; then
 fi
 # An OpenVR program draws a picture with an upper and a lower half. The host writes both eyes of the game's newest
 # frame, and the run checks that the upper half is the bright one (see below).
-if (( openvr_wine )); then
+if (( openvr_wine )) || [[ -n ${xr_vulkan} ]]; then
     mkdir -p "${work}/eyes"
     export CRANVR_EYE_DUMP=${work}/eyes
 fi
@@ -702,6 +735,13 @@ for eye in ("left", "right"):
           % (eye, top, bottom, black, height))
     if not top > 2 * bottom or black > height // 50:
         bad = True
+    # The eye's color: blue in the left eye, orange in the right one. A swap of the red and blue channels or of the
+    # eyes shows here.
+    red = sum(row[x] for row in rows[:quarter] for x in range(0, len(row), 3))
+    blue = sum(row[x + 2] for row in rows[:quarter] for x in range(0, len(row), 3))
+    print("eyes: the %s eye's upper quarter has red %d and blue %d in all" % (eye, red, blue))
+    if (blue <= red) if eye == "left" else (red <= blue):
+        bad = True
 sys.exit(1 if bad else 0)
 PYTHON
     if [[ -n ${openvr_actions} ]]; then
@@ -729,6 +769,60 @@ if (( tracking_wine )); then
     done
     grep -h "tracking_smoke:" "${work}/game.log" || true
     grep -q "tracking_smoke: PASS" "${work}/game.log" || { print -u2 "The tracking program did not pass; see ${work}/game.log"; tracking_exit=1; }
+fi
+xr_vulkan_exit=0
+if [[ -n ${xr_vulkan} ]]; then
+    for i in {1..60}; do
+        grep -qE "vulkan_runtime_smoke: (PASS|FAIL)" "${work}/game.log" && break
+        sleep 0.5
+    done
+    grep -hE "vulkan_runtime_smoke:|Vulkan frames" "${work}/game.log" || true
+    grep -q "vulkan_runtime_smoke: PASS" "${work}/game.log" || { print -u2 "The Vulkan program did not pass; see ${work}/game.log"; xr_vulkan_exit=1; }
+    # The game's frames reach the host at the rate, and each eye has its color the right way up
+    python3 -I - "${work}/host.out" "${fps}" "${work}/eyes" <<'PYTHON' || { print -u2 "The Vulkan program's frames or picture did not reach the host; see ${work}"; xr_vulkan_exit=1; }
+import json, struct, sys, zlib
+fps = float(sys.argv[2])
+counts = []
+for line in open(sys.argv[1], errors="replace"):
+    if line.startswith("@cranvr") and '"type":"stats"' in line:
+        counts.append(json.loads(line[8:]).get("game_frames") or 0)
+# The first window with game frames holds the program's start and the last one its end. A headset that links
+# later than the probe moves both, so the windows without game frames around them do not count either.
+lit = [i for i, count in enumerate(counts) if count > 0]
+middle = counts[lit[0] + 1:lit[-1]] if lit else []
+bad = not middle
+if middle:
+    rate = min(middle) / 5.0
+    print("vulkan: the host got at least %.1f game frames a second at %g Hz (windows: %s)" % (rate, fps, counts))
+    bad = rate < 0.9 * fps
+def read_png(path):
+    data = open(path, "rb").read()
+    pos, idat, width, height = 8, b"", 0, 0
+    while pos < len(data):
+        length, kind = struct.unpack(">I4s", data[pos:pos + 8])
+        body = data[pos + 8:pos + 8 + length]
+        if kind == b"IHDR":
+            width, height = struct.unpack(">II", body[:8])
+        elif kind == b"IDAT":
+            idat += body
+        pos += 12 + length
+    raw = zlib.decompress(idat)
+    stride = width * 3 + 1
+    return width, height, [raw[y * stride + 1:(y + 1) * stride] for y in range(height)]
+for eye in ("left", "right"):
+    width, height, rows = read_png("%s/eye-%s.png" % (sys.argv[3], eye))
+    # The block of the eye's color lies at a quarter of the height; the band at the left edge keeps every row lit
+    block = rows[height // 4][3 * (width // 2):3 * (width // 2) + 3]
+    lower = rows[3 * height // 4][3 * (width // 2):3 * (width // 2) + 3]
+    unlit = sum(1 for row in rows if not any(row))
+    print("vulkan: the %s eye's block is %s, its lower half %s, %d rows without a lit pixel" % (eye, tuple(block), tuple(lower), unlit))
+    blue_eye = eye == "left"
+    if (block[2] <= 2 * block[0]) if blue_eye else (block[0] <= 2 * block[2]):
+        bad = True
+    if max(lower) > 8 or unlit:
+        bad = True
+sys.exit(1 if bad else 0)
+PYTHON
 fi
 hand_interaction_exit=0
 if [[ -n ${hand_interaction} ]]; then
@@ -909,6 +1003,7 @@ python3 -I "${root}/scripts/e2e-report.py" "${work}/host.out" "${fps}" "${report
 (( tracking_exit == 0 )) || result=1
 (( hand_interaction_exit == 0 )) || result=1
 (( openvr_exit == 0 )) || result=1
+(( xr_vulkan_exit == 0 )) || result=1
 (( displays_exit == 0 )) || result=1
 grep -hE "probe: (done|frame arrival|native|desktop|audio|pause test|displays|in-game displays|[0-9.]+ s: the focus)" "${work}/probe.log" 2>/dev/null || true
 print "Report: ${report}"

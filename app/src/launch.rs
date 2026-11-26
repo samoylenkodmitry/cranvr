@@ -53,6 +53,93 @@ pub struct GameOptions {
     /// Why `openvr` holds what it holds, when cranvr chose it: a game that drew nothing through OpenComposite
     /// gets SteamVR (vr_system.rs). The Play tab shows it. A change by the user clears it.
     pub openvr_reason: String,
+    /// The graphics API of a game that picks one by an argument: None leaves the game its own choice and
+    /// adds no argument
+    pub graphics: Option<Graphics>,
+    /// The arguments that make the game draw with Vulkan. Empty: the arguments of the game's engine when
+    /// cranvr knows the engine (see [`engine`])
+    pub vulkan_args: String,
+    /// The arguments that make the game draw with Direct3D 11. Empty: the engine's, as for `vulkan_args`
+    pub direct3d_args: String,
+}
+
+/// The graphics API that a game draws with. A game that offers more than one picks it by an argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Graphics {
+    /// Direct3D 11, which DXMT runs on Metal
+    Direct3D,
+    /// Vulkan, which MoltenVK runs on Metal. cranvr's runtime and OpenComposite take the game's Vulkan
+    /// images on the GPU.
+    Vulkan,
+}
+
+impl Graphics {
+    pub const ALL: [Graphics; 2] = [Graphics::Direct3D, Graphics::Vulkan];
+
+    /// The word of app.json and of the console in VR
+    pub fn key(self) -> &'static str {
+        match self {
+            Graphics::Direct3D => "direct3d",
+            Graphics::Vulkan => "vulkan",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|choice| choice.key() == key)
+    }
+
+    /// The name that the Play tab shows
+    pub fn label(self) -> &'static str {
+        match self {
+            Graphics::Direct3D => "Direct3D 11",
+            Graphics::Vulkan => "Vulkan",
+        }
+    }
+}
+
+/// A game engine whose games take one argument for each graphics API. cranvr knows the engine by its
+/// files next to the program, never by the game.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Engine {
+    pub name: &'static str,
+    /// What showed the engine, for the Play tab
+    pub sign: &'static str,
+    pub vulkan: &'static str,
+    pub direct3d: &'static str,
+}
+
+impl Engine {
+    pub fn arguments(self, graphics: Graphics) -> &'static str {
+        match graphics {
+            Graphics::Direct3D => self.direct3d,
+            Graphics::Vulkan => self.vulkan,
+        }
+    }
+}
+
+/// The engine of the program at `program` (a Mac path), when its files show one. A Unity player has
+/// UnityPlayer.dll or a folder `<program>_Data` next to it. An Unreal game has the folder Engine/Binaries
+/// beside its program or beside the project folder of `<project>/Binaries/Win64/<program>`. A game of
+/// Croteam's Serious Engine keeps its programs in `Bin` or `Bin/x64` and its Vulkan shaders in
+/// `Content/CachedShaders_VLK.gro`; it takes the console variable gfx_strAPI as an argument.
+pub fn engine(program: &Path) -> Option<Engine> {
+    let folder = program.parent()?;
+    let stem = program.file_stem()?.to_string_lossy();
+    if folder.join("UnityPlayer.dll").is_file() || folder.join(format!("{stem}_Data")).is_dir() {
+        return Some(Engine { name: "Unity", sign: "UnityPlayer.dll or the Data folder", vulkan: "-force-vulkan", direct3d: "-force-d3d11" });
+    }
+    let unreal = [Some(folder), folder.ancestors().nth(3)].into_iter().flatten().any(|root| root.join("Engine/Binaries").is_dir());
+    if unreal {
+        return Some(Engine { name: "Unreal Engine", sign: "the folder Engine/Binaries", vulkan: "-vulkan", direct3d: "-d3d11" });
+    }
+    let serious = [folder.ancestors().nth(1), folder.ancestors().nth(2)].into_iter().flatten().any(|root| root.join("Content/CachedShaders_VLK.gro").is_file());
+    serious.then_some(Engine {
+        name: "Serious Engine",
+        sign: "Content/CachedShaders_VLK.gro",
+        vulkan: "+gfx_strAPI VLK",
+        direct3d: "+gfx_strAPI D3D11",
+    })
 }
 
 /// The runtime that answers a game's OpenVR calls. An OpenXR game ignores the choice.
@@ -179,15 +266,27 @@ pub fn variables(text: &str) -> impl Iterator<Item = (String, String)> + '_ {
     })
 }
 
-/// The program's arguments.
-pub fn arguments(game: &GameOptions) -> impl Iterator<Item = &str> {
-    game.args.split_whitespace()
+/// The arguments of the game's graphics choice: the game's own text for the choice, else the arguments of
+/// its engine. None of both: nothing, and the game keeps its own choice.
+pub fn graphics_arguments(game: &GameOptions, engine: Option<Engine>) -> &str {
+    let Some(graphics) = game.graphics else { return "" };
+    let own = match graphics {
+        Graphics::Direct3D => game.direct3d_args.trim(),
+        Graphics::Vulkan => game.vulkan_args.trim(),
+    };
+    if own.is_empty() { engine.map_or("", |engine| engine.arguments(graphics)) } else { own }
+}
+
+/// The program's arguments: its own, then the ones of its graphics choice. `engine` is the program's
+/// engine (see [`engine`]).
+pub fn arguments(game: &GameOptions, engine: Option<Engine>) -> impl Iterator<Item = &str> {
+    game.args.split_whitespace().chain(graphics_arguments(game, engine).split_whitespace())
 }
 
 /// The options as one line that the UI shows: the environment, then the arguments.
-pub fn summary(wine: &WineOptions, game: &GameOptions) -> String {
+pub fn summary(wine: &WineOptions, game: &GameOptions, engine: Option<Engine>) -> String {
     let mut parts: Vec<String> = environment(wine, game).into_iter().map(|(name, value)| format!("{name}={value}")).collect();
-    parts.extend(arguments(game).map(str::to_owned));
+    parts.extend(arguments(game, engine).map(str::to_owned));
     parts.join(" ")
 }
 
@@ -275,7 +374,7 @@ mod tests {
         assert_eq!(environment(&WineOptions::default(), &GameOptions::default()), [("DXMT_SKIP_PRESENT".to_owned(), "1".to_owned())]);
         let wine = WineOptions { mac_window: true, ..Default::default() };
         assert!(environment(&wine, &GameOptions::default()).is_empty());
-        assert_eq!(arguments(&GameOptions::default()).count(), 0);
+        assert_eq!(arguments(&GameOptions::default(), None).count(), 0);
     }
 
     #[test]
@@ -308,7 +407,7 @@ mod tests {
                 ("BAR".to_owned(), "two".to_owned()),
             ]
         );
-        assert_eq!(arguments(&game).collect::<Vec<_>>(), ["fpfc", "--verbose"]);
+        assert_eq!(arguments(&game, None).collect::<Vec<_>>(), ["fpfc", "--verbose"]);
     }
 
     #[test]
@@ -318,7 +417,7 @@ mod tests {
         let vars = environment(&wine, &game);
         assert_eq!(vars[0], ("WINEDLLOVERRIDES".to_owned(), "dxgi=n;winhttp=n,b".to_owned()));
         assert_eq!(vars.iter().rev().find(|(name, _)| name == "LEVEL").map(|(_, value)| value.as_str()), Some("2"));
-        assert_eq!(summary(&wine, &game), "WINEDLLOVERRIDES=dxgi=n;winhttp=n,b LEVEL=1 LEVEL=2");
+        assert_eq!(summary(&wine, &game, None), "WINEDLLOVERRIDES=dxgi=n;winhttp=n,b LEVEL=1 LEVEL=2");
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -354,6 +453,67 @@ mod tests {
         assert_eq!(steam_appid_file(&dir), None);
         fs::write(dir.join("steam_appid.txt"), "").unwrap();
         assert_eq!(steam_appid_file(&dir), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_graphics_choice_adds_the_game_s_own_arguments_else_its_engine_s() {
+        let unity = Engine { name: "Unity", sign: "x", vulkan: "-force-vulkan", direct3d: "-force-d3d11" };
+        let vulkan = GameOptions { graphics: Some(Graphics::Vulkan), args: "fpfc".into(), ..Default::default() };
+        assert_eq!(arguments(&vulkan, Some(unity)).collect::<Vec<_>>(), ["fpfc", "-force-vulkan"]);
+        // A game of no known engine gets nothing until the user types its argument
+        assert_eq!(arguments(&vulkan, None).collect::<Vec<_>>(), ["fpfc"]);
+        let typed = GameOptions { vulkan_args: " +gfx_strAPI VLK ".into(), ..vulkan.clone() };
+        assert_eq!(arguments(&typed, Some(unity)).collect::<Vec<_>>(), ["fpfc", "+gfx_strAPI", "VLK"]);
+        let direct3d = GameOptions { graphics: Some(Graphics::Direct3D), ..typed.clone() };
+        assert_eq!(graphics_arguments(&direct3d, Some(unity)), "-force-d3d11");
+        // The game's own choice adds no argument, and typed arguments wait for their choice
+        let own = GameOptions { graphics: None, ..typed };
+        assert_eq!(arguments(&own, Some(unity)).collect::<Vec<_>>(), ["fpfc"]);
+        assert!(!own.is_default(), "typed arguments are an option of their own");
+        assert!(!GameOptions { graphics: Some(Graphics::Vulkan), ..Default::default() }.is_default());
+        assert_eq!(summary(&WineOptions { mac_window: true, ..Default::default() }, &vulkan, Some(unity)), "fpfc -force-vulkan");
+        // The words of app.json are the console's words, and a missing choice is the game's own
+        let text = serde_json::to_string(&vulkan).unwrap();
+        assert!(text.contains(r#""graphics":"vulkan""#), "{text}");
+        assert_eq!(serde_json::from_str::<GameOptions>(r#"{"args": "-x"}"#).unwrap().graphics, None);
+        for choice in Graphics::ALL {
+            assert_eq!(serde_json::to_string(&choice).unwrap(), format!("\"{}\"", choice.key()));
+            assert_eq!(Graphics::from_key(choice.key()), Some(choice));
+        }
+    }
+
+    #[test]
+    fn the_engine_comes_from_its_files_next_to_the_program() {
+        let dir = scratch("engine");
+        let program = dir.join("Game.exe");
+        fs::write(&program, b"x").unwrap();
+        assert_eq!(engine(&program), None);
+        fs::create_dir_all(dir.join("Game_Data")).unwrap();
+        assert_eq!(engine(&program).map(|e| e.vulkan), Some("-force-vulkan"));
+        fs::remove_dir_all(dir.join("Game_Data")).unwrap();
+        fs::write(dir.join("UnityPlayer.dll"), b"x").unwrap();
+        assert_eq!(engine(&program).map(|e| e.name), Some("Unity"));
+        fs::remove_file(dir.join("UnityPlayer.dll")).unwrap();
+        // Unreal: the launcher beside Engine/, and the game's own program three folders down
+        fs::create_dir_all(dir.join("Engine/Binaries")).unwrap();
+        assert_eq!(engine(&program).map(|e| e.name), Some("Unreal Engine"));
+        let inner = dir.join("Project/Binaries/Win64");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(inner.join("Project-Win64-Shipping.exe"), b"x").unwrap();
+        assert_eq!(engine(&inner.join("Project-Win64-Shipping.exe")).map(|e| e.direct3d), Some("-d3d11"));
+        fs::remove_dir_all(&dir).ok();
+        // Serious Engine: Bin/x64/<program> and Bin/<program> with the Vulkan shaders in Content/
+        let dir = scratch("serious");
+        let wide = dir.join("Bin/x64");
+        fs::create_dir_all(&wide).unwrap();
+        fs::create_dir_all(dir.join("Content")).unwrap();
+        fs::write(wide.join("Game.exe"), b"x").unwrap();
+        fs::write(dir.join("Bin/Game.exe"), b"x").unwrap();
+        assert_eq!(engine(&wide.join("Game.exe")), None);
+        fs::write(dir.join("Content/CachedShaders_VLK.gro"), b"x").unwrap();
+        assert_eq!(engine(&wide.join("Game.exe")).map(|e| e.vulkan), Some("+gfx_strAPI VLK"));
+        assert_eq!(engine(&dir.join("Bin/Game.exe")).map(|e| e.name), Some("Serious Engine"));
         fs::remove_dir_all(&dir).ok();
     }
 

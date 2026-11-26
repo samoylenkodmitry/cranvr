@@ -133,6 +133,39 @@ applies these patches and builds both parts.
   through its words file and checks the values, the ready flags, the poses and the switch of profiles
   (`scripts/e2e.sh --hand-interaction [hand|both]`).
 
+`0013-vulkan-sessions.patch`
+
+- The runtime offers `XR_KHR_vulkan_enable` and `XR_KHR_vulkan_enable2` when the prefix has Wine's `vulkan-1.dll` and
+  DXMT's `winemetal.dll`. It loads both at the first Vulkan call, so a Direct3D 11 game loads neither. Vulkan 1.0 to 1.4
+  is accepted. The game's instance and device need no extension of the runtime: `xrGetVulkanInstanceExtensionsKHR`
+  and `xrGetVulkanDeviceExtensionsKHR` answer an empty list, and `xrGetVulkanGraphicsDevice2KHR` answers the first
+  physical device (MoltenVK has one, the Mac's GPU). `xrCreateVulkanInstanceKHR` and `xrCreateVulkanDeviceKHR` create
+  them through the game's `vkGetInstanceProcAddr`.
+- A Vulkan session takes the game's device and queue. A swapchain offers `B8G8R8A8_UNORM` and `B8G8R8A8_SRGB` with
+  three images. Each image lies on an IOSurface: `winemetal.dll` makes the IOSurface and its Metal texture (the call
+  that DXMT's patch for the runtime uses), and the runtime creates the Vulkan image on that texture with
+  `VkImportMetalTextureInfoEXT` (it needs Wine patch 0009, see `third_party/wine/README.md`). cranvr-host gets the
+  IOSurface's ID as it gets a Direct3D 11 image's, so the game's picture reaches the encoder with no copy.
+- A swapchain with two slices (both eyes in one image) keeps a private image of two layers, which the game draws. At
+  `xrEndFrame` the runtime copies each layer into an IOSurface image of its own on the GPU. The copy cost about
+  0.6 ms for two eyes of 1444x1546 on an M5.
+- The runtime signals a frame to cranvr-host when the GPU has finished it: `xrEndFrame` submits a fence on the
+  game's queue (with the slice copies, if any), and a waiting thread sends the frame when the fence signals, as the
+  Direct3D 11 path does with its fence. `control.cpp` takes the frame's GPU sync as a `FrameSync` of function
+  pointers, which the Direct3D 11 and the Vulkan sessions fill. The runtime's classes have no virtual methods and no
+  `std::vector`, because MinGW's C++ runtime for them imports `libwinpthread-1.dll`, which Wine lacks: the DLL then
+  failed to load.
+- `winemetal.dll` keeps each IOSurface alive until the process ends (its Mach port is never freed). The runtime keeps
+  up to 64 IOSurface images in a pool and gives a new swapchain of the same size, format and use the images of a
+  destroyed one, so a game that makes its swapchains again does not grow without end. The Direct3D 11 path has the
+  same leak in DXMT.
+- Every 600 frames the runtime writes a note to stderr: how long the fence's submission took and how long after
+  `xrEndFrame` the GPU finished a frame, on average and at most.
+- `tests/vulkan_runtime_smoke.cpp` renders with Vulkan through the Khronos loader: `--enable1` takes
+  `XR_KHR_vulkan_enable`, `--array` one swapchain of two slices. It draws exact black, a gray band down the left
+  edge and a block of the eye's color (blue left, orange right), and prints its rate and the time that `xrEndFrame`
+  took (`scripts/e2e.sh --xr-vulkan [enable2|enable1|array]`).
+
 ## patches/dxmt
 
 `0005-public-atomic-for-new-metal-compiler.patch`: DXMT 0.80 calls a private Metal builtin

@@ -55,8 +55,15 @@
 // submits one texture that holds both eyes side by side, each eye with its half in the bounds. OpenComposite copies
 // OpenGL textures into the runtime's Direct3D 11 images. scripts/e2e.sh --openvr-gl runs it.
 //
+// --vulkan draws with Vulkan, as a Vulkan game does: the instance and device extensions that the runtime asks for, the
+// physical device of GetOutputDevice, an image per eye (R8G8B8A8_UNORM, or B8G8R8A8_UNORM with --format bgra) with
+// --samples N samples, and a render pass that clears it. Each eye is exact black with a dim gray band down its left
+// edge and a block of the eye's color in its upper half; the block's green changes in each frame. OpenComposite copies
+// each image into the runtime's images on the GPU: a resolve for samples, a blit for a format that the runtime does
+// not offer. scripts/e2e.sh --openvr-vulkan runs it.
+//
 // Usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--trace-poses] [--actions MODE] [--expect-hz N] [--overlay] [--format F]
-//                         [--gl] [--load-only --runtime DIR] [--app-type TYPE [--runtime DIR]]
+//                         [--gl | --vulkan [--samples N]] [--load-only --runtime DIR] [--app-type TYPE [--runtime DIR]]
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -67,6 +74,7 @@
 #include <d3d11.h>
 #include <dxgi.h>
 #include <GL/gl.h>
+#include <vulkan/vulkan.h>
 
 #include <algorithm>
 #include <chrono>
@@ -818,6 +826,267 @@ bool app_type_named(const char* name, vr::EVRApplicationType* type)
 	return false;
 }
 
+// === Vulkan, as a Vulkan game draws ===
+
+template <typename T>
+T vk_struct(VkStructureType type)
+{
+	T value{};
+	value.sType = type;
+	return value;
+}
+
+struct VulkanGame {
+	PFN_vkGetInstanceProcAddr getInstanceProcAddr = nullptr;
+	PFN_vkGetDeviceProcAddr getDeviceProcAddr = nullptr;
+	PFN_vkWaitForFences waitForFences = nullptr;
+	PFN_vkResetFences resetFences = nullptr;
+	PFN_vkResetCommandBuffer resetCommandBuffer = nullptr;
+	PFN_vkBeginCommandBuffer beginCommandBuffer = nullptr;
+	PFN_vkEndCommandBuffer endCommandBuffer = nullptr;
+	PFN_vkCmdBeginRenderPass cmdBeginRenderPass = nullptr;
+	PFN_vkCmdEndRenderPass cmdEndRenderPass = nullptr;
+	PFN_vkCmdClearAttachments cmdClearAttachments = nullptr;
+	PFN_vkQueueSubmit queueSubmit = nullptr;
+	PFN_vkDeviceWaitIdle deviceWaitIdle = nullptr;
+	VkInstance instance = VK_NULL_HANDLE;
+	VkPhysicalDevice physical = VK_NULL_HANDLE;
+	VkDevice device = VK_NULL_HANDLE;
+	VkQueue queue = VK_NULL_HANDLE;
+	VkRenderPass render_pass = VK_NULL_HANDLE;
+	VkImage images[2] = {};
+	VkFramebuffer framebuffers[2] = {};
+	VkCommandBuffer commands[3] = {};
+	VkFence fences[3] = {};
+	uint32_t width = 0, height = 0;
+	VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+	VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+
+	// The space-separated names that the runtime asks for, kept in `store` for the pointers in `names`
+	static void split(const std::string& text, std::vector<std::string>& store, std::vector<const char*>& names)
+	{
+		std::istringstream words(text);
+		for (std::string word; words >> word;)
+			store.push_back(word);
+		for (const std::string& word : store)
+			names.push_back(word.c_str());
+	}
+
+	const char* setup(vr::IVRSystem* system, vr::IVRCompositor* compositor, uint32_t eye_width, uint32_t eye_height, bool bgra, uint32_t sample_count)
+	{
+		width = eye_width;
+		height = eye_height;
+		format = bgra ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM;
+		samples = static_cast<VkSampleCountFlagBits>(sample_count);
+		HMODULE module = LoadLibraryA("vulkan-1.dll");
+		if (!module)
+			return "LoadLibrary(vulkan-1.dll)";
+		getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(reinterpret_cast<void*>(GetProcAddress(module, "vkGetInstanceProcAddr")));
+
+		char extensions[1024] = {};
+		compositor->GetVulkanInstanceExtensionsRequired(extensions, sizeof(extensions));
+		say("the runtime asks for Vulkan instance extensions \"%s\"", extensions);
+		std::vector<std::string> instance_store, device_store;
+		std::vector<const char*> instance_names, device_names;
+		split(extensions, instance_store, instance_names);
+		auto app = vk_struct<VkApplicationInfo>(VK_STRUCTURE_TYPE_APPLICATION_INFO);
+		app.pApplicationName = "openvr_smoke";
+		app.apiVersion = VK_API_VERSION_1_1;
+		auto instance_info = vk_struct<VkInstanceCreateInfo>(VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO);
+		instance_info.pApplicationInfo = &app;
+		instance_info.enabledExtensionCount = static_cast<uint32_t>(instance_names.size());
+		instance_info.ppEnabledExtensionNames = instance_names.data();
+		auto create_instance = reinterpret_cast<PFN_vkCreateInstance>(getInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance"));
+		if (create_instance(&instance_info, nullptr, &instance) != VK_SUCCESS)
+			return "vkCreateInstance";
+
+		// The device that the runtime renders on, as a game asks for it
+		uint64_t output = 0;
+		system->GetOutputDevice(&output, vr::TextureType_Vulkan, reinterpret_cast<VkInstance_T*>(instance));
+		physical = reinterpret_cast<VkPhysicalDevice>(output);
+		if (physical == VK_NULL_HANDLE)
+			return "GetOutputDevice(TextureType_Vulkan)";
+		compositor->GetVulkanDeviceExtensionsRequired(reinterpret_cast<VkPhysicalDevice_T*>(physical), extensions, sizeof(extensions));
+		say("the runtime asks for Vulkan device extensions \"%s\"", extensions);
+		split(extensions, device_store, device_names);
+		float priority = 1.0f;
+		auto queue_info = vk_struct<VkDeviceQueueCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO);
+		queue_info.queueCount = 1;
+		queue_info.pQueuePriorities = &priority;
+		auto device_info = vk_struct<VkDeviceCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO);
+		device_info.queueCreateInfoCount = 1;
+		device_info.pQueueCreateInfos = &queue_info;
+		device_info.enabledExtensionCount = static_cast<uint32_t>(device_names.size());
+		device_info.ppEnabledExtensionNames = device_names.data();
+		auto create_device = reinterpret_cast<PFN_vkCreateDevice>(getInstanceProcAddr(instance, "vkCreateDevice"));
+		auto memory_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(getInstanceProcAddr(instance, "vkGetPhysicalDeviceMemoryProperties"));
+		getDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(getInstanceProcAddr(instance, "vkGetDeviceProcAddr"));
+		if (create_device(physical, &device_info, nullptr, &device) != VK_SUCCESS)
+			return "vkCreateDevice";
+#define DEVICE(name) auto name = reinterpret_cast<PFN_##name>(getDeviceProcAddr(device, #name))
+		DEVICE(vkGetDeviceQueue);
+		DEVICE(vkCreateImage);
+		DEVICE(vkGetImageMemoryRequirements);
+		DEVICE(vkAllocateMemory);
+		DEVICE(vkBindImageMemory);
+		DEVICE(vkCreateImageView);
+		DEVICE(vkCreateRenderPass);
+		DEVICE(vkCreateFramebuffer);
+		DEVICE(vkCreateCommandPool);
+		DEVICE(vkAllocateCommandBuffers);
+		DEVICE(vkCreateFence);
+#undef DEVICE
+		waitForFences = reinterpret_cast<PFN_vkWaitForFences>(getDeviceProcAddr(device, "vkWaitForFences"));
+		resetFences = reinterpret_cast<PFN_vkResetFences>(getDeviceProcAddr(device, "vkResetFences"));
+		resetCommandBuffer = reinterpret_cast<PFN_vkResetCommandBuffer>(getDeviceProcAddr(device, "vkResetCommandBuffer"));
+		beginCommandBuffer = reinterpret_cast<PFN_vkBeginCommandBuffer>(getDeviceProcAddr(device, "vkBeginCommandBuffer"));
+		endCommandBuffer = reinterpret_cast<PFN_vkEndCommandBuffer>(getDeviceProcAddr(device, "vkEndCommandBuffer"));
+		cmdBeginRenderPass = reinterpret_cast<PFN_vkCmdBeginRenderPass>(getDeviceProcAddr(device, "vkCmdBeginRenderPass"));
+		cmdEndRenderPass = reinterpret_cast<PFN_vkCmdEndRenderPass>(getDeviceProcAddr(device, "vkCmdEndRenderPass"));
+		cmdClearAttachments = reinterpret_cast<PFN_vkCmdClearAttachments>(getDeviceProcAddr(device, "vkCmdClearAttachments"));
+		queueSubmit = reinterpret_cast<PFN_vkQueueSubmit>(getDeviceProcAddr(device, "vkQueueSubmit"));
+		deviceWaitIdle = reinterpret_cast<PFN_vkDeviceWaitIdle>(getDeviceProcAddr(device, "vkDeviceWaitIdle"));
+		vkGetDeviceQueue(device, 0, 0, &queue);
+
+		// OpenVR takes the image in TRANSFER_SRC_OPTIMAL
+		VkAttachmentDescription attachment{};
+		attachment.format = format;
+		attachment.samples = samples;
+		attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+		attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+		attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+		attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		attachment.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+		VkAttachmentReference reference{ 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+		VkSubpassDescription subpass{};
+		subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+		subpass.colorAttachmentCount = 1;
+		subpass.pColorAttachments = &reference;
+		auto pass_info = vk_struct<VkRenderPassCreateInfo>(VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO);
+		pass_info.attachmentCount = 1;
+		pass_info.pAttachments = &attachment;
+		pass_info.subpassCount = 1;
+		pass_info.pSubpasses = &subpass;
+		if (vkCreateRenderPass(device, &pass_info, nullptr, &render_pass) != VK_SUCCESS)
+			return "vkCreateRenderPass";
+
+		VkPhysicalDeviceMemoryProperties memory{};
+		memory_properties(physical, &memory);
+		for (int eye = 0; eye < 2; eye++) {
+			auto image_info = vk_struct<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
+			image_info.imageType = VK_IMAGE_TYPE_2D;
+			image_info.format = format;
+			image_info.extent = { width, height, 1 };
+			image_info.mipLevels = 1;
+			image_info.arrayLayers = 1;
+			image_info.samples = samples;
+			image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+			image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+			if (vkCreateImage(device, &image_info, nullptr, &images[eye]) != VK_SUCCESS)
+				return "vkCreateImage of an eye";
+			VkMemoryRequirements requirements{};
+			vkGetImageMemoryRequirements(device, images[eye], &requirements);
+			auto allocate = vk_struct<VkMemoryAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
+			allocate.allocationSize = requirements.size;
+			for (uint32_t type = 0; type < memory.memoryTypeCount; type++) {
+				if ((requirements.memoryTypeBits & (1u << type)) && (memory.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+					allocate.memoryTypeIndex = type;
+					break;
+				}
+			}
+			VkDeviceMemory image_memory = VK_NULL_HANDLE;
+			if (vkAllocateMemory(device, &allocate, nullptr, &image_memory) != VK_SUCCESS || vkBindImageMemory(device, images[eye], image_memory, 0) != VK_SUCCESS)
+				return "the memory of an eye";
+			auto view_info = vk_struct<VkImageViewCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO);
+			view_info.image = images[eye];
+			view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+			view_info.format = format;
+			view_info.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+			VkImageView view = VK_NULL_HANDLE;
+			auto framebuffer_info = vk_struct<VkFramebufferCreateInfo>(VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO);
+			framebuffer_info.renderPass = render_pass;
+			framebuffer_info.attachmentCount = 1;
+			framebuffer_info.pAttachments = &view;
+			framebuffer_info.width = width;
+			framebuffer_info.height = height;
+			framebuffer_info.layers = 1;
+			if (vkCreateImageView(device, &view_info, nullptr, &view) != VK_SUCCESS || vkCreateFramebuffer(device, &framebuffer_info, nullptr, &framebuffers[eye]) != VK_SUCCESS)
+				return "the framebuffer of an eye";
+		}
+		auto pool_info = vk_struct<VkCommandPoolCreateInfo>(VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO);
+		pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+		VkCommandPool pool = VK_NULL_HANDLE;
+		vkCreateCommandPool(device, &pool_info, nullptr, &pool);
+		auto buffer_info = vk_struct<VkCommandBufferAllocateInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO);
+		buffer_info.commandPool = pool;
+		buffer_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+		buffer_info.commandBufferCount = 3;
+		if (vkAllocateCommandBuffers(device, &buffer_info, commands) != VK_SUCCESS)
+			return "vkAllocateCommandBuffers";
+		for (VkFence& fence : fences) {
+			auto fence_info = vk_struct<VkFenceCreateInfo>(VK_STRUCTURE_TYPE_FENCE_CREATE_INFO);
+			fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+			vkCreateFence(device, &fence_info, nullptr, &fence);
+		}
+		return nullptr;
+	}
+
+	// Both eyes of one frame: black, a gray band at the left edge, the eye's color in a block of the upper half
+	void draw(uint64_t frame, float shade)
+	{
+		const uint32_t slot = static_cast<uint32_t>(frame % 3);
+		waitForFences(device, 1, &fences[slot], VK_TRUE, 2000000000ull);
+		resetFences(device, 1, &fences[slot]);
+		resetCommandBuffer(commands[slot], 0);
+		auto begin_info = vk_struct<VkCommandBufferBeginInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
+		begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		beginCommandBuffer(commands[slot], &begin_info);
+		for (int eye = 0; eye < 2; eye++) {
+			VkClearValue black{};
+			black.color = { { 0.0f, 0.0f, 0.0f, 1.0f } };
+			auto pass = vk_struct<VkRenderPassBeginInfo>(VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO);
+			pass.renderPass = render_pass;
+			pass.framebuffer = framebuffers[eye];
+			pass.renderArea = { { 0, 0 }, { width, height } };
+			pass.clearValueCount = 1;
+			pass.pClearValues = &black;
+			cmdBeginRenderPass(commands[slot], &pass, VK_SUBPASS_CONTENTS_INLINE);
+			VkClearAttachment band{};
+			band.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			band.clearValue.color = { { 0.16f, 0.16f, 0.16f, 1.0f } };
+			VkClearRect band_rect{ { { 0, 0 }, { std::max(1u, width / 16), height } }, 0, 1 };
+			cmdClearAttachments(commands[slot], 1, &band, 1, &band_rect);
+			VkClearAttachment block = band;
+			block.clearValue.color = { { eye == 0 ? 0.1f : 0.9f, 0.2f + 0.6f * shade, eye == 0 ? 0.9f : 0.1f, 1.0f } };
+			VkClearRect block_rect{ { { static_cast<int32_t>(width / 4), static_cast<int32_t>(height / 8) }, { width / 2, height / 4 } }, 0, 1 };
+			cmdClearAttachments(commands[slot], 1, &block, 1, &block_rect);
+			cmdEndRenderPass(commands[slot]);
+		}
+		endCommandBuffer(commands[slot]);
+		auto submit = vk_struct<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);
+		submit.commandBufferCount = 1;
+		submit.pCommandBuffers = &commands[slot];
+		queueSubmit(queue, 1, &submit, fences[slot]);
+	}
+
+	vr::VRVulkanTextureData_t texture(int eye) const
+	{
+		vr::VRVulkanTextureData_t data{};
+		data.m_nImage = reinterpret_cast<uint64_t>(images[eye]);
+		data.m_pDevice = reinterpret_cast<VkDevice_T*>(device);
+		data.m_pPhysicalDevice = reinterpret_cast<VkPhysicalDevice_T*>(physical);
+		data.m_pInstance = reinterpret_cast<VkInstance_T*>(instance);
+		data.m_pQueue = reinterpret_cast<VkQueue_T*>(queue);
+		data.m_nQueueFamilyIndex = 0;
+		data.m_nWidth = width;
+		data.m_nHeight = height;
+		data.m_nFormat = format;
+		data.m_nSampleCount = samples;
+		return data;
+	}
+};
+
 struct InitCall {
 	vr::EVRApplicationType type;
 	vr::EVRInitError error;
@@ -861,7 +1130,8 @@ int refused_type(vr::EVRApplicationType type)
 int main(int argc, char** argv)
 {
 	double seconds = 15;
-	bool expect_input = false, load_only = false, no_input = false, trace_poses = false, with_overlay = false, with_gl = false;
+	bool expect_input = false, load_only = false, no_input = false, trace_poses = false, with_overlay = false, with_gl = false, with_vulkan = false;
+	uint32_t sample_count = 1;
 	std::string actions_mode;
 	float expect_hz = 0.0f;
 	bool other_type = false;
@@ -888,6 +1158,14 @@ int main(int argc, char** argv)
 			with_overlay = true;
 		} else if (!std::strcmp(argv[i], "--gl")) {
 			with_gl = true;
+		} else if (!std::strcmp(argv[i], "--vulkan")) {
+			with_vulkan = true;
+		} else if (!std::strcmp(argv[i], "--samples") && i + 1 < argc) {
+			sample_count = static_cast<uint32_t>(std::atoi(argv[++i]));
+			if (sample_count != 1 && sample_count != 2 && sample_count != 4) {
+				std::fprintf(stderr, "--samples takes 1, 2 or 4\n");
+				return 2;
+			}
 		} else if (!std::strcmp(argv[i], "--load-only")) {
 			load_only = true;
 		} else if (!std::strcmp(argv[i], "--app-type") && i + 1 < argc) {
@@ -913,7 +1191,7 @@ int main(int argc, char** argv)
 			g_runtime_path = argv[++i];
 			g_runtime_given = true;
 		} else {
-			std::fprintf(stderr, "usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--actions MODE] [--expect-hz N] [--overlay] [--format F] [--gl] [--load-only --runtime DIR] [--app-type TYPE [--runtime DIR]]\n");
+			std::fprintf(stderr, "usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--actions MODE] [--expect-hz N] [--overlay] [--format F] [--gl | --vulkan [--samples N]] [--load-only --runtime DIR] [--app-type TYPE [--runtime DIR]]\n");
 			return 2;
 		}
 	}
@@ -1070,6 +1348,13 @@ int main(int argc, char** argv)
 		}
 		say("the eyes are drawn with OpenGL into one texture of %ux%u", width * 2, height);
 	}
+	VulkanGame vulkan;
+	if (with_vulkan) {
+		if (const char* problem = vulkan.setup(system, compositor, width, height, texture_format == DXGI_FORMAT_B8G8R8A8_UNORM, sample_count)) {
+			return fail(problem);
+		}
+		say("the eyes are drawn with Vulkan into two images of %ux%u, format %d, %u samples", width, height, static_cast<int>(vulkan.format), sample_count);
+	}
 
 	// The overlay's picture: a 512x256 texture, orange above and nearly black below
 	vr::VROverlayHandle_t overlay_handle = vr::k_ulOverlayHandleInvalid;
@@ -1180,7 +1465,10 @@ int main(int argc, char** argv)
 		if (with_gl) {
 			gl.draw(shade, band_rows);
 		}
-		for (int i = 0; i < 2 && !with_gl; i++) {
+		if (with_vulkan) {
+			vulkan.draw(frames, shade);
+		}
+		for (int i = 0; i < 2 && !with_gl && !with_vulkan; i++) {
 			std::vector<uint8_t> band(static_cast<size_t>(width) * band_rows * 4);
 			for (size_t p = 0; p < band.size(); p += 4) {
 				pixel(&band[p], i == 0 ? 0.1f : 0.9f, 0.2f + 0.6f * shade, i == 0 ? 0.9f : 0.1f);
@@ -1197,6 +1485,11 @@ int main(int argc, char** argv)
 			const vr::VRTextureBounds_t half{ i == 0 ? 0.0f : 0.5f, 0.0f, i == 0 ? 0.5f : 1.0f, 1.0f };
 			if (with_gl) {
 				texture = { reinterpret_cast<void*>(static_cast<uintptr_t>(gl.texture)), vr::TextureType_OpenGL, vr::ColorSpace_Gamma };
+			}
+			vr::VRVulkanTextureData_t vulkan_texture{};
+			if (with_vulkan) {
+				vulkan_texture = vulkan.texture(i);
+				texture = { &vulkan_texture, vr::TextureType_Vulkan, vr::ColorSpace_Gamma };
 			}
 			const vr::EVRCompositorError submit = compositor->Submit(i == 0 ? vr::Eye_Left : vr::Eye_Right, &texture, with_gl ? &half : nullptr);
 			if (submit != vr::VRCompositorError_None) {

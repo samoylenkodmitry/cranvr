@@ -1,0 +1,30 @@
+; cranvr: the functions of Wine's vulkan-1.dll that OpenComposite calls. scripts/build-opencomposite.sh makes
+; the import library of MinGW-w64 from this file (dlltool).
+LIBRARY vulkan-1.dll
+EXPORTS
+    vkAllocateCommandBuffers
+    vkAllocateMemory
+    vkBeginCommandBuffer
+    vkBindImageMemory
+    vkCmdBlitImage
+    vkCmdCopyImage
+    vkCmdPipelineBarrier
+    vkCmdResolveImage
+    vkCreateCommandPool
+    vkCreateDevice
+    vkCreateImage
+    vkCreateInstance
+    vkDestroyCommandPool
+    vkDestroyDevice
+    vkDestroyImage
+    vkDestroyInstance
+    vkEndCommandBuffer
+    vkEnumeratePhysicalDevices
+    vkFreeCommandBuffers
+    vkFreeMemory
+    vkGetDeviceQueue
+    vkGetImageMemoryRequirements
+    vkGetPhysicalDeviceMemoryProperties
+    vkGetPhysicalDeviceProperties2
+    vkGetPhysicalDeviceQueueFamilyProperties
+    vkQueueSubmit

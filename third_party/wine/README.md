@@ -1,6 +1,6 @@
 # Wine patches
 
-cranvr keeps Gcenx's macOS build of Wine 11.10 as its engine. It replaces eight files of it with files built from the same Wine tag and cranvr's patches:
+cranvr keeps Gcenx's macOS build of Wine 11.10 as its engine. It replaces nine files of it with files built from the same Wine tag and cranvr's patches:
 
 - `wined3d.dll` holds vkd3d-shader, the HLSL compiler (LGPL 2.1 or later, like Wine). A game that compiles its shaders at run time calls `D3DCompile` in `d3dcompiler_47.dll`, which calls vkd3d-shader in `wined3d.dll`. A game ships its own `d3dcompiler_47.dll` too. Wine loads its own copy first, so every game's HLSL goes through vkd3d-shader.
 - `winemac.so` is the Mac side of Wine's Mac driver. It makes the OpenGL contexts of a Windows program.
@@ -10,8 +10,9 @@ cranvr keeps Gcenx's macOS build of Wine 11.10 as its engine. It replaces eight 
 - `user32.dll` holds the window functions of Windows.
 - `ntdll.so` is the Mac side of `ntdll.dll`. It manages the memory of a Windows program, among other things.
 - `winecoreaudio.so` is the Mac side of Wine's CoreAudio driver. It gives a Windows program the Mac's sound devices.
+- `winevulkan.so` is the Mac side of Wine's `vulkan-1.dll`. It passes each Vulkan call of a Windows program to MoltenVK, which runs Vulkan on Metal.
 
-`scripts/build-wine.sh` clones Wine at the tag `wine-11.10` (commit `2cac6ccf33c0807f374dc96f5a20e35a2da86157`) into `third_party/wine/src` (not committed), applies the patches in this folder and builds the eight files into `third_party/wine/build/bin`: the DLLs with MinGW-w64, the Mac libraries with Xcode's clang for x86_64 and macOS 10.15 and newer, as Gcenx's build has. The build runs under Rosetta 2, because Wine's configure wants a 64-bit Intel host. `scripts/setup-wine.sh` copies the DLLs into the engine and into the prefix's `system32`, where the loader takes them, and the libraries into the engine. The wine tree is not used otherwise. `package-game-support.sh` packs the pinned source tree and the patches as `SOURCE/wine-source.tar.xz` and as `cranvr-wine-source.tar.xz` in the release.
+`scripts/build-wine.sh` clones Wine at the tag `wine-11.10` (commit `2cac6ccf33c0807f374dc96f5a20e35a2da86157`) into `third_party/wine/src` (not committed), applies the patches in this folder and builds the nine files into `third_party/wine/build/bin`: the DLLs with MinGW-w64, the Mac libraries with Xcode's clang for x86_64 and macOS 10.15 and newer, as Gcenx's build has. The build runs under Rosetta 2, because Wine's configure wants a 64-bit Intel host. `scripts/setup-wine.sh` copies the DLLs into the engine and into the prefix's `system32`, where the loader takes them, and the libraries into the engine. The wine tree is not used otherwise. `package-game-support.sh` packs the pinned source tree and the patches as `SOURCE/wine-source.tar.xz` and as `cranvr-wine-source.tar.xz` in the release.
 
 ## patches
 
@@ -71,6 +72,14 @@ cranvr keeps Gcenx's macOS build of Wine 11.10 as its engine. It replaces eight 
 - Wine's capture path moved its read offset past the end of the buffer when a full buffer took more frames. `GetBuffer` then copied from outside the buffer, and the program crashed with a page fault. The read offset now follows the write offset.
 - With the patch and a test writer that put a click into the ring every 500 ms, `microphone_check.exe` got each click 16 to 19 ms after the writer had written it, 48000 frames a second, with no discontinuity.
 
+`0009-winevulkan-metal-texture-of-an-image.patch`
+
+- cranvr's OpenXR runtime gives a Vulkan game swapchain images that lie on IOSurfaces, so that cranvr-host encodes the game's picture with no copy (runtime patch 0013). The runtime makes a Metal texture of each IOSurface with DXMT's `winemetal.dll` and creates the Vulkan image on that texture: `VkImportMetalTextureInfoEXT` of `VK_EXT_metal_objects` in the `pNext` chain of `vkCreateImage`. MoltenVK then binds the image to the texture.
+- Wine 11.10 converts the `pNext` chain of a Windows program's `VkImageCreateInfo` into the Mac's form in `dlls/winevulkan/vulkan_thunks.c`. It knows only the structures of the extensions that it offers, and Wine offers no `VK_EXT_metal_objects` to Windows programs: it dropped the structure. The image then got memory of its own, and the IOSurface stayed empty.
+- The patch passes the structure on to MoltenVK. The Metal texture in it is the Mac's own pointer, which `winemetal.dll` gives to Windows programs as a 64-bit number, so the structure needs no conversion. The patch handles it for 64-bit programs only. Win32u still prints a FIXME line with "Unhandled sType 1000311007" for the structure and passes it on.
+- `vulkan_thunks.c` is a generated file (by `dlls/winevulkan/make_vulkan`). The patch edits the generated file, as a new generation would drop the change.
+- With the patch, `metal_texture_check.exe` reads the pattern of the IOSurface back through the Vulkan image. Without it the image reads zeros.
+
 ## tests
 
 `tests/hlsl_compile.cpp` loads a `d3dcompiler_47.dll` and compiles one HLSL file with `D3DCompile`. It prints `hlsl_compile: PASS` or `FAIL` with the compiler's messages. `tests/isnan.hlsl` calls `isnan` on a scalar and on a vector.
@@ -85,4 +94,6 @@ cranvr keeps Gcenx's macOS build of Wine 11.10 as its engine. It replaces eight 
 
 `tests/microphone_check.cpp` records from the default capture device as a voice chat does: WASAPI in shared mode with an event and a buffer of 20 ms. With `--list` it prints the device's name and ends. Otherwise it prints an `onset` line for each sound that starts after 200 ms of quiet, with the time at which it got the block. The time is the performance counter in units of 100 ns, which is `mach_continuous_time` under Wine on macOS, so a program on the Mac can compare it with its own clock. At the end it prints the frames a second and the blocks with a discontinuity.
 
-`scripts/setup-wine.sh` runs the six programs in the prefix after each install and stops when one fails. It runs `microphone_check.exe --list` with a config dir of its own that chooses `off`.
+`tests/metal_texture_check.cpp` does what the runtime does for a Vulkan game. It makes an IOSurface with a Metal texture through `winemetal.dll`, writes a pattern into the texture, creates a Vulkan image on the texture with `VkImportMetalTextureInfoEXT` and copies the image into a buffer with Vulkan. It prints `metal_texture_check: PASS` when the buffer holds the pattern. Under Wine without patch 0009 it prints `FAIL` with the first pixel that differs.
+
+`scripts/setup-wine.sh` runs the seven programs in the prefix after each install and stops when one fails. It runs `microphone_check.exe --list` with a config dir of its own that chooses `off`.
