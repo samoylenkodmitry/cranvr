@@ -20,7 +20,7 @@ use crate::{
 };
 use cranvr_common::{
     foveation::FoveationLevel,
-    menu::{Button, Buttons, Choice, Item, Opt, Page, Request, Style, Toggle, Tone, OFF, ON},
+    menu::{Button, Buttons, Choice, ChoiceShape, Item, Opt, Page, Request, Style, Toggle, Tone, OFF, ON},
 };
 use std::time::Instant;
 
@@ -71,7 +71,8 @@ impl Setting {
         let hint = (self.hint)(settings).to_string();
         match &self.kind {
             Kind::Choice { options, get, .. } => {
-                Item::Choice(Choice { id: self.id.into(), subject: None, label: self.label.into(), options: options(settings, model), value: get(settings), hint, restarts: self.restarts })
+                let shape = shape_of(self.id);
+                Item::Choice(Choice { id: self.id.into(), subject: None, label: self.label.into(), options: options(settings, model), value: get(settings), hint, restarts: self.restarts, shape })
             }
             Kind::Toggle { get, .. } => Item::Toggle(Toggle { id: self.id.into(), subject: None, label: self.label.into(), on: get(settings), hint, restarts: self.restarts }),
         }
@@ -121,6 +122,19 @@ fn foveation_hint(settings: &Settings) -> &'static str {
         FoveationLevel::Low => "The center is sharp and the edges lose a little detail. Each frame takes about 2 ms longer to encode and decode than at Medium.",
         FoveationLevel::Medium => "The center is sharp and the edges lose detail. This is the standard level.",
         FoveationLevel::High => "The center gets the most bits and the edges lose the most detail. The sharp region around straight ahead is smaller.",
+    }
+}
+
+/// The objects of a setting's options in the headset's 3D console (#111): each shows by its form
+/// what its options mean. The other settings draw keys.
+fn shape_of(id: &str) -> ChoiceShape {
+    match id {
+        "fps" => ChoiceShape::Arc,
+        "mbps" => ChoiceShape::Gems,
+        "foveation_level" => ChoiceShape::Petals,
+        "game_scale" => ChoiceShape::Cubes,
+        "game_msaa_limit" => ChoiceShape::Stepper,
+        _ => ChoiceShape::Keys,
     }
 }
 
@@ -395,11 +409,22 @@ const HEADSET_SETTINGS: &[Setting] = &[
         id: "headset_interface",
         label: "Interface",
         restarts: false,
-        hint: |_| "How the headset draws its hand menu and its console: as 3D trays with keys that sink, switches that flip and sliders, or as flat panels.",
+        hint: |_| "How the headset draws its hand menu and its console: in 3D, where the hand menu and the Stream page float as glowing glass objects and the other pages stand on trays with keys that sink, or as flat panels.",
         kind: Kind::Choice {
             options: |_, _| vec![Opt::new("3d", "3D"), Opt::new("flat", "Flat")],
             get: |s| s.headset_interface.clone().unwrap_or_default(),
             set: |s, _, v| s.headset_interface = Some(v.into()),
+        },
+    },
+    Setting {
+        id: "headset_theme",
+        label: "Theme",
+        restarts: false,
+        hint: |_| "The colors of the 3D interface: cyan glass, or violet glass with gold for the chosen options.",
+        kind: Kind::Choice {
+            options: |_, _| vec![Opt::new("cyan", "Cyan"), Opt::new("amber", "Amber")],
+            get: |s| s.headset_theme.clone().unwrap_or_default(),
+            set: |s, _, v| s.headset_theme = Some(v.into()),
         },
     },
 ];
@@ -783,7 +808,7 @@ fn wine_page(settings: &Settings, model: &Model) -> Page {
 fn headset_page(settings: &Settings, model: &Model) -> Page {
     let mut items = vec![Item::Heading { text: "Headset".into() }];
     items.extend(HEADSET_SETTINGS.iter().map(|setting| setting.item(settings, model)));
-    if settings.headset_room.is_none() || settings.headset_volume.is_none() || settings.headset_interface.is_none() {
+    if settings.headset_room.is_none() || settings.headset_volume.is_none() || settings.headset_interface.is_none() || settings.headset_theme.is_none() {
         items.push(Item::Text { text: "The headset tells its own choice when it connects.".into(), tone: Tone::Muted });
     }
     Page { id: HEADSET.into(), title: "Headset".into(), short: "Headset".into(), listed: true, items }
@@ -897,6 +922,7 @@ pub fn options_page(settings: &Settings, _model: &Model, program: &str) -> Page 
                 value: get(&options),
                 hint: if setting.id == "game.openvr" { OPENVR_HINT.into() } else { String::new() },
                 restarts: false,
+                shape: ChoiceShape::Keys,
             }),
             GameKind::Toggle { get, .. } => Item::Toggle(Toggle {
                 id: setting.id.into(),

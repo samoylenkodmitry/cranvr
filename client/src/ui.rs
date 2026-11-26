@@ -154,8 +154,10 @@ fn Client() {
             log::info!("the launch forgets the host key of {address}");
             settings::forget_host_key(&crate::connection::host_name(&address));
         }
-        if settings::console_on_launch() {
-            hub().pin_console();
+        match settings::console_on_launch() {
+            Some(true) => hub().pin_console(),
+            Some(false) => hub().hold_console_closed(),
+            None => {}
         }
         // What the pointer was last given, so a change of the mapping or of the panels is the only
         // thing that calls it
@@ -320,7 +322,8 @@ fn Client() {
         let interface = view.interface;
         let models_drawn = controller_models.is_some_and(|models| models.is_shown(XrHand::Left) || models.is_shown(XrHand::Right));
         let ball_3d = interface.is_3d() && (models_drawn || menu_open.get());
-        HandPanels(hand, (view.open, hand_menu::Look { interface, ball_3d }), view.controls, snapshot.get().state == LinkState::Streaming);
+        let look = hand_menu::Look { interface, ball_3d, theme: view.theme, room: view.room };
+        HandPanels(hand, (view.open, look), view.controls, snapshot.get().state == LinkState::Streaming);
     }
 }
 

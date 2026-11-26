@@ -15,7 +15,7 @@
 
 use crate::console::{size, Interface, Menu, Pending, Press, Progress, Shown};
 use crate::spatial_ui::STEP_LABELS;
-use cranvr_common::menu::{Buttons, Choice, Item, Page, Press as Link, Request, Style, Toggle, Tone, OFF, ON};
+use cranvr_common::menu::{Buttons, Choice, ChoiceShape, Item, Page, Press as Link, Request, Style, Toggle, Tone, OFF, ON};
 use std::time::Instant;
 
 /// The width of the rows inside the console's padding, in dp
@@ -39,6 +39,11 @@ const ROW_KEYS: usize = 4;
 const LINKS: usize = 3;
 /// A title with a line of detail under it needs a taller row
 const DETAIL_EXTRA: f32 = 10.0;
+/// The title of a hologram page: its emblem and the ribbon behind its words
+pub const HEADER: f32 = 84.0;
+/// The share of a stepper's width that each of its arrows takes, as Cranpose's `SpatialChoiceGroup`
+/// lays it out: 0.2 of 1.4
+const STEP_ARROW: f32 = 0.2 / 1.4;
 
 /// How a key looks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +84,43 @@ pub enum Form {
     /// A choice of numbers in one row: a slider over the keys with a stop for each value, and the
     /// values' words under it
     Steps,
+    /// The options of a hologram page's choice as 3D objects of this shape (`hologram_ui.rs`). The
+    /// options share the row's width equally, with no gap. A stepper shows the chosen option between
+    /// two arrows: a key before or after the chosen one stands at its arrow.
+    Object(ChoiceShape),
+}
+
+/// How the console draws a page's rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Drawn {
+    Flat,
+    /// On a tray of 3D keys (`console_tray.rs`)
+    Tray,
+    /// As a hologram of glass objects (`hologram_ui.rs`): a page whose choices have shapes, in the
+    /// 3D interface
+    Hologram,
+}
+
+impl Drawn {
+    /// How a host's page draws in `interface`.
+    pub fn of(page: &Page, interface: Interface) -> Self {
+        let shaped = page.items.iter().any(|item| matches!(item, Item::Choice(choice) if !choice.shape.is_keys()));
+        match (interface.is_3d(), shaped) {
+            (false, _) => Self::Flat,
+            (true, false) => Self::Tray,
+            (true, true) => Self::Hologram,
+        }
+    }
+}
+
+/// The height of the objects of a choice of `shape`, with the words under or over them, in dp.
+fn object_height(shape: ChoiceShape) -> f32 {
+    match shape {
+        ChoiceShape::Keys => size::BUTTON,
+        ChoiceShape::Stepper => 64.0,
+        ChoiceShape::Arc => 80.0,
+        ChoiceShape::Cubes | ChoiceShape::Gems | ChoiceShape::Petals => 84.0,
+    }
 }
 
 /// What a row draws.
@@ -86,6 +128,8 @@ pub enum Form {
 pub enum Line {
     /// The page's title, with the stream's state on the main page
     Title { text: String, status: String },
+    /// A hologram page's title beside its emblem
+    Header(String),
     Heading(String),
     Text { text: String, tone: Tone },
     Keys { name: Name, keys: Vec<Key>, form: Form },
@@ -101,10 +145,12 @@ impl Row {
     fn new(line: Line) -> Self {
         let height = match &line {
             Line::Title { .. } => size::TITLE,
+            Line::Header(_) => HEADER,
             Line::Heading(_) => size::HEADING,
             Line::Text { text, .. } => size::TEXT * lines_of(text) as f32,
             Line::Keys { name: Name::Title { detail, .. }, .. } if !detail.is_empty() => size::BUTTON + DETAIL_EXTRA,
             Line::Keys { form: Form::Steps, .. } => size::BUTTON + STEP_LABELS,
+            Line::Keys { form: Form::Object(shape), .. } => object_height(*shape),
             Line::Keys { .. } => size::BUTTON,
         };
         Self { line, height }
@@ -113,9 +159,24 @@ impl Row {
     /// The middle of each key across the row, in dp from the row's left edge.
     #[cfg_attr(not(any(test, all(feature = "scripted-hand", target_os = "android"))), allow(dead_code))]
     pub fn key_centers(&self) -> Vec<f32> {
-        let Line::Keys { name, keys, .. } = &self.line else { return Vec::new() };
+        let Line::Keys { name, keys, form } = &self.line else { return Vec::new() };
         let n = keys.len() as f32;
         let gap = size::GAP;
+        if let Form::Object(shape) = form {
+            if *shape == ChoiceShape::Stepper {
+                let chosen = keys.iter().position(|key| key.look == Look::Selected).unwrap_or(0);
+                let arrow = INNER * STEP_ARROW;
+                return (0..keys.len())
+                    .map(|i| match i.cmp(&chosen) {
+                        std::cmp::Ordering::Less => arrow / 2.0,
+                        std::cmp::Ordering::Equal => INNER / 2.0,
+                        std::cmp::Ordering::Greater => INNER - arrow / 2.0,
+                    })
+                    .collect();
+            }
+            let each = INNER / n;
+            return (0..keys.len()).map(|i| i as f32 * each + each / 2.0).collect();
+        }
         match name {
             Name::Title { width, .. } => {
                 let start = INNER - n * width - (n - 1.0) * gap;
@@ -169,17 +230,17 @@ fn label_of(request: &Request, own: &str, running: &str, busy: bool, pending: Op
 }
 
 /// The rows of one item of a host's page.
-fn item_rows(item: &Item, pending: Option<(&Pending, Progress)>, interface: Interface, rows: &mut Vec<Row>) {
+fn item_rows(item: &Item, pending: Option<(&Pending, Progress)>, drawn: Drawn, rows: &mut Vec<Row>) {
     match item {
         Item::Heading { text } => rows.push(Row::new(Line::Heading(text.clone()))),
         Item::Text { text, tone } => rows.push(Row::new(Line::Text { text: text.clone(), tone: *tone })),
-        Item::Choice(choice) => choice_rows(choice, pending, interface, rows),
+        Item::Choice(choice) => choice_rows(choice, pending, drawn, rows),
         Item::Toggle(toggle) => toggle_rows(toggle, pending, rows),
         Item::Buttons(row) => buttons_rows(row, pending, rows),
     }
 }
 
-fn choice_rows(choice: &Choice, pending: Option<(&Pending, Progress)>, interface: Interface, rows: &mut Vec<Row>) {
+fn choice_rows(choice: &Choice, pending: Option<(&Pending, Progress)>, drawn: Drawn, rows: &mut Vec<Row>) {
     let keys: Vec<Key> = choice
         .options
         .iter()
@@ -189,11 +250,17 @@ fn choice_rows(choice: &Choice, pending: Option<(&Pending, Progress)>, interface
             Key { label, press: Press::Host(request), look: if option.value == choice.value { Look::Selected } else { Look::Normal } }
         })
         .collect();
+    // A hologram draws the name over the options' objects
+    if drawn == Drawn::Hologram && !choice.shape.is_keys() {
+        rows.push(Row::new(Line::Text { text: choice.label.clone(), tone: Tone::Normal }));
+        rows.push(Row::new(Line::Keys { name: Name::None, keys, form: Form::Object(choice.shape) }));
+        return;
+    }
     // The name and the options in one row, when every option's words fit its share
     let n = keys.len().max(1) as f32;
     let share = (INNER - LABEL - n * size::GAP) / n;
     if keys.len() <= ROW_KEYS && choice.options.iter().all(|option| key_width(&option.label) <= share) {
-        let form = if interface.is_3d() && steps(choice) { Form::Steps } else { Form::Keys };
+        let form = if drawn != Drawn::Flat && steps(choice) { Form::Steps } else { Form::Keys };
         rows.push(Row::new(Line::Keys { name: Name::Setting(choice.label.clone()), keys, form }));
         return;
     }
@@ -286,9 +353,10 @@ fn buttons_rows(row: &Buttons, pending: Option<(&Pending, Progress)>, rows: &mut
 
 /// The rows of a host's page, in the form of `interface`.
 pub fn page_rows(page: &Page, pending: Option<(&Pending, Progress)>, interface: Interface) -> Vec<Row> {
+    let drawn = Drawn::of(page, interface);
     let mut rows = Vec::new();
     for item in &page.items {
-        item_rows(item, pending, interface, &mut rows);
+        item_rows(item, pending, drawn, &mut rows);
     }
     rows
 }
@@ -330,7 +398,11 @@ pub fn console_rows(menu: Option<&Menu>, shown: &Shown, local: Local, no_menu: &
     };
     let mut rows = Vec::new();
     if let Some(page) = page {
-        rows.push(Row::new(Line::Title { text: page.title.clone(), status: String::new() }));
+        let title = match Drawn::of(page, local.interface) {
+            Drawn::Hologram => Line::Header(page.title.clone()),
+            Drawn::Flat | Drawn::Tray => Line::Title { text: page.title.clone(), status: String::new() },
+        };
+        rows.push(Row::new(title));
         if let Some(notice) = &menu.notice {
             rows.push(Row::new(Line::Text { text: notice.clone(), tone: Tone::Warn }));
         }

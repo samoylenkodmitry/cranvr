@@ -708,12 +708,13 @@ impl Hub {
     /// headset's own: it goes to the Mac once for each connection. A choice of the Mac applies here
     /// and stays for the time without a link.
     fn take_choices(&self, id: u64, choices: crate::console::HeadsetChoices) {
-        let (room, volume, interface) = {
+        let (room, volume, interface, theme) = {
             let console = self.console.lock().unwrap();
             let view = console.view();
-            (view.room, view.volume, view.interface)
+            (view.room, view.volume, view.interface, view.theme)
         };
-        if (choices.room.is_none() || choices.volume.is_none() || choices.interface.is_none()) && self.told_choices.swap(id, Ordering::AcqRel) != id {
+        let untold = choices.room.is_none() || choices.volume.is_none() || choices.interface.is_none() || choices.theme.is_none();
+        if untold && self.told_choices.swap(id, Ordering::AcqRel) != id {
             use cranvr_common::menu::Request;
             if choices.room.is_none() {
                 self.send_request(&Request::set("headset_room", room.key()));
@@ -724,6 +725,15 @@ impl Hub {
             if choices.interface.is_none() {
                 self.send_request(&Request::set("headset_interface", interface.key()));
             }
+            if choices.theme.is_none() {
+                self.send_request(&Request::set("headset_theme", theme.key()));
+            }
+        }
+        // A launch that fixes the theme keeps it for the test
+        if let Some(chosen) = choices.theme.filter(|chosen| *chosen != theme && !settings::theme_fixed()) {
+            log::info!("the Mac sets the theme to {}", chosen.key());
+            self.console.lock().unwrap().set_theme(chosen);
+            settings::remember_theme(chosen);
         }
         // A launch that fixes the interface keeps it for the test
         if let Some(chosen) = choices.interface.filter(|chosen| *chosen != interface && !settings::interface_fixed()) {
@@ -913,6 +923,11 @@ impl Hub {
         self.console.lock().unwrap().pin();
     }
 
+    /// Keeps the console closed when the first menu comes (see `settings::console_on_launch`).
+    pub fn hold_console_closed(&self) {
+        self.console.lock().unwrap().hold_closed();
+    }
+
     /// What decides the room behind the panels: the user's choice and whether a game runs.
     pub fn backdrop(&self) -> Backdrop {
         self.console.lock().unwrap().backdrop(displays().game_runs())
@@ -931,6 +946,7 @@ impl Hub {
             console.set_room(room);
             console.set_volume(volume);
             console.set_interface(settings::interface());
+            console.set_theme(settings::theme());
             if let Some(controls) = settings::controls() {
                 console.set_controls(controls);
             }

@@ -65,6 +65,7 @@ pub struct HeadsetChoices {
     pub room: Option<Room>,
     pub volume: Option<Volume>,
     pub interface: Option<Interface>,
+    pub theme: Option<Theme>,
 }
 
 /// What the console shows: the app's pages and the host's state. The UI takes a copy of it many
@@ -125,6 +126,7 @@ impl Menu {
                 room: v["headset"]["room"].as_str().and_then(Room::from_key),
                 volume: v["headset"]["volume"].as_u64().and_then(|percent| Volume::from_key(&percent.to_string())),
                 interface: v["headset"]["interface"].as_str().and_then(Interface::from_key),
+                theme: v["headset"]["theme"].as_str().and_then(Theme::from_key),
             },
         })
     }
@@ -243,7 +245,8 @@ impl Room {
 /// How the headset draws the hand menu and the console.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Interface {
-    /// Trays of 3D keys, switches and sliders under the words (`spatial_ui.rs`)
+    /// The hand menu and the Stream page as glowing glass objects (`hologram_ui.rs`), the other
+    /// pages as trays of 3D keys, switches and sliders under the words (`spatial_ui.rs`)
     #[default]
     ThreeD,
     /// Flat panels
@@ -267,6 +270,32 @@ impl Interface {
 
     pub fn is_3d(self) -> bool {
         self == Interface::ThreeD
+    }
+}
+
+/// The colors of the 3D menus (#111).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Theme {
+    /// Cyan glass
+    #[default]
+    Cyan,
+    /// Violet glass with gold for the chosen options
+    Amber,
+}
+
+impl Theme {
+    pub const ALL: [Theme; 2] = [Theme::Cyan, Theme::Amber];
+
+    /// The text under which `settings.rs` saves the choice, and the Mac's value
+    pub fn key(self) -> &'static str {
+        match self {
+            Theme::Cyan => "cyan",
+            Theme::Amber => "amber",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|theme| theme.key() == key.trim())
     }
 }
 
@@ -399,6 +428,7 @@ pub struct View {
     pub room: Room,
     pub volume: Volume,
     pub interface: Interface,
+    pub theme: Theme,
     /// What the buttons do. The mapping that the Mac last sent, or the headset's copy of it while
     /// no link runs.
     pub controls: Controls,
@@ -428,6 +458,7 @@ pub struct Console {
     room: Room,
     volume: Volume,
     interface: Interface,
+    theme: Theme,
 }
 
 impl Console {
@@ -438,6 +469,7 @@ impl Console {
             room: self.room,
             volume: self.volume,
             interface: self.interface,
+            theme: self.theme,
             controls: self.controls,
             controls_editable: self.menu.is_some(),
         }
@@ -515,6 +547,10 @@ impl Console {
         self.interface = interface;
     }
 
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+    }
+
     /// What decides the room behind the panels. `desktop_hides` is the host's hiding of the desktop
     /// (see `game_runs`).
     pub fn backdrop(&self, desktop_hides: Option<bool>) -> Backdrop {
@@ -538,6 +574,13 @@ impl Console {
     pub fn pin(&mut self) {
         self.keep_open = true;
         self.open = true;
+    }
+
+    /// Keeps the console closed when the first menu comes with no game: it counts as a menu that
+    /// came already. A press opens it as always.
+    pub fn hold_closed(&mut self) {
+        self.game_ran = Some(false);
+        self.open = false;
     }
 
     /// A new menu from the host. The console shows when the first menu comes and while no game

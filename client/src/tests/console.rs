@@ -390,8 +390,9 @@ fn the_state_comes_apart_and_a_game_that_runs_at_the_connection_keeps_the_consol
 fn the_mac_keeps_the_room_and_the_volume_and_says_null_until_the_headset_told_its_own() {
     let unknown = Menu::parse(r#"{"pages":[],"controls":{},"headset":{"room":null,"volume":null}}"#).unwrap();
     assert_eq!(unknown.headset, HeadsetChoices::default());
-    let known = Menu::parse(r#"{"pages":[],"controls":{},"headset":{"room":"scene","volume":200,"interface":"flat"}}"#).unwrap();
-    assert_eq!(known.headset, HeadsetChoices { room: Some(Room::Scene), volume: Some(Volume::P200), interface: Some(Interface::Flat) });
+    let known = Menu::parse(r#"{"pages":[],"controls":{},"headset":{"room":"scene","volume":200,"interface":"flat","theme":"amber"}}"#).unwrap();
+    let expected = HeadsetChoices { room: Some(Room::Scene), volume: Some(Volume::P200), interface: Some(Interface::Flat), theme: Some(Theme::Amber) };
+    assert_eq!(known.headset, expected);
     // A value that no choice has counts as none
     let odd = Menu::parse(r#"{"pages":[],"controls":{},"headset":{"room":"sky","volume":175}}"#).unwrap();
     assert_eq!(odd.headset, HeadsetChoices::default());

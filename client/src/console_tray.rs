@@ -58,6 +58,10 @@ fn RowView3d(row: Row, page: MutableState<Shown>, pending: MutableState<Option<P
                 }
             });
         }
+        // Only a hologram draws its title beside an emblem: elsewhere it is a title
+        Line::Header(text) => {
+            Text(text, Modifier::empty().height(height), bold(34.0));
+        }
         Line::Heading(text) => {
             Text(text, Modifier::empty().height(height), text_style(26.0, MUTED_COLOR, Some(FontWeight::BOLD)));
         }

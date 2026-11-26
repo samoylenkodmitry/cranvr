@@ -80,6 +80,16 @@
 //!   value that holds and drags it to the next value. `walk_wait_ms` sets the wait before the first
 //!   press (500 by default). The log names each aim ("scripted ui3d:"),
 //!   and the host's app saves each change in its `app.json`.
+//! - `scripted_pointer=away` holds the left controller still, low and to the left out of view, and
+//!   the right one is missing: a capture shows no controller, and no ball for a look.
+//! - `scripted_pointer=hologram` changes every control of the Stream page as a hologram (#111,
+//!   launch it with `interface=3d`, `console=true`, `console_page=stream` and `default_places`). The
+//!   left controller is missing. The right controller presses, for each choice and toggle of the page
+//!   in its order, the option after the one that holds (the first after the last) or the other state
+//!   of the toggle: an object of a choice, an arrow of a stepper or a capsule. After a change that
+//!   restarts the host it waits `walk_restart_ms` (9000 by default), so the link and the menu come
+//!   back before the next press. The log names each aim ("scripted hologram:") and each value that
+//!   the menu then shows, and the host's app saves each change in its `app.json`.
 //! - `scripted_pointer=palm` plays two hands and no controller: the left hand holds its open palm
 //!   35 cm ahead of the eyes and 15 cm below them, turned to the eyes, and never pinches. The right
 //!   hand points at the ball that shows in front of that palm and pinches every 2 s, which opens and
@@ -119,6 +129,13 @@ pub fn install_once() {
             holding_left_hand();
             return;
         }
+        if args.string("scripted_pointer") == Some("away") {
+            // A tracked controller keeps the ball for a look away, and this one stands out of view
+            log::info!("scripted: the left controller stands still below the view, pointing down, and the right one is missing");
+            script_controller(missing(Hand::Right));
+            script_controller(ScriptedController::new(Hand::Left, AWAY_AT, [AWAY_AT[0], AWAY_AT[1] - 1.0, AWAY_AT[2]]).holding(Duration::from_secs(600), ScriptedButtons::default()));
+            return;
+        }
         if args.string("scripted_pointer") == Some("models") {
             pressing_right_hand();
             return;
@@ -143,6 +160,11 @@ pub fn install_once() {
         }
         if args.string("scripted_pointer") == Some("pages") {
             pages_check();
+            return;
+        }
+        if args.string("scripted_pointer") == Some("hologram") {
+            script_controller(missing(Hand::Left));
+            std::thread::spawn(hologram_walk);
             return;
         }
         if args.string("scripted_pointer") == Some("ui3d") {
@@ -176,6 +198,8 @@ pub fn install_once() {
 /// where its ray points in the turn's two halves: level and straight ahead, then 35 degrees to the
 /// right and 25 degrees up.
 const LEFT_AT: [f32; 3] = [-0.15, -0.3, -0.45];
+/// Where the left controller of `scripted_pointer=away` stands: low and to the left, out of view
+const AWAY_AT: [f32; 3] = [-0.35, -0.75, -0.1];
 const LEVEL_TO: [f32; 3] = [-0.15, -0.3, -1.45];
 const TURNED_AT: [f32; 3] = [-0.05, -0.25, -0.45];
 const TURNED_TO: [f32; 3] = [-0.05 + 0.520, -0.25 + 0.423, -0.45 - 0.742];
@@ -805,6 +829,107 @@ fn ui3d_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
             .holding(Duration::from_millis(800), rest);
     }
     Some(right.moving_to(Duration::from_millis(1), (at, away_from(at)), rest))
+}
+
+/// The id of the page that `scripted_pointer=hologram` walks
+const HOLOGRAM_PAGE: &str = "stream";
+
+/// The change of a choice or a toggle that the hologram walk presses: the option after the one that
+/// holds, or the other state, and whether it restarts the host.
+fn next_change(item: &cranvr_common::menu::Item) -> Option<(cranvr_common::menu::Request, bool)> {
+    use cranvr_common::menu::{Item, Request, OFF, ON};
+    match item {
+        Item::Choice(choice) => {
+            let at = choice.options.iter().position(|option| option.value == choice.value).unwrap_or(0);
+            let next = choice.options.get((at + 1) % choice.options.len().max(1))?;
+            Some((Request::Set { id: choice.id.clone(), subject: choice.subject.clone(), value: next.value.clone() }, choice.restarts))
+        }
+        Item::Toggle(toggle) => Some((Request::Set { id: toggle.id.clone(), subject: toggle.subject.clone(), value: if toggle.on { OFF } else { ON }.into() }, toggle.restarts)),
+        _ => None,
+    }
+}
+
+/// Plays `scripted_pointer=hologram` (see the file's notes): it plans the presses from the first
+/// menu, plays them and logs the value of each setting that the menu shows after its press.
+fn hologram_walk() {
+    use crate::{
+        console::{Press, Shown},
+        hub::hub,
+        page_model::{console_rows, find_key, key_point, Line, Local},
+    };
+    use cranvr_common::menu::{Item, Request};
+    let since = std::time::Instant::now();
+    let menu = loop {
+        if let Some(menu) = hub().console().menu.filter(|menu| menu.page(HOLOGRAM_PAGE).is_some() && menu.headset.theme.is_some()) {
+            break menu;
+        }
+        if since.elapsed() > Duration::from_secs(30) {
+            log::warn!("scripted hologram: no menu with the page {HOLOGRAM_PAGE} came from the host in 30 s");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let Some(page) = menu.page(HOLOGRAM_PAGE) else { return };
+    let rest = ScriptedButtons::default();
+    let pull = ScriptedButtons { trigger: 1.0, ..rest };
+    let at = MENU_RIGHT_AT;
+    let restart = Duration::from_millis(launch_args().int("walk_restart_ms").and_then(|ms| u64::try_from(ms).ok()).unwrap_or(9000));
+    let wait = Duration::from_millis(launch_args().int("walk_wait_ms").and_then(|ms| u64::try_from(ms).ok()).unwrap_or(1500));
+    let local = Local { link: true, interface: hub().console().interface };
+    let rows = console_rows(Some(&menu), &Shown::Host(HOLOGRAM_PAGE.into()), local, "", None, std::time::Instant::now());
+    if !rows.first().is_some_and(|row| matches!(row.line, Line::Header(_))) {
+        log::warn!("scripted hologram: the page {HOLOGRAM_PAGE} does not draw as a hologram");
+    }
+    let mut right = ScriptedController::new(Hand::Right, at, away_from(at)).holding(wait, rest);
+    // Each press and when it lands, in seconds from the walk's start, to check the menu after it
+    let mut planned: Vec<(Request, f32)> = Vec::new();
+    let mut clock = wait.as_secs_f32();
+    for item in &page.items {
+        let Some((change, restarts)) = next_change(item) else { continue };
+        let Some((row, key)) = find_key(&rows, &Press::Host(change.clone())) else {
+            log::warn!("scripted hologram: no key does {}", change.to_json());
+            continue;
+        };
+        let Some([x, y]) = key_point(&rows, row, key) else { continue };
+        let target = on_console(&rows, x, y);
+        let form = match &rows[row].line {
+            Line::Keys { form, .. } => format!("{form:?}"),
+            _ => String::new(),
+        };
+        log::info!("scripted hologram: {} at {target:?} ({form}, restarts the host: {restarts})", change.to_json());
+        right = right
+            .moving_to(Duration::from_millis(1), (at, target), rest)
+            .holding(Duration::from_millis(1000), rest)
+            .holding(Duration::from_millis(200), pull)
+            .holding(Duration::from_millis(600), rest);
+        clock += 1.8;
+        planned.push((change, clock));
+        if restarts {
+            right = right.moving_to(Duration::from_millis(1), (at, away_from(at)), rest).holding(restart, rest);
+            clock += restart.as_secs_f32();
+        }
+    }
+    script_controller(right.moving_to(Duration::from_millis(1), (at, away_from(at)), rest));
+    let start = std::time::Instant::now();
+    for (change, at) in planned {
+        let Request::Set { id, subject, value } = change else { continue };
+        // The menu after the press and the host's answer: the press lands at its time, a restart
+        // takes the time of the wait after it
+        let check = Duration::from_secs_f32(at + 1.5);
+        std::thread::sleep(check.saturating_sub(start.elapsed()));
+        let mut shown = None;
+        let until = std::time::Instant::now() + restart;
+        while std::time::Instant::now() < until {
+            shown = hub().console().menu.and_then(|menu| menu.page(HOLOGRAM_PAGE).and_then(|page| page.find(&id, subject.as_deref()).and_then(Item::value).map(str::to_owned)));
+            if shown.as_deref() == Some(value.as_str()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let held = shown.as_deref() == Some(value.as_str());
+        log::info!("scripted hologram: {id} shows {shown:?} after the press for {value} ({})", if held { "changed" } else { "NOT changed" });
+    }
+    log::info!("scripted hologram: done");
 }
 
 /// Where the right controller of the press check stands, in meters from the head's start: below the

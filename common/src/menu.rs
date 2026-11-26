@@ -123,6 +123,36 @@ pub struct Choice {
     /// A change restarts the host, so the stream stops for a moment
     #[serde(default, skip_serializing_if = "is_false")]
     pub restarts: bool,
+    /// The objects that the headset's 3D console draws for the options, by what they mean. The
+    /// Mac's window and the flat console draw keys for every shape.
+    #[serde(default, skip_serializing_if = "ChoiceShape::is_keys")]
+    pub shape: ChoiceShape,
+}
+
+/// The objects of a choice's options in the headset's 3D console (#111), each by what its options
+/// mean, so the form of an option shows its value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChoiceShape {
+    /// Keys, as for any choice
+    #[default]
+    Keys,
+    /// Cubes that grow from the first option to the last, for sizes
+    Cubes,
+    /// Gems, the chosen one larger in a beam of light, for amounts such as a bitrate
+    Gems,
+    /// Flowers whose petals grow from none to many, for levels from off to high
+    Petals,
+    /// An arc with a crystal knob over the chosen tick, for rates
+    Arc,
+    /// The chosen option in a crystal between two arrows, for a few options of words
+    Stepper,
+}
+
+impl ChoiceShape {
+    pub fn is_keys(&self) -> bool {
+        *self == Self::Keys
+    }
 }
 
 /// One option of a choice.
