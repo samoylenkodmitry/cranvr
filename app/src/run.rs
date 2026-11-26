@@ -113,6 +113,11 @@ pub fn act(settings: &mut Settings, model: &mut Model, request: &Request) {
 /// they changed.
 pub fn tick(settings: &mut Settings, model: &mut Model, slow: bool) {
     backend::pump(model);
+    if let Some(line) = backend::watch_host(settings, model) {
+        eprintln!("{line}");
+        model.log(line);
+        model.running = backend::host_running();
+    }
     model.settings_problem = backend::settings_problem();
     usb::set_choice(settings.connection);
     model.usb = usb::status();
@@ -230,7 +235,8 @@ fn chosen_program(settings: &mut Settings, model: &mut Model, chosen: backend::C
 /// does and saves the settings in its own `app.json`. Each line of its input is a request as the
 /// window's press makes it (`{"action": "run", "id": "headset.recenter"}`), so a test presses the
 /// window's buttons too. It watches no USB cable, asks macOS for no permission and moves no window,
-/// so the user's app keeps all of that. It ends with SIGTERM or when the host ends.
+/// so the user's app keeps all of that. It ends with SIGTERM, or when the host ended and the app's
+/// watch does not start it again (see `backend::watch_host`).
 pub fn headless() {
     let mut settings = Settings::load();
     let mut model = Model::default();
@@ -260,7 +266,7 @@ pub fn headless() {
             eprintln!("cranvr: the window's press {}", request.to_json());
             act(&mut settings, &mut model, &request);
         }
-        if !model.running {
+        if !backend::host_wanted() {
             eprintln!("cranvr: the host ended");
             return;
         }
