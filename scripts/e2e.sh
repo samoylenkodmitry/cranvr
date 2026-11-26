@@ -786,8 +786,10 @@ counts = []
 for line in open(sys.argv[1], errors="replace"):
     if line.startswith("@cranvr") and '"type":"stats"' in line:
         counts.append(json.loads(line[8:]).get("game_frames") or 0)
-# The first window holds the program's start; the last one its end
-middle = counts[1:-1]
+# The first window with game frames holds the program's start and the last one its end. A headset that links
+# later than the probe moves both, so the windows without game frames around them do not count either.
+lit = [i for i, count in enumerate(counts) if count > 0]
+middle = counts[lit[0] + 1:lit[-1]] if lit else []
 bad = not middle
 if middle:
     rate = min(middle) / 5.0

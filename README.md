@@ -726,6 +726,22 @@ OpenComposite takes the hidden area mesh from `XR_KHR_visibility_mask`, which th
 
 A game folder with OpenComposite's own `openvr_api.dll` or an `opencomposite.ini` from another setup bypasses the choice: the game loads that DLL, not the runtime in the prefix. Put Valve's file back. OpenComposite stops a game with a message box for an option that it does not know, such as a section header in the `.ini`.
 
+### Vulkan games
+
+A Vulkan game runs on MoltenVK, which Wine's `vulkan-1.dll` reaches through `winevulkan.so`. An OpenXR game gets `XR_KHR_vulkan_enable` and `XR_KHR_vulkan_enable2` from the runtime (runtime patch 0013). An OpenVR game submits its Vulkan images to OpenComposite (its patch 0012), which puts them into the runtime's images on the GPU. The runtime's images are Vulkan images on Metal textures of IOSurfaces (Wine patch 0009). cranvr-host encodes the game's picture from those IOSurfaces with no copy through the CPU, as it does for a Direct3D 11 game.
+
+The cost of each path at 120 Hz, from the runtime's note on the GPU's finish after `xrEndFrame` (`scripts/e2e.sh --xr-vulkan` and `--openvr-vulkan` with the probe, two eyes of 1444x1546):
+
+- An OpenXR program with a swapchain per eye: 120.1 frames a second. `xrEndFrame` took 0.044 ms, its fence 0.01 ms, and the GPU finished a frame 0.8 ms after `xrEndFrame`.
+- A swapchain of two slices: the runtime copies each slice into an IOSurface image, and the GPU finished 1.41 ms after `xrEndFrame`, about 0.6 ms later.
+- An OpenVR program through OpenComposite: 1.33 ms for B8G8R8A8 images, which OpenComposite copies, 1.40 ms for R8G8B8A8 images, which it blits, and 2.72 ms for 4x MSAA images, which it resolves first. Each made 120.0 to 120.1 frames a second.
+
+On a Quest 3 at 120 Hz and 2064x2208 per eye, the OpenXR program made 119.7 frames a second (598 and 594 game frames in the host's 5-second windows) and the OpenVR program 118.9 (601 and 600).
+
+Each game's options have the row "Graphics" with "Game's own", "Direct3D 11" and "Vulkan" (`graphics` in the game's entry of `launch`: `direct3d` or `vulkan`, absent for the game's own choice). A choice adds an argument at the game's start: the text of "Vulkan arguments" or "Direct3D 11 arguments" under Advanced (`vulkan_args` and `direct3d_args`), else the argument of the game's engine. cranvr knows three engines by their files, never by the game: Unity (`UnityPlayer.dll` or a folder `<program>_Data` next to the program: `-force-vulkan` and `-force-d3d11`), Unreal Engine (the folder `Engine/Binaries`: `-vulkan` and `-d3d11`) and Croteam's Serious Engine (`Content/CachedShaders_VLK.gro`: `+gfx_strAPI VLK` and `+gfx_strAPI D3D11`). The line under the choice says which argument the game gets and where it comes from. The console in VR shows the choice too. `scripts/run-game.sh` applies no choice: give the argument after the program.
+
+Serious Sam VR: The Last Hope, an OpenVR game of the Serious Engine, draws with Vulkan through OpenComposite. Its log says "Gfx API: Vulkan". In a test host at 120 Hz it made 99 frames a second with Vulkan and 99 with Direct3D 11 (494 to 496 game frames in each 5-second window in both runs). On the Quest it made the same 99 frames a second. The runtime's note said that the GPU finished a frame 0.8 to 1.0 ms after `xrEndFrame` on the Quest and 2.4 to 6.7 ms in the test host, on average over 600 frames. Beat Saber 1.46 has no Vulkan: its Unity player was built without it, and with `-force-vulkan` it ends at its start ("Forced GfxDevice 'Vulkan' was not built from editor").
+
 ### SteamVR games
 
 A game that needs SteamVR itself (its menus, its overlays, its input bindings, or a check for SteamVR) runs in SteamVR for Windows under Wine with the launch option "OpenVR: SteamVR". SteamVR (app 250820, free) comes from the user's Steam library in the prefix. The game support installs cranvr's SteamVR driver as `C:\cranvr\steamvr` (`steamvr/driver_cranvr.cpp`, built with MinGW-w64 by `scripts/build-steamvr-driver.sh`). The OpenVR path file names SteamVR as the runtime and the driver's folder in `external_drivers`, so the game's `VR_Init` starts SteamVR, as on Windows, and SteamVR loads the driver. The game list leaves SteamVR out: it is a runtime, not a game.
