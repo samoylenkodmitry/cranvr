@@ -732,11 +732,11 @@ A Vulkan game runs on MoltenVK, which Wine's `vulkan-1.dll` reaches through `win
 
 The cost of each path at 120 Hz, from the runtime's note on the GPU's finish after `xrEndFrame` (`scripts/e2e.sh --xr-vulkan` and `--openvr-vulkan` with the probe, two eyes of 1444x1546):
 
-- An OpenXR program with a swapchain per eye: 120.1 frames a second. `xrEndFrame` took 0.044 ms, its fence 0.01 ms, and the GPU finished a frame 0.8 ms after `xrEndFrame`.
-- A swapchain of two slices: the runtime copies each slice into an IOSurface image, and the GPU finished 1.41 ms after `xrEndFrame`, about 0.6 ms later.
+- An OpenXR program with a swapchain per eye: 120.0 to 120.1 frames a second. `xrEndFrame` took 0.04 ms, its fence 0.01 ms, and the GPU finished a frame 0.7 to 0.8 ms after `xrEndFrame`.
+- A swapchain of two slices: the runtime copies each slice into an IOSurface image. `xrEndFrame` took 0.16 ms, and the GPU finished 1.41 ms after it, about 0.6 ms later.
 - An OpenVR program through OpenComposite: 1.33 ms for B8G8R8A8 images, which OpenComposite copies, 1.40 ms for R8G8B8A8 images, which it blits, and 2.72 ms for 4x MSAA images, which it resolves first. Each made 120.0 to 120.1 frames a second.
 
-On a Quest 3 at 120 Hz and 2064x2208 per eye, the OpenXR program made 119.7 frames a second (598 and 594 game frames in the host's 5-second windows) and the OpenVR program 118.9 (601 and 600).
+On a Quest 3 at 120 Hz and 2064x2208 per eye, the OpenXR program made 119.7 frames a second (598 and 594 game frames in the host's 5-second windows), and the GPU finished a frame 1.4 to 1.5 ms after `xrEndFrame`. The OpenVR program made 120.0 frames a second after its start (601 and 600 in the windows), with the blit, and the GPU finished 1.9 ms after `xrEndFrame`.
 
 Each game's options have the row "Graphics" with "Game's own", "Direct3D 11" and "Vulkan" (`graphics` in the game's entry of `launch`: `direct3d` or `vulkan`, absent for the game's own choice). A choice adds an argument at the game's start: the text of "Vulkan arguments" or "Direct3D 11 arguments" under Advanced (`vulkan_args` and `direct3d_args`), else the argument of the game's engine. cranvr knows three engines by their files, never by the game: Unity (`UnityPlayer.dll` or a folder `<program>_Data` next to the program: `-force-vulkan` and `-force-d3d11`), Unreal Engine (the folder `Engine/Binaries`: `-vulkan` and `-d3d11`) and Croteam's Serious Engine (`Content/CachedShaders_VLK.gro`: `+gfx_strAPI VLK` and `+gfx_strAPI D3D11`). The line under the choice says which argument the game gets and where it comes from. The console in VR shows the choice too. `scripts/run-game.sh` applies no choice: give the argument after the program.
 
