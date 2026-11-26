@@ -59,6 +59,7 @@ pub struct StreamInfo {
     /// Whether the host foveates its pictures: the decoded frame holds the compressed layout
     pub foveated: bool,
     pub refresh_hz: f32,
+    /// The eye stream's bitrate: the user's setting at the start, then the host's target for the link
     pub target_mbps: f32,
     pub udp: bool,
 }
@@ -699,7 +700,17 @@ impl Hub {
             return;
         }
         match crate::console::Status::parse(text) {
-            Some(status) => self.console.lock().unwrap().on_status(status),
+            Some(status) => {
+                // The stats panel shows the bitrate that the host follows now
+                if let Some(mbps) = status.mbps {
+                    self.report(id, |snapshot| {
+                        if let Some(stream) = &mut snapshot.stream {
+                            stream.target_mbps = mbps;
+                        }
+                    });
+                }
+                self.console.lock().unwrap().on_status(status);
+            }
             None => log::warn!("the host sent a state of the stream that the console cannot read"),
         }
     }

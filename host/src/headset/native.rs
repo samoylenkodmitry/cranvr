@@ -21,7 +21,7 @@ pub mod desktop;
 mod displays;
 mod microphone;
 
-use super::{display_lock::{DisplayLock, Report}, Button, Device, Event, EventSource, FramePlan, Headset, OutFrame};
+use super::{display_lock::{DisplayLock, Report}, Button, Device, Event, EventSource, FramePlan, Headset, LinkWindow, OutFrame};
 use crate::{
     pairing::{display_name, Pairings},
     runtime_link::Haptic,
@@ -1034,6 +1034,42 @@ struct Display {
     period: Nanos,
     /// The average time from the last packet of a frame to the end of its decode, in ns
     decode: f64,
+    /// The network times of the last frames, from the start of the send to the last packet, in ns
+    network: VecDeque<Nanos>,
+}
+
+/// The network times that the estimate of a frame's arrival takes
+const NETWORK_WINDOW: usize = 64;
+/// The share of those frames that came within the estimate
+const NETWORK_PERCENTILE: f64 = 0.9;
+
+impl Display {
+    fn new(period: Nanos) -> Self {
+        Self { next: 0, period, decode: 0.0, network: VecDeque::with_capacity(NETWORK_WINDOW) }
+    }
+
+    fn note_network(&mut self, network: Nanos) {
+        if self.network.len() == NETWORK_WINDOW {
+            self.network.pop_front();
+        }
+        self.network.push_back(network);
+    }
+
+    /// How long a frame takes from the start of its send to its last packet: the 90th percentile of
+    /// the last frames. Half the round trip is the estimate before any frame. A frame of the eye
+    /// stream moved at about 330 Mbps on a Quest 3's USB network and on a Wi-Fi 6 network (#97), so
+    /// a frame of 175 KB took 4.5 ms over the cable and 6.5 ms over Wi-Fi. Half the round trip was
+    /// 0.3 and 1.5 ms. A game's frames aimed for points that they could not make: 14 percent of them
+    /// came late at 200 Mbps over the cable and 48 percent over Wi-Fi. With this estimate 1.2 percent
+    /// came late at 120 Mbps over the cable and none over Wi-Fi.
+    fn network_ns(&self, half_round_trip: Nanos) -> Nanos {
+        if self.network.is_empty() {
+            return half_round_trip;
+        }
+        let mut sorted: Vec<Nanos> = self.network.iter().copied().collect();
+        sorted.sort_unstable();
+        sorted[((sorted.len() as f64 * NETWORK_PERCENTILE).ceil() as usize).clamp(1, sorted.len()) - 1]
+    }
 }
 
 /// The first point of the grid `origin + k * period` at or after `t`, for any whole `k`. The
@@ -1092,21 +1128,9 @@ struct FocusState {
 }
 
 /// The host's end of a connected client.
-/// What one frame of the eye stream may carry on average over a cable to a Quest 3, in bits: 40 Mbps
-/// at 120 Hz. On the cable (`adb reverse`) a frame moved at about 150 Mbps. With a moving game and a
-/// target of 100 Mbps (70 sent) 3 to 7 percent of the frames came too late in bursts of 15 to 20 s,
-/// against 0.05 percent with frames 1 ms apart on the encoder's time line. At 40 (28 sent) 0.2
-/// percent came late, the same as at 30. The time from the pose to the display stayed at 43 ms.
-const CABLE_FRAME_BITS: f64 = 40e6 / 120.0;
-/// The same over a network, in bits: 12 Mbps at 120 Hz, which sends about the 8.5 Mbps that the eye
-/// stream sent before. On a Wi-Fi 6 network the share of late frames rose with every step: 4 percent
-/// at 8.5 Mbps sent, 8 at 14, 18 at 28 and 57 to 86 at 70. Issue #97 asks the host to adapt instead.
-const NETWORK_FRAME_BITS: f64 = 12e6 / 120.0;
-
 struct Session {
     link: HostLink,
-    /// The client reaches the host over a cable (`adb reverse`): the eye stream's limit is
-    /// `CABLE_FRAME_BITS`, else `NETWORK_FRAME_BITS`
+    /// The client reaches the host over a USB cable: `adb reverse` or the headset's USB network
     cable: bool,
     clock: Mutex<ClockSync>,
     history: Mutex<History>,
@@ -1114,6 +1138,11 @@ struct Session {
     display: Mutex<Display>,
     parity: Mutex<ParityController>,
     stats: Mutex<Stats>,
+    /// What the frames did since the last look of the bitrate's control. The display lock keeps the
+    /// counts of late and replaced frames.
+    window: Mutex<LinkWindow>,
+    /// The UDP sends that the system refused, at the last look of the bitrate's control
+    refused_seen: AtomicU64,
     sent: Mutex<VecDeque<SentFrame>>,
     /// The display lock's planner. It learns the display grid in every case. The frame loop follows
     /// its plans only when `lock_on` is set.
@@ -1150,9 +1179,11 @@ impl Session {
             clock: Mutex::new(ClockSync::new()),
             history: Mutex::new(History::default()),
             input: Mutex::new(InputState::default()),
-            display: Mutex::new(Display { next: 0, period, decode: 0.0 }),
+            display: Mutex::new(Display::new(period)),
             parity: Mutex::new(ParityController::new(if udp { PARITY_MIN } else { 0.0 }, PARITY_MAX)),
             stats: Mutex::new(Stats::default()),
+            window: Mutex::new(LinkWindow { first: true, ..LinkWindow::default() }),
+            refused_seen: AtomicU64::new(0),
             sent: Mutex::new(VecDeque::new()),
             lock: Mutex::new(DisplayLock::new(period)),
             lock_on,
@@ -1298,10 +1329,10 @@ impl Session {
     }
 
     /// The display time that a frame sent now can make, on the headset's clock: the first point of
-    /// the display's grid after the frame has crossed the network, decoded and waited for the
-    /// headset's take, which comes one lead before the point. A target that leaves the lead out
-    /// lies before the display time of the headset frame that takes the frame, so the headset's
-    /// queue counts the frame as late and skips frames. The planner gives successive frames
+    /// the display's grid after the frame has crossed the network (as the frames before it did),
+    /// decoded and waited for the headset's take, which comes one lead before the point. A target
+    /// that leaves the lead out lies before the display time of the headset frame that takes the
+    /// frame, so the headset's queue counts the frame as late and skips frames. The planner gives successive frames
     /// successive points (see `DisplayLock::point_for`). 0 while the clocks are not in sync.
     fn target_display(&self, now: Nanos) -> Nanos {
         let (Some(client_now), Some(estimate)) = (self.client_time(now), self.clock.lock().unwrap().estimate()) else { return 0 };
@@ -1310,7 +1341,7 @@ impl Session {
             if display.next == 0 {
                 return 0;
             }
-            client_now + estimate.rtt_ns / 2 + display.decode as Nanos + DISPLAY_MARGIN.as_nanos() as Nanos
+            client_now + display.network_ns(estimate.rtt_ns / 2) + display.decode as Nanos + DISPLAY_MARGIN.as_nanos() as Nanos
         };
         self.lock.lock().unwrap().point_for(ready).unwrap_or(0)
     }
@@ -1333,6 +1364,9 @@ impl Session {
             }
             let decode = t.decode_end.saturating_sub(t.received) as f64;
             display.decode = if display.decode == 0.0 { decode } else { display.decode * 0.9 + decode * 0.1 };
+            if let Some(sent) = sent_on_client {
+                display.note_network(t.received.saturating_sub(sent));
+            }
         }
         let ms = |ns: u64| ns as f64 / 1e6;
         let mut stats = self.stats.lock().unwrap();
@@ -1343,9 +1377,14 @@ impl Session {
         stats.decode_queue += ms(t.picked.saturating_sub(t.decode_end));
         stats.vsync_wait += ms(t.display_time.saturating_sub(t.picked));
         if let Some(sent) = sent_on_client {
+            let network = ms(t.received.saturating_sub(sent));
             stats.pose_to_send += ms(sent.saturating_sub(t.tracking_sample));
-            stats.network += ms(t.received.saturating_sub(sent));
+            stats.network += network;
             stats.network_frames += 1;
+            let mut window = self.window.lock().unwrap();
+            window.network_frames += 1;
+            window.network_ms += network;
+            window.network_max_ms = window.network_max_ms.max(network);
         }
         drop(stats);
         self.lock.lock().unwrap().on_report(&Report {
@@ -1460,9 +1499,13 @@ impl Headset for Native {
         let parity = session.parity.lock().unwrap().clone();
         let floor = session.floor.lock().unwrap().unwrap_or(0.0);
         let rects: Vec<Rect> = frame.slices.iter().map(|s| Rect { x: s.rect[0], y: s.rect[1], w: s.rect[2], h: s.rect[3] }).collect();
+        // A test of the bitrate's control drops the frames that a slower link would drop. Such a frame
+        // counts as sent and never reaches the headset, as a lost one.
+        let lost = !crate::test_bitrate::passes_cap(frame.slices.iter().map(|s| s.data.len()).sum());
+        let send_started = Instant::now();
         let mut sent_bytes = 0;
         let (mut data_packets, mut parity_packets) = (0u64, 0u64);
-        for (i, slice) in frame.slices.iter().enumerate() {
+        for (i, slice) in frame.slices.iter().enumerate().filter(|_| !lost) {
             let meta = FrameMeta {
                 stream: 0,
                 frame: index,
@@ -1510,6 +1553,14 @@ impl Headset for Native {
             }
         }
         session.frames_sent.fetch_add(1, Ordering::Relaxed);
+        {
+            let send_ms = send_started.elapsed().as_secs_f64() * 1e3;
+            let mut window = session.window.lock().unwrap();
+            window.sent_frames += 1;
+            window.sent_bytes += sent_bytes as u64;
+            window.send_ms += send_ms;
+            window.send_max_ms = window.send_max_ms.max(send_ms);
+        }
         let mut stats = session.stats.lock().unwrap();
         stats.sent_frames += 1;
         stats.sent_bytes += sent_bytes as u64;
@@ -1520,9 +1571,19 @@ impl Headset for Native {
 
     fn frame_submitted(&self, _sample_ns: u64) {}
 
-    fn link_frame_bits(&self) -> Option<f64> {
+    fn take_link_window(&self) -> Option<LinkWindow> {
         let session = self.shared.session()?;
-        Some(if session.cable { CABLE_FRAME_BITS } else { NETWORK_FRAME_BITS })
+        let mut window = std::mem::take(&mut *session.window.lock().unwrap());
+        let counts = session.lock.lock().unwrap().take_counts();
+        (window.frames, window.late, window.replaced) = (counts.frames, counts.late, counts.replaced);
+        let refused = session.link.duplex.dropped_sends();
+        window.refused_sends = refused.saturating_sub(session.refused_seen.swap(refused, Ordering::Relaxed));
+        window.cable = session.cable;
+        Some(window)
+    }
+
+    fn link_is_cable(&self) -> Option<bool> {
+        Some(self.shared.session()?.cable)
     }
 
     fn send_haptics(&self, haptic: Haptic) {

@@ -37,7 +37,10 @@ impl Headset for FakeHeadset {
     fn set_decoder_config(&self, _config: Vec<u8>) {}
     fn send_frame(&self, _frame: crate::headset::OutFrame) {}
     fn frame_submitted(&self, _sample_ns: u64) {}
-    fn link_frame_bits(&self) -> Option<f64> {
+    fn take_link_window(&self) -> Option<crate::headset::LinkWindow> {
+        None
+    }
+    fn link_is_cable(&self) -> Option<bool> {
         None
     }
     fn send_haptics(&self, _haptic: Haptic) {}

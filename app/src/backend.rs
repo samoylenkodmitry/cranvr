@@ -428,7 +428,8 @@ pub struct Stats {
     pub game_frames: u64,
     pub render_ms: f64,
     pub encode_ms: f64,
-    /// The eye stream's bitrate: the one that the user set, at most what the link carries
+    /// The eye stream's bitrate now: the host lowers it while the link misses frames and raises it
+    /// again up to the user's setting
     pub mbps: u64,
     /// The bitrate that the user set
     pub mbps_set: u64,

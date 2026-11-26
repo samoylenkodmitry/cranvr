@@ -2,6 +2,7 @@
 //! game when the BasaltVR OpenXR runtime inside Wine connects (see runtime_link.rs). Without a
 //! game it shows a head-tracked test scene.
 
+mod bitrate;
 mod desktop;
 mod desktop_layer;
 mod display_modes;
@@ -24,6 +25,7 @@ mod runtime_link;
 mod screen_capture;
 mod session;
 mod status;
+mod test_bitrate;
 mod test_input;
 mod tracking;
 mod virtual_display;
@@ -725,12 +727,6 @@ fn encode_loop(jobs: mpsc::Receiver<EncodeJob>) {
     }
 }
 
-/// The eye stream's bitrate: the user's `setting_bps`, at most the link's limit of `frame_bits` a frame
-/// at `fps`.
-fn eye_bitrate(setting_bps: u64, frame_bits: Option<f64>, fps: f32) -> u64 {
-    frame_bits.map_or(setting_bps, |bits| setting_bps.min((bits * f64::from(fps)).round() as u64))
-}
-
 /// The encoder of the eye stream: frames of `width` x `height` at `fps` and `bitrate_bps` on average,
 /// a key frame at least every 10 s.
 fn eye_encoder_config([width, height]: [u32; 2], fps: f32, full_range: bool, bitrate_bps: u64, strict_rate: bool) -> EncoderConfig {
@@ -1078,8 +1074,15 @@ fn frame_loop(
     let mut pacer = pacer::Pacer::new(120.0).with_ready(headset.pacer_ready());
     // The display lock's plan that the loop waits for, with the instant at which its start is due
     let mut pending_plan: Option<(headset::FramePlan, Instant)> = None;
-    let mut bitrate = mbps * 1_000_000;
+    // The eye stream's bitrate follows the link, at most the user's setting (bitrate.rs). A new
+    // stream or a new session starts the control again.
+    let ceiling = mbps * 1_000_000;
+    let mut control = bitrate::Control::new(ceiling, ceiling, 120.0);
+    let mut bitrate = control.target();
     let mut new_bitrate = None;
+    let mut tick_at = Instant::now();
+    // The frames handed to the encoder since the last tick
+    let mut tick_sent = 0u32;
     let (mut count, mut game_count, mut gpu_ms, mut gpu_exec_ms, mut since) = (0u32, 0u32, 0.0f64, 0.0f64, Instant::now());
     // Stats windows in a row in which a running game made fewer frames than the headset shows
     let mut slow_windows = 0u32;
@@ -1199,7 +1202,7 @@ fn frame_loop(
             );
             status::emit(json!({
                 "type": "stats", "fps": count as f64 / secs, "game_frames": game_count, "render_ms": 0.0, "encode_ms": 0.0,
-                "mbps": bitrate / 1_000_000, "audio_s": 0.0, "latency": null, "stopped": true,
+                "mbps": bitrate / 1_000_000, "mbps_set": mbps, "audio_s": 0.0, "latency": null, "stopped": true,
             }));
             (count, game_count, gpu_ms, gpu_exec_ms, since) = (0, 0, 0.0, 0.0, Instant::now());
             (no_sample, no_buffer, busy, dropped, missing) = (0, 0, 0, 0, 0);
@@ -1213,9 +1216,12 @@ fn frame_loop(
                 .foveated
                 .then(|| Foveation::new([stream.eye_width, stream.eye_height], &stream.foveation));
             let (eye_w, eye_h) = foveation.map_or((stream.eye_width, stream.eye_height), |f| (f.optimized[0], f.optimized[1]));
-            bitrate = eye_bitrate(mbps * 1_000_000, headset.link_frame_bits(), stream.fps);
+            let start = bitrate::start_for(ceiling, headset.link_is_cable().unwrap_or(false), stream.fps);
+            control = bitrate::Control::new(ceiling, start, stream.fps);
+            bitrate = test_bitrate::fixed_mbps().map_or(control.target(), |m| m * 1_000_000);
             info!("Eye stream: {} Mbps of the {mbps} Mbps set", bitrate / 1_000_000);
             new_bitrate = None;
+            tick_at = Instant::now();
             let config = eye_encoder_config([eye_w * 2, eye_h], stream.fps, stream.full_range, bitrate, strict_rate);
             time_line = TimeLine::new(stream.fps);
             encoder = match Encoder::new(&config, sender.clone()) {
@@ -1291,7 +1297,7 @@ fn frame_loop(
                 info!("Headset focus: the stream is paused. No frame went out in {:.0} s", since.elapsed().as_secs_f64());
                 status::emit(json!({
                     "type": "stats", "fps": 0.0, "game_frames": 0, "render_ms": 0.0, "encode_ms": 0.0,
-                    "mbps": bitrate / 1_000_000, "audio_s": 0.0, "latency": null, "paused": true,
+                    "mbps": bitrate / 1_000_000, "mbps_set": mbps, "audio_s": 0.0, "latency": null, "paused": true,
                 }));
                 (count, game_count, gpu_ms, gpu_exec_ms, since) = (0, 0, 0.0, 0.0, Instant::now());
                 encoded_frames.store(0, Ordering::Relaxed);
@@ -1488,12 +1494,30 @@ fn frame_loop(
             pacer.spend();
         }
 
-        // A new session with the same stream keeps the encoder: its link may have another limit
-        let wanted = eye_bitrate(mbps * 1_000_000, headset.link_frame_bits(), stream.fps);
-        if wanted != bitrate {
-            info!("Eye stream: {} Mbps of the {mbps} Mbps set", wanted / 1_000_000);
-            bitrate = wanted;
-            new_bitrate = Some(wanted);
+        // Once a second the bitrate's control reads what the headset reported. A new session with the
+        // same stream keeps the encoder and starts the control again.
+        if tick_at.elapsed() >= bitrate::TICK {
+            tick_at = Instant::now();
+            let window = headset.take_link_window();
+            // A test that fixes the bitrate holds the control at its start, so the control starts
+            // anew when the test lets go
+            let fixed = test_bitrate::fixed_mbps();
+            if let Some(w) = window.filter(|w| w.first || fixed.is_some()) {
+                control = bitrate::Control::new(ceiling, bitrate::start_for(ceiling, w.cable, stream.fps), stream.fps);
+            }
+            let sent = std::mem::take(&mut tick_sent);
+            let change = window.filter(|_| fixed.is_none()).and_then(|w| {
+                let network_ms = w.network_ms / f64::from(w.network_frames.max(1));
+                control.tick(Some(bitrate::Second { frames: w.frames, missed: w.missed(), sent, network_ms }))
+            });
+            let wanted = fixed.map_or(control.target(), |m| m * 1_000_000);
+            if let Some(w) = window.filter(|_| change.is_some() || test_bitrate::active()) {
+                info!("{}", bitrate::describe(&w, sent, change, wanted));
+            }
+            if wanted != bitrate {
+                bitrate = wanted;
+                new_bitrate = Some(wanted);
+            }
         }
         let job = EncodeJob {
             encoder: Arc::clone(enc),
@@ -1514,6 +1538,7 @@ fn frame_loop(
             Ok(()) => {
                 headset.frame_submitted(sample_id);
                 count += 1;
+                tick_sent += 1;
                 game_count += game_frame.is_some() as u32;
             }
             Err(mpsc::TrySendError::Full(job)) => {
@@ -1597,7 +1622,7 @@ fn frame_loop(
                 "latency": latency,
             }));
             info!(
-                "{:.1} fps ({game_count} game frames), render {:.2} ms (GPU {:.2} ms), encode {:.2} ms (p95 {encode_p95_ms:.2} ms), {sent_mbps:.1} Mbps of {} Mbps target, skipped: {no_sample} no new pose, {paused_frames} loop turns while the headset's app had no focus, {no_buffer} no buffer, {busy} encoder busy, {dropped} game frames replaced, {missing} unknown images; desktop layer {layer_fps:.1} fps; poses {poses}",
+                "{:.1} fps ({game_count} game frames), render {:.2} ms (GPU {:.2} ms), encode {:.2} ms (p95 {encode_p95_ms:.2} ms), {sent_mbps:.1} Mbps of {} Mbps target ({mbps} set), skipped: {no_sample} no new pose, {paused_frames} loop turns while the headset's app had no focus, {no_buffer} no buffer, {busy} encoder busy, {dropped} game frames replaced, {missing} unknown images; desktop layer {layer_fps:.1} fps; poses {poses}",
                 count as f64 / secs,
                 gpu_ms / n,
                 gpu_exec_ms / n,

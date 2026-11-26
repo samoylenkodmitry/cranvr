@@ -44,8 +44,11 @@ fn the_menu_comes_from_the_hosts_json() {
     assert_eq!(menu.pages.len(), 3);
     assert_eq!(menu.main().map(|page| page.id.as_str()), Some("play"));
     // The stream's state comes apart
-    let status = Status::parse(r#"{"refresh":120,"fps":119.4,"game_fps":117,"latency_ms":46.2,"game":"Beat Saber.exe"}"#).unwrap();
-    assert_eq!(status, Status { refresh: 120.0, fps: 119.4, game_fps: 117.0, latency_ms: Some(46.2), game: Some("Beat Saber.exe".into()) });
+    let status = Status::parse(r#"{"refresh":120,"fps":119.4,"game_fps":117,"latency_ms":46.2,"mbps":120,"mbps_set":200,"game":"Beat Saber.exe"}"#).unwrap();
+    assert_eq!(
+        status,
+        Status { refresh: 120.0, fps: 119.4, game_fps: 117.0, latency_ms: Some(46.2), mbps: Some(120.0), mbps_set: Some(200.0), game: Some("Beat Saber.exe".into()) }
+    );
     assert_eq!(Status::parse(r#"{"refresh":null}"#).unwrap(), Status::default(), "no headset streams");
     assert_eq!(Status::parse("[1]"), None);
     // The menus list the pages after the main page that ask for it: a game's page is not listed

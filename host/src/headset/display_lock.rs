@@ -152,7 +152,18 @@ pub struct DisplayLock {
     last_target: Nanos,
     in_flight: VecDeque<InFlight>,
     stats: Stats,
+    /// The same counts for the bitrate's control, which reads them more often than the stats line
+    counts: Counts,
     late_starts: (f64, u32),
+}
+
+/// The frames that the headset reported or replaced since the last call of `take_counts`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counts {
+    /// Every frame: early, on time, late or replaced
+    pub frames: u32,
+    pub late: u32,
+    pub replaced: u32,
 }
 
 fn push(window: &mut VecDeque<f64>, value: f64) {
@@ -196,6 +207,7 @@ impl DisplayLock {
             last_target: 0,
             in_flight: VecDeque::new(),
             stats: Stats::default(),
+            counts: Counts::default(),
             late_starts: (0.0, 0),
         }
     }
@@ -369,6 +381,8 @@ impl DisplayLock {
         // ready at the pick of an older frame's point and replaced that frame. The fault is then
         // this frame's earliness.
         let adapt = frame.planned;
+        self.counts.frames += older as u32 + 1;
+        self.counts.replaced += older as u32;
         for _ in 0..older {
             self.stats.replaced += 1;
             if points >= 0.0 && adapt {
@@ -382,6 +396,7 @@ impl DisplayLock {
             }
         } else if points > 0.0 {
             self.stats.late += 1;
+            self.counts.late += 1;
             if adapt {
                 self.miss();
             }
@@ -396,6 +411,11 @@ impl DisplayLock {
     fn miss(&mut self) {
         let most = MAX_MARGIN_PERIODS * self.period / 1e6;
         self.margin_ms = (self.margin_ms + MISS_STEP_MS).min(most);
+    }
+
+    /// The frames since the last call, for the bitrate's control.
+    pub fn take_counts(&mut self) -> Counts {
+        std::mem::take(&mut self.counts)
     }
 
     /// The counts since the last call, with the planner's present estimates.

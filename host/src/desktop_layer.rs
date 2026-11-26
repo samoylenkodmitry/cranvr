@@ -26,7 +26,8 @@ pub(crate) fn menu() -> Option<String> {
 }
 
 /// The stream's state for the console (`HostMsg::MenuStatus`): the headset's refresh rate, the
-/// frames a second that the host sends and that the game makes, the latency and the game's program.
+/// frames a second that the host sends and that the game makes, the latency, the eye stream's
+/// bitrate now and as the user set it (Mbps), and the game's program.
 pub(crate) fn menu_status() -> String {
     use serde_json::{json, Value};
     let headset = status::latest("headset").filter(|h| h["connected"] == true);
@@ -38,6 +39,8 @@ pub(crate) fn menu_status() -> String {
         "fps": stats.as_ref().and_then(|s| round(&s["fps"])),
         "game_fps": stats.as_ref().and_then(|s| s["game_frames"].as_f64()).map(|f| f / 5.0),
         "latency_ms": stats.as_ref().and_then(|s| round(&s["latency"]["total_ms"])),
+        "mbps": stats.as_ref().and_then(|s| s["mbps"].as_u64()),
+        "mbps_set": stats.as_ref().and_then(|s| s["mbps_set"].as_u64()),
         // The game's program file, by which the console finds its name
         "game": game.as_ref().map(|g| match g["program"].as_str() {
             Some(path) => path.rsplit(['\\', '/']).next().unwrap_or(path),

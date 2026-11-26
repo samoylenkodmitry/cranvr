@@ -266,6 +266,25 @@ fn the_display_grid_gives_the_next_refresh() {
     assert_eq!(grid_at_or_after(1000, 0, 400), 1000);
 }
 
+// A frame that no plan started aims for the first point after its arrival. The arrival counts the
+// network time that the last frames took, which grows with their size, and not half the round trip.
+#[test]
+fn the_arrival_of_a_frame_counts_the_network_time_of_the_frames_before_it() {
+    let mut display = Display::new(8_333_333);
+    // Before any report: half the round trip
+    assert_eq!(display.network_ns(300_000), 300_000);
+    // 90 frames of 4.5 ms (175 KB over the cable) and 10 slower ones
+    for i in 0..100 {
+        display.note_network(if i % 10 == 0 { 9_000_000 } else { 4_500_000 });
+    }
+    assert_eq!(display.network_ns(300_000), 4_500_000);
+    // The window follows a lower bitrate within 64 frames
+    for _ in 0..64 {
+        display.note_network(800_000);
+    }
+    assert_eq!(display.network_ns(300_000), 800_000);
+}
+
 #[test]
 fn a_native_client_connects_and_the_host_serves_it() {
     let port = free_port();

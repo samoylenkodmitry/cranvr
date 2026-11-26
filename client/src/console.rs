@@ -54,6 +54,10 @@ pub struct Status {
     /// Frames per second that the game makes
     pub game_fps: f32,
     pub latency_ms: Option<f32>,
+    /// The eye stream's bitrate now, in Mbps: the host follows the link up to the user's setting
+    pub mbps: Option<f32>,
+    /// The bitrate that the user set, in Mbps
+    pub mbps_set: Option<f32>,
     /// The program file of the game that runs, such as "Beat Saber.exe"
     pub game: Option<String>,
 }
@@ -95,6 +99,8 @@ impl Status {
             fps: number(&s["fps"]).unwrap_or(0.0),
             game_fps: number(&s["game_fps"]).unwrap_or(0.0),
             latency_ms: number(&s["latency_ms"]),
+            mbps: number(&s["mbps"]),
+            mbps_set: number(&s["mbps_set"]),
             game: s["game"].as_str().map(str::to_string),
         })
     }

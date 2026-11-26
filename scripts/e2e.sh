@@ -624,14 +624,23 @@ case ${client} in
                 "${adb_cmd[@]}" reverse "tcp:${native_port}" "tcp:${native_port}" >/dev/null
                 launch=(--es host "127.0.0.1:${native_port}" --ei usb_port "${native_port}" --ez usb_network false) ;;
         esac
-        "${adb_cmd[@]}" shell am start -n "${package}/dev.cranpose.android.CranposeActivity" \
-            "${launch[@]}" --ez connect true --es room scene >/dev/null
-        for i in {1..120}; do
+        # The headset's shell brings its home to the front after a stop. A start 70 ms after the stop
+        # lost that race on 2026-11-27: the client stayed behind the home, never linked, and the run
+        # waited 60 s for nothing. The run waits a second after the stop and starts the client again
+        # when it has not linked in 15 s.
+        sleep 1
+        for attempt in 1 2; do
+            "${adb_cmd[@]}" shell am start -n "${package}/dev.cranpose.android.CranposeActivity" \
+                "${launch[@]}" --ez connect true --es room scene >/dev/null
+            for i in {1..30}; do
+                headset_connected && break
+                sleep 0.5
+            done
             headset_connected && break
-            sleep 0.5
+            (( attempt == 1 )) && print -u2 "The Quest did not connect in 15 seconds: the run starts its client again"
         done
         if ! headset_connected; then
-            print -u2 "The Quest did not connect in 60 seconds. Check that it shares a network with this Mac."
+            print -u2 "The Quest did not connect in two starts of 15 seconds. Check that it shares a network with this Mac."
             client_exit=1
         else
             print "Streaming for ${seconds} seconds"
