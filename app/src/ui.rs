@@ -993,11 +993,12 @@ fn LogTab(model: MutableState<Model>) {
     });
 }
 
-/// What the eye stream sends against its bitrate. The link may carry less than the user set: the host
-/// then names its limit.
+/// What the eye stream sends against its bitrate. The host follows the link, and it sends the least
+/// while the headset shows no stream: while the target lies under the user's setting, the text names
+/// both.
 fn bitrate_text(stats: &backend::Stats) -> String {
     if stats.mbps_set > stats.mbps {
-        format!("{:.0} Mbps sent, at most {} Mbps on this link", stats.sent_mbps, stats.mbps)
+        format!("{:.0} Mbps sent of {} now, {} set", stats.sent_mbps, stats.mbps, stats.mbps_set)
     } else {
         format!("{:.0} Mbps sent of {}", stats.sent_mbps, stats.mbps)
     }
@@ -1008,9 +1009,9 @@ mod bitrate_tests {
     use super::*;
 
     #[test]
-    fn the_hint_names_what_the_eye_stream_sends_and_the_links_limit() {
+    fn the_hint_names_what_the_eye_stream_sends_and_the_target_for_the_link() {
         let stats = |mbps, mbps_set| backend::Stats { mbps, mbps_set, sent_mbps: 27.6, ..Default::default() };
-        assert_eq!(bitrate_text(&stats(40, 100)), "28 Mbps sent, at most 40 Mbps on this link");
+        assert_eq!(bitrate_text(&stats(40, 100)), "28 Mbps sent of 40 now, 100 set");
         assert_eq!(bitrate_text(&stats(50, 50)), "28 Mbps sent of 50");
     }
 }

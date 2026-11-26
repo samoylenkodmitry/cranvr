@@ -11,7 +11,9 @@
 //!   pose of a connection, false when it stopped at the end), and display
 //! - `audio`: ok, and message when not ok: the capture of the Mac's sound for the headset
 //! - `stats`: fps, game_frames, render_ms, encode_ms, encode_p95_ms (the eye frames' encode time,
-//!   mean and 95th percentile), mbps, audio_s: seconds of the Mac's sound
+//!   mean and 95th percentile), mbps (the eye stream's target now, which follows the link: see
+//!   bitrate.rs), mbps_set (the bitrate that the user set, the target's ceiling), sent_mbps (what
+//!   the eye stream sent), audio_s: seconds of the Mac's sound
 //!   captured for the headset (every 5 seconds), and latency: the averages of the headset's
 //!   frame timing reports since the last line (see `Headset::take_stats`), or null. The headset
 //!   reports no timing while it shows no stream: with its Room setting at Passthrough and no game

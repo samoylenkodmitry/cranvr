@@ -110,6 +110,42 @@ pub struct OutFrame {
     pub slices: Vec<FrameSlice>,
 }
 
+/// What the headset reported about the eye stream since the last look (`Headset::take_link_window`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LinkWindow {
+    /// Frames that the headset showed, early, on time or late, and frames that it replaced or that
+    /// never came (see `display_lock::Stats`)
+    pub frames: u32,
+    /// Frames that showed one or more points after their target
+    pub late: u32,
+    /// Frames that the headset replaced with a newer one, or that never came
+    pub replaced: u32,
+    /// Frames with a network time, and the sum and the largest of those times, in ms: from the
+    /// start of the host's send to the last packet at the headset
+    pub network_frames: u32,
+    pub network_ms: f64,
+    pub network_max_ms: f64,
+    /// Frames that the host sent, their bytes on the wire, and the time that the host's send of a
+    /// frame took (sum and largest, in ms)
+    pub sent_frames: u32,
+    pub sent_bytes: u64,
+    pub send_ms: f64,
+    pub send_max_ms: f64,
+    /// UDP packets that the system refused for lack of buffer space
+    pub refused_sends: u64,
+    /// This is the first look at a new session
+    pub first: bool,
+    /// The session runs over a USB cable
+    pub cable: bool,
+}
+
+impl LinkWindow {
+    /// The frames that missed their point: late or replaced
+    pub fn missed(&self) -> u32 {
+        self.late + self.replaced
+    }
+}
+
 pub trait Headset: Send + Sync {
     /// The time until the headset's display shows its next frame, when the link knows it.
     fn until_next_vsync(&self) -> Option<Duration>;
@@ -179,10 +215,14 @@ pub trait Headset: Send + Sync {
     /// The frame loop handed the frame for this sample to the encoder.
     fn frame_submitted(&self, sample_ns: u64);
 
-    /// The bits that one frame of the eye stream may carry on average over the link, when the link has
-    /// a limit. The frame loop multiplies it by the refresh rate and takes the smaller of that and the
-    /// bitrate that the user set.
-    fn link_frame_bits(&self) -> Option<f64>;
+    /// What the headset reported about the eye stream's frames since the last call, for the
+    /// bitrate's control (`bitrate.rs`). `None` while no headset is connected. The counts are
+    /// apart from those of `take_stats`, so each reader empties only its own.
+    fn take_link_window(&self) -> Option<LinkWindow>;
+
+    /// Whether the session runs over a USB cable, while a headset is connected. The bitrate's
+    /// control starts lower over a network (`bitrate::start_for`).
+    fn link_is_cable(&self) -> Option<bool>;
 
     fn send_haptics(&self, haptic: Haptic);
 

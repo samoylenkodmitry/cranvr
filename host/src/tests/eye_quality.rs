@@ -377,23 +377,8 @@ fn the_time_line_follows_the_frames_and_a_pause_saves_up_no_bits() {
     assert_eq!(at, after_pause + ms(8.0) + Duration::from_micros(1));
 }
 
-/// The eye stream takes the bitrate that the user set, at most the link's limit at the stream's rate.
-#[test]
-fn the_link_limits_the_bitrate_that_the_user_set() {
-    let set = 100_000_000;
-    assert_eq!(eye_bitrate(set, None, 120.0), set);
-    // The cable's limit: 40 Mbps at 120 Hz, the same bits a frame at 72 Hz
-    let cable = 40e6 / 120.0;
-    assert_eq!(eye_bitrate(set, Some(cable), 120.0), 40_000_000);
-    assert_eq!(eye_bitrate(set, Some(cable), 72.0), 24_000_000);
-    // A setting under the limit stays
-    assert_eq!(eye_bitrate(20_000_000, Some(cable), 120.0), 20_000_000);
-    // A link without a limit gives the setting back
-    assert_eq!(eye_bitrate(set, None, 72.0), set);
-}
-
-/// A new session with the same stream keeps its encoder, and the frame loop lowers its bitrate to the
-/// new link's limit. The encoder follows within a second.
+/// A stream keeps its encoder when the bitrate's control lowers its target (bitrate.rs). The
+/// encoder follows within a second.
 #[test]
 fn the_encoder_follows_a_lower_bitrate_in_its_session() {
     let (fps, frames) = (120.0, 360);

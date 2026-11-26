@@ -4,7 +4,7 @@
 # encode time, the client's latency split by stage) and the median and worst of each.
 #
 # Usage: scripts/e2e.sh [--seconds N] [--fps HZ] [--game | --wine PROGRAM [--wine-arg ARG]... [--sound]] [--desktop]
-#                       [--quest [SERIAL] | --native-tcp] [--native-drop PERCENT] [--native-port PORT]
+#                       [--quest [SERIAL] [--room scene|passthrough] | --native-tcp] [--native-drop PERCENT] [--native-port PORT]
 #                       [--host-arg ARG]... [--probe-arg ARG]... [--report FILE]
 #                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine | --hand-interaction [hand|both]
 #                        | --openvr-wine | --openvr-actions MODE | --openvr-overlay | --openvr-gl | --openvr-vulkan | --steamvr
@@ -169,6 +169,9 @@
 #                 Without --quest the client is cranvr-probe on this Mac, over loopback with UDP
 #                 media and parity packets. It simulates a headset's display: it reports the
 #                 frame timing and the loss, and it checks the eye badges of the host's scene.
+#   --room scene|passthrough  with --quest: the headset's room for the run (default scene). With
+#                 passthrough the headset shows the stream only while a game runs and reports no
+#                 frame timing without one.
 #   --native-tcp  with the probe: the media goes over TCP, as it does over USB with `adb reverse`
 #   --native-drop PERCENT  with the probe: it drops this share of the media packets, so the
 #                 parity has loss to recover
@@ -199,7 +202,7 @@ tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 t
 openvr_vulkan=0 openvr_args=() xr_vulkan=""
 game_stall="" moving=0
 wine="" wine_args=()
-native_tcp=0 native_drop=0 native_port=9950 pause="" left_trigger="" right_trigger="" cable=""
+native_tcp=0 native_drop=0 native_port=9950 pause="" left_trigger="" right_trigger="" cable="" room=scene
 more_host_args=() more_probe_args=()
 while (( $# )); do
     case $1 in
@@ -247,6 +250,9 @@ while (( $# )); do
         --native-drop) native_drop=$2; shift 2 ;;
         --native-port) native_port=$2; shift 2 ;;
         --cable) cable=$2; shift 2 ;;
+        --room)
+            room=$2; shift 2
+            [[ ${room} == (scene|passthrough) ]] || { print -u2 "--room takes scene or passthrough"; exit 2; } ;;
         --pause) pause=$2; shift 2 ;;
         --left-trigger) left_trigger=$2; shift 2 ;;
         --right-trigger) right_trigger=$2; shift 2 ;;
@@ -624,14 +630,23 @@ case ${client} in
                 "${adb_cmd[@]}" reverse "tcp:${native_port}" "tcp:${native_port}" >/dev/null
                 launch=(--es host "127.0.0.1:${native_port}" --ei usb_port "${native_port}" --ez usb_network false) ;;
         esac
-        "${adb_cmd[@]}" shell am start -n "${package}/dev.cranpose.android.CranposeActivity" \
-            "${launch[@]}" --ez connect true --es room scene >/dev/null
-        for i in {1..120}; do
+        # The headset's shell brings its home to the front after a stop. A start 70 ms after the stop
+        # lost that race on 2026-11-27: the client stayed behind the home, never linked, and the run
+        # waited 60 s for nothing. The run waits a second after the stop and starts the client again
+        # when it has not linked in 15 s.
+        sleep 1
+        for attempt in 1 2; do
+            "${adb_cmd[@]}" shell am start -n "${package}/dev.cranpose.android.CranposeActivity" \
+                "${launch[@]}" --ez connect true --es room "${room}" >/dev/null
+            for i in {1..30}; do
+                headset_connected && break
+                sleep 0.5
+            done
             headset_connected && break
-            sleep 0.5
+            (( attempt == 1 )) && print -u2 "The Quest did not connect in 15 seconds: the run starts its client again"
         done
         if ! headset_connected; then
-            print -u2 "The Quest did not connect in 60 seconds. Check that it shares a network with this Mac."
+            print -u2 "The Quest did not connect in two starts of 15 seconds. Check that it shares a network with this Mac."
             client_exit=1
         else
             print "Streaming for ${seconds} seconds"

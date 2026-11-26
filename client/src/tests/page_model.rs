@@ -125,6 +125,25 @@ fn the_main_page_has_the_games_the_links_to_the_pages_the_clients_settings_and_t
 }
 
 #[test]
+fn the_title_of_the_main_page_names_the_bitrate_that_the_host_follows_now() {
+    let mut menu = menu();
+    let status = |mbps, mbps_set| Status { refresh: 120.0, fps: 119.6, latency_ms: Some(45.4), mbps, mbps_set, ..Status::default() };
+    let title = |menu: &Menu| match &console_rows(Some(menu), &Shown::Main, local(), "", None, Instant::now())[0].line {
+        Line::Title { status, .. } => status.clone(),
+        other => panic!("{other:?}"),
+    };
+    menu.status = status(Some(80.0), Some(200.0));
+    assert_eq!(title(&menu), "120 Hz, 120 fps, 45 ms, 80 of 200 Mbps");
+    menu.status = status(Some(200.0), Some(200.0));
+    assert_eq!(title(&menu), "120 Hz, 120 fps, 45 ms, 200 Mbps");
+    menu.status = status(None, None);
+    assert_eq!(title(&menu), "120 Hz, 120 fps, 45 ms");
+    // No stream shown: no latency, and the host sends the least
+    menu.status = Status { latency_ms: None, ..status(Some(10.0), Some(200.0)) };
+    assert_eq!(title(&menu), "120 Hz, 120 fps");
+}
+
+#[test]
 fn a_page_of_the_host_has_its_title_its_items_and_back() {
     let menu = menu();
     let rows = console_rows(Some(&menu), &Shown::Host("stream".into()), local(), "", None, Instant::now());

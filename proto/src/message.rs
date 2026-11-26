@@ -104,7 +104,7 @@ pub struct ClientCaps {
     /// host then sends the media over TCP.
     pub tcp_only: bool,
     /// The link runs over a USB cable: `adb reverse` or the headset's USB network to the Mac. The
-    /// host then sends at the cable's bitrate.
+    /// host then starts the eye stream at the user's bitrate, and lower over a network.
     pub cable: bool,
     /// The client can record its microphone for the host's games (see [`HostMsg::Microphone`])
     pub microphone: bool,

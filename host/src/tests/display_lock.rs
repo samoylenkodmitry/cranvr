@@ -389,3 +389,20 @@ fn a_frame_does_not_start_early_when_it_would_wait_in_the_headsets_queue_beyond_
     lock.need = (0..WINDOW).map(|_| 13.0 * MS).collect();
     assert!(lock.starts_early(now, now + 7 * MS as u64));
 }
+
+// The bitrate's control counts the frames that a report finds older and unreported as replaced. A
+// headset that showed no stream while the host sent 32 frames replaces 31 of them at its first
+// report, which the control must not read as misses of the link (bitrate.rs, SILENT_TICKS).
+#[test]
+fn the_first_report_after_a_silence_counts_the_frames_before_it_as_replaced() {
+    let period = 8_333_333;
+    let mut lock = DisplayLock::new(period);
+    lock.on_tracking(1_000_000_000);
+    for i in 0..32u64 {
+        lock.sent_unplanned(i + 1, 1_000_000_000 + i * period);
+    }
+    let newest = 1_000_000_000 + 31 * period;
+    lock.on_report(&Report { sample: 32, decode_end: newest - 20_000_000, picked: newest - 16_000_000, display_time: newest });
+    assert_eq!(lock.take_counts(), Counts { frames: 32, late: 0, replaced: 31 });
+    assert_eq!(lock.take_counts(), Counts::default());
+}

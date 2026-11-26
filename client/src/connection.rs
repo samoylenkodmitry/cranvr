@@ -185,7 +185,7 @@ fn device_caps(path: Media, headset: Option<&HeadsetInfo>, phone: Option<PhoneIn
 struct Media {
     /// The path carries TCP only, as `adb reverse` does
     tcp_only: bool,
-    /// The link runs over the USB cable, so the host sends at the cable's bitrate
+    /// The link runs over the USB cable, so the host starts the eye stream at the user's bitrate
     cable: bool,
 }
 

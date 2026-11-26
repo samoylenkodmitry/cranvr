@@ -1130,7 +1130,7 @@ fn stat_lines(snap: &Snapshot) -> Vec<(&'static str, String, Color)> {
     lines.push((
         "Stream",
         format!(
-            "{}x{} per eye{}, {} at {} Hz, {} media, {:.0} Mbps asked",
+            "{}x{} per eye{}, {} at {} Hz, {} media, {:.0} Mbps target",
             stream.eye[0],
             stream.eye[1],
             if stream.foveated { format!(", foveated into frames of {}x{}", stream.picture[0], stream.picture[1]) } else { String::new() },

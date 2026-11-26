@@ -398,6 +398,20 @@ fn bottom(local: Local) -> Row {
     Row::new(Line::Keys { name: Name::None, keys, form: Form::Keys })
 }
 
+/// The eye stream's bitrate for the console's title: the target now, and the user's setting while the
+/// host sends less for the link. A headset that shows no stream reports no latency, and the host then
+/// sends the least: the title leaves the bitrate out.
+fn bitrate_text(status: &crate::console::Status) -> String {
+    if status.latency_ms.is_none() {
+        return String::new();
+    }
+    match (status.mbps, status.mbps_set) {
+        (Some(now), Some(set)) if set > now => format!(", {now:.0} of {set:.0} Mbps"),
+        (Some(now), _) => format!(", {now:.0} Mbps"),
+        _ => String::new(),
+    }
+}
+
 /// The rows of the console on `shown` with this menu. `status` is the stream's state for the title.
 /// Without a menu the console shows that the host offers none, and its buttons.
 pub fn console_rows(menu: Option<&Menu>, shown: &Shown, local: Local, no_menu: &str, pending: Option<&Pending>, now: Instant) -> Vec<Row> {
@@ -429,7 +443,7 @@ pub fn console_rows(menu: Option<&Menu>, shown: &Shown, local: Local, no_menu: &
     let status = &menu.status;
     let stream = if status.refresh > 0.0 {
         let latency = status.latency_ms.map_or(String::new(), |ms| format!(", {ms:.0} ms"));
-        format!("{:.0} Hz, {:.0} fps{latency}", status.refresh, status.fps)
+        format!("{:.0} Hz, {:.0} fps{latency}{}", status.refresh, status.fps, bitrate_text(status))
     } else {
         "No headset stream".to_string()
     };
