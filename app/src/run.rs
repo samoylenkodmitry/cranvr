@@ -235,8 +235,8 @@ fn chosen_program(settings: &mut Settings, model: &mut Model, chosen: backend::C
 /// does and saves the settings in its own `app.json`. Each line of its input is a request as the
 /// window's press makes it (`{"action": "run", "id": "headset.recenter"}`), so a test presses the
 /// window's buttons too. It watches no USB cable, asks macOS for no permission and moves no window,
-/// so the user's app keeps all of that. It ends with SIGTERM, or when the host ended and the app's
-/// watch does not start it again (see `backend::watch_host`).
+/// so the user's app keeps all of that. It ends with SIGTERM, or when a start of the host failed.
+/// A host that ends by itself starts again (see `backend::watch_host`).
 pub fn headless() {
     let mut settings = Settings::load();
     let mut model = Model::default();

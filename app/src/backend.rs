@@ -476,8 +476,10 @@ pub struct Model {
     /// The virtual display is the main display now: a headset streams
     pub vr_main: bool,
     pub stats: Option<Stats>,
-    /// The last stats line of the host, or the headset's connection before the first one. The
-    /// host sends one every 5 s while a headset streams, also while the stream pauses.
+    /// The last stats line of the host that showed a live stream: frames went out, or the
+    /// headset's app paused the stream. Before the first one, the headset's connection. The host
+    /// sends a stats line every 5 s while frames go out or the stream pauses. A line that says that
+    /// the frames stopped does not count.
     pub stats_at: Option<Instant>,
     /// The host's state in native mode, once it has said it
     pub native: Option<Native>,
@@ -564,9 +566,9 @@ pub fn forget_game_sizes() {
 }
 
 impl Model {
-    /// A headset streams with no game. The host sent no stats line for `STALL`: its frame loop
-    /// stopped. A game may hold the picture for a long time while it loads. A connected game
-    /// therefore leaves the host alone.
+    /// A headset streams with no game. The host sent no stats line of a live stream for `STALL`:
+    /// its frame loop is stuck, or its frames stopped. A game may hold the picture for a long time
+    /// while it loads. A connected game therefore leaves the host alone.
     pub fn stream_stalled(&self, now: Instant) -> bool {
         self.headset.is_some() && self.game.is_none() && self.stats_at.is_some_and(|at| now.duration_since(at) > STALL)
     }
@@ -643,7 +645,10 @@ impl Model {
             Some("headset_page") => self.headset_page = serde_json::from_value(v["page"].clone()).ok(),
             Some("black_eye") => self.black_eyes.push(v.clone()),
             Some("stats") => {
-                self.stats_at = Some(Instant::now());
+                let live = v["fps"].as_f64().unwrap_or(0.0) > 0.0 || v["paused"].as_bool().unwrap_or(false);
+                if live {
+                    self.stats_at = Some(Instant::now());
+                }
                 self.stats = Some(Stats {
                     fps: v["fps"].as_f64().unwrap_or(0.0),
                     game_frames: v["game_frames"].as_u64().unwrap_or(0),
@@ -706,12 +711,14 @@ static HOST: Mutex<Option<Child>> = Mutex::new(None);
 static LAST_EXITED: AtomicU32 = AtomicU32::new(0);
 static WATCH: Mutex<Watch> = Mutex::new(Watch { started: None, quick_ends: 0, ended_at: None });
 
-/// A host that sends no stats line this long while a headset streams is stuck (`Model::stream_stalled`)
+/// A host that sends no stats line of a live stream this long while a headset is connected is
+/// stuck (`Model::stream_stalled`)
 const STALL: Duration = Duration::from_secs(15);
 /// A host that ran this long ended for a reason of its own time, not of its start
 const QUICK_END: Duration = Duration::from_secs(60);
-/// After this many quick ends in a row the app stops starting the host: it cannot start
-const MAX_QUICK_ENDS: u32 = 5;
+/// The longest wait before the watch starts a host again. The watch never gives up: a host that
+/// cannot start now (another program holds its port) may start later.
+const MAX_DELAY: Duration = Duration::from_secs(30);
 
 /// The app's watch over the host that it started (issue #148). A host that ends by itself, for
 /// example when macOS ignores its GPU work, starts again at once. A host whose frame loop stopped
@@ -727,17 +734,16 @@ struct Watch {
 }
 
 impl Watch {
-    /// How long a new start waits after the end of a host that ran `lived`, or `None` when the app
-    /// gives up. A host that ran long starts again at once. The first quick end starts again at
-    /// once too. Each further quick end in a row waits twice as long as the one before, from 2 s.
-    fn delay(&self, lived: Duration) -> Option<Duration> {
+    /// How long a new start waits after the end of a host that ran `lived`. A host that ran long
+    /// starts again at once. The first quick end starts again at once too. Each further quick end
+    /// in a row waits twice as long as the one before, from 2 s to `MAX_DELAY`.
+    fn delay(&self, lived: Duration) -> Duration {
         if lived >= QUICK_END {
-            return Some(Duration::ZERO);
+            return Duration::ZERO;
         }
         match self.quick_ends + 1 {
-            ends if ends >= MAX_QUICK_ENDS => None,
-            1 => Some(Duration::ZERO),
-            ends => Some(Duration::from_secs(1 << (ends - 1))),
+            1 => Duration::ZERO,
+            ends => Duration::from_secs(1 << (ends - 1).min(5)).min(MAX_DELAY),
         }
     }
 
@@ -748,7 +754,7 @@ impl Watch {
 }
 
 /// The app wants a host: one runs, or one ended by itself and the watch starts it again. False
-/// after `stop_host` and after the watch gave up.
+/// after `stop_host` and after a start that failed.
 pub fn host_wanted() -> bool {
     HOST.lock().unwrap().is_some()
 }
@@ -771,19 +777,13 @@ pub fn watch_host(settings: &Settings, model: &Model) -> Option<String> {
                 }
                 format!("the host ended by itself ({status})")
             }
-            _ if model.stream_stalled(now) => format!("the host sent no numbers for {} s while the headset streamed", STALL.as_secs()),
+            _ if model.stream_stalled(now) => format!("the host sent no frames for {} s while the headset was connected", STALL.as_secs()),
             _ => return None,
         }
     };
     let ended_at = *watch.ended_at.get_or_insert(now);
     let lived = watch.started.map_or(Duration::MAX, |started| ended_at.duration_since(started));
-    let Some(delay) = watch.delay(lived) else {
-        watch.quick_ends = 0;
-        drop(watch);
-        stop_host();
-        return Some(format!("cranvr: {reason}, {MAX_QUICK_ENDS} times within a minute of its start. Start it again with Restart the host."));
-    };
-    if now.duration_since(ended_at) < delay {
+    if now.duration_since(ended_at) < watch.delay(lived) {
         return None;
     }
     watch.count(lived);
@@ -1317,26 +1317,28 @@ mod tests {
     }
 
     /// A host that ran long starts again at once. So does the first quick end. Each further quick end
-    /// in a row waits twice as long. At the fifth the app gives up.
+    /// in a row waits twice as long, up to 30 s. The watch never gives up.
     #[test]
     fn the_watch_waits_longer_after_each_quick_end() {
         let mut watch = Watch { started: None, quick_ends: 0, ended_at: None };
         let long = Duration::from_secs(600);
-        assert_eq!(watch.delay(long), Some(Duration::ZERO));
+        assert_eq!(watch.delay(long), Duration::ZERO);
         let quick = Duration::from_secs(3);
         let mut delays = Vec::new();
-        while let Some(delay) = watch.delay(quick) {
-            delays.push(delay.as_secs());
+        for _ in 0..40 {
+            delays.push(watch.delay(quick).as_secs());
             watch.count(quick);
         }
-        assert_eq!(delays, [0, 2, 4, 8]);
+        assert_eq!(delays[..7], [0, 2, 4, 8, 16, 30, 30]);
+        assert_eq!(delays[39], 30);
         // A host that runs long again counts from zero
         watch.count(long);
-        assert_eq!(watch.delay(quick), Some(Duration::ZERO));
+        assert_eq!(watch.delay(quick), Duration::ZERO);
     }
 
-    /// The stream counts as stalled only while a headset streams with no game and no stats line
-    /// came for 15 s.
+    /// The stream counts as stalled only while a headset is connected with no game and no stats
+    /// line of a live stream came for 15 s. A line that says that the frames stopped is no sign of
+    /// life.
     #[test]
     fn a_stream_without_stats_for_15_s_stalls() {
         let mut model = Model::default();
@@ -1345,6 +1347,11 @@ mod tests {
         model.apply_status(&serde_json::json!({"type": "headset", "connected": true, "eye": [1248, 1306], "fps": 120.0}));
         assert!(!model.stream_stalled(now + Duration::from_secs(10)));
         assert!(model.stream_stalled(now + Duration::from_secs(16)));
+        model.apply_status(&serde_json::json!({"type": "stats", "fps": 119.9}));
+        let live_at = model.stats_at.unwrap();
+        model.apply_status(&serde_json::json!({"type": "stats", "fps": 0.0, "stopped": true}));
+        assert_eq!(model.stats_at, Some(live_at), "frames that stopped are no sign of life");
+        assert!(model.stream_stalled(live_at + Duration::from_secs(16)));
         model.apply_status(&serde_json::json!({"type": "stats", "fps": 0.0, "paused": true}));
         let stats_at = model.stats_at.unwrap();
         assert!(!model.stream_stalled(stats_at + Duration::from_secs(14)), "a paused stream sends stats too");
