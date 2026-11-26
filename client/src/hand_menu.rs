@@ -523,7 +523,7 @@ pub fn Menu(state: HandState, console_open: bool, frame: HandFrame) {
     let listed = pages.get();
     let input = MenuInput { layout: &layout, console_open, displays: &displays_view, wishes, place: state.place.get(), adding: busy, pages: &listed, costs: true };
     let rows = menu_model::rows(&input);
-    let height = menu_model::height(&rows);
+    let height = menu_model::height(&rows, Interface::Flat);
     // The place that the user carried the menu to is read once for each opening. Cranpose keeps the
     // place of a carry while the menu stays open.
     let saved = remember(move || place::saved_pose(frame.menu)).with(|pose: &Option<Pose>| *pose);

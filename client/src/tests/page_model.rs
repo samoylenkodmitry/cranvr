@@ -2,7 +2,7 @@ use super::*;
 use crate::console::Status;
 use cranvr_common::{
     controls::Controls,
-    menu::{Button, Buttons, Choice, Opt, Toggle},
+    menu::{Button, Buttons, Choice, ChoiceShape, Opt, Toggle},
 };
 use std::time::Duration;
 
@@ -181,11 +181,41 @@ fn a_long_line_breaks_at_words() {
 #[test]
 fn a_toggle_whose_name_fits_beside_its_keys_takes_one_row_and_a_longer_one_takes_a_row_above_them() {
     let toggle = |label: &str| Item::Toggle(Toggle { id: "t".into(), label: label.into(), on: true, ..Default::default() });
-    let page = Page { id: "p".into(), title: "P".into(), short: "P".into(), listed: true, items: vec![toggle("Game sound in the headset"), toggle("Panel pixels while a game runs")] };
-    let rows = page_rows(&page, None, Interface::ThreeD);
+    let page = Page {
+        id: "p".into(),
+        title: "P".into(),
+        short: "P".into(),
+        listed: true,
+        items: vec![toggle("Game sound in the headset"), toggle("Panel pixels while a game runs"), toggle("A toggle whose name runs far too long for one row")],
+    };
+    let rows = page_rows(&page, None, Interface::Flat);
     let lines: Vec<&Line> = rows.iter().map(|row| &row.line).collect();
-    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert_eq!(lines.len(), 5, "{lines:?}");
     assert!(matches!(lines[0], Line::Keys { name: Name::Title { title, .. }, form: Form::Switch, .. } if title == "Game sound in the headset"));
     assert!(matches!(lines[1], Line::Text { text, .. } if text == "Panel pixels while a game runs"));
     assert!(matches!(lines[2], Line::Keys { name: Name::Title { title, width, .. }, keys, form: Form::Switch } if title.is_empty() && *width == SWITCH && keys.len() == 2));
+    // A hologram's switch is narrower, so the second name fits beside it and only the third takes a
+    // row above its switch
+    let rows = page_rows(&page, None, Interface::ThreeD);
+    let lines: Vec<&Line> = rows.iter().map(|row| &row.line).collect();
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    assert!(matches!(lines[1], Line::Keys { name: Name::Title { title, width, .. }, .. } if title == "Panel pixels while a game runs" && *width == HOLOGRAM_SWITCH));
+    assert!(matches!(lines[2], Line::Text { text, .. } if text.starts_with("A toggle")));
+}
+
+#[test]
+fn a_hologram_page_has_a_header_and_a_name_over_each_choice_of_objects_with_room_for_them() {
+    let shape = |id: &str, shape: ChoiceShape| {
+        Item::Choice(Choice { id: id.into(), label: id.into(), value: "1".into(), shape, options: ["1", "2", "3"].map(|v| Opt::new(v, v)).to_vec(), ..Default::default() })
+    };
+    let page = Page { id: "stream".into(), title: "Stream".into(), short: "Stream".into(), listed: true, items: vec![shape("Refresh rate", ChoiceShape::Arc), shape("Size", ChoiceShape::Cubes)] };
+    let menu = Menu { pages: vec![page].into(), ..menu() };
+    let rows = console_rows(Some(&menu), &Shown::Host("stream".into()), Local { link: true, interface: Interface::ThreeD }, "", None, Instant::now());
+    assert!(matches!(&rows[0].line, Line::Header { text, .. } if text == "Stream"));
+    assert!(matches!(&rows[1].line, Line::Label(text) if text == "Refresh rate"));
+    assert!(matches!(&rows[2].line, Line::Keys { form: Form::Object(ChoiceShape::Arc), .. }));
+    assert!(matches!(&rows[3].line, Line::Label(text) if text == "Size"));
+    // The objects take rows twice a key's height and more, so they fit above their words
+    assert!(rows[2].height >= 2.0 * size::BUTTON && rows[4].height >= 2.0 * size::BUTTON);
+    assert!(rows[1].height > size::TEXT, "a name over objects keeps a clear space above it");
 }

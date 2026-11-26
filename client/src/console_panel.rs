@@ -138,15 +138,10 @@ fn OpenConsole(view: View, state: LinkState) {
     let modifier = SubspaceModifier::new().size(size::WIDTH, height).layer_priority(crate::panel_layout::layer_rank::TEXT);
     let (controls, editable) = (view.controls, view.controls_editable);
     let notice = view.menu.as_ref().and_then(|menu| menu.notice.clone());
-    // A page whose choices have shapes is a hologram in the 3D form (its rows start with a header)
-    if rows.first().is_some_and(|row| matches!(row.line, Line::Header(_))) {
+    // The 3D form draws every page as a hologram. The Controls page keeps its flat form.
+    if view.interface.is_3d() && !matches!(shown, Shown::Controls(_)) {
         let looks = (view.theme, crate::hologram_ui::Words::of(view.room));
         crate::hologram_ui::HologramConsole(place::movable("console", modifier, start, |_| {}), rows, page, (pending, notice), looks);
-        return;
-    }
-    // The 3D form draws the rows of the other pages on a tray. The Controls page keeps its flat form.
-    if view.interface.is_3d() && !matches!(shown, Shown::Controls(_)) {
-        crate::console_tray::ConsoleTray(place::movable("console", modifier, start, |_| {}), rows, page, (pending, notice));
         return;
     }
     SpatialPanel(place::movable("console", modifier, start, |_| {}), move || {
@@ -219,9 +214,12 @@ fn RowView(row: Row, page: MutableState<Shown>, pending: MutableState<Option<Pen
                 }
             });
         }
-        // Only a hologram draws its title beside an emblem: elsewhere it is a title
-        Line::Header(text) => {
+        // Only a hologram draws its title beside an emblem and a name over objects
+        Line::Header { text, .. } => {
             Text(text, Modifier::empty().height(height), bold(34.0));
+        }
+        Line::Label(text) => {
+            Text(text, Modifier::empty().fill_max_width().height(height), text_style(22.0, TEXT_COLOR, None));
         }
         Line::Heading(text) => {
             Text(text, Modifier::empty().height(height), text_style(26.0, MUTED_COLOR, Some(FontWeight::BOLD)));

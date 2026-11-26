@@ -40,7 +40,12 @@ const LINKS: usize = 3;
 /// A title with a line of detail under it needs a taller row
 const DETAIL_EXTRA: f32 = 10.0;
 /// The title of a hologram page: its emblem and the ribbon behind its words
-pub const HEADER: f32 = 84.0;
+pub const HEADER: f32 = 92.0;
+/// A hologram's name of a choice over its objects: its words stand at the bottom, so the row above
+/// keeps a clear space
+pub const LABEL_ROW: f32 = 40.0;
+/// The width of each half of a hologram's switch beside a toggle's name
+pub const HOLOGRAM_SWITCH: f32 = 70.0;
 /// The share of a stepper's width that each of its arrows takes, as Cranpose's `SpatialChoiceGroup`
 /// lays it out: 0.2 of 1.4
 const STEP_ARROW: f32 = 0.2 / 1.4;
@@ -94,32 +99,31 @@ pub enum Form {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Drawn {
     Flat,
-    /// On a tray of 3D keys (`console_tray.rs`)
-    Tray,
-    /// As a hologram of glass objects (`hologram_ui.rs`): a page whose choices have shapes, in the
-    /// 3D interface
+    /// As a hologram of glass objects (`hologram_ui.rs`): every page in the 3D interface. A choice
+    /// with a shape draws each option as an object of that shape.
     Hologram,
 }
 
 impl Drawn {
-    /// How a host's page draws in `interface`.
-    pub fn of(page: &Page, interface: Interface) -> Self {
-        let shaped = page.items.iter().any(|item| matches!(item, Item::Choice(choice) if !choice.shape.is_keys()));
-        match (interface.is_3d(), shaped) {
-            (false, _) => Self::Flat,
-            (true, false) => Self::Tray,
-            (true, true) => Self::Hologram,
+    /// How the console's pages draw in `interface`.
+    pub fn of(interface: Interface) -> Self {
+        if interface.is_3d() {
+            Self::Hologram
+        } else {
+            Self::Flat
         }
     }
 }
 
-/// The height of the objects of a choice of `shape`, with the words under or over them, in dp.
+/// The height of the objects of a choice of `shape`, with the words under them, in dp.
 fn object_height(shape: ChoiceShape) -> f32 {
     match shape {
         ChoiceShape::Keys => size::BUTTON,
-        ChoiceShape::Stepper => 64.0,
-        ChoiceShape::Arc => 80.0,
-        ChoiceShape::Cubes | ChoiceShape::Gems | ChoiceShape::Petals => 84.0,
+        ChoiceShape::Arc => 100.0,
+        ChoiceShape::Gems => 120.0,
+        ChoiceShape::Petals => 124.0,
+        ChoiceShape::Cubes => 130.0,
+        ChoiceShape::Stepper => 124.0,
     }
 }
 
@@ -128,8 +132,10 @@ fn object_height(shape: ChoiceShape) -> f32 {
 pub enum Line {
     /// The page's title, with the stream's state on the main page
     Title { text: String, status: String },
-    /// A hologram page's title beside its emblem
-    Header(String),
+    /// A hologram page's title beside its emblem, with the stream's state on the main page
+    Header { text: String, status: String },
+    /// A hologram's name of a choice, over the choice's objects
+    Label(String),
     Heading(String),
     Text { text: String, tone: Tone },
     Keys { name: Name, keys: Vec<Key>, form: Form },
@@ -145,7 +151,8 @@ impl Row {
     fn new(line: Line) -> Self {
         let height = match &line {
             Line::Title { .. } => size::TITLE,
-            Line::Header(_) => HEADER,
+            Line::Header { .. } => HEADER,
+            Line::Label(_) => LABEL_ROW,
             Line::Heading(_) => size::HEADING,
             Line::Text { text, .. } => size::TEXT * lines_of(text) as f32,
             Line::Keys { name: Name::Title { detail, .. }, .. } if !detail.is_empty() => size::BUTTON + DETAIL_EXTRA,
@@ -159,7 +166,9 @@ impl Row {
     /// The middle of each key across the row, in dp from the row's left edge.
     #[cfg_attr(not(any(test, all(feature = "scripted-hand", target_os = "android"))), allow(dead_code))]
     pub fn key_centers(&self) -> Vec<f32> {
-        let Line::Keys { name, keys, form } = &self.line else { return Vec::new() };
+        let Line::Keys { name, keys, form } = &self.line else {
+            return Vec::new();
+        };
         let n = keys.len() as f32;
         let gap = size::GAP;
         if let Form::Object(shape) = form {
@@ -235,7 +244,7 @@ fn item_rows(item: &Item, pending: Option<(&Pending, Progress)>, drawn: Drawn, r
         Item::Heading { text } => rows.push(Row::new(Line::Heading(text.clone()))),
         Item::Text { text, tone } => rows.push(Row::new(Line::Text { text: text.clone(), tone: *tone })),
         Item::Choice(choice) => choice_rows(choice, pending, drawn, rows),
-        Item::Toggle(toggle) => toggle_rows(toggle, pending, rows),
+        Item::Toggle(toggle) => toggle_rows(toggle, pending, drawn, rows),
         Item::Buttons(row) => buttons_rows(row, pending, rows),
     }
 }
@@ -252,7 +261,7 @@ fn choice_rows(choice: &Choice, pending: Option<(&Pending, Progress)>, drawn: Dr
         .collect();
     // A hologram draws the name over the options' objects
     if drawn == Drawn::Hologram && !choice.shape.is_keys() {
-        rows.push(Row::new(Line::Text { text: choice.label.clone(), tone: Tone::Normal }));
+        rows.push(Row::new(Line::Label(choice.label.clone())));
         rows.push(Row::new(Line::Keys { name: Name::None, keys, form: Form::Object(choice.shape) }));
         return;
     }
@@ -294,7 +303,7 @@ fn pack(keys: Vec<Key>, rows: &mut Vec<Row>) {
     }
 }
 
-fn toggle_row(toggle: &Toggle, pending: Option<(&Pending, Progress)>) -> Line {
+fn toggle_row(toggle: &Toggle, pending: Option<(&Pending, Progress)>, width: f32) -> Line {
     let keys = [(ON, "On", true), (OFF, "Off", false)]
         .into_iter()
         .map(|(value, words, on)| {
@@ -303,22 +312,26 @@ fn toggle_row(toggle: &Toggle, pending: Option<(&Pending, Progress)>) -> Line {
             Key { label, press: Press::Host(request), look: if toggle.on == on { Look::Selected } else { Look::Normal } }
         })
         .collect();
-    Line::Keys { name: Name::Title { title: toggle.label.clone(), detail: String::new(), width: SWITCH }, keys, form: Form::Switch }
+    Line::Keys { name: Name::Title { title: toggle.label.clone(), detail: String::new(), width }, keys, form: Form::Switch }
 }
 
 /// The rows of a toggle: its name beside its keys On and Off when the name fits one line there,
 /// else the name in a row of its own above them, so a long name never runs over the keys or into the
-/// next row.
-fn toggle_rows(toggle: &Toggle, pending: Option<(&Pending, Progress)>, rows: &mut Vec<Row>) {
-    let line = toggle_row(toggle, pending);
-    let room = INNER - 2.0 * (SWITCH + size::GAP);
+/// next row. A hologram's switch is narrower, so most names fit beside it.
+fn toggle_rows(toggle: &Toggle, pending: Option<(&Pending, Progress)>, drawn: Drawn, rows: &mut Vec<Row>) {
+    let width = match drawn {
+        Drawn::Flat => SWITCH,
+        Drawn::Hologram => HOLOGRAM_SWITCH,
+    };
+    let line = toggle_row(toggle, pending, width);
+    let room = INNER - 2.0 * width - 2.0 * size::GAP;
     if toggle.label.chars().count() as f32 * TITLE_CHAR <= room {
         rows.push(Row::new(line));
         return;
     }
     rows.push(Row::new(Line::Text { text: toggle.label.clone(), tone: Tone::Normal }));
     if let Line::Keys { keys, form, .. } = line {
-        rows.push(Row::new(Line::Keys { name: Name::Title { title: String::new(), detail: String::new(), width: SWITCH }, keys, form }));
+        rows.push(Row::new(Line::Keys { name: Name::Title { title: String::new(), detail: String::new(), width }, keys, form }));
     }
 }
 
@@ -353,7 +366,7 @@ fn buttons_rows(row: &Buttons, pending: Option<(&Pending, Progress)>, rows: &mut
 
 /// The rows of a host's page, in the form of `interface`.
 pub fn page_rows(page: &Page, pending: Option<(&Pending, Progress)>, interface: Interface) -> Vec<Row> {
-    let drawn = Drawn::of(page, interface);
+    let drawn = Drawn::of(interface);
     let mut rows = Vec::new();
     for item in &page.items {
         item_rows(item, pending, drawn, &mut rows);
@@ -388,8 +401,12 @@ fn bottom(local: Local) -> Row {
 /// The rows of the console on `shown` with this menu. `status` is the stream's state for the title.
 /// Without a menu the console shows that the host offers none, and its buttons.
 pub fn console_rows(menu: Option<&Menu>, shown: &Shown, local: Local, no_menu: &str, pending: Option<&Pending>, now: Instant) -> Vec<Row> {
+    let title = |text: &str, status: String| match Drawn::of(local.interface) {
+        Drawn::Hologram => Line::Header { text: text.into(), status },
+        Drawn::Flat => Line::Title { text: text.into(), status },
+    };
     let Some(menu) = menu else {
-        return vec![Row::new(Line::Title { text: "cranvr".into(), status: String::new() }), Row::new(Line::Text { text: no_menu.into(), tone: Tone::Muted }), bottom(local)];
+        return vec![Row::new(title("cranvr", String::new())), Row::new(Line::Text { text: no_menu.into(), tone: Tone::Muted }), bottom(local)];
     };
     let pending = pending.map(|pending| (pending, pending.progress(menu, now)));
     let page = match shown {
@@ -398,11 +415,7 @@ pub fn console_rows(menu: Option<&Menu>, shown: &Shown, local: Local, no_menu: &
     };
     let mut rows = Vec::new();
     if let Some(page) = page {
-        let title = match Drawn::of(page, local.interface) {
-            Drawn::Hologram => Line::Header(page.title.clone()),
-            Drawn::Flat | Drawn::Tray => Line::Title { text: page.title.clone(), status: String::new() },
-        };
-        rows.push(Row::new(title));
+        rows.push(Row::new(title(&page.title, String::new())));
         if let Some(notice) = &menu.notice {
             rows.push(Row::new(Line::Text { text: notice.clone(), tone: Tone::Warn }));
         }
@@ -420,7 +433,7 @@ pub fn console_rows(menu: Option<&Menu>, shown: &Shown, local: Local, no_menu: &
     } else {
         "No headset stream".to_string()
     };
-    rows.push(Row::new(Line::Title { text: "cranvr".into(), status: stream }));
+    rows.push(Row::new(title("cranvr", stream)));
     let line = match &status.game {
         Some(program) => format!("{} makes {:.0} frames a second", program.strip_suffix(".exe").unwrap_or(program), status.game_fps),
         None => "No game runs".to_string(),
