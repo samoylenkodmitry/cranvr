@@ -67,9 +67,15 @@ pub fn start_for(ceiling: u64, cable: bool, fps: f32) -> u64 {
 /// Wi-Fi limit before #97 sent about 8.5 Mbps at 120 Hz.
 pub const FLOOR_BPS: u64 = 10_000_000;
 /// A second needs reports of at least this share of the refresh rate to count. A headset that shows
-/// no stream (Room at Passthrough, no game) or has no input focus reports nothing: the target then
-/// stays as it is.
+/// no stream (Room at Passthrough, no game) reports nothing, and one without input focus gets no
+/// frames.
 const MIN_FRAMES_SHARE: f64 = 0.25;
+/// After this many seconds without reports the target falls to the floor: nobody sees the picture,
+/// and its bits cost the Mac's encoder, the link and the headset's decoder (#97: the headset decoded
+/// all 120 frames a second of a stream that it did not show). When reports come again the control
+/// starts anew at its start. The first second with reports also holds the frames that the headset
+/// replaced while it showed nothing, up to 31 of them, so it decides nothing.
+const SILENT_TICKS: u32 = 2;
 /// A second is calm with at most this share of missed frames: 5 of 120, above the 0 to 7 a second
 /// of a calm link at the display lock's rest.
 const CALM_SHARE: f64 = 0.042;
@@ -144,12 +150,20 @@ pub enum Change {
     Cut { from: u64, to: u64, share: f64 },
     /// The link stayed calm.
     Raise { from: u64, to: u64 },
+    /// The headset reported no frames for `SILENT_TICKS` seconds: it shows no stream.
+    Unseen { from: u64, to: u64 },
+    /// The headset reports frames again: the control starts anew.
+    Seen { from: u64, to: u64 },
 }
 
 pub struct Control {
     ceiling: u64,
     floor: u64,
+    start: u64,
+    fps: f32,
     target: u64,
+    /// Seconds in a row without reports
+    silent: u32,
     /// The seconds since the last cut, newest last, at most `SPAN_TICKS`
     span: Vec<Second>,
     calm: u32,
@@ -170,10 +184,14 @@ impl Control {
     /// starts at `start`.
     pub fn new(ceiling: u64, start: u64, fps: f32) -> Self {
         let floor = FLOOR_BPS.min(ceiling);
+        let start = start.clamp(floor, ceiling);
         Self {
             ceiling,
             floor,
-            target: start.clamp(floor, ceiling),
+            start,
+            fps,
+            target: start,
+            silent: 0,
             span: Vec::with_capacity(SPAN_TICKS),
             calm: 0,
             hold: START_TICKS,
@@ -192,11 +210,19 @@ impl Control {
     /// One second passed with these reports, or none. Returns the change of the target, if any.
     pub fn tick(&mut self, second: Option<Second>) -> Option<Change> {
         self.probe_in = self.probe_in.saturating_sub(1);
+        let Some(second) = second.filter(|s| s.frames >= self.min_frames) else {
+            return self.silence();
+        };
+        if self.silent >= SILENT_TICKS {
+            let from = self.target;
+            *self = Self::new(self.ceiling, self.start, self.fps);
+            return Some(Change::Seen { from, to: self.target });
+        }
+        self.silent = 0;
         if self.hold > 0 {
             self.hold -= 1;
             return None;
         }
-        let second = second.filter(|s| s.frames >= self.min_frames)?;
         if self.span.len() == SPAN_TICKS {
             self.span.remove(0);
         }
@@ -215,6 +241,16 @@ impl Control {
         }
         self.calm = 0;
         self.raise()
+    }
+
+    fn silence(&mut self) -> Option<Change> {
+        self.silent += 1;
+        if self.silent != SILENT_TICKS || self.target <= self.floor {
+            return None;
+        }
+        let from = self.target;
+        self.target = self.floor;
+        Some(Change::Unseen { from, to: self.floor })
     }
 
     fn raise(&mut self) -> Option<Change> {
@@ -269,6 +305,10 @@ pub fn describe(w: &crate::headset::LinkWindow, encoded: u32, change: Option<Cha
             format!("; the target falls from {} to {} Mbps: {:.1}% of the frames missed their point", from / 1_000_000, to / 1_000_000, share * 100.0)
         }
         Some(Change::Raise { from, to }) => format!("; the target rises from {} to {} Mbps: the link stayed calm", from / 1_000_000, to / 1_000_000),
+        Some(Change::Unseen { from, to }) => {
+            format!("; the target falls from {} to {} Mbps: the headset shows no stream", from / 1_000_000, to / 1_000_000)
+        }
+        Some(Change::Seen { from, to }) => format!("; the target goes from {} to {} Mbps: the headset shows the stream again", from / 1_000_000, to / 1_000_000),
         None => String::new(),
     };
     format!(

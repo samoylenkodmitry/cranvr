@@ -399,8 +399,12 @@ fn bottom(local: Local) -> Row {
 }
 
 /// The eye stream's bitrate for the console's title: the target now, and the user's setting while the
-/// host sends less for the link.
+/// host sends less for the link. A headset that shows no stream reports no latency, and the host then
+/// sends the least: the title leaves the bitrate out.
 fn bitrate_text(status: &crate::console::Status) -> String {
+    if status.latency_ms.is_none() {
+        return String::new();
+    }
     match (status.mbps, status.mbps_set) {
         (Some(now), Some(set)) if set > now => format!(", {now:.0} of {set:.0} Mbps"),
         (Some(now), _) => format!(", {now:.0} Mbps"),

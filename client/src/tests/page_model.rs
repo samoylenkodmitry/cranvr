@@ -138,6 +138,9 @@ fn the_title_of_the_main_page_names_the_bitrate_that_the_host_follows_now() {
     assert_eq!(title(&menu), "120 Hz, 120 fps, 45 ms, 200 Mbps");
     menu.status = status(None, None);
     assert_eq!(title(&menu), "120 Hz, 120 fps, 45 ms");
+    // No stream shown: no latency, and the host sends the least
+    menu.status = Status { latency_ms: None, ..status(Some(10.0), Some(200.0)) };
+    assert_eq!(title(&menu), "120 Hz, 120 fps");
 }
 
 #[test]

@@ -145,14 +145,45 @@ fn the_floor_holds() {
 }
 
 #[test]
-fn seconds_without_reports_change_nothing() {
-    let mut control = Control::new(200 * MBPS, 50 * MBPS, FPS);
-    // No stream shown (Room at Passthrough), or a headset without focus: no reports, or a few
-    for _ in 0..120 {
-        assert_eq!(control.tick(None), None);
-        assert_eq!(control.tick(Some(second(10, 10))), None);
+fn a_headset_that_shows_no_stream_gets_the_floor_and_the_start_again_when_it_shows_it() {
+    let mut control = Control::new(200 * MBPS, 200 * MBPS, FPS);
+    for _ in 0..5 {
+        control.tick(calm());
     }
-    assert_eq!(control.target(), 50 * MBPS);
+    // Room at Passthrough and no game: the headset decodes the frames and reports none
+    let unseen = Some(Second { frames: 0, missed: 0, sent: 120, network_ms: 0.0 });
+    assert_eq!(control.tick(unseen), None);
+    assert_eq!(control.tick(unseen), Some(Change::Unseen { from: 200 * MBPS, to: FLOOR_BPS }));
+    for _ in 0..60 {
+        assert_eq!(control.tick(unseen), None);
+        assert_eq!(control.tick(None), None);
+        assert_eq!(control.tick(Some(second(10, 10))), None, "a few reports are no stream shown");
+    }
+    assert_eq!(control.target(), FLOOR_BPS);
+    // A game starts and the headset shows it. Its first reports also count the frames that the
+    // headset replaced while it showed nothing (31 of the display lock's 32 in flight), and a part
+    // of the second came before the first report.
+    let first = Some(Second { frames: 100, missed: 31, sent: 120, network_ms: 4.0 });
+    assert_eq!(control.tick(first), Some(Change::Seen { from: FLOOR_BPS, to: 200 * MBPS }));
+    for _ in 0..20 {
+        assert_eq!(control.tick(calm()), None);
+    }
+    assert_eq!(control.target(), 200 * MBPS);
+}
+
+#[test]
+fn the_last_second_before_the_stream_hides_cuts_nothing_that_stays() {
+    // The game ends: the headset reports half of the frames of the last second, then none
+    let mut control = Control::new(200 * MBPS, 200 * MBPS, FPS);
+    for _ in 0..5 {
+        control.tick(calm());
+    }
+    control.tick(Some(Second { frames: 60, missed: 0, sent: 120, network_ms: 4.0 }));
+    for _ in 0..5 {
+        control.tick(Some(Second { frames: 0, missed: 0, sent: 120, network_ms: 0.0 }));
+    }
+    // The next game starts at the full start, whatever that last second did
+    assert!(matches!(control.tick(Some(second(120, 31))), Some(Change::Seen { to, .. }) if to == 200 * MBPS));
 }
 
 #[test]
