@@ -1952,7 +1952,7 @@ index abf542e..df29531 100644
 +target_link_options(vulkan_runtime_smoke PRIVATE -static -static-libgcc -static-libstdc++)
 diff --git a/runtime/tests/vulkan_runtime_smoke.cpp b/runtime/tests/vulkan_runtime_smoke.cpp
 new file mode 100644
-index 0000000..f8f9990
+index 0000000..897f980
 --- /dev/null
 +++ b/runtime/tests/vulkan_runtime_smoke.cpp
 @@ -0,0 +1,561 @@
@@ -1961,7 +1961,7 @@ index 0000000..f8f9990
 +// It enables XR_KHR_vulkan_enable2 (or XR_KHR_vulkan_enable with --enable1), lets the runtime make
 +// its Vulkan instance and device, and draws a known picture into each eye for --seconds seconds at
 +// the runtime's pace. Each eye is exact black with a dim gray band down its left edge and a bright
-+// block in its upper half: orange in the left eye, blue in the right eye. A swap of the red and blue
++// block in its upper half: blue in the left eye, orange in the right eye, as in openvr_smoke.exe. A swap of the red and blue
 +// channels, a swap of the eyes and a picture upside down all show in a copy of the host's eyes.
 +// --array draws both eyes into one swapchain with two slices.
 +//
@@ -2057,8 +2057,8 @@ index 0000000..f8f9990
 +    VkClearRect bandRect{{{0, 0}, {std::max(1u, width / 16), height}}, 0, 1};
 +    vk.cmdClearAttachments(commands, 1, &band, 1, &bandRect);
 +    VkClearAttachment block = band;
-+    block.clearValue.color = eye == 0 ? VkClearColorValue{{0.90f, 0.35f, 0.0f, 1.0f}}
-+                                      : VkClearColorValue{{0.0f, 0.35f, 0.90f, 1.0f}};
++    block.clearValue.color = eye == 0 ? VkClearColorValue{{0.0f, 0.35f, 0.90f, 1.0f}}
++                                      : VkClearColorValue{{0.90f, 0.35f, 0.0f, 1.0f}};
 +    VkClearRect blockRect{{{static_cast<int32_t>(width / 4), static_cast<int32_t>(height / 8)},
 +                           {width / 2, height / 4}}, 0, 1};
 +    vk.cmdClearAttachments(commands, 1, &block, 1, &blockRect);
