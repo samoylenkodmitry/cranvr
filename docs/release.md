@@ -1,14 +1,38 @@
 # Releases
 
+## A release by tag
+
+A tag `vMAJOR.MINOR.PATCH` on a green commit of main makes a release: `git tag v0.2.0 && git push origin v0.2.0`. The tag sets the version. Nobody edits a version by hand. `.github/workflows/release.yml` then builds on GitHub's runners:
+
+- the Mac app as `cranvr-VERSION.dmg` (`scripts/release-app.sh`);
+- the headset app as `cranvr-client-VERSION.apk` (`scripts/build-client.sh`), with the version code `major * 1000000 + minor * 1000 + patch` (`scripts/release/version.sh`).
+
+It publishes both as the GitHub release of the tag. A pull request that changes the release setup runs the same builds and publishes nothing.
+
+The signatures come from the repository's secrets (Settings, Secrets and variables, Actions). The owner of the Apple and Meta accounts adds them once:
+
+| Secret | What it holds |
+|---|---|
+| `CRANVR_MACOS_DEVID_P12_BASE64` | The "Developer ID Application" certificate with its private key, exported as .p12, in base64 |
+| `CRANVR_MACOS_DEVID_P12_PASSWORD` | The password of that .p12 |
+| `CRANVR_ASC_API_KEY_P8_BASE64` | An App Store Connect API key (.p8, in base64) for Apple's notary service |
+| `CRANVR_ASC_API_KEY_ID` | The key's id |
+| `CRANVR_ASC_API_ISSUER_ID` | The key's issuer id |
+| `CRANVR_KEYSTORE_BASE64` | The headset app's upload keystore (see below), in base64 |
+| `CRANVR_KEYSTORE_PASSWORD` | Its password, which is also the key's password |
+| `CRANVR_KEY_ALIAS` | The key's alias |
+
+Without the Apple secrets the Mac app gets an ad-hoc signature and no notarization. The release notes then tell the user to clear the quarantine flag. Without the keystore secrets the APK carries the runner's debug key, which differs on each run. The release notes then tell the user to uninstall the old app first.
+
 ## The Mac app
 
 `scripts/release-app.sh` builds `target/release/cranvr-<version>.dmg`. The app inside is signed with the Developer ID, runs with the hardened runtime and is notarized and stapled, so a Mac that downloads it opens it without a warning. The disk image shows the Applications folder for a drag.
 
 1. Once, the owner of the Apple account makes a notarytool profile. It asks for an app-specific password from account.apple.com:
    `xcrun notarytool store-credentials cranvr --apple-id <Apple ID> --team-id YP97W9MQC8`
-2. Raise `version` in the root `Cargo.toml`.
-3. Run `scripts/release-app.sh`. Apple's check takes a few minutes.
-4. Upload the disk image to the public download page.
+2. Run `CRANVR_VERSION=MAJOR.MINOR.PATCH scripts/release-app.sh`. Apple's check takes a few minutes.
+
+A tag release does the same on GitHub and needs no step on a Mac. `scripts/release-app.sh --ad-hoc` builds the disk image with an ad-hoc signature and without Apple's check, as a tag run without the Apple secrets does.
 
 `scripts/release-app.sh --skip-notarize` signs and packs without Apple's check. macOS then refuses the app on other Macs. The build on this Mac keeps its "Apple Development" signature from `scripts/bundle-app.sh`, because macOS keeps Screen Recording and Accessibility per signature: a switch of signatures asks for both again.
 

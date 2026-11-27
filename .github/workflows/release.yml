@@ -1,0 +1,180 @@
+name: Release
+
+# A vMAJOR.MINOR.PATCH tag builds the Mac app and the headset APK of that commit and publishes
+# them as a GitHub release. A pull request that changes the release setup builds both and
+# publishes nothing. The runners are GitHub's: the repository is public, so it uses no runner of
+# its own.
+on:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "scripts/release/**"
+      - "scripts/release-app.sh"
+      - "scripts/bundle-app.sh"
+      - "scripts/build-client.sh"
+      - "scripts/build-quest-recorder.sh"
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  mac:
+    name: Mac app
+    runs-on: macos-latest
+    timeout-minutes: 60
+    outputs:
+      signed: ${{ steps.build.outputs.signed }}
+    env:
+      # Only a tag run signs and notarizes, and only when the owner added the secrets
+      SIGN: ${{ github.event_name == 'push' && secrets.CRANVR_MACOS_DEVID_P12_BASE64 != '' && secrets.CRANVR_ASC_API_KEY_P8_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - name: Version
+        run: bash scripts/release/version.sh >> "$GITHUB_ENV"
+      - name: Import the Developer ID certificate
+        if: env.SIGN == 'true'
+        env:
+          P12_BASE64: ${{ secrets.CRANVR_MACOS_DEVID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.CRANVR_MACOS_DEVID_P12_PASSWORD }}
+        run: bash scripts/release/macos-signing.sh prepare
+      - name: Build the disk image
+        id: build
+        env:
+          ASC_P8_BASE64: ${{ secrets.CRANVR_ASC_API_KEY_P8_BASE64 }}
+          CRANVR_ASC_KEY_ID: ${{ secrets.CRANVR_ASC_API_KEY_ID }}
+          CRANVR_ASC_ISSUER_ID: ${{ secrets.CRANVR_ASC_API_ISSUER_ID }}
+        run: |
+          if [ "$SIGN" = true ]; then
+            umask 077
+            printf '%s' "$ASC_P8_BASE64" | base64 -d > "$RUNNER_TEMP/asc.p8"
+            CRANVR_ASC_KEY="$RUNNER_TEMP/asc.p8" zsh scripts/release-app.sh
+          else
+            zsh scripts/release-app.sh --ad-hoc
+          fi
+          echo "signed=$SIGN" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cranvr-mac
+          path: target/release/cranvr-*.dmg
+          if-no-files-found: error
+          retention-days: 3
+      - name: Remove the signing material
+        if: always() && env.SIGN == 'true'
+        run: |
+          rm -f "$RUNNER_TEMP/asc.p8"
+          bash scripts/release/macos-signing.sh cleanup
+
+  headset:
+    name: Headset APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      signed: ${{ steps.build.outputs.signed }}
+    env:
+      SIGN: ${{ github.event_name == 'push' && secrets.CRANVR_KEYSTORE_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client
+          cache-bin: false
+      - name: Install the NDK, zsh and cargo-ndk
+        run: |
+          sudo apt-get update && sudo apt-get install -y zsh
+          sdkmanager "ndk;28.2.13676358"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+          cargo install cargo-ndk --locked
+      - name: Version
+        run: bash scripts/release/version.sh >> "$GITHUB_ENV"
+      - name: Restore the upload key
+        if: env.SIGN == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.CRANVR_KEYSTORE_BASE64 }}
+        run: |
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/cranvr-upload.jks"
+          echo "CRANVR_KEYSTORE=$RUNNER_TEMP/cranvr-upload.jks" >> "$GITHUB_ENV"
+      - name: Build the APK
+        id: build
+        env:
+          CRANVR_KEYSTORE_PASSWORD: ${{ secrets.CRANVR_KEYSTORE_PASSWORD }}
+          CRANVR_KEY_ALIAS: ${{ secrets.CRANVR_KEY_ALIAS }}
+        run: |
+          export ORG_GRADLE_PROJECT_cranvrVersionName="$CRANVR_VERSION"
+          export ORG_GRADLE_PROJECT_cranvrVersionCode="$CRANVR_VERSION_CODE"
+          zsh scripts/build-client.sh
+          mkdir -p dist
+          cp target/client/cranvr-client.apk "dist/cranvr-client-$CRANVR_VERSION.apk"
+          echo "signed=$SIGN" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cranvr-headset
+          path: dist/cranvr-client-*.apk
+          if-no-files-found: error
+          retention-days: 3
+      - name: Remove the upload key
+        if: always() && env.SIGN == 'true'
+        run: rm -f "$RUNNER_TEMP/cranvr-upload.jks"
+
+  publish:
+    name: Publish the release
+    if: github.event_name == 'push'
+    needs: [mac, headset]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Write the notes
+        env:
+          MAC_SIGNED: ${{ needs.mac.outputs.signed }}
+          HEADSET_SIGNED: ${{ needs.headset.outputs.signed }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          {
+            echo "- \`cranvr-$version.dmg\`: the Mac app. Open the disk image and drag cranvr to Applications."
+            echo "- \`cranvr-client-$version.apk\`: the headset app. Install it with \`adb install\` or SideQuest."
+            echo
+            echo "Both apps of a release come from one commit. Use them together."
+            if [ "$MAC_SIGNED" != true ]; then
+              echo
+              echo "This Mac app has no Developer ID signature. macOS refuses it until you run once:"
+              echo
+              echo '```'
+              echo "xattr -dr com.apple.quarantine /Applications/cranvr.app"
+              echo '```'
+            fi
+            if [ "$HEADSET_SIGNED" != true ]; then
+              echo
+              echo "This headset app carries a debug key of the build machine. It installs over no other release: uninstall the old cranvr app on the headset first. The headset then forgets its pairing and its settings."
+            fi
+          } > notes.md
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" artifacts/* --repo "$GITHUB_REPOSITORY" \
+            --title "cranvr ${GITHUB_REF_NAME#v}" --notes-file notes.md --verify-tag
