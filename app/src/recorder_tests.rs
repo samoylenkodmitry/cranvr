@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const SERIAL: &str = "2G0YC5ZH2000XX";
+const SERIAL: &str = "SERIAL0000001";
 
 // The headset's recorder as the tests play it: the file of a recording grows at each look
 #[derive(Default)]
