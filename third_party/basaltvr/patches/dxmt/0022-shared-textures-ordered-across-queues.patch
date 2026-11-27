@@ -15,14 +15,21 @@ the handle (cranvr issue #177). A keyed mutex orders its texture already (patch 
   chunk's commands ran and before its first encoder, the order step stores the chunk's writes in its slots. It reads
   the slots of the other queues. It encodes a wait on another queue's event only when the other GPU has not reached
   the value. No CPU waits for a GPU.
-- A commit takes a stamp from one counter of all DXMT processes of the session. A reader waits only for chunks that
+- A commit takes a stamp from one counter of all DXMT processes of the session. Each process keeps its handle of the
+  counter's section open: Wine drops a section's name with its last handle, also while a view maps it. A reader waits only for chunks that
   the writer committed before the reader's chunk. When such a chunk has not passed its order step yet, the reader's
   encode thread waits for the writer's encode thread (at most 100 ms). The GPU waits only for chunks that wrote the
   texture and passed their order step. So waits point back in one order: two processes that read each other's
   textures cannot wait for each other.
 - The order state lives in the TextureAllocation: every chunk that used it keeps it until the GPU has finished that
   chunk. The Texture itself may go earlier, during the encode.
-- The creator submits a shared texture's initial contents at once. A reader waits for that work too.
+- A queue joins the order when its device makes or opens a shared texture. An opener's slot comes when it opens the
+  texture. The creator's slot comes with the texture's first handle (GetSharedHandle or CreateSharedHandle). A
+  texture that never leaves by a handle, such as a swapchain image that BasaltVR gives to cranvr-host by its IOSurface
+  ID, gets no slot: a section costs about half a millisecond to make and as much to free under Wine. The creator's
+  slot starts with the event value of the queue's newest committed chunk. That value covers the writes that the
+  device flushed before the handle. The first handle also submits the texture's initial contents. A reader waits for
+  that work too.
 - A watch thread sets the events of a process that ended to the values that a GPU of this process waits for. A
   destroyed queue marks its section closed.
 - Each queue logs its counts every 10 s and at its end: the command buffers with shared textures, the waits that it
@@ -30,7 +37,7 @@ the handle (cranvr issue #177). A keyed mutex orders its texture already (patch 
   DXMT_SHARED_ORDER_STATS=1 also times each encoded wait until the other GPU's signal.
 
 diff --git c/src/d3d11/d3d11_texture_device.cpp i/src/d3d11/d3d11_texture_device.cpp
-index 35659a9..5db23c0 100644
+index 35659a9..5a124b6 100644
 --- c/src/d3d11/d3d11_texture_device.cpp
 +++ i/src/d3d11/d3d11_texture_device.cpp
 @@ -5,6 +5,7 @@
@@ -41,18 +48,104 @@ index 35659a9..5db23c0 100644
  #include "d3d11_resource.hpp"
  #include "util_env.hpp"
  #include "util_win32_compat.h"
-@@ -388,6 +389,29 @@ struct SharedResourceData {
+@@ -49,6 +50,12 @@ IsBasaltIOSurfaceCompatible(const WMTTextureInfo &info) {
+ 
+ #pragma region DeviceTexture
+ 
++// cranvr: when a shared texture joins the order of the queues that hold it (OrderSharedTexture)
++enum class SharedOrderStep { Make, Open, FirstHandle };
++static void OrderSharedTexture(
++    MTLD3D11Device *pDevice, Texture *texture, const char (&unique_name)[54], UINT misc_flags, SharedOrderStep step
++);
++
+ template <typename tag_texture>
+ class DeviceTexture : public TResourceBase<tag_texture, IMTLMinLODClampable> {
+ private:
+@@ -58,6 +65,9 @@ private:
+   D3DKMT_HANDLE global_kmt_ = 0;
+   // cranvr: the name under which this process serves the texture's port to other processes (winemetal's broker)
+   char served_name_[54] = {};
++  // cranvr: the unique name of a texture that this device made, for its slot in the order (ShareOrder)
++  char order_name_[54] = {};
++  bool order_shared_ = false;
+ 
+   using SRVBase =
+       TResourceViewBase<tag_shader_resource_view<DeviceTexture<tag_texture>>>;
+@@ -158,13 +168,15 @@ public:
+ 
+   DeviceTexture(
+       const tag_texture::DESC1 *pDesc, Rc<Texture> &&u_texture, D3DKMT_HANDLE localHandle, D3DKMT_HANDLE globalHandle,
+-      MTLD3D11Device *pDevice, const char *servedName = nullptr
++      MTLD3D11Device *pDevice, const char *servedName = nullptr, const char *uniqueName = nullptr
+   ) :
+       TResourceBase<tag_texture, IMTLMinLODClampable>(*pDesc, pDevice),
+       local_kmt_(localHandle), global_kmt_(globalHandle) {
+         this->texture_ = std::move(u_texture);
+         if (servedName)
+           snprintf(served_name_, sizeof(served_name_), "%s", servedName);
++        if (uniqueName)
++          snprintf(order_name_, sizeof(order_name_), "%s", uniqueName);
+       }
+ 
+   ~DeviceTexture() {
+@@ -314,6 +326,7 @@ public:
+       return E_INVALIDARG;
+     }
+ 
++    ShareOrder();
+     *pSharedHandle = reinterpret_cast<HANDLE>(global_kmt_);
+     return S_OK;
+   }
+@@ -350,9 +363,35 @@ public:
+       return E_FAIL;
+     }
+ 
++    ShareOrder();
+     return S_OK;
+   }
+ 
++  /*
++   * cranvr: the first handle of a texture that this device made puts the texture into the order of the queues that
++   * hold it (dxmt_shared_order.hpp). No other process can open the texture before that. A texture that never leaves
++   * by a handle, such as a game's swapchain image that BasaltVR gives to cranvr-host by its IOSurface ID, makes no
++   * slot: the slot's section costs about half a millisecond to make and as much to free under Wine, six of them for
++   * each swapchain of a texture array.
++   *
++   * The slot starts with the event value of the queue's newest committed chunk. That value covers every write that
++   * the device flushed before the handle, also of chunks whose encode comes later. DXMT clears a new texture, or fills
++   * it with its initial data, on the resource initializer's queue. The device's next chunk waits for that queue. The
++   * first handle submits that work too. The slot names the initializer event's value. A submit for each new texture
++   * would make the creation of a swapchain wait for the GPU: the initializer's queue holds two command buffers.
++   */
++  void ShareOrder() {
++    if (!order_name_[0])
++      return; // an opened texture got its slot when the device opened it
++    static dxmt::mutex lock;
++    std::lock_guard<dxmt::mutex> guard(lock);
++    if (std::exchange(order_shared_, true))
++      return;
++    OrderSharedTexture(
++        this->m_parent, this->texture_.ptr(), order_name_, this->desc.MiscFlags, SharedOrderStep::FirstHandle
++    );
++  }
++
+   void SetMinLOD(float MinLod) override { min_lod = MinLod; }
+ 
+   float GetMinLOD() override { return min_lod; }
+@@ -388,6 +427,39 @@ struct SharedResourceData {
    char server_name[54];
  };
  
 +/*
 + * cranvr: puts a shared texture without a keyed mutex into the order of the queues that hold it, so that another
 + * process's GPU waits for the writes that this device flushed (dxmt_shared_order.hpp). A keyed mutex orders its texture
-+ * already (patch 0014). The creator submits the texture's initial contents now: a reader waits for that work too.
++ * already (patch 0014). The device's queue joins the order when the device makes or opens such a texture: every chunk
++ * that may write the texture then carries a stamp. The texture's slot comes when the device opens the texture, or with
++ * the first handle of a texture that the device made (ShareOrder).
 + */
 +static void
 +OrderSharedTexture(MTLD3D11Device *pDevice, Texture *texture, const char (&unique_name)[54], UINT misc_flags,
-+                   bool creator) {
++                   SharedOrderStep step) {
 +  if (misc_flags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)
 +    return;
 +  char name[54];
@@ -62,24 +155,38 @@ index 35659a9..5db23c0 100644
 +    return;
 +  auto &queue = pDevice->GetDXMTDevice().queue();
 +  auto order = queue.SharedOrder();
-+  if (!order)
++  if (!order || step == SharedOrderStep::Make)
 +    return;
-+  uint64_t initial = creator ? queue.initializer.flushToWait() : 0;
-+  texture->current()->order = SharedOrderTexture::Create(order, name, initial);
++  auto allocation = texture->current();
++  if (allocation->order.load(std::memory_order_acquire))
++    return;
++  // An opener's chunks wrote nothing of the texture yet. Its initial contents are the creator's.
++  uint64_t written = 0, initial = 0;
++  if (step == SharedOrderStep::FirstHandle) {
++    initial = queue.initializer.flushToWait();
++    written = order->CommittedEvent();
++  }
++  allocation->order.store(SharedOrderTexture::Create(order, name, written, initial), std::memory_order_release);
 +}
 +
  template <typename tag>
  HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
                                      const typename tag::DESC1 *pDesc,
-@@ -494,6 +518,7 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
+@@ -494,9 +566,12 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
      // TODO: handle keyed mutex
  
      initialize(std::move(allocation));
-+    OrderSharedTexture(pDevice, texture.ptr(), runtimeData.mach_port_name, finalDesc.MiscFlags, true);
++    OrderSharedTexture(
++        pDevice, texture.ptr(), runtimeData.mach_port_name, finalDesc.MiscFlags, SharedOrderStep::Make
++    );
      *ppTexture = reinterpret_cast<typename tag::COM_IMPL *>(
          ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), create.hResource,
-                                    create.hGlobalShare, pDevice, runtimeData.server_name))
-@@ -576,7 +601,7 @@ template <typename tag>
+-                                   create.hGlobalShare, pDevice, runtimeData.server_name))
++                                   create.hGlobalShare, pDevice, runtimeData.server_name, runtimeData.mach_port_name))
+     );
+     if (iosurface_backed && iosurface_id)
+       (*ppTexture)->SetPrivateData(BASALT_GUID_IOSURFACE_ID, sizeof(iosurface_id), &iosurface_id);
+@@ -576,7 +651,7 @@ template <typename tag>
  HRESULT
  ImportSharedTextureInternal(
      MTLD3D11Device *pDevice, const typename tag::DESC1 *pDescUnchecked, mach_port_t MachPort, uint32_t IOSurfaceID,
@@ -88,15 +195,15 @@ index 35659a9..5db23c0 100644
  ) {
    bool IsIOSurface = IOSurfaceID != 0;
    WMTTextureInfo info;
-@@ -598,6 +623,7 @@ ImportSharedTextureInternal(
+@@ -598,6 +673,7 @@ ImportSharedTextureInternal(
    }
    uint32_t iosurface_id = allocation->iosurfaceID;
    texture->rename(std::move(allocation));
-+  OrderSharedTexture(pDevice, texture.ptr(), UniqueName, pDescUnchecked->MiscFlags, false);
++  OrderSharedTexture(pDevice, texture.ptr(), UniqueName, pDescUnchecked->MiscFlags, SharedOrderStep::Open);
  
    // cranvr: Com takes the first reference itself. With ref() as well the texture kept one reference too many: an
    // opened texture stayed with its memory until the process ended.
-@@ -668,15 +694,15 @@ ImportSharedTexture(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void
+@@ -668,15 +744,15 @@ ImportSharedTexture(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void
    {
    case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
      return ImportSharedTextureInternal<tag_texture_1d>(
@@ -115,7 +222,7 @@ index 35659a9..5db23c0 100644
      );
    default:
      ERR("ImportSharedTexture: Unsupported resource dimension");
-@@ -761,15 +787,15 @@ ImportSharedTextureFromNtHandle(MTLD3D11Device *pDevice, HANDLE hResource, REFII
+@@ -761,15 +837,15 @@ ImportSharedTextureFromNtHandle(MTLD3D11Device *pDevice, HANDLE hResource, REFII
    {
    case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
      return ImportSharedTextureInternal<tag_texture_1d>(
@@ -135,7 +242,7 @@ index 35659a9..5db23c0 100644
    default:
      ERR("ImportSharedTexture: Unsupported resource dimension");
 diff --git c/src/dxmt/dxmt_command_queue.cpp i/src/dxmt/dxmt_command_queue.cpp
-index 565a801..63383c2 100644
+index 565a801..66f8f58 100644
 --- c/src/dxmt/dxmt_command_queue.cpp
 +++ i/src/dxmt/dxmt_command_queue.cpp
 @@ -67,6 +67,7 @@ CommandQueue::~CommandQueue() {
@@ -152,7 +259,7 @@ index 565a801..63383c2 100644
    chunk.resource_initializer_event_id = initializer.flushToWait();
 +  // cranvr: the stamp and the commit go to the readers of the queue's shared textures before Flush returns
 +  auto order = shared_order_.load(std::memory_order_acquire);
-+  chunk.order_stamp = order ? order->Commit(chunk_id) : 0;
++  chunk.order_stamp = order ? order->Commit(chunk_id, chunk.chunk_event_id) : 0;
    auto& statistics = CurrentFrameStatistics();
    statistics.command_buffer_count++;
  #if ASYNC_ENCODING
@@ -254,7 +361,7 @@ index 92339bb..230c607 100644
  ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId, uint64_t event_seq_id) {
    assert(!encoder_current);
 diff --git c/src/dxmt/dxmt_context.hpp i/src/dxmt/dxmt_context.hpp
-index 6356fae..6c37549 100644
+index 6356fae..9bea72e 100644
 --- c/src/dxmt/dxmt_context.hpp
 +++ i/src/dxmt/dxmt_context.hpp
 @@ -1,5 +1,6 @@
@@ -268,7 +375,7 @@ index 6356fae..6c37549 100644
    WMT::Texture
    access(Rc<Texture> const &texture, unsigned level, unsigned slice, int flags) {
      auto allocation = texture->current();
-+    if (unlikely(allocation->order != nullptr))
++    if (unlikely(allocation->order.load(std::memory_order_acquire) != nullptr))
 +      noteSharedOrder(allocation, flags);
      retainAllocation(allocation);
      if (!allocation->flags().test(TextureAllocationFlag::GpuReadonly)) {
@@ -277,7 +384,7 @@ index 6356fae..6c37549 100644
    access(Rc<Texture> const &texture, uint64_t viewId, int flags) {
      assert(viewId);
      auto allocation = texture->current();
-+    if (unlikely(allocation->order != nullptr))
++    if (unlikely(allocation->order.load(std::memory_order_acquire) != nullptr))
 +      noteSharedOrder(allocation, flags);
      retainAllocation(allocation);
      auto &view = texture->view(viewId, allocation);
@@ -289,7 +396,7 @@ index 6356fae..6c37549 100644
 +  /* cranvr: notes that the chunk uses a texture that other queues share (dxmt_shared_order.hpp) */
 +  void
 +  noteSharedOrder(TextureAllocation *allocation, int flags) {
-+    auto order = allocation->order;
++    auto order = allocation->order.load(std::memory_order_relaxed);
 +    if (order->noted_chunk != seq_id_) {
 +      order->noted_chunk = seq_id_;
 +      order->noted_write = false;
@@ -333,10 +440,10 @@ index 3a51e7c..98eec91 100644
  
 diff --git c/src/dxmt/dxmt_shared_order.cpp i/src/dxmt/dxmt_shared_order.cpp
 new file mode 100644
-index 0000000..04daf83
+index 0000000..dd3481e
 --- /dev/null
 +++ i/src/dxmt/dxmt_shared_order.cpp
-@@ -0,0 +1,698 @@
+@@ -0,0 +1,709 @@
 +/*
 + * cranvr: the order of the GPU work of two queues on a shared texture. dxmt_shared_order.hpp says why and how.
 + */
@@ -412,9 +519,11 @@ index 0000000..04daf83
 +        CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, 4096, L"Local\\dxmt_order_stamps");
 +    if (!mapping)
 +      return nullptr;
-+    // The view keeps the section for the life of the process
++    // The handle stays open for the life of the process. Wine drops a section's name with its last handle, also
++    // while a view maps it: the next process then made a counter of its own.
 +    void *view = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, 4096);
-+    CloseHandle(mapping);
++    if (!view)
++      CloseHandle(mapping);
 +    return static_cast<std::atomic<uint64_t> *>(view);
 +  }();
 +  return stamps;
@@ -537,8 +646,8 @@ index 0000000..04daf83
 +  std::unordered_map<uint64_t, SharedOrderLink *> links_;
 +};
 +
-+/* A thread of each process. It ends the waits of the process's GPUs for a process that has gone. It also times the waits
-+ * with DXMT_SHARED_ORDER_STATS=1. It lives until the process ends. */
++/* A thread of each process. It ends the waits of the process's GPUs for a process that has gone. It also times the
++ * waits with DXMT_SHARED_ORDER_STATS=1. It lives until the process ends. */
 +class Watch {
 +public:
 +  static Watch &
@@ -690,7 +799,7 @@ index 0000000..04daf83
 +} // namespace
 +
 +SharedOrderTexture *
-+SharedOrderTexture::Create(SharedOrderQueue *queue, const char *unique_name, uint64_t initial) {
++SharedOrderTexture::Create(SharedOrderQueue *queue, const char *unique_name, uint64_t written, uint64_t initial) {
 +  std::wstring name = Wide(std::string("Local\\dxmt_order_") + unique_name);
 +  HANDLE mapping =
 +      CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(SharedOrderSection), name.c_str());
@@ -707,8 +816,9 @@ index 0000000..04daf83
 +    auto &slot = section->slots[i];
 +    if (!slot.queue.compare_exchange_strong(free, queue->Id(), std::memory_order_acq_rel))
 +      continue;
-+    // A freed slot holds zeros; the creator's initial contents come before the handle leaves the process
-+    slot.initial.store(initial, std::memory_order_release);
++    // A freed slot holds zeros. The texture leaves the process only after this: no reader looks at the slot yet.
++    slot.initial.store(initial, std::memory_order_relaxed);
++    slot.written.store(written, std::memory_order_relaxed);
 +    uint32_t used = section->used.load(std::memory_order_relaxed);
 +    while (used < i + 1 && !section->used.compare_exchange_weak(used, i + 1, std::memory_order_acq_rel))
 +      ;
@@ -727,7 +837,9 @@ index 0000000..04daf83
 +  }
 +  static bool told = false;
 +  if (!std::exchange(told, true))
-+    WARN("cranvr: shared order: all ", kSharedOrderSlots, " slots of a shared texture are taken: no order for one more");
++    WARN(
++        "cranvr: shared order: all ", kSharedOrderSlots, " slots of a shared texture are taken: no order for one more"
++    );
 +  UnmapViewOfFile(section);
 +  CloseHandle(mapping);
 +  return nullptr;
@@ -830,7 +942,8 @@ index 0000000..04daf83
 +}
 +
 +uint64_t
-+SharedOrderQueue::Commit(uint64_t chunk) {
++SharedOrderQueue::Commit(uint64_t chunk, uint64_t event) {
++  committed_event_.store(event, std::memory_order_release);
 +  uint64_t stamp = stamps_->fetch_add(1, std::memory_order_seq_cst) + 1;
 +  auto &entry = progress_->ring[chunk % kSharedOrderRing];
 +  entry.stamp.store(stamp, std::memory_order_relaxed);
@@ -959,16 +1072,21 @@ index 0000000..04daf83
 +  auto begin = steady::now();
 +  stats_.chunks++;
 +  for (TextureAllocation *allocation : used) {
-+    auto order = allocation->order;
-+    if (order->noted_write) {
-+      auto &slot = order->section_->slots[order->slot_];
-+      slot.previous.store(slot.written.load(std::memory_order_relaxed), std::memory_order_release);
++    auto order = allocation->order.load(std::memory_order_relaxed);
++    if (!order->noted_write)
++      continue;
++    auto &slot = order->section_->slots[order->slot_];
++    uint64_t written = slot.written.load(std::memory_order_relaxed);
++    // A chunk that the queue committed before the texture's first handle may come here after it: the slot's first
++    // value covers its write already
++    if (event > written) {
++      slot.previous.store(written, std::memory_order_release);
 +      slot.written.store(event, std::memory_order_release);
 +    }
 +  }
 +  waits_.clear();
 +  for (TextureAllocation *allocation : used) {
-+    auto order = allocation->order;
++    auto order = allocation->order.load(std::memory_order_relaxed);
 +    auto section = order->section_;
 +    unsigned count = std::min(section->used.load(std::memory_order_acquire), kSharedOrderSlots);
 +    for (unsigned i = 0; i < count; i++) {
@@ -1021,8 +1139,8 @@ index 0000000..04daf83
 +  // A queue whose shared textures no other queue holds logs nothing, unless DXMT_SHARED_ORDER_STATS=1 asks
 +  if (stats_.others || (timing_ && stats_.chunks)) {
 +    Logger::info(str::format(
-+        "cranvr: shared order: queue ", Hex(id_), " of ", env::getExeName(), last ? " at its end" : "", ", in the last ",
-+        seconds, " s: ",
++        "cranvr: shared order: queue ", Hex(id_), " of ", env::getExeName(), last ? " at its end" : "",
++        ", in the last ", seconds, " s: ",
 +        stats_.chunks, " command buffers used shared textures, ", stats_.others,
 +        " of them textures that other queues hold (", stats_.checks, " looks at another queue); ", stats_.waits,
 +        " waits encoded for another GPU; the step took ", stats_.step_us / stats_.chunks, " us on average and ",
@@ -1037,10 +1155,10 @@ index 0000000..04daf83
 +} // namespace dxmt
 diff --git c/src/dxmt/dxmt_shared_order.hpp i/src/dxmt/dxmt_shared_order.hpp
 new file mode 100644
-index 0000000..18f58be
+index 0000000..d9ac809
 --- /dev/null
 +++ i/src/dxmt/dxmt_shared_order.hpp
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,224 @@
 +#pragma once
 +/*
 + * cranvr: the order of the GPU work of two queues on a shared texture (cranvr issue #177).
@@ -1077,15 +1195,25 @@ index 0000000..18f58be
 + * That chunk came after the reader's chunk. The reader then waits for the write before it, which the slot keeps too.
 + * That write covers every write that the reader owes.
 + *
++ * When a texture gets its slots. A queue joins the order when its device makes or opens a shared texture, so every
++ * chunk that may write the texture carries a stamp. An opener's slot comes when it opens the texture. The creator's
++ * slot comes with the texture's first handle: no other process can open the texture before that. A texture that never
++ * leaves by a handle, such as a game's swapchain image that BasaltVR gives to cranvr-host by its IOSurface ID, gets no
++ * slot. A slot's section costs about half a millisecond to make and as much to free under Wine: six of them for each
++ * swapchain of a texture array made the creation of such a swapchain three times as slow. The creator's slot starts
++ * with the event value of the queue's newest committed chunk. That value covers every write before the handle, also of
++ * the chunks whose order step comes after the handle. Such a chunk stores no older value later.
++ *
 + * Initial contents. DXMT clears a new texture, or fills it with its initial data, on a queue of its own (the resource
-+ * initializer). The device's next chunk waits for that queue. The creator of a shared texture submits that work at
-+ * once. It puts the initializer event's value into its slot. The broker serves the initializer event too.
++ * initializer). The device's next chunk waits for that queue. When the creator gives out the texture's first handle,
++ * it submits that work and puts the initializer event's value into its slot. The broker serves the initializer event
++ * too.
 + *
 + * Cost. A queue without a shared texture pays nothing. A queue with one pays one atomic add on the shared counter and
-+ * three stores at each commit. It pays two stores at each encode, plus two stores for each shared texture that the
++ * four stores at each commit. It pays two stores at each encode, plus two stores for each texture with a slot that the
 + * chunk wrote. A chunk that uses a shared texture of another queue reads a few words of shared memory. It asks the
 + * other queue's event for its value only when the value is new. It encodes a wait only when the other GPU has not
-+ * reached the value. A game whose swapchain images only cranvr-host reads pays the stores alone.
++ * reached the value. A game whose swapchain images only cranvr-host reads pays the stores at commit and encode alone.
 + *
 + * Why not other ways:
 + * - A shared event for each texture, signalled at the writer's flush: the flush does not know which textures its
@@ -1158,7 +1286,9 @@ index 0000000..18f58be
 +/* A texture's slot in its section. Created on the app's thread; the encode thread of the texture's queue uses it. */
 +class SharedOrderTexture {
 +public:
-+  static SharedOrderTexture *Create(SharedOrderQueue *queue, const char *unique_name, uint64_t initial);
++  /* `written` and `initial` start the slot: the creator's writes and initial contents before the first handle */
++  static SharedOrderTexture *
++  Create(SharedOrderQueue *queue, const char *unique_name, uint64_t written, uint64_t initial);
 +  ~SharedOrderTexture();
 +
 +  // The encode thread's notes: the chunk that used the texture last, whether that chunk writes it
@@ -1199,7 +1329,13 @@ index 0000000..18f58be
 +  }
 +
 +  /* The app's thread, at the commit of a chunk: returns the chunk's stamp */
-+  uint64_t Commit(uint64_t chunk);
++  uint64_t Commit(uint64_t chunk, uint64_t event);
++
++  /* The event value of the newest committed chunk, for a texture's first handle on any thread */
++  uint64_t
++  CommittedEvent() const {
++    return committed_event_.load(std::memory_order_acquire);
++  }
 +
 +  /* The encode thread, after the chunk's commands ran and before its first Metal encoder */
 +  void Order(
@@ -1228,6 +1364,7 @@ index 0000000..18f58be
 +  void *mapping_ = nullptr;
 +  SharedOrderProgress *progress_ = nullptr;
 +  std::atomic<uint64_t> *stamps_ = nullptr;
++  std::atomic<uint64_t> committed_event_ = 0;
 +  bool timing_ = false;
 +  std::vector<Wait> waits_;
 +
@@ -1247,7 +1384,7 @@ index 0000000..18f58be
 +
 +} // namespace dxmt
 diff --git c/src/dxmt/dxmt_texture.cpp i/src/dxmt/dxmt_texture.cpp
-index 970b30f..ae30d6c 100644
+index 970b30f..ca66031 100644
 --- c/src/dxmt/dxmt_texture.cpp
 +++ i/src/dxmt/dxmt_texture.cpp
 @@ -1,4 +1,5 @@
@@ -1260,12 +1397,12 @@ index 970b30f..ae30d6c 100644
    // cranvr: the right of a shared texture held its IOSurface until the process ended
    if (machPort)
      WMTMachPortDeallocate(machPort);
-+  delete order;
++  delete order.load(std::memory_order_acquire);
  };
  
  void
 diff --git c/src/dxmt/dxmt_texture.hpp i/src/dxmt/dxmt_texture.hpp
-index fb207b8..08258d4 100644
+index fb207b8..7cb4bae 100644
 --- c/src/dxmt/dxmt_texture.hpp
 +++ i/src/dxmt/dxmt_texture.hpp
 @@ -66,6 +66,7 @@ struct TextureViewKey {
@@ -1276,18 +1413,19 @@ index fb207b8..08258d4 100644
  
  class TextureView {
  public:
-@@ -133,6 +134,10 @@ public:
+@@ -133,6 +134,11 @@ public:
    mach_port_t machPort;
    uint32_t iosurfaceID;
    small_vector<GenericAccessTracker, 1> fenceTrackers;
 +  // cranvr: the slot of a shared texture without a keyed mutex in the order of the queues that hold it
-+  // (dxmt_shared_order.hpp); set before the first use. It goes with the allocation, which every chunk that used it
-+  // keeps until the GPU has finished that chunk: the Texture itself may go earlier.
-+  SharedOrderTexture *order = nullptr;
++  // (dxmt_shared_order.hpp). An opener sets it before the first use. A creator sets it at the texture's first handle,
++  // on any thread, while the encode thread may run chunks that use the texture. It goes with the allocation, which
++  // every chunk that used it keeps until the GPU has finished that chunk: the Texture itself may go earlier.
++  std::atomic<SharedOrderTexture *> order = nullptr;
  
  private:
    TextureAllocation(
-@@ -268,6 +273,7 @@ public:
+@@ -268,6 +274,7 @@ public:
  
    Texture(unsigned bytes_per_image, unsigned bytes_per_row, const WMTTextureInfo &info, WMT::Device device);
  
