@@ -1467,19 +1467,27 @@ private:
 
 // SteamVR multiplies the size that the driver recommends by a factor of its own, which it takes from a measurement of
 // the GPU: up to 1.5 times the area. cranvr's game render size and the host's learned share decide a game's size in
-// OpenXR games, so they decide it here too: SteamVR's factor stays 1. The settings persist in steamvr.vrsettings. The
-// driver sets them again at each start, also when Steam or scripts/run-game.sh starts SteamVR.
+// OpenXR games, so they decide it here too: SteamVR's render scale is manual. The setting persists in
+// steamvr.vrsettings. The driver sets it again at each start, also when Steam or scripts/run-game.sh starts SteamVR.
+// The manual scale itself is 1 unless the user set another one on SteamVR's settings page: SteamVR lets no driver
+// change it ("Blocking driver cranvr attempt to set setting steamvr/supersampleScale").
 void KeepRenderScale() {
     EVRSettingsError error = VRSettingsError_None;
     bool manual = VRSettings()->GetBool(k_pch_SteamVR_Section, k_pch_SteamVR_SupersampleManualOverride_Bool, &error);
     float scale = VRSettings()->GetFloat(k_pch_SteamVR_Section, k_pch_SteamVR_SupersampleScale_Float, &error);
-    if (manual && scale == 1.0f) {
-        return;
+    if (!manual) {
+        error = VRSettingsError_None;
+        VRSettings()->SetBool(k_pch_SteamVR_Section, k_pch_SteamVR_SupersampleManualOverride_Bool, true, &error);
+        if (error == VRSettingsError_None) {
+            Log("SteamVR's render scale was automatic: the driver set it to manual, so games render at the size it recommends");
+        } else {
+            Log("SteamVR refused the manual render scale (error %d): games render at SteamVR's own scale", error);
+        }
     }
-    VRSettings()->SetBool(k_pch_SteamVR_Section, k_pch_SteamVR_SupersampleManualOverride_Bool, true);
-    VRSettings()->SetFloat(k_pch_SteamVR_Section, k_pch_SteamVR_SupersampleScale_Float, 1.0f);
-    Log("SteamVR's render scale was %s at %.2f: the driver set it to manual at 1, so games render at the size it recommends",
-        manual ? "manual" : "automatic", scale);
+    if (scale != 1.0f) {
+        Log("SteamVR's settings hold a manual render scale of %.2f, which only its settings page changes: games render at that share "
+            "of the size that the driver recommends", scale);
+    }
 }
 
 EVRInitError Driver::Init(IVRDriverContext *context) {
