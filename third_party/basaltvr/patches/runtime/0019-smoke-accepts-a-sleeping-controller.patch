@@ -1,0 +1,242 @@
+diff --git i/runtime/tests/d3d11_runtime_smoke.cpp w/runtime/tests/d3d11_runtime_smoke.cpp
+index 9af1dda..377374a 100644
+--- i/runtime/tests/d3d11_runtime_smoke.cpp
++++ w/runtime/tests/d3d11_runtime_smoke.cpp
+@@ -58,6 +58,18 @@ bool requireControllerInput() {
+     return value != nullptr && std::strcmp(value, "1") == 0;
+ }
+ 
++// cranvr: BASALT_ACCEPT_MISSING_CONTROLLER=1 is the mode for cranvr-host with a headset whose
++// controllers may sleep. The host gives a game the Touch profile of both hands at its start, also
++// while no controller pose comes, as Unity needs. The left hand may then have the Touch profile
++// with inactive actions, or no profile at all. The program checks the controller's values only
++// while its actions are active, and it waits for no controller. Without the variable the program
++// knows two modes: no profile (no controller), and BASALT_REQUIRE_CONTROLLER_INPUT=1 or the native
++// daemon's injected controller.
++bool acceptMissingController() {
++    const char* value = std::getenv("BASALT_ACCEPT_MISSING_CONTROLLER");
++    return value != nullptr && std::strcmp(value, "1") == 0;
++}
++
+ uint32_t expectedViewDimension(const char* name, uint32_t fallback) {
+     const char* value = std::getenv(name);
+     if (value == nullptr || value[0] == '\0') {
+@@ -398,6 +410,32 @@ bool expectNoEvent(XrInstance instance) {
+     return true;
+ }
+ 
++// cranvr: takes the interaction-profile events of this session that wait in the queue and counts
++// them. Each hand's profile may change in its own xrSyncActions. Any other event fails: -1.
++int takeInteractionProfileChanges(XrInstance instance, XrSession session) {
++    int count = 0;
++    for (;;) {
++        XrEventDataBuffer eventData{};
++        eventData.type = XR_TYPE_EVENT_DATA_BUFFER;
++        const XrResult result = xrPollEvent(instance, &eventData);
++        if (result == XR_EVENT_UNAVAILABLE) {
++            return count;
++        }
++        const auto* changed =
++            reinterpret_cast<const XrEventDataInteractionProfileChanged*>(&eventData);
++        if (result != XR_SUCCESS ||
++            eventData.type != XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED ||
++            changed->session != session) {
++            std::fprintf(
++                stderr,
++                "FAIL: expected only interaction-profile events, got XrResult %d/type %d\n",
++                result, static_cast<int>(eventData.type));
++            return -1;
++        }
++        ++count;
++    }
++}
++
+ bool expectInteractionProfileChanged(XrInstance instance, XrSession session) {
+     XrEventDataBuffer eventData{};
+     eventData.type = XR_TYPE_EVENT_DATA_BUFFER;
+@@ -1098,6 +1136,8 @@ int main(int argc, char** argv) {
+     result = xrGetActionStateFloat(session, &getInfo, &floatState);
+     const bool injectedController = expectInjectedHeadPose();
+     const bool requireController = injectedController || requireControllerInput();
++    // cranvr: the left controller may sleep, so its actions may be inactive
++    const bool mayLackController = !requireController && acceptMissingController();
+     if (XR_SUCCEEDED(result) && requireController &&
+         floatState.isActive != XR_TRUE) {
+         // StreamReady only proves that ALVR's sockets are live. A Touch
+@@ -1121,11 +1161,14 @@ int main(int argc, char** argv) {
+             Sleep(10);
+         }
+     }
++    // cranvr: with a controller that may sleep, the squeeze has a value only while it is active
++    const bool squeezeActive =
++        mayLackController ? floatState.isActive == XR_TRUE : requireController;
+     if (XR_FAILED(result) ||
+-        floatState.isActive != (requireController ? XR_TRUE : XR_FALSE) ||
++        floatState.isActive != (squeezeActive ? XR_TRUE : XR_FALSE) ||
+         (injectedController && !nearlyEqual(floatState.currentState, 0.75f)) ||
+-        (!requireController && floatState.currentState != 0.0f) ||
+-        (requireControllerInput() &&
++        (!squeezeActive && floatState.currentState != 0.0f) ||
++        ((requireControllerInput() || squeezeActive) &&
+          (!std::isfinite(floatState.currentState) || floatState.currentState < 0.0f ||
+           floatState.currentState > 1.0f)) ||
+         (injectedController && floatState.lastChangeTime <= 0) ||
+@@ -1133,11 +1176,12 @@ int main(int argc, char** argv) {
+         std::fprintf(
+             stderr,
+             "INFO: initial float state active=%u current=%.3f changed=%u "
+-            "changeTime=%lld requireController=%u injected=%u\n",
++            "changeTime=%lld requireController=%u injected=%u mayLack=%u\n",
+             floatState.isActive, floatState.currentState,
+             floatState.changedSinceLastSync,
+             static_cast<long long>(floatState.lastChangeTime),
+-            requireController ? 1u : 0u, injectedController ? 1u : 0u);
++            requireController ? 1u : 0u, injectedController ? 1u : 0u,
++            mayLackController ? 1u : 0u);
+         xrDestroySession(session);
+         release(context);
+         release(device);
+@@ -1181,7 +1225,8 @@ int main(int argc, char** argv) {
+         }
+     }
+     if (XR_FAILED(result) ||
+-        poseState.isActive != (requireController ? XR_TRUE : XR_FALSE)) {
++        (!mayLackController &&
++         poseState.isActive != (requireController ? XR_TRUE : XR_FALSE))) {
+         xrDestroySession(session);
+         release(context);
+         release(device);
+@@ -1192,15 +1237,48 @@ int main(int argc, char** argv) {
+     XrInteractionProfileState profileState{};
+     profileState.type = XR_TYPE_INTERACTION_PROFILE_STATE;
+     result = xrGetCurrentInteractionProfile(session, leftHandPath, &profileState);
++    if (mayLackController) {
++        // cranvr: the host's profiles follow its HelloAck. A few syncs in the first second take
++        // them; a host that gives none leaves the hand without a profile.
++        for (int attempt = 0; attempt < 100 && XR_SUCCEEDED(result) &&
++                              profileState.interactionProfile == XR_NULL_PATH;
++             ++attempt) {
++            Sleep(10);
++            result = xrSyncActions(session, &syncInfo);
++            if (XR_SUCCEEDED(result)) {
++                result = xrGetCurrentInteractionProfile(session, leftHandPath, &profileState);
++            }
++        }
++    }
++    // cranvr: the bindings of a hand follow its profile, not the activity of its actions
++    const bool controllerBound = mayLackController
++        ? profileState.interactionProfile == touchProfilePath
++        : requireController;
+     if (XR_FAILED(result) || profileState.interactionProfile !=
+-            (requireController ? touchProfilePath : XR_NULL_PATH)) {
++            (controllerBound ? touchProfilePath : XR_NULL_PATH)) {
+         xrDestroySession(session);
+         release(context);
+         release(device);
+         xrDestroyInstance(instance);
+         return fail("xrGetCurrentInteractionProfile", result);
+     }
+-    if (!(requireController
++    if (mayLackController) {
++        const int changes = takeInteractionProfileChanges(instance, session);
++        if (changes < 0 || (controllerBound ? changes < 1 : changes != 0)) {
++            std::fprintf(stderr, "FAIL: %d interaction-profile events for a %s left hand\n",
++                         changes, controllerBound ? "Touch" : "profileless");
++            xrDestroySession(session);
++            release(context);
++            release(device);
++            xrDestroyInstance(instance);
++            return 1;
++        }
++        std::printf(
++            "INFO: the left hand has %s; its squeeze is %s and its pose is %s\n",
++            controllerBound ? "the Touch profile" : "no profile",
++            floatState.isActive == XR_TRUE ? "active" : "inactive",
++            poseState.isActive == XR_TRUE ? "active" : "inactive");
++    } else if (!(requireController
+               ? expectInteractionProfileChanged(instance, session)
+               : expectNoEvent(instance)) ||
+         !expectNoEvent(instance)) {
+@@ -1217,7 +1295,7 @@ int main(int argc, char** argv) {
+     uint32_t boundSourceCount = UINT32_MAX;
+     result = xrEnumerateBoundSourcesForAction(
+         session, &boundSourcesInfo, 0, &boundSourceCount, nullptr);
+-    if (XR_FAILED(result) || boundSourceCount != (requireController ? 1u : 0u)) {
++    if (XR_FAILED(result) || boundSourceCount != (controllerBound ? 1u : 0u)) {
+         xrDestroySession(session);
+         release(context);
+         release(device);
+@@ -1225,7 +1303,7 @@ int main(int argc, char** argv) {
+         return fail("xrEnumerateBoundSourcesForAction", result);
+     }
+     XrPath boundSource = XR_NULL_PATH;
+-    if (requireController) {
++    if (controllerBound) {
+         result = xrEnumerateBoundSourcesForAction(
+             session, &boundSourcesInfo, 1, &boundSourceCount, &boundSource);
+         if (XR_FAILED(result) || boundSourceCount != 1 || boundSource != squeezePath) {
+@@ -1239,14 +1317,14 @@ int main(int argc, char** argv) {
+ 
+     XrInputSourceLocalizedNameGetInfo localizedNameInfo{};
+     localizedNameInfo.type = XR_TYPE_INPUT_SOURCE_LOCALIZED_NAME_GET_INFO;
+-    localizedNameInfo.sourcePath = requireController ? boundSource : squeezePath;
++    localizedNameInfo.sourcePath = controllerBound ? boundSource : squeezePath;
+     localizedNameInfo.whichComponents =
+         XR_INPUT_SOURCE_LOCALIZED_NAME_USER_PATH_BIT |
+         XR_INPUT_SOURCE_LOCALIZED_NAME_COMPONENT_BIT;
+     uint32_t localizedNameCount = UINT32_MAX;
+     result = xrGetInputSourceLocalizedName(
+         session, &localizedNameInfo, 0, &localizedNameCount, nullptr);
+-    if (requireController) {
++    if (controllerBound) {
+         constexpr const char* kLocalized = "Left Hand Squeeze";
+         char localizedName[64]{};
+         const uint32_t expectedCount = static_cast<uint32_t>(std::strlen(kLocalized) + 1);
+@@ -1499,9 +1577,22 @@ int main(int argc, char** argv) {
+         XR_SPACE_LOCATION_POSITION_VALID_BIT |
+         XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT |
+         XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
+-    const XrSpaceLocationFlags expectedControllerFlags =
+-        requireController ? kControllerTrackedFlags : 0;
+-    if (XR_FAILED(result) || location.locationFlags != expectedControllerFlags ||
++    // cranvr: a controller that may sleep is either tracked or not at each locate: it may wake
++    // during the run. Only a tracked one has a pose to check.
++    const auto controllerFlagsFit = [&](XrSpaceLocationFlags flags) {
++        if (mayLackController) {
++            return flags == 0 || flags == kControllerTrackedFlags;
++        }
++        return flags == (requireController ? kControllerTrackedFlags : 0);
++    };
++    const auto trackedPoseFinite = [](const XrSpaceLocation& located) {
++        return located.locationFlags == 0 ||
++               (std::isfinite(located.pose.position.x) && std::isfinite(located.pose.position.y) &&
++                std::isfinite(located.pose.position.z) &&
++                std::isfinite(located.pose.orientation.w));
++    };
++    if (XR_FAILED(result) || !controllerFlagsFit(location.locationFlags) ||
++        (mayLackController && !trackedPoseFinite(location)) ||
+         (injectedController &&
+          (!nearlyEqual(location.pose.position.x, -0.1f) ||
+           !nearlyEqual(location.pose.position.y, 1.2f) ||
+@@ -1692,14 +1783,19 @@ int main(int argc, char** argv) {
+         return fail("create space from destroyed action", result);
+     }
+     result = xrLocateSpace(handSpace, localSpace, locateTime, &location);
+-    if (XR_FAILED(result) || location.locationFlags != expectedControllerFlags) {
++    if (XR_FAILED(result) || !controllerFlagsFit(location.locationFlags) ||
++        (mayLackController && !trackedPoseFinite(location))) {
+         xrDestroySession(session);
+         release(context);
+         release(device);
+         xrDestroyInstance(instance);
+         return fail("action space after xrDestroyAction", result);
+     }
+-    if (requireControllerInput()) {
++    if (mayLackController && location.locationFlags == 0) {
++        std::printf("INFO: the left controller is not tracked: the program checked no pose of it\n");
++    }
++    if (requireControllerInput() ||
++        (mayLackController && location.locationFlags == kControllerTrackedFlags)) {
+         std::printf(
+             "PASS: live left controller reached OpenXR actions "
+             "(squeeze %.3f, position %.3f %.3f %.3f)\n",
