@@ -1,5 +1,11 @@
 # cranvr
 
+
+
+https://github.com/user-attachments/assets/8c58fbfc-4ba8-43ad-a4a8-9bc6d51156b0
+
+
+
 cranvr streams VR from an Apple Silicon Mac to a Meta Quest. The Mac side is Rust. It renders and composes with Metal, encodes HEVC with VideoToolbox and sends the frames with cranvr's own protocol (`proto/`, crate `cranvr-proto`). The headset side is a Cranpose app (`client/`, package `cranvr-client`, application id `dev.cranvr.client`). It uses only Cranpose's public API and plain Rust crates. It has no ndk, JNI, GL, OpenXR or platform code of its own. The same crate also builds as a flat app for an Android phone or tablet.
 
 The goal is to play Windows SteamVR games on a Quest from a Mac. Windows games run under Wine with the OpenXR runtime and the DXMT fork from [BasaltVR](https://github.com/Stooovie/BasaltVR) (MIT). A game that speaks OpenVR runs through [OpenComposite](https://gitlab.com/znixian/OpenOVR) (GPL 3), which turns its OpenVR calls into OpenXR calls to that runtime. The game's frames reach the host as shared IOSurfaces. No frame of a Direct3D 11 or Vulkan game passes through the CPU. An OpenGL game's frames do: OpenComposite copies them into the runtime's images (see "OpenVR games").
