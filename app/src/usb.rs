@@ -693,7 +693,7 @@ mod tests {
 * daemon not running; starting now at tcp:5037
 * daemon started successfully
 R52R40K1F2A            device usb:51511296X product:gts7xlwifiser model:SM_T970 device:gts7xlwifi transport_id:3594
-2G0YC5ZH2000XX         unauthorized usb:1-1 transport_id:2
+SERIAL0000001         unauthorized usb:1-1 transport_id:2
 0123456789ABCDEF       offline usb:2-3 transport_id:7
 192.168.1.55:5555      device product:eureka_user model:Quest_3 device:eureka transport_id:5
 adb-2G0YC5ZH-ab._adb-tls-connect._tcp device product:eureka_user model:Quest_3 device:eureka transport_id:6
@@ -706,7 +706,7 @@ emulator-5554          device product:sdk_gphone64 model:sdk device:emu64 transp
         let devices = parse_devices(DEVICES);
         assert_eq!(devices.len(), 6, "{devices:?}");
         assert_eq!(devices[0], Listed { serial: "R52R40K1F2A".into(), state: DeviceState::Device, usb: true });
-        assert_eq!(devices[1], Listed { serial: "2G0YC5ZH2000XX".into(), state: DeviceState::Unauthorized, usb: true });
+        assert_eq!(devices[1], Listed { serial: "SERIAL0000001".into(), state: DeviceState::Unauthorized, usb: true });
         assert_eq!(devices[2].state, DeviceState::Offline);
         // Devices of Wi-Fi debugging and emulators are no cable
         assert!(devices[3..].iter().all(|d| !d.usb && d.state == DeviceState::Device));
