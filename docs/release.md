@@ -2,12 +2,12 @@
 
 ## A release by tag
 
-A tag `vMAJOR.MINOR.PATCH` on a green commit of main makes a release: `git tag v0.2.0 && git push origin v0.2.0`. The tag sets the version. Nobody edits a version by hand. `.github/workflows/release.yml` then builds on GitHub's runners:
+A tag `vMAJOR.MINOR.PATCH` on a green commit of main makes a release: `git tag v0.2.0 && git push origin v0.2.0`. The tag sets the version. Nobody edits a version by hand. `.github/workflows/release.yml` then builds on the owner's runners (a Mac with the label `idle-mac`, which takes jobs only while it sits idle on power or after the owner agrees, and a Linux machine with the label `samarch1`):
 
 - the Mac app as `cranvr-VERSION.dmg` (`scripts/release-app.sh`);
 - the headset app as `cranvr-client-VERSION.apk` (`scripts/build-client.sh`), with the version code `major * 1000000 + minor * 1000 + patch` (`scripts/release/version.sh`).
 
-It publishes both as the GitHub release of the tag. A pull request that changes the release setup runs the same builds and publishes nothing.
+It publishes both as the GitHub release of the tag. A pull request that changes the release setup runs the same builds on GitHub's runners and publishes nothing: code from a fork never runs on the owner's machines. A pull request from an outside contributor runs no workflow until the owner approves it.
 
 The signatures come from the repository's secrets (Settings, Secrets and variables, Actions). The owner of the Apple and Meta accounts adds them once:
 
