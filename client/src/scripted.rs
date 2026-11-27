@@ -17,6 +17,16 @@
 //!   2 s: a hand alone presses a hologram (#111). Launch it with `interface=3d`, `console=true`,
 //!   `console_page` and `default_places`. The log names the change ("scripted pinch:"), and the
 //!   host's app saves it in its `app.json`.
+//! - `scripted_point` is `touch`: the hand presses with the tip of its index finger and never pinches
+//!   (Cranpose's direct touch). Once the host's menu came, the fingertip touches in turn: the object of
+//!   the first change of the console's page `walk_page` (`stream` by default) that restarts nothing,
+//!   the object that puts the value back, the hand menu's ball twice (the menu opens and closes), the
+//!   gem that records twice (a recording starts and stops) and the middle of the upper half of the
+//!   first display's panel. Each touch comes from 10 cm in front of its place, hovers 3 cm in front for
+//!   1.5 s, goes 1 cm into the face and comes back. The hand's ray points at the floor all the while.
+//!   Launch it with `interface=3d`, `console=true`, `console_page`, `hand_anchor=view`,
+//!   `shown=display1` and `default_places`. The log names each step ("scripted touch:") and the value
+//!   that the menu shows after each touch of the console.
 //! - `scripted_hand` is the hand (`left` or `right`, default right).
 //! - `scripted_pointer=desktop` plays both controllers over the Mac's first display instead, with
 //!   buttons: it shows that both hands point at once and that right clicks, middle clicks and scroll
@@ -217,6 +227,8 @@ pub fn install_once() {
             script_hand(ScriptedHand::pointing(hand, HAND_AT, BALL_AT, cycle));
         } else if args.string("scripted_point") == Some("hologram") {
             std::thread::spawn(move || hologram_pinch(hand, cycle));
+        } else if args.string("scripted_point") == Some("touch") {
+            std::thread::spawn(move || touch_walk(hand));
         }
     });
 }
@@ -611,10 +623,16 @@ fn menu_check(hands: &str) {
 /// The place in the room of the point `x`, `y` dp from the top left corner of the console, whose
 /// rows `rows` are. The console stands at its default place in a subspace a meter ahead of the head.
 fn on_console(rows: &[crate::page_model::Row], x: f32, y: f32) -> [f32; 3] {
+    console_place(rows, x, y).at
+}
+
+/// The point `x`, `y` dp from the top left corner of the console with the rows `rows`, and the
+/// console's front there.
+fn console_place(rows: &[crate::page_model::Row], x: f32, y: f32) -> FacePoint {
     use crate::console::size::WIDTH;
     let height = crate::page_model::height(rows);
     let console = Pose::at([0.0, 0.0, -1.0]).then(&crate::console_panel::start_place());
-    console.then(&Pose::at([(x - WIDTH / 2.0) / 1000.0, (height / 2.0 - y) / 1000.0, 0.0])).position
+    FacePoint::on(&console, [(x - WIDTH / 2.0) / 1000.0, (height / 2.0 - y) / 1000.0])
 }
 
 /// The first change of a page that restarts nothing: its first option, or toggle state, that does not
@@ -1086,6 +1104,139 @@ fn hologram_pinch(hand: Hand, cycle: PinchCycle) {
     // No controller script here: a scripted controller, even a missing one, makes the runtime's
     // hands count as controllers, so the hand's pinch would press nothing
     script_hand(ScriptedHand::pointing(hand, HAND_AT, target, cycle));
+}
+
+/// A point on a panel's face in the room and the face's front there, a unit direction
+#[derive(Clone, Copy, Debug)]
+struct FacePoint {
+    at: [f32; 3],
+    front: [f32; 3],
+}
+
+impl FacePoint {
+    /// The point `offset` meters to the right and up from the middle of the flat panel at `panel`
+    fn on(panel: &Pose, offset: [f32; 2]) -> Self {
+        Self { at: panel.then(&Pose::at([offset[0], offset[1], 0.0])).position, front: panel.rotate([0.0, 0.0, 1.0]) }
+    }
+
+    /// The place `height` meters in front of the point, or behind it below zero
+    fn ahead(&self, height: f32) -> [f32; 3] {
+        [0, 1, 2].map(|axis| self.at[axis] + self.front[axis] * height)
+    }
+}
+
+/// Where the touch walk's fingertip waits between touches, in meters from the head's start: right of
+/// the head and in front of every panel, so the way to each touch crosses no face
+const TOUCH_PARK: [f32; 3] = [0.25, -0.1, -0.2];
+/// How long a touch walk's fingertip hovers near each place before it touches, so a capture shows
+/// the hover
+const TOUCH_HOVER: Duration = Duration::from_millis(1500);
+
+/// The fingertip's steps of one touch of `place` after the script so far: from the park to 10 cm in
+/// front of the place in 0.5 s, to 3 cm in front in 0.2 s, a hover of `TOUCH_HOVER`, 1 cm into the
+/// face in 0.15 s, a hold of 0.15 s, back to 10 cm in 0.2 s, to the park in 0.3 s and a rest of `rest`.
+fn touch_steps(script: ScriptedHand, place: &FacePoint, rest: Duration) -> ScriptedHand {
+    let ms = Duration::from_millis;
+    script
+        .moving_fingertip_to(ms(500), place.ahead(0.10))
+        .moving_fingertip_to(ms(200), place.ahead(0.03))
+        .holding_fingertip(TOUCH_HOVER)
+        .moving_fingertip_to(ms(150), place.ahead(-0.01))
+        .holding_fingertip(ms(150))
+        .moving_fingertip_to(ms(200), place.ahead(0.10))
+        .moving_fingertip_to(ms(300), TOUCH_PARK)
+        .holding_fingertip(rest)
+}
+
+/// The time from the start of a touch's steps to the touch itself, and the length of its steps
+/// before the rest
+const TOUCH_AT: Duration = Duration::from_millis(500 + 200 + 1500 + 150);
+const TOUCH_LENGTH: Duration = Duration::from_millis(500 + 200 + 1500 + 150 + 150 + 200 + 300);
+
+/// Plays `scripted_point=touch` (see the file's notes). A thread waits for the host's menu to find
+/// the console's objects, installs the hand and logs each step at its time.
+fn touch_walk(hand: Hand) {
+    use crate::{
+        console::{Press, Shown},
+        hub::hub,
+        page_model::{console_rows, find_key, key_point, Local},
+    };
+    use cranvr_common::menu::{Item, Request};
+    let page_id = launch_args().string("walk_page").unwrap_or(HOLOGRAM_PAGE).to_owned();
+    let since = std::time::Instant::now();
+    let menu = loop {
+        if let Some(menu) = hub().console().menu.filter(|menu| menu.page(&page_id).is_some()) {
+            break menu;
+        }
+        if since.elapsed() > Duration::from_secs(30) {
+            log::warn!("scripted touch: no menu with the page {page_id} came from the host in 30 s");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let Some(page) = menu.page(&page_id) else {
+        return;
+    };
+    let Some(change) = first_change(page) else {
+        return;
+    };
+    let Request::Set { id, subject, .. } = &change else {
+        return;
+    };
+    let Some(before) = page.find(id, subject.as_deref()).and_then(Item::value).map(str::to_owned) else {
+        return;
+    };
+    let local = Local { link: true, interface: hub().console().interface };
+    let rows = console_rows(Some(&menu), &Shown::Host(page_id.clone()), local, "", None, std::time::Instant::now());
+    let point_of = |request: &Request| find_key(&rows, &Press::Host(request.clone())).and_then(|(row, key)| key_point(&rows, row, key)).map(|[x, y]| console_place(&rows, x, y));
+    let Some(changed) = point_of(&change) else {
+        log::warn!("scripted touch: no key does {}", change.to_json());
+        return;
+    };
+    // A choice goes back by the option that holds now, a toggle by the same capsule
+    let back = point_of(&Request::Set { id: id.clone(), subject: subject.clone(), value: before.clone() }).unwrap_or(changed);
+    // The ball and the gem stand in the subspace of `hand_anchor=view`, which faces the head's start
+    let view = Pose::at([0.0, 0.0, -1.0]);
+    let base = hand_menu::ON_VIEW.base;
+    let ball = FacePoint::on(&view, [base[0] / 1000.0, (base[1] + hand_menu::LIFT) / 1000.0]);
+    let ball = FacePoint { at: [ball.at[0], ball.at[1], -1.0 + base[2] / 1000.0], ..ball };
+    let gem_at = crate::record_gem::ON_CONTROLLER;
+    let gem = FacePoint { at: [(base[0] + gem_at[0]) / 1000.0, (base[1] + gem_at[1]) / 1000.0, -1.0 + (base[2] + gem_at[2]) / 1000.0], front: [0.0, 0.0, 1.0] };
+    // The middle of the upper half of the first display's panel, clear of the console below it
+    let (display_pose, width) = crate::display_panel::start_panel();
+    let display = FacePoint::on(&view.then(&display_pose), [0.0, width * 9.0 / 16.0 / 4.0]);
+    let ms = Duration::from_millis;
+    let touches: [(&str, FacePoint, Duration); 7] = [
+        ("the console's change", changed, ms(1500)),
+        ("the console's way back", back, ms(1500)),
+        ("the ball, which opens the menu", ball, ms(2000)),
+        ("the ball, which closes the menu", ball, ms(1000)),
+        ("the gem, which starts a recording", gem, ms(3000)),
+        ("the gem, which stops the recording", gem, ms(2000)),
+        ("the display", display, ms(1000)),
+    ];
+    let floor = away_from(HAND_AT);
+    // The first touch waits 5 s: a system toast blacks the headset's captures for about 5 s after a
+    // start of the app
+    let first = ms(5000);
+    let script = touches.iter().fold(ScriptedHand::touching(hand, HAND_AT, floor, TOUCH_PARK).holding_fingertip(first), |script, (_, place, rest)| touch_steps(script, place, *rest));
+    log::info!("scripted touch: the {hand:?} hand touches {} at {:?}, then back at {:?}, the ball at {:?}, the gem at {:?} and the display at {:?}", change.to_json(), changed.at, back.at, ball.at, gem.at, display.at);
+    script_hand(script);
+    let start = std::time::Instant::now();
+    let mut clock = first;
+    for (index, (name, _, rest)) in touches.iter().enumerate() {
+        std::thread::sleep((clock + TOUCH_AT - TOUCH_HOVER).saturating_sub(start.elapsed()));
+        log::info!("scripted touch: the fingertip hovers 3 cm in front of {name}");
+        std::thread::sleep((clock + TOUCH_AT).saturating_sub(start.elapsed()));
+        log::info!("scripted touch: the fingertip touches {name}");
+        clock += TOUCH_LENGTH + *rest;
+        std::thread::sleep(clock.saturating_sub(start.elapsed()));
+        if index < 2 {
+            let shown = hub().console().menu.and_then(|menu| menu.page(&page_id).and_then(|page| page.find(id, subject.as_deref()).and_then(Item::value).map(str::to_owned)));
+            log::info!("scripted touch: {id} shows {shown:?} after {name} (it was {before:?})");
+        }
+    }
+    log::info!("scripted touch: done");
 }
 
 /// Where the right controller of the press check stands, in meters from the head's start: below the
