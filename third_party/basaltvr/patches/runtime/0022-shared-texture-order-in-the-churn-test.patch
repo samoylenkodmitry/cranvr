@@ -1,0 +1,580 @@
+diff --git i/runtime/tests/shared_churn.cpp w/runtime/tests/shared_churn.cpp
+index fde4528..8dabd6b 100644
+--- i/runtime/tests/shared_churn.cpp
++++ w/runtime/tests/shared_churn.cpp
+@@ -19,11 +19,25 @@
+ // The first process then releases everything and starts the next cycle. The second releases what it opened at the
+ // end of each cycle.
+ //
++// The order of the GPU work across the two processes. Direct3D 11 asks a writer to call Flush before another device
++// uses a texture that they share without a keyed mutex. After that the reader sees the writes. Metal orders no work
++// of two processes on a shared texture: before cranvr's DXMT patch 0022 the second process could copy a texture
++// before the first process's GPU had cleared it (cycle 13 of 200 in one run read zeros of rgba16f). To show such a
++// gap at once, each process keeps its GPU busy before its clears with some copies of a texture of 4096 x 4096. The
++// clears wait on the GPU for that work (the busy work's own fence). The first process clears the textures, flushes and
++// sends the handles at once. It does not wait for its GPU. The second process then reads the colors while the first
++// GPU may still copy. It also writes back: it clears bgra8 to another color after its own busy work, flushes and
++// replies. The first process reads that color at once. Each wrong color fails the run.
++//
+ // At the end the first process tests the size check of the IOSurface path. It shares an IOSurface texture and
+ // releases it. Then it makes IOSurface textures of another width until macOS gives one of them the ID of the released
+ // surface (macOS reuses the IDs of freed surfaces at once). The second process must then refuse to open the handle of
+ // the released texture, because its ID names a surface of another size now.
+ //
++// Last, a writer that ends: the second process opens a new texture, clears it after its busy work, flushes, replies
++// and ends at once (TerminateProcess). Its GPU may still work then. The first process then copies the texture. Its GPU
++// must not wait for good for a process that has gone: the copy must be done within 3 seconds. Either color counts.
++//
+ // Usage: shared_churn.exe [--cycles N] [--width W] [--height H] [--signal FILE]
+ // The textures are W x H (default 640 x 333). With --signal FILE the program stops three times, so that a script can
+ // count the names in launchd and measure memory while both processes live. In its first cycle, while both processes
+@@ -38,6 +52,7 @@
+ #include <d3d11_4.h>
+ #include <dxgi1_2.h>
+ 
++#include <algorithm>
+ #include <chrono>
+ #include <cstdint>
+ #include <cstdio>
+@@ -180,11 +195,11 @@ bool writeLine(HANDLE pipe, const std::string &line) {
+     return WriteFile(pipe, text.data(), static_cast<DWORD>(text.size()), &done, nullptr) && done == text.size();
+ }
+ 
+-bool waitFence(ID3D11Fence *fence, UINT64 value, HANDLE event) {
++bool waitFence(ID3D11Fence *fence, UINT64 value, HANDLE event, DWORD waitMs = kWaitMs) {
+     if (fence->GetCompletedValue() >= value)
+         return true;
+     fence->SetEventOnCompletion(value, event);
+-    DWORD until = GetTickCount() + kWaitMs;
++    DWORD until = GetTickCount() + waitMs;
+     while (fence->GetCompletedValue() < value) {
+         DWORD now = GetTickCount();
+         if (now >= until)
+@@ -194,10 +209,172 @@ bool waitFence(ID3D11Fence *fence, UINT64 value, HANDLE event) {
+     return true;
+ }
+ 
++// Work that keeps a process's GPU busy for some milliseconds, and the commands after it wait for it on the GPU. Metal
++// may run the encoders of a command buffer in any order when they share no resource, so the copies alone would not
++// delay a clear of another texture. A fence of the process orders them: run() signals it after the copies and the
++// next commands wait for that value.
++struct Busy {
++    ID3D11Texture2D *a = nullptr, *b = nullptr;
++    ID3D11Fence *fence = nullptr;
++    UINT64 value = 0;
++    unsigned copies = 0;
++
++    bool create(Device &d) {
++        D3D11_TEXTURE2D_DESC desc = {};
++        desc.Width = desc.Height = 4096;
++        desc.MipLevels = desc.ArraySize = 1;
++        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++        desc.SampleDesc.Count = 1;
++        desc.Usage = D3D11_USAGE_DEFAULT;
++        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++        HRESULT hr = d.device->CreateTexture2D(&desc, nullptr, &a);
++        if (SUCCEEDED(hr))
++            hr = d.device->CreateTexture2D(&desc, nullptr, &b);
++        if (SUCCEEDED(hr))
++            hr = d.device5->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
++        return SUCCEEDED(hr) || fail("the busy work's textures and fence", hr);
++    }
++
++    void run(Device &d) {
++        for (unsigned i = 0; i < copies; i++)
++            d.context->CopyResource(i % 2 ? a : b, i % 2 ? b : a);
++        d.context4->Signal(fence, ++value); // flushes
++        d.context4->Wait(fence, value);
++    }
++
++    // Doubles the copies until the work takes at least 4 ms of the GPU (at most 512 copies); returns the time. A first
++    // run of one copy is not timed: it waits for the zeros that DXMT writes into new textures.
++    double calibrate(Device &d, HANDLE event) {
++        copies = 1;
++        run(d);
++        if (!waitFence(fence, value, event, 10000))
++            return -1;
++        double ms = 0;
++        for (copies = 4; copies <= 512; copies *= 2) {
++            auto begin = std::chrono::steady_clock::now();
++            run(d);
++            if (!waitFence(fence, value, event, 10000))
++                return -1;
++            ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
++            if (ms >= 4)
++                break;
++        }
++        copies = std::min(copies, 512u);
++        return ms;
++    }
++
++    ~Busy() {
++        release(fence);
++        release(b);
++        release(a);
++    }
++};
++
++// Copies a subresource of a texture to a staging texture and reads its first texel as 8-bit R, G, B, or the three
++// half floats of R16G16B16A16_FLOAT. Fails when the copy does not end within `waitMs` (a GPU that waits for good).
++std::string readTexel(Device &d, ID3D11Texture2D *texture, const D3D11_TEXTURE2D_DESC &desc, UINT subresource,
++                      uint16_t out[3], DWORD waitMs = INFINITE) {
++    D3D11_TEXTURE2D_DESC sdesc = desc;
++    sdesc.MipLevels = 1;
++    sdesc.ArraySize = 1;
++    sdesc.Usage = D3D11_USAGE_STAGING;
++    sdesc.BindFlags = 0;
++    sdesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++    sdesc.MiscFlags = 0;
++    ID3D11Texture2D *staging = nullptr;
++    if (FAILED(d.device->CreateTexture2D(&sdesc, nullptr, &staging)))
++        return "no staging texture";
++    d.context->CopySubresourceRegion(staging, 0, 0, 0, 0, texture, subresource, nullptr);
++    if (waitMs != INFINITE) {
++        ID3D11Query *query = nullptr;
++        D3D11_QUERY_DESC qdesc = {D3D11_QUERY_EVENT, 0};
++        if (FAILED(d.device->CreateQuery(&qdesc, &query))) {
++            staging->Release();
++            return "no event query";
++        }
++        d.context->End(query);
++        d.context->Flush();
++        DWORD until = GetTickCount() + waitMs;
++        while (d.context->GetData(query, nullptr, 0, 0) == S_FALSE && GetTickCount() < until)
++            Sleep(1);
++        bool done = d.context->GetData(query, nullptr, 0, 0) == S_OK;
++        query->Release();
++        if (!done) {
++            staging->Release();
++            return "the copy did not end within " + std::to_string(waitMs) + " ms";
++        }
++    }
++    D3D11_MAPPED_SUBRESOURCE mapped;
++    if (FAILED(d.context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped))) {
++        staging->Release();
++        return "the copy does not map";
++    }
++    if (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
++        const uint16_t *p = static_cast<const uint16_t *>(mapped.pData);
++        out[0] = p[0];
++        out[1] = p[1];
++        out[2] = p[2];
++    } else {
++        const uint8_t *p = static_cast<const uint8_t *>(mapped.pData);
++        bool bgra = desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM;
++        out[0] = bgra ? p[2] : p[0];
++        out[1] = p[1];
++        out[2] = bgra ? p[0] : p[2];
++    }
++    d.context->Unmap(staging, 0);
++    staging->Release();
++    return "ok";
++}
++
++// Whether a texel that readTexel read is the color c; `seen` describes it
++bool sameColor(DXGI_FORMAT format, const uint16_t got[3], const uint8_t c[4], char *seen, size_t size) {
++    if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
++        std::snprintf(seen, size, "%04x %04x %04x, want %04x %04x %04x", got[0], got[1], got[2],
++                      halfOf(c[0] / 256.0f), halfOf(c[1] / 256.0f), halfOf(c[2] / 256.0f));
++        return got[0] == halfOf(c[0] / 256.0f) && got[1] == halfOf(c[1] / 256.0f) && got[2] == halfOf(c[2] / 256.0f);
++    }
++    std::snprintf(seen, size, "%u %u %u, want %u %u %u", got[0], got[1], got[2], c[0], c[1], c[2]);
++    return got[0] == c[0] && got[1] == c[1] && got[2] == c[2];
++}
++
++// Clears every slice of a color texture to c
++bool clearTo(Device &d, ID3D11Texture2D *texture, const D3D11_TEXTURE2D_DESC &desc, const uint8_t c[4]) {
++    float rgba[4] = {c[0] / 256.0f, c[1] / 256.0f, c[2] / 256.0f, 1.0f};
++    if (desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT) {
++        for (int i = 0; i < 3; i++)
++            rgba[i] = c[i] / 255.0f;
++    }
++    for (UINT slice = 0; slice < desc.ArraySize; slice++) {
++        D3D11_RENDER_TARGET_VIEW_DESC rtv = {};
++        rtv.Format = desc.Format;
++        if (desc.ArraySize > 1) {
++            rtv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
++            rtv.Texture2DArray.FirstArraySlice = slice;
++            rtv.Texture2DArray.ArraySize = 1;
++        } else {
++            rtv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
++        }
++        ID3D11RenderTargetView *view = nullptr;
++        HRESULT hr = d.device->CreateRenderTargetView(texture, &rtv, &view);
++        if (FAILED(hr))
++            return fail("CreateRenderTargetView", hr);
++        d.context->ClearRenderTargetView(view, rgba);
++        view->Release();
++    }
++    return true;
++}
++
++// The color that the second process writes back into bgra8 in a cycle, and into the last texture before it ends
++void colorBackOf(unsigned cycle, uint8_t out[4]) {
++    colorOf(cycle + 100000u, kBgra8, out);
++}
++
+ // --- the second process ---------------------------------------------------------------------------------------
+ 
+ // Opens one texture and checks it; reply is "ok" or the failure
+-std::string openAndCheck(Device &d, int kind, unsigned cycle, HANDLE handle, UINT width, UINT height) {
++// Opens one texture and checks it; reply is "ok" or the failure. With `keep` the caller gets the opened texture.
++std::string openAndCheck(Device &d, int kind, unsigned cycle, HANDLE handle, UINT width, UINT height,
++                         ID3D11Texture2D **keep = nullptr) {
+     const KindInfo &k = kKindInfo[kind];
+     ID3D11Texture2D *texture = nullptr;
+     HRESULT hr = k.nt ? d.device1->OpenSharedResource1(handle, IID_PPV_ARGS(&texture))
+@@ -222,66 +399,45 @@ std::string openAndCheck(Device &d, int kind, unsigned cycle, HANDLE handle, UIN
+             result = "keyed: no keyed mutex";
+     }
+     if (k.color && result == "ok") {
+-        D3D11_TEXTURE2D_DESC sdesc = want;
+-        sdesc.MipLevels = 1;
+-        sdesc.ArraySize = 1;
+-        sdesc.Usage = D3D11_USAGE_STAGING;
+-        sdesc.BindFlags = 0;
+-        sdesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+-        sdesc.MiscFlags = 0;
+-        ID3D11Texture2D *staging = nullptr;
+-        if (FAILED(d.device->CreateTexture2D(&sdesc, nullptr, &staging))) {
+-            result = std::string(k.name) + ": no staging texture";
++        UINT slice = k.slices > 1 ? 1 : 0;
++        uint16_t texel[3];
++        std::string read = readTexel(d, texture, want, D3D11CalcSubresource(0, slice, k.mips), texel);
++        if (read != "ok") {
++            result = std::string(k.name) + ": " + read;
+         } else {
+-            UINT slice = k.slices > 1 ? 1 : 0;
+-            d.context->CopySubresourceRegion(staging, 0, 0, 0, 0, texture, D3D11CalcSubresource(0, slice, k.mips),
+-                                             nullptr);
+-            D3D11_MAPPED_SUBRESOURCE mapped;
+-            if (FAILED(d.context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped))) {
+-                result = std::string(k.name) + ": the copy does not map";
+-            } else {
+-                uint8_t c[4];
+-                colorOf(cycle, kind, c);
+-                bool same;
+-                char seen[64];
+-                if (k.format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+-                    const uint16_t *p = static_cast<const uint16_t *>(mapped.pData);
+-                    same = p[0] == halfOf(c[0] / 256.0f) && p[1] == halfOf(c[1] / 256.0f) &&
+-                           p[2] == halfOf(c[2] / 256.0f);
+-                    std::snprintf(seen, sizeof(seen), "%04x %04x %04x", p[0], p[1], p[2]);
+-                } else {
+-                    const uint8_t *p = static_cast<const uint8_t *>(mapped.pData);
+-                    bool bgra = k.format == DXGI_FORMAT_B8G8R8A8_UNORM;
+-                    uint8_t r = bgra ? p[2] : p[0], b = bgra ? p[0] : p[2];
+-                    same = r == c[0] && p[1] == c[1] && b == c[2];
+-                    std::snprintf(seen, sizeof(seen), "%u %u %u, want %u %u %u", r, p[1], b, c[0], c[1], c[2]);
+-                }
+-                d.context->Unmap(staging, 0);
+-                if (!same)
+-                    result = std::string(k.name) + " has another color: " + seen;
+-            }
+-            staging->Release();
++            uint8_t c[4];
++            colorOf(cycle, kind, c);
++            char seen[96];
++            if (!sameColor(k.format, texel, c, seen, sizeof(seen)))
++                result = std::string(k.name) + " has another color: " + seen;
+         }
+     }
+     if (mutex) {
+         mutex->ReleaseSync(0);
+         mutex->Release();
+     }
+-    texture->Release();
++    if (keep && result == "ok")
++        *keep = texture;
++    else
++        texture->Release();
+     return result;
+ }
+ 
+-int child() {
++int child(unsigned copies) {
+     HANDLE in = GetStdHandle(STD_INPUT_HANDLE), out = GetStdHandle(STD_OUTPUT_HANDLE);
+     Device d;
+     if (!d.create())
+         return 1;
++    Busy busy;
++    if (!busy.create(d))
++        return 1;
++    busy.copies = copies;
+     HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+     for (;;) {
+         std::string line = readLine(in);
+         if (line == "quit" || line == "eof")
+             break;
+-        // "cycle N W H HANDLE*kKinds FENCE" or "forge W H HANDLE"
++        // "cycle N W H HANDLE*kKinds FENCE", "forge W H HANDLE" or "die W H HANDLE"
+         std::vector<std::string> words;
+         size_t start = 0;
+         while (start < line.size()) {
+@@ -313,6 +469,23 @@ int child() {
+             writeLine(out, reply);
+             continue;
+         }
++        if (words.size() == 4 && words[0] == "die") {
++            // A writer that ends while its GPU may still work: the first process must not wait for it for good
++            UINT width = std::atoi(words[1].c_str()), height = std::atoi(words[2].c_str());
++            ID3D11Texture2D *texture = nullptr;
++            HRESULT hr = d.device->OpenSharedResource(handleAt(3), IID_PPV_ARGS(&texture));
++            if (FAILED(hr) || !texture) {
++                writeLine(out, "the last texture does not open");
++                continue;
++            }
++            uint8_t c[4];
++            colorBackOf(1000000u, c);
++            busy.run(d);
++            clearTo(d, texture, descOf(kBgra8, width, height), c);
++            d.context->Flush();
++            writeLine(out, "dying");
++            TerminateProcess(GetCurrentProcess(), 0);
++        }
+         if (words.size() != 4 + kKinds + 1 || words[0] != "cycle") {
+             writeLine(out, "bad command: " + line);
+             continue;
+@@ -320,11 +493,23 @@ int child() {
+         unsigned cycle = std::strtoul(words[1].c_str(), nullptr, 10);
+         UINT width = std::atoi(words[2].c_str()), height = std::atoi(words[3].c_str());
+         std::string reply = "ok";
++        ID3D11Texture2D *back = nullptr;
+         for (int kind = 0; kind < kKinds; kind++) {
+-            std::string r = openAndCheck(d, kind, cycle, handleAt(4 + kind), width, height);
++            std::string r = openAndCheck(d, kind, cycle, handleAt(4 + kind), width, height,
++                                         kind == kBgra8 ? &back : nullptr);
+             if (r != "ok" && reply == "ok")
+                 reply = r;
+         }
++        // The write back: this GPU clears bgra8 after its busy work. The first process reads it as soon as it has the
++        // reply, without a wait of its own.
++        if (back) {
++            uint8_t c[4];
++            colorBackOf(cycle, c);
++            busy.run(d);
++            clearTo(d, back, descOf(kBgra8, width, height), c);
++            d.context->Flush();
++            back->Release();
++        }
+         // The fence's round, the second process's part: the first process signaled 1 before the command. This
+         // process waits for 1 on the CPU and signals 2. Its GPU then waits for 3, which the first process signals
+         // only after it saw 2, so the wait is pending when this process makes it. After the wait the GPU signals 4.
+@@ -368,7 +553,7 @@ struct Child {
+     PROCESS_INFORMATION process = {};
+     HANDLE toChild = nullptr, fromChild = nullptr;
+ 
+-    bool start() {
++    bool start(unsigned copies) {
+         SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
+         HANDLE childIn = nullptr, childOut = nullptr;
+         if (!CreatePipe(&childIn, &toChild, &sa, 0) || !CreatePipe(&fromChild, &childOut, &sa, 0))
+@@ -377,7 +562,7 @@ struct Child {
+         SetHandleInformation(fromChild, HANDLE_FLAG_INHERIT, 0);
+         wchar_t path[MAX_PATH];
+         GetModuleFileNameW(nullptr, path, MAX_PATH);
+-        std::wstring command = std::wstring(L"\"") + path + L"\" --child";
++        std::wstring command = std::wstring(L"\"") + path + L"\" --child --busy " + std::to_wstring(copies);
+         STARTUPINFOW si = {};
+         si.cb = sizeof(si);
+         si.dwFlags = STARTF_USESTDHANDLES;
+@@ -435,12 +620,16 @@ std::string hex(uintptr_t value) {
+ void waitForFile(const std::string &signal, const char *stage);
+ 
+ unsigned fenceRounds = 0; // the cycles whose fence went through its whole round in both processes
++unsigned writeBacks = 0;  // the cycles in which the first process saw the second one's write back
+ 
+-bool cycleOnce(Device &d, Child &c, unsigned cycle, UINT width, UINT height, HANDLE event, const std::string *live) {
++bool cycleOnce(Device &d, Child &c, Busy &busy, unsigned cycle, UINT width, UINT height, HANDLE event,
++               const std::string *live) {
+     ID3D11Texture2D *textures[kKinds] = {};
+     HANDLE ntHandles[kKinds] = {};
+     std::string command = "cycle " + std::to_string(cycle) + " " + std::to_string(width) + " " + std::to_string(height);
+     bool ok = true;
++    // The clears below run on the GPU only after this work
++    busy.run(d);
+     for (int kind = 0; kind < kKinds && ok; kind++) {
+         const KindInfo &k = kKindInfo[kind];
+         D3D11_TEXTURE2D_DESC desc = descOf(kind, width, height);
+@@ -458,28 +647,9 @@ bool cycleOnce(Device &d, Child &c, unsigned cycle, UINT width, UINT height, HAN
+         if (k.samples == 1) {
+             uint8_t color[4];
+             colorOf(cycle, kind, color);
+-            float rgba[4] = {color[0] / 256.0f, color[1] / 256.0f, color[2] / 256.0f, 1.0f};
+-            if (k.format != DXGI_FORMAT_R16G16B16A16_FLOAT) {
+-                for (int i = 0; i < 3; i++)
+-                    rgba[i] = color[i] / 255.0f;
+-            }
+-            for (UINT slice = 0; slice < k.slices; slice++) {
+-                D3D11_RENDER_TARGET_VIEW_DESC rtv = {};
+-                rtv.Format = k.format;
+-                if (k.slices > 1) {
+-                    rtv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+-                    rtv.Texture2DArray.FirstArraySlice = slice;
+-                    rtv.Texture2DArray.ArraySize = 1;
+-                } else {
+-                    rtv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+-                }
+-                ID3D11RenderTargetView *view = nullptr;
+-                if (FAILED(hr = d.device->CreateRenderTargetView(textures[kind], &rtv, &view))) {
+-                    ok = fail((std::string("CreateRenderTargetView ") + k.name).c_str(), hr);
+-                    break;
+-                }
+-                d.context->ClearRenderTargetView(view, rgba);
+-                view->Release();
++            if (!clearTo(d, textures[kind], desc, color)) {
++                ok = false;
++                break;
+             }
+         }
+         if (mutex) {
+@@ -523,17 +693,29 @@ bool cycleOnce(Device &d, Child &c, unsigned cycle, UINT width, UINT height, HAN
+         // Then this GPU signals 5. Each process thus waits on the CPU and on the GPU for a value of the other.
+         command += " " + hex(reinterpret_cast<uintptr_t>(c.give(fenceHandle)));
+         d.context4->Signal(fence, 1);
++        // Direct3D 11's rule for a texture without a keyed mutex: the writer flushes, then the other device may use
++        // it. This process does not wait for its GPU, which may still run the busy work before the clears.
+         d.context->Flush();
+-        // Metal orders no work across processes on a texture of DXMT's stock path. The second process reads the
+-        // colors once this GPU has cleared the textures: without the wait it read zeros now and then (cycle 13 of
+-        // 200 in one run, rgba16f).
+-        if (!waitFence(fence, 1, event))
+-            ok = fail(("cycle " + std::to_string(cycle) + ": this process's own GPU did not reach 1").c_str());
+     }
+     if (ok) {
+         writeLine(c.toChild, command);
+         std::string reply = readLine(c.fromChild);
+         std::string at = "cycle " + std::to_string(cycle) + ": ";
++        if (reply == "ok") {
++            // The second process flushed its write back before it replied; this process reads it at once
++            uint8_t back[4];
++            colorBackOf(cycle, back);
++            uint16_t texel[3];
++            D3D11_TEXTURE2D_DESC desc = descOf(kBgra8, width, height);
++            std::string read = readTexel(d, textures[kBgra8], desc, 0, texel);
++            char seen[96];
++            if (read != "ok")
++                reply = "the write back of bgra8: " + read;
++            else if (!sameColor(desc.Format, texel, back, seen, sizeof(seen)))
++                reply = std::string("the first process saw another color of the second one's write back: ") + seen;
++            else
++                writeBacks++;
++        }
+         if (reply != "ok") {
+             ok = fail((at + reply).c_str());
+         } else if (!waitFence(fence, 2, event)) {
+@@ -650,6 +832,54 @@ bool forge(Device &d, Child &c, UINT height) {
+     return true;
+ }
+ 
++// A writer that ends while its GPU may still work: the second process writes a texture of this process and ends at
++// once. This process's copy of it must be done within 3 s, with either color.
++bool writerEnds(Device &d, Child &c, UINT width, UINT height) {
++    D3D11_TEXTURE2D_DESC desc = descOf(kBgra8, width, height);
++    ID3D11Texture2D *texture = nullptr;
++    HRESULT hr = d.device->CreateTexture2D(&desc, nullptr, &texture);
++    if (FAILED(hr))
++        return fail("CreateTexture2D for the writer that ends", hr);
++    struct Keep {
++        ID3D11Texture2D *texture;
++        ~Keep() { texture->Release(); }
++    } keep{texture};
++    uint8_t mine[4], theirs[4];
++    colorOf(1000000u, kBgra8, mine);
++    colorBackOf(1000000u, theirs);
++    if (!clearTo(d, texture, desc, mine))
++        return false;
++    d.context->Flush();
++    IDXGIResource *resource = nullptr;
++    HANDLE handle = nullptr;
++    if (SUCCEEDED(texture->QueryInterface(IID_PPV_ARGS(&resource))))
++        resource->GetSharedHandle(&handle);
++    release(resource);
++    if (!handle)
++        return fail("the shared handle of the writer's last texture");
++    writeLine(c.toChild, "die " + std::to_string(width) + " " + std::to_string(height) + " " +
++                             hex(reinterpret_cast<uintptr_t>(handle)));
++    std::string reply = readLine(c.fromChild);
++    if (reply != "dying")
++        return fail(("the writer that ends: " + reply).c_str());
++    if (WaitForSingleObject(c.process.hProcess, 5000) != WAIT_OBJECT_0)
++        return fail("the second process did not end");
++    auto begin = std::chrono::steady_clock::now();
++    uint16_t texel[3];
++    std::string read = readTexel(d, texture, desc, 0, texel, 3000);
++    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
++    if (read != "ok")
++        return fail(("after the writer ended: " + read).c_str());
++    char seen[96];
++    const char *which = sameColor(desc.Format, texel, theirs, seen, sizeof(seen)) ? "the ended process's color"
++                        : sameColor(desc.Format, texel, mine, seen, sizeof(seen)) ? "this process's color"
++                                                                                  : "another color";
++    std::printf("shared_churn: the second process ended right after its write; this process's copy took %.1f ms and "
++                "read %s\n",
++                ms, which);
++    return true;
++}
++
+ } // namespace
+ 
+ int main(int argc, char **argv) {
+@@ -659,8 +889,12 @@ int main(int argc, char **argv) {
+     std::string signal;
+     for (int i = 1; i < argc; i++) {
+         std::string arg = argv[i];
+-        if (arg == "--child")
+-            return child();
++        if (arg == "--child") {
++            unsigned copies = 0;
++            if (i + 2 < argc && std::string(argv[i + 1]) == "--busy")
++                copies = std::strtoul(argv[i + 2], nullptr, 10);
++            return child(copies);
++        }
+         if (arg == "--cycles" && i + 1 < argc)
+             cycles = std::strtoul(argv[++i], nullptr, 10);
+         else if (arg == "--width" && i + 1 < argc)
+@@ -679,25 +913,39 @@ int main(int argc, char **argv) {
+     Device d;
+     if (!d.create())
+         return 1;
++    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++    Busy busy;
++    if (!busy.create(d))
++        return 1;
++    double busyMs = busy.calibrate(d, event);
++    if (busyMs < 0)
++        return fail("the busy work did not end within 10 s") ? 0 : 1;
++    std::printf("shared_churn: each process's GPU copies a texture of 4096 x 4096 %u times before its clears: %.1f ms\n",
++                busy.copies, busyMs);
+     Child c;
+-    if (!c.start())
++    if (!c.start(busy.copies))
+         return 1;
+-    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+-    bool ok = cycleOnce(d, c, 0, width, height, event, &signal);
++    bool ok = cycleOnce(d, c, busy, 0, width, height, event, &signal);
+     if (ok)
+         waitForFile(signal, "warm");
+     auto begin = std::chrono::steady_clock::now();
+     for (unsigned cycle = 1; ok && cycle < cycles; cycle++)
+-        ok = cycleOnce(d, c, cycle, width, height, event, nullptr);
++        ok = cycleOnce(d, c, busy, cycle, width, height, event, nullptr);
+     double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+     if (ok)
+         waitForFile(signal, "churned");
+     if (ok)
+         ok = forge(d, c, height);
+-    CloseHandle(event);
+     std::printf("shared_churn: the fence's round went through in %u of %u cycles: each process waited on the CPU and "
+                 "on the GPU for a value that the other signaled\n",
+                 fenceRounds, cycles);
++    std::printf("shared_churn: the colors were right in %u of %u cycles: the second process read each texture right "
++                "after the first one flushed it; the first one read the second one's write back right after its "
++                "reply\n",
++                writeBacks, cycles);
++    if (ok)
++        ok = writerEnds(d, c, width, height);
++    CloseHandle(event);
+     if (ok)
+         std::printf("shared_churn: PASS %u cycles of %d shared textures and a shared fence across two processes, "
+                     "%.2f ms a cycle\n",
