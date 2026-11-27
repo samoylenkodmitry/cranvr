@@ -19,6 +19,10 @@
 #            the next start of the app saves the recording
 #   kill     SIGKILL to the app during a recording: the headset records on, the next start of the app
 #            stops it and saves the recording
+# The first start of the client after its install only warms up: the headset may change its USB
+# functions about 28 s after that start, which ends the test port's link for a while (2026-11-27:
+# the headset's tracks went silent from then on). A check in which the link ended says that its
+# headset numbers are void.
 # Presses other than the row's come on the app's input, as the window's button and the headset's
 # requests reach it. For each saved file the script prints the app's numbers (the sound's source,
 # offset, the windows that matched, both sounds' loudness) and ffprobe's, then deletes the file. At
@@ -162,8 +166,14 @@ ${adb_cmd} shell am broadcast -a com.oculus.vrpowermanager.prox_close > /dev/nul
 ${adb_cmd} logcat -c
 scripted=()
 [[ ${checks} == *,row,* ]] && scripted=(--es scripted_pointer record_row --ei record_ms 9000)
-client_start ${host_log} --es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room scene --es theme amber --ez save_choices false \
-    --es panels hidden --ez console false --es interface flat --es hand_menu open --ez default_places true --es forget_host_key ${forget} ${scripted}
+common=(--es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room scene --es theme amber --ez save_choices false
+    --es panels hidden --ez console false --es interface flat --es hand_menu open --ez default_places true --es forget_host_key ${forget})
+client_start ${host_log} ${common}
+print "warm start: ${client_result}"
+${adb_cmd} shell am force-stop ${CLIENT_PACKAGE}
+sleep 1
+${adb_cmd} logcat -c
+client_start ${host_log} ${common} ${scripted}
 print "client: ${client_result} ${client_linked}"
 [[ ${client_result} == alive ]] || exit 1
 # The headset's log drops lines while its recorder runs: the client's lines go to a file as they come
@@ -270,6 +280,14 @@ check_sound() {
     grep -E "audio: (playing|waiting)" ${work}/client.log | tail -2 | sed -E 's/^[0-9-]+ ([0-9:.]+) .*audio: /  the client at \1: /' | cut -c1-160
     report
 }
+link_ends() {
+    grep -c "the headset link ended" ${host_log} 2> /dev/null || print 0
+}
 for check in ${order}; do
+    ends=$(link_ends)
     check_${check}
+    # SIGTERM and SIGKILL end the link with the app on purpose
+    if [[ ${check} != term && ${check} != kill ]] && (( $(link_ends) > ends )); then
+        print "  the link ended during this check: its numbers of the headset's track are void"
+    fi
 done

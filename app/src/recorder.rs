@@ -586,7 +586,8 @@ impl<D: Device, O: Out> Recorder<D, O> {
             let Some(video) = now.into_iter().find(|video| video.name == name) else {
                 return Err(Unsaved::Never(format!("the headset's file {name} is gone")));
             };
-            if !video.writing && last.as_ref() == Some(&video) {
+            // The age of the last write grows with each look: the size alone tells a whole file
+            if !video.writing && last.as_ref().is_some_and(|before| before.bytes == video.bytes) {
                 return Ok(video);
             }
             last = Some(video);
