@@ -810,7 +810,7 @@ case ${client} in
         else
             # A Quest 3 gets at its link the eye that the host wrote for a game before any link (#170)
             read -r _ _ view_width view_height view_rate _ < "${work}/config/runtime-control.txt"
-            if grep -q "Native protocol: Meta Quest 3 at " "${work}/host.log"; then
+            if grep -qh "Native protocol: Meta Quest 3 at " "${work}/host.log" "${work}/host.out" 2>/dev/null; then
                 if [[ "${view_width}x${view_height} at ${view_rate} Hz" == "${start_view}" ]]; then
                     print -r "The Quest 3's link kept the game's view of ${start_view}"
                 else
