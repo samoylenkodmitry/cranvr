@@ -575,6 +575,13 @@ for i in {1..50}; do
     [[ -f ${work}/config/runtime-control.txt ]] && break
     sleep 0.2
 done
+# Before any link the host writes the eye that a Quest 3 would get at the game render size (#170)
+start_view=""
+if [[ -f ${work}/config/runtime-control.txt ]]; then
+    read -r _ _ view_width view_height view_rate _ < "${work}/config/runtime-control.txt"
+    start_view="${view_width}x${view_height} at ${view_rate} Hz"
+    print -r "A game that starts before the link renders ${start_view}"
+fi
 if [[ ${client} == quest && ! -f ${identity} && -f ${work}/config/host-identity.txt ]]; then
     cp "${work}/config/host-identity.txt" "${identity}"
 fi
@@ -801,6 +808,16 @@ case ${client} in
             print -u2 "The Quest did not connect in two starts of 15 seconds. Check that it shares a network with this Mac."
             client_exit=1
         else
+            # A Quest 3 gets at its link the eye that the host wrote for a game before any link (#170)
+            read -r _ _ view_width view_height view_rate _ < "${work}/config/runtime-control.txt"
+            if grep -q "Native protocol: Meta Quest 3 at " "${work}/host.log"; then
+                if [[ "${view_width}x${view_height} at ${view_rate} Hz" == "${start_view}" ]]; then
+                    print -r "The Quest 3's link kept the game's view of ${start_view}"
+                else
+                    print -u2 -r "The Quest 3's link gave a game ${view_width}x${view_height} at ${view_rate} Hz, the host wrote ${start_view} before it"
+                    client_exit=1
+                fi
+            fi
             print "Streaming for ${seconds} seconds"
             start_program
             # A signal ends the wait at once, so cleanup gives Guardian back without delay

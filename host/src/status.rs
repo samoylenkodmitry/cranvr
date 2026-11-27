@@ -28,6 +28,9 @@
 //!   eye stayed black for several seconds while its left eye showed a picture. Eye "both": both
 //!   eyes stayed black for 90 seconds while the game delivered frames (see eye_check.rs). The host
 //!   sends it once for each game run.
+//! - `game_eye`: kept [w, h] (the eye size in the control file when the running game started), eye
+//!   [w, h] (the size that a new link wrote) and message: a headset linked with another eye while a
+//!   game ran, and the game keeps the size of its start (see game_eye.rs)
 //! - `headset_page`: page, the headset's own page (`cranvr_common::menu::Page`): its panels, its
 //!   displays and its actions, which the app draws and presses through `headset JSON` on the input
 //! - `vr_request`: a button of the console in VR (see desktop_layer.rs): action "set" with id and

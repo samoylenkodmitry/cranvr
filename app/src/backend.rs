@@ -546,6 +546,9 @@ impl Model {
 
 const LOG_LINES: usize = 200;
 
+/// The console's line in VR for a game that keeps the eye size of its start at a new link
+const GAME_EYE_KEPT: &str = "The game keeps its start size. Start it again for the new size.";
+
 /// The render sizes that the host learned for games: each program's file name and its share
 /// of the size set in the app (game-sizes.txt, written by the host).
 pub fn learned_game_sizes() -> Vec<(String, f32)> {
@@ -645,6 +648,12 @@ impl Model {
             Some("vr_request") => self.vr_requests.push(v.clone()),
             Some("headset_page") => self.headset_page = serde_json::from_value(v["page"].clone()).ok(),
             Some("black_eye") => self.black_eyes.push(v.clone()),
+            // A headset linked with another eye than the one that the running game read at its start (#170)
+            Some("game_eye") => {
+                let window = v["message"].as_str().unwrap_or("The running game keeps the eye size of its start. Start the game again for the new size.");
+                let notice = crate::black_eye::Notice { window: window.to_string(), headset: GAME_EYE_KEPT.to_string() };
+                self.notice = Some((notice, Instant::now() + crate::black_eye::NOTICE_TIME));
+            }
             Some("stats") => {
                 let live = v["fps"].as_f64().unwrap_or(0.0) > 0.0 || v["paused"].as_bool().unwrap_or(false);
                 if live {
@@ -1443,6 +1452,17 @@ mod tests {
         .unwrap();
         assert_eq!(take_chosen(), [Chosen::Add(PathBuf::from("/games/a/game.exe")), Chosen::Run(PathBuf::from("/games/b/other.exe"))]);
         assert!(take_chosen().is_empty());
+    }
+
+    #[test]
+    fn a_game_that_keeps_its_start_size_shows_in_the_window_and_in_the_console_in_vr() {
+        let mut model = Model::default();
+        let message = "The running game keeps the eye size of its start, 1176x1232. The stream's eye at the game render size is 874x914 now. Start the game again for the new size.";
+        model.apply_status(&serde_json::json!({"type": "game_eye", "kept": [1176, 1232], "eye": [874, 914], "message": message}));
+        let (notice, until) = model.notice.expect("a notice");
+        assert_eq!(notice.window, message);
+        assert_eq!(notice.headset, GAME_EYE_KEPT);
+        assert!(until > Instant::now());
     }
 
     #[test]
