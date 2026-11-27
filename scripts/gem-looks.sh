@@ -15,8 +15,9 @@
 #     second press, one of the dim gem with the reason beside it.
 # It measures the gem's color in each capture (scripts/gem-color.py), keeps a capture only when
 # scripts/capture-check.py passes it, and exits 1 unless each look has its color (`--verdict`).
-# The first start of the client after its install only warms up: the headset changes its USB
-# functions about 28 s after that start, which ends the test port's link for 2 s.
+# The first start of the client after its install only warms up. The headset may change its USB
+# functions about 28 s after that start, which ends the test port's link for 2 s: a run in which the
+# link ended is void, and the script exits 2.
 #
 # Usage: scripts/gem-looks.sh SERIAL WORKDIR [CAPTURES] [PORT]
 #   CAPTURES  the folder for the captures that pass (none by default: every capture is deleted)
@@ -138,4 +139,10 @@ measure gem-blocked-press
 ${adb_cmd} logcat -d -v time > ${work}/client.log
 grep -E "Cranpose" ${work}/client.log | grep -E "scripted gem:|the gem (cannot|starts|stops)|pointer (enters|presses|rests on|leaves) the gem|the gem.s look" | sed -E 's/^[0-9-]+ ([0-9:.]+) .*cranvr_client::[a-z_:]+: /\1 /'
 print "cut ends $(date +%T)"
+# The link of the measured start must hold through the walk: with no link the gem shows another look
+if (( $(grep -c "Headset connected" ${host_log}) > 2 )); then
+    grep -E "link ended" ${host_log} | tail -1
+    print "the run is void: the link ended during the walk; run the script again"
+    exit 2
+fi
 python3 -I ${root}/scripts/gem-color.py --verdict ${work}/colors.txt ${theme}

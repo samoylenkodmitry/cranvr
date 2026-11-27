@@ -31,8 +31,9 @@ const RATE: f64 = wav::SAMPLE_RATE as f64;
 /// The search for the lag spans this far on each side of the guess from the start's times, in s
 const SEARCH_SPAN: f64 = 2.0;
 /// The headset's recorder shows its first frame about this long after it answers that it started,
-/// in s. Only a recording with no sound to match falls back on it.
-const FIRST_FRAME_AFTER_START: f64 = 0.0;
+/// in s: the first frame came 0.15 s before the answer in a recording whose sound matched at 0.99
+/// (2026-11-27). Only a recording with no sound to match falls back on it.
+const FIRST_FRAME_AFTER_START: f64 = -0.15;
 /// The headset's microphone reaches the Mac this much later than the Mac's sound reaches the ear in
 /// the headset, in s: its sound goes this much earlier in the file
 const MICROPHONE_LATER: f64 = 0.02;
