@@ -3,12 +3,16 @@
 //! one line "<share> <program>" per game, once per game start (cranvr's runtime patch 0002).
 //! A game reads its view size only when it starts, so a new share cannot apply during a session.
 //!
-//! The rate cap hides how fast a game could run, so the host only lowers a share. The share
-//! returns to the full size when the user forgets the learned sizes in the app.
+//! The rate cap hides how fast a game could run, so the host never raises a share above the one
+//! before its last step. The share returns to the full size when the user forgets the learned sizes
+//! in the app.
 //!
 //! `game-rates.txt` keeps the frame rate that each game made before its last step, one line
 //! "<share> <fps> <program>". When a smaller share did not speed a game up, its size is not
-//! what limits it, and the host stops lowering it.
+//! what limits it: the game gets the share from before that step back and keeps it. A game that
+//! caps its own frame rate, such as a loading scene that the game holds at 99 frames a second, would
+//! otherwise lose pixels for nothing (issue #155). The rates line then names the share that the
+//! game has again, which tells the next start that the size does not limit the game.
 
 use log::warn;
 use std::{
@@ -60,8 +64,8 @@ impl Sizes {
     }
 
     /// Decides from the game's frame rates in WINDOWS stats windows at the headset's `rate`.
-    /// Returns the old and the new share when the game gets a smaller size at its next start.
-    pub fn learn(&self, program: &str, rates: &[f64], rate: f64) -> Option<(f32, f32)> {
+    /// Returns the change of the game's share for its next start, or none.
+    pub fn learn(&self, program: &str, rates: &[f64], rate: f64) -> Option<Step> {
         if rates.iter().filter(|&&fps| fps < SLOW * rate).count() < SLOW_WINDOWS {
             return None;
         }
@@ -69,28 +73,57 @@ impl Sizes {
         sorted.sort_by(f64::total_cmp);
         let fps = sorted[sorted.len() / 2];
         let share = self.share(program);
-        let next = next_share(share, fps, rate, self.before(program))?;
-        replace(&self.sizes, program, &format!("{next:.3} {program}"));
-        replace(&self.rates, program, &format!("{share:.3} {fps:.1} {program}"));
-        Some((share, next))
+        let step = next_share(share, fps, rate, self.before(program))?;
+        match step {
+            Step::Smaller { old, new } => {
+                replace(&self.sizes, program, &format!("{new:.3} {program}"));
+                replace(&self.rates, program, &format!("{old:.3} {fps:.1} {program}"));
+            }
+            Step::Back { new, .. } => {
+                // A line stays also at the full size: the app lists it, and its Forget button clears it
+                // together with the rates line, which holds the game at this share
+                replace(&self.sizes, program, &format!("{new:.3} {program}"));
+                // The rates line keeps the share from before the step and its frame rate. Its share is
+                // the game's share again, so the next start takes no step.
+            }
+        }
+        Some(step)
     }
+}
+
+/// A change of a game's share for its next start
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Step {
+    /// The game stayed below the headset's rate: a smaller share
+    Smaller { old: f32, new: f32 },
+    /// A smaller share did not raise the game's frame rate: the share from before that step. The game
+    /// keeps it, because its size does not limit it.
+    Back { old: f32, new: f32, fps: f64 },
 }
 
 /// The next share for a game that made `fps` at `share` while the headset shows `rate`, or none.
 /// `before` is the share and frame rate before the last step.
-fn next_share(share: f32, fps: f64, rate: f64, before: Option<(f32, f64)>) -> Option<f32> {
-    if fps >= SLOW * rate || share <= FLOOR + 0.001 {
+fn next_share(share: f32, fps: f64, rate: f64, before: Option<(f32, f64)>) -> Option<Step> {
+    if fps >= SLOW * rate {
         return None;
     }
-    // A smaller size that did not speed the game up: the size is not what limits it
     if let Some((old_share, old_fps)) = before {
-        if old_share > share + 0.001 && fps < old_fps * 1.05 {
+        // The game had its size back after a step that did not help: its size does not limit it
+        if (old_share - share).abs() <= 0.001 {
             return None;
         }
+        // A smaller size that did not speed the game up: the size is not what limits it, so the game
+        // gets its size back
+        if old_share > share + 0.001 && fps < old_fps * 1.05 {
+            return Some(Step::Back { old: share, new: old_share, fps });
+        }
+    }
+    if share <= FLOOR + 0.001 {
+        return None;
     }
     // The GPU time follows the pixel count, the square of the share. Aim 10% under the rate.
     let step = (fps / rate * 0.9).sqrt().clamp(0.7, 0.95) as f32;
-    Some((share * step).max(FLOOR))
+    Some(Step::Smaller { old: share, new: (share * step).max(FLOOR) })
 }
 
 /// The lines of a file, without the line ends; none when it is missing.
@@ -126,13 +159,33 @@ mod tests {
         dir
     }
 
+    /// The new share of a step to a smaller size
+    fn smaller(step: Option<Step>) -> (f32, f32) {
+        match step {
+            Some(Step::Smaller { old, new }) => (old, new),
+            other => panic!("expected a smaller share, got {other:?}"),
+        }
+    }
+
+    /// The shares of a step back, from the share of the run to the one before the last step
+    fn back(step: Option<Step>) -> (f32, f32) {
+        match step {
+            Some(Step::Back { old, new, .. }) => (old, new),
+            other => panic!("expected the share before the last step, got {other:?}"),
+        }
+    }
+
+    fn near(a: f32, b: f32) -> bool {
+        (a - b).abs() < 0.001
+    }
+
     #[test]
     fn a_slow_game_gets_a_smaller_share_once_per_decision() {
         let dir = temp("slow");
         let sizes = Sizes::new(&dir);
         assert_eq!(sizes.share(GAME), 1.0);
         // 91 fps at 120 Hz: about 0.83 of the size
-        let (old, new) = sizes.learn(GAME, &[91.0; WINDOWS], 120.0).unwrap();
+        let (old, new) = smaller(sizes.learn(GAME, &[91.0; WINDOWS], 120.0));
         assert_eq!(old, 1.0);
         assert!((0.8..0.86).contains(&new), "{new}");
         assert!((sizes.share(&GAME.to_uppercase()) - new).abs() < 0.001);
@@ -155,17 +208,47 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// Serious Sam VR holds its menu at 99 frames a second (issue #155). A smaller size cannot raise
+    /// that rate. The game lost 15% of its size for good before; now it gets the full size back and
+    /// keeps it at every later start.
     #[test]
-    fn a_game_that_a_smaller_size_did_not_speed_up_stops_shrinking() {
+    fn a_game_that_caps_its_own_rate_gets_its_size_back_and_keeps_it() {
+        let dir = temp("capped");
+        let sizes = Sizes::new(&dir);
+        let other = r"C:\Games\Other\Other.exe";
+        smaller(sizes.learn(other, &[90.0; WINDOWS], 120.0));
+        let (_, first) = smaller(sizes.learn(GAME, &[99.0; WINDOWS], 120.0));
+        assert!(first < 0.95, "{first}");
+        // The next start, at the smaller size, makes the same 99 fps
+        let (old, new) = back(sizes.learn(GAME, &[99.0; WINDOWS], 120.0));
+        assert!(near(old, first) && new == 1.0, "{old} {new}");
+        assert_eq!(sizes.share(GAME), 1.0);
+        // The line stays at the full size, so the app lists the game and can forget what it learned
+        let text = fs::read_to_string(dir.join("game-sizes.txt")).unwrap();
+        assert!(text.contains(&format!("1.000 {GAME}")), "{text}");
+        assert!(text.contains(other), "{text}");
+        // Every later start keeps the full size
+        for _ in 0..3 {
+            assert_eq!(sizes.learn(GAME, &[99.0; WINDOWS], 120.0), None);
+            assert_eq!(sizes.share(GAME), 1.0);
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_step_that_did_not_help_goes_back_to_the_share_before_it() {
         let dir = temp("cpu");
         let sizes = Sizes::new(&dir);
-        let (_, first) = sizes.learn(GAME, &[80.0; WINDOWS], 120.0).unwrap();
-        // The next start, at the smaller size, makes the same 81 fps: the CPU limits this game
-        assert_eq!(sizes.learn(GAME, &[81.0; WINDOWS], 120.0), None);
-        assert!((sizes.share(GAME) - first).abs() < 0.001);
+        let (_, first) = smaller(sizes.learn(GAME, &[80.0; WINDOWS], 120.0));
         // A real gain allows one more step
-        let (old, second) = sizes.learn(GAME, &[100.0; WINDOWS], 120.0).unwrap();
-        assert!((old - first).abs() < 0.001 && second < first);
+        let (old, second) = smaller(sizes.learn(GAME, &[100.0; WINDOWS], 120.0));
+        assert!(near(old, first) && second < first);
+        // The second step gained nothing: the CPU limits the game now. It gets the first share back.
+        let (old, new) = back(sizes.learn(GAME, &[101.0; WINDOWS], 120.0));
+        assert!(near(old, second) && near(new, first), "{old} {new}");
+        assert!(near(sizes.share(GAME), first));
+        assert_eq!(sizes.learn(GAME, &[101.0; WINDOWS], 120.0), None);
+        assert!(near(sizes.share(GAME), first));
         assert_eq!(fs::read_to_string(dir.join("game-sizes.txt")).unwrap().lines().count(), 1);
         assert_eq!(fs::read_to_string(dir.join("game-rates.txt")).unwrap().lines().count(), 1);
         fs::remove_dir_all(&dir).ok();
@@ -173,7 +256,8 @@ mod tests {
 
     #[test]
     fn the_share_stops_at_the_floor() {
-        assert_eq!(next_share(0.42, 30.0, 120.0, None), Some(FLOOR));
+        let to = |share: f32| Some(Step::Smaller { old: 0.42, new: share });
+        assert_eq!(next_share(0.42, 30.0, 120.0, None), to(FLOOR));
         assert_eq!(next_share(FLOOR, 30.0, 120.0, None), None);
         assert_eq!(next_share(1.0, 118.0, 120.0, None), None);
     }

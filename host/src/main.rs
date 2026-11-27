@@ -1660,13 +1660,19 @@ fn frame_loop(
             if loaded && game.active() && game.rates.len() < game_sizes::WINDOWS {
                 game.rates.push(game_fps);
                 if let (game_sizes::WINDOWS, Some(program)) = (game.rates.len(), &game.program) {
-                    if let Some((old, new)) = sizes.learn(program, &game.rates, rate) {
-                        let name = program.rsplit('\\').next().unwrap_or(program);
-                        warn!(
+                    let name = program.rsplit('\\').next().unwrap_or(program);
+                    match sizes.learn(program, &game.rates, rate) {
+                        Some(game_sizes::Step::Smaller { old, new }) => warn!(
                             "Game: {name} stayed below {rate:.0} Hz. Its next start renders at {:.0}% of the size set in cranvr, after {:.0}%.",
                             new * 100.0,
                             old * 100.0
-                        );
+                        ),
+                        Some(game_sizes::Step::Back { old, new, fps }) => warn!(
+                            "Game: {name} made {fps:.0} fps at {:.0}% of the size set in cranvr. The smaller size did not raise its frame rate, so its size does not limit it. Its next start renders at {:.0}% again.",
+                            old * 100.0,
+                            new * 100.0
+                        ),
+                        None => {}
                     }
                 }
             }
