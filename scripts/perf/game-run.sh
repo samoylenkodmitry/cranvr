@@ -7,7 +7,7 @@
 #   PROGRAM    the game's Windows path (default: Beat Saber)
 #
 # The cranvr app must run with "cranvr client" as its Headset app (Settings tab). The headset
-# must be paired with it already (see "Pairing" in the README). The script wakes the headset
+# must be paired with it already (see "Pairing" in docs/connection.md). The script wakes the headset
 # without a wearer (proximity sensor and guardian off), starts the Cranpose client
 # (dev.cranvr.client) and the game without sound, records the host's stats and the Mac's GPU
 # use, then stops the game and sets Guardian back to its exact old value, on a failure or a kill too

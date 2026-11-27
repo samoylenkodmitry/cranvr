@@ -12,6 +12,7 @@
 # script signs with your first "Apple Development" identity, so a rebuilt app keeps them.
 # Set CRANVR_SIGN_IDENTITY to choose another identity, or "-" for an ad-hoc signature (then
 # macOS asks again after each build).
+# CRANVR_VERSION sets the version. It defaults to Cargo.toml's.
 
 set -euo pipefail
 
@@ -36,7 +37,7 @@ mkdir -p "${app}/Contents/MacOS" "${app}/Contents/Resources/scripts"
 cp target/release/cranvr target/release/cranvr-host "${app}/Contents/MacOS/"
 cp scripts/setup-wine.sh scripts/setup-steam.sh scripts/install-game-support.sh scripts/run-game.sh scripts/game-support-version.txt "${app}/Contents/Resources/scripts/"
 cp target/quest-recorder/cranvr-quest-recorder.jar "${app}/Contents/Resources/"
-version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+version=${CRANVR_VERSION:-$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)}
 
 cat > "${app}/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

@@ -4,7 +4,7 @@ cranvr runs Windows OpenVR games under Wine with [OpenComposite](https://gitlab.
 
 - `mingw-x86_64.cmake` is the CMake toolchain file. It defines `WIN32` (OpenComposite tests it, and GCC does not define it in strict C++20 mode) and includes `<cstdint>` for the OpenXR loader's sources, which GCC 16 no longer gets from other headers.
 - `shim/atlbase.h` is the part of ATL that OpenComposite uses, for MinGW-w64.
-- `tests/openvr_smoke.cpp` is the OpenVR test program (see "End-to-end test" in the README).
+- `tests/openvr_smoke.cpp` is the OpenVR test program (see "End-to-end test" in `docs/development.md`).
 - `vulkan-1.def` lists the Vulkan functions that OpenComposite calls. `build-opencomposite.sh` makes a delay-load import library of Wine's `vulkan-1.dll` from it with MinGW-w64's `dlltool`, so a Direct3D 11 game never loads Vulkan. The build takes Khronos' Vulkan headers at a pinned commit (checked by their SHA-256). The upstream build takes both from the Vulkan SDK for Windows.
 
 ## patches

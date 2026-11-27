@@ -7,7 +7,7 @@
 //! Cranpose's `backend::open_microphone` records with an AAudio input stream on a Quest, in
 //! low-latency mode with the preset for speech recognition. On a Quest 3 a game hears the sound about
 //! 30 ms sooner with it than with the preset for a call, which cancels the echo of the headset's
-//! speakers (see "The microphone in games" in the README). The launch extra
+//! speakers (see "The microphone in games" in docs/desktop.md). The launch extra
 //! `microphone_preset=communication` records with the call preset. The recorder runs
 //! on the input thread. It mixes the channels down to one, resamples to 48 kHz when the device runs
 //! at another rate and puts the frames into a lock-free queue. A thread of this file sends them in
