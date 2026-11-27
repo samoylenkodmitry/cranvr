@@ -64,7 +64,9 @@ pub fn find(heard: &[i16], played: &[i16], guess: f64, span: f64) -> Option<Lag>
 /// The loudness of each step of 1 ms, less its mean, so silence and a steady hum match nothing.
 fn loudness(samples: &[i16]) -> Vec<f32> {
     let steps: Vec<f32> = samples
-        .chunks_exact(STEP)
+        .as_chunks::<STEP>()
+        .0
+        .iter()
         .map(|step| step.iter().map(|sample| f32::from(*sample).abs()).sum::<f32>() / STEP as f32)
         .collect();
     let mean = steps.iter().sum::<f32>() / steps.len().max(1) as f32;
@@ -119,7 +121,7 @@ fn loudest(samples: &[i16], window: usize) -> usize {
 
 /// One channel from interleaved stereo: the mean of the two.
 pub fn mono(stereo: &[i16]) -> Vec<i16> {
-    stereo.chunks_exact(2).map(|pair| ((i32::from(pair[0]) + i32::from(pair[1])) / 2) as i16).collect()
+    stereo.as_chunks::<2>().0.iter().map(|[left, right]| ((i32::from(*left) + i32::from(*right)) / 2) as i16).collect()
 }
 
 #[cfg(test)]

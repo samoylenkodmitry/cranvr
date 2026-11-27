@@ -47,8 +47,9 @@ const NOTE_SIZE: [f32; 2] = [300.0, 34.0];
 
 const GREEN: Color = Color(0.25, 1.0, 0.42, 1.0);
 const RED: Color = Color(1.0, 0.16, 0.12, 1.0);
-/// The share of the theme's light of a gem that cannot record now
-const DIM: f32 = 0.35;
+/// The share of the theme's light of a gem that cannot record now. The gem's core still clips to
+/// white, so the gem as a whole shows about half as bright as the idle gem.
+const DIM: f32 = 0.2;
 
 /// What the gem rides on
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -156,9 +157,15 @@ pub fn RecordGem(state: HandState, theme: Theme) {
                 let hovered = source.collectIsHoveredAsState().get();
                 let current = recording.get();
                 let look = look(current.as_ref(), hovered, glass);
-                Box(Modifier::empty().fill_max_size().then(hover::hover_modifier(hover::GEM)), BoxSpec::default(), move || {
-                    SpatialGem(move || press(recording, note), Modifier::empty().fill_max_size(), true, look.color, look.glow, source);
+                // The log names each new look, for a test that checks the gem's colors
+                let named = (hovered, current.as_ref().map(|state| (state.running, state.blocked.is_some())));
+                LaunchedEffect(named, async move |_| {
+                    let Color(red, green, blue, _) = look.color;
+                    log::info!("the gem's look: hovered {}, the Mac's state {:?} (running, blocked), color {red:.2} {green:.2} {blue:.2}", named.0, named.1);
                 });
+                // The gem takes its color as an argument of this scope, which composes again with each
+                // new look
+                SpatialGem(move || press(recording, note), Modifier::empty().fill_max_size().then(hover::hover_modifier(hover::GEM)), true, look.color, look.glow, source);
             });
             if let Some((text, _)) = note.get() {
                 // The line stands to the left of the gem, away from the ball and the menu

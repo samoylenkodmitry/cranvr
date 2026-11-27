@@ -31,10 +31,12 @@ fn main() {
     // A test beside the user's app runs with no window (see run.rs)
     if std::env::args().any(|arg| arg == "--headless") {
         run::headless();
+        recorder::stop_at_exit();
         backend::stop_host();
         return;
     }
     let result = AppLauncher::new().with_title("cranvr").with_size(820, 760).try_run(ui::CranvrApp);
+    recorder::stop_at_exit();
     backend::stop_host();
     if let Err(error) = result {
         eprintln!("cranvr: {error}");

@@ -55,10 +55,10 @@ fn slot_of(pointer: u64) -> usize {
 pub fn set(id: u32, pointer: u64, hovered: bool) {
     let bit = 1u64 << id;
     let slot = &HOVERED[slot_of(pointer)];
-    if hovered {
-        slot.fetch_or(bit, Ordering::Relaxed);
-    } else {
-        slot.fetch_and(!bit, Ordering::Relaxed);
+    let before = if hovered { slot.fetch_or(bit, Ordering::Relaxed) } else { slot.fetch_and(!bit, Ordering::Relaxed) };
+    // The gem's hover changes its color: the log says which pointer rests on it, for a test
+    if id == GEM && (before & bit != 0) != hovered {
+        log::info!("{} pointer {} the gem that records", ["the left", "the right", "a"][slot_of(pointer)], if hovered { "rests on" } else { "leaves" });
     }
 }
 
@@ -146,19 +146,20 @@ pub fn hover_modifier(id: u32) -> Modifier {
                     if let Some(hovered) = hover_of(event.kind) {
                         set(id, event.id.0, hovered);
                     }
-                    // The log says where a ray enters the hand menu, its ball or the console and where
-                    // it presses them, so a test reads the panel's place from the point that the ray
+                    // The log says where a ray enters the hand menu, its ball, the console or the gem
+                    // and where it presses them, so a test reads the panel's place from the point that the ray
                     // was aimed at
                     let verb = match event.kind {
                         PointerEventKind::Enter => Some("enters"),
                         PointerEventKind::Down => Some("presses"),
                         _ => None,
                     };
-                    if let Some(verb) = verb.filter(|_| [MENU, STRIP, PALM, CONSOLE].contains(&id)) {
+                    if let Some(verb) = verb.filter(|_| [MENU, STRIP, PALM, CONSOLE, GEM].contains(&id)) {
                         let hand = ["the left", "the right", "a"][slot_of(event.id.0)];
                         let what = match id {
                             MENU => "the hand menu",
                             CONSOLE => "the console",
+                            GEM => "the gem that records",
                             _ => "the hand ball",
                         };
                         log::info!("{hand} pointer {verb} {what} at {:.0}, {:.0} dp", event.position.x, event.position.y);

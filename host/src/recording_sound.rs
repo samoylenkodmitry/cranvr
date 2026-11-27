@@ -41,7 +41,10 @@ struct Times {
     start_mark: Option<u64>,
 }
 
-static TAP: OnceLock<Mutex<Option<Sender<(u64, Vec<u8>)>>>> = OnceLock::new();
+/// A buffer of the tap with the time of its arrival on `mach_continuous_time`
+type Buffer = (u64, Vec<u8>);
+
+static TAP: OnceLock<Mutex<Option<Sender<Buffer>>>> = OnceLock::new();
 
 /// The tap's sink: the buffer with the time of its arrival, to the writer's thread
 fn to_writer(pcm: &[u8]) {

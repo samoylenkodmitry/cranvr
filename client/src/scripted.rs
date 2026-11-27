@@ -34,9 +34,10 @@
 //!   seconds of rest between: the trigger, A, the grip, the thumbstick forward and the thumbstick to
 //!   the right. The log says each change of the right controller's inputs ("scripted models:"), so a
 //!   screen capture can be matched with the press that it shows.
-//! - `scripted_pointer=gem` holds the left controller still with the gem that records on it. The
-//!   right controller points away for `gem_wait_ms` (12 s by default), at the gem for 4 s, presses it,
-//!   points away for 8 s while the recording runs and presses it again (see `gem_walk`).
+//! - `scripted_pointer=gem` holds the left controller still with the gem that records on it. Once
+//!   the Mac's state arrives, the right controller points away for `gem_wait_ms` (12 s by default),
+//!   at the gem for 4 s, presses it, points away for 8 s while the recording runs and presses it
+//!   again (see `gem_walk`).
 //! - `scripted_pointer=console` holds the left controller still. The right controller points at the
 //!   console for 4 seconds and away from every panel for 4 seconds, again and again. Once a game runs
 //!   the script opens the console, which a game's start closes. The log then shows the right
@@ -280,9 +281,10 @@ const GEM_LEFT_AT: [f32; 3] = [-0.15, -0.3, -0.45];
 const GEM_RIGHT_AT: [f32; 3] = [0.15, -0.32, -0.3];
 
 /// Plays `scripted_pointer=gem`: the left controller holds still and carries the gem that records
-/// (`record_gem.rs`). The right controller points away for `wait_ms`, then at the gem for 4 s, pulls
-/// its trigger, points away for 8 s while the recording runs, and points at the gem and pulls again.
-/// The log names each step ("scripted gem:"), so a test takes its screen captures in the right step.
+/// (`record_gem.rs`). Once the Mac's first state of its recording arrives, the right controller
+/// points away for `wait_ms`, then at the gem for 4 s, pulls its trigger, points away for 8 s while the
+/// recording runs, and points at the gem and pulls again. The log names each step ("scripted
+/// gem:"), so a test takes its screen captures in the right step.
 fn gem_walk(wait_ms: u64) {
     let rest = ScriptedButtons::default();
     let pull = ScriptedButtons { trigger: 1.0, ..rest };
@@ -292,31 +294,35 @@ fn gem_walk(wait_ms: u64) {
     let offset = crate::record_gem::ON_CONTROLLER.map(|dp| dp / 1000.0);
     let gem = [0, 1, 2].map(|axis| GEM_LEFT_AT[axis] + offset[axis]);
     let away = [GEM_RIGHT_AT[0] + 1.0, GEM_RIGHT_AT[1] + 0.3, GEM_RIGHT_AT[2] - 1.0];
-    // Cranpose's pointer smooths the ray, so each press comes 1.2 s after the aim
-    let steps: [(u64, &str); 6] = [
-        (wait_ms, "the right controller points away: the gem shows its idle look"),
-        (4000, "the right controller points at the gem"),
-        (1500, "the right controller pulls its trigger on the gem"),
-        (8000, "the right controller points away while the recording runs"),
-        (1500, "the right controller points at the gem and pulls its trigger again"),
-        (600_000, "the right controller points away"),
-    ];
-    let right = ScriptedController::new(Hand::Right, GEM_RIGHT_AT, away)
-        .holding(Duration::from_millis(wait_ms), rest)
-        .moving_to(Duration::from_millis(1), (GEM_RIGHT_AT, gem), rest)
-        .holding(Duration::from_millis(4000), rest)
-        .holding(Duration::from_millis(1200), rest)
-        .holding(Duration::from_millis(300), pull)
-        .moving_to(Duration::from_millis(1), (GEM_RIGHT_AT, away), rest)
-        .holding(Duration::from_millis(8000), rest)
-        .moving_to(Duration::from_millis(1), (GEM_RIGHT_AT, gem), rest)
-        .holding(Duration::from_millis(1200), rest)
-        .holding(Duration::from_millis(300), pull)
-        .moving_to(Duration::from_millis(1), (GEM_RIGHT_AT, away), rest)
-        .holding(Duration::from_secs(600), rest);
-    script_controller(right);
-    log::info!("scripted gem: the gem stands at {gem:?}");
+    log::info!("scripted gem: the gem stands at {gem:?}; the right controller waits for the Mac's state");
     std::thread::spawn(move || {
+        // The walk starts with the link: before it, a press would reach no Mac
+        while crate::hub::hub().recording().is_none() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Cranpose's pointer smooths the ray, so each press comes 1.2 s after the aim
+        let right = ScriptedController::new(Hand::Right, GEM_RIGHT_AT, away)
+            .holding(Duration::from_millis(wait_ms), rest)
+            .moving_to(Duration::from_millis(1), (GEM_RIGHT_AT, gem), rest)
+            .holding(Duration::from_millis(4000), rest)
+            .holding(Duration::from_millis(1200), rest)
+            .holding(Duration::from_millis(300), pull)
+            .moving_to(Duration::from_millis(1), (GEM_RIGHT_AT, away), rest)
+            .holding(Duration::from_millis(8000), rest)
+            .moving_to(Duration::from_millis(1), (GEM_RIGHT_AT, gem), rest)
+            .holding(Duration::from_millis(1200), rest)
+            .holding(Duration::from_millis(300), pull)
+            .moving_to(Duration::from_millis(1), (GEM_RIGHT_AT, away), rest)
+            .holding(Duration::from_secs(600), rest);
+        script_controller(right);
+        let steps: [(u64, &str); 6] = [
+            (wait_ms, "the right controller points away: the gem shows its idle look"),
+            (5500, "the right controller points at the gem"),
+            (0, "the right controller pulls its trigger on the gem"),
+            (8000, "the right controller points away while the recording runs"),
+            (1500, "the right controller points at the gem and pulls its trigger again"),
+            (0, "the right controller points away"),
+        ];
         for (millis, step) in steps {
             log::info!("scripted gem: {step}");
             std::thread::sleep(Duration::from_millis(millis));

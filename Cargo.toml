@@ -15,13 +15,12 @@ cranvr-vt = { path = "vt" }
 cranvr-common = { path = "common" }
 cranvr-proto = { path = "proto" }
 
-# Cranpose's forks (wgpu, basisu) at the revision that the app and the client pin. That Cranpose needs fork
+# Cranpose's wgpu forks at the revision that the app and the client pin. That Cranpose needs fork
 # versions that crates.io gets only with Cranpose's next release.
 [patch.crates-io]
-cranpose-wgpu = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "ffe27e10fe63017ba85191d80990bb17cd2a12bf" }
-cranpose-wgpu-core = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "ffe27e10fe63017ba85191d80990bb17cd2a12bf" }
-cranpose-wgpu-hal = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "ffe27e10fe63017ba85191d80990bb17cd2a12bf" }
-cranpose-basisu = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "ffe27e10fe63017ba85191d80990bb17cd2a12bf" }
+cranpose-wgpu = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0734df8264a7c5ada5e0d9cb0fad7291c194f71b" }
+cranpose-wgpu-core = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0734df8264a7c5ada5e0d9cb0fad7291c194f71b" }
+cranpose-wgpu-hal = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0734df8264a7c5ada5e0d9cb0fad7291c194f71b" }
 
 [profile.release]
 debug = 1

@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Measures the gem that records in a screen capture of the headset (scripts/gem-check.sh).
 
-Usage: scripts/gem-color.py --find CAPTURE.png   prints X,Y: the middle of the green pixels in the
-                                                  left eye, where a pointed gem stands
+Usage: scripts/gem-color.py --find CAPTURE.png [BEFORE.png]
+                                              prints X,Y: the middle of the green pixels in the left
+                                              eye, where a pointed gem stands. With BEFORE, a capture
+                                              of the gem before the ray pointed at it, only the
+                                              pixels that turned green count.
        scripts/gem-color.py CAPTURE.png [X,Y]     prints the mean color of the lit pixels within 30
-                                                  pixels of X,Y and what it looks like
+                                                  pixels of X,Y, its light (luma) and what it looks
+                                                  like
 
 macOS's `sips` turns the PNG into a BMP, which the script reads.
 """
@@ -38,13 +42,17 @@ def pixels(png):
     return width, height, at
 
 
-def find(png):
+def green(r, g, b):
+    return g > 150 and g - r > 70 and g - b > 40
+
+
+def find(png, before=None):
     width, height, at = pixels(png)
+    was = pixels(before)[2] if before else None
     xs, ys = [], []
     for y in range(0, height, 2):
         for x in range(0, width // 2, 2):
-            r, g, b = at(x, y)
-            if g > 150 and g - r > 70 and g - b > 40:
+            if green(*at(x, y)) and not (was and green(*was(x, y))):
                 xs.append(x)
                 ys.append(y)
     if len(xs) < 20:
@@ -55,11 +63,11 @@ def find(png):
 
 
 def look(r, g, b):
-    if max(r, g, b) < 110:
-        return "dim"
-    if r > g + 60 and r > b + 60:
+    """What the mean color of the gem's lit pixels looks like. The bright core of a gem clips to
+    white, so the mean says more of its hue than its brightest pixels."""
+    if r > g + 50 and r > b + 50:
         return "red"
-    if g > r + 50 and g > b + 30:
+    if g > r + 40 and g > b + 10:
         return "green"
     if b > g and r > g:
         return "violet"
@@ -70,7 +78,7 @@ def look(r, g, b):
 
 def main():
     if sys.argv[1] == "--find":
-        place = find(sys.argv[2])
+        place = find(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)
         if place:
             print(f"{place[0]},{place[1]}")
         return
@@ -92,7 +100,8 @@ def main():
     mean = [sum(p[i] for p in lit) / len(lit) for i in range(3)]
     brightest = sorted(lit, key=lambda p: -max(p))[: max(1, len(lit) // 5)]
     top = [sum(p[i] for p in brightest) / len(brightest) for i in range(3)]
-    print(f"{pathlib.Path(png).name}: {len(lit)} lit pixels at {cx},{cy}, mean rgb {mean[0]:.0f},{mean[1]:.0f},{mean[2]:.0f}, brightest fifth {top[0]:.0f},{top[1]:.0f},{top[2]:.0f}: {look(*top)}")
+    light = 0.2126 * mean[0] + 0.7152 * mean[1] + 0.0722 * mean[2]
+    print(f"{pathlib.Path(png).name}: {len(lit)} lit pixels at {cx},{cy}, mean rgb {mean[0]:.0f},{mean[1]:.0f},{mean[2]:.0f} (light {light:.0f}), brightest fifth {top[0]:.0f},{top[1]:.0f},{top[2]:.0f}: {look(*mean)}")
 
 
 if __name__ == "__main__":

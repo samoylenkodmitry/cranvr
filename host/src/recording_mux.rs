@@ -85,7 +85,7 @@ pub fn run(video: &Path, dir: &Path, out: &Path) -> Result<Value, String> {
                 let range = unsafe { CMTimeRange::new(time(skip), time(length)) };
                 insert(&composition, unsafe { AVMediaTypeAudio }, &sound_track, range, time((-lag).max(0.0)))?;
             }
-            numbers["sound"] = json!({"source": "mac", "lag_s": lag, "found_by": method});
+            numbers["sound"] = json!({"source": "mac", "lag_s": lag, "guess_s": guess, "found_by": method});
         }
         _ => {
             if let Some(heard) = heard {
@@ -155,7 +155,7 @@ fn read_pcm(asset: &AVAsset, track: &AVAssetTrack) -> Result<(f64, Vec<i16>), St
         let length = unsafe { block.data_length() };
         let mut bytes = vec![0u8; length];
         if unsafe { block.copy_data_bytes(0, length, std::ptr::NonNull::new(bytes.as_mut_ptr()).expect("a buffer").cast()) } == 0 {
-            samples.extend(bytes.chunks_exact(2).map(|pair| i16::from_le_bytes([pair[0], pair[1]])));
+            samples.extend(bytes.as_chunks::<2>().0.iter().map(|pair| i16::from_le_bytes(*pair)));
         }
     }
     Ok((start.unwrap_or(0.0), samples))

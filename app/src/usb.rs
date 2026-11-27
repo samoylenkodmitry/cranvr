@@ -437,6 +437,11 @@ fn wake() {
     }
 }
 
+/// True once the thread runs. The app with no window runs none (`cranvr --headless`).
+pub fn watching() -> bool {
+    WAKE.get().is_some()
+}
+
 /// Starts the thread, once.
 pub fn start(port: u16) {
     static STARTED: std::sync::Once = std::sync::Once::new();

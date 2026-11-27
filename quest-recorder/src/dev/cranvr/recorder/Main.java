@@ -16,8 +16,9 @@ import java.lang.reflect.Method;
  * {@code CLASSPATH=cranvr-quest-recorder.jar app_process / dev.cranvr.recorder.Main start|stop}.
  *
  * <p>The recorder answers through the messenger of the request. The program prints {@code ok} and the
- * time of the answer on {@code SystemClock.elapsedRealtimeNanos}, or {@code error} and the reason, and
- * ends with code 0 or 1. The recorder keeps its own settings: the program changes none.
+ * time of the answer on {@code SystemClock.elapsedRealtimeNanos}, or {@code error} and the reason. It
+ * ends with code 0 either way, so adb hands the line to the Mac. The recorder keeps its own settings:
+ * the program changes none.
  */
 public final class Main {
     private static final String ACTION_PREFIX = "horizonos.appactions.";
@@ -41,7 +42,6 @@ public final class Main {
             return;
         }
         Looper.prepare();
-        int[] code = {1};
         Handler handler = new Handler(Looper.myLooper()) {
             @Override
             public void handleMessage(Message message) {
@@ -49,7 +49,6 @@ public final class Main {
                 String error = data == null ? null : data.getString("__error_message");
                 if (message.arg1 == RESULT_OK && error == null) {
                     System.out.println("ok " + SystemClock.elapsedRealtimeNanos());
-                    code[0] = 0;
                 } else {
                     System.out.println("error " + (error != null ? error : "the recorder answered " + message.arg1));
                 }
@@ -60,9 +59,18 @@ public final class Main {
         intent.setComponent(RECORDER);
         intent.putExtra("__result_messenger", new Messenger(handler));
         intent.putExtra("__request_id", "cranvr-" + SystemClock.elapsedRealtimeNanos());
-        if (!startService(intent)) {
+        boolean taken;
+        try {
+            taken = startService(intent);
+        } catch (Exception e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            System.out.println("error the request did not reach the recorder: " + cause);
+            System.exit(0);
+            return;
+        }
+        if (!taken) {
             System.out.println("error the headset has no recorder that takes the request");
-            System.exit(1);
+            System.exit(0);
             return;
         }
         handler.postDelayed(() -> {
@@ -70,7 +78,7 @@ public final class Main {
             Looper.myLooper().quit();
         }, ANSWER_WAIT);
         Looper.loop();
-        System.exit(code[0]);
+        System.exit(0);
     }
 
     /** Starts the recorder's service as the shell user. Returns whether a service took the intent. */

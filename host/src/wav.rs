@@ -83,7 +83,7 @@ pub fn read(path: &Path) -> io::Result<(u16, Vec<i16>)> {
         match &data[at..at + 4] {
             b"fmt " if body.len() >= 16 && u16::from_le_bytes([body[14], body[15]]) == 16 => channels = Some(u16::from_le_bytes([body[2], body[3]])),
             b"data" => {
-                let samples = body.chunks_exact(2).map(|pair| i16::from_le_bytes([pair[0], pair[1]])).collect();
+                let samples = body.as_chunks::<2>().0.iter().map(|pair| i16::from_le_bytes(*pair)).collect();
                 return channels.map(|channels| (channels, samples)).ok_or_else(refused);
             }
             _ => {}

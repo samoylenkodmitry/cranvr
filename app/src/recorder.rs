@@ -32,6 +32,8 @@ use std::{
 
 /// Where the program lives on the headset while the app uses it
 const ON_HEADSET: &str = "/data/local/tmp/cranvr-quest-recorder.jar";
+/// The headset's own recorder
+const RECORDER_APP: &str = "com.oculus.metacam";
 /// Where the headset's recorder writes its videos
 const VIDEOS: &str = "/sdcard/Oculus/VideoShots";
 /// A recording does not start, and one that runs stops, under this much free disk on the Mac
@@ -75,6 +77,8 @@ impl View {
 
 enum Ask {
     Toggle { microphone: bool },
+    /// The app ends: stop the headset's recorder, which keeps its file in the headset's gallery
+    Quit(Sender<()>),
 }
 
 static VIEW: Mutex<Option<View>> = Mutex::new(None);
@@ -90,6 +94,19 @@ pub fn toggle(microphone: bool) {
     start_thread();
     if let Some(ask) = ASK.get() {
         ask.lock().unwrap().send(Ask::Toggle { microphone }).ok();
+    }
+}
+
+/// Stops a recording that runs as the app ends. The headset's recorder stops and keeps its file in
+/// the headset's gallery: the app does not wait for the pull and the final file. Waits up to 12 s.
+pub fn stop_at_exit() {
+    if !view().running() {
+        return;
+    }
+    if let Some(ask) = ASK.get() {
+        let (done, wait) = mpsc::channel();
+        ask.lock().unwrap().send(Ask::Quit(done)).ok();
+        wait.recv_timeout(Duration::from_secs(12)).ok();
     }
 }
 
@@ -143,6 +160,14 @@ struct Running {
 }
 
 fn run(asks: &mpsc::Receiver<Ask>) {
+    // The parts of a recording that an app's end cut short may hold the room: none stays
+    if let Ok(entries) = std::fs::read_dir(movies_dir()) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(".cranvr-") {
+                remove_parts(&entry.path());
+            }
+        }
+    }
     let mut running: Option<Running> = None;
     loop {
         let ask = match asks.recv_timeout(LOOK_EVERY) {
@@ -171,6 +196,17 @@ fn run(asks: &mpsc::Receiver<Ask>) {
                 },
             },
             (Some(Ask::Toggle { .. }), Some(recording)) => running = stop(recording),
+            (Some(Ask::Quit(done)), recording) => {
+                if let Some(mut recording) = recording {
+                    let stopped = recorder(&recording.adb, &recording.serial, "stop");
+                    backend::log(format!("Recording: the app ends; the headset's recorder keeps the file in its gallery ({stopped:?})"));
+                    drop(recording.sound.stdin.take());
+                    wait_for(&mut recording.sound, Duration::from_secs(2));
+                    remove_parts(&recording.dir);
+                }
+                done.send(()).ok();
+                return;
+            }
             (None, Some(recording)) => match disk_short() {
                 Some(free) => {
                     note(format!("The Mac has only {} free: the recording stops", gigabytes(free)));
@@ -183,16 +219,45 @@ fn run(asks: &mpsc::Receiver<Ask>) {
     }
 }
 
-/// The headset on the cable that has cranvr's headset app, with the adb that reaches it
+/// Whether each device on the cable has the headset's own recorder, by its serial: a phone with
+/// cranvr's phone build has none
+static HAS_RECORDER: Mutex<Vec<(String, bool)>> = Mutex::new(Vec::new());
+
+/// The headset on the cable that has cranvr's headset app and the headset's own recorder, with the
+/// adb that reaches it
 fn cable() -> Result<(PathBuf, String), String> {
-    let status = crate::usb::status();
-    let adb = status.adb.ok_or("Recording needs adb: press Add USB support in the Connection settings")?;
-    let serial = status
-        .headsets
-        .first()
-        .map(|headset| headset.serial.clone())
-        .ok_or("Recording needs the headset on the USB cable with USB debugging")?;
-    Ok((adb, serial))
+    let (adb, serials) = cabled()?;
+    for serial in serials {
+        let known = HAS_RECORDER.lock().unwrap().iter().find(|(seen, _)| *seen == serial).map(|(_, has)| *has);
+        let has = match known {
+            Some(has) => has,
+            None => {
+                let Ok(path) = adb_call(&adb, &serial, &["shell", "pm", "path", RECORDER_APP]) else { continue };
+                let has = path.contains("package:");
+                HAS_RECORDER.lock().unwrap().push((serial.clone(), has));
+                has
+            }
+        };
+        if has {
+            return Ok((adb, serial));
+        }
+    }
+    Err("Recording needs the headset on the USB cable with USB debugging".into())
+}
+
+/// The adb tool and the serials of the headsets on the USB cable. The cable thread knows them. The
+/// app with no window runs no cable thread: it asks adb itself.
+fn cabled() -> Result<(PathBuf, Vec<String>), String> {
+    const NO_ADB: &str = "Recording needs adb: press Add USB support in the Connection settings";
+    if crate::usb::watching() {
+        let status = crate::usb::status();
+        let adb = status.adb.ok_or(NO_ADB)?;
+        return Ok((adb, status.headsets.into_iter().map(|headset| headset.serial).collect()));
+    }
+    let adb = crate::usb::locate_adb().ok_or(NO_ADB)?;
+    let listed = crate::usb::call(&adb, &["devices", "-l"], ADB_CALL).map(|text| crate::usb::parse_devices(&text)).unwrap_or_default();
+    let serials = listed.into_iter().filter(|device| device.usb && device.state == crate::usb::DeviceState::Device).map(|device| device.serial).collect();
+    Ok((adb, serials))
 }
 
 /// The free disk under 5 GB where the final files go, or `None` while there is more
@@ -223,6 +288,10 @@ fn program() -> Result<PathBuf, String> {
     let bundled = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.parent()?.join("Resources/cranvr-quest-recorder.jar")));
     let built = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/quest-recorder/cranvr-quest-recorder.jar");
     [bundled, Some(built)].into_iter().flatten().find(|path| path.exists()).ok_or_else(|| "this build of cranvr has no recorder for the headset (scripts/build-quest-recorder.sh)".into())
+}
+
+fn adb_call(tool: &Path, serial: &str, args: &[&str]) -> Result<String, String> {
+    adb(tool, serial, args, ADB_CALL)
 }
 
 fn adb(tool: &Path, serial: &str, args: &[&str], limit: Duration) -> Result<String, String> {
