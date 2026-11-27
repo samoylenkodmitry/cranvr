@@ -155,16 +155,51 @@ applies these patches and builds both parts.
   pointers, which the Direct3D 11 and the Vulkan sessions fill. The runtime's classes have no virtual methods and no
   `std::vector`, because MinGW's C++ runtime for them imports `libwinpthread-1.dll`, which Wine lacks: the DLL then
   failed to load.
-- `winemetal.dll` keeps each IOSurface alive until the process ends (its Mach port is never freed). The runtime keeps
-  up to 64 IOSurface images in a pool and gives a new swapchain of the same size, format and use the images of a
-  destroyed one, so a game that makes its swapchains again does not grow without end. The Direct3D 11 path has the
-  same leak in DXMT.
+- Each IOSurface image has a Metal texture of its own on a new IOSurface. Patch 0015 frees it with its swapchain.
 - Every 600 frames the runtime writes a note to stderr: how long the fence's submission took and how long after
   `xrEndFrame` the GPU finished a frame, on average and at most.
 - `tests/vulkan_runtime_smoke.cpp` renders with Vulkan through the Khronos loader: `--enable1` takes
   `XR_KHR_vulkan_enable`, `--array` one swapchain of two slices. It draws exact black, a gray band down the left
   edge and a block of the eye's color (blue left, orange right), and prints its rate and the time that `xrEndFrame`
   took (`scripts/e2e.sh --xr-vulkan [enable2|enable1|array]`).
+
+`0014-dxmt-patches-checked-in-order.patch`
+
+- BasaltVR's `build-dxmt-fork.zsh` checked each DXMT patch on its own against DXMT v0.80 before it applied any. A
+  patch that changes lines of an earlier patch (cranvr's DXMT patch 0019 changes lines of BasaltVR's 0001) failed that
+  check. The script now applies the whole set in order to a scratch index of git: a set that does not apply still
+  leaves the tree as it was.
+
+`0015-vulkan-images-free-with-their-swapchain.patch`
+
+- A destroyed swapchain releases the Metal textures of its IOSurface images (`NSObject_release` of `winemetal.dll`),
+  and with them the IOSurfaces (DXMT patch 0019). Patch 0013 kept every texture in a pool of 64 for the next
+  swapchain of the same size, because `winemetal.dll` kept each IOSurface until the game ended. A game that made
+  swapchains of ever new sizes failed with `XR_ERROR_RUNTIME_FAILURE` once the pool was full: after 21 swapchains of
+  three images in `swapchain_churn.exe --vulkan`. The pool also saved no time: 1000 swapchains of three images of one
+  size took 1.6 to 2.3 ms each with it and 1.0 to 1.5 ms without it, on a Mac under load. It is gone.
+- MoltenVK's command buffers hold no reference to their textures, so a texture may go only after the GPU has
+  finished with it. The swapchain waits, at most a second, for the newest fence of the frame handoff, which signals
+  after the runtime's copies of the slices and every command of the game before its last `xrEndFrame`. A lock keeps
+  `xrEndFrame` from resetting that fence during the wait. When the wait fails, the textures stay until the game ends,
+  and the runtime writes a note. After the session's frame handoff is gone, every fence has been waited for already.
+- cranvr-host keeps its own reference to each surface (a `CVPixelBuffer` from `IOSurfaceLookup`) from the swapchain's
+  creation until it handles its destruction, and it waits for the GPU in each compose. The surface stays until the
+  host lets go, so the host never reads freed memory.
+
+`0016-swapchain-churn-test.patch`
+
+- `tests/swapchain_churn.cpp` creates and destroys a swapchain of three images many times (`--cycles`, default 1000)
+  with Direct3D 11 or with Vulkan (`--vulkan`), with one slice or two (`--slices`). The images are 333 pixels high,
+  which no game uses, and of a new width each time (256 to 510), so no reuse of images hides a leak. It clears each
+  image once and waits for the GPU before the swapchain goes. `--frames` begins the session and shows each swapchain
+  in one frame, then destroys it at once while the GPU may still work on it. `--signal FILE` stops after the first
+  and after the last swapchain until `FILE.warm` and `FILE.churned` exist, for a measurement of the process.
+  `scripts/e2e.sh --swapchain-churn d3d11|d3d11-array|vulkan|vulkan-array [--churn-frames]` runs it.
+- Before the fix, 21 swapchains of Direct3D 11 left 63 IOSurfaces (24 MB) alive while the program ran and also after
+  it ended (launchd held them). With Vulkan, the 22nd swapchain failed, and the 63 surfaces of the first 21 went
+  with the process. After the fix, 1000 swapchains left none, in each of the four ways, and none with `--frames`
+  either (100 to 120 swapchains, each shown in a frame).
 
 ## patches/dxmt
 
@@ -222,7 +257,8 @@ hull or domain shader and no stream output takes its place. `DXMT_RASTERIZE_OUTP
 former behavior back for a comparison. The log says once which vertex shader this was.
 
 Patches 0013 to 0018 run SteamVR for Windows under Wine (cranvr's SteamVR mode, `steamvr/driver_cranvr.cpp`). Each
-applies on its own to DXMT v0.80, as the build script checks.
+applies on its own to DXMT v0.80. The build script checks the whole set in order (runtime patch 0014), because patch
+0019 changes lines of BasaltVR's 0001.
 
 `0013-shared-buffers-between-processes.patch`: SteamVR's compositor makes a constant buffer with
 `D3D11_RESOURCE_MISC_SHARED` and stops at start when the buffer has no shared handle ("Failed to create shared frame
@@ -254,3 +290,21 @@ share it again, as on Windows. SteamVR's web helper passes the textures of Chrom
 compositor. Without the patch each of them failed with `VROverlayError_InvalidTexture`, and SteamVR's panels and
 controller hints stayed away from the headset. The private data comes from opening the shared resource: the query of
 it gives only the size.
+
+`0019-iosurface-textures-free-with-their-last-texture.patch`: `MTLDevice_newTextureFromIOSurface` (BasaltVR's 0001) made
+a Mach send right of each new IOSurface and returned it in `WMTTextureInfo::mach_port`. Nothing freed it, so the
+surface stayed until the process ended. DXMT also registered the right with launchd under the texture's shared name,
+for `OpenSharedResource` in another process. launchd keeps a registered right until the user logs out and refuses to
+remove the name (a register with no port answers `BOOTSTRAP_NAME_IN_USE`). Every swapchain image of every Direct3D 11
+game and of SteamVR's shared textures therefore stayed after the program had ended: on 2026-11-27 launchd held 206
+surfaces (529 MB) for 209 names of dead Wine processes on the owner's Mac. The call now makes no Mach port: the
+texture is the process's only owner of the surface, which goes a few milliseconds after the last texture on it, in
+any process, is released. A shared IOSurface texture registers nothing with launchd. Its runtime data carries the
+surface's global ID (`iosurface_id`), and `OpenSharedResource` and `OpenSharedResource1` open the surface by that ID
+(`WMTTextureInfo::reserved` in; 0 makes a new surface). The unique name stays in the runtime data, because patch 0014
+names the section of the keyed mutex by it. A shared texture of DXMT's own path (`MTLSharedTextureHandle`: other
+formats, mipmaps, arrays, MSAA) and a shared fence keep their registration with launchd: launchd held 41 such
+surfaces (under 1 MB) and 3 other ports on the owner's Mac. As with a legacy shared handle on Windows, an IOSurface texture
+whose last texture is gone no longer opens; on Windows an NT handle keeps the resource. BasaltVR's checks of the fork
+(`runtime/scripts/test-dxmt.zsh`, with the reopen of an NT handle) pass with the patch, and
+`scripts/e2e.sh --swapchain-churn` checks that no surface stays (see runtime patch 0016).
