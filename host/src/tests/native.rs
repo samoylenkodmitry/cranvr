@@ -49,6 +49,7 @@ fn config(port: u16) -> Config {
         approval_wait: Duration::from_secs(30),
         approve_loopback: false,
         trust_all: false,
+        loopback: false,
         cable: Arc::new(AtomicBool::new(true)),
         display_lock: true,
         desktop: Default::default(),

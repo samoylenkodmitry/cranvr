@@ -68,7 +68,8 @@ fn header(channels: u16, data_bytes: u32) -> [u8; HEADER] {
     out
 }
 
-/// Reads a WAV file of 16-bit samples: its channels and its interleaved samples.
+/// Reads a WAV file of 16-bit samples: its channels and its interleaved samples. A file whose writer
+/// never wrote the sizes into its header, as after a kill, holds its samples up to its end.
 pub fn read(path: &Path) -> io::Result<(u16, Vec<i16>)> {
     let mut data = Vec::new();
     File::open(path)?.read_to_end(&mut data)?;
@@ -83,6 +84,8 @@ pub fn read(path: &Path) -> io::Result<(u16, Vec<i16>)> {
         match &data[at..at + 4] {
             b"fmt " if body.len() >= 16 && u16::from_le_bytes([body[14], body[15]]) == 16 => channels = Some(u16::from_le_bytes([body[2], body[3]])),
             b"data" => {
+                // The header of a file that is still written, or that a kill cut short, says 0 bytes
+                let body = if size == 0 { &data[at + 8..] } else { body };
                 let samples = body.as_chunks::<2>().0.iter().map(|pair| i16::from_le_bytes(*pair)).collect();
                 return channels.map(|channels| (channels, samples)).ok_or_else(refused);
             }

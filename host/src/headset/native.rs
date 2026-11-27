@@ -81,6 +81,8 @@ pub struct Config {
     pub approve_loopback: bool,
     /// Accept every client without a pairing (for tests)
     pub trust_all: bool,
+    /// Listen on 127.0.0.1 alone with no listener for the USB network (`--loopback`, for tests)
+    pub loopback: bool,
     /// Whether the host takes a link over a USB cable: the headset's USB network or `adb reverse`.
     /// The user turns it off with the Connection choice Wi-Fi. The host's preamble tells each client,
     /// and the host refuses a client that comes over the cable while it is off.
@@ -202,7 +204,9 @@ fn announce(config: &Config) {
 /// Starts listening. A bind error comes back to the caller.
 pub fn start(config: Config) -> std::io::Result<(Arc<dyn Headset>, Box<dyn EventSource>)> {
     // Any machine on the network may connect. A client that the host does not know waits for the user.
-    let address: SocketAddr = ([0, 0, 0, 0], config.port).into();
+    // A loopback host takes `adb reverse` and this Mac alone, so macOS never asks for Local Network
+    // access for it.
+    let address: SocketAddr = (if config.loopback { [127, 0, 0, 1] } else { [0, 0, 0, 0] }, config.port).into();
     let listener = HostListener::bind(address, config.identity.clone())
         .map_err(|e| std::io::Error::other(e.to_string()))?
         .share_cable_switch(Arc::clone(&config.cable));
@@ -217,6 +221,7 @@ pub fn start(config: Config) -> std::io::Result<(Arc<dyn Headset>, Box<dyn Event
     // A headset's USB network to this Mac has IPv6 link-local addresses only. Without this
     // listener the headset still reaches the host over Wi-Fi and `adb reverse`.
     let cable_listener = match HostListener::bind_ipv6(config.port, config.identity.clone()) {
+        _ if config.loopback => None,
         Ok(listener) => {
             let listener = listener.share_cable_switch(Arc::clone(&config.cable));
             info!("Native protocol: listening on [::]:{} for a headset's USB network", config.port);

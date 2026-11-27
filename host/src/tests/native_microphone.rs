@@ -37,6 +37,7 @@ fn the_host_records_the_headset_while_a_game_reads_the_ring() {
         approval_wait: Duration::from_secs(30),
         approve_loopback: false,
         trust_all: false,
+        loopback: false,
         cable: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         display_lock: false,
         desktop: Default::default(),

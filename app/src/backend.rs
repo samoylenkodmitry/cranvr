@@ -914,6 +914,11 @@ fn host_args(settings: &Settings, config_dir: &Path, test: bool) -> Vec<OsString
     if test {
         args.extend(["--trust-all", "--tcp"].map(OsString::from));
     }
+    // A test beside the user's app listens on loopback alone: macOS then asks for no Local Network
+    // access for the test's binary
+    if env::var_os("CRANVR_TEST_LOOPBACK").is_some() {
+        args.push("--loopback".into());
+    }
     if !settings.connection.allows_usb() {
         args.push("--no-cable".into());
     }

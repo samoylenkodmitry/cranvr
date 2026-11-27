@@ -26,7 +26,7 @@ source ${root}/scripts/client-start.zsh
 home=${work}/home
 mkdir -p ${home}
 print '{"desktop": false, "game_audio": false, "autostart": true, "connection": "Automatic", "microphone": "Headset", "wine": {"mac_window": false}, "headset_room": "passthrough", "headset_interface": "3d", "launch": {}}' > ${home}/app.json
-CRANVR_HOME=${home} CRANVR_NATIVE_PORT=${port} CRANVR_TEST_TRUST_ALL=1 CRANVR_HOST_BIN=${root}/target/release/cranvr-host \
+CRANVR_HOME=${home} CRANVR_NATIVE_PORT=${port} CRANVR_TEST_TRUST_ALL=1 CRANVR_TEST_LOOPBACK=1 CRANVR_HOST_BIN=${root}/target/release/cranvr-host \
     ${root}/target/release/cranvr --headless < /dev/null > ${work}/app.log 2>&1 &
 app=$!
 finish() {

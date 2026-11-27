@@ -1,4 +1,4 @@
-use super::{blocked, look, GREEN, RED};
+use super::{blocked, look, GREEN, LINK_LOST, RED};
 use cranpose::prelude::Color;
 use cranpose_xr::{GemGlow, HologramColors};
 use cranvr_proto::message::Recording;
@@ -32,7 +32,17 @@ fn a_press_while_nothing_can_start_names_the_reason() {
     assert_eq!(blocked(None).as_deref(), Some("Connect to the Mac to record"));
     let cable = Recording { blocked: Some("Recording needs the USB cable".into()), ..Default::default() };
     assert_eq!(blocked(Some(&cable)).as_deref(), Some("Recording needs the USB cable"));
-    let running = Recording { running: true, blocked: Some("stale".into()), ..Default::default() };
+    let running = Recording { running: true, ..Default::default() };
     assert_eq!(blocked(Some(&running)), None);
     assert_eq!(blocked(Some(&Recording::default())), None);
+}
+
+// The link ended while a recording ran: the headset records on, so the gem stays red, and a press
+// says that the Mac saves the recording once the link is back
+#[test]
+fn a_recording_whose_link_ended_stays_red_and_a_press_says_why() {
+    let lost = Recording { running: true, blocked: Some(LINK_LOST.into()), ..Default::default() };
+    let seen = look(Some(&lost), true, GLASS);
+    assert_eq!((seen.color, seen.glow), (RED, GemGlow::Pulse));
+    assert_eq!(blocked(Some(&lost)).as_deref(), Some(LINK_LOST));
 }

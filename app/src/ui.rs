@@ -1063,3 +1063,7 @@ mod hover_tests;
 #[cfg(test)]
 #[path = "pages_render_tests.rs"]
 mod pages_render_tests;
+
+#[cfg(test)]
+#[path = "record_button_tests.rs"]
+mod record_button_tests;
