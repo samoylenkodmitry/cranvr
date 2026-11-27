@@ -252,6 +252,22 @@ applies these patches and builds both parts.
   the second process read zeros in one of 200 cycles of one run. The program prints in how many cycles the round went
   through, which `scripts/shared-churn.sh` checks.
 
+`0021-stock-checks-keep-dxmt-names-in-their-process.patch`
+
+- `runtime/scripts/test-dxmt.zsh`, which `scripts/build-basaltvr.sh` runs before each build, first checks the runtime
+  with stock DXMT v0.80. Stock DXMT registers the port of each shared texture and each shared event with launchd, and
+  launchd keeps such a name with the memory behind it until the user logs out (cranvr issues #154 and #160). Each
+  build left about 20 names of that phase. Since patch 0018 the smoke's swapchain at the limit of 4128x4416 added
+  three surfaces of 73 MB, 219 MB in all (cranvr issue #179).
+- `tests/native/keep_dxmt_names.c` builds a small x86_64 library that the stock phase loads into its Wine processes
+  with `DYLD_INSERT_LIBRARIES`. It answers `bootstrap_register2` and `bootstrap_look_up` for the names "DXMT_..."
+  from a table of the process and passes every other name to launchd. The probes of the stock phase share their
+  objects only inside their own process, so every check of the phase stays as it was, with the stock DXMT binaries
+  and the swapchain at the limit. The names go with the process. launchd refuses to remove a registered name, and
+  macOS 27 refuses `bootstrap_subset`, so the names cannot go to launchd and be removed later.
+- The phase fails when the library kept no name, so a run without it cannot leave names in launchd unseen. The fork
+  phase runs without the library: the fork serves its names through winemetal's broker (DXMT patch 0020).
+
 ## patches/dxmt
 
 `0005-public-atomic-for-new-metal-compiler.patch`: DXMT 0.80 calls a private Metal builtin

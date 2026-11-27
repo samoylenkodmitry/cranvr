@@ -1,0 +1,218 @@
+diff --git i/runtime/scripts/test-dxmt.zsh w/runtime/scripts/test-dxmt.zsh
+index d08fa3d..4c4a62b 100755
+--- i/runtime/scripts/test-dxmt.zsh
++++ w/runtime/scripts/test-dxmt.zsh
+@@ -157,6 +157,7 @@ cleanup() {
+         kill ${control_peer_pid} 2>/dev/null || true
+     fi
+     WINEPREFIX=${wine_prefix} "${wine_root}/bin/wineserver" -k >/dev/null 2>&1 || true
++    rm -f "${kept_names:-}"
+     # A failing fork-phase step exits under `set -e`; never leave the shared
+     # Wine tree and prefix on the fork overlay.
+     if [[ ${fork_overlay_active} == true ]]; then
+@@ -209,41 +210,66 @@ run_control_gate() {
+     rm -f "${control_file}" "${peer_out}"
+ }
+ 
++# cranvr: stock DXMT v0.80 registers the Mach port of each shared texture and each shared event with launchd. The
++# ports belong to the kernel and never die, so launchd keeps each name with the memory behind it until the user logs
++# out (cranvr issues #154, #160 and #179). Each build left about 20 names of this phase. Since cranvr's runtime patch
++# 0018 the smoke's swapchain at the limit of 4128x4416 added three surfaces of 73 MB. The probes of this phase share
++# their objects only inside their own process, so keep_dxmt_names.dylib answers DXMT's names from a table of the
++# process, and the names go with the process. The stock DXMT binaries and every check of this phase stay as they
++# were. The fork phase runs without the library: the fork serves its names through winemetal's broker (cranvr's DXMT
++# patch 0020), and launchd drops them with their object. The library goes on wine's own command line, because macOS
++# drops DYLD_ variables at the start of a system program such as env.
++keep_names_dylib=${probe_dir}/keep_dxmt_names.dylib
++cc -arch x86_64 -dynamiclib -O2 -Wall -Wextra -o "${keep_names_dylib}" "${runtime_dir}/tests/native/keep_dxmt_names.c"
++kept_names=${probe_dir}/kept-names.$$
++rm -f "${kept_names}"
++stock_wine() {
++    DYLD_INSERT_LIBRARIES=${keep_names_dylib} BASALT_KEPT_NAMES_FILE=${kept_names} "${wine_root}/bin/wine" "$@"
++}
++
+ pushd "${probe_dir}" >/dev/null
+ WINEPREFIX=${wine_prefix} \
+ WINEARCH=win64 \
+ WINEDEBUG=-all \
+ MVK_CONFIG_LOG_LEVEL=0 \
+-    "${wine_root}/bin/wine" ./dxmt_shared_texture_probe.exe
++    stock_wine ./dxmt_shared_texture_probe.exe
+ 
+ WINEPREFIX=${wine_prefix} \
+ WINEARCH=win64 \
+ WINEDEBUG=-all \
+ MVK_CONFIG_LOG_LEVEL=0 \
+-    "${wine_root}/bin/wine" ./dxmt_fence_probe.exe
++    stock_wine ./dxmt_fence_probe.exe
+ 
+ WINEPREFIX=${wine_prefix} \
+ WINEARCH=win64 \
+ WINEDEBUG=-all \
+-    "${wine_root}/bin/wine" ./frame_timer_probe.exe
++    stock_wine ./frame_timer_probe.exe
+ 
+ # Stock DXMT must not expose the Basalt IOSurface private data.
+ WINEPREFIX=${wine_prefix} \
+ WINEARCH=win64 \
+ WINEDEBUG=-all \
+ MVK_CONFIG_LOG_LEVEL=0 \
+-    "${wine_root}/bin/wine" ./dxmt_iosurface_probe.exe
++    stock_wine ./dxmt_iosurface_probe.exe
+ 
+ manifest=${build_dir}/bin/basalt_openxr.json
+ manifest_windows="Z:${manifest//\//\\}"
+ WINEPREFIX=${wine_prefix} WINEDEBUG=-all \
+-    "${wine_root}/bin/wine" reg.exe add \
++    stock_wine reg.exe add \
+     'HKLM\Software\Khronos\OpenXR\1' \
+     /v ActiveRuntime /t REG_SZ /d "${manifest_windows}" /f
+ WINEPREFIX=${wine_prefix} \
+ WINEDEBUG=-all \
+ MVK_CONFIG_LOG_LEVEL=0 \
+-    "${wine_root}/bin/wine" ./d3d11_runtime_smoke.exe
++    stock_wine ./d3d11_runtime_smoke.exe
++
++# cranvr: the library ran. A run without it would leave this phase's names in launchd again, unseen.
++if [[ ! -s ${kept_names} ]]; then
++    print -u2 "FAIL: keep_dxmt_names.dylib kept no name of stock DXMT, so the names went to launchd"
++    exit 1
++fi
++print "PASS: stock DXMT's $(wc -l < "${kept_names}" | tr -d ' ') shared names stayed in their processes, none in launchd"
++rm -f "${kept_names}"
+ 
+ # --- Basalt DXMT fork phase (runs when build-dxmt-fork.zsh has produced it) --
+ fork_install=${build_dir}/dxmt/fork-install
+diff --git i/runtime/tests/native/keep_dxmt_names.c w/runtime/tests/native/keep_dxmt_names.c
+new file mode 100644
+index 0000000..d86c78b
+--- /dev/null
++++ w/runtime/tests/native/keep_dxmt_names.c
+@@ -0,0 +1,127 @@
++// cranvr: keeps the names that stock DXMT v0.80 registers with launchd inside the process.
++//
++// Stock DXMT registers the Mach port of each shared texture and each shared event with launchd under a name
++// "DXMT_..." (bootstrap_register2), so that another process can open the object. Those ports belong to the kernel
++// and never die, so launchd keeps each name with the memory behind it until the user logs out (cranvr issues #154,
++// #160 and #179). launchd refuses to remove such a name, and bootstrap_subset is refused on macOS 27. The probes of
++// test-dxmt.zsh's stock phase share their objects only inside their own process, so this library answers DXMT's
++// names from a table of the process instead. The process frees the table's rights when it ends, and the memory goes
++// with them. Every other name goes to launchd as before.
++//
++// test-dxmt.zsh loads it into the stock phase's Wine processes with DYLD_INSERT_LIBRARIES. Wine runs under
++// Rosetta 2, so the library is x86_64. With BASALT_KEPT_NAMES_FILE set, it appends one line for each name that it
++// keeps, so the script can check that the library ran.
++//
++// Build: cc -arch x86_64 -dynamiclib -O2 -o keep_dxmt_names.dylib keep_dxmt_names.c
++
++#include <fcntl.h>
++#include <mach/mach.h>
++#include <pthread.h>
++#include <servers/bootstrap.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++extern kern_return_t bootstrap_register2(mach_port_t bp, name_t service_name, mach_port_t sp, int flags);
++
++#define INTERPOSE(replacement, replacee)                                                                              \
++    __attribute__((used)) static struct {                                                                             \
++        const void *with;                                                                                             \
++        const void *of;                                                                                               \
++    } interpose_##replacee __attribute__((section("__DATA,__interpose"))) = {(const void *)&replacement,              \
++                                                                             (const void *)&replacee}
++
++struct kept_name {
++    name_t name;
++    mach_port_t port; // a send right of this table's own
++};
++
++static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++static struct kept_name *kept;
++static size_t kept_count, kept_capacity;
++
++static int is_dxmt_name(const char *name) {
++    return name != NULL && strncmp(name, "DXMT_", 5) == 0;
++}
++
++static struct kept_name *find(const char *name) {
++    for (size_t i = 0; i < kept_count; i++) {
++        if (strncmp(kept[i].name, name, sizeof(name_t)) == 0)
++            return &kept[i];
++    }
++    return NULL;
++}
++
++static void note(const char *name) {
++    const char *path = getenv("BASALT_KEPT_NAMES_FILE");
++    if (path == NULL || path[0] == '\0')
++        return;
++    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
++    if (fd < 0)
++        return;
++    char line[sizeof(name_t) + 32];
++    int length = snprintf(line, sizeof(line), "%d %s\n", (int)getpid(), name);
++    if (length > 0)
++        write(fd, line, (size_t)length);
++    close(fd);
++}
++
++static kern_return_t keep_register2(mach_port_t bp, name_t name, mach_port_t port, int flags) {
++    if (!is_dxmt_name(name))
++        return bootstrap_register2(bp, name, port, flags);
++    kern_return_t result = KERN_SUCCESS;
++    pthread_mutex_lock(&lock);
++    struct kept_name *entry = find(name);
++    if (port == MACH_PORT_NULL) {
++        // A register with no port removes the name, as launchd once did
++        if (entry != NULL) {
++            mach_port_deallocate(mach_task_self(), entry->port);
++            *entry = kept[--kept_count];
++        }
++    } else if (entry != NULL) {
++        result = BOOTSTRAP_NAME_IN_USE;
++    } else if (mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_SEND, 1) != KERN_SUCCESS) {
++        result = BOOTSTRAP_NOT_PRIVILEGED;
++    } else {
++        if (kept_count == kept_capacity) {
++            size_t capacity = kept_capacity ? kept_capacity * 2 : 64;
++            struct kept_name *grown = realloc(kept, capacity * sizeof(*kept));
++            if (grown == NULL) {
++                mach_port_deallocate(mach_task_self(), port);
++                pthread_mutex_unlock(&lock);
++                return BOOTSTRAP_NO_MEMORY;
++            }
++            kept = grown;
++            kept_capacity = capacity;
++        }
++        strlcpy(kept[kept_count].name, name, sizeof(name_t));
++        kept[kept_count].port = port;
++        kept_count++;
++    }
++    pthread_mutex_unlock(&lock);
++    if (result == KERN_SUCCESS && port != MACH_PORT_NULL)
++        note(name);
++    return result;
++}
++
++static kern_return_t keep_look_up(mach_port_t bp, const name_t name, mach_port_t *port) {
++    if (is_dxmt_name(name) && port != NULL) {
++        pthread_mutex_lock(&lock);
++        struct kept_name *entry = find(name);
++        // The caller gets a send right of its own, as from launchd
++        kern_return_t result = entry != NULL
++            ? mach_port_mod_refs(mach_task_self(), entry->port, MACH_PORT_RIGHT_SEND, 1)
++            : KERN_FAILURE;
++        if (result == KERN_SUCCESS)
++            *port = entry->port;
++        pthread_mutex_unlock(&lock);
++        if (result == KERN_SUCCESS)
++            return KERN_SUCCESS;
++    }
++    // A name of another process, or another service
++    return bootstrap_look_up(bp, name, port);
++}
++
++INTERPOSE(keep_register2, bootstrap_register2);
++INTERPOSE(keep_look_up, bootstrap_look_up);
