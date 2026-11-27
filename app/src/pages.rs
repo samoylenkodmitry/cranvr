@@ -10,7 +10,7 @@
 
 use crate::{
     backend::{Model, Settings, StreamPath},
-    launch::{self, GameOptions, Graphics, OpenVr},
+    launch::{self, GameOptions, Graphics, OpenVr, Window},
     microphone::MicrophoneSource,
     pending,
     setup::{self, Progress, Setup},
@@ -490,6 +490,19 @@ const GAME_SETTINGS: &[GameSetting] = &[
         },
     },
     GameSetting {
+        id: "game.window",
+        label: "Mac window",
+        kind: GameKind::Choice {
+            options: |s| {
+                let mut options = vec![Opt::new(AS_SETTINGS, format!("As in Settings ({})", launch::window(&s.wine, &GameOptions::default()).label()))];
+                options.extend(Window::ALL.iter().map(|choice| Opt::new(choice.key(), choice.label())));
+                options
+            },
+            get: |o| o.window.map_or(AS_SETTINGS, Window::key).to_string(),
+            set: |o, v| o.window = Window::from_key(v),
+        },
+    },
+    GameSetting {
         id: "game.openvr",
         label: "OpenVR",
         kind: GameKind::Choice {
@@ -560,6 +573,26 @@ fn graphics_line(options: &GameOptions, engine: Option<launch::Engine>) -> Strin
             format!("The game gets {added}, the argument of {} games ({} next to the program).", engine.name, engine.sign)
         }
         (Some(_), _) => format!("The game gets {added}, as typed under Advanced."),
+    }
+}
+
+const WINDOW_HINT: &str = "The game's own window on the Mac. Small: cranvr gives the game a small window by the arguments of its engine. Game's own: the game picks its window, often one that covers the whole screen. As in Settings: a small window while the game's window on the Mac shows no picture, the game's own while it shows the picture. A Unity game keeps the window of its last start in its settings, so after a small start it opens the small window again with Game's own. Add -screen-fullscreen 1 to its arguments for the full screen. It applies when the game starts.";
+
+/// The line under a game's window choice: which arguments the choice adds and why
+fn window_line(wine: &launch::WineOptions, options: &GameOptions, engine: Option<launch::Engine>) -> String {
+    let small = engine.and_then(|engine| engine.small_window);
+    match (launch::window(wine, options), engine, small) {
+        (Window::Small, Some(engine), Some(small)) => {
+            let why = if wine.mac_window { "" } else { " Its window on the Mac shows no picture, so a full-screen window would only cover the Mac's desktop." };
+            format!("The game gets {small}, the small window of {} games ({} next to the program).{why}", engine.name, engine.sign)
+        }
+        (Window::Small, Some(engine), None) => format!(
+            "cranvr knows no arguments of a small window for {} games. The game keeps its own window. Type its arguments under Advanced in the Mac's window.",
+            engine.name
+        ),
+        (Window::Small, None, _) => "cranvr knows no arguments of a small window for this game. The game keeps its own window. Type its arguments under Advanced in the Mac's window.".into(),
+        (Window::Own, _, _) if options.window.is_none() => "The game's window on the Mac shows its picture (Settings), so the game keeps its own window.".into(),
+        (Window::Own, _, _) => String::new(),
     }
 }
 
@@ -974,6 +1007,7 @@ pub fn options_page(settings: &Settings, model: &Model, program: &str) -> Page {
                 hint: match setting.id {
                     "game.openvr" => OPENVR_HINT.into(),
                     "game.graphics" => GRAPHICS_HINT.into(),
+                    "game.window" => WINDOW_HINT.into(),
                     _ => String::new(),
                 },
                 restarts: false,
@@ -991,6 +1025,7 @@ pub fn options_page(settings: &Settings, model: &Model, program: &str) -> Page {
         // cranvr's reason for a value that it chose stands under the setting
         let reason = match setting.id {
             "game.graphics" => graphics_line(&options, engine),
+            "game.window" => window_line(&settings.wine, &options, engine),
             "game.openvr" if options.openvr.is_some() => options.openvr_reason.clone(),
             "game.eye_per_pass" if options.eye_per_pass => options.eye_per_pass_reason.clone(),
             "game.eye_one_pass" if options.eye_one_pass => options.eye_one_pass_reason.clone(),

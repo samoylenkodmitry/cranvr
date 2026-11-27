@@ -24,7 +24,8 @@
 //!   paired (the names of the paired headsets) and pending (the headsets that wait for the user:
 //!   key in hex, name, ip and code). The user's answer comes back on the host's input as
 //!   `allow KEY` or `deny KEY`.
-//! - `black_eye`: eye and program (the game's program path, or null). Eye "right": the game's right
+//! - `black_eye`: eye, program (the game's program path, or null) and name (the game's renderer, as
+//!   in the `game` line: "SteamVR (cranvr driver)" for a game in SteamVR). Eye "right": the game's right
 //!   eye stayed black for several seconds while its left eye showed a picture. Eye "both": both
 //!   eyes stayed black for 90 seconds while the game delivered frames (see eye_check.rs). The host
 //!   sends it once for each game run.

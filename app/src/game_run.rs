@@ -154,6 +154,11 @@ impl Watch {
         Some(why)
     }
 
+    /// Whether OpenComposite took the OpenVR calls of `program` in this run, as its log `log` says
+    pub fn through_opencomposite(&self, program: &str, log: LogSays) -> bool {
+        log != LogSays::NotThisGame && !self.folder.is_empty() && program.to_ascii_lowercase().starts_with(&self.folder.to_ascii_lowercase())
+    }
+
     /// The verdict at the end of the game's processes
     pub fn ended(&mut self, log: LogSays) -> Option<Nothing> {
         if !self.open() || log == LogSays::NotThisGame || (log == LogSays::Loaded && !self.counted_none) {
@@ -207,6 +212,14 @@ fn log_of(prefix: &Path, watch: &Watch) -> LogSays {
         return LogSays::NotThisGame;
     }
     log_says(&fs::read_to_string(&file).unwrap_or_default(), &watch.folder)
+}
+
+/// Whether OpenComposite took the OpenVR calls of `program` in the run that runs now: the program lies in the run's
+/// folder, and OpenComposite's log of the run names that folder. An OpenXR game never loads OpenComposite, also when
+/// its options choose it.
+pub fn through_opencomposite(prefix: &Path, program: &str) -> bool {
+    let run = run();
+    run.as_ref().is_some_and(|run| run.watch.through_opencomposite(program, log_of(prefix, &run.watch)))
 }
 
 /// Whether a run holds the path file now.
@@ -390,6 +403,16 @@ mod tests {
         assert_eq!(stopped.ended(LogSays::Loaded), None);
         assert_eq!(watch(OpenVr::SteamVr).ended(LogSays::Loaded), None);
         assert_eq!(watch(OpenVr::OpenComposite).ended(LogSays::NotThisGame), None, "an OpenXR game: no OpenComposite");
+    }
+
+    #[test]
+    fn only_a_program_of_the_run_s_folder_that_opencomposite_s_log_names_went_through_opencomposite() {
+        let run = watch(OpenVr::OpenComposite);
+        assert!(run.through_opencomposite(r"C:\Lab\win64\Lab.exe", LogSays::Loaded));
+        assert!(run.through_opencomposite(r"c:\lab\WIN64\lab.exe", LogSays::Aborted));
+        // An OpenXR game: OpenComposite's log is of another program or older than the run
+        assert!(!run.through_opencomposite(r"C:\Lab\win64\Lab.exe", LogSays::NotThisGame));
+        assert!(!run.through_opencomposite(r"C:\Other\game.exe", LogSays::Loaded));
     }
 
     #[test]

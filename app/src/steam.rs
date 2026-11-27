@@ -454,7 +454,7 @@ fn game_wine(program: &str, steam_args: &[String], engine: Option<launch::Engine
         }
     }
     let mut command = wine_with(program, settings.game_msaa_limit);
-    command.envs(launch::environment(&settings.wine, &options)).args(steam_args).args(launch::arguments(&options, engine));
+    command.envs(launch::environment(&settings.wine, &options)).args(steam_args).args(launch::arguments(&settings.wine, &options, engine));
     // cranvr's SteamVR driver finds the game's render size in game-sizes.txt by the game's program. SteamVR,
     // which the game starts, inherits the variable.
     command.env("CRANVR_GAME", program);

@@ -111,7 +111,7 @@ fn a_game_s_page_shows_and_sets_its_vr_system_and_its_eyes_and_cranvrs_reason() 
 
 #[test]
 fn a_game_s_graphics_choice_adds_its_engine_s_argument_and_says_where_it_comes_from() {
-    let unity = launch::Engine { name: "Unity", sign: "UnityPlayer.dll or the Data folder", vulkan: "-force-vulkan", direct3d: "-force-d3d11" };
+    let unity = launch::Engine { small_window: None, ..launch::UNITY };
     let games = [Game { engine: Some(unity), ..lab() }, added()];
     let program = steam::program(&lab()).unwrap();
     let plain = steam::program(&added()).unwrap();
@@ -140,6 +140,44 @@ fn a_game_s_graphics_choice_adds_its_engine_s_argument_and_says_where_it_comes_f
     apply(&mut settings, &model_with(games.to_vec()), &Request::set("game.graphics", "own").of(program.clone()));
     assert!(!settings.launch.contains_key(&program));
     assert!(apply(&mut settings, &model_with(games.to_vec()), &Request::set("game.graphics", "opengl").of(program.clone())).refused.is_some());
+}
+
+#[test]
+fn a_unity_game_gets_a_small_window_with_its_reason_until_the_mac_window_shows_the_picture() {
+    let games = [Game { engine: Some(launch::UNITY), ..lab() }, added()];
+    let program = steam::program(&lab()).unwrap();
+    let plain = steam::program(&added()).unwrap();
+    let small = launch::UNITY.small_window.unwrap();
+    let mut settings = Settings::default();
+    let texts = |settings: &Settings, program: &str| -> Vec<String> {
+        let pages = pages(settings, &model_with(games.to_vec()));
+        page(&pages, &game_page(program)).items.iter().filter_map(|item| match item { Item::Text { text, .. } => Some(text.clone()), _ => None }).collect()
+    };
+    let pages_now = pages(&settings, &model_with(games.to_vec()));
+    let choice = page(&pages_now, &game_page(&program)).find("game.window", Some(&program)).cloned();
+    assert_eq!(choice.as_ref().and_then(Item::value), Some("default"));
+    let Some(Item::Choice(choice)) = choice else { panic!("no window choice") };
+    assert_eq!(choice.options[0].label, "As in Settings (Small)");
+    let lines = texts(&settings, &program);
+    assert!(lines.iter().any(|text| text.starts_with(&format!("The game gets {small}, the small window of Unity games"))), "{lines:?}");
+    assert!(lines.iter().any(|text| text == &format!("The game starts with: DXMT_SKIP_PRESENT=1 {small}")), "{lines:?}");
+    assert!(settings.launch.is_empty(), "the default leaves no entry");
+    // A game of no known engine says that it keeps its own window
+    assert!(texts(&settings, &plain).iter().any(|text| text.starts_with("cranvr knows no arguments of a small window for this game")));
+    // The game's own window: no argument
+    let out = apply(&mut settings, &model_with(games.to_vec()), &Request::set("game.window", "own").of(program.clone()));
+    assert!(out.changed && !out.restart);
+    assert_eq!(settings.launch[&program].window, Some(launch::Window::Own));
+    assert!(texts(&settings, &program).iter().any(|text| text == "The game starts with: DXMT_SKIP_PRESENT=1"));
+    apply(&mut settings, &model_with(games.to_vec()), &Request::set("game.window", "default").of(program.clone()));
+    assert!(settings.launch.is_empty());
+    // The picture on the Mac: the game keeps its own window, and the line says why
+    settings.wine.mac_window = true;
+    let lines = texts(&settings, &program);
+    assert!(lines.iter().any(|text| text.starts_with("The game's window on the Mac shows its picture")), "{lines:?}");
+    assert!(lines.iter().any(|text| text == "The game starts with nothing added."), "{lines:?}");
+    // A word that is no window changes nothing
+    assert!(apply(&mut settings, &model_with(games.to_vec()), &Request::set("game.window", "huge").of(program.clone())).refused.is_some());
 }
 
 #[test]
