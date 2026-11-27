@@ -6,7 +6,13 @@
 # fence and wait on it, on the CPU and on the GPU, for a value that the other one signaled. Then both release
 # everything. At the end the program checks that the handle of a released IOSurface texture does not
 # open once its ID names a surface of another size. The run needs no host, no headset and no game. It takes about
-# 5 seconds.
+# 7 seconds.
+#
+# The order of the GPU work across the processes (cranvr's DXMT patch 0022, #177): each process keeps its GPU busy for
+# a few milliseconds before its clears. Neither process waits for its own GPU before it hands a texture on. The second
+# process must read every color that the first one flushed. The first one must read the color that the second one
+# wrote back. Last, the second process writes a texture and ends at once: the first one's copy of it must not wait for
+# good. Before the patch the second process read zeros of rgba16f in the second cycle.
 #
 # Usage: scripts/shared-churn.sh [--cycles N] [--width W] [--height H]
 #
@@ -20,7 +26,10 @@
 #
 # Before cranvr's DXMT patch 0020 each cycle left 8 names in launchd (6 textures, the keyed mutex's event and the
 # fence) with the memory of the textures until the user logged out. Run the old stack only with --cycles 2 --width 64
-# --height 64. Before cranvr's DXMT patch 0021 the second process could not open the shared fence (#161). Set CRANVR_HOME to the stack to test (default: the app's, ~/Library/Application Support/cranvr).
+# --height 64. Before cranvr's DXMT patch 0021 the second process could not open the shared fence (#161). Since patch
+# 0022 each process's queue serves two events under "DXMT_order_..." names while it lives. They are no names of
+# released objects. They must not grow. Set CRANVR_HOME to the stack to test (default: the app's,
+# ~/Library/Application Support/cranvr).
 
 set -euo pipefail
 
@@ -110,14 +119,22 @@ if [[ -z ${rounds} ]]; then
 elif [[ ${rounds%% *} != ${cycles} ]]; then
     bad+=("the fence's round went through in ${rounds%% *} of ${cycles} cycles")
 fi
+# The order of the GPU work across the processes (DXMT patch 0022, #177)
+colors=$(sed -n "s/^shared_churn: the colors were right in \([0-9]*\) of .*/\1/p" "${work}/program.log" | tail -1)
+[[ ${colors} == ${cycles} ]] || bad+=("the colors were right in ${colors:-no} of ${cycles} cycles")
+grep -q "shared_churn: the second process ended right after its write" "${work}/program.log" ||
+    bad+=("the program did not finish the check of a writer that ends")
 field() { print -r -- "$1" | awk -v key="$2" '{ for (i = 1; i < NF; i++) if ($i == key) { print $(i + 1); exit } }'; }
 if [[ -n ${at[live]:-} ]]; then
     (( $(field "${at[live]}" names) > 0 )) || bad+=("no name in launchd while both processes held the objects: the count sees nothing")
 fi
 if [[ -n ${at[warm]:-} && -n ${at[churned]:-} ]]; then
-    warm_names=$(field "${at[warm]}" names) churned_names=$(field "${at[churned]}" names)
+    # The names of the queues' events (DXMT patch 0022) live with the processes; every other name is a released object's
+    warm_order=$(field "${at[warm]}" order) churned_order=$(field "${at[churned]}" order)
+    warm_names=$(( $(field "${at[warm]}" names) - warm_order )) churned_names=$(( $(field "${at[churned]}" names) - churned_order ))
     (( warm_names == 0 )) || bad+=("${warm_names} names of released objects stay in launchd after the first cycle")
     (( churned_names <= warm_names )) || bad+=("$(( churned_names - warm_names )) names of released objects stay in launchd after the last cycle")
+    (( churned_order <= warm_order )) || bad+=("the queues' names in launchd grew from ${warm_order} to ${churned_order}")
     # What the cycles made, in bytes a pixel: R16G16B16A16 8, B8G8R8A8 4, mipmaps 5 (4 and a third), two slices 8,
     # 4 samples 16, the keyed mutex's 4, the IOSurface texture 4
     made=$(( (cycles - 1) * width * height * (8 + 4 + 5 + 8 + 16 + 4 + 4) ))
