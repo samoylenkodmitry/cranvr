@@ -333,10 +333,10 @@ index 3a51e7c..98eec91 100644
  
 diff --git c/src/dxmt/dxmt_shared_order.cpp i/src/dxmt/dxmt_shared_order.cpp
 new file mode 100644
-index 0000000..bdb3ab5
+index 0000000..f221bb4
 --- /dev/null
 +++ i/src/dxmt/dxmt_shared_order.cpp
-@@ -0,0 +1,692 @@
+@@ -0,0 +1,693 @@
 +/*
 + * cranvr: the order of the GPU work of two queues on a shared texture. dxmt_shared_order.hpp says why and how.
 + */
@@ -1014,7 +1014,8 @@ index 0000000..bdb3ab5
 +void
 +SharedOrderQueue::Report(bool last) {
 +  double seconds = std::chrono::duration<double>(steady::now() - stats_.since).count();
-+  if (stats_.others) {
++  // A queue whose shared textures no other queue holds logs nothing, unless DXMT_SHARED_ORDER_STATS=1 asks
++  if (stats_.others || (timing_ && stats_.chunks)) {
 +    Logger::info(str::format(
 +        "cranvr: shared order: queue ", Hex(id_), last ? " at its end" : "", ", in the last ", seconds, " s: ",
 +        stats_.chunks, " command buffers used shared textures, ", stats_.others,
@@ -1031,7 +1032,7 @@ index 0000000..bdb3ab5
 +} // namespace dxmt
 diff --git c/src/dxmt/dxmt_shared_order.hpp i/src/dxmt/dxmt_shared_order.hpp
 new file mode 100644
-index 0000000..6373fc3
+index 0000000..18f58be
 --- /dev/null
 +++ i/src/dxmt/dxmt_shared_order.hpp
 @@ -0,0 +1,205 @@
@@ -1102,7 +1103,7 @@ index 0000000..6373fc3
 + *
 + * DXMT_SHARED_ORDER=0 turns the order off, for a comparison. DXMT_SHARED_ORDER_STATS=1 also times each wait that the
 + * GPU had not reached at the encode: the time from the encode to the other GPU's signal (an upper bound of the GPU's
-+ * wait).
++ * wait). With it a queue logs its counts also when no other queue holds its shared textures.
 + */
 +
 +#include "Metal.hpp"
