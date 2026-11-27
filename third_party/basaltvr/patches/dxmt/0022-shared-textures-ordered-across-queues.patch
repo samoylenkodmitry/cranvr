@@ -333,10 +333,10 @@ index 3a51e7c..98eec91 100644
  
 diff --git c/src/dxmt/dxmt_shared_order.cpp i/src/dxmt/dxmt_shared_order.cpp
 new file mode 100644
-index 0000000..f221bb4
+index 0000000..04daf83
 --- /dev/null
 +++ i/src/dxmt/dxmt_shared_order.cpp
-@@ -0,0 +1,693 @@
+@@ -0,0 +1,698 @@
 +/*
 + * cranvr: the order of the GPU work of two queues on a shared texture. dxmt_shared_order.hpp says why and how.
 + */
@@ -558,7 +558,7 @@ index 0000000..f221bb4
 +  void
 +  Time(WMT::SharedEvent event, uint64_t value, obj_handle_t listener) {
 +    std::unique_lock<dxmt::mutex> lock(lock_);
-+    if (timings_.size() >= MAXIMUM_WAIT_OBJECTS - 1)
++    if (timings_.size() >= MAXIMUM_WAIT_OBJECTS - 2)
 +      return;
 +    HANDLE handle;
 +    if (!free_.empty()) {
@@ -570,6 +570,8 @@ index 0000000..f221bb4
 +    timings_.push_back({handle, steady::now()});
 +    MTLSharedEvent_setWin32EventAtValue(event, listener, handle, value);
 +    Start();
++    // The thread waits on the new event from now on
++    SetEvent(wake_);
 +  }
 +
 +private:
@@ -582,6 +584,7 @@ index 0000000..f221bb4
 +  Start() {
 +    if (thread_)
 +      return;
++    wake_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 +    // The thread runs code of this DLL, so the DLL stays loaded
 +    HMODULE self = nullptr;
 +    GetModuleHandleExW(
@@ -601,31 +604,31 @@ index 0000000..f221bb4
 +  Loop() {
 +    auto since = steady::now();
 +    for (;;) {
-+      std::vector<HANDLE> events;
++      std::vector<HANDLE> events = {wake_};
 +      {
 +        std::unique_lock<dxmt::mutex> lock(lock_);
 +        for (auto &timing : timings_)
 +          events.push_back(timing.event);
 +      }
-+      if (events.empty()) {
-+        Sleep(100);
-+      } else {
++      {
 +        DWORD got = WaitForMultipleObjects(events.size(), events.data(), FALSE, 100);
-+        if (got < WAIT_OBJECT_0 + events.size()) {
++        // Index 0 is the wake for a new timing: the next turn waits on it too
++        if (got > WAIT_OBJECT_0 && got < WAIT_OBJECT_0 + events.size()) {
 +          std::unique_lock<dxmt::mutex> lock(lock_);
-+          auto &timing = timings_[got - WAIT_OBJECT_0];
++          auto &timing = timings_[got - WAIT_OBJECT_0 - 1];
 +          double us = MicrosecondsSince(timing.encoded);
 +          timed_++;
 +          timed_us_ += us;
 +          timed_max_us_ = std::max(timed_max_us_, us);
 +          free_.push_back(timing.event);
-+          timings_.erase(timings_.begin() + (got - WAIT_OBJECT_0));
++          timings_.erase(timings_.begin() + (got - WAIT_OBJECT_0 - 1));
 +        }
 +      }
 +      Check();
 +      if (timed_ && std::chrono::duration<double>(steady::now() - since).count() >= 10) {
 +        Logger::info(str::format(
-+            "cranvr: shared order: in the last ", std::chrono::duration<double>(steady::now() - since).count(),
++            "cranvr: shared order: ", env::getExeName(), ", in the last ",
++            std::chrono::duration<double>(steady::now() - since).count(),
 +            " s the values of ", timed_, " waits came ", timed_us_ / timed_, " us on average and ", timed_max_us_,
 +            " us at most after the encode of the waiting command buffer"
 +        ));
@@ -675,6 +678,7 @@ index 0000000..f221bb4
 +
 +  dxmt::mutex lock_;
 +  HANDLE thread_ = nullptr;
++  HANDLE wake_ = nullptr;
 +  std::vector<SharedOrderLink *> links_;
 +  steady::time_point checked_ = steady::now();
 +  std::vector<Timing> timings_;
@@ -1017,7 +1021,8 @@ index 0000000..f221bb4
 +  // A queue whose shared textures no other queue holds logs nothing, unless DXMT_SHARED_ORDER_STATS=1 asks
 +  if (stats_.others || (timing_ && stats_.chunks)) {
 +    Logger::info(str::format(
-+        "cranvr: shared order: queue ", Hex(id_), last ? " at its end" : "", ", in the last ", seconds, " s: ",
++        "cranvr: shared order: queue ", Hex(id_), " of ", env::getExeName(), last ? " at its end" : "", ", in the last ",
++        seconds, " s: ",
 +        stats_.chunks, " command buffers used shared textures, ", stats_.others,
 +        " of them textures that other queues hold (", stats_.checks, " looks at another queue); ", stats_.waits,
 +        " waits encoded for another GPU; the step took ", stats_.step_us / stats_.chunks, " us on average and ",
