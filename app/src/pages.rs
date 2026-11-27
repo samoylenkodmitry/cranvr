@@ -735,7 +735,7 @@ fn stream_page(settings: &Settings, model: &Model) -> Page {
         title: if sizes.is_empty() { "No learned game sizes".into() } else { format!("Learned: {}", sizes.join(", ")) },
         detail: String::new(),
         buttons: if sizes.is_empty() { Vec::new() } else { vec![Button::run("Forget learned sizes", "sizes.forget")] },
-        hint: "A game that stays below the refresh rate for a minute renders smaller at its next start, as a share of the size above. A game reads its size only when it starts.".into(),
+        hint: "A game whose run of 5 minutes or more stays below the refresh rate in its median renders smaller at its next start, as a share of the size above. A game reads its size only when it starts.".into(),
     }));
     Page { id: STREAM.into(), title: "Stream".into(), short: "Stream".into(), listed: true, items }
 }
