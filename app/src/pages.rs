@@ -576,7 +576,7 @@ fn graphics_line(options: &GameOptions, engine: Option<launch::Engine>) -> Strin
     }
 }
 
-const WINDOW_HINT: &str = "The game's own window on the Mac. Small: cranvr gives the game a small window by the arguments of its engine. Game's own: the game picks its window, often one that covers the whole screen. As in Settings: a small window while the game's window on the Mac shows no picture, the game's own while it shows the picture. A Unity game keeps the window of its last start in its settings, so after a small start it opens the small window again with Game's own. Add -screen-fullscreen 1 to its arguments for the full screen. It applies when the game starts.";
+const WINDOW_HINT: &str = "The game's own window on the Mac. Small: cranvr gives the game a small window by the arguments of its engine. Game's own: the game picks its window, often one that covers the whole screen. As in Settings: a small window while the game's window on the Mac shows no picture, the game's own while it shows the picture. A Unity game keeps the window of its last start in its settings, so after a small start it opens the small window again with Game's own. For the full screen again, give it -screen-fullscreen 1 with -screen-width and -screen-height of the display under Advanced for one start. It applies when the game starts.";
 
 /// The line under a game's window choice: which arguments the choice adds and why
 fn window_line(wine: &launch::WineOptions, options: &GameOptions, engine: Option<launch::Engine>) -> String {
