@@ -6,7 +6,8 @@
 # game's sound in place of the tap, to the headset and to the recording alike (host/src/test_sound.rs):
 # 30 s of silence after the app's start, then the files of SOUNDS one after another.
 #
-# The checks, in this order (CHECKS names some of them, as a comma list):
+# The checks, in the order of CHECKS, a comma list (row,busy,mic,disk,cable,term,kill by default):
+#   sound    a plain recording of 6 s: the level of the headset's own track
 #   row      the hand menu's row "Record what I see": the scripted build presses the row's Record on
 #            the menu in front of the user and 9 s later its Stop (`scripted_pointer=record_row`)
 #   busy     a start while the headset's own recorder records refuses, and touches nothing of it
@@ -23,8 +24,10 @@
 # offset, the windows that matched, both sounds' loudness) and ffprobe's, then deletes the file. At
 # the end it deletes every headset video that the run made and gives the client back.
 #
-# Usage: SOUNDS="FILE..." [CHECKS=row,busy,...] scripts/recording-check.sh SERIAL WORKDIR [PORT]
+# Usage: SOUNDS="FILE..." [CHECKS=row,busy,...] [SOUND_DELAY=30] scripts/recording-check.sh SERIAL WORKDIR [PORT]
 #   PORT  the test app's port (9962 by default)
+#   SOUND_DELAY  the seconds of silence from the app's start before SOUNDS play
+# The client's log goes to WORKDIR/client.log for the whole run.
 #
 # `cargo build --release` must have built cranvr and cranvr-host, scripts/build-quest-recorder.sh the
 # recorder, and the client must be a build of `scripts/build-client.sh --scripted-hand`. Hold the
@@ -37,7 +40,8 @@ root=${0:A:h:h}
 adb_cmd=(adb -s ${serial})
 source ${root}/scripts/client-start.zsh
 export CLIENT_LINK_WAIT=${CLIENT_LINK_WAIT:-40}
-checks=,${CHECKS:-row,busy,mic,disk,cable,term,kill},
+order=(${(s:,:)${CHECKS:-row,busy,mic,disk,cable,term,kill}})
+checks=,${(j:,:)order},
 home=${work}/host records=${work}/recordings
 mkdir -p ${home} ${records}
 videos=/sdcard/Oculus/VideoShots
@@ -67,8 +71,10 @@ headset_videos() {
 }
 before=(${(f)"$(headset_videos | awk '{ print $2 }')"})
 print "the headset holds ${#before} videos before the run"
+logger=""
 finish() {
     exec 3>&- 2> /dev/null
+    [[ -n ${logger} ]] && kill ${logger} 2> /dev/null
     [[ -n ${app} ]] && kill ${app} 2> /dev/null
     wait 2> /dev/null
     pkill -TERM -f "${root}/target/release/cranvr-host --status.*--native-port ${port}"
@@ -143,7 +149,7 @@ headset_grows() {
 }
 lan=$(ipconfig getifaddr en0 || ipconfig getifaddr en1)
 forget=127.0.0.1:${port}${lan:+,${lan}:${port}}
-sound_start=$(( $(date +%s) * 1000 + 30000 ))
+sound_start=$(( $(date +%s) * 1000 + ${SOUND_DELAY:-30} * 1000 ))
 print "cut starts $(date +%T)"
 start_app
 sleep 2
@@ -160,16 +166,19 @@ client_start ${host_log} --es host 127.0.0.1:${port} --ez connect true --ez usb_
     --es panels hidden --ez console false --es interface flat --es hand_menu open --ez default_places true --es forget_host_key ${forget} ${scripted}
 print "client: ${client_result} ${client_linked}"
 [[ ${client_result} == alive ]] || exit 1
+# The headset's log drops lines while its recorder runs: the client's lines go to a file as they come
+${adb_cmd} logcat -v time -s Cranpose > ${work}/client.log 2> /dev/null &
+logger=$!
 
-if [[ ${checks} == *,row,* ]]; then
+check_row() {
     print "== row: the hand menu's row"
     at=$(lines)
     wait_line "started" 40 ${at} && wait_line "saved " 40 ${at}
     ${adb_cmd} logcat -d -v time > ${work}/client-row.log
     grep -E "scripted record row|hand menu|the Mac's recording" ${work}/client-row.log | sed -E 's/^[0-9-]+ ([0-9:.]+) .*cranvr_client::[a-z_:]+: /  \1 /' | cut -c1-220
     report
-fi
-if [[ ${checks} == *,busy,* ]]; then
+}
+check_busy() {
     print "== busy: a start while the headset's own recorder records"
     ${adb_cmd} shell CLASSPATH=/data/local/tmp/cranvr-quest-recorder.jar app_process / dev.cranvr.recorder.Main start
     sleep 1
@@ -180,8 +189,8 @@ if [[ ${checks} == *,busy,* ]]; then
     ${adb_cmd} shell CLASSPATH=/data/local/tmp/cranvr-quest-recorder.jar app_process / dev.cranvr.recorder.Main stop
     sleep 2
     print "  the headset's own recording stays until the run's end, which deletes it"
-fi
-if [[ ${checks} == *,mic,* ]]; then
+}
+check_mic() {
     print "== mic: the microphone in a recording"
     print -u 3 '{"action": "set", "id": "recording_microphone", "value": "on"}'
     sleep 0.5
@@ -190,8 +199,8 @@ if [[ ${checks} == *,mic,* ]]; then
     wait_line "started" 15 ${at} && sleep 5 && press && wait_line "saved " 40 ${at}
     report
     print -u 3 '{"action": "set", "id": "recording_microphone", "value": "off"}'
-fi
-if [[ ${checks} == *,disk,* ]]; then
+}
+check_disk() {
     print "== disk: the free disk falls under 5 GB"
     at=$(lines)
     press
@@ -202,8 +211,8 @@ if [[ ${checks} == *,disk,* ]]; then
     print 100000000000 > ${free_file}
     tail -n +$(( at + 1 )) ${recordings_log} | grep -v "saved /" | sed 's/^/  /'
     report
-fi
-if [[ ${checks} == *,cable,* ]]; then
+}
+check_cable() {
     print "== cable: the cable reads as pulled during a recording"
     at=$(lines)
     press
@@ -219,8 +228,8 @@ if [[ ${checks} == *,cable,* ]]; then
     wait_line "The cable is back" 8 ${at} && wait_line "saved " 40 ${at}
     tail -n +$(( at + 1 )) ${recordings_log} | grep -v "saved /" | sed 's/^/  /'
     report
-fi
-if [[ ${checks} == *,term,* ]]; then
+}
+check_term() {
     print "== term: SIGTERM to the app during a recording"
     at=$(lines)
     press
@@ -234,8 +243,8 @@ if [[ ${checks} == *,term,* ]]; then
     wait_line "saved " 40 ${at}
     tail -n +$(( at + 1 )) ${recordings_log} | grep -v "saved /" | sed 's/^/  /'
     report
-fi
-if [[ ${checks} == *,kill,* ]]; then
+}
+check_kill() {
     print "== kill: SIGKILL to the app during a recording"
     at=$(lines)
     sleep 3
@@ -252,4 +261,15 @@ if [[ ${checks} == *,kill,* ]]; then
     wait_line "saved " 40 ${at}
     tail -n +$(( at + 1 )) ${recordings_log} | grep -v "saved /" | sed 's/^/  /'
     report
-fi
+}
+check_sound() {
+    print "== sound: a plain recording of 6 s"
+    at=$(lines)
+    press
+    wait_line "started" 15 ${at} && sleep 6 && press && wait_line "saved " 40 ${at}
+    grep -E "audio: (playing|waiting)" ${work}/client.log | tail -2 | sed -E 's/^[0-9-]+ ([0-9:.]+) .*audio: /  the client at \1: /' | cut -c1-160
+    report
+}
+for check in ${order}; do
+    check_${check}
+done
