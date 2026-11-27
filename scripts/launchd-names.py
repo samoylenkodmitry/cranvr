@@ -12,11 +12,13 @@ process that serves the object. The name goes with the object or the process.
 `launchctl print gui/UID` lists the names under "unmanaged processes", one entry for each process, alive or not,
 that still has a name. The script looks each DXMT name up and asks IOSurface whether the port is a surface's.
 
-It prints one line: "names N dxmt D dead D2 surfaces S bytes B" for all names, or for the processes of --pids:
+It prints one line: "names N dxmt D dead D2 surfaces S bytes B order O" for all names, or for the processes of --pids:
   names     the names of those processes ("dynamic endpoints")
   dxmt      the names of DXMT among them
   dead      the names of processes that have ended
   surfaces  the DXMT names whose port is an IOSurface, then the bytes of those surfaces
+  order     the DXMT names "DXMT_order_..." among them: since cranvr's DXMT patch 0022 each command queue that holds a
+            shared texture serves its two events under such names while it lives (dxmt_shared_order.hpp)
 --save FILE keeps the list of (process, name). --since FILE also prints "new N gone G": the names that came and went
 since that list. --list prints each name with its process and its surface's bytes.
 """
@@ -124,11 +126,12 @@ def main():
         entries = [e for e in entries if e[0] in opts["pids"]]
     surfaces = Surfaces()
     count = len(entries)
-    dxmt = dead = surface_count = surface_bytes = 0
+    dxmt = dead = surface_count = surface_bytes = order = 0
     lines = []
     for pid, process, name in entries:
         is_dxmt = name.startswith("DXMT_")
         dxmt += is_dxmt
+        order += name.startswith("DXMT_order_")
         dead += not alive(pid)
         size = surfaces.bytes_of(name) if is_dxmt else None
         if size is not None:
@@ -137,7 +140,8 @@ def main():
         if opts["list"]:
             lines.append("%d %s %s %s %s" % (pid, process, "alive" if alive(pid) else "dead", name,
                                              "-" if size is None else size))
-    result = "names %d dxmt %d dead %d surfaces %d bytes %d" % (count, dxmt, dead, surface_count, surface_bytes)
+    result = "names %d dxmt %d dead %d surfaces %d bytes %d order %d" % (count, dxmt, dead, surface_count, surface_bytes,
+                                                                         order)
     if opts["since"]:
         with open(opts["since"]) as f:
             before = {(p, n) for p, n in json.load(f)}

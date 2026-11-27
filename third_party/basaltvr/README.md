@@ -268,6 +268,20 @@ applies these patches and builds both parts.
 - The phase fails when the library kept no name, so a run without it cannot leave names in launchd unseen. The fork
   phase runs without the library: the fork serves its names through winemetal's broker (DXMT patch 0020).
 
+`0022-shared-texture-order-in-the-churn-test.patch`
+
+- `tests/shared_churn.cpp` checks the order of the GPU work of its two processes on the shared textures (cranvr issue
+  #177, DXMT patch 0022). The CPU wait of patch 0020 is gone: the first process no longer waits for its own GPU
+  before it sends a cycle's handles. Each process keeps its GPU busy for at least 4 ms before its clears, with copies
+  of a texture of 4096 x 4096 that its clears wait for on the GPU. The second process reads the colors at once. It
+  also clears bgra8 to another color after its own busy work, flushes and replies. The first process then reads that
+  color at once. Each wrong color fails the run. The program prints in how many cycles all colors were right.
+- In even cycles the first process takes each handle before its Flush. In odd cycles it flushes each clear before it
+  takes the texture's handle.
+- Last, the second process writes a texture and ends at once (TerminateProcess). The first process's copy of the
+  texture must be done within 3 seconds.
+- With stock DXMT 0.80 and cranvr's patches up to 0021 the second process read zeros of rgba16f in the second cycle.
+
 ## patches/dxmt
 
 `0005-public-atomic-for-new-metal-compiler.patch`: DXMT 0.80 calls a private Metal builtin
@@ -326,6 +340,7 @@ former behavior back for a comparison. The log says once which vertex shader thi
 Patches 0013 to 0018 run SteamVR for Windows under Wine (cranvr's SteamVR mode, `steamvr/driver_cranvr.cpp`). Each
 applies on its own to DXMT v0.80. The build script checks the whole set in order (runtime patch 0014), because patch
 0019 changes lines of BasaltVR's 0001. Patch 0020 changes lines of 0013, 0014, 0018 and 0019. Patch 0021 changes lines of 0020.
+Patch 0022 changes lines of 0019 and 0020.
 
 `0013-shared-buffers-between-processes.patch`: SteamVR's compositor makes a constant buffer with
 `D3D11_RESOURCE_MISC_SHARED` and stops at start when the buffer has no shared handle ("Failed to create shared frame
@@ -406,3 +421,27 @@ object with a resource only in such a bundle) and the fence's sync object. `Open
 patch 0020. A handle whose data has another size or no tag is no fence's. The opened fence keeps the bundle and can
 share it again. Each process logs its open of another process's fence and its first wait on such a fence, on the CPU
 (`SetEventOnCompletion`) and on the GPU (`ID3D11DeviceContext4::Wait`), with its process ID.
+
+`0022-shared-textures-ordered-across-queues.patch`: Direct3D 11 asks a writer to call Flush before another device uses
+a resource that they share without a keyed mutex. After that the reader sees the writes. Metal orders no work of two
+command queues on a texture. DXMT made the reader's queue wait for nothing. A second process could copy a texture of
+the stock path or an IOSurface texture before the writer's GPU had run the writes that the writer flushed (cranvr
+issue #177). A keyed mutex orders its texture already (patch 0014). Each queue that holds another shared texture now
+serves its shared event and its resource initializer's event through winemetal's broker. A section of shared memory
+has a slot for each such queue. The texture's unique name names the section. A slot holds the event value of the
+queue's newest chunk that wrote the texture and of the write before it. The encode thread notes a chunk's shared
+textures in `access`. After the chunk's commands ran and before its first encoder, it stores the chunk's writes in its
+slots, reads the other queues' slots and encodes a wait on another queue's event only while the other GPU has not
+reached the value. A commit takes a stamp from a counter of all DXMT processes. Each process keeps its handle of the
+counter's section open: Wine drops a section's name with its last handle, also while a view maps it. A reader waits
+only for chunks that the writer committed before the reader's chunk. Its encode thread waits for the writer's encode
+thread (at most 100 ms) only when such a chunk has not reached its order step. The GPU waits only for chunks that
+wrote the texture and passed their order step. So two processes cannot wait for each other. The order state lives in
+the `TextureAllocation`, which every chunk keeps until the GPU has finished it. An opener's slot comes when it opens
+the texture. The creator's slot comes with the texture's first handle. It starts with the event value of the queue's
+newest committed chunk. The first handle also submits the initial contents, which a reader waits for too. A texture
+that never leaves by a handle gets no slot: a game's swapchain image that BasaltVR gives to cranvr-host by its
+IOSurface ID costs nothing. A slot's section costs about half a millisecond to make and as much to free under Wine. A
+watch thread sets the event of a process that ended to the value that a GPU of this process waits for.
+`src/dxmt/dxmt_shared_order.hpp` gives the reasons and the costs. `DXMT_SHARED_ORDER=0` turns the order off.
+`DXMT_SHARED_ORDER_STATS=1` times each encoded wait. `scripts/shared-churn.sh` checks it (runtime patch 0022).
