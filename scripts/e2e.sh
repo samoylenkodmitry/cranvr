@@ -76,7 +76,9 @@
 #                 eye's color in its upper half. --openvr-arg --format --openvr-arg bgra takes B8G8R8A8 images, which
 #                 OpenComposite copies as they are, and --openvr-arg --samples --openvr-arg 4 multisampled ones, which it
 #                 resolves. Implies --openvr-wine.
-#   --openvr-arg ARG  one more argument of openvr_smoke.exe in the --openvr-* runs
+#   --openvr-arg ARG  one more argument of openvr_smoke.exe in the --openvr-* runs. --openvr-arg --scale --openvr-arg 1.118
+#                 draws the eyes at 1.118 times the recommended size, as Serious Sam VR does: with --host-arg --game-scale
+#                 --host-arg 1 its images of 2307x2468 lie above a Quest 3 eye (#164)
 #   --xr-vulkan [enable2|enable1|array]  an OpenXR program that renders with Vulkan: C:\basalt\runtime\vulkan_runtime_smoke.exe
 #                 runs in Wine with XR_KHR_vulkan_enable2 (the default), with XR_KHR_vulkan_enable (enable1) or with one
 #                 swapchain of two slices (array). It draws the picture of --openvr-vulkan into the runtime's IOSurface

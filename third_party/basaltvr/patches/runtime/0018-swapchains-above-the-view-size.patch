@@ -1,0 +1,167 @@
+diff --git i/runtime/pe/basalt_control_protocol.h w/runtime/pe/basalt_control_protocol.h
+index 6126c89..b077592 100644
+--- i/runtime/pe/basalt_control_protocol.h
++++ w/runtime/pe/basalt_control_protocol.h
+@@ -138,8 +138,8 @@
+ #define BASALT_CONTROL_PROTOCOL_VERSION 9u
+ #define BASALT_CONTROL_TOKEN_LENGTH 32u
+ #define BASALT_CONTROL_MAX_MESSAGE_LENGTH 4096u
+-/* Per-eye view size bounds. The maximum is also the runtime's advertised and
+- * accepted swapchain limit. */
++/* Per-eye view size bounds. The maximum is also the runtime's recommended size
++ * when the streamer configures none. */
+ #define BASALT_CONTROL_MIN_VIEW_DIMENSION 256u
+ #define BASALT_CONTROL_MAX_VIEW_WIDTH 2064u
+ #define BASALT_CONTROL_MAX_VIEW_HEIGHT 2208u
+diff --git i/runtime/pe/runtime.hpp w/runtime/pe/runtime.hpp
+index 4d7fe97..fa4105d 100644
+--- i/runtime/pe/runtime.hpp
++++ w/runtime/pe/runtime.hpp
+@@ -22,11 +22,25 @@ constexpr XrVersion kRuntimeApiVersion = XR_MAKE_VERSION(1, 0, 0);
+ constexpr XrVersion kRuntimeVersion = XR_MAKE_VERSION(0, 1, 0);
+ constexpr XrSystemId kSystemId = 1;
+ 
+-// Largest per-eye render target the runtime advertises, accepts for a
+-// swapchain, or takes from the streamer's configured view size.
++// Largest per-eye view size the runtime recommends or takes from the
++// streamer's configured view size.
+ constexpr uint32_t kMaxViewWidth = BASALT_CONTROL_MAX_VIEW_WIDTH;
+ constexpr uint32_t kMaxViewHeight = BASALT_CONTROL_MAX_VIEW_HEIGHT;
+ 
++// cranvr: the largest swapchain image and image rect the runtime advertises and
++// accepts, twice the largest view in each axis. A game may render above the
++// recommended size: Serious Sam VR asks for 1.118 times it, and SteamVR-style
++// supersampling asks for more. The host composes from an image of any size,
++// because it samples the image in normalized coordinates into the encoder's own
++// frame. Up to twice the largest eye, its one bilinear tap per pixel still reads
++// every texel. An image at the limit takes 4128 x 4416 x 4 bytes, 73 MB: two
++// eyes of three images take 437 MB. The limit lies well under the 16384 of
++// Direct3D 11 and Metal textures. It does not follow the configured view size,
++// which shrinks with the game's render size, so a game that picks its own
++// resolution gets no lower limit than before.
++constexpr uint32_t kMaxImageWidth = 2 * kMaxViewWidth;
++constexpr uint32_t kMaxImageHeight = 2 * kMaxViewHeight;
++
+ // ALVR's hashed path ID for /user/hand/right/input/system/click.
+ constexpr uint64_t kAlvrRightSystemClickPathId = 0x19729bd97073d474ULL;
+ 
+diff --git i/runtime/pe/swapchain.cpp w/runtime/pe/swapchain.cpp
+index d61f542..47f6e43 100644
+--- i/runtime/pe/swapchain.cpp
++++ w/runtime/pe/swapchain.cpp
+@@ -253,7 +253,7 @@ XrResult XRAPI_CALL createSwapchain(
+     if (createInfo == nullptr || createInfo->type != XR_TYPE_SWAPCHAIN_CREATE_INFO ||
+         createInfo->createFlags != 0 || createInfo->usageFlags == 0 ||
+         createInfo->width == 0 || createInfo->height == 0 ||
+-        createInfo->width > basalt::kMaxViewWidth || createInfo->height > basalt::kMaxViewHeight ||
++        createInfo->width > basalt::kMaxImageWidth || createInfo->height > basalt::kMaxImageHeight ||
+         createInfo->arraySize == 0 || createInfo->arraySize > maxArraySize() ||
+         createInfo->faceCount != 1 || createInfo->mipCount != 1 ||
+         createInfo->sampleCount != 1) {
+diff --git i/runtime/pe/system.cpp w/runtime/pe/system.cpp
+index 0d096ed..2db0ee0 100644
+--- i/runtime/pe/system.cpp
++++ w/runtime/pe/system.cpp
+@@ -68,8 +68,8 @@ XrResult XRAPI_CALL getSystemProperties(
+     properties->vendorId = 0;
+     std::strncpy(properties->systemName, "BasaltVR ALVR HMD prototype", XR_MAX_SYSTEM_NAME_SIZE - 1);
+     properties->systemName[XR_MAX_SYSTEM_NAME_SIZE - 1] = '\0';
+-    properties->graphicsProperties.maxSwapchainImageWidth = kMaxViewWidth;
+-    properties->graphicsProperties.maxSwapchainImageHeight = kMaxViewHeight;
++    properties->graphicsProperties.maxSwapchainImageWidth = kMaxImageWidth;
++    properties->graphicsProperties.maxSwapchainImageHeight = kMaxImageHeight;
+     properties->graphicsProperties.maxLayerCount = XR_MIN_COMPOSITION_LAYERS_SUPPORTED;
+     properties->trackingProperties.orientationTracking = XR_TRUE;
+     properties->trackingProperties.positionTracking = XR_TRUE;
+@@ -202,9 +202,9 @@ XrResult XRAPI_CALL enumerateViewConfigurationViews(
+     }
+     for (uint32_t index = 0; index < kViewCount; ++index) {
+         views[index].recommendedImageRectWidth = recommendedWidth;
+-        views[index].maxImageRectWidth = kMaxViewWidth;
++        views[index].maxImageRectWidth = kMaxImageWidth;
+         views[index].recommendedImageRectHeight = recommendedHeight;
+-        views[index].maxImageRectHeight = kMaxViewHeight;
++        views[index].maxImageRectHeight = kMaxImageHeight;
+         views[index].recommendedSwapchainSampleCount = 1;
+         views[index].maxSwapchainSampleCount = 1;
+     }
+diff --git i/runtime/tests/d3d11_runtime_smoke.cpp w/runtime/tests/d3d11_runtime_smoke.cpp
+index d1390c6..9af1dda 100644
+--- i/runtime/tests/d3d11_runtime_smoke.cpp
++++ w/runtime/tests/d3d11_runtime_smoke.cpp
+@@ -164,6 +164,10 @@ XrPosef levelPoseToLocalUp(const XrPosef& pose) {
+     return {{0.0f, std::sin(halfYaw), 0.0f, std::cos(halfYaw)}, pose.position};
+ }
+ 
++// cranvr: the largest swapchain image, twice a Quest 3 eye in each axis
++constexpr uint32_t kMaxImageWidth = 4128;
++constexpr uint32_t kMaxImageHeight = 4416;
++
+ bool parseOptions(int argc, char** argv, SmokeOptions& options) {
+     for (int index = 1; index < argc; ++index) {
+         if (std::strcmp(argv[index], "--visual") == 0) {
+@@ -499,8 +503,8 @@ int main(int argc, char** argv) {
+         configurationViews[1].recommendedImageRectWidth != expectedWidth ||
+         configurationViews[0].recommendedImageRectHeight != expectedHeight ||
+         configurationViews[1].recommendedImageRectHeight != expectedHeight ||
+-        configurationViews[0].maxImageRectWidth != 2064 ||
+-        configurationViews[0].maxImageRectHeight != 2208) {
++        configurationViews[0].maxImageRectWidth != kMaxImageWidth ||
++        configurationViews[0].maxImageRectHeight != kMaxImageHeight) {
+         xrDestroyInstance(instance);
+         return fail("xrEnumerateViewConfigurationViews dimensions", result);
+     }
+@@ -2040,6 +2044,53 @@ int main(int argc, char** argv) {
+     }
+     swapchainInfo.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+ 
++    // cranvr: a game may render above the recommended size, up to the limit
++    // that the system properties name. One pixel more is refused.
++    {
++        XrSystemProperties properties{};
++        properties.type = XR_TYPE_SYSTEM_PROPERTIES;
++        result = xrGetSystemProperties(instance, systemId, &properties);
++        const bool advertised = XR_SUCCEEDED(result) &&
++            properties.graphicsProperties.maxSwapchainImageWidth == kMaxImageWidth &&
++            properties.graphicsProperties.maxSwapchainImageHeight == kMaxImageHeight;
++        XrSwapchainCreateInfo largest = swapchainInfo;
++        largest.width = kMaxImageWidth + 1;
++        largest.height = kMaxImageHeight;
++        XrSwapchain refused = XR_NULL_HANDLE;
++        const XrResult tooLarge = advertised
++            ? xrCreateSwapchain(session, &largest, &refused)
++            : XR_SUCCESS;
++        largest.width = kMaxImageWidth;
++        XrSwapchain accepted = XR_NULL_HANDLE;
++        const XrResult atLimit = advertised && tooLarge == XR_ERROR_VALIDATION_FAILURE
++            ? xrCreateSwapchain(session, &largest, &accepted)
++            : XR_ERROR_VALIDATION_FAILURE;
++        if (refused != XR_NULL_HANDLE) {
++            xrDestroySwapchain(refused);
++        }
++        if (accepted != XR_NULL_HANDLE) {
++            xrDestroySwapchain(accepted);
++        }
++        if (!advertised || tooLarge != XR_ERROR_VALIDATION_FAILURE ||
++            XR_FAILED(atLimit) || accepted == XR_NULL_HANDLE) {
++            std::fprintf(
++                stderr,
++                "FAIL: swapchain limit: advertised %ux%u, %ux%u gave %d, %ux%u gave %d\n",
++                properties.graphicsProperties.maxSwapchainImageWidth,
++                properties.graphicsProperties.maxSwapchainImageHeight,
++                kMaxImageWidth + 1, kMaxImageHeight, static_cast<int>(tooLarge),
++                kMaxImageWidth, kMaxImageHeight, static_cast<int>(atLimit));
++            xrDestroySession(session);
++            release(context);
++            release(device);
++            xrDestroyInstance(instance);
++            return 1;
++        }
++        std::printf(
++            "PASS: swapchains up to %ux%u, one pixel more refused\n",
++            kMaxImageWidth, kMaxImageHeight);
++    }
++
+     XrSwapchain swapchain = XR_NULL_HANDLE;
+     result = xrCreateSwapchain(session, &swapchainInfo, &swapchain);
+     if (XR_FAILED(result) || swapchain == XR_NULL_HANDLE) {
