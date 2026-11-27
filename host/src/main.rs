@@ -922,9 +922,10 @@ impl Game {
                 if self.connected {
                     info!("Game disconnected");
                     status::emit(json!({"type": "game", "connected": false}));
-                }
-                if let Some(program) = &self.program {
-                    learn_size(sizes, program, &std::mem::take(&mut self.run));
+                    // A connection that the host refused before its hello had no run
+                    if let Some(program) = &self.program {
+                        learn_size(sizes, program, &std::mem::take(&mut self.run));
+                    }
                 }
                 *newest = None;
                 self.swapchains.clear();
