@@ -196,6 +196,17 @@ applies these patches and builds both parts.
   in one frame, then destroys it at once while the GPU may still work on it. `--signal FILE` stops after the first
   and after the last swapchain until `FILE.warm` and `FILE.churned` exist, for a measurement of the process.
   `scripts/e2e.sh --swapchain-churn d3d11|d3d11-array|vulkan|vulkan-array [--churn-frames]` runs it.
+
+`0017-shared-objects-churn-test.patch`
+
+- `tests/shared_churn.cpp` makes, in each cycle (`--cycles`, default 200), six shared textures of DXMT's own path
+  (R16G16B16A16_FLOAT, B8G8R8A8 with a legacy handle, mipmaps, two slices with an NT handle, 4x MSAA, a keyed mutex),
+  one IOSurface texture and a shared fence. A second process of the program (`--child`) opens each one, checks its
+  description and the color that the first process cleared it to, and both release everything. At the end it checks
+  that the handle of a released IOSurface texture, whose ID names a surface of another size by then, does not open.
+  `--signal FILE` stops while both processes hold the first cycle's objects, after that cycle and after the last one,
+  until `FILE.live`, `FILE.warm` and `FILE.churned` exist. `scripts/shared-churn.sh` runs it and counts the names in
+  launchd.
 - Before the fix, 21 swapchains of Direct3D 11 left 63 IOSurfaces (24 MB) alive while the program ran and also after
   it ended (launchd held them). With Vulkan, the 22nd swapchain failed, and the 63 surfaces of the first 21 went
   with the process. After the fix, 1000 swapchains left none, in each of the four ways, and none with `--frames`
@@ -258,7 +269,7 @@ former behavior back for a comparison. The log says once which vertex shader thi
 
 Patches 0013 to 0018 run SteamVR for Windows under Wine (cranvr's SteamVR mode, `steamvr/driver_cranvr.cpp`). Each
 applies on its own to DXMT v0.80. The build script checks the whole set in order (runtime patch 0014), because patch
-0019 changes lines of BasaltVR's 0001.
+0019 changes lines of BasaltVR's 0001, and patch 0020 changes lines of 0013, 0014, 0018 and 0019.
 
 `0013-shared-buffers-between-processes.patch`: SteamVR's compositor makes a constant buffer with
 `D3D11_RESOURCE_MISC_SHARED` and stops at start when the buffer has no shared handle ("Failed to create shared frame
@@ -303,10 +314,26 @@ any process, is released. A shared IOSurface texture registers nothing with laun
 surface's global ID (`iosurface_id`), and `OpenSharedResource` and `OpenSharedResource1` open the surface by that ID
 (`WMTTextureInfo::reserved` in; 0 makes a new surface). The unique name stays in the runtime data, because patch 0014
 names the section of the keyed mutex by it. A shared texture of DXMT's own path (`MTLSharedTextureHandle`: other
-formats, mipmaps, arrays, MSAA) and a shared fence keep their registration with launchd, and so still stay until the
-user logs out. Before the first SteamVR run of the new stack launchd held 41 such surfaces (under 1 MB) and 3 other
-ports. After one `scripts/e2e.sh --steamvr` it held 30 more names with 240 MB of such surfaces, from processes that
-by their IDs belong to that run, and Steam's web helper held 10 (18 MB). As with a legacy shared handle on Windows, an IOSurface texture
-whose last texture is gone no longer opens; on Windows an NT handle keeps the resource. BasaltVR's checks of the fork
-(`runtime/scripts/test-dxmt.zsh`, with the reopen of an NT handle) pass with the patch, and
-`scripts/e2e.sh --swapchain-churn` checks that no surface stays (see runtime patch 0016).
+formats, mipmaps, arrays, MSAA) and a shared fence kept their registration with launchd until patch 0020. As with a
+legacy shared handle on Windows, an IOSurface texture whose last texture is gone no longer opens; on Windows an NT
+handle keeps the resource. BasaltVR's checks of the fork (`runtime/scripts/test-dxmt.zsh`, with the reopen of an NT
+handle) pass with the patch, and `scripts/e2e.sh --swapchain-churn` checks that no surface stays (see runtime patch
+0016).
+
+`0020-shared-ports-leave-launchd-with-their-object.patch`: DXMT registered the port of each shared texture of its own
+path and of each shared event (a shared `ID3D11Fence`, the event of patch 0014's keyed mutex) with launchd. These
+ports belong to the kernel and never die, so launchd kept them, and the memory of the textures, until the user logged
+out: one `scripts/e2e.sh --steamvr` left 30 names with 240 MB, and Steam's web helper held 10 names (18 MB) while it
+ran. winemetal now shares such a port through a broker: `WMTBootstrapRegister` registers a service port whose receive
+right the process holds, one for each object, and a thread of the broker answers each request on it with a copy of
+the object's port. `WMTBootstrapUnregister` destroys the service port when the object goes, and launchd drops the name
+at once; the end of the process destroys it too. Such a texture cannot go by the ID of its IOSurface as patch 0019
+does: Metal makes it on a surface that is not global, so another process finds nothing under the ID. A process that
+shares an opened texture again (patch 0018) serves its own port under a new name, so the next process does not
+depend on the creator. The patch also ends three leaks of DXMT's own: an opened texture and an opened shared buffer
+kept one reference too many, and the resource deleted its keyed mutex through `IDXGIKeyedMutex`, which has no virtual
+destructor, so the keyed mutex's section and its event stayed. Each lasted until the process ended. The import of an
+IOSurface texture of patch 0019 now compares the size and the pixel format of the surface that the ID names with the
+runtime data and refuses another surface with a log line, because macOS gives the lowest free ID to the next new
+surface. `scripts/shared-churn.sh` checks all of this (runtime patch 0017). In Wine 11.10 a shared fence still does not
+open in another process: Wine keeps and reads the private data of resources only, and the fence's name is in none.

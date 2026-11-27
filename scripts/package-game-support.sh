@@ -25,8 +25,8 @@
 # The archive holds:
 #   engine/      Wine 11.10 (Gcenx's macOS build), with DXMT's DLLs and the patched Wine files in place
 #   dxmt/        DXMT's DLLs again, for the Wine prefix's system32
-#   runtime/     the OpenXR runtime, its manifest, its checks (hand_interaction_smoke.exe, vulkan_runtime_smoke.exe and swapchain_churn.exe
-#                among them) and the Steam web helper shim
+#   runtime/     the OpenXR runtime, its manifest, its checks (hand_interaction_smoke.exe, vulkan_runtime_smoke.exe, swapchain_churn.exe
+#                and shared_churn.exe among them) and the Steam web helper shim
 #   opencomposite/  OpenComposite's vrclient_x64.dll, its empty version.txt and openvr_smoke.exe, cranvr's
 #                OpenVR test program
 #   steamvr-driver/  cranvr's SteamVR driver as SteamVR loads it: driver.vrdrivermanifest, bin/win64/driver_cranvr.dll
@@ -64,7 +64,7 @@ driver_build=${CRANVR_STEAMVR_DRIVER_DIR:-${cranvr}/target/steamvr-driver/cranvr
 
 for f in "${wine_app}/bin/wine" "${fork}/x86_64-windows/d3d11.dll" "${fork}/x86_64-unix/winemetal.so" \
          "${runtime_bin}/basalt_openxr.dll" "${runtime_bin}/steamwebhelper_compat.exe" "${runtime_bin}/hand_interaction_smoke.exe" \
-         "${runtime_bin}/vulkan_runtime_smoke.exe" "${runtime_bin}/swapchain_churn.exe"; do
+         "${runtime_bin}/vulkan_runtime_smoke.exe" "${runtime_bin}/swapchain_churn.exe" "${runtime_bin}/shared_churn.exe"; do
     if [[ ! -e ${f} ]]; then
         print -u2 "Missing ${f}. Run scripts/build-basaltvr.sh first."
         exit 1
@@ -159,7 +159,7 @@ cp "${fork}/x86_64-unix/winemetal.so" "${root}/dxmt/x86_64-unix/winemetal.so"
 
 print "Copying the OpenXR runtime"
 for f in basalt_openxr.dll basalt_openxr.json loader_smoke.exe d3d11_runtime_smoke.exe tracking_smoke.exe hand_interaction_smoke.exe \
-    vulkan_runtime_smoke.exe swapchain_churn.exe steamwebhelper_compat.exe; do
+    vulkan_runtime_smoke.exe swapchain_churn.exe shared_churn.exe steamwebhelper_compat.exe; do
     cp "${runtime_bin}/${f}" "${root}/runtime/${f}"
 done
 
