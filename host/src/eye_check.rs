@@ -25,6 +25,7 @@
 use log::{info, warn};
 use cranvr_vt::PixelBuffer;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -51,6 +52,39 @@ const INTERVAL: Duration = Duration::from_secs(1);
 fn dump_dir() -> Option<&'static Path> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| std::env::var_os("CRANVR_EYE_DUMP").filter(|dir| !dir.is_empty()).map(PathBuf::from)).as_deref()
+}
+
+/// Both eyes of one check for the dump: each image with its rect
+type Dump = [(PixelBuffer, [i32; 4]); 2];
+
+/// The queue of the thread that writes the dumps, when `CRANVR_EYE_DUMP` names a folder. A whole eye takes the thread
+/// tens of milliseconds to encode and write, which the frame loop cannot spend: with the files written on the loop,
+/// the host replaced one game frame and found the encoder busy once each second, so a game at 120 Hz lost about 1
+/// percent of its frames in a test with the dump. The thread reads the images a moment after the check, so a dump
+/// may show a newer frame of the game.
+fn dump_queue() -> Option<&'static SyncSender<Dump>> {
+    static QUEUE: OnceLock<Option<SyncSender<Dump>>> = OnceLock::new();
+    QUEUE
+        .get_or_init(|| {
+            let dir = dump_dir()?;
+            let (queue, dumps) = sync_channel::<Dump>(1);
+            let spawned = std::thread::Builder::new().name("cranvr-eye-dump".into()).spawn(move || {
+                for eyes in dumps {
+                    for (name, (image, rect)) in ["left", "right"].into_iter().zip(eyes) {
+                        let size = (image.width(), image.height());
+                        let Some(png) = image.with_pixels(|data, stride| Grid::png(data, stride, size, rect)).flatten() else { continue };
+                        if let Err(e) = std::fs::write(dir.join(format!("eye-{name}.png")), png) {
+                            warn!("Eye check: cannot write the {name} eye to {}: {e}", dir.display());
+                        }
+                    }
+                }
+            });
+            if let Err(e) = &spawned {
+                warn!("Eye check: no thread for the dump: {e}");
+            }
+            spawned.ok().map(|_| queue)
+        })
+        .as_ref()
 }
 
 /// The widest dump in pixels: `CRANVR_EYE_DUMP_WIDTH`, else 640. A test that reads a game's menu asks for the whole
@@ -266,16 +300,9 @@ impl Watch {
     /// has held long enough to report.
     pub fn check(&mut self, images: [&PixelBuffer; 2], rects: [[i32; 4]; 2]) -> Option<Symptom> {
         self.last = Some(Instant::now());
-        if let Some(dir) = dump_dir() {
-            for (name, image, rect) in [("left", images[0], rects[0]), ("right", images[1], rects[1])] {
-                let size = (image.width(), image.height());
-                let png = image.with_pixels(|data, stride| Grid::png(data, stride, size, rect)).flatten();
-                if let Some(png) = png {
-                    if let Err(e) = std::fs::write(dir.join(format!("eye-{name}.png")), png) {
-                        warn!("Eye check: cannot write the {name} eye to {}: {e}", dir.display());
-                    }
-                }
-            }
+        if let Some(dumps) = dump_queue() {
+            // A dump that is still being written skips this check's eyes
+            dumps.try_send([(images[0].clone(), rects[0]), (images[1].clone(), rects[1])]).ok();
         }
         if self.left.read(images[0], rects[0]) && self.right.read(images[1], rects[1]) {
             // The log keeps the first check of a run and each change, so it shows what the host saw

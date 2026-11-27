@@ -212,9 +212,14 @@ pub fn install_rosetta() -> Result<(), String> {
 }
 
 /// Whether Steam of this prefix runs. A Wine process maps its program's file, so the processes that
-/// hold this prefix's steam.exe are its Steam. Another prefix's Steam does not count.
+/// hold this prefix's steam.exe are its Steam. Another prefix's Steam does not count. lsof looks only
+/// at the processes whose command line names a steam.exe: over every process of the Mac it took 0.2 s
+/// of CPU time, and the window asks every 2 s.
 pub fn running() -> bool {
-    Command::new("lsof").arg("-t").arg(steam_dir().join("steam.exe")).output().is_ok_and(|o| !o.stdout.is_empty())
+    let Ok(named) = Command::new("pgrep").args(["-i", "-d", ",", "-f", r"steam\.exe"]).output() else { return false };
+    let pids = String::from_utf8_lossy(&named.stdout).trim().to_owned();
+    !pids.is_empty()
+        && Command::new("lsof").args(["-a", "-t", "-p", &pids]).arg(steam_dir().join("steam.exe")).output().is_ok_and(|o| !o.stdout.is_empty())
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
