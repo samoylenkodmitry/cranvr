@@ -1,6 +1,7 @@
 //! The ring of the headset's microphone: the host asks the client to record while a reader stamps the
 //! ring, writes the client's datagrams in order with silence for a lost one, drops a late one and
-//! stops the recording when the stamps stop. One test, because the ring is one for the process.
+//! stops the recording when the stamps stop. One test, because the ring is one for the process: the
+//! sessions of the other tests' hosts, which keep no ring, stay out of it.
 
 use super::*;
 use crate::headset::native::{start, Config};
@@ -113,7 +114,12 @@ fn the_host_records_the_headset_while_a_game_reads_the_ring() {
     assert_eq!(first - start_pos, MICROPHONE_FRAMES as u64, "the first datagram went into the ring");
     for (sequence, value) in [(1, 200), (3, 400), (2, 300), (4, 500)] {
         client.duplex.send_datagram(&datagram(sequence, value)).unwrap();
-        thread::sleep(Duration::from_millis(20));
+    }
+    // The host reads its socket in order, so the late 2 met the host before the ring holds the
+    // fourth block. A late 2 that the host wrote shows as 300 in the fourth block.
+    let blocks_in = Instant::now() + Duration::from_secs(2);
+    while ring.word(WRITE_POS).load(Ordering::Relaxed) - first < 4 * MICROPHONE_FRAMES as u64 && Instant::now() < blocks_in {
+        thread::sleep(Duration::from_millis(1));
     }
     let end = ring.word(WRITE_POS).load(Ordering::Relaxed);
     assert_eq!(end - first, 4 * MICROPHONE_FRAMES as u64, "datagrams 1, a silence for 2, 3 and 4; the late 2 is dropped");

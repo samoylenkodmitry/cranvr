@@ -283,8 +283,11 @@ pub(super) fn attach(session: &Arc<Session>) {
         return;
     }
     *WRITER.lock().unwrap() = Writer { pos: ring.word(WRITE_POS).load(Ordering::Relaxed), ..Writer::new() };
+    // The watch thread tells only the stored session of a change. A change between the state sent
+    // here and the store would reach no session, so both happen under the lock.
+    let mut current = SESSION.lock().unwrap();
     session.link.duplex.send_control(&HostMsg::Microphone(recording(ring))).ok();
-    *SESSION.lock().unwrap() = Some(Arc::clone(session));
+    *current = Some(Arc::clone(session));
 }
 
 pub(super) fn detach(session: &Arc<Session>) {
@@ -297,7 +300,7 @@ pub(super) fn detach(session: &Arc<Session>) {
 /// Writes a datagram of the headset's microphone into the ring.
 pub(super) fn on_datagram(session: &Session, mic: Microphone) {
     let Some(ring) = RING.get() else { return };
-    if mic.pcm.len() != MICROPHONE_FRAMES * 2 {
+    if !session.microphone || mic.pcm.len() != MICROPHONE_FRAMES * 2 {
         return;
     }
     let mut writer = WRITER.lock().unwrap();

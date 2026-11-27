@@ -554,7 +554,7 @@ fn start_session(config: &Config, shared: &Arc<Shared>, pending: Pending, name: 
     };
     info!("Native protocol: {name} at {peer} connected, {} media, sealed", if link.duplex.has_udp() { "UDP" } else { "TCP" });
     let mut session = Session::new(link, &stream, config.display_lock, cable);
-    session.microphone = can_record;
+    session.microphone = can_record && config.microphone.is_some();
     let session = Arc::new(session);
     session.displays.set(displays::Displays::start(config.desktop.clone(), Arc::clone(&session))).ok();
     if config.audio {
@@ -1181,7 +1181,8 @@ struct Session {
     /// The displays that the client shows as panels: their streams and pointers. They start after
     /// the session exists, because their threads share the session.
     displays: std::sync::OnceLock<Arc<displays::Displays>>,
-    /// The client can record its microphone for games
+    /// The client records its microphone for games: it can record, and this host keeps the ring.
+    /// The ring is one for the process, so the session of a host with no ring stays out of it.
     microphone: bool,
     next_frame: AtomicU32,
     heard: Mutex<Instant>,
