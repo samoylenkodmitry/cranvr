@@ -1,0 +1,1049 @@
+Subject: [PATCH] winemetal, d3d11: shared textures and events leave launchd with their object (cranvr)
+
+DXMT registered the Mach port of each shared texture of its stock path (MTLSharedTextureHandle: formats other than
+RGBA8 and BGRA8, mipmaps, arrays, MSAA, legacy handles) and of each shared event (a shared ID3D11Fence, the event of
+the keyed mutex of patch 0014) with launchd under the object's shared name, for OpenSharedResource and
+OpenSharedFence in another process. These ports belong to the kernel and never die. launchd kept them, with the
+memory of the textures, until the user logged out. launchd also refuses to remove a name (a register with no port
+answers 1101, BOOTSTRAP_NAME_IN_USE). On 2026-11-27 one run of SteamVR left 30 names with 240 MB in launchd.
+
+winemetal now shares such a port through a broker. WMTBootstrapRegister makes a service port whose receive right the
+process holds, one for each object. It registers that port under the name. A thread of the broker answers each
+request on a service port with a copy of the object's send right. WMTBootstrapUnregister, a new call, destroys the
+service port when the object goes. launchd then drops the name at once (0.2 ms in a check). The end of the process
+destroys the service port too. WMTBootstrapLookUp asks the service port for the object's port, with a time-out of a
+second. WMTMachPortDeallocate, a new call, frees a right that the look-up gave.
+
+A texture of the stock path cannot go by the global ID of its IOSurface, as the IOSurface textures of patch 0019 do.
+Metal makes it on an IOSurface that is not global: IOSurfaceLookup in another process finds nothing (checked for
+RGBA8, RGBA16Float, mipmaps, two slices, 4x MSAA, Depth32Float, BC1 and RGB10A2). The surface also reports no size
+and no pixel format. Its port is the only way into another process. An event has no ID at all. The private calls
+stay those that DXMT used before (initWithMachPort: of MTLSharedTextureHandle, newSharedEventWithMachPort: of the
+device, eventPort of MTLSharedEventHandle). A check in two native processes opened all eight textures above and an
+event through the broker: each texture had its description, the RGBA8 one had its pixels, the event had its value.
+Neither call takes the caller's right, so the caller frees it.
+
+- A shared texture of the stock path is served while its DeviceTexture lives. The allocation frees its own right with
+  the texture, in the process that made it and in each process that opened it. DXMT kept those rights until the
+  process ended. A process that shares an opened texture again (patch 0018) serves its own port under a new name.
+  The new private data carries that name in server_name, so the next process does not depend on the creator. The
+  unique name stays the same in every process, because the keyed mutex names its section by it.
+- A shared fence is served while the fence lives. The event of a keyed mutex is served while the process that made
+  its section holds the section. A process that comes later gets no event. Its keyed mutex then takes the first way
+  (the writer's ReleaseSync waits for its GPU).
+- An opened texture and an opened shared buffer (patch 0013) kept one reference too many. Com takes the first
+  reference itself. ref() took a second one. They stayed with their memory until the process ended. The same held
+  for the IOSurfaces of patch 0019 that another DXMT process opened.
+- The resource deleted its keyed mutex through IDXGIKeyedMutex, which has no virtual destructor. The keyed mutex's
+  section and the name of its event therefore stayed until the process ended. The resource now holds the concrete
+  type.
+- The import of an IOSurface texture compares the width, the height and the pixel format of the surface that the ID
+  names with the runtime data. It refuses another surface with a log line. macOS gives the lowest free ID to a new
+  surface, so the ID of a released texture names the next new surface at once.
+
+In Wine 11.10 a shared fence still does not open in another process, as before. DXMT's CreateFence stores its name
+with D3DKMT_ESCAPE_UPDATE_RESOURCE_WINE, which Wine runs for resources only. DXMT's check of the result is the wrong
+way round, so the fence goes on without the name. OpenSharedFence reads the name with
+D3DKMTQueryResourceInfoFromNtHandle, which Wine answers for resources only. The fence's name in launchd now goes with
+the fence all the same.
+
+scripts/shared-churn.sh in cranvr runs runtime/tests/shared_churn.exe (runtime patch 0017). In each cycle it makes six
+textures of the stock path, one IOSurface texture and a shared fence, which a second process opens and checks. Before
+the patch, 2 cycles of 64 x 64 left 16 names in launchd with 375 KB of surfaces after both processes had ended. The
+handle of a released IOSurface texture opened on a new surface of another size. With the patch, 200 cycles of
+640 x 333 show 8 names while both processes hold the objects. None stays after each cycle or after the end. The
+IOSurfaces of both processes grow by 11 MB once while the cycles make 1981 MB.
+---
+diff --git i/src/d3d11/d3d11_buffer.cpp w/src/d3d11/d3d11_buffer.cpp
+index 34b879e..b3422d2 100644
+--- i/src/d3d11/d3d11_buffer.cpp
++++ w/src/d3d11/d3d11_buffer.cpp
+@@ -387,7 +387,8 @@ ImportSharedBuffer(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void
+     WARN("ImportSharedBuffer: Failed to map the memory of the shared buffer: ", hResource);
+     return E_FAIL;
+   }
+-  Com<D3D11Buffer> buffer = ref(new D3D11Buffer(&data.desc, nullptr, pDevice, &memory, open.hGlobalShare));
++  // cranvr: Com takes the first reference itself; with ref() as well an opened buffer stayed until the process ended
++  Com<D3D11Buffer> buffer = new D3D11Buffer(&data.desc, nullptr, pDevice, &memory, open.hGlobalShare);
+   return buffer->QueryInterface(riid, ppResource);
+ }
+ 
+diff --git i/src/d3d11/d3d11_fence.cpp w/src/d3d11/d3d11_fence.cpp
+index 65146c0..5cd6afd 100644
+--- i/src/d3d11/d3d11_fence.cpp
++++ w/src/d3d11/d3d11_fence.cpp
+@@ -2,18 +2,27 @@
+ #include "d3d11_device_child.hpp"
+ #include "d3d11_resource.hpp"
+ #include "util_win32_compat.h"
++#include <cstring>
+ 
+ namespace dxmt {
+ 
+ class MTLD3D11FenceImpl : public MTLD3D11DeviceChild<MTLD3D11Fence> {
+ public:
+-  MTLD3D11FenceImpl(MTLD3D11Device *pDevice, WMT::Reference<WMT::SharedEvent> event, D3DKMT_HANDLE handle) :
++  MTLD3D11FenceImpl(
++      MTLD3D11Device *pDevice, WMT::Reference<WMT::SharedEvent> event, D3DKMT_HANDLE handle,
++      const char *servedName = nullptr
++  ) :
+       MTLD3D11DeviceChild<MTLD3D11Fence>(pDevice) {
+     this->event = std::move(event);
+     local_kmt = handle;
++    if (servedName)
++      snprintf(served_name, sizeof(served_name), "%s", servedName);
+   };
+ 
+   ~MTLD3D11FenceImpl() {
++    // cranvr: launchd drops the name now, so the event goes when the last fence on it goes, in any process
++    if (served_name[0])
++      WMTBootstrapUnregister(served_name);
+     if (local_kmt) {
+       D3DKMT_DESTROYSYNCHRONIZATIONOBJECT destroy = {};
+       destroy.hSyncObject = local_kmt;
+@@ -86,6 +95,10 @@ public:
+     MTLSharedEvent_setWin32EventAtValue(event.handle, shared_event_listener, Event, Value);
+     return S_OK;
+   };
++
++private:
++  // cranvr: the name under which this process serves the event's port to other processes (winemetal's broker)
++  char served_name[54] = {};
+ };
+ 
+ HRESULT
+@@ -114,12 +127,19 @@ CreateFence(MTLD3D11Device *pDevice, UINT64 InitialValue, D3D11_FENCE_FLAG Flags
+       ERR("D3D11Fence: Failed to create mach port for shared fence");
+       return E_FAIL;
+     }
++    // cranvr: the event's port is the kernel's, so launchd held it until the user logged out. winemetal's broker
++    // serves it while the fence lives in this process. The broker takes a right of its own.
+     char mach_port_name[54];
+     MakeUniqueSharedName(mach_port_name);
+-    if (!WMTBootstrapRegister(mach_port_name, mach_port)) {
++    bool registered = WMTBootstrapRegister(mach_port_name, mach_port);
++    WMTMachPortDeallocate(mach_port);
++    if (!registered) {
+       ERR("D3D11Fence: Failed to register mach port for shared fence");
+       return E_FAIL;
+     }
++    // cranvr: Wine 11.10 updates the private data of resources only, so this escape fails for a fence. The check
++    // below is the wrong way round: it lets the fence go on without the name. OpenSharedFence then fails in another
++    // process, at D3DKMTQueryResourceInfoFromNtHandle, which Wine answers for resources only as well.
+     D3DKMT_ESCAPE escape = {};
+     escape.Type = D3DKMT_ESCAPE_UPDATE_RESOURCE_WINE;
+     escape.pPrivateDriverData = mach_port_name;
+@@ -127,8 +147,12 @@ CreateFence(MTLD3D11Device *pDevice, UINT64 InitialValue, D3D11_FENCE_FLAG Flags
+     escape.hContext = local_kmt;
+     if (!D3DKMTEscape(&escape)) {
+       ERR("D3D11Fence: Failed to escape mach port for shared fence");
++      WMTBootstrapUnregister(mach_port_name);
+       return E_FAIL;
+     }
++    event.signalValue(InitialValue);
++    auto fence = new MTLD3D11FenceImpl(pDevice, std::move(event), local_kmt, mach_port_name);
++    return fence->QueryInterface(riid, ppFence);
+   }
+   event.signalValue(InitialValue);
+   auto fence = new MTLD3D11FenceImpl(pDevice, std::move(event), local_kmt);
+@@ -183,16 +207,20 @@ OpenSharedFence(MTLD3D11Device *pDevice, HANDLE hResource,
+     return E_INVALIDARG;
+   }
+ 
+-  mach_port_t mach_port;
+-  if (!WMTBootstrapLookUp(mach_port_name, &mach_port)) {
+-    ERR("ImportSharedTexture: Failed to look up mach port");
++  mach_port_name[sizeof(mach_port_name) - 1] = 0;
++  mach_port_t mach_port = 0;
++  if (!WMTBootstrapLookUp(mach_port_name, &mach_port) || !mach_port) {
++    ERR("OpenSharedFence: no process serves ", mach_port_name, " now: the process that shared the fence released it or ended");
++    D3DKMT_DESTROYSYNCHRONIZATIONOBJECT destroy = {};
++    destroy.hSyncObject = open.hSyncObject;
++    D3DKMTDestroySynchronizationObject(&destroy);
+     return E_INVALIDARG;
+   }
+ 
+-  auto fence = new MTLD3D11FenceImpl(
+-      pDevice,
+-      pDevice->GetMTLDevice().newSharedEventWithMachPort(mach_port),
+-      open.hSyncObject);
++  // cranvr: the event takes a right of its own
++  auto event = pDevice->GetMTLDevice().newSharedEventWithMachPort(mach_port);
++  WMTMachPortDeallocate(mach_port);
++  auto fence = new MTLD3D11FenceImpl(pDevice, std::move(event), open.hSyncObject);
+   return fence->QueryInterface(riid, ppFence);
+ }
+ 
+diff --git i/src/d3d11/d3d11_keyed_mutex.hpp w/src/d3d11/d3d11_keyed_mutex.hpp
+index aa748ba..a723323 100644
+--- i/src/d3d11/d3d11_keyed_mutex.hpp
++++ w/src/d3d11/d3d11_keyed_mutex.hpp
+@@ -10,8 +10,10 @@
+  *
+  * Every process that holds a shared texture maps one small section of shared memory. The name of the
+  * section comes from the texture's shared Metal name, so all processes find the same one. The process
+- * that makes the section also makes the event and registers it under a name of the same kind; the
+- * others look it up. The section counts the releases. ReleaseSync takes the next count and has the GPU
++ * that makes the section also makes the event and serves its port under a name of the same kind, through
++ * winemetal's broker, while it holds the section; the others look it up. launchd drops the name with the
++ * section or the process: it held the event's port until the user logged out before. A process that
++ * comes after the section's maker has let go of it gets no event and takes the first way below. The section counts the releases. ReleaseSync takes the next count and has the GPU
+  * set the event to it after the caller's commands. AcquireSync has the GPU wait until the event reaches
+  * the last count before the caller's next commands. Both return at once, and the key is not checked.
+  * If a writer's process ends before its GPU sets the event, the reader's process sets it after a
+@@ -66,10 +68,15 @@ public:
+     if (created) {
+       opened->event_ = device->GetMTLDevice().newSharedEvent();
+       mach_port_t port = opened->event_.createMachPort();
+-      if (!port || !WMTBootstrapRegister(event_name.c_str(), port)) {
++      // The broker takes a right of its own
++      bool registered = port && WMTBootstrapRegister(event_name.c_str(), port);
++      if (port)
++        WMTMachPortDeallocate(port);
++      if (!registered) {
+         InterlockedExchange(&opened->counts_->ready, 2);
+         return nullptr;
+       }
++      opened->served_ = event_name;
+       InterlockedExchange(&opened->counts_->ready, 1);
+     } else {
+       // The process that made the section registers the event right after it
+@@ -78,9 +85,11 @@ public:
+         Sleep(1);
+       mach_port_t port = 0;
+       if (InterlockedCompareExchange(&opened->counts_->ready, 0, 0) != 1 ||
+-          !WMTBootstrapLookUp(event_name.c_str(), &port))
++          !WMTBootstrapLookUp(event_name.c_str(), &port) || !port)
+         return nullptr;
++      // The event takes a right of its own
+       opened->event_ = device->GetMTLDevice().newSharedEventWithMachPort(port);
++      WMTMachPortDeallocate(port);
+     }
+     if (FAILED(CreateFenceOfEvent(device, opened->event_, IID_PPV_ARGS(&opened->fence_))))
+       return nullptr;
+@@ -92,6 +101,8 @@ public:
+   KeyedMutexSection &operator=(const KeyedMutexSection &) = delete;
+ 
+   ~KeyedMutexSection() {
++    if (!served_.empty())
++      WMTBootstrapUnregister(served_.c_str());
+     fence_ = nullptr;
+     if (counts_)
+       UnmapViewOfFile(counts_);
+@@ -114,6 +125,7 @@ public:
+ private:
+   HANDLE mapping_ = nullptr;
+   KeyedMutexCounts *counts_ = nullptr;
++  std::string served_; // the name under which this process serves the event, if it made the section
+   WMT::Reference<WMT::SharedEvent> event_;
+   Com<ID3D11Fence> fence_;
+ };
+diff --git i/src/d3d11/d3d11_resource.hpp w/src/d3d11/d3d11_resource.hpp
+index d78ef4d..e35bfe2 100644
+--- i/src/d3d11/d3d11_resource.hpp
++++ w/src/d3d11/d3d11_resource.hpp
+@@ -129,8 +129,9 @@ struct D3D11ResourceCommon : ID3D11Resource {
+   virtual HRESULT GetSharedHandle(HANDLE *pSharedHandle) = 0;
+   virtual HRESULT
+   CreateSharedHandle(const SECURITY_ATTRIBUTES *Attributes, DWORD Access, const WCHAR *pName, HANDLE *pNTHandle) = 0;
+-  /* cranvr: the kernel handles that share an opened texture again (see ShareOpenedTexture) */
+-  virtual void AdoptSharedHandles(UINT LocalHandle, UINT GlobalHandle) {}
++  /* cranvr: the kernel handles that share an opened texture again. ServedName is the name under which this process
++   * serves its port, if any (see ShareOpenedTexture). */
++  virtual void AdoptSharedHandles(UINT LocalHandle, UINT GlobalHandle, const char *ServedName) {}
+ 
+   virtual Rc<StagingResource> staging(UINT Subresource) = 0;
+   virtual Rc<DynamicBuffer> dynamicBuffer(UINT *pBufferLength, UINT *pBindFlags) = 0;
+@@ -244,7 +245,7 @@ public:
+ 
+     if (riid == __uuidof(IDXGIKeyedMutex)) {
+       if (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) {
+-        *ppvObject = ref(keyed_mutex.get());
++        *ppvObject = ref(static_cast<IDXGIKeyedMutex *>(keyed_mutex.get()));
+         return S_OK;
+       }
+       static bool warned = false;
+@@ -334,7 +335,9 @@ public:
+ protected:
+   tag::DESC1 desc;
+   std::unique_ptr<IDXGIResource1> dxgi_resource;
+-  std::unique_ptr<IDXGIKeyedMutex> keyed_mutex;
++  // cranvr: the concrete type, so that the delete runs its destructor. IDXGIKeyedMutex has no virtual destructor: a
++  // delete through it left the keyed mutex's section and the name of its event in launchd until the process ended.
++  std::unique_ptr<MTLDXGIKeyedMutex<TResourceBase<tag, Base...>>> keyed_mutex;
+   tag::D3D10_IMPL d3d10;
+ };
+ 
+diff --git i/src/d3d11/d3d11_texture_device.cpp w/src/d3d11/d3d11_texture_device.cpp
+index d333516..35659a9 100644
+--- i/src/d3d11/d3d11_texture_device.cpp
++++ w/src/d3d11/d3d11_texture_device.cpp
+@@ -56,6 +56,8 @@ private:
+   float min_lod = 0.0;
+   D3DKMT_HANDLE local_kmt_ = 0;
+   D3DKMT_HANDLE global_kmt_ = 0;
++  // cranvr: the name under which this process serves the texture's port to other processes (winemetal's broker)
++  char served_name_[54] = {};
+ 
+   using SRVBase =
+       TResourceViewBase<tag_shader_resource_view<DeviceTexture<tag_texture>>>;
+@@ -156,14 +158,19 @@ public:
+ 
+   DeviceTexture(
+       const tag_texture::DESC1 *pDesc, Rc<Texture> &&u_texture, D3DKMT_HANDLE localHandle, D3DKMT_HANDLE globalHandle,
+-      MTLD3D11Device *pDevice
++      MTLD3D11Device *pDevice, const char *servedName = nullptr
+   ) :
+       TResourceBase<tag_texture, IMTLMinLODClampable>(*pDesc, pDevice),
+       local_kmt_(localHandle), global_kmt_(globalHandle) {
+         this->texture_ = std::move(u_texture);
++        if (servedName)
++          snprintf(served_name_, sizeof(served_name_), "%s", servedName);
+       }
+ 
+   ~DeviceTexture() {
++    // cranvr: launchd drops the name now: no other process opens the texture through this one after it let go
++    if (served_name_[0])
++      WMTBootstrapUnregister(served_name_);
+     if (local_kmt_) {
+       D3DKMT_DESTROYALLOCATION destroy = {};
+       destroy.hDevice = this->m_parent->GetLocalD3DKMT();
+@@ -350,17 +357,23 @@ public:
+ 
+   float GetMinLOD() override { return min_lod; }
+ 
+-  void AdoptSharedHandles(UINT LocalHandle, UINT GlobalHandle) override {
+-    if (local_kmt_)
++  void AdoptSharedHandles(UINT LocalHandle, UINT GlobalHandle, const char *ServedName) override {
++    if (local_kmt_) {
++      if (ServedName)
++        WMTBootstrapUnregister(ServedName);
+       return;
++    }
+     local_kmt_ = LocalHandle;
+     global_kmt_ = GlobalHandle;
++    if (ServedName)
++      snprintf(served_name_, sizeof(served_name_), "%s", ServedName);
+   }
+ };
+ 
+ struct SharedResourceData {
+-  // cranvr: an IOSurface texture keeps a unique name here (the keyed mutex names its section by it), but launchd has no
+-  // port under it: another process opens the surface by iosurface_id
++  // cranvr: the texture's unique name. The keyed mutex of patch 0014 names its section by it, so it stays the same in
++  // every process that shares the texture again (ShareOpenedTexture). An IOSurface texture has no port under any name:
++  // another process opens the surface by iosurface_id. A texture of the stock path opens through server_name.
+   char mach_port_name[54];
+   D3D11_RESOURCE_DIMENSION dimension;
+   uint32_t is_iosurface;
+@@ -370,6 +383,9 @@ struct SharedResourceData {
+     D3D11_TEXTURE2D_DESC1 desc2d;
+     D3D11_TEXTURE3D_DESC1 desc3d;
+   } desc;
++  // cranvr: the name under which a process serves the port of a texture of the stock path, while that process holds
++  // the texture: the creator's name, or the name of the process that shared an opened texture again
++  char server_name[54];
+ };
+ 
+ template <typename tag>
+@@ -434,15 +450,19 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
+       ERR("DeviceTexture: Failed to get mach port for shared texture");
+       return E_FAIL;
+     }
+-    SharedResourceData runtimeData;
++    SharedResourceData runtimeData = {};
+     MakeUniqueSharedName(runtimeData.mach_port_name);
+     runtimeData.is_iosurface = iosurface_backed ? 1 : 0;
+     runtimeData.iosurface_id = iosurface_backed ? iosurface_id : 0;
+-    // cranvr: launchd keeps a registered port, and the IOSurface behind it, until the user logs out. An IOSurface
+-    // texture therefore registers nothing: the surface lives while a texture on it lives in any process.
+-    if (!iosurface_backed && !WMTBootstrapRegister(runtimeData.mach_port_name, mach_port)) {
+-      ERR("DeviceTexture: Failed to register mach port for shared texture");
+-      return E_FAIL;
++    // cranvr: an IOSurface texture registers nothing: the surface lives while a texture on it lives in any process.
++    // A texture of the stock path is served by winemetal's broker, whose name launchd drops when the texture goes
++    // (~DeviceTexture) or the process ends.
++    if (!iosurface_backed) {
++      memcpy(runtimeData.server_name, runtimeData.mach_port_name, sizeof(runtimeData.server_name));
++      if (!WMTBootstrapRegister(runtimeData.server_name, mach_port)) {
++        ERR("DeviceTexture: Failed to register mach port for shared texture");
++        return E_FAIL;
++      }
+     }
+     runtimeData.dimension = tag::dimension;
+     memcpy(&runtimeData.desc, pDesc, sizeof(typename tag::DESC1));
+@@ -466,6 +486,8 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
+     create.Flags.NtSecuritySharing = !!(finalDesc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE);
+     if (D3DKMTCreateAllocation2(&create)) {
+       ERR("DeviceTexture: Failed to create D3DKMT for shared texture");
++      if (runtimeData.server_name[0])
++        WMTBootstrapUnregister(runtimeData.server_name);
+       return E_FAIL;
+     }
+ 
+@@ -474,7 +496,7 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
+     initialize(std::move(allocation));
+     *ppTexture = reinterpret_cast<typename tag::COM_IMPL *>(
+         ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), create.hResource,
+-                                   create.hGlobalShare, pDevice))
++                                   create.hGlobalShare, pDevice, runtimeData.server_name))
+     );
+     if (iosurface_backed && iosurface_id)
+       (*ppTexture)->SetPrivateData(BASALT_GUID_IOSURFACE_ID, sizeof(iosurface_id), &iosurface_id);
+@@ -527,6 +549,29 @@ CreateDeviceTexture3D(MTLD3D11Device *pDevice,
+                                                      pInitialData, ppTexture);
+ }
+ 
++/*
++ * cranvr: the port of a texture of the stock path comes from the process that serves it, through winemetal's broker;
++ * an IOSurface texture opens by the surface's global ID, with no port
++ */
++static bool
++LookUpSharedTexture(SharedResourceData &runtimeData, mach_port_t *pMachPort, uint32_t *pIOSurfaceID) {
++  *pMachPort = 0;
++  *pIOSurfaceID = 0;
++  if (runtimeData.is_iosurface) {
++    *pIOSurfaceID = runtimeData.iosurface_id;
++    if (!*pIOSurfaceID)
++      ERR("ImportSharedTexture: the shared texture has no IOSurface ID");
++    return *pIOSurfaceID != 0;
++  }
++  runtimeData.server_name[sizeof(runtimeData.server_name) - 1] = 0;
++  if (!runtimeData.server_name[0] || !WMTBootstrapLookUp(runtimeData.server_name, pMachPort) || !*pMachPort) {
++    ERR("ImportSharedTexture: no process serves ", runtimeData.server_name,
++        " now: the processes that shared the texture released it or ended");
++    return false;
++  }
++  return true;
++}
++
+ template <typename tag>
+ HRESULT
+ ImportSharedTextureInternal(
+@@ -536,17 +581,27 @@ ImportSharedTextureInternal(
+   bool IsIOSurface = IOSurfaceID != 0;
+   WMTTextureInfo info;
+   typename tag::DESC1 finalDesc;
+-  if (FAILED(CreateMTLTextureDescriptor(pDevice, pDescUnchecked, &finalDesc, &info)))
++  // cranvr: the allocation keeps the right that the look-up gave and frees it with the texture; a failure frees it
++  if (FAILED(CreateMTLTextureDescriptor(pDevice, pDescUnchecked, &finalDesc, &info))) {
++    if (MachPort)
++      WMTMachPortDeallocate(MachPort);
+     return E_INVALIDARG;
++  }
+ 
+   auto texture = Rc<Texture>(new Texture(info, pDevice->GetMTLDevice()));
+   auto allocation = IsIOSurface ? texture->importIOSurface(IOSurfaceID) : texture->import(MachPort);
+-  if (!allocation)
++  if (!allocation) {
++    if (MachPort)
++      WMTMachPortDeallocate(MachPort);
++    ERR("ImportSharedTexture: the shared texture does not open");
+     return E_FAIL;
++  }
+   uint32_t iosurface_id = allocation->iosurfaceID;
+   texture->rename(std::move(allocation));
+ 
+-  Com<DeviceTexture<tag>> device_texture = (ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), pDevice)));
++  // cranvr: Com takes the first reference itself. With ref() as well the texture kept one reference too many: an
++  // opened texture stayed with its memory until the process ended.
++  Com<DeviceTexture<tag>> device_texture = new DeviceTexture<tag>(&finalDesc, std::move(texture), pDevice);
+   if (IsIOSurface && iosurface_id)
+     device_texture->SetPrivateData(BASALT_GUID_IOSURFACE_ID, sizeof(iosurface_id), &iosurface_id);
+   return device_texture->QueryInterface(riid, ppTexture);
+@@ -604,13 +659,10 @@ ImportSharedTexture(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void
+   destroy.hResource = open.hResource;
+   D3DKMTDestroyAllocation(&destroy);
+ 
+-  // cranvr: an IOSurface texture opens by the surface's global ID, with no port from launchd
+   mach_port_t mach_port = 0;
+-  uint32_t iosurface_id = runtimeData.is_iosurface ? runtimeData.iosurface_id : 0;
+-  if (runtimeData.is_iosurface ? !iosurface_id : !WMTBootstrapLookUp(runtimeData.mach_port_name, &mach_port)) {
+-    ERR("ImportSharedTexture: Failed to look up mach port");
++  uint32_t iosurface_id = 0;
++  if (!LookUpSharedTexture(runtimeData, &mach_port, &iosurface_id))
+     return E_INVALIDARG;
+-  }
+ 
+   switch (runtimeData.dimension)
+   {
+@@ -628,6 +680,8 @@ ImportSharedTexture(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void
+     );
+   default:
+     ERR("ImportSharedTexture: Unsupported resource dimension");
++    if (mach_port)
++      WMTMachPortDeallocate(mach_port);
+     return E_INVALIDARG;
+   }
+ }
+@@ -698,13 +752,10 @@ ImportSharedTextureFromNtHandle(MTLD3D11Device *pDevice, HANDLE hResource, REFII
+     D3DKMTDestroyKeyedMutex(&destroyMutex);
+   }
+ 
+-  // cranvr: an IOSurface texture opens by the surface's global ID, with no port from launchd
+   mach_port_t mach_port = 0;
+-  uint32_t iosurface_id = runtimeData.is_iosurface ? runtimeData.iosurface_id : 0;
+-  if (runtimeData.is_iosurface ? !iosurface_id : !WMTBootstrapLookUp(runtimeData.mach_port_name, &mach_port)) {
+-    ERR("ImportSharedTexture: Failed to look up mach port");
++  uint32_t iosurface_id = 0;
++  if (!LookUpSharedTexture(runtimeData, &mach_port, &iosurface_id))
+     return E_INVALIDARG;
+-  }
+ 
+   switch (runtimeData.dimension)
+   {
+@@ -722,6 +773,8 @@ ImportSharedTextureFromNtHandle(MTLD3D11Device *pDevice, HANDLE hResource, REFII
+     );
+   default:
+     ERR("ImportSharedTexture: Unsupported resource dimension");
++    if (mach_port)
++      WMTMachPortDeallocate(mach_port);
+     return E_INVALIDARG;
+   }
+ }
+@@ -766,8 +819,12 @@ ImportSharedTextureByName(
+ /*
+  * cranvr: shares a texture that this process opened again, as Windows allows. SteamVR's web helper opens the
+  * textures that Chromium's GPU process shares and passes them on to SteamVR's compositor. The compositor then opens
+- * them in turn. A new kernel allocation with the private data of the shared one names the same mach port, so the
++ * them in turn. A new kernel allocation with the private data of the shared one names the same memory, so the
+  * next process opens the same memory. The texture keeps the new handles until it is released.
++ *
++ * A texture of the stock path opens through a process that serves its port (winemetal's broker). This process
++ * serves the port of its own texture under a new name in the new private data, so the next process does not
++ * depend on the creator, which may release the texture first. The unique name stays, for the keyed mutex.
+  */
+ void
+ ShareOpenedTexture(MTLD3D11Device *pDevice, HANDLE hResource, bool NtHandle, void *pResource) {
+@@ -779,7 +836,7 @@ ShareOpenedTexture(MTLD3D11Device *pDevice, HANDLE hResource, bool NtHandle, voi
+   if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER || dimension == D3D11_RESOURCE_DIMENSION_UNKNOWN)
+     return;
+   // The query gives the size of the private data, and opening the resource gives the data
+-  char data[512];
++  alignas(8) char data[512];
+   UINT size = 0;
+   D3DKMT_HANDLE opened = 0;
+   D3DDDI_OPENALLOCATIONINFO2 allocation = {};
+@@ -830,6 +887,22 @@ ShareOpenedTexture(MTLD3D11Device *pDevice, HANDLE hResource, bool NtHandle, voi
+   destroy.hResource = opened;
+   D3DKMTDestroyAllocation(&destroy);
+ 
++  char served_name[54] = {};
++  auto common = GetResourceCommon(resource.ptr());
++  if (size == sizeof(SharedResourceData)) {
++    SharedResourceData *runtimeData = reinterpret_cast<SharedResourceData *>(data);
++    TextureAllocation *opened_allocation = common->texture() ? common->texture()->current() : nullptr;
++    if (!runtimeData->is_iosurface && opened_allocation && opened_allocation->machPort) {
++      MakeUniqueSharedName(served_name);
++      if (WMTBootstrapRegister(served_name, opened_allocation->machPort)) {
++        memcpy(runtimeData->server_name, served_name, sizeof(runtimeData->server_name));
++      } else {
++        WARN("ShareOpenedTexture: the next process opens the texture through its creator");
++        served_name[0] = 0;
++      }
++    }
++  }
++
+   D3DKMT_CREATEALLOCATION create = {};
+   create.hDevice = pDevice->GetLocalD3DKMT();
+   create.pPrivateRuntimeData = data;
+@@ -849,9 +922,11 @@ ShareOpenedTexture(MTLD3D11Device *pDevice, HANDLE hResource, bool NtHandle, voi
+   create.Flags.NtSecuritySharing = NtHandle;
+   if (D3DKMTCreateAllocation2(&create)) {
+     WARN("ShareOpenedTexture: the opened texture cannot be shared again");
++    if (served_name[0])
++      WMTBootstrapUnregister(served_name);
+     return;
+   }
+-  GetResourceCommon(resource.ptr())->AdoptSharedHandles(create.hResource, create.hGlobalShare);
++  common->AdoptSharedHandles(create.hResource, create.hGlobalShare, served_name[0] ? served_name : nullptr);
+ }
+ 
+ } // namespace dxmt
+diff --git i/src/dxmt/dxmt_texture.cpp w/src/dxmt/dxmt_texture.cpp
+index 2bb23d9..970b30f 100644
+--- i/src/dxmt/dxmt_texture.cpp
++++ w/src/dxmt/dxmt_texture.cpp
+@@ -1,4 +1,5 @@
+ #include "dxmt_texture.hpp"
++#include "log/log.hpp"
+ #include "dxmt_residency.hpp"
+ #include "wsi_platform.hpp"
+ #include <atomic>
+@@ -76,6 +77,9 @@ TextureAllocation::~TextureAllocation(){
+ #ifdef __i386__
+   wsi::aligned_free(mappedMemory);
+ #endif
++  // cranvr: the right of a shared texture held its IOSurface until the process ended
++  if (machPort)
++    WMTMachPortDeallocate(machPort);
+ };
+ 
+ void
+@@ -224,20 +228,30 @@ Texture::importIOSurface(uint32_t iosurface_id) {
+   info.mach_port = 0;
+   info.reserved = iosurface_id;
+   auto texture = device_.newTextureFromIOSurface(info);
+-  if (texture) {
+-    if (info.options & WMTResourceStorageModeManaged)
+-      flags.set(TextureAllocationFlag::GpuManaged);
+-    if (info.options & WMTResourceStorageModePrivate)
+-      flags.set(TextureAllocationFlag::GpuPrivate);
+-    if (info.options & WMTResourceHazardTrackingModeUntracked)
+-      flags.set(TextureAllocationFlag::NoTracking);
+-    if ((info.usage & (WMTTextureUsageShaderWrite | WMTTextureUsageRenderTarget)) == 0)
+-      flags.set(TextureAllocationFlag::ShaderReadonly);
+-    flags.set(TextureAllocationFlag::Shared);
+-    flags.set(TextureAllocationFlag::IOSurfaceBacked);
+-    return new TextureAllocation(this, std::move(texture), info, flags);
++  if (!texture) {
++    // cranvr: winemetal refuses a surface of another size or pixel format, because macOS gives the ID of a freed
++    // surface to a new one within milliseconds
++    if (!info.reserved)
++      ERR("Texture: no IOSurface has the ID ", iosurface_id, ": its last texture is gone");
++    else if (info.width != info_.width || info.height != info_.height || info.pixel_format != info_.pixel_format)
++      ERR("Texture: IOSurface ", iosurface_id, " is ", info.width, "x", info.height, " in Metal format ",
++          (uint32_t)info.pixel_format, ", the shared texture ", info_.width, "x", info_.height, " in format ",
++          (uint32_t)info_.pixel_format, ": the ID names another surface now, so the texture does not open");
++    else
++      ERR("Texture: Metal makes no texture on IOSurface ", iosurface_id);
++    return nullptr;
+   }
+-  return nullptr;
++  if (info.options & WMTResourceStorageModeManaged)
++    flags.set(TextureAllocationFlag::GpuManaged);
++  if (info.options & WMTResourceStorageModePrivate)
++    flags.set(TextureAllocationFlag::GpuPrivate);
++  if (info.options & WMTResourceHazardTrackingModeUntracked)
++    flags.set(TextureAllocationFlag::NoTracking);
++  if ((info.usage & (WMTTextureUsageShaderWrite | WMTTextureUsageRenderTarget)) == 0)
++    flags.set(TextureAllocationFlag::ShaderReadonly);
++  flags.set(TextureAllocationFlag::Shared);
++  flags.set(TextureAllocationFlag::IOSurfaceBacked);
++  return new TextureAllocation(this, std::move(texture), info, flags);
+ }
+ 
+ TextureView &
+diff --git i/src/winemetal/unix/winemetal_unix.c w/src/winemetal/unix/winemetal_unix.c
+index fc4974e..4379b1a 100644
+--- i/src/winemetal/unix/winemetal_unix.c
++++ w/src/winemetal/unix/winemetal_unix.c
+@@ -10,6 +10,8 @@
+ #include "objc/objc-runtime.h"
+ #include <bootstrap.h>
+ #include <mach/mach_port.h>
++#include <pthread.h>
++#include <signal.h>
+ #define WINEMETAL_API
+ #include "../winemetal_thunks.h"
+ #include "../airconv_thunks.h"
+@@ -2697,25 +2699,45 @@ _MTLDevice_newTextureFromIOSurface(void *obj) {
+   IOSurfaceRef surface = NULL;
+   uint32_t import_id = info->reserved;
+   info->mach_port = 0;
++  uint32_t pixel_format;
++  switch (info->pixel_format) {
++  case WMTPixelFormatBGRA8Unorm:
++  case WMTPixelFormatBGRA8Unorm_sRGB:
++    pixel_format = 'BGRA';
++    break;
++  case WMTPixelFormatRGBA8Unorm:
++  case WMTPixelFormatRGBA8Unorm_sRGB:
++    pixel_format = 'RGBA';
++    break;
++  default:
++    /* Only the Basalt swapchain color formats are supported for now. */
++    info->reserved = 0;
++    return STATUS_SUCCESS;
++  }
+   if (import_id) {
+     surface = IOSurfaceLookup(import_id);
+-    if (!surface)
++    if (!surface) {
++      info->reserved = 0;
+       return STATUS_SUCCESS;
++    }
++    /*
++     * cranvr: macOS gives the ID of a freed surface to a new one within milliseconds, so the ID of a texture that is
++     * gone may name another surface by now. A surface of another size or pixel format is refused. On a refusal
++     * info->reserved keeps the ID. info->width, info->height and info->pixel_format then describe the surface that
++     * has it, for the caller's log.
++     */
++    uint32_t found_format = IOSurfaceGetPixelFormat(surface);
++    if (IOSurfaceGetWidth(surface) != info->width || IOSurfaceGetHeight(surface) != info->height ||
++        found_format != pixel_format) {
++      info->width = (uint32_t)IOSurfaceGetWidth(surface);
++      info->height = (uint32_t)IOSurfaceGetHeight(surface);
++      info->pixel_format = found_format == 'BGRA'   ? WMTPixelFormatBGRA8Unorm
++                           : found_format == 'RGBA' ? WMTPixelFormatRGBA8Unorm
++                                                    : WMTPixelFormatInvalid;
++      CFRelease(surface);
++      return STATUS_SUCCESS;
++    }
+   } else {
+-    uint32_t pixel_format;
+-    switch (info->pixel_format) {
+-    case WMTPixelFormatBGRA8Unorm:
+-    case WMTPixelFormatBGRA8Unorm_sRGB:
+-      pixel_format = 'BGRA';
+-      break;
+-    case WMTPixelFormatRGBA8Unorm:
+-    case WMTPixelFormatRGBA8Unorm_sRGB:
+-      pixel_format = 'RGBA';
+-      break;
+-    default:
+-      /* Only the Basalt swapchain color formats are supported for now. */
+-      return STATUS_SUCCESS;
+-    }
+     size_t bytes_per_element = 4;
+     size_t bytes_per_row =
+         IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, (size_t)info->width * bytes_per_element);
+@@ -2763,31 +2785,253 @@ _MTLDevice_newTextureFromIOSurface(void *obj) {
+ /* Private API to register a mach port with the bootstrap server */
+ extern kern_return_t bootstrap_register2(mach_port_t bp, name_t service_name, mach_port_t sp, int flags);
+ 
++/*
++ * cranvr: a broker that shares the ports of shared textures and shared events with other processes.
++ *
++ * DXMT registered the object's own port with launchd under the object's shared name. Such a port belongs to the
++ * kernel (an IOSurface or an IOGPU event), so it never dies. launchd held it, with the memory behind it, until the
++ * user logged out. launchd also refuses to remove a name (a register with no port answers 1101,
++ * BOOTSTRAP_NAME_IN_USE). On 2026-11-27 one run of SteamVR left 30 such names with 240 MB.
++ *
++ * The broker registers a port of its own under the name instead: a service port whose receive right this process
++ * holds, one per shared object. launchd drops the name when the receive right goes, which WMTBootstrapUnregister
++ * does when the object goes and the kernel does when the process ends (both checked on macOS 26: the name was gone
++ * at the first look-up, 0.2 ms after the unregister). A thread of the broker answers each request on a service port
++ * with a copy of the object's send right. Another process looks the name up in launchd as before and asks the
++ * service port for the object's port, with a time-out of a second.
++ *
++ * A texture of the stock shared path cannot go by the global ID of its IOSurface, as cranvr's IOSurface textures
++ * do (DXMT patch 0019): Metal makes it on an IOSurface that is not global, so IOSurfaceLookup in another process
++ * finds nothing (checked for RGBA8, RGBA16Float, mipmaps, two slices, 4x MSAA, Depth32Float, BC1, RGB10A2). The
++ * surface also reports no size and no pixel format. Its port is the only way into another process. An event has no ID
++ * at all.
++ */
++#define BROKER_NAME_SIZE 128 /* struct unixcall_bootstrap::name */
++#define BROKER_REQUEST_ID 0x44580001
++#define BROKER_REPLY_ID 0x44580002
++#define BROKER_TIMEOUT_MS 1000
++
++struct broker_entry {
++  struct broker_entry *next;
++  mach_port_t service; /* receive right of this process; launchd holds the only send right, under the name */
++  mach_port_t object;  /* the broker's own send right to the shared object */
++  char name[BROKER_NAME_SIZE];
++};
++
++struct broker_request {
++  mach_msg_header_t header;
++  char name[BROKER_NAME_SIZE];
++};
++
++struct broker_reply {
++  mach_msg_header_t header;
++  mach_msg_body_t body;
++  mach_msg_port_descriptor_t port;
++};
++
++static pthread_mutex_t broker_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct broker_entry *broker_entries;
++static mach_port_t broker_set; /* the port set of all service ports, on which the thread waits */
++
++static struct broker_entry *
++broker_find(const char *name) {
++  for (struct broker_entry *e = broker_entries; e; e = e->next)
++    if (!strncmp(e->name, name, BROKER_NAME_SIZE))
++      return e;
++  return NULL;
++}
++
++static void *
++broker_serve(void *unused) {
++  union {
++    struct broker_request request;
++    char space[sizeof(struct broker_request) + MAX_TRAILER_SIZE];
++  } in;
++  (void)unused;
++  for (;;) {
++    if (mach_msg(&in.request.header, MACH_RCV_MSG, 0, sizeof(in), broker_set, MACH_MSG_TIMEOUT_NONE,
++                 MACH_PORT_NULL) != MACH_MSG_SUCCESS)
++      continue; /* the kernel drops a message that is too large */
++    mach_msg_header_t *h = &in.request.header;
++    if (h->msgh_id != BROKER_REQUEST_ID || h->msgh_size < sizeof(struct broker_request) ||
++        (h->msgh_bits & MACH_MSGH_BITS_COMPLEX) || !MACH_PORT_VALID(h->msgh_remote_port)) {
++      mach_msg_destroy(h);
++      continue;
++    }
++    in.request.name[BROKER_NAME_SIZE - 1] = 0;
++    struct broker_reply reply;
++    memset(&reply, 0, sizeof(reply));
++    reply.header.msgh_bits = MACH_MSGH_BITS(MACH_MSGH_BITS_REMOTE(h->msgh_bits), 0) | MACH_MSGH_BITS_COMPLEX;
++    reply.header.msgh_size = sizeof(reply);
++    reply.header.msgh_remote_port = h->msgh_remote_port;
++    reply.header.msgh_id = BROKER_REPLY_ID;
++    reply.body.msgh_descriptor_count = 1;
++    reply.port.type = MACH_MSG_PORT_DESCRIPTOR;
++    reply.port.disposition = MACH_MSG_TYPE_COPY_SEND;
++    /* The lock keeps the object's right alive until the kernel has copied it into the reply */
++    pthread_mutex_lock(&broker_lock);
++    struct broker_entry *e = broker_find(in.request.name);
++    reply.port.name = e && e->service == h->msgh_local_port ? e->object : MACH_PORT_NULL;
++    kern_return_t kr = mach_msg(&reply.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(reply), 0, MACH_PORT_NULL,
++                                100, MACH_PORT_NULL);
++    pthread_mutex_unlock(&broker_lock);
++    if (kr != MACH_MSG_SUCCESS)
++      mach_port_deallocate(mach_task_self(), h->msgh_remote_port);
++  }
++  return NULL;
++}
++
++/* Called with broker_lock held */
++static bool
++broker_start(void) {
++  pthread_t thread;
++  pthread_attr_t attr;
++  sigset_t all, old;
++  if (broker_set)
++    return true;
++  if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_PORT_SET, &broker_set) != KERN_SUCCESS) {
++    broker_set = MACH_PORT_NULL;
++    return false;
++  }
++  /* The thread is no Wine thread: it takes no signal of Wine's */
++  pthread_attr_init(&attr);
++  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
++  sigfillset(&all);
++  pthread_sigmask(SIG_SETMASK, &all, &old);
++  int err = pthread_create(&thread, &attr, broker_serve, NULL);
++  pthread_sigmask(SIG_SETMASK, &old, NULL);
++  pthread_attr_destroy(&attr);
++  if (err) {
++    mach_port_mod_refs(mach_task_self(), broker_set, MACH_PORT_RIGHT_PORT_SET, -1);
++    broker_set = MACH_PORT_NULL;
++    return false;
++  }
++  return true;
++}
++
+ static NTSTATUS
+ _WMTBootstrapRegister(void *obj) {
+   struct unixcall_bootstrap *params = obj;
+-  mach_port_t rp = params->mach_port;
+-  mach_port_t bp;
++  struct broker_entry *e = NULL;
++  mach_port_t bp = MACH_PORT_NULL;
++  bool ok = false;
+ 
+-  if (task_get_bootstrap_port(mach_task_self(), &bp) != KERN_SUCCESS)
+-    return STATUS_UNSUCCESSFUL;
+-  NTSTATUS ret = bootstrap_register2(bp, params->name, rp, 0) != KERN_SUCCESS ? STATUS_UNSUCCESSFUL : STATUS_SUCCESS;
+-  mach_port_deallocate(mach_task_self(), bp);
+-  return ret;
++  params->name[BROKER_NAME_SIZE - 1] = 0;
++  pthread_mutex_lock(&broker_lock);
++  if (!MACH_PORT_VALID(params->mach_port) || !broker_start() || broker_find(params->name) ||
++      !(e = calloc(1, sizeof(*e))))
++    goto out;
++  strncpy(e->name, params->name, BROKER_NAME_SIZE - 1);
++  if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &e->service) != KERN_SUCCESS)
++    goto out;
++  if (mach_port_insert_right(mach_task_self(), e->service, e->service, MACH_MSG_TYPE_MAKE_SEND) != KERN_SUCCESS ||
++      task_get_bootstrap_port(mach_task_self(), &bp) != KERN_SUCCESS ||
++      bootstrap_register2(bp, e->name, e->service, 0) != KERN_SUCCESS ||
++      mach_port_move_member(mach_task_self(), e->service, broker_set) != KERN_SUCCESS ||
++      mach_port_mod_refs(mach_task_self(), params->mach_port, MACH_PORT_RIGHT_SEND, 1) != KERN_SUCCESS) {
++    /* A name that launchd took goes with the receive right */
++    mach_port_mod_refs(mach_task_self(), e->service, MACH_PORT_RIGHT_RECEIVE, -1);
++    goto out;
++  }
++  /* launchd now holds the only send right of the service port */
++  mach_port_deallocate(mach_task_self(), e->service);
++  e->object = params->mach_port;
++  e->next = broker_entries;
++  broker_entries = e;
++  e = NULL;
++  ok = true;
++out:
++  pthread_mutex_unlock(&broker_lock);
++  free(e);
++  if (bp)
++    mach_port_deallocate(mach_task_self(), bp);
++  return ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
++}
++
++static NTSTATUS
++_WMTBootstrapUnregister(void *obj) {
++  struct unixcall_bootstrap *params = obj;
++  params->name[BROKER_NAME_SIZE - 1] = 0;
++  pthread_mutex_lock(&broker_lock);
++  struct broker_entry **link = &broker_entries;
++  while (*link && strncmp((*link)->name, params->name, BROKER_NAME_SIZE))
++    link = &(*link)->next;
++  struct broker_entry *e = *link;
++  if (e) {
++    *link = e->next;
++    /* launchd drops the name when the receive right goes */
++    mach_port_mod_refs(mach_task_self(), e->service, MACH_PORT_RIGHT_RECEIVE, -1);
++    mach_port_deallocate(mach_task_self(), e->object);
++  }
++  pthread_mutex_unlock(&broker_lock);
++  free(e);
++  return e ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+ }
+ 
+ static NTSTATUS
+ _WMTBootstrapLookUp(void *obj) {
+   struct unixcall_bootstrap *params = obj;
+-  mach_port_t rp = 0;
+-  mach_port_t bp;
++  mach_port_t bp = MACH_PORT_NULL, service = MACH_PORT_NULL, reply_port = MACH_PORT_NULL;
++  params->name[BROKER_NAME_SIZE - 1] = 0;
++  params->mach_port = 0;
++
++  /* A name that this process serves needs no message */
++  pthread_mutex_lock(&broker_lock);
++  struct broker_entry *own = broker_find(params->name);
++  if (own && mach_port_mod_refs(mach_task_self(), own->object, MACH_PORT_RIGHT_SEND, 1) == KERN_SUCCESS)
++    params->mach_port = own->object;
++  pthread_mutex_unlock(&broker_lock);
++  if (own)
++    return params->mach_port ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+ 
+   if (task_get_bootstrap_port(mach_task_self(), &bp) != KERN_SUCCESS)
+     return STATUS_UNSUCCESSFUL;
+-  NTSTATUS ret = bootstrap_look_up(bp, params->name, &rp) != KERN_SUCCESS ? STATUS_UNSUCCESSFUL : STATUS_SUCCESS;
++  kern_return_t kr = bootstrap_look_up(bp, params->name, &service);
+   mach_port_deallocate(mach_task_self(), bp);
+-  params->mach_port = rp;
+-  return ret;
++  if (kr != KERN_SUCCESS)
++    return STATUS_UNSUCCESSFUL;
++  if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &reply_port) != KERN_SUCCESS) {
++    mach_port_deallocate(mach_task_self(), service);
++    return STATUS_UNSUCCESSFUL;
++  }
++  union {
++    struct broker_request request;
++    struct {
++      struct broker_reply reply;
++      mach_msg_trailer_t trailer;
++    } in;
++  } msg;
++  memset(&msg, 0, sizeof(msg));
++  msg.request.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND_ONCE);
++  msg.request.header.msgh_size = sizeof(msg.request);
++  msg.request.header.msgh_remote_port = service;
++  msg.request.header.msgh_local_port = reply_port;
++  msg.request.header.msgh_id = BROKER_REQUEST_ID;
++  strncpy(msg.request.name, params->name, BROKER_NAME_SIZE - 1);
++  /* A server that hangs or ends costs the caller at most a second */
++  kr = mach_msg(&msg.request.header, MACH_SEND_MSG | MACH_RCV_MSG | MACH_SEND_TIMEOUT | MACH_RCV_TIMEOUT,
++                sizeof(msg.request), sizeof(msg.in), reply_port, BROKER_TIMEOUT_MS, MACH_PORT_NULL);
++  if (kr == MACH_MSG_SUCCESS) {
++    struct broker_reply *r = &msg.in.reply;
++    if (r->header.msgh_id == BROKER_REPLY_ID && (r->header.msgh_bits & MACH_MSGH_BITS_COMPLEX) &&
++        r->header.msgh_size >= sizeof(*r) && r->body.msgh_descriptor_count == 1 &&
++        r->port.type == MACH_MSG_PORT_DESCRIPTOR && MACH_PORT_VALID(r->port.name))
++      params->mach_port = r->port.name;
++    else
++      mach_msg_destroy(&r->header);
++  }
++  /* A reply that comes after the time-out goes with the reply port, with the right in it */
++  mach_port_mod_refs(mach_task_self(), reply_port, MACH_PORT_RIGHT_RECEIVE, -1);
++  mach_port_deallocate(mach_task_self(), service);
++  return params->mach_port ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
++}
++
++static NTSTATUS
++_WMTMachPortDeallocate(void *obj) {
++  struct unixcall_bootstrap *params = obj;
++  if (MACH_PORT_VALID(params->mach_port))
++    mach_port_deallocate(mach_task_self(), params->mach_port);
++  return STATUS_SUCCESS;
+ }
+ 
+ @protocol MTLDeviceSPI <MTLDevice>
+@@ -3118,6 +3362,8 @@ const void *__wine_unix_call_funcs[] = {
+     &_MTLCommandBuffer_property,
+     &_MTLDevice_newTileRenderPipelineState,
+     &_MTLDevice_newTextureFromIOSurface,
++    &_WMTBootstrapUnregister,
++    &_WMTMachPortDeallocate,
+ };
+ 
+ #ifndef DXMT_NATIVE
+@@ -3255,5 +3501,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
+     &_MTLCommandBuffer_property,
+     &_MTLDevice_newTileRenderPipelineState,
+     &_MTLDevice_newTextureFromIOSurface,
++    &_WMTBootstrapUnregister,
++    &_WMTMachPortDeallocate,
+ };
+ #endif
+diff --git i/src/winemetal/winemetal.h w/src/winemetal/winemetal.h
+index 0a2650e..e9c13e9 100644
+--- i/src/winemetal/winemetal.h
++++ w/src/winemetal/winemetal.h
+@@ -1869,16 +1869,29 @@ WINEMETAL_API bool WMTSetMetalShaderCachePath(const char *path);
+ WINEMETAL_API obj_handle_t MTLDevice_newSharedTexture(obj_handle_t device, struct WMTTextureInfo *info);
+ 
+ /**
+- * Basalt extension: create (mach_port == 0) or import (mach_port != 0) an
+- * IOSurface-backed texture. On success info->reserved carries the global
+- * IOSurfaceID and info->mach_port a send right to the surface.
++ * Basalt extension: create (reserved == 0) or import (reserved is the surface's
++ * global IOSurfaceID) an IOSurface-backed texture. On success info->reserved
++ * carries the global IOSurfaceID; info->mach_port is 0. cranvr: an import that
++ * finds no surface sets info->reserved to 0; one that finds a surface of another
++ * size or pixel format keeps the ID and describes that surface in info->width,
++ * info->height and info->pixel_format.
+  */
+ WINEMETAL_API obj_handle_t MTLDevice_newTextureFromIOSurface(obj_handle_t device, struct WMTTextureInfo *info);
+ 
++/*
++ * cranvr: shares a Mach send right with other processes under a name. The name lives in launchd while this process
++ * serves it: until WMTBootstrapUnregister or the end of the process. WMTBootstrapRegister takes a right of its own,
++ * so the caller keeps and frees its right. WMTBootstrapLookUp gives the caller a right that the caller frees with
++ * WMTMachPortDeallocate.
++ */
+ WINEMETAL_API bool WMTBootstrapRegister(const char *name, mach_port_t mach_port);
+ 
+ WINEMETAL_API bool WMTBootstrapLookUp(const char *name, mach_port_t *mach_port);
+ 
++WINEMETAL_API bool WMTBootstrapUnregister(const char *name);
++
++WINEMETAL_API void WMTMachPortDeallocate(mach_port_t mach_port);
++
+ WINEMETAL_API mach_port_t MTLSharedEvent_createMachPort(obj_handle_t event);
+ 
+ WINEMETAL_API obj_handle_t MTLDevice_newSharedEventWithMachPort(obj_handle_t device, mach_port_t mach_port);
+diff --git i/src/winemetal/winemetal_thunks.c w/src/winemetal/winemetal_thunks.c
+index 177f00d..d1c9f2a 100644
+--- i/src/winemetal/winemetal_thunks.c
++++ w/src/winemetal/winemetal_thunks.c
+@@ -1089,6 +1089,24 @@ WMTBootstrapLookUp(const char *name, mach_port_t *mach_port) {
+   return !ret;
+ }
+ 
++WINEMETAL_API bool
++WMTBootstrapUnregister(const char *name) {
++  struct unixcall_bootstrap params;
++  strncpy(params.name, name, sizeof(params.name) - 1);
++  params.name[sizeof(params.name) - 1] = '\0';
++  params.mach_port = 0;
++  NTSTATUS ret = WINE_UNIX_CALL(133, &params);
++  return !ret;
++}
++
++WINEMETAL_API void
++WMTMachPortDeallocate(mach_port_t mach_port) {
++  struct unixcall_bootstrap params;
++  params.name[0] = '\0';
++  params.mach_port = mach_port;
++  WINE_UNIX_CALL(134, &params);
++}
++
+ WINEMETAL_API mach_port_t
+ MTLSharedEvent_createMachPort(obj_handle_t event) {
+   struct unixcall_mtlsharedevent_createmachport params;

@@ -1,0 +1,691 @@
+diff --git a/runtime/tests/CMakeLists.txt b/runtime/tests/CMakeLists.txt
+--- a/runtime/tests/CMakeLists.txt
++++ b/runtime/tests/CMakeLists.txt
+@@ -165,3 +165,10 @@
+ target_link_libraries(swapchain_churn PRIVATE OpenXR::openxr_loader basalt_vulkan_headers d3d11)
+ target_compile_options(swapchain_churn PRIVATE -Wall -Wextra -Wpedantic)
+ target_link_options(swapchain_churn PRIVATE -static -static-libgcc -static-libstdc++)
++
++# cranvr: creates and destroys shared textures and shared fences many times and opens each one in a second process,
++# for a count of what they leave in launchd (scripts/shared-churn.sh in cranvr)
++add_executable(shared_churn shared_churn.cpp)
++target_link_libraries(shared_churn PRIVATE d3d11 dxgi)
++target_compile_options(shared_churn PRIVATE -Wall -Wextra -Wpedantic)
++target_link_options(shared_churn PRIVATE -static -static-libgcc -static-libstdc++)
+diff --git a/runtime/tests/shared_churn.cpp b/runtime/tests/shared_churn.cpp
+new file mode 100644
+--- /dev/null
++++ b/runtime/tests/shared_churn.cpp
+@@ -0,0 +1,672 @@
++// cranvr: creates and destroys shared Direct3D 11 textures and fences many times. A second process opens each of
++// them, as SteamVR, its web helper and a game do. The program tests what DXMT leaves in launchd. Before cranvr's DXMT
++// patch 0020, each shared texture of DXMT's stock path and each shared fence put a port under a name in launchd.
++// launchd kept the port and the memory behind it until the user logged out.
++//
++// Each cycle makes these objects. The second process (the same program with --child) opens each one. It checks its
++// description and, for a color texture, the color that the first process cleared it to:
++//   rgba16f      R16G16B16A16_FLOAT, legacy shared handle (stock path: the format)
++//   bgra8        B8G8R8A8_UNORM, legacy shared handle (stock path: a legacy handle, as SteamVR's textures have)
++//   rgba8-mips   R8G8B8A8_UNORM with 4 mip levels, legacy shared handle (stock path: mipmaps)
++//   bgra8-array  B8G8R8A8_UNORM with 2 slices, NT handle (stock path: slices); the check reads slice 1
++//   rgba8-msaa   R8G8B8A8_UNORM with 4 samples, legacy shared handle (stock path: MSAA); no color check
++//   keyed        R8G8B8A8_UNORM with a keyed mutex, legacy shared handle (stock path; the keyed mutex has an event)
++//   iosurface    B8G8R8A8_UNORM, NT handle (cranvr's IOSurface path of DXMT patch 0019, by the surface's ID)
++//   fence        a shared ID3D11Fence, NT handle: the first process signals 1, the second waits for it and signals 2,
++//                then the first waits for 2. In Wine 11.10 the second process cannot open it. DXMT's
++//                OpenSharedFence reads the fence's private data with D3DKMTQueryResourceInfoFromNtHandle, which Wine
++//                answers for resources only. DXMT's CreateFence never stores the data either: Wine's
++//                D3DKMT_ESCAPE_UPDATE_RESOURCE_WINE takes resources only too. DXMT checks its result the wrong way
++//                round. The program then counts the cycles whose fence did not open and goes on. The first process
++//                still makes and shares the fence, which put a name in launchd before DXMT patch 0020.
++// The first process then releases everything and starts the next cycle. The second releases what it opened at the
++// end of each cycle.
++//
++// At the end the first process tests the size check of the IOSurface path. It shares an IOSurface texture and
++// releases it. Then it makes IOSurface textures of another width until macOS gives one of them the ID of the released
++// surface (macOS reuses the IDs of freed surfaces at once). The second process must then refuse to open the handle of
++// the released texture, because its ID names a surface of another size now.
++//
++// Usage: shared_churn.exe [--cycles N] [--width W] [--height H] [--signal FILE]
++// The textures are W x H (default 640 x 333). With --signal FILE the program stops three times, so that a script can
++// count the names in launchd and measure memory while both processes live. In its first cycle, while both processes
++// hold the objects, it prints "shared_churn: measure live" and waits for FILE.live to exist; after that cycle it
++// prints "shared_churn: measure warm" and waits for FILE.warm; after its last cycle it prints "shared_churn: measure
++// churned" and waits for FILE.churned. It waits at most 30 s each time.
++//
++// It prints "shared_churn: PASS" with the number of cycles and the time that one took, or "shared_churn: FAIL ...".
++
++#include <windows.h>
++
++#include <d3d11_4.h>
++#include <dxgi1_2.h>
++
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace {
++
++// DXMT republishes the global ID of an IOSurface texture's surface under this GUID (BasaltVR's DXMT patch 0001)
++const GUID kIOSurfaceIdGuid = {0xdd807311, 0x529e, 0x4856, {0xa5, 0xc0, 0x48, 0xbe, 0xd2, 0x04, 0x81, 0x29}};
++
++constexpr DWORD kWaitMs = 1000;
++
++enum Kind { kRgba16f, kBgra8, kRgba8Mips, kBgra8Array, kRgba8Msaa, kKeyed, kIOSurface, kKinds };
++
++struct KindInfo {
++    const char *name;
++    DXGI_FORMAT format;
++    UINT mips;
++    UINT slices;
++    UINT samples;
++    UINT misc;
++    bool nt;    // NT handle (CreateSharedHandle) rather than a legacy one (GetSharedHandle)
++    bool color; // the second process checks a texel
++};
++
++const KindInfo kKindInfo[kKinds] = {
++    {"rgba16f", DXGI_FORMAT_R16G16B16A16_FLOAT, 1, 1, 1, D3D11_RESOURCE_MISC_SHARED, false, true},
++    {"bgra8", DXGI_FORMAT_B8G8R8A8_UNORM, 1, 1, 1, D3D11_RESOURCE_MISC_SHARED, false, true},
++    {"rgba8-mips", DXGI_FORMAT_R8G8B8A8_UNORM, 4, 1, 1, D3D11_RESOURCE_MISC_SHARED, false, true},
++    {"bgra8-array", DXGI_FORMAT_B8G8R8A8_UNORM, 1, 2, 1,
++     D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE, true, true},
++    {"rgba8-msaa", DXGI_FORMAT_R8G8B8A8_UNORM, 1, 1, 4, D3D11_RESOURCE_MISC_SHARED, false, false},
++    {"keyed", DXGI_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, false, true},
++    {"iosurface", DXGI_FORMAT_B8G8R8A8_UNORM, 1, 1, 1,
++     D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE, true, true},
++};
++
++template <typename T> void release(T *&object) {
++    if (object) {
++        object->Release();
++        object = nullptr;
++    }
++}
++
++bool fail(const char *what, HRESULT hr = S_OK) {
++    if (hr == S_OK)
++        std::printf("shared_churn: FAIL %s\n", what);
++    else
++        std::printf("shared_churn: FAIL %s (0x%08lx)\n", what, static_cast<unsigned long>(hr));
++    std::fflush(stdout);
++    return false;
++}
++
++struct Device {
++    ID3D11Device *device = nullptr;
++    ID3D11Device1 *device1 = nullptr;
++    ID3D11Device5 *device5 = nullptr;
++    ID3D11DeviceContext *context = nullptr;
++    ID3D11DeviceContext4 *context4 = nullptr;
++
++    bool create() {
++        D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_1;
++        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
++                                       &level, 1, D3D11_SDK_VERSION, &device, nullptr, &context);
++        if (FAILED(hr))
++            return fail("D3D11CreateDevice", hr);
++        if (FAILED(hr = device->QueryInterface(IID_PPV_ARGS(&device1))))
++            return fail("ID3D11Device1", hr);
++        if (FAILED(hr = device->QueryInterface(IID_PPV_ARGS(&device5))))
++            return fail("ID3D11Device5", hr);
++        if (FAILED(hr = context->QueryInterface(IID_PPV_ARGS(&context4))))
++            return fail("ID3D11DeviceContext4", hr);
++        return true;
++    }
++
++    ~Device() {
++        release(context4);
++        release(context);
++        release(device5);
++        release(device1);
++        release(device);
++    }
++};
++
++// The color of a kind in a cycle: 8-bit values that differ from one cycle and kind to the next
++void colorOf(unsigned cycle, int kind, uint8_t out[4]) {
++    unsigned seed = cycle * 7u + static_cast<unsigned>(kind) * 31u;
++    out[0] = static_cast<uint8_t>(16 + seed % 200);
++    out[1] = static_cast<uint8_t>(16 + (seed * 3u) % 200);
++    out[2] = static_cast<uint8_t>(16 + (seed * 5u) % 200);
++    out[3] = 255;
++}
++
++uint16_t halfOf(float value) {
++    // Exact for the multiples of 1/256 that the colors use
++    uint32_t bits;
++    std::memcpy(&bits, &value, 4);
++    uint32_t sign = (bits >> 16) & 0x8000u;
++    int exponent = static_cast<int>((bits >> 23) & 0xff) - 127 + 15;
++    uint32_t mantissa = bits & 0x7fffffu;
++    if (value == 0.0f)
++        return static_cast<uint16_t>(sign);
++    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent) << 10) | (mantissa >> 13));
++}
++
++D3D11_TEXTURE2D_DESC descOf(int kind, UINT width, UINT height) {
++    const KindInfo &k = kKindInfo[kind];
++    D3D11_TEXTURE2D_DESC desc = {};
++    desc.Width = width;
++    desc.Height = height;
++    desc.MipLevels = k.mips;
++    desc.ArraySize = k.slices;
++    desc.Format = k.format;
++    desc.SampleDesc.Count = k.samples;
++    desc.Usage = D3D11_USAGE_DEFAULT;
++    desc.BindFlags = D3D11_BIND_RENDER_TARGET | (k.samples == 1 ? D3D11_BIND_SHADER_RESOURCE : 0);
++    desc.MiscFlags = k.misc;
++    return desc;
++}
++
++std::string readLine(HANDLE pipe) {
++    std::string line;
++    char c;
++    DWORD got = 0;
++    while (ReadFile(pipe, &c, 1, &got, nullptr) && got == 1) {
++        if (c == '\n')
++            return line;
++        line += c;
++    }
++    return line.empty() ? std::string("eof") : line;
++}
++
++bool writeLine(HANDLE pipe, const std::string &line) {
++    std::string text = line + "\n";
++    DWORD done = 0;
++    return WriteFile(pipe, text.data(), static_cast<DWORD>(text.size()), &done, nullptr) && done == text.size();
++}
++
++bool waitFence(ID3D11Fence *fence, UINT64 value, HANDLE event) {
++    if (fence->GetCompletedValue() >= value)
++        return true;
++    fence->SetEventOnCompletion(value, event);
++    DWORD until = GetTickCount() + kWaitMs;
++    while (fence->GetCompletedValue() < value) {
++        DWORD now = GetTickCount();
++        if (now >= until)
++            return false;
++        WaitForSingleObject(event, until - now);
++    }
++    return true;
++}
++
++// --- the second process ---------------------------------------------------------------------------------------
++
++// Opens one texture and checks it; reply is "ok" or the failure
++std::string openAndCheck(Device &d, int kind, unsigned cycle, HANDLE handle, UINT width, UINT height) {
++    const KindInfo &k = kKindInfo[kind];
++    ID3D11Texture2D *texture = nullptr;
++    HRESULT hr = k.nt ? d.device1->OpenSharedResource1(handle, IID_PPV_ARGS(&texture))
++                      : d.device->OpenSharedResource(handle, IID_PPV_ARGS(&texture));
++    if (k.nt)
++        CloseHandle(handle);
++    if (FAILED(hr) || !texture)
++        return std::string(k.name) + " does not open";
++    D3D11_TEXTURE2D_DESC got;
++    texture->GetDesc(&got);
++    D3D11_TEXTURE2D_DESC want = descOf(kind, width, height);
++    if (got.Width != want.Width || got.Height != want.Height || got.Format != want.Format ||
++        got.MipLevels != want.MipLevels || got.ArraySize != want.ArraySize ||
++        got.SampleDesc.Count != want.SampleDesc.Count) {
++        texture->Release();
++        return std::string(k.name) + " opens with another description";
++    }
++    std::string result = "ok";
++    IDXGIKeyedMutex *mutex = nullptr;
++    if (kind == kKeyed) {
++        if (FAILED(texture->QueryInterface(IID_PPV_ARGS(&mutex))) || FAILED(mutex->AcquireSync(1, kWaitMs)))
++            result = "keyed: no keyed mutex";
++    }
++    if (k.color && result == "ok") {
++        D3D11_TEXTURE2D_DESC sdesc = want;
++        sdesc.MipLevels = 1;
++        sdesc.ArraySize = 1;
++        sdesc.Usage = D3D11_USAGE_STAGING;
++        sdesc.BindFlags = 0;
++        sdesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++        sdesc.MiscFlags = 0;
++        ID3D11Texture2D *staging = nullptr;
++        if (FAILED(d.device->CreateTexture2D(&sdesc, nullptr, &staging))) {
++            result = std::string(k.name) + ": no staging texture";
++        } else {
++            UINT slice = k.slices > 1 ? 1 : 0;
++            d.context->CopySubresourceRegion(staging, 0, 0, 0, 0, texture, D3D11CalcSubresource(0, slice, k.mips),
++                                             nullptr);
++            D3D11_MAPPED_SUBRESOURCE mapped;
++            if (FAILED(d.context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped))) {
++                result = std::string(k.name) + ": the copy does not map";
++            } else {
++                uint8_t c[4];
++                colorOf(cycle, kind, c);
++                bool same;
++                char seen[64];
++                if (k.format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
++                    const uint16_t *p = static_cast<const uint16_t *>(mapped.pData);
++                    same = p[0] == halfOf(c[0] / 256.0f) && p[1] == halfOf(c[1] / 256.0f) &&
++                           p[2] == halfOf(c[2] / 256.0f);
++                    std::snprintf(seen, sizeof(seen), "%04x %04x %04x", p[0], p[1], p[2]);
++                } else {
++                    const uint8_t *p = static_cast<const uint8_t *>(mapped.pData);
++                    bool bgra = k.format == DXGI_FORMAT_B8G8R8A8_UNORM;
++                    uint8_t r = bgra ? p[2] : p[0], b = bgra ? p[0] : p[2];
++                    same = r == c[0] && p[1] == c[1] && b == c[2];
++                    std::snprintf(seen, sizeof(seen), "%u %u %u, want %u %u %u", r, p[1], b, c[0], c[1], c[2]);
++                }
++                d.context->Unmap(staging, 0);
++                if (!same)
++                    result = std::string(k.name) + " has another color: " + seen;
++            }
++            staging->Release();
++        }
++    }
++    if (mutex) {
++        mutex->ReleaseSync(0);
++        mutex->Release();
++    }
++    texture->Release();
++    return result;
++}
++
++int child() {
++    HANDLE in = GetStdHandle(STD_INPUT_HANDLE), out = GetStdHandle(STD_OUTPUT_HANDLE);
++    Device d;
++    if (!d.create())
++        return 1;
++    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++    for (;;) {
++        std::string line = readLine(in);
++        if (line == "quit" || line == "eof")
++            break;
++        // "cycle N W H HANDLE*kKinds FENCE" or "forge W H HANDLE"
++        std::vector<std::string> words;
++        size_t start = 0;
++        while (start < line.size()) {
++            size_t end = line.find(' ', start);
++            if (end == std::string::npos)
++                end = line.size();
++            words.push_back(line.substr(start, end - start));
++            start = end + 1;
++        }
++        auto handleAt = [&](size_t i) {
++            return reinterpret_cast<HANDLE>(static_cast<uintptr_t>(std::strtoull(words[i].c_str(), nullptr, 16)));
++        };
++        if (words.size() == 4 && words[0] == "forge") {
++            UINT width = std::atoi(words[1].c_str()), height = std::atoi(words[2].c_str());
++            ID3D11Texture2D *texture = nullptr;
++            HANDLE handle = handleAt(3);
++            HRESULT hr = d.device1->OpenSharedResource1(handle, IID_PPV_ARGS(&texture));
++            CloseHandle(handle);
++            std::string reply = "ok";
++            if (SUCCEEDED(hr) && texture) {
++                D3D11_TEXTURE2D_DESC got;
++                texture->GetDesc(&got);
++                char text[128];
++                std::snprintf(text, sizeof(text), "the handle of a released %ux%u texture opened as %ux%u", width,
++                              height, got.Width, got.Height);
++                reply = text;
++                texture->Release();
++            }
++            writeLine(out, reply);
++            continue;
++        }
++        if (words.size() != 4 + kKinds + 1 || words[0] != "cycle") {
++            writeLine(out, "bad command: " + line);
++            continue;
++        }
++        unsigned cycle = std::strtoul(words[1].c_str(), nullptr, 10);
++        UINT width = std::atoi(words[2].c_str()), height = std::atoi(words[3].c_str());
++        std::string reply = "ok";
++        for (int kind = 0; kind < kKinds; kind++) {
++            std::string r = openAndCheck(d, kind, cycle, handleAt(4 + kind), width, height);
++            if (r != "ok" && reply == "ok")
++                reply = r;
++        }
++        ID3D11Fence *fence = nullptr;
++        HANDLE fenceHandle = handleAt(4 + kKinds);
++        HRESULT hr = d.device5->OpenSharedFence(fenceHandle, IID_PPV_ARGS(&fence));
++        CloseHandle(fenceHandle);
++        if (FAILED(hr) || !fence) {
++            if (reply == "ok")
++                reply = "ok unopened";
++        } else {
++            if (!waitFence(fence, 1, event)) {
++                if (reply == "ok")
++                    reply = "the fence never reached 1";
++            }
++            d.context4->Signal(fence, 2);
++            d.context->Flush();
++            fence->Release();
++        }
++        d.context->Flush();
++        writeLine(out, reply);
++    }
++    CloseHandle(event);
++    return 0;
++}
++
++// --- the first process ----------------------------------------------------------------------------------------
++
++struct Child {
++    PROCESS_INFORMATION process = {};
++    HANDLE toChild = nullptr, fromChild = nullptr;
++
++    bool start() {
++        SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
++        HANDLE childIn = nullptr, childOut = nullptr;
++        if (!CreatePipe(&childIn, &toChild, &sa, 0) || !CreatePipe(&fromChild, &childOut, &sa, 0))
++            return fail("CreatePipe");
++        SetHandleInformation(toChild, HANDLE_FLAG_INHERIT, 0);
++        SetHandleInformation(fromChild, HANDLE_FLAG_INHERIT, 0);
++        wchar_t path[MAX_PATH];
++        GetModuleFileNameW(nullptr, path, MAX_PATH);
++        std::wstring command = std::wstring(L"\"") + path + L"\" --child";
++        STARTUPINFOW si = {};
++        si.cb = sizeof(si);
++        si.dwFlags = STARTF_USESTDHANDLES;
++        si.hStdInput = childIn;
++        si.hStdOutput = childOut;
++        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
++        BOOL ok = CreateProcessW(nullptr, &command[0], nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &process);
++        CloseHandle(childIn);
++        CloseHandle(childOut);
++        if (!ok)
++            return fail("CreateProcess of the second process");
++        return true;
++    }
++
++    HANDLE give(HANDLE handle) {
++        HANDLE theirs = nullptr;
++        DuplicateHandle(GetCurrentProcess(), handle, process.hProcess, &theirs, 0, FALSE, DUPLICATE_SAME_ACCESS);
++        return theirs;
++    }
++
++    ~Child() {
++        if (toChild) {
++            writeLine(toChild, "quit");
++            CloseHandle(toChild);
++        }
++        if (process.hProcess) {
++            WaitForSingleObject(process.hProcess, 5000);
++            CloseHandle(process.hProcess);
++            CloseHandle(process.hThread);
++        }
++        if (fromChild)
++            CloseHandle(fromChild);
++    }
++};
++
++void waitForFile(const std::string &signal, const char *stage) {
++    std::printf("shared_churn: measure %s\n", stage);
++    std::fflush(stdout);
++    if (signal.empty())
++        return;
++    std::string path = signal + "." + stage;
++    for (int i = 0; i < 3000; i++) {
++        if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES)
++            return;
++        Sleep(10);
++    }
++}
++
++std::string hex(uintptr_t value) {
++    char text[32];
++    std::snprintf(text, sizeof(text), "%llx", static_cast<unsigned long long>(value));
++    return text;
++}
++
++void waitForFile(const std::string &signal, const char *stage);
++
++unsigned fencesUnopened = 0; // the cycles whose fence the second process could not open
++
++bool cycleOnce(Device &d, Child &c, unsigned cycle, UINT width, UINT height, HANDLE event, const std::string *live) {
++    ID3D11Texture2D *textures[kKinds] = {};
++    HANDLE ntHandles[kKinds] = {};
++    std::string command = "cycle " + std::to_string(cycle) + " " + std::to_string(width) + " " + std::to_string(height);
++    bool ok = true;
++    for (int kind = 0; kind < kKinds && ok; kind++) {
++        const KindInfo &k = kKindInfo[kind];
++        D3D11_TEXTURE2D_DESC desc = descOf(kind, width, height);
++        HRESULT hr = d.device->CreateTexture2D(&desc, nullptr, &textures[kind]);
++        if (FAILED(hr)) {
++            ok = fail((std::string("CreateTexture2D ") + k.name).c_str(), hr);
++            break;
++        }
++        IDXGIKeyedMutex *mutex = nullptr;
++        if (kind == kKeyed && (FAILED(textures[kind]->QueryInterface(IID_PPV_ARGS(&mutex))) ||
++                               FAILED(mutex->AcquireSync(0, kWaitMs)))) {
++            ok = fail("keyed mutex of the first process");
++            break;
++        }
++        if (k.samples == 1) {
++            uint8_t color[4];
++            colorOf(cycle, kind, color);
++            float rgba[4] = {color[0] / 256.0f, color[1] / 256.0f, color[2] / 256.0f, 1.0f};
++            if (k.format != DXGI_FORMAT_R16G16B16A16_FLOAT) {
++                for (int i = 0; i < 3; i++)
++                    rgba[i] = color[i] / 255.0f;
++            }
++            for (UINT slice = 0; slice < k.slices; slice++) {
++                D3D11_RENDER_TARGET_VIEW_DESC rtv = {};
++                rtv.Format = k.format;
++                if (k.slices > 1) {
++                    rtv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
++                    rtv.Texture2DArray.FirstArraySlice = slice;
++                    rtv.Texture2DArray.ArraySize = 1;
++                } else {
++                    rtv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
++                }
++                ID3D11RenderTargetView *view = nullptr;
++                if (FAILED(hr = d.device->CreateRenderTargetView(textures[kind], &rtv, &view))) {
++                    ok = fail((std::string("CreateRenderTargetView ") + k.name).c_str(), hr);
++                    break;
++                }
++                d.context->ClearRenderTargetView(view, rgba);
++                view->Release();
++            }
++        }
++        if (mutex) {
++            mutex->ReleaseSync(1);
++            mutex->Release();
++        }
++        HANDLE handle = nullptr;
++        if (k.nt) {
++            IDXGIResource1 *resource = nullptr;
++            hr = textures[kind]->QueryInterface(IID_PPV_ARGS(&resource));
++            if (SUCCEEDED(hr))
++                hr = resource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
++                                                  nullptr, &ntHandles[kind]);
++            release(resource);
++            handle = SUCCEEDED(hr) ? c.give(ntHandles[kind]) : nullptr;
++        } else {
++            IDXGIResource *resource = nullptr;
++            hr = textures[kind]->QueryInterface(IID_PPV_ARGS(&resource));
++            if (SUCCEEDED(hr))
++                hr = resource->GetSharedHandle(&handle);
++            release(resource);
++        }
++        if (FAILED(hr) || !handle) {
++            ok = fail((std::string("shared handle of ") + k.name).c_str(), hr);
++            break;
++        }
++        command += " " + hex(reinterpret_cast<uintptr_t>(handle));
++    }
++    ID3D11Fence *fence = nullptr;
++    HANDLE fenceHandle = nullptr;
++    if (ok) {
++        HRESULT hr = d.device5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence));
++        if (SUCCEEDED(hr))
++            hr = fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &fenceHandle);
++        if (FAILED(hr))
++            ok = fail("shared fence", hr);
++    }
++    if (ok) {
++        command += " " + hex(reinterpret_cast<uintptr_t>(c.give(fenceHandle)));
++        d.context4->Signal(fence, 1);
++        d.context->Flush();
++        writeLine(c.toChild, command);
++        std::string reply = readLine(c.fromChild);
++        if (reply == "ok unopened")
++            fencesUnopened++;
++        else if (reply != "ok")
++            ok = fail(("cycle " + std::to_string(cycle) + ": " + reply).c_str());
++        else if (!waitFence(fence, 2, event))
++            ok = fail("the fence never reached 2: the second process's signal does not arrive");
++        if (ok && live)
++            waitForFile(*live, "live");
++    }
++    release(fence);
++    if (fenceHandle)
++        CloseHandle(fenceHandle);
++    for (int kind = 0; kind < kKinds; kind++) {
++        release(textures[kind]);
++        if (ntHandles[kind])
++            CloseHandle(ntHandles[kind]);
++    }
++    d.context->Flush();
++    return ok;
++}
++
++uint32_t surfaceIdOf(ID3D11Texture2D *texture) {
++    uint32_t id = 0;
++    UINT size = sizeof(id);
++    if (FAILED(texture->GetPrivateData(kIOSurfaceIdGuid, &size, &id)))
++        return 0;
++    return id;
++}
++
++// The size check of the IOSurface path: the handle of a released texture whose ID names a surface of another size now
++bool forge(Device &d, Child &c, UINT height) {
++    const UINT releasedWidth = 300, newWidth = 400;
++    D3D11_TEXTURE2D_DESC scratchDesc = descOf(kBgra8, 64, 64);
++    scratchDesc.MiscFlags = 0;
++    ID3D11Texture2D *scratchTexture = nullptr;
++    ID3D11RenderTargetView *scratch = nullptr;
++    if (FAILED(d.device->CreateTexture2D(&scratchDesc, nullptr, &scratchTexture)) ||
++        FAILED(d.device->CreateRenderTargetView(scratchTexture, nullptr, &scratch)))
++        return fail("scratch texture for the size check");
++    scratchTexture->Release();
++    struct Scratch {
++        ID3D11RenderTargetView *view;
++        ~Scratch() { view->Release(); }
++    } keep{scratch};
++    for (int attempt = 0; attempt < 50; attempt++) {
++        D3D11_TEXTURE2D_DESC desc = descOf(kIOSurface, releasedWidth, height);
++        ID3D11Texture2D *texture = nullptr;
++        if (FAILED(d.device->CreateTexture2D(&desc, nullptr, &texture)))
++            return fail("CreateTexture2D for the size check");
++        uint32_t id = surfaceIdOf(texture);
++        IDXGIResource1 *resource = nullptr;
++        HANDLE handle = nullptr;
++        if (SUCCEEDED(texture->QueryInterface(IID_PPV_ARGS(&resource))))
++            resource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ, nullptr, &handle);
++        release(resource);
++        texture->Release();
++        d.context->Flush();
++        if (!id || !handle)
++            return fail("the size check needs an IOSurface texture (DXMT_BASALT_IOSURFACE=1)");
++        // DXMT clears a new texture on the GPU and holds it until a later submission has finished: some work on a
++        // scratch texture moves the queue on
++        for (int i = 0; i < 10; i++) {
++            float black[4] = {0, 0, 0, 1};
++            d.context->ClearRenderTargetView(scratch, black);
++            d.context->Flush();
++            Sleep(5);
++        }
++        std::vector<ID3D11Texture2D *> others;
++        bool reused = false;
++        uint32_t seen = 0;
++        for (int i = 0; i < 16 && !reused; i++) {
++            D3D11_TEXTURE2D_DESC other = descOf(kIOSurface, newWidth, height);
++            ID3D11Texture2D *t = nullptr;
++            if (FAILED(d.device->CreateTexture2D(&other, nullptr, &t)))
++                break;
++            others.push_back(t);
++            seen = surfaceIdOf(t);
++            reused = seen == id;
++        }
++        if (attempt < 3)
++            std::printf("shared_churn: size check attempt %d: released ID %u, newest ID %u\n", attempt + 1, id, seen);
++        if (reused) {
++            writeLine(c.toChild, "forge " + std::to_string(releasedWidth) + " " + std::to_string(height) + " " +
++                                     hex(reinterpret_cast<uintptr_t>(c.give(handle))));
++            std::string reply = readLine(c.fromChild);
++            for (auto *t : others)
++                t->Release();
++            CloseHandle(handle);
++            if (reply != "ok")
++                return fail(("size check: " + reply).c_str());
++            std::printf("shared_churn: the released texture's ID %u named a %ux%u surface; the second process "
++                        "refused it (attempt %d)\n",
++                        id, newWidth, height, attempt + 1);
++            return true;
++        }
++        for (auto *t : others)
++            t->Release();
++        CloseHandle(handle);
++        d.context->Flush();
++    }
++    std::printf("shared_churn: the size check did not run: macOS gave no new surface the ID of a released one\n");
++    return true;
++}
++
++} // namespace
++
++int main(int argc, char **argv) {
++    setvbuf(stdout, nullptr, _IONBF, 0);
++    unsigned cycles = 200;
++    UINT width = 640, height = 333;
++    std::string signal;
++    for (int i = 1; i < argc; i++) {
++        std::string arg = argv[i];
++        if (arg == "--child")
++            return child();
++        if (arg == "--cycles" && i + 1 < argc)
++            cycles = std::strtoul(argv[++i], nullptr, 10);
++        else if (arg == "--width" && i + 1 < argc)
++            width = std::atoi(argv[++i]);
++        else if (arg == "--height" && i + 1 < argc)
++            height = std::atoi(argv[++i]);
++        else if (arg == "--signal" && i + 1 < argc)
++            signal = argv[++i];
++        else {
++            std::printf("usage: shared_churn.exe [--cycles N] [--width W] [--height H] [--signal FILE]\n");
++            return 2;
++        }
++    }
++    if (cycles < 1 || width < 8 || height < 8)
++        return fail("bad arguments") ? 0 : 1;
++    Device d;
++    if (!d.create())
++        return 1;
++    Child c;
++    if (!c.start())
++        return 1;
++    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++    bool ok = cycleOnce(d, c, 0, width, height, event, &signal);
++    if (ok)
++        waitForFile(signal, "warm");
++    auto begin = std::chrono::steady_clock::now();
++    for (unsigned cycle = 1; ok && cycle < cycles; cycle++)
++        ok = cycleOnce(d, c, cycle, width, height, event, nullptr);
++    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
++    if (ok)
++        waitForFile(signal, "churned");
++    if (ok)
++        ok = forge(d, c, height);
++    CloseHandle(event);
++    if (ok && fencesUnopened)
++        std::printf("shared_churn: the second process could not open the shared fence in %u of %u cycles\n",
++                    fencesUnopened, cycles);
++    if (ok)
++        std::printf("shared_churn: PASS %u cycles of %d shared textures and a shared fence across two processes, "
++                    "%.2f ms a cycle\n",
++                    cycles, static_cast<int>(kKinds), cycles > 1 ? ms / (cycles - 1) : 0.0);
++    return ok ? 0 : 1;
++}
