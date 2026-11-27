@@ -1132,6 +1132,8 @@ int main(int argc, char** argv)
 	double seconds = 15;
 	bool expect_input = false, load_only = false, no_input = false, trace_poses = false, with_overlay = false, with_gl = false, with_vulkan = false;
 	uint32_t sample_count = 1;
+	// The eye textures' share of the recommended size: Serious Sam VR renders at 1.118 times it
+	double scale = 1.0;
 	std::string actions_mode;
 	float expect_hz = 0.0f;
 	bool other_type = false;
@@ -1187,11 +1189,17 @@ int main(int argc, char** argv)
 				std::fprintf(stderr, "--format takes rgba, bgra or bgra-typeless\n");
 				return 2;
 			}
+		} else if (!std::strcmp(argv[i], "--scale") && i + 1 < argc) {
+			scale = std::atof(argv[++i]);
+			if (!(scale >= 0.25 && scale <= 2.0)) {
+				std::fprintf(stderr, "--scale takes a share of the recommended size from 0.25 to 2\n");
+				return 2;
+			}
 		} else if (!std::strcmp(argv[i], "--runtime") && i + 1 < argc) {
 			g_runtime_path = argv[++i];
 			g_runtime_given = true;
 		} else {
-			std::fprintf(stderr, "usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--actions MODE] [--expect-hz N] [--overlay] [--format F] [--gl | --vulkan [--samples N]] [--load-only --runtime DIR] [--app-type TYPE [--runtime DIR]]\n");
+			std::fprintf(stderr, "usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--actions MODE] [--expect-hz N] [--overlay] [--format F] [--scale S] [--gl | --vulkan [--samples N]] [--load-only --runtime DIR] [--app-type TYPE [--runtime DIR]]\n");
 			return 2;
 		}
 	}
@@ -1249,6 +1257,12 @@ int main(int argc, char** argv)
 	say("recommended render target %ux%u, eye textures of DXGI format %d", width, height, static_cast<int>(texture_format));
 	if (width < 256 || height < 256 || width > 8192 || height > 8192) {
 		return fail("the recommended render target size is not sane");
+	}
+	if (scale != 1.0) {
+		// A game that renders above or below the recommended size, in even pixels
+		width = static_cast<uint32_t>(width * scale / 2.0 + 0.5) * 2;
+		height = static_cast<uint32_t>(height * scale / 2.0 + 0.5) * 2;
+		say("eye textures at %.3f of the recommended size: %ux%u", scale, width, height);
 	}
 	// Slots of IVRSystem_022: GetProjectionMatrix 1, GetEyeToHeadTransform 4, GetHiddenAreaMesh 32
 	vr::HmdMatrix44_t projection{};

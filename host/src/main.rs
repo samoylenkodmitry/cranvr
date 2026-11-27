@@ -854,9 +854,9 @@ struct Game {
     last_frame: Option<Instant>,
     /// The game's program path, from the runtime
     program: Option<String>,
-    /// The game's frame rate in each stats window after its loading, until the host decides on
-    /// its size for the next start
-    rates: Vec<f64>,
+    /// The game's frame rate in each stats window after its first 20 s. The host decides on its size for
+    /// the next start when the game disconnects.
+    run: game_sizes::Run,
     /// Frames the game delivered since the last stats window, encoded or not
     delivered: u32,
     /// Looks for a black picture in this run (see eye_check.rs)
@@ -890,12 +890,12 @@ impl Game {
 
 
     /// Applies one event. A frame replaces `newest`; the replaced frame goes back to the game.
-    fn apply(&mut self, event: GameEvent, newest: &mut Option<GameFrame>, link: &RuntimeLink, dropped: &mut u32) {
+    fn apply(&mut self, event: GameEvent, newest: &mut Option<GameFrame>, link: &RuntimeLink, sizes: &game_sizes::Sizes, dropped: &mut u32) {
         match event {
             GameEvent::Connected { renderer, program } => {
                 info!("Game connected ({renderer})");
                 self.program = program;
-                self.rates.clear();
+                self.run = Default::default();
                 self.eye_watch = Default::default();
                 status::emit(json!({"type": "game", "connected": true, "name": renderer, "program": self.program}));
                 self.swapchains.clear();
@@ -922,6 +922,10 @@ impl Game {
                 if self.connected {
                     info!("Game disconnected");
                     status::emit(json!({"type": "game", "connected": false}));
+                    // A connection that the host refused before its hello had no run
+                    if let Some(program) = &self.program {
+                        learn_size(sizes, program, &std::mem::take(&mut self.run));
+                    }
                 }
                 *newest = None;
                 self.swapchains.clear();
@@ -933,6 +937,30 @@ impl Game {
                 self.last_frame = None;
             }
         }
+    }
+}
+
+/// Decides at the end of a game's run whether its next start renders at another size, and says so.
+fn learn_size(sizes: &game_sizes::Sizes, program: &str, run: &game_sizes::Run) {
+    let name = program.rsplit('\\').next().unwrap_or(program);
+    match sizes.learn(program, run) {
+        game_sizes::Verdict::Short { windows } => info!(
+            "Game: {name} ran {windows} stats windows after its first 20 s. The host decides on a game's size after {} windows (5 minutes).",
+            game_sizes::MIN_WINDOWS
+        ),
+        game_sizes::Verdict::Keeps { fps, windows } => {
+            info!("Game: {name} made {fps:.0} fps in the median of {windows} stats windows. Its next start keeps its size.")
+        }
+        game_sizes::Verdict::Step(game_sizes::Step::Smaller { old, new }) => warn!(
+            "Game: {name} stayed below the headset's rate. Its next start renders at {:.0}% of the size set in cranvr, after {:.0}%.",
+            new * 100.0,
+            old * 100.0
+        ),
+        game_sizes::Verdict::Step(game_sizes::Step::Back { old, new, fps }) => warn!(
+            "Game: {name} made {fps:.0} fps at {:.0}% of the size set in cranvr. The smaller size did not raise its frame rate, so its size does not limit it. Its next start renders at {:.0}% again.",
+            old * 100.0,
+            new * 100.0
+        ),
     }
 }
 
@@ -1133,7 +1161,7 @@ fn frame_loop(
                 while let Some(event) = next {
                     match event {
                         GameEvent::HeadPose => pose = true,
-                        event => game.apply(event, &mut game_frame, &link, &mut dropped),
+                        event => game.apply(event, &mut game_frame, &link, &sizes, &mut dropped),
                     }
                     next = game_events.try_recv().ok();
                 }
@@ -1655,26 +1683,9 @@ fn frame_loop(
                     "Game: {game_fps:.0} fps, below the headset's {rate:.0} Hz, which adds latency. Lower the game's anti-aliasing, or the game render size in cranvr's settings (--game-scale)."
                 );
             }
-            // After a minute of play the host decides once whether the game gets a smaller size
-            // at its next start
-            if loaded && game.active() && game.rates.len() < game_sizes::WINDOWS {
-                game.rates.push(game_fps);
-                if let (game_sizes::WINDOWS, Some(program)) = (game.rates.len(), &game.program) {
-                    let name = program.rsplit('\\').next().unwrap_or(program);
-                    match sizes.learn(program, &game.rates, rate) {
-                        Some(game_sizes::Step::Smaller { old, new }) => warn!(
-                            "Game: {name} stayed below {rate:.0} Hz. Its next start renders at {:.0}% of the size set in cranvr, after {:.0}%.",
-                            new * 100.0,
-                            old * 100.0
-                        ),
-                        Some(game_sizes::Step::Back { old, new, fps }) => warn!(
-                            "Game: {name} made {fps:.0} fps at {:.0}% of the size set in cranvr. The smaller size did not raise its frame rate, so its size does not limit it. Its next start renders at {:.0}% again.",
-                            old * 100.0,
-                            new * 100.0
-                        ),
-                        None => {}
-                    }
-                }
+            // The host decides on the game's size for its next start when the game disconnects
+            if loaded && game.active() {
+                game.run.push(game_fps, rate);
             }
             (count, game_count, gpu_ms, gpu_exec_ms, since) = (0, 0, 0.0, 0.0, Instant::now());
             (no_sample, no_buffer, busy, dropped, missing, paused_frames) = (0, 0, 0, 0, 0, 0);

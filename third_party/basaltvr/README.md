@@ -21,7 +21,8 @@ applies these patches and builds both parts.
 - The control file takes an optional fifth field, the refresh rate in Hz (60 to 240).
   `xrWaitFrame` paces the game at that rate. Without the patch the runtime paces every game at
   72 Hz. cranvr-host writes the rate negotiated with the headset.
-- The per-eye size limit grows from 1680x1760 to 2064x2208, the Quest 3 panel size.
+- The per-eye size limit grows from 1680x1760 to 2064x2208, the Quest 3 panel size. Patch 0018 lets a
+  swapchain grow to twice this size.
 - The runtime tests expect the new limit.
 
 `0002-game-path-and-per-game-view-size.patch`
@@ -211,6 +212,20 @@ applies these patches and builds both parts.
   it ended (launchd held them). With Vulkan, the 22nd swapchain failed, and the 63 surfaces of the first 21 went
   with the process. After the fix, 1000 swapchains left none, in each of the four ways, and none with `--frames`
   either (100 to 120 swapchains, each shown in a frame).
+
+`0018-swapchains-above-the-view-size.patch`
+
+- A game may render above the view size that the runtime recommends: Serious Sam VR asks for 1.118 times it, and
+  a game's own supersampling asks for more. The runtime refused every swapchain above 2064x2208, and OpenComposite
+  stopped such a game with a message box (cranvr issue #164). Now `maxSwapchainImageWidth`, `maxSwapchainImageHeight`,
+  `maxImageRectWidth` and `maxImageRectHeight` name 4128x4416, twice the largest view in each axis, and
+  `xrCreateSwapchain` accepts images up to that size. The recommended size stays as it was.
+- The limit is fixed. It does not follow the configured view size, which shrinks with the game's render size, so a
+  game that picks its own resolution gets no lower limit than before. Up to twice the largest eye, the host's one
+  bilinear tap for each pixel of the encoded eye still reads every texel of the game's image. An image at the limit
+  takes 73 MB: two eyes of three images take 437 MB. Direct3D 11 and Metal take textures up to 16384 pixels.
+- `tests/d3d11_runtime_smoke.cpp` checks the four numbers, creates a swapchain at the limit and expects one pixel
+  more to be refused.
 
 ## patches/dxmt
 
