@@ -96,6 +96,10 @@ mkdir -p "${build}"
 # A delay-load library: a Direct3D game never loads vulkan-1.dll, a Vulkan game loads it at its first call here
 x86_64-w64-mingw32-dlltool -d "${support}/vulkan-1.def" -y "${build}/libvulkan-1.a" -D vulkan-1.dll
 
+# The DLL's log and abort lines name their source files (__FILE__). The map writes them relative to the source and build
+# folders, so the DLL holds no path of the Mac that built it. CMake reads these variables at the first configure of a folder.
+export CFLAGS="-ffile-prefix-map=${dir}=OpenComposite -ffile-prefix-map=${build}=build"
+export CXXFLAGS=${CFLAGS}
 # The static libraries make the DLL stand alone: Wine has no libstdc++ or libgcc to give it
 print "Building OpenComposite (MinGW, Release)"
 cmake -S "${dir}" -B "${build}" -G Ninja \
