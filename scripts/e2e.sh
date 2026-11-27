@@ -586,6 +586,8 @@ if (( game )); then
     # headset on a desk sends no controller input.
     if [[ ${client} == mac ]]; then
         game_args=(--expect-input)
+        # A scripted pull turns the probe's cycle of presses off, which --expect-input checks
+        [[ -n ${left_trigger}${right_trigger} ]] && game_args=()
         (( tracking )) && game_args=(--use-tracking "${tracking_features}" --release-tracking --expect-tracking --face-source "${face_source}")
         (( hand_controllers )) && game_args=(--expect-hand-controllers)
         (( hand_hold )) && game_args+=(--expect-hand-held)
