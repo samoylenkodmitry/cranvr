@@ -73,6 +73,10 @@ impl Device for Fake {
             video.writing = recording.as_ref() == Some(&video.name);
             if video.writing {
                 video.bytes += 1000;
+                video.age_s = 0;
+            } else {
+                // Each look comes later: a file that nobody writes grows older
+                video.age_s += 1;
             }
         }
         Ok(quest.files.clone())
