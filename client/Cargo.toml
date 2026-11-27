@@ -42,28 +42,28 @@ cranvr-proto = { path = "../proto" }
 # The foveated layout that the host encodes: the client derives the same sizes
 cranvr-common = { path = "../common" }
 # One Cranpose revision for every Cranpose crate: the main branch of the Cranpose repository
-cranpose = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0734df8264a7c5ada5e0d9cb0fad7291c194f71b", features = ["embedded-default-font"] }
-cranpose-xr = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0734df8264a7c5ada5e0d9cb0fad7291c194f71b" }
+cranpose = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0b7f5306ef86a89414ed1f590e96c33e72155846", features = ["embedded-default-font"] }
+cranpose-xr = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0b7f5306ef86a89414ed1f590e96c33e72155846" }
 # The output device and the queue for the host's sound (see src/audio.rs)
-cranpose-audio = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0734df8264a7c5ada5e0d9cb0fad7291c194f71b" }
+cranpose-audio = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0b7f5306ef86a89414ed1f590e96c33e72155846" }
 log = "0.4"
 serde_json = "1"
 env_logger = { version = "0.11", optional = true }
 
 [dev-dependencies]
 # A test composes the console's rows in a headless shell and reads the words on the screen
-cranpose-testing = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0734df8264a7c5ada5e0d9cb0fad7291c194f71b" }
+cranpose-testing = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0b7f5306ef86a89414ed1f590e96c33e72155846" }
 
 [build-dependencies]
-cranpose-capabilities = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0734df8264a7c5ada5e0d9cb0fad7291c194f71b" }
+cranpose-capabilities = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0b7f5306ef86a89414ed1f590e96c33e72155846" }
 
 # Cranpose's forks (wgpu, basisu) at the same revision. The pinned Cranpose needs fork versions that crates.io
 # gets only with Cranpose's next release.
 [patch.crates-io]
-cranpose-wgpu = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0734df8264a7c5ada5e0d9cb0fad7291c194f71b" }
-cranpose-wgpu-core = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0734df8264a7c5ada5e0d9cb0fad7291c194f71b" }
-cranpose-wgpu-hal = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0734df8264a7c5ada5e0d9cb0fad7291c194f71b" }
-cranpose-basisu = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0734df8264a7c5ada5e0d9cb0fad7291c194f71b" }
+cranpose-wgpu = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0b7f5306ef86a89414ed1f590e96c33e72155846" }
+cranpose-wgpu-core = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0b7f5306ef86a89414ed1f590e96c33e72155846" }
+cranpose-wgpu-hal = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0b7f5306ef86a89414ed1f590e96c33e72155846" }
+cranpose-basisu = { git = "https://github.com/samoylenkodmitry/Cranpose", rev = "0b7f5306ef86a89414ed1f590e96c33e72155846" }
 
 # The Reed-Solomon code of the protocol is about ten times slower without optimization.
 [profile.dev.package.reed-solomon-simd]
