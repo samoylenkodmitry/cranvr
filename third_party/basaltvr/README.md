@@ -241,6 +241,17 @@ applies these patches and builds both parts.
   during the run, so each check judges its own moment. The program waits for no controller. The two old modes
   stay as they were.
 
+`0020-shared-fence-round-in-the-churn-test.patch`
+
+- `tests/shared_churn.cpp` gives the shared fence a round in each cycle. The first process signals 1. The second waits
+  for 1 on the CPU and signals 2. Its GPU then waits for 3, which the first process signals only after it saw 2, and
+  signals 4. The first process's GPU waits for 4 and signals 5. Each process thus waits on the CPU and on the GPU for
+  a value that the other one signaled, and both GPU waits are pending when they are made. A fence that does not open
+  fails the run, where the program counted such cycles before. The first process now also waits for its own 1 before
+  it sends the cycle: Metal orders no work on a texture of DXMT's stock path across processes, and without the wait
+  the second process read zeros in one of 200 cycles of one run. The program prints in how many cycles the round went
+  through, which `scripts/shared-churn.sh` checks.
+
 ## patches/dxmt
 
 `0005-public-atomic-for-new-metal-compiler.patch`: DXMT 0.80 calls a private Metal builtin
@@ -298,7 +309,7 @@ former behavior back for a comparison. The log says once which vertex shader thi
 
 Patches 0013 to 0018 run SteamVR for Windows under Wine (cranvr's SteamVR mode, `steamvr/driver_cranvr.cpp`). Each
 applies on its own to DXMT v0.80. The build script checks the whole set in order (runtime patch 0014), because patch
-0019 changes lines of BasaltVR's 0001. Patch 0020 changes lines of 0013, 0014, 0018 and 0019.
+0019 changes lines of BasaltVR's 0001. Patch 0020 changes lines of 0013, 0014, 0018 and 0019. Patch 0021 changes lines of 0020.
 
 `0013-shared-buffers-between-processes.patch`: SteamVR's compositor makes a constant buffer with
 `D3D11_RESOURCE_MISC_SHARED` and stops at start when the buffer has no shared handle ("Failed to create shared frame
@@ -364,6 +375,18 @@ its keyed mutex through `IDXGIKeyedMutex`, which has no virtual destructor, so t
 stayed. The rights of the texture ports were never freed. Each kept memory until the process ended. The import of an
 IOSurface texture of patch 0019 now compares the size and the pixel format of the surface that the ID names with the
 runtime data. It refuses another surface with a log line, because macOS gives the lowest free ID to the next new
-surface. `scripts/shared-churn.sh` checks all of this (runtime patch 0017). In Wine 11.10 a shared fence still does not
-open in another process (#161): Wine keeps and reads the private data of resources only. The fence's name is in no
-such data.
+surface. `scripts/shared-churn.sh` checks all of this (runtime patch 0017). Patch 0021 makes a shared fence open in
+another process.
+
+`0021-shared-fences-open-in-another-process.patch`: a shared `ID3D11Fence` did not open in another process under Wine
+11.10 (#161). DXMT stored the name of the fence's event in the sync object's private data with
+`D3DKMT_ESCAPE_UPDATE_RESOURCE_WINE`, which Wine runs for resources only. DXMT's check of the result was the wrong way
+round, so the fence went on without its name. `OpenSharedFence` read the name with
+`D3DKMTQueryResourceInfoFromNtHandle`, which Wine answers for resources only and which gives the size of the data,
+not the data. The fence's NT handle now shares a bundle of three objects, as Wine shares a texture with a keyed mutex:
+a resource whose private data holds the event's name and a tag, a keyed mutex that nobody uses (Wine shares a sync
+object with a resource only in such a bundle) and the fence's sync object. `OpenSharedFence` opens the bundle with
+`D3DKMTOpenResourceFromNtHandle`, which gives the name and the sync object, and looks the name up in the broker of
+patch 0020. A handle whose data has another size or no tag is no fence's. The opened fence keeps the bundle and can
+share it again. Each process logs its open of another process's fence and its first wait on such a fence, on the CPU
+(`SetEventOnCompletion`) and on the GPU (`ID3D11DeviceContext4::Wait`), with its process ID.
