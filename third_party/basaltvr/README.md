@@ -303,8 +303,10 @@ any process, is released. A shared IOSurface texture registers nothing with laun
 surface's global ID (`iosurface_id`), and `OpenSharedResource` and `OpenSharedResource1` open the surface by that ID
 (`WMTTextureInfo::reserved` in; 0 makes a new surface). The unique name stays in the runtime data, because patch 0014
 names the section of the keyed mutex by it. A shared texture of DXMT's own path (`MTLSharedTextureHandle`: other
-formats, mipmaps, arrays, MSAA) and a shared fence keep their registration with launchd: launchd held 41 such
-surfaces (under 1 MB) and 3 other ports on the owner's Mac. As with a legacy shared handle on Windows, an IOSurface texture
+formats, mipmaps, arrays, MSAA) and a shared fence keep their registration with launchd, and so still stay until the
+user logs out. Before the first SteamVR run of the new stack launchd held 41 such surfaces (under 1 MB) and 3 other
+ports. After one `scripts/e2e.sh --steamvr` it held 30 more names with 240 MB of such surfaces, from processes that
+by their IDs belong to that run, and Steam's web helper held 10 (18 MB). As with a legacy shared handle on Windows, an IOSurface texture
 whose last texture is gone no longer opens; on Windows an NT handle keeps the resource. BasaltVR's checks of the fork
 (`runtime/scripts/test-dxmt.zsh`, with the reopen of an NT handle) pass with the patch, and
 `scripts/e2e.sh --swapchain-churn` checks that no surface stays (see runtime patch 0016).
