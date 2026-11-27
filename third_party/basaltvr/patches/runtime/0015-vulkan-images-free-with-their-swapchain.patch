@@ -1,0 +1,310 @@
+diff --git a/runtime/pe/vulkan.cpp b/runtime/pe/vulkan.cpp
+index 74533f6..af61703 100644
+--- a/runtime/pe/vulkan.cpp
++++ b/runtime/pe/vulkan.cpp
+@@ -76,6 +76,7 @@ struct WineMetal {
+     ObjHandle (*arrayObject)(ObjHandle, uint64_t) = nullptr;
+     uint64_t (*arrayCount)(ObjHandle) = nullptr;
+     ObjHandle (*newTextureFromIOSurface)(ObjHandle, WmtTextureInfo*) = nullptr;
++    void (*release)(ObjHandle) = nullptr;
+     ObjHandle device = 0;
+ };
+ 
+@@ -104,8 +105,10 @@ BOOL CALLBACK loadLibraries(PINIT_ONCE, PVOID, PVOID*) {
+         reinterpret_cast<void*>(GetProcAddress(metal, "NSArray_count")));
+     gMetal.newTextureFromIOSurface = reinterpret_cast<ObjHandle (*)(ObjHandle, WmtTextureInfo*)>(
+         reinterpret_cast<void*>(GetProcAddress(metal, "MTLDevice_newTextureFromIOSurface")));
++    gMetal.release = reinterpret_cast<void (*)(ObjHandle)>(
++        reinterpret_cast<void*>(GetProcAddress(metal, "NSObject_release")));
+     if (gGetInstanceProcAddr == nullptr || gMetal.copyAllDevices == nullptr || gMetal.arrayObject == nullptr ||
+-        gMetal.arrayCount == nullptr || gMetal.newTextureFromIOSurface == nullptr) {
++        gMetal.arrayCount == nullptr || gMetal.newTextureFromIOSurface == nullptr || gMetal.release == nullptr) {
+         std::fprintf(stderr, "Basalt OpenXR: winemetal.dll is not cranvr's DXMT fork, or vulkan-1.dll is broken\n");
+         return TRUE;
+     }
+@@ -210,6 +213,9 @@ XrResult writeExtensionList(uint32_t capacity, uint32_t* countOutput, char* buff
+     return XR_SUCCESS;
+ }
+ 
++// The frame handoff of a session (below)
++struct VulkanFrameSync;
++
+ }  // namespace
+ 
+ namespace basalt {
+@@ -244,6 +250,11 @@ struct VulkanSession {
+     PFN_vkDestroyFence destroyFence = nullptr;
+     PFN_vkWaitForFences waitForFences = nullptr;
+     PFN_vkResetFences resetFences = nullptr;
++
++    // The frame handoff while the host is linked. A destroyed swapchain waits for its newest fence; the
++    // lock keeps xrEndFrame from resetting that fence meanwhile.
++    SRWLOCK syncLock = SRWLOCK_INIT;
++    VulkanFrameSync* sync = nullptr;
+ };
+ 
+ struct VulkanSwapchainImages {
+@@ -258,9 +269,9 @@ struct VulkanSwapchainImages {
+     // For two slices: one IOSurface image per slice of each image
+     std::array<std::array<VkImage, 2>, kVulkanSwapchainImageCount> exports{};
+     std::array<std::array<VkDeviceMemory, 2>, kVulkanSwapchainImageCount> exportMemory{};
+-    // The pool's textures that the images lie on
+-    std::array<size_t, kVulkanSwapchainImageCount * 2> pooledTextures{};
+-    uint32_t pooledCount = 0;
++    // The Metal textures that the IOSurface images lie on: the swapchain owns them
++    std::array<ObjHandle, kVulkanSwapchainImageCount * 2> textures{};
++    uint32_t textureCount = 0;
+ };
+ 
+ }  // namespace basalt
+@@ -269,47 +280,18 @@ namespace {
+ 
+ // --- IOSurface textures -----------------------------------------------------------------------
+ //
+-// winemetal keeps a Mach send right to each IOSurface that it makes, and that right holds the
+-// surface until the game ends: a released texture does not free its IOSurface. A game recreates
+-// its swapchains at each session restart (OpenComposite restarts twice at a game's start). The
+-// runtime therefore keeps every texture that it made and gives it to the next swapchain of the same
+-// size and format. The memory stays at the largest set of swapchains that the game had at a time.
+-
+-struct PooledTexture {
+-    uint32_t width = 0;
+-    uint32_t height = 0;
+-    uint32_t pixelFormat = 0;
+-    uint32_t usage = 0;
+-    ObjHandle texture = 0;
+-    uint32_t iosurfaceId = 0;
+-    bool inUse = false;
+-};
+-
+-// Four swapchains of three images with two slices each are 24 textures at a time. The runtime has
+-// no exceptions: a fixed pool, and a swapchain that finds it full fails.
+-constexpr size_t kPoolCapacity = 64;
+-SRWLOCK gPoolLock = SRWLOCK_INIT;
+-std::array<PooledTexture, kPoolCapacity> gPool{};
+-size_t gPoolCount = 0;
+-
+-// A texture on an IOSurface, from the pool or new. Returns the pool index or SIZE_MAX.
+-size_t takeTexture(uint32_t width, uint32_t height, uint32_t pixelFormat, uint32_t usage) {
+-    AcquireSRWLockExclusive(&gPoolLock);
+-    for (size_t index = 0; index < gPoolCount; ++index) {
+-        PooledTexture& pooled = gPool[index];
+-        if (!pooled.inUse && pooled.width == width && pooled.height == height &&
+-            pooled.pixelFormat == pixelFormat && (pooled.usage & usage) == usage) {
+-            pooled.inUse = true;
+-            ReleaseSRWLockExclusive(&gPoolLock);
+-            return index;
+-        }
+-    }
+-    const bool full = gPoolCount == kPoolCapacity;
+-    ReleaseSRWLockExclusive(&gPoolLock);
+-    if (full) {
+-        return SIZE_MAX;
+-    }
+-
++// Each IOSurface image has a Metal texture of its own on a new IOSurface. The texture is the surface's
++// only owner in the game's process (cranvr's DXMT patch 0019 gives the surface no Mach port), so the
++// surface goes when the swapchain releases the texture. cranvr-host keeps its own reference to the
++// surface while it reads it, until it learns that the swapchain is gone.
++//
++// The runtime once kept every texture in a pool for the next swapchain of the same size, because the
++// surfaces never went. The pool saved no time: a swapchain of three images of one size that a test made
++// and destroyed 1000 times took 1.6 to 2.3 ms with the pool and 1.0 to 1.5 ms without it. It also failed
++// a game that made swapchains of ever new sizes once it held 64 textures.
++
++// A texture on a new IOSurface, or 0. Writes the surface's global ID.
++ObjHandle newSurfaceTexture(uint32_t width, uint32_t height, uint32_t pixelFormat, uint32_t usage, uint32_t* iosurfaceId) {
+     WmtTextureInfo info{};
+     info.pixelFormat = pixelFormat;
+     info.width = width;
+@@ -321,33 +303,14 @@ size_t takeTexture(uint32_t width, uint32_t height, uint32_t pixelFormat, uint32
+     info.sampleCount = 1;
+     info.usage = usage;
+     info.options = kWmtStorageModeShared;
++    // reserved 0: a new surface
+     const ObjHandle texture = gMetal.newTextureFromIOSurface(gMetal.device, &info);
+-    if (texture == 0 || info.reserved == 0) {
+-        return SIZE_MAX;
++    if (texture != 0 && info.reserved == 0) {
++        gMetal.release(texture);
++        return 0;
+     }
+-    AcquireSRWLockExclusive(&gPoolLock);
+-    if (gPoolCount == kPoolCapacity) {
+-        // Another thread took the last place: the texture stays alive with its IOSurface
+-        ReleaseSRWLockExclusive(&gPoolLock);
+-        return SIZE_MAX;
+-    }
+-    const size_t index = gPoolCount++;
+-    gPool[index] = {width, height, pixelFormat, usage, texture, info.reserved, true};
+-    ReleaseSRWLockExclusive(&gPoolLock);
+-    return index;
+-}
+-
+-PooledTexture pooledTexture(size_t index) {
+-    AcquireSRWLockShared(&gPoolLock);
+-    const PooledTexture pooled = gPool[index];
+-    ReleaseSRWLockShared(&gPoolLock);
+-    return pooled;
+-}
+-
+-void returnTexture(size_t index) {
+-    AcquireSRWLockExclusive(&gPoolLock);
+-    gPool[index].inUse = false;
+-    ReleaseSRWLockExclusive(&gPoolLock);
++    *iosurfaceId = info.reserved;
++    return texture;
+ }
+ 
+ template <typename Function>
+@@ -402,8 +365,8 @@ VkImageUsageFlags imageUsage(XrSwapchainUsageFlags usage) {
+     return flags;
+ }
+ 
+-// An image on an IOSurface texture of the pool. Its Vulkan usage follows the Metal texture's
+-// usage, which MoltenVK reads from the texture.
++// An image on a new IOSurface texture. Its Vulkan usage follows the Metal texture's usage, which
++// MoltenVK reads from the texture.
+ bool createSurfaceImage(
+     basalt::VulkanSession* session,
+     const XrSwapchainCreateInfo* createInfo,
+@@ -419,16 +382,17 @@ bool createSurfaceImage(
+     }
+     const uint32_t pixelFormat = createInfo->format == VK_FORMAT_B8G8R8A8_SRGB
+         ? kWmtPixelFormatBgra8UnormSrgb : kWmtPixelFormatBgra8Unorm;
+-    const size_t index = takeTexture(createInfo->width, createInfo->height, pixelFormat, metalUsage);
+-    if (index == SIZE_MAX) {
++    uint32_t surfaceId = 0;
++    const ObjHandle texture = newSurfaceTexture(createInfo->width, createInfo->height, pixelFormat, metalUsage, &surfaceId);
++    if (texture == 0) {
+         return false;
+     }
+-    owner->pooledTextures[owner->pooledCount++] = index;
+-    const PooledTexture texture = pooledTexture(index);
++    // The swapchain releases the texture when it goes, also when this image fails below
++    owner->textures[owner->textureCount++] = texture;
+ 
+     auto import = vkStruct<VkImportMetalTextureInfoEXT>(VK_STRUCTURE_TYPE_IMPORT_METAL_TEXTURE_INFO_EXT);
+     import.plane = VK_IMAGE_ASPECT_PLANE_0_BIT;
+-    import.mtlTexture = reinterpret_cast<MTLTexture_id>(static_cast<uintptr_t>(texture.texture));
++    import.mtlTexture = reinterpret_cast<MTLTexture_id>(static_cast<uintptr_t>(texture));
+     auto imageInfo = vkStruct<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
+     imageInfo.pNext = &import;
+     imageInfo.flags = flags;
+@@ -446,7 +410,7 @@ bool createSurfaceImage(
+         *image = VK_NULL_HANDLE;
+         return false;
+     }
+-    *iosurfaceId = texture.iosurfaceId;
++    *iosurfaceId = surfaceId;
+     return bindMemory(session, *image, memory);
+ }
+ 
+@@ -575,13 +539,20 @@ bool vulkanSignal(basalt::FrameSync* base, uint64_t frameNumber) {
+         return false;
+     }
+     const LARGE_INTEGER start = counterNow();
++    // A destroyed swapchain may wait for the newest fence meanwhile (waitForSubmittedFrames): the
++    // reset and the submission happen under the session's lock, and a slot counts as submitted only
++    // with a fence that will signal
++    AcquireSRWLockExclusive(&session->syncLock);
+     if (slot.submitted && session->resetFences(session->device, 1, &slot.fence) != VK_SUCCESS) {
++        ReleaseSRWLockExclusive(&session->syncLock);
+         return false;
+     }
++    slot.submitted = false;
+     auto submitInfo = vkStruct<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);
+     if (sync->recording) {
+         sync->recording = false;
+         if (session->endCommandBuffer(slot.commands) != VK_SUCCESS) {
++            ReleaseSRWLockExclusive(&session->syncLock);
+             return false;
+         }
+         submitInfo.commandBufferCount = 1;
+@@ -592,9 +563,10 @@ bool vulkanSignal(basalt::FrameSync* base, uint64_t frameNumber) {
+     const VkResult result = session->queueSubmit(
+         session->queue, submitInfo.commandBufferCount == 0 ? 0 : 1, &submitInfo, slot.fence);
+     InterlockedExchange(&slot.waited, 0);
+-    slot.submitted = true;
++    slot.submitted = result == VK_SUCCESS;
+     slot.frameNumber = frameNumber;
+     slot.signaledAt = counterNow();
++    ReleaseSRWLockExclusive(&session->syncLock);
+     sync->submitSeconds += secondsBetween(start, slot.signaledAt);
+     ++sync->next;
+     return result == VK_SUCCESS;
+@@ -634,6 +606,12 @@ bool vulkanWait(basalt::FrameSync* base, uint64_t frameNumber, DWORD millisecond
+ void vulkanDestroy(basalt::FrameSync* base) {
+     auto* sync = reinterpret_cast<VulkanFrameSync*>(base);
+     basalt::VulkanSession* session = sync->session;
++    // Swapchains destroyed from here on find no fence to wait for: the waits below cover every frame
++    AcquireSRWLockExclusive(&session->syncLock);
++    if (session->sync == sync) {
++        session->sync = nullptr;
++    }
++    ReleaseSRWLockExclusive(&session->syncLock);
+     for (FrameSlot& slot : sync->slots) {
+         if (slot.fence == VK_NULL_HANDLE) {
+             continue;
+@@ -677,9 +655,35 @@ basalt::FrameSync* makeVulkanFrameSync(basalt::VulkanSession* session) {
+         vulkanDestroy(&sync->base);
+         return nullptr;
+     }
++    AcquireSRWLockExclusive(&session->syncLock);
++    session->sync = sync;
++    ReleaseSRWLockExclusive(&session->syncLock);
+     return &sync->base;
+ }
+ 
++// Waits until the GPU has finished what the runtime submitted on the game's queue: the copies of the
++// slices and, through the fence after them, every command of the game before its last xrEndFrame.
++// MoltenVK's command buffers keep no reference to their textures, so a swapchain's textures may go
++// only after that. False when the GPU took more than a second.
++bool waitForSubmittedFrames(basalt::VulkanSession* session) {
++    AcquireSRWLockExclusive(&session->syncLock);
++    bool finished = true;
++    if (session->sync != nullptr) {
++        // The newest fence signals after every earlier submission to the queue
++        FrameSlot* newest = nullptr;
++        for (FrameSlot& slot : session->sync->slots) {
++            if (slot.submitted && (newest == nullptr || slot.frameNumber > newest->frameNumber)) {
++                newest = &slot;
++            }
++        }
++        if (newest != nullptr) {
++            finished = session->waitForFences(session->device, 1, &newest->fence, VK_TRUE, 1000000000ull) == VK_SUCCESS;
++        }
++    }
++    ReleaseSRWLockExclusive(&session->syncLock);
++    return finished;
++}
++
+ }  // namespace
+ 
+ namespace basalt {
+@@ -970,6 +974,7 @@ void destroyVulkanSwapchainImages(VulkanSwapchainImages* images) {
+         return;
+     }
+     VulkanSession* session = images->session;
++    const bool finished = waitForSubmittedFrames(session);
+     for (uint32_t image = 0; image < kVulkanSwapchainImageCount; ++image) {
+         if (images->images[image] != VK_NULL_HANDLE) {
+             session->destroyImage(session->device, images->images[image], nullptr);
+@@ -986,8 +991,15 @@ void destroyVulkanSwapchainImages(VulkanSwapchainImages* images) {
+             }
+         }
+     }
+-    for (uint32_t index = 0; index < images->pooledCount; ++index) {
+-        returnTexture(images->pooledTextures[index]);
++    // The textures go after their images, so MoltenVK's images never point at a released texture
++    if (finished) {
++        for (uint32_t index = 0; index < images->textureCount; ++index) {
++            gMetal.release(images->textures[index]);
++        }
++    } else {
++        // A texture that the GPU may still use stays, with its IOSurface, until the game ends
++        basalt::note("Basalt OpenXR: the GPU did not finish a destroyed swapchain's frames within a second; its %u IOSurfaces "
++                     "stay until the game ends\n", images->textureCount);
+     }
+     std::free(images);
+ }

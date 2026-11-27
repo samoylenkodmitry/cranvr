@@ -1,0 +1,595 @@
+diff --git a/runtime/tests/CMakeLists.txt b/runtime/tests/CMakeLists.txt
+index df29531..e373735 100644
+--- a/runtime/tests/CMakeLists.txt
++++ b/runtime/tests/CMakeLists.txt
+@@ -158,3 +158,10 @@ add_executable(vulkan_runtime_smoke vulkan_runtime_smoke.cpp)
+ target_link_libraries(vulkan_runtime_smoke PRIVATE OpenXR::openxr_loader basalt_vulkan_headers)
+ target_compile_options(vulkan_runtime_smoke PRIVATE -Wall -Wextra -Wpedantic)
+ target_link_options(vulkan_runtime_smoke PRIVATE -static -static-libgcc -static-libstdc++)
++
++# cranvr: creates and destroys a swapchain many times, with Direct3D 11 or Vulkan, for a measurement of the memory
++# that a destroyed swapchain leaves behind (scripts/e2e.sh --swapchain-churn in cranvr)
++add_executable(swapchain_churn swapchain_churn.cpp)
++target_link_libraries(swapchain_churn PRIVATE OpenXR::openxr_loader basalt_vulkan_headers d3d11)
++target_compile_options(swapchain_churn PRIVATE -Wall -Wextra -Wpedantic)
++target_link_options(swapchain_churn PRIVATE -static -static-libgcc -static-libstdc++)
+diff --git a/runtime/tests/swapchain_churn.cpp b/runtime/tests/swapchain_churn.cpp
+new file mode 100644
+index 0000000..5daab05
+--- /dev/null
++++ b/runtime/tests/swapchain_churn.cpp
+@@ -0,0 +1,574 @@
++// cranvr: creates and destroys a swapchain many times, as a game does that restarts its session or
++// changes its resolution. It renders with Direct3D 11, or with Vulkan (XR_KHR_vulkan_enable2) when
++// given --vulkan.
++//
++// Each swapchain has the height --height (default 333, a height that no game uses, so a count of the
++// live IOSurfaces of that height finds the program's own) and a width that changes from one swapchain
++// to the next (256 to 510 pixels). A runtime that hands the images of a destroyed swapchain to a new
++// one of the same size cannot hide a leak then. The program clears each image once, waits for the GPU
++// and destroys the swapchain. --slices 2 makes swapchains with two slices. --width N gives every
++// swapchain the same width, so a runtime may reuse its images: the time of one swapchain then shows what
++// a reuse saves.
++//
++// --frames begins the session and shows each swapchain in one frame (both views, a slice each with
++// --slices 2) before it destroys the swapchain at once, without a wait for the GPU: the runtime then
++// has to keep the images until the GPU has finished the frame and its own copies of the slices. The
++// runtime paces the frames, so a run with --frames takes about a refresh period per swapchain.
++//
++// With --signal FILE the program stops twice, so that a script can measure its memory: after its first
++// swapchain it prints "swapchain_churn: measure warm" and waits for FILE.warm to exist, and after its
++// last one it prints "swapchain_churn: measure churned" and waits for FILE.churned. It waits at most
++// 30 s each time.
++//
++// It prints "swapchain_churn: PASS" with the number of swapchains and the time that one took, or
++// "FAIL ..." with the call that failed.
++
++#include <windows.h>
++
++#include <d3d11.h>
++#include <dxgi.h>
++#include <vulkan/vulkan.h>
++
++#define XR_USE_GRAPHICS_API_D3D11
++#define XR_USE_GRAPHICS_API_VULKAN
++#include <openxr/openxr.h>
++#include <openxr/openxr_platform.h>
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++namespace {
++
++template <typename T>
++T xrStruct(XrStructureType type) {
++    T value{};
++    value.type = type;
++    return value;
++}
++
++template <typename T>
++T vkStruct(VkStructureType type) {
++    T value{};
++    value.sType = type;
++    return value;
++}
++
++int fail(const char* what, long long result) {
++    std::printf("swapchain_churn: FAIL %s (%lld)\n", what, result);
++    std::fflush(stdout);
++    return 1;
++}
++
++double now() {
++    LARGE_INTEGER counter{}, frequency{};
++    QueryPerformanceCounter(&counter);
++    QueryPerformanceFrequency(&frequency);
++    return static_cast<double>(counter.QuadPart) / static_cast<double>(frequency.QuadPart);
++}
++
++// Prints the stage and waits until the measuring script creates SIGNAL.STAGE
++void measure(const std::string& signal, const char* stage) {
++    std::printf("swapchain_churn: measure %s\n", stage);
++    std::fflush(stdout);
++    if (signal.empty()) {
++        return;
++    }
++    const std::string path = signal + "." + stage;
++    const double until = now() + 30.0;
++    while (GetFileAttributesA(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
++        if (now() > until) {
++            std::printf("swapchain_churn: no %s after 30 s, going on\n", path.c_str());
++            std::fflush(stdout);
++            return;
++        }
++        Sleep(10);
++    }
++}
++
++// The width of swapchain number INDEX: even, from 256 to 510, or the one width of --width
++uint32_t gWidth = 0;
++uint32_t widthOf(uint32_t index) {
++    return gWidth != 0 ? gWidth : 256 + 2 * (index % 128);
++}
++
++struct Vk {
++    PFN_vkGetInstanceProcAddr getInstanceProcAddr = nullptr;
++    PFN_vkGetDeviceProcAddr getDeviceProcAddr = nullptr;
++    PFN_vkGetDeviceQueue getDeviceQueue = nullptr;
++    PFN_vkCreateCommandPool createCommandPool = nullptr;
++    PFN_vkDestroyCommandPool destroyCommandPool = nullptr;
++    PFN_vkAllocateCommandBuffers allocateCommandBuffers = nullptr;
++    PFN_vkBeginCommandBuffer beginCommandBuffer = nullptr;
++    PFN_vkEndCommandBuffer endCommandBuffer = nullptr;
++    PFN_vkResetCommandBuffer resetCommandBuffer = nullptr;
++    PFN_vkCmdPipelineBarrier cmdPipelineBarrier = nullptr;
++    PFN_vkCmdClearColorImage cmdClearColorImage = nullptr;
++    PFN_vkQueueSubmit queueSubmit = nullptr;
++    PFN_vkCreateFence createFence = nullptr;
++    PFN_vkDestroyFence destroyFence = nullptr;
++    PFN_vkWaitForFences waitForFences = nullptr;
++    PFN_vkResetFences resetFences = nullptr;
++    PFN_vkDeviceWaitIdle deviceWaitIdle = nullptr;
++    PFN_vkDestroyDevice destroyDevice = nullptr;
++    PFN_vkDestroyInstance destroyInstance = nullptr;
++};
++
++// The graphics of the session: a Direct3D 11 device, or a Vulkan device with a queue
++struct Graphics {
++    bool vulkan = false;
++    ID3D11Device* d3d = nullptr;
++    ID3D11DeviceContext* context = nullptr;
++    Vk vk;
++    VkInstance instance = VK_NULL_HANDLE;
++    VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
++    VkDevice device = VK_NULL_HANDLE;
++    VkQueue queue = VK_NULL_HANDLE;
++    VkCommandPool pool = VK_NULL_HANDLE;
++    VkCommandBuffer commands[3]{};
++    VkFence fence = VK_NULL_HANDLE;
++    // --frames: the session runs, and the fence of the last clears may still be pending
++    bool frames = false;
++    XrSpace space = XR_NULL_HANDLE;
++    bool fencePending = false;
++    uint32_t framesShown = 0;
++};
++
++XrResult setUpD3D11(XrInstance instance, XrSystemId system, Graphics* graphics, XrGraphicsBindingD3D11KHR* binding) {
++    PFN_xrGetD3D11GraphicsRequirementsKHR getRequirements = nullptr;
++    xrGetInstanceProcAddr(instance, "xrGetD3D11GraphicsRequirementsKHR",
++                          reinterpret_cast<PFN_xrVoidFunction*>(&getRequirements));
++    auto requirements = xrStruct<XrGraphicsRequirementsD3D11KHR>(XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR);
++    if (getRequirements == nullptr) {
++        return XR_ERROR_FUNCTION_UNSUPPORTED;
++    }
++    XrResult result = getRequirements(instance, system, &requirements);
++    if (XR_FAILED(result)) {
++        return result;
++    }
++    const D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
++    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, &level, 1,
++                                 D3D11_SDK_VERSION, &graphics->d3d, nullptr, &graphics->context))) {
++        return XR_ERROR_RUNTIME_FAILURE;
++    }
++    binding->device = graphics->d3d;
++    return XR_SUCCESS;
++}
++
++XrResult setUpVulkan(XrInstance instance, XrSystemId system, Graphics* graphics, XrGraphicsBindingVulkanKHR* binding) {
++    Vk& vk = graphics->vk;
++    HMODULE vulkanModule = LoadLibraryA("vulkan-1.dll");
++    if (vulkanModule == nullptr) {
++        return XR_ERROR_RUNTIME_FAILURE;
++    }
++    vk.getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
++        reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkGetInstanceProcAddr")));
++    PFN_xrGetVulkanGraphicsRequirements2KHR getRequirements = nullptr;
++    PFN_xrCreateVulkanInstanceKHR createInstance = nullptr;
++    PFN_xrGetVulkanGraphicsDevice2KHR graphicsDevice = nullptr;
++    PFN_xrCreateVulkanDeviceKHR createDevice = nullptr;
++    xrGetInstanceProcAddr(instance, "xrGetVulkanGraphicsRequirements2KHR", reinterpret_cast<PFN_xrVoidFunction*>(&getRequirements));
++    xrGetInstanceProcAddr(instance, "xrCreateVulkanInstanceKHR", reinterpret_cast<PFN_xrVoidFunction*>(&createInstance));
++    xrGetInstanceProcAddr(instance, "xrGetVulkanGraphicsDevice2KHR", reinterpret_cast<PFN_xrVoidFunction*>(&graphicsDevice));
++    xrGetInstanceProcAddr(instance, "xrCreateVulkanDeviceKHR", reinterpret_cast<PFN_xrVoidFunction*>(&createDevice));
++    if (vk.getInstanceProcAddr == nullptr || getRequirements == nullptr || createInstance == nullptr ||
++        graphicsDevice == nullptr || createDevice == nullptr) {
++        return XR_ERROR_FUNCTION_UNSUPPORTED;
++    }
++    auto requirements = xrStruct<XrGraphicsRequirementsVulkanKHR>(XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR);
++    XrResult result = getRequirements(instance, system, &requirements);
++    if (XR_FAILED(result)) {
++        return result;
++    }
++    auto appInfo = vkStruct<VkApplicationInfo>(VK_STRUCTURE_TYPE_APPLICATION_INFO);
++    appInfo.pApplicationName = "cranvr swapchain churn";
++    appInfo.apiVersion = VK_API_VERSION_1_1;
++    auto instanceInfo = vkStruct<VkInstanceCreateInfo>(VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO);
++    instanceInfo.pApplicationInfo = &appInfo;
++    auto createInfo = xrStruct<XrVulkanInstanceCreateInfoKHR>(XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR);
++    createInfo.systemId = system;
++    createInfo.pfnGetInstanceProcAddr = vk.getInstanceProcAddr;
++    createInfo.vulkanCreateInfo = &instanceInfo;
++    VkResult vkResult = VK_SUCCESS;
++    result = createInstance(instance, &createInfo, &graphics->instance, &vkResult);
++    if (XR_FAILED(result) || vkResult != VK_SUCCESS) {
++        return XR_FAILED(result) ? result : XR_ERROR_RUNTIME_FAILURE;
++    }
++    auto getInfo = xrStruct<XrVulkanGraphicsDeviceGetInfoKHR>(XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR);
++    getInfo.systemId = system;
++    getInfo.vulkanInstance = graphics->instance;
++    if (XR_FAILED(result = graphicsDevice(instance, &getInfo, &graphics->physicalDevice))) {
++        return result;
++    }
++    float priority = 1.0f;
++    auto queueInfo = vkStruct<VkDeviceQueueCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO);
++    queueInfo.queueCount = 1;
++    queueInfo.pQueuePriorities = &priority;
++    auto deviceInfo = vkStruct<VkDeviceCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO);
++    deviceInfo.queueCreateInfoCount = 1;
++    deviceInfo.pQueueCreateInfos = &queueInfo;
++    auto deviceCreate = xrStruct<XrVulkanDeviceCreateInfoKHR>(XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR);
++    deviceCreate.systemId = system;
++    deviceCreate.pfnGetInstanceProcAddr = vk.getInstanceProcAddr;
++    deviceCreate.vulkanPhysicalDevice = graphics->physicalDevice;
++    deviceCreate.vulkanCreateInfo = &deviceInfo;
++    result = createDevice(instance, &deviceCreate, &graphics->device, &vkResult);
++    if (XR_FAILED(result) || vkResult != VK_SUCCESS) {
++        return XR_FAILED(result) ? result : XR_ERROR_RUNTIME_FAILURE;
++    }
++    const VkDevice device = graphics->device;
++    vk.getDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
++        vk.getInstanceProcAddr(graphics->instance, "vkGetDeviceProcAddr"));
++    vk.destroyInstance = reinterpret_cast<PFN_vkDestroyInstance>(
++        vk.getInstanceProcAddr(graphics->instance, "vkDestroyInstance"));
++#define LOAD_DEVICE(member, name) vk.member = reinterpret_cast<PFN_##name>(vk.getDeviceProcAddr(device, #name))
++    LOAD_DEVICE(getDeviceQueue, vkGetDeviceQueue);
++    LOAD_DEVICE(createCommandPool, vkCreateCommandPool);
++    LOAD_DEVICE(destroyCommandPool, vkDestroyCommandPool);
++    LOAD_DEVICE(allocateCommandBuffers, vkAllocateCommandBuffers);
++    LOAD_DEVICE(beginCommandBuffer, vkBeginCommandBuffer);
++    LOAD_DEVICE(endCommandBuffer, vkEndCommandBuffer);
++    LOAD_DEVICE(resetCommandBuffer, vkResetCommandBuffer);
++    LOAD_DEVICE(cmdPipelineBarrier, vkCmdPipelineBarrier);
++    LOAD_DEVICE(cmdClearColorImage, vkCmdClearColorImage);
++    LOAD_DEVICE(queueSubmit, vkQueueSubmit);
++    LOAD_DEVICE(createFence, vkCreateFence);
++    LOAD_DEVICE(destroyFence, vkDestroyFence);
++    LOAD_DEVICE(waitForFences, vkWaitForFences);
++    LOAD_DEVICE(resetFences, vkResetFences);
++    LOAD_DEVICE(deviceWaitIdle, vkDeviceWaitIdle);
++    LOAD_DEVICE(destroyDevice, vkDestroyDevice);
++#undef LOAD_DEVICE
++    vk.getDeviceQueue(device, 0, 0, &graphics->queue);
++    auto poolInfo = vkStruct<VkCommandPoolCreateInfo>(VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO);
++    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++    auto bufferInfo = vkStruct<VkCommandBufferAllocateInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO);
++    bufferInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++    bufferInfo.commandBufferCount = 3;
++    auto fenceInfo = vkStruct<VkFenceCreateInfo>(VK_STRUCTURE_TYPE_FENCE_CREATE_INFO);
++    if (vk.createCommandPool(device, &poolInfo, nullptr, &graphics->pool) != VK_SUCCESS ||
++        (bufferInfo.commandPool = graphics->pool, vk.allocateCommandBuffers(device, &bufferInfo, graphics->commands)) != VK_SUCCESS ||
++        vk.createFence(device, &fenceInfo, nullptr, &graphics->fence) != VK_SUCCESS) {
++        return XR_ERROR_RUNTIME_FAILURE;
++    }
++    binding->instance = graphics->instance;
++    binding->physicalDevice = graphics->physicalDevice;
++    binding->device = device;
++    binding->queueFamilyIndex = 0;
++    binding->queueIndex = 0;
++    return XR_SUCCESS;
++}
++
++// Clears one image of a Vulkan swapchain to a gray, all of its slices, and leaves it as a color attachment
++void recordClear(const Vk& vk, VkCommandBuffer commands, VkImage image, uint32_t slices) {
++    VkImageMemoryBarrier barrier = vkStruct<VkImageMemoryBarrier>(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER);
++    barrier.srcAccessMask = 0;
++    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barrier.image = image;
++    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, slices};
++    vk.cmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
++                          0, nullptr, 1, &barrier);
++    VkClearColorValue gray{};
++    gray.float32[0] = gray.float32[1] = gray.float32[2] = 0.25f;
++    gray.float32[3] = 1.0f;
++    vk.cmdClearColorImage(commands, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &gray, 1, &barrier.subresourceRange);
++    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++    barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++    barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++    vk.cmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0,
++                          nullptr, 0, nullptr, 1, &barrier);
++}
++
++// Polls the session's events until it is READY and begins it
++int beginSession(XrInstance instance, XrSession session) {
++    const double until = now() + 10.0;
++    while (now() < until) {
++        auto event = xrStruct<XrEventDataBuffer>(XR_TYPE_EVENT_DATA_BUFFER);
++        while (xrPollEvent(instance, &event) == XR_SUCCESS) {
++            if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED &&
++                reinterpret_cast<XrEventDataSessionStateChanged*>(&event)->state == XR_SESSION_STATE_READY) {
++                auto beginInfo = xrStruct<XrSessionBeginInfo>(XR_TYPE_SESSION_BEGIN_INFO);
++                beginInfo.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
++                const XrResult result = xrBeginSession(session, &beginInfo);
++                return XR_FAILED(result) ? fail("xrBeginSession", result) : 0;
++            }
++            event = xrStruct<XrEventDataBuffer>(XR_TYPE_EVENT_DATA_BUFFER);
++        }
++        Sleep(10);
++    }
++    return fail("the session never became READY", 0);
++}
++
++// One frame that shows the swapchain's last released image in both views
++int showFrame(XrSession session, Graphics& graphics, XrSwapchain swapchain, uint32_t width, uint32_t height, uint32_t slices) {
++    auto frameState = xrStruct<XrFrameState>(XR_TYPE_FRAME_STATE);
++    auto waitInfo = xrStruct<XrFrameWaitInfo>(XR_TYPE_FRAME_WAIT_INFO);
++    auto beginInfo = xrStruct<XrFrameBeginInfo>(XR_TYPE_FRAME_BEGIN_INFO);
++    XrResult result = xrWaitFrame(session, &waitInfo, &frameState);
++    if (XR_FAILED(result) || XR_FAILED(result = xrBeginFrame(session, &beginInfo))) {
++        return fail("xrWaitFrame or xrBeginFrame", result);
++    }
++    XrCompositionLayerProjectionView views[2] = {
++        xrStruct<XrCompositionLayerProjectionView>(XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW),
++        xrStruct<XrCompositionLayerProjectionView>(XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW)};
++    for (uint32_t eye = 0; eye < 2; ++eye) {
++        views[eye].pose.orientation.w = 1.0f;
++        views[eye].fov = {-0.8f, 0.8f, 0.8f, -0.8f};
++        views[eye].subImage.swapchain = swapchain;
++        views[eye].subImage.imageRect = {{0, 0}, {static_cast<int32_t>(width), static_cast<int32_t>(height)}};
++        views[eye].subImage.imageArrayIndex = slices > 1 ? eye : 0;
++    }
++    auto layer = xrStruct<XrCompositionLayerProjection>(XR_TYPE_COMPOSITION_LAYER_PROJECTION);
++    layer.space = graphics.space;
++    layer.viewCount = 2;
++    layer.views = views;
++    const XrCompositionLayerBaseHeader* layers[1] = {reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer)};
++    auto endInfo = xrStruct<XrFrameEndInfo>(XR_TYPE_FRAME_END_INFO);
++    endInfo.displayTime = frameState.predictedDisplayTime;
++    endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
++    endInfo.layerCount = frameState.shouldRender ? 1 : 0;
++    endInfo.layers = layers;
++    if (XR_FAILED(result = xrEndFrame(session, &endInfo))) {
++        return fail("xrEndFrame", result);
++    }
++    graphics.framesShown += endInfo.layerCount;
++    return 0;
++}
++
++// One swapchain: made, each image cleared once, the GPU waited for (or the swapchain shown in a frame
++// with --frames), destroyed
++int churnOnce(XrSession session, Graphics& graphics, int64_t format, uint32_t width, uint32_t height, uint32_t slices) {
++    const Vk& vk = graphics.vk;
++    if (graphics.fencePending) {
++        // The command buffers of the last swapchain's clears are used again below
++        vk.waitForFences(graphics.device, 1, &graphics.fence, VK_TRUE, 2000000000ull);
++        vk.resetFences(graphics.device, 1, &graphics.fence);
++        graphics.fencePending = false;
++    }
++    auto info = xrStruct<XrSwapchainCreateInfo>(XR_TYPE_SWAPCHAIN_CREATE_INFO);
++    info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
++                      XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
++    info.format = format;
++    info.sampleCount = 1;
++    info.width = width;
++    info.height = height;
++    info.faceCount = 1;
++    info.arraySize = slices;
++    info.mipCount = 1;
++    XrSwapchain swapchain = XR_NULL_HANDLE;
++    XrResult result = xrCreateSwapchain(session, &info, &swapchain);
++    if (XR_FAILED(result)) {
++        return fail("xrCreateSwapchain", result);
++    }
++    uint32_t count = 0;
++    xrEnumerateSwapchainImages(swapchain, 0, &count, nullptr);
++    std::vector<XrSwapchainImageD3D11KHR> d3dImages(count, xrStruct<XrSwapchainImageD3D11KHR>(XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR));
++    std::vector<XrSwapchainImageVulkanKHR> vkImages(count, xrStruct<XrSwapchainImageVulkanKHR>(XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR));
++    auto* images = graphics.vulkan ? reinterpret_cast<XrSwapchainImageBaseHeader*>(vkImages.data())
++                                   : reinterpret_cast<XrSwapchainImageBaseHeader*>(d3dImages.data());
++    if (count == 0 || count > 3 || XR_FAILED(result = xrEnumerateSwapchainImages(swapchain, count, &count, images))) {
++        return fail("xrEnumerateSwapchainImages", XR_FAILED(result) ? static_cast<long long>(result) : count);
++    }
++    for (uint32_t step = 0; step < count; ++step) {
++        uint32_t index = 0;
++        auto acquire = xrStruct<XrSwapchainImageAcquireInfo>(XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO);
++        auto wait = xrStruct<XrSwapchainImageWaitInfo>(XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO);
++        wait.timeout = XR_INFINITE_DURATION;
++        if (XR_FAILED(result = xrAcquireSwapchainImage(swapchain, &acquire, &index)) ||
++            XR_FAILED(result = xrWaitSwapchainImage(swapchain, &wait))) {
++            return fail("xrAcquireSwapchainImage or xrWaitSwapchainImage", result);
++        }
++        if (graphics.vulkan) {
++            VkCommandBuffer commands = graphics.commands[step];
++            auto begin = vkStruct<VkCommandBufferBeginInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
++            begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++            vk.resetCommandBuffer(commands, 0);
++            vk.beginCommandBuffer(commands, &begin);
++            recordClear(vk, commands, vkImages[index].image, slices);
++            vk.endCommandBuffer(commands);
++            auto submit = vkStruct<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);
++            submit.commandBufferCount = 1;
++            submit.pCommandBuffers = &commands;
++            // The last image's submission signals the fence after the earlier ones
++            const VkFence fence = step + 1 == count ? graphics.fence : VK_NULL_HANDLE;
++            if (vk.queueSubmit(graphics.queue, 1, &submit, fence) != VK_SUCCESS) {
++                return fail("vkQueueSubmit", 0);
++            }
++        } else {
++            for (uint32_t slice = 0; slice < slices; ++slice) {
++                auto viewInfo = D3D11_RENDER_TARGET_VIEW_DESC{};
++                viewInfo.Format = static_cast<DXGI_FORMAT>(format);
++                viewInfo.ViewDimension = slices > 1 ? D3D11_RTV_DIMENSION_TEXTURE2DARRAY : D3D11_RTV_DIMENSION_TEXTURE2D;
++                viewInfo.Texture2DArray.FirstArraySlice = slice;
++                viewInfo.Texture2DArray.ArraySize = 1;
++                ID3D11RenderTargetView* view = nullptr;
++                if (FAILED(graphics.d3d->CreateRenderTargetView(d3dImages[index].texture, &viewInfo, &view))) {
++                    return fail("CreateRenderTargetView", 0);
++                }
++                const float gray[4] = {0.25f, 0.25f, 0.25f, 1.0f};
++                graphics.context->ClearRenderTargetView(view, gray);
++                view->Release();
++            }
++        }
++        auto release = xrStruct<XrSwapchainImageReleaseInfo>(XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO);
++        if (XR_FAILED(result = xrReleaseSwapchainImage(swapchain, &release))) {
++            return fail("xrReleaseSwapchainImage", result);
++        }
++    }
++    if (graphics.frames) {
++        // The frame's GPU work, the clears and the runtime's copies of the slices, may still run
++        // while the swapchain goes
++        if (showFrame(session, graphics, swapchain, width, height, slices) != 0) {
++            return 1;
++        }
++        graphics.fencePending = graphics.vulkan;
++    } else if (graphics.vulkan) {
++        // The GPU's work on the images ends before the swapchain goes, as a game's does
++        vk.waitForFences(graphics.device, 1, &graphics.fence, VK_TRUE, 2000000000ull);
++        vk.resetFences(graphics.device, 1, &graphics.fence);
++    } else {
++        graphics.context->Flush();
++    }
++    if (XR_FAILED(result = xrDestroySwapchain(swapchain))) {
++        return fail("xrDestroySwapchain", result);
++    }
++    return 0;
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++    bool vulkan = false;
++    bool frames = false;
++    uint32_t cycles = 1000;
++    uint32_t height = 333;
++    uint32_t slices = 1;
++    std::string signal;
++    for (int index = 1; index < argc; ++index) {
++        if (std::strcmp(argv[index], "--vulkan") == 0) {
++            vulkan = true;
++        } else if (std::strcmp(argv[index], "--cycles") == 0 && index + 1 < argc) {
++            cycles = static_cast<uint32_t>(std::strtoul(argv[++index], nullptr, 10));
++        } else if (std::strcmp(argv[index], "--height") == 0 && index + 1 < argc) {
++            height = static_cast<uint32_t>(std::strtoul(argv[++index], nullptr, 10));
++        } else if (std::strcmp(argv[index], "--frames") == 0) {
++            frames = true;
++        } else if (std::strcmp(argv[index], "--width") == 0 && index + 1 < argc) {
++            gWidth = static_cast<uint32_t>(std::strtoul(argv[++index], nullptr, 10));
++        } else if (std::strcmp(argv[index], "--slices") == 0 && index + 1 < argc) {
++            slices = static_cast<uint32_t>(std::strtoul(argv[++index], nullptr, 10));
++        } else if (std::strcmp(argv[index], "--signal") == 0 && index + 1 < argc) {
++            signal = argv[++index];
++        } else {
++            std::printf("usage: swapchain_churn.exe [--vulkan] [--frames] [--cycles N] [--height H] [--width W] [--slices 1|2] "
++                        "[--signal FILE]\n");
++            return 2;
++        }
++    }
++    if (cycles == 0 || height == 0 || slices < 1 || slices > 2) {
++        return fail("the arguments", 0);
++    }
++
++    const char* extension = vulkan ? XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME : XR_KHR_D3D11_ENABLE_EXTENSION_NAME;
++    auto instanceInfo = xrStruct<XrInstanceCreateInfo>(XR_TYPE_INSTANCE_CREATE_INFO);
++    std::strncpy(instanceInfo.applicationInfo.applicationName, "cranvr swapchain churn", XR_MAX_APPLICATION_NAME_SIZE - 1);
++    instanceInfo.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
++    instanceInfo.enabledExtensionCount = 1;
++    instanceInfo.enabledExtensionNames = &extension;
++    XrInstance instance = XR_NULL_HANDLE;
++    XrResult result = xrCreateInstance(&instanceInfo, &instance);
++    if (XR_FAILED(result)) {
++        return fail("xrCreateInstance", result);
++    }
++    auto systemInfo = xrStruct<XrSystemGetInfo>(XR_TYPE_SYSTEM_GET_INFO);
++    systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
++    XrSystemId system = XR_NULL_SYSTEM_ID;
++    if (XR_FAILED(result = xrGetSystem(instance, &systemInfo, &system))) {
++        return fail("xrGetSystem", result);
++    }
++
++    Graphics graphics;
++    graphics.vulkan = vulkan;
++    auto d3dBinding = xrStruct<XrGraphicsBindingD3D11KHR>(XR_TYPE_GRAPHICS_BINDING_D3D11_KHR);
++    auto vkBinding = xrStruct<XrGraphicsBindingVulkanKHR>(XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR);
++    result = vulkan ? setUpVulkan(instance, system, &graphics, &vkBinding) : setUpD3D11(instance, system, &graphics, &d3dBinding);
++    if (XR_FAILED(result)) {
++        return fail(vulkan ? "the Vulkan device" : "the Direct3D 11 device", result);
++    }
++    auto sessionInfo = xrStruct<XrSessionCreateInfo>(XR_TYPE_SESSION_CREATE_INFO);
++    sessionInfo.next = vulkan ? static_cast<const void*>(&vkBinding) : static_cast<const void*>(&d3dBinding);
++    sessionInfo.systemId = system;
++    XrSession session = XR_NULL_HANDLE;
++    if (XR_FAILED(result = xrCreateSession(instance, &sessionInfo, &session))) {
++        return fail("xrCreateSession", result);
++    }
++    uint32_t formatCount = 0;
++    xrEnumerateSwapchainFormats(session, 0, &formatCount, nullptr);
++    std::vector<int64_t> formats(formatCount);
++    if (formatCount == 0 || XR_FAILED(result = xrEnumerateSwapchainFormats(session, formatCount, &formatCount, formats.data()))) {
++        return fail("xrEnumerateSwapchainFormats", result);
++    }
++    std::printf("swapchain_churn: %s, %u swapchains of 3 images, %u high, %u slice%s, format %lld%s\n",
++                vulkan ? "Vulkan" : "Direct3D 11", cycles, height, slices, slices == 1 ? "" : "s",
++                static_cast<long long>(formats[0]), frames ? ", each shown in a frame" : "");
++    std::fflush(stdout);
++    if (frames) {
++        auto spaceInfo = xrStruct<XrReferenceSpaceCreateInfo>(XR_TYPE_REFERENCE_SPACE_CREATE_INFO);
++        spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
++        spaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
++        if (XR_FAILED(result = xrCreateReferenceSpace(session, &spaceInfo, &graphics.space))) {
++            return fail("xrCreateReferenceSpace", result);
++        }
++        if (beginSession(instance, session) != 0) {
++            return 1;
++        }
++        graphics.frames = true;
++    }
++
++    // One swapchain first: the libraries make their caches and pools then, which the measurement leaves out
++    if (churnOnce(session, graphics, formats[0], widthOf(0), height, slices) != 0) {
++        return 1;
++    }
++    measure(signal, "warm");
++    const double start = now();
++    for (uint32_t index = 1; index <= cycles; ++index) {
++        if (churnOnce(session, graphics, formats[0], widthOf(index), height, slices) != 0) {
++            std::printf("swapchain_churn: swapchain %u of %u failed\n", index, cycles);
++            std::fflush(stdout);
++            measure(signal, "churned");
++            return 1;
++        }
++    }
++    const double seconds = now() - start;
++    measure(signal, "churned");
++    if (frames && graphics.framesShown == 0) {
++        return fail("no frame showed a swapchain (the session never rendered)", 0);
++    }
++
++    xrDestroySession(session);
++    xrDestroyInstance(instance);
++    if (vulkan) {
++        graphics.vk.deviceWaitIdle(graphics.device);
++        graphics.vk.destroyFence(graphics.device, graphics.fence, nullptr);
++        graphics.vk.destroyCommandPool(graphics.device, graphics.pool, nullptr);
++        graphics.vk.destroyDevice(graphics.device, nullptr);
++        graphics.vk.destroyInstance(graphics.instance, nullptr);
++    } else {
++        graphics.context->Release();
++        graphics.d3d->Release();
++    }
++    std::printf("swapchain_churn: %u swapchains in %.2f s, %.2f ms each", cycles, seconds, seconds / cycles * 1000.0);
++    if (frames) {
++        std::printf(", %u of them shown in a frame", graphics.framesShown);
++    }
++    std::printf("\n");
++    std::printf("swapchain_churn: PASS\n");
++    std::fflush(stdout);
++    return 0;
++}

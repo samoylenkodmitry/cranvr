@@ -8,7 +8,9 @@
 #                       [--host-arg ARG]... [--probe-arg ARG]... [--report FILE]
 #                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine | --hand-interaction [hand|both]
 #                        | --openvr-wine | --openvr-actions MODE | --openvr-overlay | --openvr-gl | --openvr-vulkan | --steamvr
-#                        | --xr-vulkan [enable2|enable1|array]] [--openvr-arg ARG]...
+#                        | --xr-vulkan [enable2|enable1|array]
+#                        | --swapchain-churn d3d11|d3d11-array|vulkan|vulkan-array [--churn-cycles N] [--churn-frames]]
+#                       [--openvr-arg ARG]...
 #                       [--displays N] [--hold] [--hand-hold] [--displays-in-game]
 #                       [--game-stall AT:FOR] [--moving]
 #                       [--pause AT:FOR] [--left-trigger AT:FOR] [--right-trigger AT:FOR]
@@ -82,6 +84,21 @@
 #                 in the windows after the first) and the colors of each eye in the host's copy of the eyes. It works with
 #                 --quest too. Set CRANVR_HOME to a stack that scripts/setup-wine.sh built with the runtime and the Wine
 #                 files to test.
+#   --swapchain-churn d3d11|d3d11-array|vulkan|vulkan-array  a leak test of swapchain images: C:\basalt\runtime\swapchain_churn.exe
+#                 runs in Wine and creates and destroys a swapchain of three images --churn-cycles times (default 1000) through
+#                 Direct3D 11 or Vulkan (-array: swapchains with two slices). Its images are 333 pixels high, which no
+#                 game uses, and of a new width each time. The run measures the program's memory footprint (`footprint`)
+#                 and the live global IOSurfaces of that height (scripts/iosurfaces.py) after the first swapchain and
+#                 after the last one, and the IOSurfaces once more after the program ended. It fails when the IOSurfaces
+#                 of the destroyed swapchains stay, also in another process such as launchd or the host, or when the
+#                 IOSurfaces of the footprint ("IOSurface" and "Owned physical footprint (unmapped)") grew by more than a
+#                 twentieth of the memory that the swapchains had. The whole footprint moves with the GPU memory that Metal
+#                 makes purgeable: the run reports it. The run lasts 10 s.
+#                 --churn-frames shows each swapchain in one frame and destroys it right after xrEndFrame, while the GPU
+#                 may still draw the frame and copy its slices: the runtime must keep the images until the GPU is done,
+#                 and the host gets each swapchain's frame. The runtime paces the frames, so the default is then 120
+#                 swapchains (a second at 120 Hz).
+#                 Set CRANVR_HOME to a stack that scripts/setup-wine.sh built with the runtime and DXMT to test.
 #   --steamvr     the same program through SteamVR for Windows and cranvr's driver (steamvr/driver_cranvr.cpp):
 #                 scripts/run-game.sh writes the OpenVR path file for CRANVR_OPENVR=steamvr, and the program's
 #                 VR_Init starts SteamVR from the prefix's Steam library. The checks are those of --openvr-wine. The
@@ -196,17 +213,17 @@ unsetopt BG_NICE
 
 root=${0:A:h:h}
 source "${root}/scripts/guardian.sh"
-seconds=20 fps=120 fps_given=0 game=0 desktop=0 sound=0 client=mac serial="" report=""
+seconds=20 seconds_given=0 fps=120 fps_given=0 game=0 desktop=0 sound=0 client=mac serial="" report=""
 displays=1 hold=0 hand_hold=0 displays_in_game=0 display_test=0
 tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 hand_interaction="" openvr_wine=0 openvr_actions="" openvr_overlay=0 openvr_gl=0 steamvr=0 face_source=audio
-openvr_vulkan=0 openvr_args=() xr_vulkan=""
+openvr_vulkan=0 openvr_args=() xr_vulkan="" swapchain_churn="" churn_cycles=1000 churn_cycles_given=0 churn_frames=0
 game_stall="" moving=0
 wine="" wine_args=()
 native_tcp=0 native_drop=0 native_port=9950 pause="" left_trigger="" right_trigger="" cable="" room=scene
 more_host_args=() more_probe_args=()
 while (( $# )); do
     case $1 in
-        --seconds) seconds=$2; shift 2 ;;
+        --seconds) seconds=$2; seconds_given=1; shift 2 ;;
         --fps) fps=$2; fps_given=1; shift 2 ;;
         --game) game=1; shift ;;
         --moving) game=1 moving=1; shift ;;
@@ -229,6 +246,11 @@ while (( $# )); do
             xr_vulkan=enable2; shift
             if (( $# )) && [[ $1 != --* ]]; then xr_vulkan=$1; shift; fi
             [[ ${xr_vulkan} == (enable2|enable1|array) ]] || { print -u2 "--xr-vulkan takes enable2, enable1 or array"; exit 2; } ;;
+        --swapchain-churn)
+            swapchain_churn=$2; shift 2
+            [[ ${swapchain_churn} == (d3d11|d3d11-array|vulkan|vulkan-array) ]] || { print -u2 "--swapchain-churn takes d3d11, d3d11-array, vulkan or vulkan-array"; exit 2; } ;;
+        --churn-cycles) churn_cycles=$2; churn_cycles_given=1; shift 2 ;;
+        --churn-frames) churn_frames=1; shift ;;
         --steamvr) openvr_wine=1 steamvr=1; shift ;;
         --openvr-actions)
             openvr_wine=1 openvr_actions=$2; shift 2
@@ -360,6 +382,21 @@ if [[ -n ${hand_interaction} ]]; then
     wine='C:\basalt\runtime\hand_interaction_smoke.exe'
     wine_args=(--words "Z:${words//\//\\}" --profiles "${hand_interaction}")
     (( seconds >= 45 )) || seconds=45
+fi
+if [[ -n ${swapchain_churn} ]]; then
+    # The program stops after its first and after its last swapchain until the run has measured it (see below)
+    churn_signal=${work}/churn-signal
+    churn_height=333
+    (( churn_frames && ! churn_cycles_given )) && churn_cycles=120
+    wine='C:\basalt\runtime\swapchain_churn.exe'
+    wine_args=(--cycles "${churn_cycles}" --height "${churn_height}" --signal "Z:${churn_signal//\//\\}")
+    case ${swapchain_churn} in
+        d3d11-array) wine_args+=(--slices 2) ;;
+        vulkan) wine_args+=(--vulkan) ;;
+        vulkan-array) wine_args+=(--vulkan --slices 2) ;;
+    esac
+    (( churn_frames )) && wine_args+=(--frames)
+    (( seconds_given )) || seconds=10
 fi
 report=${report:-${work}/report.json}
 print "Building the host and the probe (log: ${work}/build.log)"
@@ -549,12 +586,59 @@ if (( game )); then
     pids+=(${game_pid})
 fi
 
+# The live IOSurfaces of the leak test's height, as "COUNT BYTES"
+churn_count() {
+    python3 -I "${root}/scripts/iosurfaces.py" "${churn_height}"
+}
+if [[ -n ${swapchain_churn} ]]; then
+    # Surfaces of the height that an earlier run left in launchd stay until the user logs out: the run compares with
+    # this count. Each line of churn.txt: the stage, the program's footprint and its IOSurface part in bytes, the count of
+    # the surfaces and their bytes.
+    print "start 0 0 $(churn_count)" > "${work}/churn.txt"
+fi
 if [[ -n ${wine} ]]; then
     print -r "Starting ${wine} in Wine (log: ${work}/game.log)"
     mute=(--mute)
     (( sound )) && mute=()
     CRANVR_CONTROL=${work}/config/runtime-control.txt "${root}/scripts/run-game.sh" "${mute[@]}" "${wine}" "${wine_args[@]}" \
         > "${work}/game.log" 2>&1 &
+    pids+=($!)
+fi
+if [[ -n ${swapchain_churn} ]]; then
+    # The program waits at each stop until the run has measured it
+    (
+        warm="0 0"
+        for stage in warm churned; do
+            for i in {1..1200}; do
+                grep -q "swapchain_churn: measure ${stage}" "${work}/game.log" 2>/dev/null && break
+                grep -qE "swapchain_churn: (PASS|FAIL)" "${work}/game.log" 2>/dev/null && exit 0
+                sleep 0.05
+            done
+            count=$(churn_count)
+            # The surfaces go a few milliseconds after their last owner, and the host lets go of a swapchain's images when
+            # its frame loop takes the event: the count gets a second to come down to the count after the first swapchain
+            if [[ ${stage} == churned ]]; then
+                for i in {1..20}; do
+                    (( ${count%% *} <= ${warm%% *} )) && break
+                    sleep 0.05
+                    count=$(churn_count)
+                done
+            fi
+            pid=$(pgrep -f '^C:.basalt.runtime.swapchain_churn.exe' | head -1)
+            # The whole footprint moves with the GPU memory that Metal makes purgeable ("(graphics)"). The process's
+            # IOSurfaces count in two categories: "IOSurface" for those mapped into it (MoltenVK maps its images) and
+            # "Owned physical footprint (unmapped)" for the rest (DXMT's). The categories stay beside the report.
+            footprint -p "${pid:-0}" -f bytes > "${work}/footprint-${stage}.txt" 2>/dev/null || true
+            bytes=$(awk '/phys_footprint:/ { print $2; exit }' "${work}/footprint-${stage}.txt")
+            mapped=$(awk '$2 == "B" && $4 == "B" && $6 == "B" {
+                category = $8; for (i = 9; i <= NF; i++) category = category " " $i
+                if (category == "IOSurface" || category == "Owned physical footprint (unmapped)") sum += $1
+            } END { print sum + 0 }' "${work}/footprint-${stage}.txt")
+            print "${stage} ${bytes:-0} ${mapped:-0} ${count}" >> "${work}/churn.txt"
+            [[ ${stage} == warm ]] && warm=${count}
+            : > "${churn_signal}.${stage}"
+        done
+    ) &
     pids+=($!)
 fi
 # SteamVR goes on drawing its own room after the program ends, so the host's last eyes are SteamVR's. The run keeps
@@ -839,6 +923,57 @@ for eye in ("left", "right"):
 sys.exit(1 if bad else 0)
 PYTHON
 fi
+churn_exit=0
+if [[ -n ${swapchain_churn} ]]; then
+    for i in {1..60}; do
+        grep -qE "swapchain_churn: (PASS|FAIL)" "${work}/game.log" && break
+        sleep 0.5
+    done
+    grep -h "swapchain_churn:" "${work}/game.log" || true
+    grep -q "swapchain_churn: PASS" "${work}/game.log" || { print -u2 "The swapchain program did not pass; see ${work}/game.log"; churn_exit=1; }
+    # After the program's end only another process can hold its surfaces: launchd for a registered Mach port, or the host
+    started=$(awk '$1 == "start" { print $4 }' "${work}/churn.txt")
+    for i in {1..20}; do
+        count=$(churn_count)
+        (( ${count%% *} <= ${started:-0} )) && break
+        sleep 0.1
+    done
+    print "exited 0 0 ${count}" >> "${work}/churn.txt"
+    python3 -I - "${work}/churn.txt" "${churn_cycles}" "${churn_height}" "${swapchain_churn}" <<'PYTHON' || churn_exit=1
+import sys
+stages = {}
+for line in open(sys.argv[1]):
+    name, footprint, mapped, count, size = line.split()
+    stages[name] = (int(footprint), int(count), int(size), int(mapped))
+cycles, height, mode = int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+slices = 2 if mode.endswith("-array") else 1
+# The IOSurfaces that the swapchains had: three images of 256 to 510 pixels across (swapchain_churn.cpp), a surface per slice
+made = sum(3 * slices * (256 + 2 * (index % 128)) * 4 * height for index in range(1, cycles + 1))
+missing = [name for name in ("start", "warm", "churned", "exited") if name not in stages]
+if missing:
+    print("churn: the run did not measure %s" % ", ".join(missing), file=sys.stderr)
+    sys.exit(1)
+mb = lambda value: value / 1048576.0
+start, warm, churned, exited = (stages[name] for name in ("start", "warm", "churned", "exited"))
+grown = churned[3] - warm[3]
+print("churn: %d swapchains (%s); IOSurfaces %d high: %d before the program, %d after its first swapchain, %d after its last, %d after its end (%.1f MB)"
+      % (cycles, mode, height, start[1], warm[1], churned[1], exited[1], mb(exited[2])))
+print("churn: the program's footprint %.1f MB after its first swapchain, %.1f MB after its last; its IOSurfaces %.1f MB and %.1f MB (%+.1f MB); "
+      "the swapchains had %.0f MB of IOSurfaces" % (mb(warm[0]), mb(churned[0]), mb(warm[3]), mb(churned[3]), mb(grown), mb(made)))
+bad = []
+if churned[1] > warm[1]:
+    bad.append("%d IOSurfaces of destroyed swapchains stay while the program runs" % (churned[1] - warm[1]))
+if exited[1] > start[1]:
+    bad.append("%d IOSurfaces stay after the program ended" % (exited[1] - start[1]))
+if warm[0] == 0 or churned[0] == 0:
+    bad.append("the footprint of the program was not measured")
+elif grown > made / 20:
+    bad.append("the IOSurfaces of the footprint grew by %.1f MB, more than a twentieth of the swapchains" % mb(grown))
+for problem in bad:
+    print("churn: " + problem, file=sys.stderr)
+sys.exit(1 if bad else 0)
+PYTHON
+fi
 hand_interaction_exit=0
 if [[ -n ${hand_interaction} ]]; then
     # The Windows program ends on its own: wait for its verdict
@@ -1012,6 +1147,11 @@ python3 -I "${root}/scripts/e2e-report.py" "${work}/host.out" "${fps}" "${report
 [[ -z ${pause} ]] || result=0
 # A stall empties some of the host's 5-second windows in the same way: the stall check counts
 [[ -z ${game_stall} ]] || result=0
+# The leak test runs too short for the report's windows of the stream: its own checks count
+if [[ -n ${swapchain_churn} ]]; then
+    print "churn: the stream's verdict above does not count; the leak test's checks do"
+    result=0
+fi
 (( client_exit == 0 )) || result=1
 (( mouse_exit == 0 )) || result=1
 (( game_exit == 0 )) || result=1
@@ -1019,6 +1159,7 @@ python3 -I "${root}/scripts/e2e-report.py" "${work}/host.out" "${fps}" "${report
 (( hand_interaction_exit == 0 )) || result=1
 (( openvr_exit == 0 )) || result=1
 (( xr_vulkan_exit == 0 )) || result=1
+(( churn_exit == 0 )) || result=1
 (( displays_exit == 0 )) || result=1
 grep -hE "probe: (done|frame arrival|native|desktop|audio|pause test|displays|in-game displays|[0-9.]+ s: the focus)" "${work}/probe.log" 2>/dev/null || true
 print "Report: ${report}"

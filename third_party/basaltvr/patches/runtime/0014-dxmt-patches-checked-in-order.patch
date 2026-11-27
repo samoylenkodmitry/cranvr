@@ -1,0 +1,25 @@
+diff --git a/runtime/scripts/build-dxmt-fork.zsh b/runtime/scripts/build-dxmt-fork.zsh
+index 1ff6aa2..05eb718 100755
+--- a/runtime/scripts/build-dxmt-fork.zsh
++++ b/runtime/scripts/build-dxmt-fork.zsh
+@@ -122,12 +122,18 @@ else
+     git -C "${src_dir}" submodule update --init include/native/directx
+     # Check every patch before applying any, so a bad set cannot leave the
+     # tree half-patched and wedge later runs on the dirty-tree refusal.
++    # cranvr: a later patch may change lines that an earlier one added, so the
++    # check applies the set in order to a scratch index, not to the tree.
++    check_index=$(mktemp)
++    GIT_INDEX_FILE=${check_index} git -C "${src_dir}" read-tree HEAD
+     for patch in "${patches_dir}"/*.patch; do
+-        if ! git -C "${src_dir}" apply --check "${patch}"; then
+-            print -u2 "FAIL: ${patch:t} does not apply to ${dxmt_tag}; tree left untouched."
++        if ! GIT_INDEX_FILE=${check_index} git -C "${src_dir}" apply --cached "${patch}"; then
++            rm -f "${check_index}"
++            print -u2 "FAIL: ${patch:t} does not apply to ${dxmt_tag} after the patches before it; tree left untouched."
+             exit 1
+         fi
+     done
++    rm -f "${check_index}"
+     for patch in "${patches_dir}"/*.patch; do
+         # --index stages exactly the patch's changes (including added files)
+         # without sweeping up unrelated untracked build output.
