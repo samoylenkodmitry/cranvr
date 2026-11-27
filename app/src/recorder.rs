@@ -61,8 +61,6 @@ const VIDEOS: &str = "/sdcard/Oculus/VideoShots";
 const LEAST_FREE: u64 = 5_000_000_000;
 /// How often the thread looks at the cable and the disk
 const LOOK_EVERY: Duration = Duration::from_secs(2);
-/// A file that grows in this time belongs to a recording that runs
-const GROWTH_WAIT: Duration = Duration::from_millis(1500);
 /// The longest wait for the recorder's file after its start
 const START_WAIT: Duration = Duration::from_secs(6);
 /// The longest wait for the headset's recorder to finish its file after the stop
@@ -113,11 +111,36 @@ impl View {
     }
 }
 
-/// A video in the headset's folder and its size in bytes
+/// A video in the headset's folder, its size in bytes, and whether its recorder still writes it
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Video {
     pub name: String,
     pub bytes: u64,
+    #[serde(default)]
+    pub writing: bool,
+}
+
+/// Whether the first bytes of an MP4 file say that its writer still writes it. The headset's recorder
+/// (Android's MPEG4Writer) starts a file with `ftyp` and `free` boxes that keep room, and writes the
+/// `mdat` box's header and the `moov` box only at its stop: a file whose boxes hold neither is still
+/// being recorded. Its size alone says little: the recorder writes its first data about 5 s after the
+/// start, and then in pieces (2026-11-27). A file of other boxes is no recording of the headset's.
+pub(crate) fn mp4_writing(header: &[u8]) -> bool {
+    if header.len() < 8 {
+        return true;
+    }
+    let mut at = 0;
+    while at + 8 <= header.len() {
+        let size = u32::from_be_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]]) as usize;
+        match &header[at + 4..at + 8] {
+            // An mdat of unknown length is still written
+            b"mdat" => return size == 0 || (size == 1 && header.get(at + 8..at + 16).is_some_and(|large| large.iter().all(|byte| *byte == 0))),
+            b"moov" => return false,
+            b"ftyp" | b"free" | b"skip" | b"wide" if size >= 8 => at += size,
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// The sound of a recording that runs: a process of the host's binary
@@ -380,12 +403,10 @@ impl<D: Device, O: Out> Recorder<D, O> {
         new.or(larger).map(|video| video.name.clone())
     }
 
-    /// The video that grows on the headset now, by two looks `GROWTH_WAIT` apart, with the second look
+    /// The video that the headset's recorder writes now, with the list of videos
     fn growing(&self, serial: &str) -> Result<(Option<String>, Vec<Video>), String> {
-        let before = self.device.videos(serial)?;
-        self.device.wait(GROWTH_WAIT);
         let now = self.device.videos(serial)?;
-        Ok((Self::grown(&before, &now), now))
+        Ok((now.iter().filter(|video| video.writing).map(|video| video.name.clone()).max(), now))
     }
 
     fn start(&mut self, microphone: bool) -> Result<Running, String> {
@@ -413,11 +434,12 @@ impl<D: Device, O: Out> Recorder<D, O> {
             return Err(format!("the headset's recorder: {e}"));
         }
         sound.mark_start();
-        // The start counts once the recorder's file grows
+        // The start counts once the recorder writes its file
         let started = Instant::now();
         while started.elapsed() < START_WAIT {
             self.device.wait(POLL);
-            if let Some(video) = self.device.videos(&serial).ok().and_then(|now| Self::grown(&journal.before, &now)) {
+            let now = self.device.videos(&serial).unwrap_or_default();
+            if let Some(video) = now.iter().filter(|video| video.writing).map(|video| video.name.clone()).max().or_else(|| Self::grown(&journal.before, &now)) {
                 journal.video = Some(video);
                 journal.write(&dir);
                 return Ok(Running { dir, journal, sound, missing: 0, cable_out: false });
@@ -435,8 +457,7 @@ impl<D: Device, O: Out> Recorder<D, O> {
         let Some(mut running) = self.running.take() else { return };
         let serial = running.journal.serial.clone();
         if let Err(e) = self.device.recorder(&serial, "stop") {
-            // A recorder that stopped by itself, such as from the headset's own menu, has a file that no
-            // longer grows
+            // A recorder that stopped by itself, such as from the headset's own menu, has a whole file
             let grows = self.growing(&serial).map(|(grows, _)| grows.is_some()).unwrap_or(true);
             if grows {
                 self.running = Some(running);
@@ -545,7 +566,8 @@ impl<D: Device, O: Out> Recorder<D, O> {
         Ok((out, numbers))
     }
 
-    /// The headset's video `name` once its recorder has finished writing it: its size held for a look
+    /// The headset's video `name` once its recorder has finished writing it: its header is whole and
+    /// its size held for a look
     fn whole(&self, serial: &str, name: &str) -> Result<Video, Unsaved> {
         let started = Instant::now();
         let mut last: Option<Video> = None;
@@ -554,7 +576,7 @@ impl<D: Device, O: Out> Recorder<D, O> {
             let Some(video) = now.into_iter().find(|video| video.name == name) else {
                 return Err(Unsaved::Never(format!("the headset's file {name} is gone")));
             };
-            if last.as_ref() == Some(&video) {
+            if !video.writing && last.as_ref() == Some(&video) {
                 return Ok(video);
             }
             last = Some(video);
@@ -562,6 +584,15 @@ impl<D: Device, O: Out> Recorder<D, O> {
         }
         Err(Unsaved::Later(format!("the headset's file {name} still grew after {} s", FILE_WAIT.as_secs())))
     }
+}
+
+/// A line of the headset's list of videos: `SIZE xHEX NAME`
+fn parse_video(line: &str) -> Option<Video> {
+    let (bytes, rest) = line.split_once(' ')?;
+    let (hex, name) = rest.split_once(' ')?;
+    let hex = hex.strip_prefix('x')?;
+    let header: Vec<u8> = (0..hex.len() / 2).filter_map(|at| u8::from_str_radix(hex.get(at * 2..at * 2 + 2)?, 16).ok()).collect();
+    Some(Video { name: name.to_string(), bytes: bytes.parse().ok()?, writing: mp4_writing(&header) })
 }
 
 /// A reason of a failure that a later try may not have
@@ -838,18 +869,16 @@ impl Device for Real {
     }
 
     fn videos(&self, serial: &str) -> Result<Vec<Video>, String> {
-        // A folder that does not exist yet holds no videos: the headset has recorded nothing yet
-        let line = format!("cd {VIDEOS} 2> /dev/null && for f in *.mp4; do [ -e \"$f\" ] && stat -c '%s %n' \"$f\"; done; echo end");
+        // A folder that does not exist yet holds no videos: the headset has recorded nothing yet. Each
+        // line holds a video's size, its first 64 bytes in hex and its name.
+        let line = format!("cd {VIDEOS} 2> /dev/null && for f in *.mp4; do [ -e \"$f\" ] && echo \"$(stat -c %s \"$f\") x$(head -c 64 \"$f\" | od -An -tx1 | tr -d ' \\n') $f\"; done; echo end");
         let listed = Self::adb(serial, &["shell", &line], ADB_CALL)?;
         if !listed.lines().any(|line| line.trim() == "end") {
             return Err(format!("the headset's list of videos ended early: {}", listed.trim()));
         }
         Ok(listed
             .lines()
-            .filter_map(|line| {
-                let (bytes, name) = line.trim().split_once(' ')?;
-                Some(Video { name: name.to_string(), bytes: bytes.parse().ok()? })
-            })
+            .filter_map(|line| parse_video(line.trim()))
             .collect())
     }
 

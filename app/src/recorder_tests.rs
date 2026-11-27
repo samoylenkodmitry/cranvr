@@ -1,4 +1,4 @@
-use super::{local_stamp, Device, Journal, Out, Phase, Recorder, Sound, Video, View, CABLE_OUT, JOURNAL, OUT_LOOKS};
+use super::{local_stamp, mp4_writing, parse_video, Device, Journal, Out, Phase, Recorder, Sound, Video, View, CABLE_OUT, JOURNAL, OUT_LOOKS};
 use serde_json::{json, Value};
 use std::{
     path::{Path, PathBuf},
@@ -68,8 +68,10 @@ impl Device for Fake {
         if !quest.on_cable {
             return Err("no device".into());
         }
-        if let Some(name) = quest.recording.clone() {
-            if let Some(video) = quest.files.iter_mut().find(|video| video.name == name) {
+        let recording = quest.recording.clone();
+        for video in &mut quest.files {
+            video.writing = recording.as_ref() == Some(&video.name);
+            if video.writing {
                 video.bytes += 1000;
             }
         }
@@ -86,7 +88,7 @@ impl Device for Fake {
                 quest.starts += 1;
                 let name = quest.append_to.clone().unwrap_or_else(|| format!("dev.cranvr.client-2026112{}-0.mp4", quest.starts));
                 if !quest.files.iter().any(|video| video.name == name) {
-                    quest.files.push(Video { name: name.clone(), bytes: 0 });
+                    quest.files.push(Video { name: name.clone(), bytes: 0, writing: true });
                 }
                 quest.recording = Some(name);
             }
@@ -202,7 +204,7 @@ fn a_press_starts_a_recording_and_the_next_press_saves_it() {
 #[test]
 fn a_start_while_the_headsets_recorder_records_refuses() {
     let (fake, movies) = (Fake::new(), Movies::new("busy"));
-    fake.quest().files.push(Video { name: "dev.cranvr.client-20261127-131219-0.mp4".into(), bytes: 5000 });
+    fake.quest().files.push(Video { name: "dev.cranvr.client-20261127-131219-0.mp4".into(), bytes: 5000, writing: true });
     fake.quest().recording = Some("dev.cranvr.client-20261127-131219-0.mp4".into());
     let (mut recorder, lines) = recorder(&fake, &movies);
     recorder.press(false);
@@ -259,7 +261,7 @@ fn a_quit_stops_the_recorder_and_the_next_start_saves_the_recording() {
 fn a_file_of_an_earlier_name_that_grew_counts() {
     let (fake, movies) = (Fake::new(), Movies::new("grew"));
     let old = "dev.cranvr.client-20261127-120000-0.mp4";
-    fake.quest().files.push(Video { name: old.into(), bytes: 5000 });
+    fake.quest().files.push(Video { name: old.into(), bytes: 5000, writing: false });
     fake.quest().append_to = Some(old.into());
     let (mut recorder, lines) = recorder(&fake, &movies);
     recorder.press(false);
@@ -408,4 +410,26 @@ fn the_stamp_is_the_local_date_and_time() {
     let parts: Vec<&str> = stamp.split('-').collect();
     assert_eq!(parts.iter().map(|part| part.len()).collect::<Vec<_>>(), vec![4, 2, 2, 6], "{stamp}");
     assert!(stamp.chars().all(|c| c.is_ascii_digit() || c == '-'), "{stamp}");
+}
+
+fn hex(text: &str) -> Vec<u8> {
+    (0..text.len() / 2).map(|at| u8::from_str_radix(&text[at * 2..at * 2 + 2], 16).unwrap()).collect()
+}
+
+// The first 64 bytes of the headset's own files on 2026-11-27: one that the recorder still wrote
+// (2.6 MB, 4 s in), and the owner's whole recording of 13:12 (697 MB)
+const WRITTEN: &str = "0000001c667479706d703431000002006d70343169736f366d70343100000008667265650000002466726565";
+const WHOLE: &str = "0000001c667479706d703431000002006d70343169736f366d70343100000008667265652981aeea6d6461740000001c667479706d703431000002006d703431";
+
+#[test]
+fn the_header_says_whether_the_headsets_recorder_still_writes_a_file() {
+    assert!(mp4_writing(&hex(WRITTEN)), "ftyp and free boxes alone: the recorder writes on");
+    assert!(!mp4_writing(&hex(WHOLE)), "an mdat of a known length: a whole file");
+    assert!(mp4_writing(&[]), "a file that the recorder just made");
+    // A file that the recorder did not make, such as a copied video with its moov first
+    assert!(!mp4_writing(&hex("0000001c667479706d703431000002006d70343169736f366d7034310000ffff6d6f6f76")));
+    assert!(!mp4_writing(b"not a video at all"));
+    let line = format!("2621512 x{WRITTEN} dev.cranvr.client-20261127-141739-0.mp4");
+    assert_eq!(parse_video(&line), Some(Video { name: "dev.cranvr.client-20261127-141739-0.mp4".into(), bytes: 2_621_512, writing: true }));
+    assert_eq!(parse_video(&format!("696810515 x{WHOLE} a.mp4")).map(|video| video.writing), Some(false));
 }

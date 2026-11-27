@@ -7,8 +7,8 @@
 # 30 s of silence after the app's start, then the files of SOUNDS one after another.
 #
 # The checks, in this order (CHECKS names some of them, as a comma list):
-#   row      the hand menu's row "Record what I see": the scripted build presses the 3D ball, the
-#            row's Record and 9 s later its Stop (`scripted_pointer=record_row`)
+#   row      the hand menu's row "Record what I see": the scripted build presses the row's Record on
+#            the menu in front of the user and 9 s later its Stop (`scripted_pointer=record_row`)
 #   busy     a start while the headset's own recorder records refuses, and touches nothing of it
 #   mic      the setting "Microphone in recordings" on, a recording of 5 s, the setting off
 #   disk     a recording stops by itself when the free disk reads under 5 GB (CRANVR_TEST_FREE_DISK)
@@ -135,11 +135,11 @@ print("  picture", n.get("width"), "x", n.get("height"), "at", n.get("fps"), "fp
         print "  no recording was saved"
     fi
 }
+# Whether the headset's recorder writes a file now: the file's boxes hold no mdat yet (recorder.rs)
 headset_grows() {
-    local first=$(headset_videos) second
-    sleep 1.5
-    second=$(headset_videos)
-    [[ ${first} != ${second} ]] && print yes || print no
+    local line
+    line=$(${adb_cmd} shell "cd ${videos} 2> /dev/null && for f in *.mp4; do [ -e \"\$f\" ] && head -c 48 \"\$f\" | od -An -tx1 | tr -d ' \\n' && echo; done" 2> /dev/null | tr -d '\r' | grep -v '^$' | grep -cv '6d646174')
+    (( line > 0 )) && print yes || print no
 }
 lan=$(ipconfig getifaddr en0 || ipconfig getifaddr en1)
 forget=127.0.0.1:${port}${lan:+,${lan}:${port}}
@@ -157,7 +157,7 @@ ${adb_cmd} logcat -c
 scripted=()
 [[ ${checks} == *,row,* ]] && scripted=(--es scripted_pointer record_row --ei record_ms 9000)
 client_start ${host_log} --es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room scene --es theme amber --ez save_choices false \
-    --es panels hidden --ez console false --es interface 3d --ez default_places true --es forget_host_key ${forget} ${scripted}
+    --es panels hidden --ez console false --es interface flat --es hand_menu open --ez default_places true --es forget_host_key ${forget} ${scripted}
 print "client: ${client_result} ${client_linked}"
 [[ ${client_result} == alive ]] || exit 1
 
@@ -165,7 +165,8 @@ if [[ ${checks} == *,row,* ]]; then
     print "== row: the hand menu's row"
     at=$(lines)
     wait_line "started" 40 ${at} && wait_line "saved " 40 ${at}
-    ${adb_cmd} logcat -d -s Cranpose 2> /dev/null | grep -E "scripted record row|hand menu (toggles|cannot)" | sed -E 's/^[0-9-]+ ([0-9:.]+) .*cranvr_client::[a-z_:]+: /  \1 /'
+    ${adb_cmd} logcat -d -v time > ${work}/client-row.log
+    grep -E "scripted record row|hand menu|the Mac's recording" ${work}/client-row.log | sed -E 's/^[0-9-]+ ([0-9:.]+) .*cranvr_client::[a-z_:]+: /  \1 /' | cut -c1-220
     report
 fi
 if [[ ${checks} == *,busy,* ]]; then

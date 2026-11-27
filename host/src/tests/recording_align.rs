@@ -102,6 +102,19 @@ fn a_mac_sound_of_the_first_part_alone_still_finds_the_lag() {
     assert!(close(found.offset_s, 0.25, 0.0015), "{found:?}");
 }
 
+// A kill of the app 6 s into a recording on 2026-11-27: the Mac's sound lasts 6 s, the headset's
+// file 10.6 s, and the headset heard other sound after the kill. The short Mac sound still finds
+// its lag.
+#[test]
+fn a_mac_sound_shorter_than_a_window_still_finds_the_lag() {
+    let source = game_sound(12, 9);
+    let played = source[..6 * RATE].to_vec();
+    let mut heard = heard(&source, 0.6 * RATE as f64, 0.0, 0.6, 5 * RATE);
+    heard.extend(game_sound(6, 10).into_iter().map(|sample| sample / 2));
+    let found = align(&heard, 0.0, &played).expect("a lag");
+    assert!(close(found.offset_s, 0.6, 0.0015), "{found:?}");
+}
+
 // The headset's sound starts 65 ms into the file, as in the headset's own recordings
 #[test]
 fn the_start_of_the_headsets_sound_in_its_file_counts() {

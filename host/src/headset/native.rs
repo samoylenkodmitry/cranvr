@@ -220,14 +220,15 @@ pub fn start(config: Config) -> std::io::Result<(Arc<dyn Headset>, Box<dyn Event
     }
     // A headset's USB network to this Mac has IPv6 link-local addresses only. Without this
     // listener the headset still reaches the host over Wi-Fi and `adb reverse`.
-    let cable_listener = match HostListener::bind_ipv6(config.port, config.identity.clone()) {
-        _ if config.loopback => None,
-        Ok(listener) => {
+    // A loopback host binds nothing beyond 127.0.0.1
+    let cable_listener = match (!config.loopback).then(|| HostListener::bind_ipv6(config.port, config.identity.clone())) {
+        None => None,
+        Some(Ok(listener)) => {
             let listener = listener.share_cable_switch(Arc::clone(&config.cable));
             info!("Native protocol: listening on [::]:{} for a headset's USB network", config.port);
             Some(listener)
         }
-        Err(e) => {
+        Some(Err(e)) => {
             warn!("Native protocol: no IPv6 listener on port {}: {e}. A headset's USB network cannot reach this host.", config.port);
             None
         }

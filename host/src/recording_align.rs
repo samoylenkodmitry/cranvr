@@ -79,8 +79,10 @@ struct Found {
 pub fn align(heard: &[i16], heard_start: f64, played: &[i16]) -> Option<Alignment> {
     let (heard_fine, played_fine) = (loudness(heard), loudness(played));
     let (heard_coarse, played_coarse) = (coarse(&heard_fine), coarse(&played_fine));
-    let window = WINDOW.min(heard_coarse.len());
-    if window < LEAST_WINDOW || played_coarse.len() < window {
+    // A short Mac sound, as of an app that died early in the recording, gets windows of half its
+    // length, so that each window still has lags to search
+    let window = WINDOW.min(heard_coarse.len()).min(played_coarse.len() / 2);
+    if window < LEAST_WINDOW {
         return None;
     }
     let played_sums = Sums::of(&played_coarse);
