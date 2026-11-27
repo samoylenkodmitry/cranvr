@@ -29,6 +29,8 @@ pub const MENU: u32 = 3;
 pub const STRIP: u32 = 4;
 /// The ball on an open palm (`palm.rs`)
 pub const PALM: u32 = 5;
+/// The gem that records what the headset shows (`record_gem.rs`)
+pub const GEM: u32 = 6;
 /// The first bit of the displays: the display of stream `s` has bit `DISPLAY + s`
 pub const DISPLAY: u32 = 8;
 

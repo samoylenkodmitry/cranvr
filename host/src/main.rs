@@ -21,6 +21,9 @@ mod pacer;
 mod pairing;
 mod pose;
 mod pose_gaps;
+mod recording_align;
+mod recording_mux;
+mod recording_sound;
 mod render;
 mod runtime_link;
 mod screen_capture;
@@ -31,6 +34,7 @@ mod test_bitrate;
 mod test_input;
 mod tracking;
 mod virtual_display;
+mod wav;
 
 use cranvr_common::{
     foveation::{Foveation, FoveationLevel},
@@ -312,7 +316,7 @@ fn start_game_audio() {
             let (changed, change) = std::sync::mpsc::channel();
             game_audio::watch_default_output(changed.clone());
             loop {
-                match game_audio::Capture::start(changed.clone()) {
+                match game_audio::Capture::start(changed.clone(), headset::native::audio::send) {
                     Ok(capture) => {
                         info!("Game audio: capturing this Mac's sound for the headset with a Core Audio tap: {}", capture.summary);
                         status::emit(json!({"type": "audio", "ok": true}));
@@ -412,6 +416,28 @@ fn options_for(fps: f32, foveation: FoveationLevel, eye_width: u32) -> Options {
     options
 }
 
+/// `--record-sound DIR [--microphone RING]` (recording_sound.rs) or `--mux-recording VIDEO DIR OUT`
+/// (recording_mux.rs). Ends the process.
+fn recording_main(args: &[String], sound: bool) -> ! {
+    status::enable();
+    let result = if sound {
+        let microphone = args.iter().position(|arg| arg == "--microphone").and_then(|at| args.get(at + 1)).map(PathBuf::from);
+        match args.first() {
+            Some(dir) => recording_sound::run(std::path::Path::new(dir), microphone.as_deref()),
+            None => Err("--record-sound needs a folder".into()),
+        }
+    } else {
+        match recording_mux::paths(args) {
+            Some((video, dir, out)) => recording_mux::run(&video, &dir, &out).map(|numbers| status::emit(json!({"type": "recording_file", "ok": true, "numbers": numbers}))),
+            None => Err("--mux-recording needs VIDEO DIR OUT".into()),
+        }
+    };
+    if let Err(e) = &result {
+        status::emit(json!({"type": "recording_file", "ok": false, "message": e}));
+    }
+    std::process::exit(i32::from(result.is_err()));
+}
+
 fn main() {
     raise_file_limit();
     let args: Vec<String> = std::env::args().collect();
@@ -420,6 +446,13 @@ fn main() {
     }
     if args.get(1).map(String::as_str) == Some("--unscale-displays") {
         display_modes::helper_main();
+    }
+    // The cranvr app runs the parts of a recording of what the headset shows as processes of their own
+    if args.get(1).map(String::as_str) == Some("--record-sound") {
+        recording_main(&args[2..], true);
+    }
+    if args.get(1).map(String::as_str) == Some("--mux-recording") {
+        recording_main(&args[2..], false);
     }
     let (options, mut desktop, config_dir) = parse_args();
     std::fs::create_dir_all(&config_dir).expect("config dir");

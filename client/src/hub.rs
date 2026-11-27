@@ -24,7 +24,7 @@ use cranvr_common::controls::{Action as ControlAction, Control, Controls, Hand, 
 use cranvr_common::foveation::{Foveation, FoveationConfig};
 use cranvr_proto::{
     clock::now_ns,
-    message::{Focus, FoveationParams, Input},
+    message::{Focus, FoveationParams, Input, Recording},
     wire::{Fov, Nanos, Pose},
 };
 use std::{
@@ -390,6 +390,16 @@ pub struct Hub {
     /// The saved settings of the console were loaded. A rebuilt composition must not load them
     /// again, because the choices in memory are newer when a save failed.
     settings_loaded: AtomicBool,
+    /// The Mac's state of its recording of what the headset shows (see `record_gem.rs`)
+    recording: Mutex<RecordingSlot>,
+}
+
+/// The state of the Mac's recording, the connection that sent it and a count of its changes
+#[derive(Default)]
+struct RecordingSlot {
+    link: u64,
+    state: Recording,
+    changes: u64,
 }
 
 /// The one hub of the process. The activity may rebuild the composition, and the link outlives it.
@@ -427,6 +437,7 @@ pub fn hub() -> &'static Hub {
         headset_page_changed: AtomicBool::new(true),
         told_choices: AtomicU64::new(0),
         settings_loaded: AtomicBool::new(false),
+        recording: Mutex::new(RecordingSlot::default()),
     })
 }
 
@@ -788,6 +799,36 @@ impl Hub {
         let extra = queue.len().saturating_sub(16);
         queue.drain(..extra);
         fires
+    }
+
+    /// The Mac's state of its recording of what the headset shows (`HostMsg::Recording`).
+    pub(crate) fn set_recording(&self, id: u64, state: Recording) {
+        if self.current.load(Ordering::Acquire) != id {
+            return;
+        }
+        log::info!("the Mac's recording: runs {}, blocked {:?}, note {:?}", state.running, state.blocked, state.note);
+        let mut slot = self.recording.lock().unwrap();
+        slot.link = id;
+        slot.state = state;
+        slot.changes += 1;
+    }
+
+    /// A count that changes with the recording's state and with the link, so a look that finds it
+    /// unchanged copies nothing.
+    pub fn recording_changes(&self) -> (u64, u64) {
+        (self.recording.lock().unwrap().changes, self.current.load(Ordering::Acquire))
+    }
+
+    /// The Mac's state of its recording, while the link that sent it runs.
+    pub fn recording(&self) -> Option<Recording> {
+        let current = self.current.load(Ordering::Acquire);
+        let slot = self.recording.lock().unwrap();
+        (current != 0 && slot.link == current).then(|| slot.state.clone())
+    }
+
+    /// Asks the Mac to start a recording of what the headset shows, or to stop the one that runs.
+    pub fn toggle_recording(&self) {
+        self.send_request(&cranvr_common::menu::Request::Run { id: "recording.toggle".into(), subject: None });
     }
 
     /// The Mac asks to open the hand menu (`HostMsg::OpenMenu`). The UI opens it with its next look.

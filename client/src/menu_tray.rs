@@ -87,9 +87,16 @@ pub fn MenuTray(state: HandState, console_open: bool, frame: HandFrame, (open, l
     let (colors, words) = (colors(look.theme), Words::of(look.room));
     let view = rememberMutableStateOf(|| displays().menu_view());
     let pages = rememberMutableStateOf(|| hub().listed_pages());
-    // The menu looks at the displays and the pages only while it is open
+    let recording = rememberMutableStateOf(|| hub().recording());
+    // The menu looks at the displays, the pages and the recording only while it is open
     LaunchedEffect(open, async move |_| {
+        let mut seen = hub().recording_changes();
         while open {
+            let changes = hub().recording_changes();
+            if changes != seen {
+                seen = changes;
+                recording.set(hub().recording());
+            }
             let now = displays().menu_view();
             if view.get_non_reactive() != now {
                 view.set(now);
@@ -107,7 +114,8 @@ pub fn MenuTray(state: HandState, console_open: bool, frame: HandFrame, (open, l
     let displays_view = view.get();
     let busy = adding.get().is_some_and(|add| add.runs(&displays_view));
     let listed = pages.get();
-    let input = MenuInput { layout: &layout, console_open, displays: &displays_view, wishes, place: state.place.get(), adding: busy, pages: &listed, costs: true };
+    let recorded = recording.get();
+    let input = MenuInput { layout: &layout, console_open, displays: &displays_view, wishes, place: state.place.get(), adding: busy, pages: &listed, costs: true, recording: recorded.as_ref() };
     let rows = menu_model::rows(&input);
     let height = menu_model::height(&rows, Interface::ThreeD);
     // The place that the user carried the menu to, else its start. Cranpose keeps a carry's place

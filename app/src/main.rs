@@ -10,6 +10,7 @@ mod microphone;
 mod openvr;
 mod pages;
 mod pending;
+mod recorder;
 mod run;
 mod setup;
 mod steam;

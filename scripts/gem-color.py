@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Measures the gem that records in a screen capture of the headset (scripts/gem-check.sh).
+
+Usage: scripts/gem-color.py --find CAPTURE.png   prints X,Y: the middle of the green pixels in the
+                                                  left eye, where a pointed gem stands
+       scripts/gem-color.py CAPTURE.png [X,Y]     prints the mean color of the lit pixels within 30
+                                                  pixels of X,Y and what it looks like
+
+macOS's `sips` turns the PNG into a BMP, which the script reads.
+"""
+import pathlib
+import struct
+import subprocess
+import sys
+import tempfile
+
+BOX = 30
+
+
+def pixels(png):
+    with tempfile.TemporaryDirectory() as folder:
+        bmp = pathlib.Path(folder) / "capture.bmp"
+        subprocess.run(["sips", "-s", "format", "bmp", str(png), "--out", str(bmp)], check=True, capture_output=True)
+        data = bmp.read_bytes()
+    offset = struct.unpack_from("<I", data, 10)[0]
+    width, height = struct.unpack_from("<ii", data, 18)
+    size = struct.unpack_from("<H", data, 28)[0] // 8
+    stride = (width * size + 3) // 4 * 4
+    bottom_up = height > 0
+    height = abs(height)
+
+    def at(x, y):
+        row = height - 1 - y if bottom_up else y
+        start = offset + row * stride + x * size
+        b, g, r = data[start], data[start + 1], data[start + 2]
+        return r, g, b
+
+    return width, height, at
+
+
+def find(png):
+    width, height, at = pixels(png)
+    xs, ys = [], []
+    for y in range(0, height, 2):
+        for x in range(0, width // 2, 2):
+            r, g, b = at(x, y)
+            if g > 150 and g - r > 70 and g - b > 40:
+                xs.append(x)
+                ys.append(y)
+    if len(xs) < 20:
+        return None
+    xs.sort()
+    ys.sort()
+    return xs[len(xs) // 2], ys[len(ys) // 2]
+
+
+def look(r, g, b):
+    if max(r, g, b) < 110:
+        return "dim"
+    if r > g + 60 and r > b + 60:
+        return "red"
+    if g > r + 50 and g > b + 30:
+        return "green"
+    if b > g and r > g:
+        return "violet"
+    if b > r:
+        return "blue"
+    return "other"
+
+
+def main():
+    if sys.argv[1] == "--find":
+        place = find(sys.argv[2])
+        if place:
+            print(f"{place[0]},{place[1]}")
+        return
+    png = sys.argv[1]
+    if len(sys.argv) < 3 or "," not in sys.argv[2]:
+        print(f"{pathlib.Path(png).name}: no place of the gem")
+        return
+    cx, cy = (int(v) for v in sys.argv[2].split(","))
+    width, height, at = pixels(png)
+    lit = []
+    for y in range(max(0, cy - BOX), min(height, cy + BOX)):
+        for x in range(max(0, cx - BOX), min(width, cx + BOX)):
+            r, g, b = at(x, y)
+            if max(r, g, b) > 24:
+                lit.append((r, g, b))
+    if not lit:
+        print(f"{pathlib.Path(png).name}: nothing lit at {cx},{cy}")
+        return
+    mean = [sum(p[i] for p in lit) / len(lit) for i in range(3)]
+    brightest = sorted(lit, key=lambda p: -max(p))[: max(1, len(lit) // 5)]
+    top = [sum(p[i] for p in brightest) / len(brightest) for i in range(3)]
+    print(f"{pathlib.Path(png).name}: {len(lit)} lit pixels at {cx},{cy}, mean rgb {mean[0]:.0f},{mean[1]:.0f},{mean[2]:.0f}, brightest fifth {top[0]:.0f},{top[1]:.0f},{top[2]:.0f}: {look(*top)}")
+
+
+if __name__ == "__main__":
+    main()

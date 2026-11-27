@@ -29,6 +29,7 @@ The goal is to play Windows SteamVR games on a Quest from a Mac. Windows games r
 | `probe` | `cranvr-probe` (a client of the protocol on this Mac for tests) and `cranvr-fake-game` (a stand-in for a game). |
 | `client` | `cranvr-client`: the Cranpose app for the Quest and for Android phones. Its own Cargo workspace. |
 | `scripts` | Build the client, bundle the app, set up Wine and Steam, run games, run the end-to-end test. |
+| `quest-recorder` | The program that starts and stops the headset's own recorder over adb, for a recording of what the headset shows. |
 | `third_party/basaltvr` | cranvr's patches to BasaltVR's runtime and DXMT fork. |
 | `third_party/wine` | cranvr's patch to Wine's HLSL compiler (`wined3d.dll`) and its test program. |
 
@@ -532,6 +533,26 @@ Measured on a Quest 3 at the Mac over the USB network, in runs of 8 s. The Mac's
 - Most of the delay lies in the headset before the app gets the sound. A probe on the Mac that sent clicks through the host into the ring was heard by the game 2 to 16 ms later (runs of 3 s), and the network takes about 2 ms. The Mac's own output and the air take some milliseconds more. AAudio's timestamps gave 83 to 116 ms from the capture to the host in different runs. Android's unprocessed preset gives silence on the Quest 3.
 - Recording costs the headset about 1 % of one core: the thread of Android's recorder appears only while a game records. The host's work is a check of the heartbeat ten times a second and a copy of 100 datagrams a second, within the noise of the stream's 5 to 13 %. The game's stream of the device took 0.5 % of a core under Wine.
 - A game that starts to record waits for the headset's first sound: it got 110 to 150 ms of silence at first, and then 0 to 431 frames of silence in each 5 s (0.2 % at most).
+
+## Recording what you see
+
+A gem on the left hand records what the headset shows. The gem is an octahedron of glowing glass, 25 mm across (Cranpose's `SpatialGem`). It floats 5 cm above the left controller's grip and 5.5 cm out to the left of the hand, clear of the hand menu's ball. Without a controller it floats 4.5 cm above the back of the left hand. It turns slowly. Its color says what a press does:
+- the theme's glass while nothing points at it: blue in the Cyan theme, violet in the Amber theme;
+- green while a ray or a hand's pointer rests on it: a press starts a recording;
+- red with a slow pulse while a recording runs, pointed at or not: a press stops it;
+- the theme's glass, dim, while no recording can start. A press then shows the reason beside the gem for 3 s.
+
+The gem shows in games too, as the ball does. It hides while neither the left controller nor the left hand is tracked. A hidden gem composes nothing. The hand menu's row "Record what I see" serves a user who works with the right hand only. The Mac window's button "Record what I see" serves the Mac. All three show one state, which the Mac's app owns (`app/src/recorder.rs`). The host passes it to the headset as `HostMsg::Recording` (protocol 17). A press in the headset sends the console's request `recording.toggle`. The launch extra `record_gem=false` leaves the gem out, for a measure of its cost.
+
+**How the picture comes to the Mac.** The headset's own recorder (Meta's MetaCam) records the picture. It records the compositor's final view of one eye with no lens warp: the game or the desktop, the holograms, the controllers and the hands, and the room when passthrough shows it. The headset's own recording settings set its size and rate. cranvr changes none of them. The app pushes a small program to the headset over adb (`quest-recorder/`, built by `scripts/build-quest-recorder.sh`). The program asks the recorder to start and to stop through the recorder's app actions, as the shell user. A recording therefore needs the headset on the USB cable with USB debugging, which needs Developer Mode. Without adb the gem says "Recording needs the headset on the USB cable with USB debugging". At the stop the app pulls the recorder's file and deletes it on the headset.
+
+Two other ways were tried first:
+- Android's MediaProjection, which needs no setting: Horizon OS shows a picker of its own ("Entire view, including physical surroundings" or "Just this window") at each start. After Share, the capture got no frame in 3 s while cranvr's immersive app ran.
+- The display's mirror (`screenrecord`, SurfaceControl): it gives both eyes at 92 fps in the display's own space, with the lens warp and the color fringes of the panels. No lens model is public, and the warp moves with the IPD wheel.
+
+**The sound.** The Mac's sound replaces the recorder's own track: it has no loss and nothing of the headset's own sounds. While the picture records, a process of the host's binary records the Mac's sound with a Core Audio tap (`cranvr-host --record-sound`, `host/src/recording_sound.rs`). The recorder's own track holds what the headset played: the same sound, some tens of milliseconds later. At the stop `cranvr-host --mux-recording` (`host/src/recording_mux.rs`) finds the lag between the two sounds (`host/src/recording_align.rs`) and puts the Mac's sound where the user heard it. A recording with no sound to match falls back to the times of the start. A Mac without System Audio Recording for cranvr keeps the recorder's own track. The setting "Microphone in recordings" on the Sound page (off by default) adds the headset's microphone: the recording reads the host's microphone ring as a game does, so the host asks the headset for its microphone while the recording runs.
+
+**The file.** The final file is `~/Movies/cranvr/cranvr-YYYY-MM-DD-HHMMSS.mp4`, named after the start's local time. It holds the recorder's HEVC picture as it is, with no new encode. Its sound is AAC. The Mac app shows "Saved:" with the file's name and Show in Finder. The console in the headset says "Saved: NAME" for 8 s. The line beside the gem says it for 3 s. A recording stops by itself when the Mac's free disk falls under 5 GB. `CRANVR_RECORDINGS` names another folder, for a test. `scripts/gem-check.sh` checks the gem's looks and a recording on a Quest on a desk with a test app. `scripts/recording-mux-check.sh` checks the final file with made-up parts on the Mac.
 
 ## Several displays
 

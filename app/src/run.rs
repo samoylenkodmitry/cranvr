@@ -94,6 +94,7 @@ pub fn act(settings: &mut Settings, model: &mut Model, request: &Request) {
             }
             Effect::RunProgram(path) => backend::choose(backend::Chosen::Run(path)),
             Effect::WatchLog => model.log_until = Some(Instant::now() + crate::pages::LOG_TIME),
+            Effect::ToggleRecording => crate::recorder::toggle(settings.recording_microphone),
             Effect::PermissionSettings(permission) => permission.open_settings(),
             Effect::OpenSteam => {
                 // Steam may need seconds to start: keep the window responsive
@@ -119,6 +120,9 @@ pub fn tick(settings: &mut Settings, model: &mut Model, slow: bool) {
         model.running = backend::host_running();
     }
     model.settings_problem = backend::settings_problem();
+    crate::recorder::start_thread();
+    model.recording = crate::recorder::view();
+    model.recording_seconds = model.recording.since.map_or(0, |since| since.elapsed().as_secs());
     usb::set_choice(settings.connection);
     model.usb = usb::status();
     for request in std::mem::take(&mut model.vr_requests) {

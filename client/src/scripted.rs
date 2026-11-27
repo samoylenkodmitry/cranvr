@@ -34,6 +34,9 @@
 //!   seconds of rest between: the trigger, A, the grip, the thumbstick forward and the thumbstick to
 //!   the right. The log says each change of the right controller's inputs ("scripted models:"), so a
 //!   screen capture can be matched with the press that it shows.
+//! - `scripted_pointer=gem` holds the left controller still with the gem that records on it. The
+//!   right controller points away for `gem_wait_ms` (12 s by default), at the gem for 4 s, presses it,
+//!   points away for 8 s while the recording runs and presses it again (see `gem_walk`).
 //! - `scripted_pointer=console` holds the left controller still. The right controller points at the
 //!   console for 4 seconds and away from every panel for 4 seconds, again and again. Once a game runs
 //!   the script opens the console, which a game's start closes. The log then shows the right
@@ -180,6 +183,10 @@ pub fn install_once() {
             walk_after_menu("ui3d", ScriptedController::new(Hand::Left, UI3D_LEFT_AT, to).holding(Duration::from_secs(120), rest), ui3d_script);
             return;
         }
+        if args.string("scripted_pointer") == Some("gem") {
+            gem_walk(args.int("gem_wait_ms").and_then(|ms| u64::try_from(ms).ok()).unwrap_or(12_000));
+            return;
+        }
         if args.string("scripted_pointer") == Some("menu") {
             menu_check(args.string("scripted_hands").unwrap_or("both"));
             return;
@@ -264,6 +271,57 @@ fn pressing_right_hand() {
     log::info!("scripted models: the right controller at {RIGHT_AT:?} presses the trigger, A, the grip and the thumbstick in turn, 4 s each with 5 s of rest");
     script_controller(left);
     script_controller(right);
+}
+
+/// Where the left controller of `scripted_pointer=gem` stands and where it points: level and
+/// straight ahead, 30 cm below the head and 45 cm ahead of it
+const GEM_LEFT_AT: [f32; 3] = [-0.15, -0.3, -0.45];
+/// Where the right controller of `scripted_pointer=gem` stands: right of the left one and nearer
+const GEM_RIGHT_AT: [f32; 3] = [0.15, -0.32, -0.3];
+
+/// Plays `scripted_pointer=gem`: the left controller holds still and carries the gem that records
+/// (`record_gem.rs`). The right controller points away for `wait_ms`, then at the gem for 4 s, pulls
+/// its trigger, points away for 8 s while the recording runs, and points at the gem and pulls again.
+/// The log names each step ("scripted gem:"), so a test takes its screen captures in the right step.
+fn gem_walk(wait_ms: u64) {
+    let rest = ScriptedButtons::default();
+    let pull = ScriptedButtons { trigger: 1.0, ..rest };
+    let level = [GEM_LEFT_AT[0], GEM_LEFT_AT[1], GEM_LEFT_AT[2] - 1.0];
+    script_controller(ScriptedController::new(Hand::Left, GEM_LEFT_AT, level).holding(Duration::from_secs(600), rest));
+    // The gem stands in the left controller's frame, which points straight ahead with no turn
+    let offset = crate::record_gem::ON_CONTROLLER.map(|dp| dp / 1000.0);
+    let gem = [0, 1, 2].map(|axis| GEM_LEFT_AT[axis] + offset[axis]);
+    let away = [GEM_RIGHT_AT[0] + 1.0, GEM_RIGHT_AT[1] + 0.3, GEM_RIGHT_AT[2] - 1.0];
+    // Cranpose's pointer smooths the ray, so each press comes 1.2 s after the aim
+    let steps: [(u64, &str); 6] = [
+        (wait_ms, "the right controller points away: the gem shows its idle look"),
+        (4000, "the right controller points at the gem"),
+        (1500, "the right controller pulls its trigger on the gem"),
+        (8000, "the right controller points away while the recording runs"),
+        (1500, "the right controller points at the gem and pulls its trigger again"),
+        (600_000, "the right controller points away"),
+    ];
+    let right = ScriptedController::new(Hand::Right, GEM_RIGHT_AT, away)
+        .holding(Duration::from_millis(wait_ms), rest)
+        .moving_to(Duration::from_millis(1), (GEM_RIGHT_AT, gem), rest)
+        .holding(Duration::from_millis(4000), rest)
+        .holding(Duration::from_millis(1200), rest)
+        .holding(Duration::from_millis(300), pull)
+        .moving_to(Duration::from_millis(1), (GEM_RIGHT_AT, away), rest)
+        .holding(Duration::from_millis(8000), rest)
+        .moving_to(Duration::from_millis(1), (GEM_RIGHT_AT, gem), rest)
+        .holding(Duration::from_millis(1200), rest)
+        .holding(Duration::from_millis(300), pull)
+        .moving_to(Duration::from_millis(1), (GEM_RIGHT_AT, away), rest)
+        .holding(Duration::from_secs(600), rest);
+    script_controller(right);
+    log::info!("scripted gem: the gem stands at {gem:?}");
+    std::thread::spawn(move || {
+        for (millis, step) in steps {
+            log::info!("scripted gem: {step}");
+            std::thread::sleep(Duration::from_millis(millis));
+        }
+    });
 }
 
 /// Plays `scripted_pointer=console`: the right controller points at the console and away from it, in
@@ -446,7 +504,7 @@ fn empty_menu_height() -> f32 {
     use crate::{displays::DisplaysView, menu_place::MenuPlace, panel_layout::Layout};
     let layout = Layout::default();
     let displays = DisplaysView::default();
-    let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays, wishes: Default::default(), place: MenuPlace::View, adding: false, pages: &[], costs: true };
+    let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays, wishes: Default::default(), place: MenuPlace::View, adding: false, pages: &[], costs: true, recording: None };
     menu_model::height(&menu_model::rows(&input), crate::hub::hub().console().interface)
 }
 
@@ -616,7 +674,7 @@ fn pages_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
     let pages = menu.listed();
     let layout = Layout::default();
     let displays_view = displays().menu_view();
-    let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays_view, wishes: Default::default(), place: MenuPlace::View, adding: false, pages: &pages, costs: true };
+    let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays_view, wishes: Default::default(), place: MenuPlace::View, adding: false, pages: &pages, costs: true, recording: None };
     let rows = menu_model::rows(&input);
     let height = menu_model::height(&rows, local.interface);
     // The place of the button of the page `index` in the hand menu
@@ -734,7 +792,7 @@ fn ui3d_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
     let pages = menu.listed();
     let layout = Layout::default();
     let displays_view = displays().menu_view();
-    let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays_view, wishes: Default::default(), place: MenuPlace::Hand(cranvr_common::controls::Hand::Left), adding: false, pages: &pages, costs: true };
+    let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays_view, wishes: Default::default(), place: MenuPlace::Hand(cranvr_common::controls::Hand::Left), adding: false, pages: &pages, costs: true, recording: None };
     let rows = menu_model::rows(&input);
     let height = menu_model::height(&rows, local.interface);
     // The left controller holds the menu at its usual distance (`UI3D_LEFT_AT`)

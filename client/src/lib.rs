@@ -43,6 +43,7 @@ mod palm;
 mod panel_layout;
 mod phone;
 mod place;
+mod record_gem;
 #[cfg(all(feature = "scripted-hand", target_os = "android"))]
 mod scripted;
 mod settings;

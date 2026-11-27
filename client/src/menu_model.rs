@@ -16,7 +16,7 @@ use crate::{
     menu_place::MenuPlace,
     panel_layout::{Layout, PanelId},
 };
-use cranvr_proto::message::DesktopWish;
+use cranvr_proto::message::{DesktopWish, Recording};
 
 /// What a button of the menu does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,6 +34,8 @@ pub enum MenuAction {
     OpenControls,
     /// Opens the console on a page of the Mac's settings: its place in `MenuInput::pages`
     OpenPage(u8),
+    /// Starts a recording of what the headset shows on the Mac, or stops the one that runs
+    ToggleRecording,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +77,9 @@ pub struct MenuInput<'a> {
     /// Each display says what showing it costs. Without, it says where it stands and whether it
     /// shows, which changes only with the user's press (`headset_page.rs`).
     pub costs: bool,
+    /// The Mac's recording of what the headset shows, while a link runs. The menu then has the row
+    /// "Record what I see" for a user who works with the right hand only.
+    pub recording: Option<&'a Recording>,
 }
 
 /// The page buttons stand three in a row
@@ -143,6 +148,11 @@ pub fn rows(input: &MenuInput<'_>) -> Vec<MenuRow> {
         .collect();
     for chunk in listed.chunks(PAGES_IN_ROW) {
         rows.push(MenuRow { title: String::new(), details: Vec::new(), buttons: chunk.to_vec() });
+    }
+    if let Some(state) = input.recording {
+        let (label, kind) = if state.running { ("Stop", ButtonKind::On) } else { ("Record", ButtonKind::Normal) };
+        let details = if state.running { vec!["Recording what you see on the Mac".to_string()] } else { state.blocked.iter().cloned().collect() };
+        rows.push(MenuRow { title: "Record what I see".into(), details, buttons: vec![MenuButton { label: label.into(), action: MenuAction::ToggleRecording, kind }] });
     }
     let mut actions = Vec::new();
     if input.displays.can_add {
@@ -238,7 +248,25 @@ mod tests {
     }
 
     fn input<'a>(layout: &'a Layout, displays: &'a DisplaysView) -> MenuInput<'a> {
-        MenuInput { layout, console_open: false, displays, wishes: Default::default(), place: MenuPlace::Hand(cranvr_common::controls::Hand::Left), adding: false, pages: &[], costs: true }
+        MenuInput { layout, console_open: false, displays, wishes: Default::default(), place: MenuPlace::Hand(cranvr_common::controls::Hand::Left), adding: false, pages: &[], costs: true, recording: None }
+    }
+
+    /// While a link runs, the menu has the row that records what the headset shows: Record, Stop
+    /// while a recording runs, and the reason under it while none can start
+    #[test]
+    fn the_menu_records_what_the_headset_shows_while_a_link_runs() {
+        let layout = Layout::default();
+        let displays = view(Vec::new(), false);
+        let record_row = |state: Option<&Recording>| {
+            let found = rows(&MenuInput { recording: state, ..input(&layout, &displays) }).into_iter().find(|row| row.title == "Record what I see");
+            found.map(|row| (row.buttons[0].label.clone(), row.buttons[0].kind, row.details))
+        };
+        assert_eq!(record_row(None), None, "no link, no row");
+        assert_eq!(record_row(Some(&Recording::default())), Some(("Record".into(), ButtonKind::Normal, vec![])));
+        let running = Recording { running: true, ..Default::default() };
+        assert_eq!(record_row(Some(&running)).map(|(label, kind, _)| (label, kind)), Some(("Stop".into(), ButtonKind::On)));
+        let cable = Recording { blocked: Some("Recording needs the USB cable".into()), ..Default::default() };
+        assert_eq!(record_row(Some(&cable)).map(|(_, _, details)| details), Some(vec!["Recording needs the USB cable".to_string()]));
     }
 
     #[test]
