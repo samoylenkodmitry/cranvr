@@ -363,12 +363,13 @@ unsafe impl Send for Capture {}
 
 impl Capture {
     /// Starts the capture. `changed` gets a message when the output device's rate changes: the
-    /// capture must start again then.
-    pub fn start(changed: Sender<()>) -> Result<Self, String> {
-        unsafe { Self::start_unchecked(changed) }
+    /// capture must start again then. `sink` takes each buffer as interleaved 16-bit stereo at
+    /// 48 kHz: the headset link, or a recording's file.
+    pub fn start(changed: Sender<()>, sink: fn(&[u8])) -> Result<Self, String> {
+        unsafe { Self::start_unchecked(changed, sink) }
     }
 
-    unsafe fn start_unchecked(changed: Sender<()>) -> Result<Self, String> {
+    unsafe fn start_unchecked(changed: Sender<()>, sink: fn(&[u8])) -> Result<Self, String> {
         let output: AudioObjectID = get(kAudioObjectSystemObject as AudioObjectID, kAudioHardwarePropertyDefaultOutputDevice, None)
             .map_err(|e| format!("no default output device ({e})"))?;
         if output == 0 {
@@ -484,7 +485,7 @@ impl Capture {
                 let samples = resampler.borrow_mut().run(samples);
                 FRAMES.fetch_add((samples.len() / CHANNELS / 2) as u64, Ordering::Relaxed);
                 measure(input_time.as_ref(), device_frames, handed, &samples);
-                crate::headset::native::audio::send(&samples);
+                sink(&samples);
             },
         );
         let status = AudioDeviceCreateIOProcIDWithBlock(

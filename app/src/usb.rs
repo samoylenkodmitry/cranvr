@@ -345,6 +345,16 @@ fn adb(tool: &Path, args: &[&str], limit: Duration) -> Result<String, Unanswered
     Err(Unanswered::Hung)
 }
 
+/// Runs adb with a time limit for another part of the app, such as a recording, and returns what it
+/// printed on stdout.
+pub fn call(tool: &Path, args: &[&str], limit: Duration) -> Result<String, String> {
+    adb(tool, args, limit).map_err(|why| match why {
+        Unanswered::Failed => "adb failed".to_string(),
+        Unanswered::Hung => format!("adb gave no answer in {} s", limit.as_secs()),
+        Unanswered::Busy => "the same adb call still runs".to_string(),
+    })
+}
+
 /// Whether adb has ended. It leaves adb unwaited for, so adb's pid stays adb's (WNOWAIT).
 fn has_ended(pid: u32) -> bool {
     // SAFETY: waitid writes only into `info`, which lives on this stack
@@ -425,6 +435,11 @@ fn wake() {
     if let Some(sender) = WAKE.get() {
         sender.lock().unwrap().send(()).ok();
     }
+}
+
+/// True once the thread runs. The app with no window runs none (`cranvr --headless`).
+pub fn watching() -> bool {
+    WAKE.get().is_some()
 }
 
 /// Starts the thread, once.

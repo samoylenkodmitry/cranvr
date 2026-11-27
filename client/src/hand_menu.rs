@@ -252,6 +252,8 @@ pub struct HandState {
     pub palm: MutableState<Option<ControlHand>>,
     /// The cameras track a hand
     pub hands: MutableState<bool>,
+    /// The cameras track the left hand, which carries the gem that records (`record_gem.rs`)
+    pub left_hand: MutableState<bool>,
     /// No controller is present and the cameras track no hand: a look opens the menu (`gaze.rs`)
     pub gaze: MutableState<bool>,
     /// A look rests on that ball and counts toward a press: the ball shows it
@@ -503,16 +505,25 @@ pub fn Menu(state: HandState, console_open: bool, frame: HandFrame) {
     let view = rememberMutableStateOf(|| displays().menu_view());
     // The pages of the Mac's settings, as the host's menu lists them
     let pages = rememberMutableStateOf(|| hub().listed_pages());
-    LaunchedEffect((), async move |_| loop {
-        let now = displays().menu_view();
-        if view.get_non_reactive() != now {
-            view.set(now);
+    let recording = rememberMutableStateOf(|| hub().recording());
+    LaunchedEffect((), async move |_| {
+        let mut seen = hub().recording_changes();
+        loop {
+            let now = displays().menu_view();
+            if view.get_non_reactive() != now {
+                view.set(now);
+            }
+            let listed = hub().listed_pages();
+            if pages.get_non_reactive() != listed {
+                pages.set(listed);
+            }
+            let changes = hub().recording_changes();
+            if changes != seen {
+                seen = changes;
+                recording.set(hub().recording());
+            }
+            delay(MENU_POLL).await;
         }
-        let listed = hub().listed_pages();
-        if pages.get_non_reactive() != listed {
-            pages.set(listed);
-        }
-        delay(MENU_POLL).await;
     });
     // A display that the user added, from the press until the host lists it or says why not
     let adding = rememberMutableStateOf(|| None::<Adding>);
@@ -521,7 +532,8 @@ pub fn Menu(state: HandState, console_open: bool, frame: HandFrame) {
     let displays_view = view.get();
     let busy = adding.get().is_some_and(|add| add.runs(&displays_view));
     let listed = pages.get();
-    let input = MenuInput { layout: &layout, console_open, displays: &displays_view, wishes, place: state.place.get(), adding: busy, pages: &listed, costs: true };
+    let recorded = recording.get();
+    let input = MenuInput { layout: &layout, console_open, displays: &displays_view, wishes, place: state.place.get(), adding: busy, pages: &listed, costs: true, recording: recorded.as_ref() };
     let rows = menu_model::rows(&input);
     let height = menu_model::height(&rows, Interface::Flat);
     // The place that the user carried the menu to is read once for each opening. Cranpose keeps the
@@ -666,6 +678,14 @@ pub(crate) fn perform(action: MenuAction, state: HandState, adding: Option<Mutab
             state.recenter.set(state.recenter.get_non_reactive() + 1);
         }
         MenuAction::OpenControls => hub().open_controls(),
+        MenuAction::ToggleRecording => match crate::record_gem::blocked(hub().recording().as_ref()) {
+            // The row's line names the reason already
+            Some(why) => log::info!("the hand menu cannot record: {why}"),
+            None => {
+                log::info!("the hand menu toggles the recording");
+                hub().toggle_recording();
+            }
+        },
         MenuAction::OpenPage(index) => {
             // The console takes the place of the menu, which closes
             if let Some((id, short)) = hub().listed_pages().into_iter().nth(usize::from(index)) {

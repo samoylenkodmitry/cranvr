@@ -315,6 +315,13 @@ fn microphone_key(source: &MicrophoneSource) -> String {
 /// choice when it opens.
 const SOUND_SETTINGS: &[Setting] = &[
     Setting {
+        id: "recording_microphone",
+        label: "Microphone in recordings",
+        restarts: false,
+        hint: |_| "A recording of what the headset shows takes the headset's microphone too. Off by default: a recording then holds the game's sound only.",
+        kind: Kind::Toggle { get: |s| s.recording_microphone, set: |s, on| s.recording_microphone = on },
+    },
+    Setting {
         id: "game_audio",
         label: "Game sound in the headset",
         restarts: true,
@@ -1036,6 +1043,8 @@ pub enum Effect {
     RunProgram(std::path::PathBuf),
     /// The log page carries the newest lines for a while
     WatchLog,
+    /// Starts a recording of what the headset shows, or stops the one that runs (see recorder.rs)
+    ToggleRecording,
 }
 
 /// What a request did.
@@ -1168,6 +1177,7 @@ fn run(settings: &mut Settings, games: &[Game], id: &str, subject: Option<&str>)
         "usb.download" => Outcome { effects: vec![Effect::DownloadUsb], ..Default::default() },
         "host.restart" => Outcome { effects: vec![Effect::RestartHost], ..Default::default() },
         "log.watch" => Outcome { effects: vec![Effect::WatchLog], ..Default::default() },
+        "recording.toggle" => Outcome { effects: vec![Effect::ToggleRecording], ..Default::default() },
         "permission.ask" | "permission.settings" => match permission_of(subject) {
             Some(permission) if id == "permission.ask" => Outcome { effects: vec![Effect::AskPermission(permission)], ..Default::default() },
             Some(permission) => Outcome { effects: vec![Effect::PermissionSettings(permission)], ..Default::default() },

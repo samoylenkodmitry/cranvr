@@ -78,20 +78,39 @@ impl Ring {
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path)?;
         let len = HEADER + CAPACITY * 2;
         file.set_len(len as u64)?;
-        // SAFETY: a shared mapping of the whole file, which has `len` bytes. The mapping outlives the
-        // file handle and stays for the life of the process.
-        let base = unsafe {
-            libc::mmap(ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, std::os::fd::AsRawFd::as_raw_fd(&file), 0)
-        };
-        if base == libc::MAP_FAILED {
-            return Err(std::io::Error::last_os_error());
-        }
-        let ring = Self { base: base.cast() };
+        let ring = Self::map(&file, len)?;
         for (offset, value) in [(0, MAGIC), (4, VERSION), (8, MICROPHONE_FORMAT.sample_rate), (12, CAPACITY as u32)] {
             // SAFETY: the header's first 16 bytes are in the mapping.
             unsafe { ptr::write_unaligned(ring.base.add(offset).cast::<u32>(), value) };
         }
         Ok(ring)
+    }
+
+    /// Maps the ring that a host made, for a reader in another process.
+    fn open(path: &Path) -> std::io::Result<Self> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let len = HEADER + CAPACITY * 2;
+        if file.metadata()?.len() < len as u64 {
+            return Err(std::io::Error::other("the ring is shorter than its header and frames"));
+        }
+        let ring = Self::map(&file, len)?;
+        // SAFETY: the header's first 4 bytes are in the mapping.
+        if unsafe { ptr::read_unaligned(ring.base.cast::<u32>()) } != MAGIC {
+            return Err(std::io::Error::other("the file is no ring of the headset's microphone"));
+        }
+        Ok(ring)
+    }
+
+    fn map(file: &std::fs::File, len: usize) -> std::io::Result<Self> {
+        // SAFETY: a shared mapping of the whole file, which has `len` bytes. The mapping outlives the
+        // file handle and stays for the life of the process.
+        let base = unsafe {
+            libc::mmap(ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, std::os::fd::AsRawFd::as_raw_fd(file), 0)
+        };
+        if base == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { base: base.cast() })
     }
 
     fn word(&self, offset: usize) -> &AtomicU64 {
@@ -110,6 +129,40 @@ impl Ring {
         }
         self.word(WRITE_POS).store(end, Ordering::Release);
         end
+    }
+}
+
+/// A reader of the ring of a host in another process, as Wine's driver is one: a recording of what
+/// the headset shows takes the headset's microphone this way. It stamps the reader's time at each
+/// read, so the host asks the headset for its microphone while the reader reads.
+pub(crate) struct RingReader {
+    ring: Ring,
+    next: Option<u64>,
+}
+
+impl RingReader {
+    pub(crate) fn open(path: &Path) -> std::io::Result<Self> {
+        Ok(Self { ring: Ring::open(path)?, next: None })
+    }
+
+    /// Stamps the reader's time and appends the frames that the host wrote since the last read to
+    /// `out`. The first read takes none. A host that started again writes from its frame 0, and the
+    /// reader follows it. A lag of more than half the ring skips to its newest half.
+    pub(crate) fn read(&mut self, out: &mut Vec<i16>) {
+        self.ring.word(READER_BEAT).store(continuous_ns(), Ordering::Relaxed);
+        let end = self.ring.word(WRITE_POS).load(Ordering::Acquire);
+        let mut pos = match self.next {
+            Some(next) if next <= end => next,
+            _ => end,
+        };
+        pos = pos.max(end.saturating_sub(CAPACITY as u64 / 2));
+        while pos < end {
+            let at = HEADER + (pos as usize & (CAPACITY - 1)) * 2;
+            // SAFETY: `at` lies in the ring's samples.
+            out.push(unsafe { ptr::read_unaligned(self.ring.base.add(at).cast::<i16>()) });
+            pos += 1;
+        }
+        self.next = Some(end);
     }
 }
 
@@ -138,7 +191,7 @@ impl Writer {
 }
 
 /// The time on `mach_continuous_time` in ns, the clock of Wine's performance counter
-fn continuous_ns() -> u64 {
+pub(crate) fn continuous_ns() -> u64 {
     #[repr(C)]
     struct Timebase {
         numer: u32,

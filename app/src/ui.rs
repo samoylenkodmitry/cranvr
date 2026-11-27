@@ -503,9 +503,11 @@ fn HeadsetCard(settings: MutableState<Settings>, model: MutableState<Model>) {
                     Hint(format!("{:.0} fps, render {:.1} ms, encode {:.1} ms, {}{latency}", st.fps, st.render_ms, st.encode_ms, bitrate_text(&st)));
                 }
                 // A user whose controllers do not reach the hand menu opens it from here
-                FlowRow(Modifier::empty().fill_max_width(), flow(), || {
+                FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
                     Action("Open the menu in the headset".into(), backend::open_headset_menu);
+                    RecordButton(settings, model);
                 });
+                RecordingNotes(model);
                 // The headset's own page: its panels, its displays and its actions, as it sends them
                 if let Some(page) = model.with(|m| m.headset_page.clone()) {
                     PageItems(page.items, settings, model);
@@ -523,6 +525,44 @@ fn HeadsetCard(settings: MutableState<Settings>, model: MutableState<Model>) {
             Text(note, Modifier::empty(), colored(230, 180, 90));
         }
     });
+}
+
+/// Starts a recording of what the headset shows, or stops the one that runs (see recorder.rs).
+#[composable]
+fn RecordButton(settings: MutableState<Settings>, model: MutableState<Model>) {
+    let (recording, seconds) = model.with(|m| (m.recording.clone(), m.recording_seconds));
+    let toggle = move || crate::recorder::toggle(settings.with(|s| s.recording_microphone));
+    if recording.running() {
+        Styled(format!("Stop recording ({}:{:02})", seconds / 60, seconds % 60), DANGER, toggle);
+    } else if recording.saving {
+        Hint("Saving the recording...".into());
+    } else {
+        Action("Record what I see".into(), toggle);
+    }
+}
+
+/// Why a recording cannot start, the last word of the recorder, and the last saved file with Show in
+/// Finder.
+#[composable]
+fn RecordingNotes(model: MutableState<Model>) {
+    let (recording, saved) = model.with(|m| (m.recording.clone(), m.saved.clone()));
+    let idle = !recording.running() && !recording.saving;
+    if let Some(why) = recording.blocked.filter(|_| idle) {
+        Hint(why);
+    }
+    if let Some(note) = recording.note.filter(|note| !note.starts_with("Saved")) {
+        Hint(note);
+    }
+    if let Some((path, _)) = saved {
+        FlowRow(Modifier::empty().fill_max_width(), flow(), move || {
+            let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+            Text(format!("Saved: {name}"), Modifier::empty().padding(8.0), colored(110, 200, 140));
+            let path = path.clone();
+            Action("Show in Finder".into(), move || {
+                std::process::Command::new("open").arg("-R").arg(&path).spawn().ok();
+            });
+        });
+    }
 }
 
 /// What the user does to connect the cranvr client: open it on the headset. The headset finds this

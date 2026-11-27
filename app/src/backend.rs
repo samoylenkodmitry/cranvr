@@ -113,6 +113,8 @@ pub struct Settings {
     /// The colors of the headset's 3D menus: "cyan" or "amber". None until the headset tells its
     /// own choice once.
     pub headset_theme: Option<String>,
+    /// A recording of what the headset shows takes the headset's microphone too. Off by default.
+    pub recording_microphone: bool,
 }
 
 impl Default for Settings {
@@ -143,6 +145,7 @@ impl Default for Settings {
             headset_volume: None,
             headset_interface: None,
             headset_theme: None,
+            recording_microphone: false,
         }
     }
 }
@@ -532,6 +535,11 @@ pub struct Model {
     pub found_programs: Vec<PathBuf>,
     /// The pages carry the newest lines of the log until then: the headset asked to see them
     pub log_until: Option<Instant>,
+    /// The file of the last recording and when it was saved: the window shows it with Show in Finder
+    pub saved: Option<(PathBuf, Instant)>,
+    /// The recording of what the headset shows (see recorder.rs), and how long the running one runs
+    pub recording: crate::recorder::View,
+    pub recording_seconds: u64,
 }
 
 impl Model {
@@ -680,6 +688,8 @@ enum HostLine {
     Log(String),
     Exited,
     Message(String),
+    /// A recording saved this file
+    Saved(PathBuf),
 }
 
 /// Shows a message in the window, from any thread.
@@ -812,7 +822,7 @@ pub fn watch_host(settings: &Settings, model: &Model) -> Option<String> {
 static HOST_INPUT: Mutex<Option<ChildStdin>> = Mutex::new(None);
 
 /// `cranvr-host` next to this executable, or at $CRANVR_HOST_BIN.
-fn host_binary() -> Result<PathBuf, String> {
+pub(crate) fn host_binary() -> Result<PathBuf, String> {
     let host = match env::var_os("CRANVR_HOST_BIN") {
         Some(p) => PathBuf::from(p),
         None => env::current_exe().map_err(|e| e.to_string())?.with_file_name("cranvr-host"),
@@ -867,6 +877,20 @@ pub fn send_headset_request(request: &cranvr_common::menu::Request) {
     if !matches!(sent, Some(Ok(()))) {
         notify("The host did not take the request. Start the host and connect the headset.".into());
     }
+}
+
+/// Tells the running host the state of the recording of what the headset shows, which it passes to
+/// the headset (`HostMsg::Recording`, see recorder.rs).
+pub fn tell_host_recording(state: &Value) {
+    let mut input = HOST_INPUT.lock().unwrap();
+    if let Some(input) = input.as_mut() {
+        input.write_all(format!("recording {state}\n").as_bytes()).and_then(|()| input.flush()).ok();
+    }
+}
+
+/// Tells the window that a recording saved its file, from any thread.
+pub fn notify_saved(path: &Path) {
+    channel().0.send(HostLine::Saved(path.to_path_buf())).ok();
 }
 
 /// Asks the connected headset to open its hand menu, for a user whose controllers do not reach it.
@@ -929,6 +953,8 @@ pub fn start_host(settings: &Settings) -> Result<(), String> {
         watch.ended_at = None;
     }
     *HOST_INPUT.lock().unwrap() = child.stdin.take();
+    // A new host knows nothing of a recording that runs: the gem shows the state again
+    crate::recorder::announce();
     let sender = channel().0.clone();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
@@ -1074,6 +1100,13 @@ pub fn pump(model: &mut Model) {
                 }
             }
             HostLine::Message(text) => model.note_message(text),
+            HostLine::Saved(path) => {
+                // The console in VR says it for a few seconds too
+                let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+                let notice = crate::black_eye::Notice { window: String::new(), headset: format!("Saved: {name}") };
+                model.notice = Some((notice, Instant::now() + crate::recorder::SAVED_NOTICE));
+                model.saved = Some((path, Instant::now()));
+            }
         }
     }
     model.running = host_running();

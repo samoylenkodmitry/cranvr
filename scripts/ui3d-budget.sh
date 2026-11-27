@@ -13,6 +13,8 @@
 #     the controller;
 #   - the closed menu of both interfaces with that controller while a game runs: the host's fake game
 #     (`cranvr-fake-game`) sends frames through the runtime's protocol.
+# A game case may end in `:nogem`: the gem that records (`record_gem.rs`) stays out, for a measure of
+# what the idle gem costs against the same case with it.
 # A fourth part of a case names the panels that show, as `shown` takes them: with
 # `flat:closed:holding:stats` the stats panel shows, so the beams and the model show while the stream
 # runs. No panel of the user's shows.
@@ -51,7 +53,8 @@ finish() {
     kill ${host} 2> /dev/null
     wait 2> /dev/null
     ${adb_cmd} reverse --remove tcp:${port} > /dev/null 2>&1
-    ${root}/scripts/give-back.sh ${serial} ${CRANVR_GIVE_BACK_APK:-}
+    # A batch of checks gives the client back once, after its last check
+    [[ -n ${CRANVR_NO_GIVE_BACK:-} ]] || ${root}/scripts/give-back.sh ${serial} ${CRANVR_GIVE_BACK_APK:-}
 }
 trap finish EXIT
 trap 'exit 130' INT TERM
@@ -82,6 +85,7 @@ for case in warm:closed:none ${cases}; do
     fi
     [[ ${interface} == warm ]] && interface=flat
     extras=(--es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room scene --es interface ${interface} --ez save_choices false --ez first_start true --es shown ${panels} --es forget_host_key ${forget} --es scripted_pointer ${pointer})
+    [[ ${case} == *:nogem ]] && extras+=(--ez record_gem false)
     case ${menu} in
         open) extras+=(--ez console false --es hand_menu open) ;;
         stream) extras+=(--ez console true --es console_page stream) ;;

@@ -11,7 +11,7 @@ use cranvr_proto::message::DisplayInfo;
 
 fn input_rows(layout: &Layout, displays: &DisplaysView) -> Vec<MenuRow> {
     let pages = [("stream".to_string(), "Stream".to_string())];
-    rows(&MenuInput { layout, console_open: true, displays, wishes: Default::default(), place: MenuPlace::Hand(cranvr_common::controls::Hand::Left), adding: false, pages: &pages, costs: false })
+    rows(&MenuInput { layout, console_open: true, displays, wishes: Default::default(), place: MenuPlace::Hand(cranvr_common::controls::Hand::Left), adding: false, pages: &pages, costs: false, recording: None })
 }
 
 fn displays() -> DisplaysView {

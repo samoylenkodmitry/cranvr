@@ -123,9 +123,10 @@ fn Client() {
     // An open palm that faces the eyes carries a ball (see `palm.rs`)
     let palm = rememberMutableStateOf(|| None);
     let hands_seen = rememberMutableStateOf(|| false);
+    let left_hand = rememberMutableStateOf(|| false);
     let gaze = rememberMutableStateOf(|| false);
     let looking = rememberMutableStateOf(|| false);
-    let hand = HandState { layout, menu_open, place, present, hint, palm, hands: hands_seen, gaze, looking, recenter: recenters };
+    let hand = HandState { layout, menu_open, place, present, hint, palm, hands: hands_seen, left_hand, gaze, looking, recenter: recenters };
     let opened = menu_open.get();
     LaunchedEffect(opened, async move |_| {
         if opened && hint.get_non_reactive() {
@@ -207,7 +208,7 @@ fn Client() {
                 let read = (layout.get_non_reactive(), console.get_non_reactive().open, displays().menu_view().without_costs(), place.get_non_reactive());
                 if hub().headset_page_due(page_read.as_ref() != Some(&read)) {
                     let (shown, console_open, listed, at) = &read;
-                    let input = MenuInput { layout: shown, console_open: *console_open, displays: listed, wishes: Default::default(), place: *at, adding: false, pages: &[], costs: false };
+                    let input = MenuInput { layout: shown, console_open: *console_open, displays: listed, wishes: Default::default(), place: *at, adding: false, pages: &[], costs: false, recording: None };
                     hub().send_headset_page(&crate::headset_page::page(&menu_model::rows(&input)));
                 }
                 page_read = Some(read);
@@ -324,6 +325,7 @@ fn Client() {
         let ball_3d = interface.is_3d() && (models_drawn || menu_open.get());
         let look = hand_menu::Look { interface, ball_3d, theme: view.theme, room: view.room };
         HandPanels(hand, (view.open, look), view.controls, snapshot.get().state == LinkState::Streaming);
+        crate::record_gem::RecordGem(hand, view.theme);
     }
 }
 
@@ -541,7 +543,7 @@ pub(crate) fn text_style(size: f32, color: Color, weight: Option<FontWeight>) ->
 /// loop once for each headset frame. It does no network call: the sender thread wakes and sends.
 #[composable]
 fn HeadsetFrames(hand: HandState) {
-    let HandState { menu_open, place, present, hint, palm, hands, gaze, looking, .. } = hand;
+    let HandState { menu_open, place, present, hint, palm, hands, left_hand, gaze, looking, .. } = hand;
     let reader = remember(|| Rc::new(RefCell::new(FrameReader::default()))).with(Clone::clone);
     let hold = remember(|| Rc::new(RefCell::new(PanelHold::default()))).with(Clone::clone);
     let placer = remember(|| Rc::new(RefCell::new(Placer::default()))).with(Clone::clone);
@@ -571,6 +573,9 @@ fn HeadsetFrames(hand: HandState) {
             let tracked = tracked_hands.contains(&true);
             if tracked != hands.get_non_reactive() {
                 hands.set(tracked);
+            }
+            if tracked_hands[0] != left_hand.get_non_reactive() {
+                left_hand.set(tracked_hands[0]);
             }
             if let Some(eyes) = frame.device_pose.map(|pose| pose.position) {
                 let change = palms.borrow_mut().update(frame.predicted_display_time, eyes, palm_frames);

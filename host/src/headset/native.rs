@@ -19,7 +19,7 @@
 pub mod audio;
 pub mod desktop;
 mod displays;
-mod microphone;
+pub(crate) mod microphone;
 
 use super::{display_lock::{DisplayLock, Report}, Button, Device, Event, EventSource, FramePlan, Headset, LinkWindow, OutFrame};
 use crate::{
@@ -41,7 +41,7 @@ use cranvr_proto::{
     media::{FrameMeta, DEFAULT_SHARD_LEN},
     message::{
         buttons, display_index, negotiate, ClientDatagram, ClientMsg, FrameTiming, Focus, HostDatagram, HostMsg, HostWishes, Input,
-        InputHold, LossReport, Ping, Pong, RejectReason, Tracking, Views as ProtoViews, UPDATE_HEADSET, UPDATE_MAC,
+        InputHold, LossReport, Ping, Pong, Recording, RejectReason, Tracking, Views as ProtoViews, UPDATE_HEADSET, UPDATE_MAC,
     },
     motion::extrapolate,
     tracking::{Features, Tracked},
@@ -128,6 +128,8 @@ struct Shared {
     asking: Asking,
     /// The tracking features that a game uses now. A new session gets them at once.
     wish: Mutex<Features>,
+    /// The state of the app's recording of what the headset shows. A new session gets it at once.
+    recording: Mutex<Recording>,
 }
 
 /// The most threads that hold a client for the user's answer at once. A device that opens many
@@ -230,7 +232,7 @@ pub fn start(config: Config) -> std::io::Result<(Arc<dyn Headset>, Box<dyn Event
     }
     announce(&config);
     let (events, receiver) = mpsc::channel();
-    let shared = Arc::new(Shared { events, session: Mutex::new(None), decoder_config: Mutex::new(None), starting: Mutex::new(()), asking: Asking::default(), wish: Mutex::new(Features::NONE) });
+    let shared = Arc::new(Shared { events, session: Mutex::new(None), decoder_config: Mutex::new(None), starting: Mutex::new(()), asking: Asking::default(), wish: Mutex::new(Features::NONE), recording: Mutex::new(Recording::default()) });
     {
         let shared = Arc::clone(&shared);
         let config = Arc::new(config);
@@ -277,8 +279,9 @@ fn start_discovery(port: u16, config: &Config) {
 /// Reads the cranvr app's lines from the host's input. `allow KEY` or `deny KEY` is the user's answer
 /// to a headset's request, with the key that the status line shows. `cable on` or `cable off` is the
 /// user's Connection choice: off for Wi-Fi. `menu open` opens the hand menu of the connected headset.
-/// `headset JSON` is a press of the app on the headset's own page (`HostMsg::HeadsetRequest`). A
-/// person who runs the host by hand may type them.
+/// `headset JSON` is a press of the app on the headset's own page (`HostMsg::HeadsetRequest`).
+/// `recording JSON` is the state of the app's recording (`HostMsg::Recording`). A person who runs the
+/// host by hand may type them.
 pub fn read_input(pairings: Arc<Pairings>, cable: Arc<AtomicBool>, headset: Arc<dyn Headset>) {
     thread::Builder::new()
         .name("native-input".into())
@@ -301,6 +304,10 @@ pub fn read_input(pairings: Arc<Pairings>, cable: Arc<AtomicBool>, headset: Arc<
                         } else {
                             info!("Native protocol: no headset is connected to open its hand menu");
                         }
+                    }
+                    Some(Command::Recording(state)) => {
+                        info!("Native protocol: the recording runs: {}, blocked: {:?}", state.running, state.blocked);
+                        headset.set_recording(state);
                     }
                     Some(Command::Headset(request)) => {
                         if headset.send_headset_request(&request) {
@@ -326,11 +333,16 @@ enum Command {
     OpenMenu,
     /// A press of the app on the headset's own page, as a JSON object
     Headset(String),
+    /// The state of the app's recording of what the headset shows
+    Recording(Recording),
 }
 
-/// `allow KEY`, `deny KEY` (the key is 64 hex digits), `cable on`, `cable off`, `menu open` or
-/// `headset JSON`.
+/// `allow KEY`, `deny KEY` (the key is 64 hex digits), `cable on`, `cable off`, `menu open`,
+/// `headset JSON` or `recording JSON`.
 fn parse_command(line: &str) -> Option<Command> {
+    if let Some(state) = line.strip_prefix("recording ") {
+        return serde_json::from_str(state.trim()).ok().map(Command::Recording);
+    }
     if let Some(request) = line.strip_prefix("headset ") {
         let request = request.trim();
         return matches!(serde_json::from_str::<serde_json::Value>(request), Ok(serde_json::Value::Object(_))).then(|| Command::Headset(request.to_string()));
@@ -566,6 +578,8 @@ fn run_session(shared: &Shared, session: &Arc<Session>, stream: cranvr_proto::me
     if let Some(config) = shared.decoder_config.lock().unwrap().clone() {
         session.send_decoder_config(config);
     }
+    let recording = shared.recording.lock().unwrap().clone();
+    session.link.duplex.send_control(&HostMsg::Recording(recording)).ok();
     thread::scope(|scope| {
         scope.spawn(|| ping_loop(session));
         if session.link.duplex.has_udp() {
@@ -1604,6 +1618,15 @@ impl Headset for Native {
                 amplitude: haptic.amplitude,
             };
             session.link.duplex.send_datagram(&HostDatagram::Haptics(message)).ok();
+        }
+    }
+
+    fn set_recording(&self, state: Recording) {
+        *self.shared.recording.lock().unwrap() = state.clone();
+        if let Some(session) = self.shared.session() {
+            if let Err(e) = session.link.duplex.send_control(&HostMsg::Recording(state)) {
+                warn!("Native protocol: the recording's state did not go out: {e}");
+            }
         }
     }
 

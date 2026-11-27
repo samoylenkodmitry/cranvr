@@ -40,7 +40,8 @@ fn panel_key(id: PanelId) -> String {
 }
 
 /// The id and the subject of the request that a button of the hand menu makes from the Mac. A
-/// button that opens a page of the Mac's settings has none: the Mac shows its pages itself.
+/// button that opens a page of the Mac's settings has none: the Mac shows its pages itself. Nor
+/// has the recording's button: the Mac records itself.
 fn request_of(action: MenuAction) -> Option<(&'static str, Option<String>)> {
     let display = |stream: u8| Some((stream - DESKTOP_STREAM + 1).to_string());
     match action {
@@ -50,7 +51,8 @@ fn request_of(action: MenuAction) -> Option<(&'static str, Option<String>)> {
         MenuAction::AddDisplay => Some(("headset.add_display", None)),
         MenuAction::Recenter => Some(("headset.recenter", None)),
         MenuAction::OpenControls => Some(("headset.controls", None)),
-        MenuAction::OpenPage(_) => None,
+        // The Mac's window has its own Record button
+        MenuAction::OpenPage(_) | MenuAction::ToggleRecording => None,
     }
 }
 

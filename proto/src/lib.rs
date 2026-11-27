@@ -74,7 +74,10 @@ pub use wire::{Error, Nanos};
 /// are gone. The stream's state for the console travels apart in [`message::HostMsg::MenuStatus`].
 /// The headset sends its own page ([`message::ClientMsg::HeadsetPage`]) and the Mac presses it
 /// ([`message::HostMsg::HeadsetRequest`]).
-pub const PROTOCOL_VERSION: u16 = 16;
+///
+/// Version 17 adds [`message::HostMsg::Recording`]: the state of the Mac's recording of what the
+/// headset shows, for the gem on the left hand and the hand menu.
+pub const PROTOCOL_VERSION: u16 = 17;
 
 /// The largest datagram, in bytes, sealed: the counter and the tag are in it. A media packet and
 /// any datagram message fit in it. A typical path MTU of 1500 bytes minus the IP and UDP headers

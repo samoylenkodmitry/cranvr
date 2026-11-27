@@ -347,6 +347,26 @@ pub enum HostMsg {
     /// a JSON object (`cranvr_common::menu::Request`). The client does it as a press in the headset
     /// does.
     HeadsetRequest(String),
+    /// The state of the Mac's recording of what the headset shows (see [`Recording`]). The host
+    /// sends it when the client connects and when it changes. The client starts and stops a
+    /// recording with the console's request `{"action": "run", "id": "recording.toggle"}`.
+    Recording(Recording),
+}
+
+/// The state of the recording of what the headset shows: the cranvr app on the Mac drives the
+/// headset's own recorder over adb and saves the file on the Mac.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Recording {
+    /// A recording runs
+    pub running: bool,
+    /// Why a press cannot start or stop a recording now, such as "Recording needs the USB cable",
+    /// or `None` while it can
+    pub blocked: Option<String>,
+    /// A line that the headset shows for a few seconds, such as "Saved: cranvr-2026-11-27-101500.mp4"
+    /// or why a recording failed. `note_id` counts up with each new line, so the same words twice
+    /// show twice.
+    pub note: Option<String>,
+    pub note_id: u32,
 }
 
 /// Datagram messages from the client to the host.

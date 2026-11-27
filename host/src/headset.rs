@@ -247,6 +247,10 @@ pub trait Headset: Send + Sync {
         false
     }
 
+    /// The state of the app's recording of what the headset shows. The link sends it to the headset
+    /// now and at each new connection.
+    fn set_recording(&self, _state: cranvr_proto::message::Recording) {}
+
     /// The tracking features that a game uses now. The link asks the headset for these, within what
     /// the headset offers, and for nothing else. It asks again at each new connection.
     fn set_tracking_wish(&self, _wish: Features) {}
