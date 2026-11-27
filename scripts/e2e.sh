@@ -603,6 +603,22 @@ if [[ -n ${wine} ]]; then
     CRANVR_CONTROL=${work}/config/runtime-control.txt "${root}/scripts/run-game.sh" "${mute[@]}" "${wine}" "${wine_args[@]}" \
         > "${work}/game.log" 2>&1 &
     pids+=($!)
+    # The cranvr app starts a game at normal priority, so the run's program must run at nice 0 too: at nice 5 a
+    # game lost frames to the Mac's other work (#155). The first look at the program's process keeps its nice
+    # value. Its command line starts with its Windows path.
+    (
+        name=${wine##*\\}
+        for i in {1..600}; do
+            # awk reads all of ps's lines: an early exit would end ps with SIGPIPE, which pipefail turns into a failure
+            value=$(ps -axo nice=,command= | awk -v name="${name}" '!seen && $2 ~ /^[A-Za-z]:/ && index($0, name) { found = $1; seen = 1 } END { print found }')
+            if [[ -n ${value} ]]; then
+                print -r -- "${value}" > "${work}/program-nice.txt"
+                exit 0
+            fi
+            sleep 0.1
+        done
+    ) &
+    pids+=($!)
 fi
 if [[ -n ${swapchain_churn} ]]; then
     # The program waits at each stop until the run has measured it
@@ -1161,6 +1177,13 @@ fi
 (( xr_vulkan_exit == 0 )) || result=1
 (( churn_exit == 0 )) || result=1
 (( displays_exit == 0 )) || result=1
+if [[ -n ${wine} ]]; then
+    program_nice=$(cat "${work}/program-nice.txt" 2>/dev/null || true)
+    if [[ -n ${program_nice} && ${program_nice} != 0 ]]; then
+        print -u2 "The program ran at nice ${program_nice}; the cranvr app starts games at normal priority"
+        result=1
+    fi
+fi
 grep -hE "probe: (done|frame arrival|native|desktop|audio|pause test|displays|in-game displays|[0-9.]+ s: the focus)" "${work}/probe.log" 2>/dev/null || true
 print "Report: ${report}"
 exit ${result}
