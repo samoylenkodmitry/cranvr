@@ -2,8 +2,9 @@
 # A leak test of DXMT's shared textures and shared fences. C:\basalt\runtime\shared_churn.exe runs in Wine. In each
 # of --cycles cycles (default 200) it makes six textures of DXMT's stock shared path (R16G16B16A16_FLOAT, B8G8R8A8 with
 # a legacy handle, mipmaps, two slices with an NT handle, 4x MSAA, a keyed mutex), one IOSurface texture of cranvr's
-# path and one shared fence. A second process of the program opens each one, checks it and signals the fence. Then
-# both release everything. At the end the program checks that the handle of a released IOSurface texture does not
+# path and one shared fence. A second process of the program opens each one and checks it. Both processes signal the
+# fence and wait on it, on the CPU and on the GPU, for a value that the other one signaled. Then both release
+# everything. At the end the program checks that the handle of a released IOSurface texture does not
 # open once its ID names a surface of another size. The run needs no host, no headset and no game. It takes about
 # 5 seconds.
 #
@@ -14,11 +15,12 @@
 # reads the IOSurface part of each process's footprint (`footprint`) after the first and the last cycle. It counts the
 # global IOSurfaces of the test's height (scripts/iosurfaces.py) before and after. It fails when a name of a released
 # object stays while the processes live or after their end, when a global surface of the test stays, or when the
-# processes' surfaces grew by more than 32 MB and a twentieth of what the cycles made.
+# processes' surfaces grew by more than 32 MB and a twentieth of what the cycles made. It fails when the fence's round
+# did not go through in every cycle.
 #
 # Before cranvr's DXMT patch 0020 each cycle left 8 names in launchd (6 textures, the keyed mutex's event and the
 # fence) with the memory of the textures until the user logged out. Run the old stack only with --cycles 2 --width 64
-# --height 64. Set CRANVR_HOME to the stack to test (default: the app's, ~/Library/Application Support/cranvr).
+# --height 64. Before cranvr's DXMT patch 0021 the second process could not open the shared fence (#161). Set CRANVR_HOME to the stack to test (default: the app's, ~/Library/Application Support/cranvr).
 
 set -euo pipefail
 
@@ -101,6 +103,13 @@ grep -q "shared_churn: PASS" "${work}/program.log" || bad+=("the program did not
 (( program_code == 0 )) || bad+=("the program ended with exit code ${program_code}")
 grep -q "refused it" "${work}/program.log" && ! grep -q "the ID names another surface now" "${work}/program.log" &&
     bad+=("the second process refused the forged ID, but DXMT logged no size check")
+# The program counts the cycles whose fence went through its whole round in both processes (DXMT patch 0021, #161)
+rounds=$(sed -n "s/^shared_churn: the fence's round went through in \([0-9]*\) of \([0-9]*\) cycles.*/\1 \2/p" "${work}/program.log" | tail -1)
+if [[ -z ${rounds} ]]; then
+    bad+=("the program printed no count of the fence's rounds")
+elif [[ ${rounds%% *} != ${cycles} ]]; then
+    bad+=("the fence's round went through in ${rounds%% *} of ${cycles} cycles")
+fi
 field() { print -r -- "$1" | awk -v key="$2" '{ for (i = 1; i < NF; i++) if ($i == key) { print $(i + 1); exit } }'; }
 if [[ -n ${at[live]:-} ]]; then
     (( $(field "${at[live]}" names) > 0 )) || bad+=("no name in launchd while both processes held the objects: the count sees nothing")

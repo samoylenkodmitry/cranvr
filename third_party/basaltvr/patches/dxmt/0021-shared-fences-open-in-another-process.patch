@@ -1,0 +1,415 @@
+Subject: [PATCH] d3d11: a shared fence opens in another process (cranvr)
+
+DXMT's CreateFence stored the name of a shared fence's event in the sync object's private data with
+D3DKMT_ESCAPE_UPDATE_RESOURCE_WINE. Wine 11.10 runs that escape for resources only, so it failed with
+STATUS_INVALID_PARAMETER. DXMT's check of the result was the wrong way round (if (!D3DKMTEscape(...))), so the fence
+went on without its name. OpenSharedFence read the name with D3DKMTQueryResourceInfoFromNtHandle, which Wine answers
+for resources only, and it read no data even then: Wine's query gives the size alone. No shared fence opened in
+another process (cranvr issue #161).
+
+- The fence's NT handle now shares a bundle of three objects, as Wine shares a texture with a keyed mutex
+  (D3DKMTShareObjects with a resource, a keyed mutex and the sync object). The resource carries the event's name
+  and a tag in its private data. Nobody uses the keyed mutex: Wine shares a sync object with a resource only in such
+  a bundle. The escape is gone.
+- OpenSharedFence queries the resource of the bundle, opens it with D3DKMTOpenResourceFromNtHandle, which gives the
+  name and the sync object, and looks the name up in winemetal's broker (patch 0020). A handle whose data has another
+  size or no tag is no fence's: a texture's handle does not open as a fence. The opened fence keeps the bundle, so it
+  can share it again.
+- Each process logs the open of a fence of another process and its first wait on such a fence on the CPU
+  (SetEventOnCompletion) and on the GPU (ID3D11DeviceContext4::Wait), with its process ID. A run then tells which
+  process waits on a fence that another process signals.
+- util_d3dkmt.h declares D3DKMTCreateKeyedMutex2.
+
+diff --git i/src/d3d11/d3d11_context_imm.cpp w/src/d3d11/d3d11_context_imm.cpp
+index b361f17..ffc1392 100644
+--- i/src/d3d11/d3d11_context_imm.cpp
++++ w/src/d3d11/d3d11_context_imm.cpp
+@@ -606,6 +606,7 @@ public:
+ 
+   HRESULT STDMETHODCALLTYPE Wait(ID3D11Fence *pFence, UINT64 Value) override {
+     auto fence = static_cast<MTLD3D11Fence *>(pFence);
++    fence->NoteWait(true, Value);
+ 
+     Flush();
+     EmitOP([event = fence->event, Value](ArgumentEncodingContext &enc) mutable {
+diff --git i/src/d3d11/d3d11_fence.cpp w/src/d3d11/d3d11_fence.cpp
+index 5cd6afd..dc0efdc 100644
+--- i/src/d3d11/d3d11_fence.cpp
++++ w/src/d3d11/d3d11_fence.cpp
+@@ -6,15 +6,57 @@
+ 
+ namespace dxmt {
+ 
++/* cranvr: what the NT handle of a shared fence carries for another process: the name under which winemetal's broker
++   serves the fence's event. Wine 11.10 keeps private data for resources only. It shares a sync object together with a
++   resource only in a bundle of three objects (D3DKMTShareObjects: a resource, a keyed mutex and the sync object), as
++   for a texture with a keyed mutex. So the fence's handle shares such a bundle. The resource holds this data, and
++   nobody uses the keyed mutex. OpenSharedFence takes the data and the sync object with
++   D3DKMTOpenResourceFromNtHandle. The tag keeps the handle of a texture from opening as a fence and back: a texture's
++   data has another size. */
++struct SharedFenceData {
++  char tag[16];
++  char mach_port_name[54];
++};
++constexpr char kSharedFenceTag[16] = "cranvr fence 1";
++
++/* The D3DKMT objects of a shared fence in this process: the sync object, and the resource and the keyed mutex that
++   carry it in the handle's bundle */
++struct SharedFenceObjects {
++  D3DKMT_HANDLE sync = 0;
++  D3DKMT_HANDLE resource = 0;
++  D3DKMT_HANDLE mutex = 0;
++};
++
++static void
++DestroySharedFenceObjects(D3DKMT_HANDLE device, const SharedFenceObjects &objects) {
++  if (objects.resource) {
++    D3DKMT_DESTROYALLOCATION destroy = {};
++    destroy.hDevice = device;
++    destroy.hResource = objects.resource;
++    D3DKMTDestroyAllocation(&destroy);
++  }
++  if (objects.mutex) {
++    D3DKMT_DESTROYKEYEDMUTEX destroy = {};
++    destroy.hKeyedMutex = objects.mutex;
++    D3DKMTDestroyKeyedMutex(&destroy);
++  }
++  if (objects.sync) {
++    D3DKMT_DESTROYSYNCHRONIZATIONOBJECT destroy = {};
++    destroy.hSyncObject = objects.sync;
++    D3DKMTDestroySynchronizationObject(&destroy);
++  }
++}
++
+ class MTLD3D11FenceImpl : public MTLD3D11DeviceChild<MTLD3D11Fence> {
+ public:
+   MTLD3D11FenceImpl(
+-      MTLD3D11Device *pDevice, WMT::Reference<WMT::SharedEvent> event, D3DKMT_HANDLE handle,
++      MTLD3D11Device *pDevice, WMT::Reference<WMT::SharedEvent> event, SharedFenceObjects objects,
+       const char *servedName = nullptr
+   ) :
+       MTLD3D11DeviceChild<MTLD3D11Fence>(pDevice) {
+     this->event = std::move(event);
+-    local_kmt = handle;
++    local_kmt = objects.sync;
++    bundle = objects;
+     if (servedName)
+       snprintf(served_name, sizeof(served_name), "%s", servedName);
+   };
+@@ -23,11 +65,7 @@ public:
+     // cranvr: launchd drops the name now, so the event goes when the last fence on it goes, in any process
+     if (served_name[0])
+       WMTBootstrapUnregister(served_name);
+-    if (local_kmt) {
+-      D3DKMT_DESTROYSYNCHRONIZATIONOBJECT destroy = {};
+-      destroy.hSyncObject = local_kmt;
+-      D3DKMTDestroySynchronizationObject(&destroy);
+-    }
++    DestroySharedFenceObjects(this->m_parent->GetLocalD3DKMT(), bundle);
+   };
+ 
+   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
+@@ -77,8 +115,12 @@ public:
+       attr.Attributes = OBJ_CASE_INSENSITIVE;
+     }
+ 
+-    if (D3DKMTShareObjects(1, &local_kmt, &attr, Access, pHandle)) {
+-      ERR("D3D11Fence: Failed to create shared handle");
++    // cranvr: the bundle that carries the event's name; a fence of another process shares the same bundle again
++    D3DKMT_HANDLE objects[3] = {bundle.resource, bundle.mutex, bundle.sync};
++    NTSTATUS status = bundle.resource && bundle.mutex ? D3DKMTShareObjects(3, objects, &attr, Access, pHandle)
++                                                      : D3DKMTShareObjects(1, &local_kmt, &attr, Access, pHandle);
++    if (status) {
++      ERR("D3D11Fence: Failed to create shared handle: ", status);
+       return E_FAIL;
+     }
+ 
+@@ -91,6 +133,7 @@ public:
+ 
+   HRESULT STDMETHODCALLTYPE SetEventOnCompletion(UINT64 Value,
+                                                  HANDLE Event) final {
++    NoteWait(false, Value);
+     auto shared_event_listener = this->m_parent->GetDXMTDevice().queue().GetSharedEventListener();
+     MTLSharedEvent_setWin32EventAtValue(event.handle, shared_event_listener, Event, Value);
+     return S_OK;
+@@ -99,6 +142,7 @@ public:
+ private:
+   // cranvr: the name under which this process serves the event's port to other processes (winemetal's broker)
+   char served_name[54] = {};
++  SharedFenceObjects bundle;
+ };
+ 
+ HRESULT
+@@ -111,8 +155,10 @@ CreateFence(MTLD3D11Device *pDevice, UINT64 InitialValue, D3D11_FENCE_FLAG Flags
+       ERR("D3D11Fence: Invalid device handle");
+       return E_FAIL;
+     }
++    SharedFenceObjects objects;
++    D3DKMT_HANDLE device = pDevice->GetLocalD3DKMT();
+     D3DKMT_CREATESYNCHRONIZATIONOBJECT2 create = {};
+-    create.hDevice = pDevice->GetLocalD3DKMT();
++    create.hDevice = device;
+     create.Info.Type = D3DDDI_FENCE;
+     create.Info.Flags.Shared = 1;
+     create.Info.Flags.NtSecuritySharing = 1;
+@@ -120,42 +166,68 @@ CreateFence(MTLD3D11Device *pDevice, UINT64 InitialValue, D3D11_FENCE_FLAG Flags
+       ERR("D3D11Fence: Failed to create D3DKMT handle");
+       return E_FAIL;
+     }
+-    local_kmt = create.hSyncObject;
++    objects.sync = create.hSyncObject;
+ 
+     mach_port_t mach_port = event.createMachPort();
+     if (!mach_port) {
+       ERR("D3D11Fence: Failed to create mach port for shared fence");
++      DestroySharedFenceObjects(device, objects);
+       return E_FAIL;
+     }
+     // cranvr: the event's port is the kernel's, so launchd held it until the user logged out. winemetal's broker
+     // serves it while the fence lives in this process. The broker takes a right of its own.
+-    char mach_port_name[54];
+-    MakeUniqueSharedName(mach_port_name);
+-    bool registered = WMTBootstrapRegister(mach_port_name, mach_port);
++    SharedFenceData data = {};
++    memcpy(data.tag, kSharedFenceTag, sizeof(data.tag));
++    MakeUniqueSharedName(data.mach_port_name);
++    bool registered = WMTBootstrapRegister(data.mach_port_name, mach_port);
+     WMTMachPortDeallocate(mach_port);
+     if (!registered) {
+       ERR("D3D11Fence: Failed to register mach port for shared fence");
++      DestroySharedFenceObjects(device, objects);
+       return E_FAIL;
+     }
+-    // cranvr: Wine 11.10 updates the private data of resources only, so this escape fails for a fence. The check
+-    // below is the wrong way round: it lets the fence go on without the name. OpenSharedFence then fails in another
+-    // process, at D3DKMTQueryResourceInfoFromNtHandle, which Wine answers for resources only as well.
+-    D3DKMT_ESCAPE escape = {};
+-    escape.Type = D3DKMT_ESCAPE_UPDATE_RESOURCE_WINE;
+-    escape.pPrivateDriverData = mach_port_name;
+-    escape.PrivateDriverDataSize = sizeof(mach_port_name);
+-    escape.hContext = local_kmt;
+-    if (!D3DKMTEscape(&escape)) {
+-      ERR("D3D11Fence: Failed to escape mach port for shared fence");
+-      WMTBootstrapUnregister(mach_port_name);
++    // cranvr: DXMT stored the name in the sync object's private data with D3DKMT_ESCAPE_UPDATE_RESOURCE_WINE, which
++    // Wine 11.10 runs for resources only. Its check of the result was the wrong way round, so the fence went on
++    // without the name, and no other process could open it. The name now lives in a resource of the handle's bundle.
++    D3DKMT_CREATEALLOCATION allocation = {};
++    allocation.hDevice = device;
++    allocation.pPrivateRuntimeData = &data;
++    allocation.PrivateRuntimeDataSize = sizeof(data);
++    allocation.Flags.StandardAllocation = 1;
++    allocation.NumAllocations = 1;
++    D3DDDI_ALLOCATIONINFO2 allocationInfo = {};
++    allocation.pAllocationInfo2 = &allocationInfo;
++    D3DKMT_CREATESTANDARDALLOCATION standardAllocation = {};
++    allocation.pStandardAllocation = &standardAllocation;
++    standardAllocation.Type = D3DKMT_STANDARDALLOCATIONTYPE_EXISTINGHEAP;
++    allocation.Flags.ExistingSysMem = 1;
++    D3DDDI_ALLOCATIONINFO systemMem = {};
++    allocationInfo.pSystemMem = &systemMem;
++    allocation.Flags.CreateResource = 1;
++    allocation.Flags.CreateShared = 1;
++    allocation.Flags.NtSecuritySharing = 1;
++    if (D3DKMTCreateAllocation2(&allocation)) {
++      ERR("D3D11Fence: Failed to create the resource that carries the shared fence's name");
++      WMTBootstrapUnregister(data.mach_port_name);
++      DestroySharedFenceObjects(device, objects);
+       return E_FAIL;
+     }
++    objects.resource = allocation.hResource;
++    D3DKMT_CREATEKEYEDMUTEX2 mutex = {};
++    mutex.Flags.NtSecuritySharing = 1;
++    if (D3DKMTCreateKeyedMutex2(&mutex)) {
++      ERR("D3D11Fence: Failed to create the keyed mutex of the shared fence's bundle");
++      WMTBootstrapUnregister(data.mach_port_name);
++      DestroySharedFenceObjects(device, objects);
++      return E_FAIL;
++    }
++    objects.mutex = mutex.hKeyedMutex;
+     event.signalValue(InitialValue);
+-    auto fence = new MTLD3D11FenceImpl(pDevice, std::move(event), local_kmt, mach_port_name);
++    auto fence = new MTLD3D11FenceImpl(pDevice, std::move(event), objects, data.mach_port_name);
+     return fence->QueryInterface(riid, ppFence);
+   }
+   event.signalValue(InitialValue);
+-  auto fence = new MTLD3D11FenceImpl(pDevice, std::move(event), local_kmt);
++  auto fence = new MTLD3D11FenceImpl(pDevice, std::move(event), SharedFenceObjects{});
+   return fence->QueryInterface(riid, ppFence);
+ }
+ 
+@@ -163,7 +235,7 @@ HRESULT
+ CreateFenceOfEvent(MTLD3D11Device *pDevice, WMT::Reference<WMT::SharedEvent> event,
+                    REFIID riid, void **ppFence) {
+   InitReturnPtr(ppFence);
+-  auto fence = new MTLD3D11FenceImpl(pDevice, std::move(event), 0);
++  auto fence = new MTLD3D11FenceImpl(pDevice, std::move(event), SharedFenceObjects{});
+   return fence->QueryInterface(riid, ppFence);
+ }
+ 
+@@ -180,47 +252,62 @@ OpenSharedFence(MTLD3D11Device *pDevice, HANDLE hResource,
+   if (ppFence == nullptr)
+     return S_FALSE;
+ 
+-  char mach_port_name[54];
+-
++  D3DKMT_HANDLE device = pDevice->GetLocalD3DKMT();
++  SharedFenceData data = {};
+   D3DKMT_QUERYRESOURCEINFOFROMNTHANDLE query = {};
+-  query.hDevice = pDevice->GetLocalD3DKMT();
++  query.hDevice = device;
+   query.hNtHandle = hResource;
+-  query.pPrivateRuntimeData = mach_port_name;
+-  query.PrivateRuntimeDataSize = sizeof(mach_port_name);
+ 
++  // cranvr: Wine answers for the resource of the handle's bundle (see SharedFenceData)
+   if (D3DKMTQueryResourceInfoFromNtHandle(&query)) {
+     WARN(str::format("OpenSharedFence: Failed to query resource: ", hResource));
+     return E_INVALIDARG;
+   }
+ 
+-  if (query.PrivateRuntimeDataSize != sizeof(mach_port_name)) {
+-    WARN(str::format("OpenSharedFence: Unexpected size: ", query.PrivateRuntimeDataSize));
++  if (query.PrivateRuntimeDataSize != sizeof(data)) {
++    WARN(str::format("OpenSharedFence: Unexpected size: ", query.PrivateRuntimeDataSize, ": the handle is no fence's"));
+     return E_INVALIDARG;
+   }
+ 
+-  D3DKMT_OPENSYNCOBJECTFROMNTHANDLE2 open = {};
+-  open.hDevice = pDevice->GetLocalD3DKMT();
++  D3DDDI_OPENALLOCATIONINFO2 alloc = {};
++  D3DKMT_OPENRESOURCEFROMNTHANDLE open = {};
++  char dummy;
++  open.hDevice = device;
+   open.hNtHandle = hResource;
+-
+-  if (D3DKMTOpenSyncObjectFromNtHandle2(&open)) {
++  open.NumAllocations = 1;
++  open.pOpenAllocationInfo2 = &alloc;
++  open.pPrivateRuntimeData = &data;
++  open.PrivateRuntimeDataSize = sizeof(data);
++  open.pTotalPrivateDriverDataBuffer = &dummy;
++  open.TotalPrivateDriverDataBufferSize = 0;
++  if (D3DKMTOpenResourceFromNtHandle(&open)) {
+     WARN(str::format("OpenSharedFence: Failed to open resource: ", hResource));
+     return E_INVALIDARG;
+   }
++  // The fence keeps the whole bundle, so that it can share it again
++  SharedFenceObjects objects = {open.hSyncObject, open.hResource, open.hKeyedMutex};
++  if (memcmp(data.tag, kSharedFenceTag, sizeof(data.tag)) || !objects.sync) {
++    WARN(str::format("OpenSharedFence: the handle ", hResource, " carries no fence"));
++    DestroySharedFenceObjects(device, objects);
++    return E_INVALIDARG;
++  }
+ 
+-  mach_port_name[sizeof(mach_port_name) - 1] = 0;
++  data.mach_port_name[sizeof(data.mach_port_name) - 1] = 0;
+   mach_port_t mach_port = 0;
+-  if (!WMTBootstrapLookUp(mach_port_name, &mach_port) || !mach_port) {
+-    ERR("OpenSharedFence: no process serves ", mach_port_name, " now: the process that shared the fence released it or ended");
+-    D3DKMT_DESTROYSYNCHRONIZATIONOBJECT destroy = {};
+-    destroy.hSyncObject = open.hSyncObject;
+-    D3DKMTDestroySynchronizationObject(&destroy);
++  if (!WMTBootstrapLookUp(data.mach_port_name, &mach_port) || !mach_port) {
++    ERR("OpenSharedFence: no process serves ", data.mach_port_name,
++        " now: the process that shared the fence released it or ended");
++    DestroySharedFenceObjects(device, objects);
+     return E_INVALIDARG;
+   }
+ 
+   // cranvr: the event takes a right of its own
+   auto event = pDevice->GetMTLDevice().newSharedEventWithMachPort(mach_port);
+   WMTMachPortDeallocate(mach_port);
+-  auto fence = new MTLD3D11FenceImpl(pDevice, std::move(event), open.hSyncObject);
++  auto fence = new MTLD3D11FenceImpl(pDevice, std::move(event), objects);
++  fence->opened = true;
++  Logger::info(str::format("OpenSharedFence: process ", GetCurrentProcessId(), " opened the fence of ",
++                           data.mach_port_name, " at value ", fence->event.signaledValue()));
+   return fence->QueryInterface(riid, ppFence);
+ }
+ 
+diff --git i/src/d3d11/d3d11_fence.hpp w/src/d3d11/d3d11_fence.hpp
+index f98d37e..6fafb32 100644
+--- i/src/d3d11/d3d11_fence.hpp
++++ w/src/d3d11/d3d11_fence.hpp
+@@ -1,12 +1,26 @@
+ #pragma once
+ #include "d3d11_device.hpp"
+ #include "util_d3dkmt.h"
++#include <atomic>
+ 
+ namespace dxmt {
+ 
+ struct MTLD3D11Fence : public ID3D11Fence {
+   WMT::Reference<WMT::SharedEvent> event;
+   D3DKMT_HANDLE local_kmt = 0;
++  /* cranvr: the fence came from another process (OpenSharedFence). Its first wait of each kind gets a log line, so a
++     run tells which process waits on a fence that another process signals. */
++  bool opened = false;
++  std::atomic<bool> waited_on_cpu{false};
++  std::atomic<bool> waited_on_gpu{false};
++
++  void NoteWait(bool gpu, UINT64 Value) {
++    if (!opened || (gpu ? waited_on_gpu : waited_on_cpu).exchange(true))
++      return;
++    Logger::info(str::format("D3D11Fence: process ", GetCurrentProcessId(), " waits for the first time on the ",
++                             gpu ? "GPU" : "CPU", " for value ", Value, " of a fence that another process shared (now ",
++                             event.signaledValue(), ")"));
++  }
+ };
+ 
+ HRESULT
+diff --git i/src/util/util_d3dkmt.h w/src/util/util_d3dkmt.h
+index dcf13b2..d084648 100644
+--- i/src/util/util_d3dkmt.h
++++ w/src/util/util_d3dkmt.h
+@@ -140,6 +140,29 @@ typedef struct _D3DKMT_DESTROYKEYEDMUTEX
+   D3DKMT_HANDLE hKeyedMutex;
+ } D3DKMT_DESTROYKEYEDMUTEX;
+ 
++typedef struct _D3DKMT_CREATEKEYEDMUTEX2_FLAGS
++{
++  union
++  {
++    struct
++    {
++      UINT NtSecuritySharing : 1;
++      UINT Reserved : 31;
++    };
++    UINT Value;
++  };
++} D3DKMT_CREATEKEYEDMUTEX2_FLAGS;
++
++typedef struct _D3DKMT_CREATEKEYEDMUTEX2
++{
++  UINT64 InitialValue;
++  D3DKMT_HANDLE hSharedHandle;
++  D3DKMT_HANDLE hKeyedMutex;
++  void *pPrivateRuntimeData;
++  UINT PrivateRuntimeDataSize;
++  D3DKMT_CREATEKEYEDMUTEX2_FLAGS Flags;
++} D3DKMT_CREATEKEYEDMUTEX2;
++
+ typedef struct _D3DKMT_QUERYRESOURCEINFO
+ {
+   D3DKMT_HANDLE hDevice;
+@@ -486,6 +509,7 @@ extern "C"
+   DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTOpenResourceFromNtHandle(D3DKMT_OPENRESOURCEFROMNTHANDLE *desc);
+   DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTEscape(const D3DKMT_ESCAPE *desc);
+   DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTDestroyKeyedMutex(const D3DKMT_DESTROYKEYEDMUTEX *desc);
++  DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTCreateKeyedMutex2(D3DKMT_CREATEKEYEDMUTEX2 *desc);
+   DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTQueryResourceInfo(D3DKMT_QUERYRESOURCEINFO *desc);
+   DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTQueryResourceInfoFromNtHandle(D3DKMT_QUERYRESOURCEINFOFROMNTHANDLE *desc);
+   DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTCreateSynchronizationObject2(D3DKMT_CREATESYNCHRONIZATIONOBJECT2 *desc);
+@@ -552,6 +576,11 @@ extern "C"
+     return -1;
+   }
+ 
++  inline NTSTATUS D3DKMTCreateKeyedMutex2(D3DKMT_CREATEKEYEDMUTEX2 *desc) {
++    dxmt::Logger::warn("D3DKMTCreateKeyedMutex2 not implemented.");
++    return -1;
++  }
++
+   inline NTSTATUS D3DKMTQueryResourceInfo(D3DKMT_QUERYRESOURCEINFO *desc) {
+     dxmt::Logger::warn("D3DKMTQueryResourceInfo not implemented.");
+     return -1;

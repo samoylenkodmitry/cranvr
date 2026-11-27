@@ -1,0 +1,136 @@
+diff --git c/runtime/tests/shared_churn.cpp w/runtime/tests/shared_churn.cpp
+index 0880575..fde4528 100644
+--- c/runtime/tests/shared_churn.cpp
++++ w/runtime/tests/shared_churn.cpp
+@@ -12,13 +12,10 @@
+ //   rgba8-msaa   R8G8B8A8_UNORM with 4 samples, legacy shared handle (stock path: MSAA); no color check
+ //   keyed        R8G8B8A8_UNORM with a keyed mutex, legacy shared handle (stock path; the keyed mutex has an event)
+ //   iosurface    B8G8R8A8_UNORM, NT handle (cranvr's IOSurface path of DXMT patch 0019, by the surface's ID)
+-//   fence        a shared ID3D11Fence, NT handle: the first process signals 1, the second waits for it and signals 2,
+-//                then the first waits for 2. In Wine 11.10 the second process cannot open it. DXMT's
+-//                OpenSharedFence reads the fence's private data with D3DKMTQueryResourceInfoFromNtHandle, which Wine
+-//                answers for resources only. DXMT's CreateFence never stores the data either: Wine's
+-//                D3DKMT_ESCAPE_UPDATE_RESOURCE_WINE takes resources only too. DXMT checks its result the wrong way
+-//                round. The program then counts the cycles whose fence did not open and goes on. The first process
+-//                still makes and shares the fence, which put a name in launchd before DXMT patch 0020.
++//   fence        a shared ID3D11Fence, NT handle. Both processes signal it and wait on it, on the CPU and on the
++//                GPU (see the second process and cycleOnce). Before cranvr's DXMT patch 0021 the second process could
++//                not open it under Wine 11.10, and the program counted such cycles and went on. Now a fence that does
++//                not open fails the run.
+ // The first process then releases everything and starts the next cycle. The second releases what it opened at the
+ // end of each cycle.
+ //
+@@ -328,24 +325,38 @@ int child() {
+             if (r != "ok" && reply == "ok")
+                 reply = r;
+         }
++        // The fence's round, the second process's part: the first process signaled 1 before the command. This
++        // process waits for 1 on the CPU and signals 2. Its GPU then waits for 3, which the first process signals
++        // only after it saw 2, so the wait is pending when this process makes it. After the wait the GPU signals 4.
++        // The second line of the reply tells whether 4 came.
+         ID3D11Fence *fence = nullptr;
+         HANDLE fenceHandle = handleAt(4 + kKinds);
+         HRESULT hr = d.device5->OpenSharedFence(fenceHandle, IID_PPV_ARGS(&fence));
+         CloseHandle(fenceHandle);
++        std::string fenceReply = "fence ok";
+         if (FAILED(hr) || !fence) {
++            char text[96];
++            std::snprintf(text, sizeof(text), "the second process could not open the shared fence (0x%08lx)",
++                          static_cast<unsigned long>(hr));
+             if (reply == "ok")
+-                reply = "ok unopened";
++                reply = text;
++            fenceReply = "fence unopened";
+         } else {
+-            if (!waitFence(fence, 1, event)) {
+-                if (reply == "ok")
+-                    reply = "the fence never reached 1";
+-            }
++            if (!waitFence(fence, 1, event) && reply == "ok")
++                reply = "the second process saw no 1 of the first one's signal";
+             d.context4->Signal(fence, 2);
++            d.context4->Wait(fence, 3);
++            d.context4->Signal(fence, 4);
+             d.context->Flush();
+-            fence->Release();
+         }
+         d.context->Flush();
+         writeLine(out, reply);
++        if (fence) {
++            if (!waitFence(fence, 4, event))
++                fenceReply = "the second process's GPU did not get past its wait for 3: no 4";
++            fence->Release();
++        }
++        writeLine(out, fenceReply);
+     }
+     CloseHandle(event);
+     return 0;
+@@ -423,7 +434,7 @@ std::string hex(uintptr_t value) {
+ 
+ void waitForFile(const std::string &signal, const char *stage);
+ 
+-unsigned fencesUnopened = 0; // the cycles whose fence the second process could not open
++unsigned fenceRounds = 0; // the cycles whose fence went through its whole round in both processes
+ 
+ bool cycleOnce(Device &d, Child &c, unsigned cycle, UINT width, UINT height, HANDLE event, const std::string *live) {
+     ID3D11Texture2D *textures[kKinds] = {};
+@@ -507,17 +518,40 @@ bool cycleOnce(Device &d, Child &c, unsigned cycle, UINT width, UINT height, HAN
+             ok = fail("shared fence", hr);
+     }
+     if (ok) {
++        // The fence's round, the first process's part: it signals 1, waits for 2 on the CPU, signals 3 for the second
++        // process's GPU, and its own GPU waits for 4, which the second process's GPU signals after its wait for 3.
++        // Then this GPU signals 5. Each process thus waits on the CPU and on the GPU for a value of the other.
+         command += " " + hex(reinterpret_cast<uintptr_t>(c.give(fenceHandle)));
+         d.context4->Signal(fence, 1);
+         d.context->Flush();
++        // Metal orders no work across processes on a texture of DXMT's stock path. The second process reads the
++        // colors once this GPU has cleared the textures: without the wait it read zeros now and then (cycle 13 of
++        // 200 in one run, rgba16f).
++        if (!waitFence(fence, 1, event))
++            ok = fail(("cycle " + std::to_string(cycle) + ": this process's own GPU did not reach 1").c_str());
++    }
++    if (ok) {
+         writeLine(c.toChild, command);
+         std::string reply = readLine(c.fromChild);
+-        if (reply == "ok unopened")
+-            fencesUnopened++;
+-        else if (reply != "ok")
+-            ok = fail(("cycle " + std::to_string(cycle) + ": " + reply).c_str());
+-        else if (!waitFence(fence, 2, event))
+-            ok = fail("the fence never reached 2: the second process's signal does not arrive");
++        std::string at = "cycle " + std::to_string(cycle) + ": ";
++        if (reply != "ok") {
++            ok = fail((at + reply).c_str());
++        } else if (!waitFence(fence, 2, event)) {
++            ok = fail((at + "the fence never reached 2: the second process's signal does not arrive").c_str());
++        } else {
++            d.context4->Signal(fence, 3);
++            d.context4->Wait(fence, 4);
++            d.context4->Signal(fence, 5);
++            d.context->Flush();
++            if (!waitFence(fence, 5, event))
++                ok = fail((at + "the fence never reached 5: this GPU did not get past its wait for the second "
++                                "process's 4").c_str());
++        }
++        std::string fenceReply = readLine(c.fromChild);
++        if (ok && fenceReply != "fence ok")
++            ok = fail((at + fenceReply).c_str());
++        if (ok)
++            fenceRounds++;
+         if (ok && live)
+             waitForFile(*live, "live");
+     }
+@@ -661,9 +695,9 @@ int main(int argc, char **argv) {
+     if (ok)
+         ok = forge(d, c, height);
+     CloseHandle(event);
+-    if (ok && fencesUnopened)
+-        std::printf("shared_churn: the second process could not open the shared fence in %u of %u cycles\n",
+-                    fencesUnopened, cycles);
++    std::printf("shared_churn: the fence's round went through in %u of %u cycles: each process waited on the CPU and "
++                "on the GPU for a value that the other signaled\n",
++                fenceRounds, cycles);
+     if (ok)
+         std::printf("shared_churn: PASS %u cycles of %d shared textures and a shared fence across two processes, "
+                     "%.2f ms a cycle\n",
