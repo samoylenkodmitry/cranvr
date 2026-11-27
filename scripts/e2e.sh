@@ -16,7 +16,8 @@
 #                       [--pause AT:FOR] [--left-trigger AT:FOR] [--right-trigger AT:FOR]
 #                       [--face-source visual|audio|unknown]
 #
-#   --seconds N   how long the stream runs (default 20)
+#   --seconds N   how long the stream runs (default 12: the report needs two 5-second windows after the
+#                 first; 14 with --desktop, whose pointer check needs two turns of the probe's script)
 #   --fps HZ      the stream's refresh rate (default 120, as the host). The probe also offers 144,
 #                 165, 180 and 240 Hz, which measure the room left above a Quest 3's 120 Hz
 #   --game        a fake game sends the frames through the BasaltVR runtime protocol. With the
@@ -24,7 +25,11 @@
 #   --wine PROGRAM a Windows OpenXR program runs in cranvr's Wine stack without sound, through
 #                 scripts/run-game.sh: a Windows path such as 'C:\basalt\runtime\d3d11_runtime_smoke.exe'.
 #                 The probe then counts every frame of the right size, since the program draws no
-#                 eye badges. --wine-arg passes one argument to the program.
+#                 eye badges, so the run fails unless the host counted frames of the program. The
+#                 run starts the program once the client has linked. The program gets the variables
+#                 of BasaltVR's test with a live headset (see start_program), so
+#                 d3d11_runtime_smoke.exe runs its checks against the run's host. --wine-arg passes
+#                 one argument to the program.
 #   --tracking [FEATURES]  hands, body, face and eyes: the fake game uses these features (a comma
 #                 list of hands, body, full_body, face and eyes; default all), the probe offers
 #                 them and plays the script of probe/src/tracked.rs, and the fake game checks what
@@ -193,7 +198,7 @@
 #                 frame timing without one.
 #   --native-tcp  with the probe: the media goes over TCP, as it does over USB with `adb reverse`
 #   --native-drop PERCENT  with the probe: it drops this share of the media packets, so the
-#                 parity has loss to recover
+#                 parity has loss to recover. UDP media only: TCP has no parity and loses nothing
 #   --native-port PORT  the host's TCP port (default 9950)
 #   --host-arg ARG one more cranvr-host argument, for an A/B run of a setting:
 #                 --host-arg --no-display-lock
@@ -205,7 +210,10 @@
 # client are the only ones.
 #
 # The script exits with 0 when the median fps reached 90 percent of the target and the client saw
-# the right picture. It exits with 1 otherwise.
+# the right picture. It exits with 1 otherwise. Every program that the run starts (a Windows program or
+# the fake game) also fails the run when its log has a FAIL line ("FAIL: ..." or "NAME: FAIL ...") or
+# when it ends on its own with an exit code other than 0. A program that still runs at the end, such as
+# a game, ends with the run.
 
 set -euo pipefail
 # zsh lowers the priority of a background job by 5 ("nice") unless this option is off. The host and the game run as
@@ -215,12 +223,12 @@ unsetopt BG_NICE
 
 root=${0:A:h:h}
 source "${root}/scripts/guardian.sh"
-seconds=20 seconds_given=0 fps=120 fps_given=0 game=0 desktop=0 sound=0 client=mac serial="" report=""
+seconds=12 seconds_given=0 fps=120 fps_given=0 game=0 desktop=0 sound=0 client=mac serial="" report=""
 displays=1 hold=0 hand_hold=0 displays_in_game=0 display_test=0
 tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 hand_interaction="" openvr_wine=0 openvr_actions="" openvr_overlay=0 openvr_gl=0 steamvr=0 face_source=audio
 openvr_vulkan=0 openvr_args=() xr_vulkan="" swapchain_churn="" churn_cycles=1000 churn_cycles_given=0 churn_frames=0
 game_stall="" moving=0
-wine="" wine_args=()
+wine="" wine_args=() wine_given=0
 native_tcp=0 native_drop=0 native_port=9950 pause="" left_trigger="" right_trigger="" cable="" room=scene
 more_host_args=() more_probe_args=()
 while (( $# )); do
@@ -238,7 +246,7 @@ while (( $# )); do
         --hand-interaction)
             hand_interaction=hand; shift
             if (( $# )) && [[ $1 != --* ]]; then hand_interaction=$1; shift; fi
-            [[ ${hand_interaction} == (hand|both) ]] || { print -u2 "--hand-interaction takes hand or both"; exit 2; } ;;
+            [[ ${hand_interaction} == (hand|both) ]] || { print -u2 -r -- "--hand-interaction takes hand or both"; exit 2; } ;;
         --openvr-wine) openvr_wine=1; shift ;;
         --openvr-overlay) openvr_wine=1 openvr_overlay=1; shift ;;
         --openvr-gl) openvr_wine=1 openvr_gl=1; shift ;;
@@ -247,19 +255,19 @@ while (( $# )); do
         --xr-vulkan)
             xr_vulkan=enable2; shift
             if (( $# )) && [[ $1 != --* ]]; then xr_vulkan=$1; shift; fi
-            [[ ${xr_vulkan} == (enable2|enable1|array) ]] || { print -u2 "--xr-vulkan takes enable2, enable1 or array"; exit 2; } ;;
+            [[ ${xr_vulkan} == (enable2|enable1|array) ]] || { print -u2 -r -- "--xr-vulkan takes enable2, enable1 or array"; exit 2; } ;;
         --swapchain-churn)
             swapchain_churn=$2; shift 2
-            [[ ${swapchain_churn} == (d3d11|d3d11-array|vulkan|vulkan-array) ]] || { print -u2 "--swapchain-churn takes d3d11, d3d11-array, vulkan or vulkan-array"; exit 2; } ;;
+            [[ ${swapchain_churn} == (d3d11|d3d11-array|vulkan|vulkan-array) ]] || { print -u2 -r -- "--swapchain-churn takes d3d11, d3d11-array, vulkan or vulkan-array"; exit 2; } ;;
         --churn-cycles) churn_cycles=$2; churn_cycles_given=1; shift 2 ;;
         --churn-frames) churn_frames=1; shift ;;
         --steamvr) openvr_wine=1 steamvr=1; shift ;;
         --openvr-actions)
             openvr_wine=1 openvr_actions=$2; shift 2
-            [[ ${openvr_actions} == (touch|vive|both) ]] || { print -u2 "--openvr-actions takes touch, vive or both"; exit 2; } ;;
+            [[ ${openvr_actions} == (touch|vive|both) ]] || { print -u2 -r -- "--openvr-actions takes touch, vive or both"; exit 2; } ;;
         --face-source)
             face_source=$2; shift 2
-            [[ ${face_source} == (visual|audio|unknown) ]] || { print -u2 "--face-source takes visual, audio or unknown"; exit 2; } ;;
+            [[ ${face_source} == (visual|audio|unknown) ]] || { print -u2 -r -- "--face-source takes visual, audio or unknown"; exit 2; } ;;
         --desktop) desktop=1; shift ;;
         --sound) sound=1; shift ;;
         --displays) displays=$2; shift 2 ;;
@@ -267,7 +275,7 @@ while (( $# )); do
         --hold) game=1 hold=1; shift ;;
         --hand-hold) game=1 hand_controllers=1 hand_hold=1; shift ;;
         --displays-in-game) game=1 displays_in_game=1; shift ;;
-        --wine) wine=$2; shift 2 ;;
+        --wine) wine=$2 wine_given=1; shift 2 ;;
         --wine-arg) wine_args+=("$2"); shift 2 ;;
         --cranvr-client|--native) shift ;;
         --native-tcp) native_tcp=1; shift ;;
@@ -276,7 +284,7 @@ while (( $# )); do
         --cable) cable=$2; shift 2 ;;
         --room)
             room=$2; shift 2
-            [[ ${room} == (scene|passthrough) ]] || { print -u2 "--room takes scene or passthrough"; exit 2; } ;;
+            [[ ${room} == (scene|passthrough) ]] || { print -u2 -r -- "--room takes scene or passthrough"; exit 2; } ;;
         --pause) pause=$2; shift 2 ;;
         --left-trigger) left_trigger=$2; shift 2 ;;
         --right-trigger) right_trigger=$2; shift 2 ;;
@@ -290,6 +298,8 @@ while (( $# )); do
     esac
 done
 
+# The pointer check of --desktop needs two turns of the probe's script
+(( desktop && ! seconds_given && seconds < 14 )) && seconds=14
 if (( displays > 1 && ! displays_in_game )); then
     # The probe adds the displays, shows them and removes the last one three seconds before the end
     desktop=1
@@ -300,11 +310,11 @@ if (( displays_in_game )); then
     (( seconds >= 18 )) || seconds=18
 fi
 if [[ ${client} == quest ]] && (( hold || displays > 1 || displays_in_game || tracking || hand_controllers || tracking_wine || openvr_wine )); then
-    print -u2 "--tracking, --hand-controllers, --tracking-wine and --openvr-wine belong to the probe: they cannot combine with --quest."
+    print -u2 -r -- "--tracking, --hand-controllers, --tracking-wine and --openvr-wine belong to the probe: they cannot combine with --quest."
     exit 2
 fi
 if [[ ${client} == quest && -n ${hand_interaction} ]]; then
-    print -u2 "--hand-interaction belongs to the probe: its checks need the probe's still head and controllers."
+    print -u2 -r -- "--hand-interaction belongs to the probe: its checks need the probe's still head and controllers."
     exit 2
 fi
 if (( openvr_wine )); then
@@ -352,11 +362,17 @@ if (( tracking_wine )); then
 fi
 
 if [[ -n ${pause} && ${client} == quest ]]; then
-    print -u2 "--pause belongs to the probe: it cannot combine with --quest."
+    print -u2 -r -- "--pause belongs to the probe: it cannot combine with --quest."
     exit 2
 fi
 if [[ ${client} == quest ]] && (( native_tcp || native_drop )); then
-    print -u2 "--native-tcp and --native-drop belong to the probe: they cannot combine with --quest."
+    print -u2 -r -- "--native-tcp and --native-drop belong to the probe: they cannot combine with --quest."
+    exit 2
+fi
+if (( native_tcp && native_drop )); then
+    # TCP carries no parity and loses no packet. A packet that the probe drops there loses its frame, the probe waits for
+    # a key frame, and a drop of 3 percent of the packets left 58 percent of the frames: a loss that no TCP link has.
+    print -u2 -r -- "--native-drop tests the parity of UDP media: it cannot combine with --native-tcp."
     exit 2
 fi
 
@@ -570,6 +586,8 @@ if (( game )); then
     # headset on a desk sends no controller input.
     if [[ ${client} == mac ]]; then
         game_args=(--expect-input)
+        # A scripted pull turns the probe's cycle of presses off, which --expect-input checks
+        [[ -n ${left_trigger}${right_trigger} ]] && game_args=()
         (( tracking )) && game_args=(--use-tracking "${tracking_features}" --release-tracking --expect-tracking --face-source "${face_source}")
         (( hand_controllers )) && game_args=(--expect-hand-controllers)
         (( hand_hold )) && game_args+=(--expect-hand-held)
@@ -598,13 +616,32 @@ if [[ -n ${swapchain_churn} ]]; then
     # the surfaces and their bytes.
     print "start 0 0 $(churn_count)" > "${work}/churn.txt"
 fi
-if [[ -n ${wine} ]]; then
-    print -r "Starting ${wine} in Wine (log: ${work}/game.log)"
-    mute=(--mute)
+program_pid=""
+view_size=""
+# Starts the Windows program once the client has linked, as a user starts a game after the headset linked. The host
+# writes the stream's view size into the control file then, before its status line of the link, and the runtime reads
+# the file when the program starts. A program that started before the link got a Quest 3 eye whatever the game render
+# size, so its size depended on which of the two came first (#169).
+start_program() {
+    [[ -n ${wine} && -z ${program_pid} ]] || return 0
+    # BasaltVR's test programs, such as d3d11_runtime_smoke.exe, check the runtime against the native test daemon of
+    # BasaltVR's build unless these variables say what a live host gives a game. BasaltVR's own test with a headset
+    # sets the same (runtime/scripts/test-headset.zsh). Without them the program failed its own checks under
+    # cranvr-host before its first frame, and the run passed on the host's own scene (#169). Games read none of them.
+    read -r _ _ view_width view_height _ < "${work}/config/runtime-control.txt"
+    view_size=${view_width}x${view_height}
+    export BASALT_EXPECT_VIEW_WIDTH=${view_width} BASALT_EXPECT_VIEW_HEIGHT=${view_height}
+    # The program checks the left controller: the probe's follows its script. The host gives a game the Touch profile of
+    # both hands at its start, so the program's check of no controller fails under the host. With a Quest the program
+    # waits up to 30 s for the left controller, which must be awake.
+    export BASALT_REQUIRE_HEAD_POSE=1 BASALT_EXPECT_IOSURFACE=1 BASALT_REQUIRE_CONTROLLER_INPUT=1
+    print -r "Starting ${wine} in Wine at a view of ${view_size} (log: ${work}/game.log)"
+    local mute=(--mute)
     (( sound )) && mute=()
     CRANVR_CONTROL=${work}/config/runtime-control.txt "${root}/scripts/run-game.sh" "${mute[@]}" "${wine}" "${wine_args[@]}" \
         > "${work}/game.log" 2>&1 &
-    pids+=($!)
+    program_pid=$!
+    pids+=(${program_pid})
     # The cranvr app starts a game at normal priority, so the run's program must run at nice 0 too: at nice 5 a
     # game lost frames to the Mac's other work (#155). The first look at the program's process keeps its nice
     # value. Its command line starts with its Windows path.
@@ -621,7 +658,7 @@ if [[ -n ${wine} ]]; then
         done
     ) &
     pids+=($!)
-fi
+}
 if [[ -n ${swapchain_churn} ]]; then
     # The program waits at each stop until the run has measured it
     (
@@ -678,8 +715,8 @@ probe_args=(--seconds "${seconds}" --connect "127.0.0.1:${native_port}" --drop-p
 (( native_tcp )) && probe_args+=(--tcp)
 (( game )) && probe_args+=(--game)
 (( steamvr )) && probe_args+=(--quest-view)
-# A real program and the desktop scene draw no eye badges
-if [[ -n ${wine} ]] || (( desktop )); then
+# A real program, the desktop scene and the moving landscape of the fake game draw no eye badges
+if [[ -n ${wine} ]] || (( desktop || moving )); then
     probe_args+=(--any-picture)
 fi
 # The probe asks for the desktop stream, plays a pointer script and counts the Mac's sound
@@ -705,7 +742,20 @@ case ${client} in
     mac)
         print "Running cranvr-probe for ${seconds} seconds"
         # HOME keeps the probe out of the user's Library folder
-        HOME=${work}/probe-home "${bin}/cranvr-probe" "${probe_args[@]}" > "${work}/probe.log" 2>&1 || client_exit=$?
+        HOME=${work}/probe-home "${bin}/cranvr-probe" "${probe_args[@]}" > "${work}/probe.log" 2>&1 &
+        probe_pid=$!
+        pids+=(${probe_pid})
+        if [[ -n ${wine} ]]; then
+            # The probe links within a second. A probe that never links fails the run, and the program then starts
+            # without a stream as before.
+            for i in {1..100}; do
+                headset_connected && break
+                kill -0 ${probe_pid} 2>/dev/null || break
+                sleep 0.1
+            done
+            start_program
+        fi
+        wait ${probe_pid} || client_exit=$?
         ;;
     quest)
         print "Starting ${package} on ${serial}"
@@ -752,6 +802,7 @@ case ${client} in
             client_exit=1
         else
             print "Streaming for ${seconds} seconds"
+            start_program
             # A signal ends the wait at once, so cleanup gives Guardian back without delay
             sleep "${seconds}" & wait $!
             if [[ -n ${cable} ]]; then
@@ -887,12 +938,23 @@ if (( tracking_wine )); then
     grep -h "tracking_smoke:" "${work}/game.log" || true
     grep -q "tracking_smoke: PASS" "${work}/game.log" || { print -u2 "The tracking program did not pass; see ${work}/game.log"; tracking_exit=1; }
 fi
+# Waits up to 6 s for the host's next stats line: the 5-second window that holds a program's end comes after its verdict
+next_stats_window() {
+    local lines=$(grep -c '"type":"stats"' "${work}/host.out")
+    for i in {1..60}; do
+        (( $(grep -c '"type":"stats"' "${work}/host.out") > lines )) && return 0
+        sleep 0.1
+    done
+}
 xr_vulkan_exit=0
 if [[ -n ${xr_vulkan} ]]; then
     for i in {1..60}; do
         grep -qE "vulkan_runtime_smoke: (PASS|FAIL)" "${work}/game.log" && break
         sleep 0.5
     done
+    # The check below leaves out the windows of the program's start and end. The program starts after the client's
+    # link, so on a Quest it ends close to the run's end, and the window of its end came after the check (#169).
+    next_stats_window
     grep -hE "vulkan_runtime_smoke:|Vulkan frames" "${work}/game.log" || true
     grep -q "vulkan_runtime_smoke: PASS" "${work}/game.log" || { print -u2 "The Vulkan program did not pass; see ${work}/game.log"; xr_vulkan_exit=1; }
     # The game's frames reach the host at the rate, and each eye has its color the right way up
@@ -1112,6 +1174,74 @@ fi
 # The host prints a stats line every 5 seconds: wait for the last one
 sleep 5.5
 
+# Every program of the run fails the run with a FAIL line in its log or with an end of its own with an error code
+# (#169). The OpenVR modes and the other modes with a verdict line required their PASS line only, and a plain --wine
+# run required nothing of its program. A program that still runs now, such as a game or the fake game of a Quest run,
+# ends with the run. A test program with a verdict line ends on its own after it: the run gives it 10 s for that, since
+# Wine takes a few seconds to end a program that used the GPU.
+program_exit=0
+program_ends=0
+(( openvr_wine || tracking_wine )) && program_ends=1
+[[ -n ${xr_vulkan}${hand_interaction}${swapchain_churn} ]] && program_ends=1
+check_program() {
+    local name=$1 pid=$2 log=$3 code
+    if grep -qE '^([A-Za-z0-9_.-]+: )?FAIL([: ]|$)' "${log}" 2>/dev/null; then
+        print -u2 "${name} printed a FAIL line; see ${log}:"
+        grep -E '^([A-Za-z0-9_.-]+: )?FAIL([: ]|$)' "${log}" | head -5 >&2
+        program_exit=1
+    fi
+    [[ -n ${pid} ]] || return 0
+    if (( program_ends )); then
+        for i in {1..100}; do
+            kill -0 "${pid}" 2>/dev/null || break
+            sleep 0.1
+        done
+        if kill -0 "${pid}" 2>/dev/null; then
+            print -u2 "${name} still runs 10 s after its verdict; see ${log}"
+            program_exit=1
+            return 0
+        fi
+    fi
+    kill -0 "${pid}" 2>/dev/null && return 0
+    wait "${pid}" && code=0 || code=$?
+    print "${name} ended with exit code ${code}"
+    if (( code != 0 )); then
+        print -u2 "${name} ended with an error; see ${log}"
+        program_exit=1
+    fi
+}
+if [[ -n ${wine} ]]; then
+    check_program "The Windows program ${wine##*\\}" "${program_pid}" "${work}/game.log"
+    # The control file's size at the program's start went to the program. A size that changed during the run belongs to
+    # a new link, and the program renders at the old one.
+    read -r _ _ view_width view_height _ < "${work}/config/runtime-control.txt"
+    if [[ -n ${view_size} && ${view_width}x${view_height} != "${view_size}" ]]; then
+        print -u2 "The game's view size changed from ${view_size} to ${view_width}x${view_height} during the run"
+        program_exit=1
+    fi
+fi
+if (( wine_given )); then
+    # The probe counts every frame of the right size, the host's own scene too: the host's count of the program's frames
+    # tells a program that draws from one that failed before its first frame
+    game_frames=$(python3 -I - "${work}/host.out" <<'PYTHON'
+import json, sys
+print(sum(json.loads(line[8:]).get("game_frames") or 0 for line in open(sys.argv[1], errors="replace")
+          if line.startswith("@cranvr") and '"type":"stats"' in line))
+PYTHON
+)
+    print "The host got ${game_frames} frames of the program"
+    if (( game_frames == 0 )); then
+        print -u2 "The host got no frame of the program: the stream showed the host's own scene"
+        program_exit=1
+    fi
+fi
+if (( game )) && [[ ${client} == quest ]]; then
+    # The fake game of a Quest run outlasts the run: an end before it is a failure
+    check_program "The fake game" "${game_pid}" "${work}/game.log"
+elif (( game )); then
+    check_program "The fake game" "" "${work}/game.log"
+fi
+
 protocol=udp
 if (( ${host_args[(Ie)--tcp]} )); then
     protocol=tcp
@@ -1170,22 +1300,33 @@ if [[ -n ${swapchain_churn} ]]; then
     print "churn: the stream's verdict above does not count; the leak test's checks do"
     result=0
 fi
-(( client_exit == 0 )) || result=1
-(( mouse_exit == 0 )) || result=1
-(( game_exit == 0 )) || result=1
-(( tracking_exit == 0 )) || result=1
-(( hand_interaction_exit == 0 )) || result=1
-(( openvr_exit == 0 )) || result=1
-(( xr_vulkan_exit == 0 )) || result=1
-(( churn_exit == 0 )) || result=1
-(( displays_exit == 0 )) || result=1
+# The report's line above judges the stream alone. The run's verdict also holds the checks of the client and the
+# programs: a run whose program failed printed only the stream's PASS before (#169).
+failed=()
+(( result == 0 )) || failed+=(stream)
+(( client_exit == 0 )) || failed+=(client)
+(( mouse_exit == 0 )) || failed+=(mouse)
+(( game_exit == 0 )) || failed+=("fake game")
+(( tracking_exit == 0 )) || failed+=(tracking)
+(( hand_interaction_exit == 0 )) || failed+=("hand interaction")
+(( openvr_exit == 0 )) || failed+=(OpenVR)
+(( xr_vulkan_exit == 0 )) || failed+=("Vulkan program")
+(( churn_exit == 0 )) || failed+=("swapchain churn")
+(( displays_exit == 0 )) || failed+=(displays)
+(( program_exit == 0 )) || failed+=(program)
 if [[ -n ${wine} ]]; then
     program_nice=$(cat "${work}/program-nice.txt" 2>/dev/null || true)
     if [[ -n ${program_nice} && ${program_nice} != 0 ]]; then
         print -u2 "The program ran at nice ${program_nice}; the cranvr app starts games at normal priority"
-        result=1
+        failed+=(nice)
     fi
 fi
+(( ${#failed} == 0 )) || result=1
 grep -hE "probe: (done|frame arrival|native|desktop|audio|pause test|displays|in-game displays|[0-9.]+ s: the focus)" "${work}/probe.log" 2>/dev/null || true
 print "Report: ${report}"
+if (( result == 0 )); then
+    print "e2e: PASS"
+else
+    print "e2e: FAIL (${(j:, :)failed})"
+fi
 exit ${result}

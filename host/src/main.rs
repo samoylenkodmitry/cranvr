@@ -513,12 +513,13 @@ fn main() {
                 // `cable` tells the app which way the stream travels
                 // `foveation` names the level of a foveated stream, which the window shows
                 let level = if n.foveated { options.foveation } else { FoveationLevel::Off };
-                status::emit(json!({"type": "headset", "connected": true, "eye": [n.eye_width, n.eye_height], "fps": n.fps, "foveated": n.foveated, "foveation": level.name(), "ip": client_ip.to_string(), "cable": cable}));
-                // games that start from now on render at the stream's eye size
+                // Games that start from now on render at the stream's eye size. The file comes before the status
+                // line, so a game that starts at the line gets this size (scripts/e2e.sh starts its program there).
                 let scaled = |v: u32| (v as f32 * options.game_scale).round() as u32;
                 if let Err(e) = link.write_control_file((scaled(n.eye_width), scaled(n.eye_height)), n.fps.round() as u32) {
                     warn!("Game runtime control file: {e}");
                 }
+                status::emit(json!({"type": "headset", "connected": true, "eye": [n.eye_width, n.eye_height], "fps": n.fps, "foveated": n.foveated, "foveation": level.name(), "ip": client_ip.to_string(), "cable": cable}));
                 *shared.stream.lock().unwrap() = Some(negotiated).filter(|n| n.codec == Codec::Hevc);
                 shared.force_idr.store(true, Ordering::Relaxed);
             }
