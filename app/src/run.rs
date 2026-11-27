@@ -163,12 +163,15 @@ pub fn tick(settings: &mut Settings, model: &mut Model, slow: bool) {
     backend::write_vr_menu(settings, model);
 }
 
-/// Answers the host's reports of a black picture (see black_eye.rs): the program's option "Each
-/// eye in its own pass" turns on once, and the game starts again with it. A report with the option
-/// on already only shows a notice.
+/// Answers the host's reports of a black picture (see black_eye.rs): an eye option of the program
+/// turns on, and the game starts again with it. A report with the options tried already only shows a
+/// notice.
 fn black_eye_reports(settings: &mut Settings, model: &mut Model, reports: Vec<serde_json::Value>) {
     for report in reports {
-        let black_eye::Response { notice, restart } = black_eye::respond(&mut settings.launch, &model.games, report["program"].as_str(), report["eye"].as_str().unwrap_or("right"));
+        let program = report["program"].as_str();
+        let opencomposite = program.is_some_and(|program| crate::game_run::through_opencomposite(&steam::prefix(), program));
+        let images = black_eye::EyeImages::of(report["name"].as_str(), opencomposite);
+        let black_eye::Response { notice, restart } = black_eye::respond(&mut settings.launch, &model.games, program, report["eye"].as_str().unwrap_or("right"), images);
         model.notice = Some((notice, Instant::now() + black_eye::NOTICE_TIME));
         if let Some(program) = restart {
             // The new start reads the saved options

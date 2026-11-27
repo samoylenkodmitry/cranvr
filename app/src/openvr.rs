@@ -27,6 +27,10 @@ pub const RUNTIME: &str = r"C:\opencomposite";
 /// The folder of cranvr's SteamVR driver inside the prefix, as Windows programs see it.
 pub const DRIVER: &str = r"C:\cranvr\steamvr";
 
+/// The name of cranvr's SteamVR driver in its hello to the host (steamvr/driver_cranvr.cpp). The host's lines
+/// about a game name the game so when it runs in SteamVR.
+pub const STEAMVR_DRIVER: &str = "SteamVR (cranvr driver)";
+
 /// A Windows path as a JSON string: the backslash is an escape.
 fn json(path: &str) -> String {
     format!("\"{}\"", path.replace('\\', r"\\"))

@@ -993,9 +993,11 @@ public:
     }
     uint32_t Width() const { return control_.width; }
     uint32_t Height() const { return control_.height; }
-    // The size that a game renders an eye at: the eye's size at the game's share
-    uint32_t RenderWidth() const { return static_cast<uint32_t>(control_.width * share_ + 0.5f) & ~1u; }
-    uint32_t RenderHeight() const { return static_cast<uint32_t>(control_.height * share_ + 0.5f) & ~1u; }
+    // The size that a game renders an eye at: the eye's size at the game's share. SteamVR rounds a recommended size
+    // down to a multiple of 4 (874x934 became 872x932), so the driver recommends such a size and its log names the
+    // size of the game's images.
+    uint32_t RenderWidth() const { return static_cast<uint32_t>(control_.width * share_ + 0.5f) & ~3u; }
+    uint32_t RenderHeight() const { return static_cast<uint32_t>(control_.height * share_ + 0.5f) & ~3u; }
     uint32_t Fps() const { return fps_; }
 
     // A process whose layers reach a frame. The first one that is not SteamVR's compositor is the game.
@@ -1463,6 +1465,31 @@ private:
 
 // ---- the driver ----
 
+// SteamVR multiplies the size that the driver recommends by a factor of its own, which it takes from a measurement of
+// the GPU: up to 1.5 times the area. cranvr's game render size and the host's learned share decide a game's size in
+// OpenXR games, so they decide it here too: SteamVR's render scale is manual. The setting persists in
+// steamvr.vrsettings. The driver sets it again at each start, also when Steam or scripts/run-game.sh starts SteamVR.
+// The manual scale itself is 1 unless the user set another one on SteamVR's settings page: SteamVR lets no driver
+// change it ("Blocking driver cranvr attempt to set setting steamvr/supersampleScale").
+void KeepRenderScale() {
+    EVRSettingsError error = VRSettingsError_None;
+    bool manual = VRSettings()->GetBool(k_pch_SteamVR_Section, k_pch_SteamVR_SupersampleManualOverride_Bool, &error);
+    float scale = VRSettings()->GetFloat(k_pch_SteamVR_Section, k_pch_SteamVR_SupersampleScale_Float, &error);
+    if (!manual) {
+        error = VRSettingsError_None;
+        VRSettings()->SetBool(k_pch_SteamVR_Section, k_pch_SteamVR_SupersampleManualOverride_Bool, true, &error);
+        if (error == VRSettingsError_None) {
+            Log("SteamVR's render scale was automatic: the driver set it to manual, so games render at the size it recommends");
+        } else {
+            Log("SteamVR refused the manual render scale (error %d): games render at SteamVR's own scale", error);
+        }
+    }
+    if (scale != 1.0f) {
+        Log("SteamVR's settings hold a manual render scale of %.2f, which only its settings page changes: games render at that share "
+            "of the size that the driver recommends", scale);
+    }
+}
+
 EVRInitError Driver::Init(IVRDriverContext *context) {
     VR_INIT_SERVER_DRIVER_CONTEXT(context);
     std::string control = ControlPath();
@@ -1494,6 +1521,7 @@ EVRInitError Driver::Init(IVRDriverContext *context) {
     if (share_ < 1.0f) {
         Log("the game renders at %.0f%% of the eye's size (game-sizes.txt): %s", share_ * 100, game.c_str());
     }
+    KeepRenderScale();
     frames.Configure(control_.width, control_.height);
     frames.SetPeriod(1.0 / fps_);
 

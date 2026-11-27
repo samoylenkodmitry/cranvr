@@ -454,7 +454,7 @@ fn game_wine(program: &str, steam_args: &[String], engine: Option<launch::Engine
         }
     }
     let mut command = wine_with(program, settings.game_msaa_limit);
-    command.envs(launch::environment(&settings.wine, &options)).args(steam_args).args(launch::arguments(&options, engine));
+    command.envs(launch::environment(&settings.wine, &options)).args(steam_args).args(launch::arguments(&settings.wine, &options, engine));
     // cranvr's SteamVR driver finds the game's render size in game-sizes.txt by the game's program. SteamVR,
     // which the game starts, inherits the variable.
     command.env("CRANVR_GAME", program);
@@ -603,6 +603,11 @@ pub fn run_program(path: &Path) -> Result<(), String> {
 pub fn restart(program: &str) -> Result<(), String> {
     let name = program.rsplit('\\').next().unwrap_or(program);
     end_program(name);
+    let settings = backend::Settings::load();
+    let options = settings.launch.get(program).cloned().unwrap_or_default();
+    if launch::openvr(&settings.wine, &options) == launch::OpenVr::SteamVr {
+        end_steamvr();
+    }
     let path = windows_to_mac(program).ok_or(format!("cranvr cannot start {program} again"))?;
     match games().into_iter().find(|game| self::program(game).is_some_and(|own| own.eq_ignore_ascii_case(program))) {
         Some(game) => play(&game),
@@ -614,15 +619,51 @@ pub fn restart(program: &str) -> Result<(), String> {
 /// the game's run gives no verdict for it (game_run.rs).
 fn end_program(name: &str) {
     game_run::stopping();
-    wine("taskkill").args(["/IM", name, "/F"]).stdout(Stdio::null()).stderr(Stdio::null()).status().ok();
-    for _ in 0..30 {
-        if !program_running(name) {
-            break;
-        }
-        thread::sleep(Duration::from_millis(500));
-    }
+    taskkill(name);
+    wait_until_gone(name, Duration::from_secs(15));
     // The host sees the end of the old connection first, then the new game connects
     thread::sleep(Duration::from_secs(2));
+}
+
+/// SteamVR's programs. A game in SteamVR starts them, and cranvr's driver asks SteamVR to quit when the game ends.
+const STEAMVR_PROGRAMS: [&str; 6] = ["vrserver.exe", "vrcompositor.exe", "vrmonitor.exe", "vrdashboard.exe", "vrwebhelper.exe", "vrstartup.exe"];
+
+/// How long SteamVR may take to quit by itself after its game ended. It took about 3 s with The Thrill of the Fight.
+const STEAMVR_QUIT: Duration = Duration::from_secs(8);
+
+/// Waits until SteamVR has quit after its game ended, and ends its programs when it still runs after
+/// [`STEAMVR_QUIT`]. A game that starts while SteamVR quits gets "Init_ShuttingDown" from SteamVR, and a Unity
+/// player crashed on it. Under Wine SteamVR's quit can stall for minutes on a web helper that it fails to end.
+fn end_steamvr() {
+    if wait_until_gone("vrserver.exe", STEAMVR_QUIT) {
+        return;
+    }
+    for name in STEAMVR_PROGRAMS {
+        taskkill(name);
+    }
+    let gone = wait_until_gone("vrserver.exe", Duration::from_secs(15));
+    backend::log(if gone {
+        "SteamVR did not quit after its game ended. cranvr ended SteamVR before the game's new start.".into()
+    } else {
+        "SteamVR did not quit after its game ended, and cranvr could not end it. The game's new start may find no headset.".into()
+    });
+}
+
+/// Ends every process of the Windows program with this file name.
+fn taskkill(name: &str) {
+    wine("taskkill").args(["/IM", name, "/F"]).stdout(Stdio::null()).stderr(Stdio::null()).status().ok();
+}
+
+/// Waits up to `time` until no process of the Windows program `name` runs. Returns whether it is gone.
+fn wait_until_gone(name: &str, time: Duration) -> bool {
+    let since = Instant::now();
+    while program_running(name) {
+        if since.elapsed() >= time {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    true
 }
 
 fn program_running(name: &str) -> bool {

@@ -985,6 +985,8 @@ struct Game {
     last_frame: Option<Instant>,
     /// The game's program path, from the runtime
     program: Option<String>,
+    /// The game's name from its runtime's hello: the GPU, or cranvr's SteamVR driver for a game in SteamVR
+    name: String,
     /// The game's frame rate in each stats window after its first 20 s. The host decides on its size for
     /// the next start when the game disconnects.
     run: game_sizes::Run,
@@ -1029,6 +1031,7 @@ impl Game {
                 self.run = Default::default();
                 self.eye_watch = Default::default();
                 status::emit(json!({"type": "game", "connected": true, "name": renderer, "program": self.program}));
+                self.name = renderer;
                 self.swapchains.clear();
                 self.connected = true;
                 self.since = Some(Instant::now());
@@ -1096,9 +1099,10 @@ fn learn_size(sizes: &game_sizes::Sizes, program: &str, run: &game_sizes::Run) {
 }
 
 /// Checks the two eyes of a game frame about once a second. The cranvr app hears of a black picture
-/// once for each game run, as a `black_eye` status line, and decides what to do. The caller
-/// holds the images, so this takes the fields of `Game` that it needs, not the whole of it.
-fn watch_eyes(watch: &mut eye_check::Watch, program: Option<&str>, frame: &GameFrame, left: &PixelBuffer, right: &PixelBuffer) {
+/// once for each game run, as a `black_eye` status line, and decides what to do. The line names the
+/// game's runtime as the `game` line does, because the answer differs for a game in SteamVR. The
+/// caller holds the images, so this takes the fields of `Game` that it needs, not the whole of it.
+fn watch_eyes(watch: &mut eye_check::Watch, program: Option<&str>, name: &str, frame: &GameFrame, left: &PixelBuffer, right: &PixelBuffer) {
     if !watch.due() {
         return;
     }
@@ -1107,7 +1111,7 @@ fn watch_eyes(watch: &mut eye_check::Watch, program: Option<&str>, frame: &GameF
             eye_check::Symptom::RightEye => warn!("The right eye of the game stays black while the left eye shows a picture"),
             eye_check::Symptom::BothEyes => warn!("Both eyes of the game stay black while the game delivers frames"),
         }
-        status::emit(json!({"type": "black_eye", "eye": symptom.eye(), "program": program}));
+        status::emit(json!({"type": "black_eye", "eye": symptom.eye(), "program": program, "name": name}));
     }
 }
 
@@ -1524,7 +1528,7 @@ fn frame_loop(
                 let images = (game.swapchains.image(&frame.views[0]), game.swapchains.image(&frame.views[1]));
                 let result = match images {
                     (Some(left), Some(right)) => {
-                        watch_eyes(&mut game.eye_watch, game.program.as_deref(), frame, left, right);
+                        watch_eyes(&mut game.eye_watch, game.program.as_deref(), &game.name, frame, left, right);
                         let mut params = ComposeParams {
                             fov: views.fov,
                             eye_w,
