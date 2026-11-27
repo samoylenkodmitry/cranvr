@@ -128,8 +128,18 @@ fn change(update: impl FnOnce(&mut View)) {
     }
 }
 
+/// A line of the recording for the Log tab, also kept in `recordings.log` in the cranvr folder: a
+/// recording's numbers and its failures stay there after the app ends.
+fn log(line: String) {
+    let stamp = local_stamp();
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(config_dir().join("recordings.log")) {
+        writeln!(file, "{stamp} {line}").ok();
+    }
+    backend::log(format!("Recording: {line}"));
+}
+
 fn note(text: String) {
-    backend::log(format!("Recording: {text}"));
+    log(text.clone());
     change(|view| {
         view.note = Some(text);
         view.note_id += 1;
@@ -188,7 +198,7 @@ fn run(asks: &mpsc::Receiver<Ask>) {
                 Some(why) => note(why),
                 None => match start(microphone) {
                     Ok(started) => {
-                        backend::log(format!("Recording: started ({})", started.name));
+                        log(format!("started ({})", started.name));
                         change(|view| view.since = Some(Instant::now()));
                         running = Some(started);
                     }
@@ -199,7 +209,7 @@ fn run(asks: &mpsc::Receiver<Ask>) {
             (Some(Ask::Quit(done)), recording) => {
                 if let Some(mut recording) = recording {
                     let stopped = recorder(&recording.adb, &recording.serial, "stop");
-                    backend::log(format!("Recording: the app ends; the headset's recorder keeps the file in its gallery ({stopped:?})"));
+                    log(format!("the app ends; the headset's recorder keeps the file in its gallery ({stopped:?})"));
                     drop(recording.sound.stdin.take());
                     wait_for(&mut recording.sound, Duration::from_secs(2));
                     remove_parts(&recording.dir);
@@ -371,7 +381,7 @@ fn stop(mut recording: Running) -> Option<Running> {
     change(|view| view.saving = false);
     match result {
         Ok((path, numbers)) => {
-            backend::log(format!("Recording: saved {} ({numbers})", path.display()));
+            log(format!("saved {} ({numbers})", path.display()));
             change(|view| view.saved = Some(path.clone()));
             note(format!("Saved: {}", recording.name));
             backend::notify_saved(&path);

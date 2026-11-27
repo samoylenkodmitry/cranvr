@@ -10,9 +10,18 @@ Usage: scripts/gem-color.py --find CAPTURE.png [BEFORE.png]
                                                   pixels of X,Y, its light (luma) and what it looks
                                                   like
 
+       scripts/gem-color.py --verdict COLORS.txt THEME
+                                              reads the lines that the second form printed for the
+                                              captures of scripts/gem-looks.sh and exits 1 unless
+                                              the idle gem has the theme's hue (violet for amber,
+                                              blue for cyan), the pointed gem is green, the
+                                              recording gem red and the blocked gem the theme's hue
+                                              at no more than 60% of the idle gem's light
+
 macOS's `sips` turns the PNG into a BMP, which the script reads.
 """
 import pathlib
+import re
 import struct
 import subprocess
 import sys
@@ -76,7 +85,50 @@ def look(r, g, b):
     return "other"
 
 
+# The blocked gem's light may reach this share of the idle gem's light at most
+DIM_AT_MOST = 0.6
+
+
+def verdict(path, theme):
+    glass = {"amber": "violet", "cyan": "blue"}[theme]
+    looks = {}
+    for line in pathlib.Path(path).read_text().splitlines():
+        found = re.match(r"(gem-[a-z-]+)\.png: .* \(light (\d+)\), .*: (\w+)$", line.strip())
+        if found:
+            looks[found[1]] = (found[3], int(found[2]))
+    wants = [
+        ("gem-idle", glass),
+        ("gem-pointed", "green"),
+        ("gem-recording", "red"),
+        ("gem-recording-later", "red"),
+        ("gem-blocked", glass),
+        ("gem-blocked-press", glass),
+    ]
+    fails = []
+    for name, hue in wants:
+        seen = looks.get(name, ("missing", 0))[0]
+        if seen != hue:
+            fails.append(f"{name} is {seen}, not {hue}")
+    idle = looks.get("gem-idle", (None, 0))[1]
+    for name in ("gem-blocked", "gem-blocked-press"):
+        light = looks.get(name, (None, 0))[1]
+        if idle and light > DIM_AT_MOST * idle:
+            fails.append(f"{name} has {light / idle:.0%} of the idle gem's light, more than {DIM_AT_MOST:.0%}")
+        elif idle:
+            print(f"{name} has {light / idle:.0%} of the idle gem's light")
+    pulse = [looks.get(name, (None, 0))[1] for name in ("gem-recording", "gem-recording-later")]
+    if all(pulse):
+        print(f"the recording gem's light in two captures about 0.8 s apart: {pulse[0]} and {pulse[1]}")
+    for fail in fails:
+        print(f"the looks fail: {fail}")
+    if not fails:
+        print("the looks pass")
+    return 1 if fails else 0
+
+
 def main():
+    if sys.argv[1] == "--verdict":
+        sys.exit(verdict(sys.argv[2], sys.argv[3]))
     if sys.argv[1] == "--find":
         place = find(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)
         if place:

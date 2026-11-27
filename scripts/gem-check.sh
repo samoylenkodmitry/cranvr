@@ -105,7 +105,7 @@ for i in {1..60}; do
     [[ -n ${saved} ]] && break
     sleep 1
 done
-grep -E "Recording: " ${work}/app.log | tail -6 | cut -c1-300
+tail -4 ${home}/recordings.log 2> /dev/null | cut -c1-400
 if [[ -n ${saved} ]]; then
     ffprobe -v error -count_frames -show_entries stream=codec_type,codec_name,width,height,avg_frame_rate,nb_read_frames,duration,sample_rate,channels -of compact ${saved}
     ffmpeg -hide_banner -nostats -i ${saved} -vn -af volumedetect -f null - 2>&1 | grep -E "mean_volume|max_volume"

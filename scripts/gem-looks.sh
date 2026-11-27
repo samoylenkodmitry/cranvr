@@ -13,8 +13,10 @@
 #     show the pulse;
 #   - sends a state in which no recording can start, takes a capture of the dim gem and, after the
 #     second press, one of the dim gem with the reason beside it.
-# It measures the gem's color in each capture (scripts/gem-color.py) and keeps a capture only when
-# scripts/capture-check.py passes it.
+# It measures the gem's color in each capture (scripts/gem-color.py), keeps a capture only when
+# scripts/capture-check.py passes it, and exits 1 unless each look has its color (`--verdict`).
+# The first start of the client after its install only warms up: the headset changes its USB
+# functions about 28 s after that start, which ends the test port's link for 2 s.
 #
 # Usage: scripts/gem-looks.sh SERIAL WORKDIR [CAPTURES] [PORT]
 #   CAPTURES  the folder for the captures that pass (none by default: every capture is deleted)
@@ -89,12 +91,17 @@ sleep 1
 client_waiting
 ${adb_cmd} shell am force-stop ${CLIENT_PACKAGE}
 ${adb_cmd} shell am broadcast -a com.oculus.vrpowermanager.prox_close > /dev/null
+theme=${THEME:-amber}
+common=(--es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room none --es theme ${theme} --ez save_choices false \
+    --es panels hidden --ez console false --es forget_host_key ${forget})
+client_start ${host_log} ${common}
+print "warm start: ${client_result}"
+${adb_cmd} shell am force-stop ${CLIENT_PACKAGE}
+sleep 1
 ${adb_cmd} logcat -c
-client_start ${host_log} --es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room none --es theme amber --ez save_choices false \
-    --es panels hidden --ez console false --es forget_host_key ${forget} --es scripted_pointer gem --ei gem_wait_ms 16000
+client_start ${host_log} ${common} --es scripted_pointer gem --ei gem_wait_ms 12000
 print "client: ${client_result} ${client_linked}"
 [[ ${client_result} == alive ]] || exit 1
-shot gem-first
 wait_log "points away: the gem shows its idle look" 10 || print "no idle step"
 sleep 4
 # The idle capture waits for the place that the green of the pointed gem shows
@@ -104,7 +111,6 @@ sleep 2.5
 shot gem-pointed
 gem_at=$(python3 -I ${root}/scripts/gem-color.py --find ${work}/gem-pointed.png ${work}/gem-idle.png)
 print "the gem stands at ${gem_at:-an unknown place}"
-measure gem-first
 measure gem-idle
 measure gem-pointed
 # The press reaches the host as the menu's request `recording.toggle`
@@ -116,8 +122,8 @@ grep -q "recording.toggle" ${host_log} && print "the host got the press" || prin
 state '{"running": true, "blocked": null, "note": null, "note_id": 0}'
 wait_log "points away while the recording runs" 6 || print "no recording step"
 sleep 2.5
+# Two captures half of the pulse's 1.6 s apart: a capture takes about 0.8 s
 shot gem-recording
-sleep 0.7
 shot gem-recording-later
 measure gem-recording
 measure gem-recording-later
@@ -132,3 +138,4 @@ measure gem-blocked-press
 ${adb_cmd} logcat -d -v time > ${work}/client.log
 grep -E "Cranpose" ${work}/client.log | grep -E "scripted gem:|the gem (cannot|starts|stops)|pointer (enters|presses|rests on|leaves) the gem|the gem.s look" | sed -E 's/^[0-9-]+ ([0-9:.]+) .*cranvr_client::[a-z_:]+: /\1 /'
 print "cut ends $(date +%T)"
+python3 -I ${root}/scripts/gem-color.py --verdict ${work}/colors.txt ${theme}
