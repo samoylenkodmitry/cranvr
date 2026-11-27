@@ -631,12 +631,10 @@ start_program() {
     read -r _ _ view_width view_height _ < "${work}/config/runtime-control.txt"
     view_size=${view_width}x${view_height}
     export BASALT_EXPECT_VIEW_WIDTH=${view_width} BASALT_EXPECT_VIEW_HEIGHT=${view_height}
-    export BASALT_REQUIRE_HEAD_POSE=1 BASALT_EXPECT_IOSURFACE=1
-    # The probe's controllers follow its script. A Quest on a desk sends no controller input, and the program then
-    # expects none.
-    if [[ ${client} == mac ]]; then
-        export BASALT_REQUIRE_CONTROLLER_INPUT=1
-    fi
+    # The program checks the left controller: the probe's follows its script. The host gives a game the Touch profile of
+    # both hands at its start, so the program's check of no controller fails under the host. With a Quest the program
+    # waits up to 30 s for the left controller, which must be awake.
+    export BASALT_REQUIRE_HEAD_POSE=1 BASALT_EXPECT_IOSURFACE=1 BASALT_REQUIRE_CONTROLLER_INPUT=1
     print -r "Starting ${wine} in Wine at a view of ${view_size} (log: ${work}/game.log)"
     local mute=(--mute)
     (( sound )) && mute=()
@@ -940,12 +938,23 @@ if (( tracking_wine )); then
     grep -h "tracking_smoke:" "${work}/game.log" || true
     grep -q "tracking_smoke: PASS" "${work}/game.log" || { print -u2 "The tracking program did not pass; see ${work}/game.log"; tracking_exit=1; }
 fi
+# Waits up to 6 s for the host's next stats line: the 5-second window that holds a program's end comes after its verdict
+next_stats_window() {
+    local lines=$(grep -c '"type":"stats"' "${work}/host.out")
+    for i in {1..60}; do
+        (( $(grep -c '"type":"stats"' "${work}/host.out") > lines )) && return 0
+        sleep 0.1
+    done
+}
 xr_vulkan_exit=0
 if [[ -n ${xr_vulkan} ]]; then
     for i in {1..60}; do
         grep -qE "vulkan_runtime_smoke: (PASS|FAIL)" "${work}/game.log" && break
         sleep 0.5
     done
+    # The check below leaves out the windows of the program's start and end. The program starts after the client's
+    # link, so on a Quest it ends close to the run's end, and the window of its end came after the check (#169).
+    next_stats_window
     grep -hE "vulkan_runtime_smoke:|Vulkan frames" "${work}/game.log" || true
     grep -q "vulkan_runtime_smoke: PASS" "${work}/game.log" || { print -u2 "The Vulkan program did not pass; see ${work}/game.log"; xr_vulkan_exit=1; }
     # The game's frames reach the host at the rate, and each eye has its color the right way up
