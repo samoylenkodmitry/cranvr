@@ -3,53 +3,55 @@ Subject: [PATCH] winemetal, d3d11: shared textures and events leave launchd with
 DXMT registered the Mach port of each shared texture of its stock path (MTLSharedTextureHandle: formats other than
 RGBA8 and BGRA8, mipmaps, arrays, MSAA, legacy handles) and of each shared event (a shared ID3D11Fence, the event of
 the keyed mutex of patch 0014) with launchd under the object's shared name, for OpenSharedResource and
-OpenSharedFence in another process. These ports belong to the kernel and never die. launchd kept them, and the memory
-of the textures, until the user logged out, and it refuses to remove a name (a register with no port answers 1101,
-BOOTSTRAP_NAME_IN_USE). On 2026-11-27 one run of SteamVR left 30 names with 240 MB in launchd.
+OpenSharedFence in another process. These ports belong to the kernel and never die. launchd kept them, with the
+memory of the textures, until the user logged out. launchd also refuses to remove a name (a register with no port
+answers 1101, BOOTSTRAP_NAME_IN_USE). On 2026-11-27 one run of SteamVR left 30 names with 240 MB in launchd.
 
 winemetal now shares such a port through a broker. WMTBootstrapRegister makes a service port whose receive right the
-process holds, one for each object, and registers that port under the name. A thread of the broker answers each
+process holds, one for each object. It registers that port under the name. A thread of the broker answers each
 request on a service port with a copy of the object's send right. WMTBootstrapUnregister, a new call, destroys the
-service port when the object goes, and launchd drops the name at once (0.2 ms in a check); the end of the process
-destroys it too. WMTBootstrapLookUp asks the service port for the object's port, with a time-out of a second, and
-WMTMachPortDeallocate, a new call, frees a right that it gave.
+service port when the object goes. launchd then drops the name at once (0.2 ms in a check). The end of the process
+destroys the service port too. WMTBootstrapLookUp asks the service port for the object's port, with a time-out of a
+second. WMTMachPortDeallocate, a new call, frees a right that the look-up gave.
 
-A texture of the stock path cannot go by the global ID of its IOSurface, as the IOSurface textures of patch 0019 do:
-Metal makes it on an IOSurface that is not global, so IOSurfaceLookup in another process finds nothing (checked for
-RGBA8, RGBA16Float, mipmaps, two slices, 4x MSAA, Depth32Float, BC1 and RGB10A2), and the surface reports no size
+A texture of the stock path cannot go by the global ID of its IOSurface, as the IOSurface textures of patch 0019 do.
+Metal makes it on an IOSurface that is not global: IOSurfaceLookup in another process finds nothing (checked for
+RGBA8, RGBA16Float, mipmaps, two slices, 4x MSAA, Depth32Float, BC1 and RGB10A2). The surface also reports no size
 and no pixel format. Its port is the only way into another process. An event has no ID at all. The private calls
 stay those that DXMT used before (initWithMachPort: of MTLSharedTextureHandle, newSharedEventWithMachPort: of the
 device, eventPort of MTLSharedEventHandle). A check in two native processes opened all eight textures above and an
-event through the broker: each texture had its description, the RGBA8 one its pixels, and the event its value.
+event through the broker: each texture had its description, the RGBA8 one had its pixels, the event had its value.
 Neither call takes the caller's right, so the caller frees it.
 
 - A shared texture of the stock path is served while its DeviceTexture lives. The allocation frees its own right with
-  the texture, in the process that made it and in each process that opened it; DXMT kept those rights until the
-  process ended. A process that shares an opened texture again (patch 0018) serves its own port under a new name,
-  which the new private data carries in server_name, so the next process does not depend on the creator. The unique
-  name stays the same in every process, because the keyed mutex names its section by it.
-- A shared fence is served while the fence lives, and the event of a keyed mutex while the process that made its
-  section holds the section. A process that comes later gets no event and takes the keyed mutex's first way (the
-  writer's ReleaseSync waits for its GPU).
-- An opened texture and an opened shared buffer (patch 0013) kept one reference too many (Com takes the first
-  reference itself, and ref() took another), so they stayed until the process ended, and so did their memory and the
-  IOSurfaces of patch 0019 that another DXMT process opened.
-- The resource deleted its keyed mutex through IDXGIKeyedMutex, which has no virtual destructor, so the keyed mutex's
-  section and the name of its event stayed until the process ended. The resource now holds the concrete type.
+  the texture, in the process that made it and in each process that opened it. DXMT kept those rights until the
+  process ended. A process that shares an opened texture again (patch 0018) serves its own port under a new name.
+  The new private data carries that name in server_name, so the next process does not depend on the creator. The
+  unique name stays the same in every process, because the keyed mutex names its section by it.
+- A shared fence is served while the fence lives. The event of a keyed mutex is served while the process that made
+  its section holds the section. A process that comes later gets no event. Its keyed mutex then takes the first way
+  (the writer's ReleaseSync waits for its GPU).
+- An opened texture and an opened shared buffer (patch 0013) kept one reference too many. Com takes the first
+  reference itself. ref() took a second one. They stayed with their memory until the process ended. The same held
+  for the IOSurfaces of patch 0019 that another DXMT process opened.
+- The resource deleted its keyed mutex through IDXGIKeyedMutex, which has no virtual destructor. The keyed mutex's
+  section and the name of its event therefore stayed until the process ended. The resource now holds the concrete
+  type.
 - The import of an IOSurface texture compares the width, the height and the pixel format of the surface that the ID
-  names with the runtime data, and refuses another surface with a log line. macOS gives the lowest free ID to a new
+  names with the runtime data. It refuses another surface with a log line. macOS gives the lowest free ID to a new
   surface, so the ID of a released texture names the next new surface at once.
 
-In Wine 11.10 a shared fence still does not open in another process, as before: DXMT's CreateFence stores its name with
-D3DKMT_ESCAPE_UPDATE_RESOURCE_WINE, which Wine runs for resources only (DXMT's check of the result is the wrong way
-round, so the fence goes on without the name), and OpenSharedFence reads it with D3DKMTQueryResourceInfoFromNtHandle,
-which Wine answers for resources only. The fence's name now goes with the fence all the same.
+In Wine 11.10 a shared fence still does not open in another process, as before. DXMT's CreateFence stores its name
+with D3DKMT_ESCAPE_UPDATE_RESOURCE_WINE, which Wine runs for resources only. DXMT's check of the result is the wrong
+way round, so the fence goes on without the name. OpenSharedFence reads the name with
+D3DKMTQueryResourceInfoFromNtHandle, which Wine answers for resources only. The fence's name in launchd now goes with
+the fence all the same.
 
-scripts/shared-churn.sh in cranvr runs runtime/tests/shared_churn.exe (runtime patch 0017): in each cycle six textures
-of the stock path, one IOSurface texture and a shared fence, which a second process opens and checks. Before the
-patch, 2 cycles of 64 x 64 left 16 names in launchd with 375 KB of surfaces after both processes had ended, and the
+scripts/shared-churn.sh in cranvr runs runtime/tests/shared_churn.exe (runtime patch 0017). In each cycle it makes six
+textures of the stock path, one IOSurface texture and a shared fence, which a second process opens and checks. Before
+the patch, 2 cycles of 64 x 64 left 16 names in launchd with 375 KB of surfaces after both processes had ended. The
 handle of a released IOSurface texture opened on a new surface of another size. With the patch, 200 cycles of
-640 x 333 show 8 names while both processes hold the objects, none after each cycle and none after the end, and the
+640 x 333 show 8 names while both processes hold the objects. None stays after each cycle or after the end. The
 IOSurfaces of both processes grow by 11 MB once while the cycles make 1981 MB.
 ---
 diff --git i/src/d3d11/d3d11_buffer.cpp w/src/d3d11/d3d11_buffer.cpp
@@ -67,7 +69,7 @@ index 34b879e..b3422d2 100644
  }
  
 diff --git i/src/d3d11/d3d11_fence.cpp w/src/d3d11/d3d11_fence.cpp
-index 65146c0..a023166 100644
+index 65146c0..5cd6afd 100644
 --- i/src/d3d11/d3d11_fence.cpp
 +++ w/src/d3d11/d3d11_fence.cpp
 @@ -2,18 +2,27 @@
@@ -115,7 +117,7 @@ index 65146c0..a023166 100644
        return E_FAIL;
      }
 +    // cranvr: the event's port is the kernel's, so launchd held it until the user logged out. winemetal's broker
-+    // serves it while the fence lives in this process, and takes a right of its own.
++    // serves it while the fence lives in this process. The broker takes a right of its own.
      char mach_port_name[54];
      MakeUniqueSharedName(mach_port_name);
 -    if (!WMTBootstrapRegister(mach_port_name, mach_port)) {
@@ -125,9 +127,9 @@ index 65146c0..a023166 100644
        ERR("D3D11Fence: Failed to register mach port for shared fence");
        return E_FAIL;
      }
-+    // cranvr: Wine 11.10 updates the private data of resources only, so this escape fails for a fence, and the check
-+    // below, which is the wrong way round, lets the fence go on without the name. OpenSharedFence then fails in
-+    // another process, at D3DKMTQueryResourceInfoFromNtHandle, which Wine answers for resources only as well.
++    // cranvr: Wine 11.10 updates the private data of resources only, so this escape fails for a fence. The check
++    // below is the wrong way round: it lets the fence go on without the name. OpenSharedFence then fails in another
++    // process, at D3DKMTQueryResourceInfoFromNtHandle, which Wine answers for resources only as well.
      D3DKMT_ESCAPE escape = {};
      escape.Type = D3DKMT_ESCAPE_UPDATE_RESOURCE_WINE;
      escape.pPrivateDriverData = mach_port_name;
@@ -237,7 +239,7 @@ index aa748ba..a723323 100644
    Com<ID3D11Fence> fence_;
  };
 diff --git i/src/d3d11/d3d11_resource.hpp w/src/d3d11/d3d11_resource.hpp
-index d78ef4d..927e82b 100644
+index d78ef4d..e35bfe2 100644
 --- i/src/d3d11/d3d11_resource.hpp
 +++ w/src/d3d11/d3d11_resource.hpp
 @@ -129,8 +129,9 @@ struct D3D11ResourceCommon : ID3D11Resource {
@@ -246,8 +248,8 @@ index d78ef4d..927e82b 100644
    CreateSharedHandle(const SECURITY_ATTRIBUTES *Attributes, DWORD Access, const WCHAR *pName, HANDLE *pNTHandle) = 0;
 -  /* cranvr: the kernel handles that share an opened texture again (see ShareOpenedTexture) */
 -  virtual void AdoptSharedHandles(UINT LocalHandle, UINT GlobalHandle) {}
-+  /* cranvr: the kernel handles that share an opened texture again, and the name under which this process serves its
-+   * port, if any (see ShareOpenedTexture) */
++  /* cranvr: the kernel handles that share an opened texture again. ServedName is the name under which this process
++   * serves its port, if any (see ShareOpenedTexture). */
 +  virtual void AdoptSharedHandles(UINT LocalHandle, UINT GlobalHandle, const char *ServedName) {}
  
    virtual Rc<StagingResource> staging(UINT Subresource) = 0;
@@ -273,7 +275,7 @@ index d78ef4d..927e82b 100644
  };
  
 diff --git i/src/d3d11/d3d11_texture_device.cpp w/src/d3d11/d3d11_texture_device.cpp
-index d333516..6fc321f 100644
+index d333516..35659a9 100644
 --- i/src/d3d11/d3d11_texture_device.cpp
 +++ w/src/d3d11/d3d11_texture_device.cpp
 @@ -56,6 +56,8 @@ private:
@@ -443,8 +445,8 @@ index d333516..6fc321f 100644
    texture->rename(std::move(allocation));
  
 -  Com<DeviceTexture<tag>> device_texture = (ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), pDevice)));
-+  // cranvr: Com takes the first reference itself. With ref() as well the texture kept one reference too many, so an
-+  // opened texture, and its memory, stayed until the process ended.
++  // cranvr: Com takes the first reference itself. With ref() as well the texture kept one reference too many: an
++  // opened texture stayed with its memory until the process ended.
 +  Com<DeviceTexture<tag>> device_texture = new DeviceTexture<tag>(&finalDesc, std::move(texture), pDevice);
    if (IsIOSurface && iosurface_id)
      device_texture->SetPrivateData(BASALT_GUID_IOSURFACE_ID, sizeof(iosurface_id), &iosurface_id);
@@ -623,7 +625,7 @@ index 2bb23d9..970b30f 100644
  
  TextureView &
 diff --git i/src/winemetal/unix/winemetal_unix.c w/src/winemetal/unix/winemetal_unix.c
-index fc4974e..e7930c7 100644
+index fc4974e..4379b1a 100644
 --- i/src/winemetal/unix/winemetal_unix.c
 +++ w/src/winemetal/unix/winemetal_unix.c
 @@ -10,6 +10,8 @@
@@ -664,7 +666,7 @@ index fc4974e..e7930c7 100644
 +    /*
 +     * cranvr: macOS gives the ID of a freed surface to a new one within milliseconds, so the ID of a texture that is
 +     * gone may name another surface by now. A surface of another size or pixel format is refused. On a refusal
-+     * info->reserved keeps the ID, and info->width, info->height and info->pixel_format describe the surface that
++     * info->reserved keeps the ID. info->width, info->height and info->pixel_format then describe the surface that
 +     * has it, for the caller's log.
 +     */
 +    uint32_t found_format = IOSurfaceGetPixelFormat(surface);
@@ -704,8 +706,8 @@ index fc4974e..e7930c7 100644
 + * cranvr: a broker that shares the ports of shared textures and shared events with other processes.
 + *
 + * DXMT registered the object's own port with launchd under the object's shared name. Such a port belongs to the
-+ * kernel (an IOSurface or an IOGPU event), so it never dies, and launchd held it, with the memory behind it, until
-+ * the user logged out. launchd also refuses to remove a name (a register with no port answers 1101,
++ * kernel (an IOSurface or an IOGPU event), so it never dies. launchd held it, with the memory behind it, until the
++ * user logged out. launchd also refuses to remove a name (a register with no port answers 1101,
 + * BOOTSTRAP_NAME_IN_USE). On 2026-11-27 one run of SteamVR left 30 such names with 240 MB.
 + *
 + * The broker registers a port of its own under the name instead: a service port whose receive right this process
@@ -717,8 +719,8 @@ index fc4974e..e7930c7 100644
 + *
 + * A texture of the stock shared path cannot go by the global ID of its IOSurface, as cranvr's IOSurface textures
 + * do (DXMT patch 0019): Metal makes it on an IOSurface that is not global, so IOSurfaceLookup in another process
-+ * finds nothing (checked for RGBA8, RGBA16Float, mipmaps, two slices, 4x MSAA, Depth32Float, BC1, RGB10A2), and the
-+ * surface reports no size and no pixel format. Its port is the only way into another process. An event has no ID
++ * finds nothing (checked for RGBA8, RGBA16Float, mipmaps, two slices, 4x MSAA, Depth32Float, BC1, RGB10A2). The
++ * surface also reports no size and no pixel format. Its port is the only way into another process. An event has no ID
 + * at all.
 + */
 +#define BROKER_NAME_SIZE 128 /* struct unixcall_bootstrap::name */
@@ -947,7 +949,7 @@ index fc4974e..e7930c7 100644
 +    else
 +      mach_msg_destroy(&r->header);
 +  }
-+  /* A reply that comes after the time-out goes with the reply port, and so does the right in it */
++  /* A reply that comes after the time-out goes with the reply port, with the right in it */
 +  mach_port_mod_refs(mach_task_self(), reply_port, MACH_PORT_RIGHT_RECEIVE, -1);
 +  mach_port_deallocate(mach_task_self(), service);
 +  return params->mach_port ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;

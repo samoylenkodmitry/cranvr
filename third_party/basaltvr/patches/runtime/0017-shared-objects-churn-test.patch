@@ -17,34 +17,34 @@ new file mode 100644
 --- /dev/null
 +++ b/runtime/tests/shared_churn.cpp
 @@ -0,0 +1,672 @@
-+// cranvr: creates and destroys shared Direct3D 11 textures and fences many times, and opens each of them in a second
-+// process, as SteamVR, its web helper and a game do. It tests what DXMT leaves in launchd: before cranvr's DXMT
-+// patch 0020, each shared texture of DXMT's stock path and each shared fence put a port under a name in launchd, and
++// cranvr: creates and destroys shared Direct3D 11 textures and fences many times. A second process opens each of
++// them, as SteamVR, its web helper and a game do. The program tests what DXMT leaves in launchd. Before cranvr's DXMT
++// patch 0020, each shared texture of DXMT's stock path and each shared fence put a port under a name in launchd.
 +// launchd kept the port and the memory behind it until the user logged out.
 +//
-+// Each cycle makes these objects, and the second process (the same program with --child) opens each one, checks its
++// Each cycle makes these objects. The second process (the same program with --child) opens each one. It checks its
 +// description and, for a color texture, the color that the first process cleared it to:
 +//   rgba16f      R16G16B16A16_FLOAT, legacy shared handle (stock path: the format)
 +//   bgra8        B8G8R8A8_UNORM, legacy shared handle (stock path: a legacy handle, as SteamVR's textures have)
 +//   rgba8-mips   R8G8B8A8_UNORM with 4 mip levels, legacy shared handle (stock path: mipmaps)
 +//   bgra8-array  B8G8R8A8_UNORM with 2 slices, NT handle (stock path: slices); the check reads slice 1
 +//   rgba8-msaa   R8G8B8A8_UNORM with 4 samples, legacy shared handle (stock path: MSAA); no color check
-+//   keyed        R8G8B8A8_UNORM with a keyed mutex, legacy shared handle (stock path, and the keyed mutex's event)
++//   keyed        R8G8B8A8_UNORM with a keyed mutex, legacy shared handle (stock path; the keyed mutex has an event)
 +//   iosurface    B8G8R8A8_UNORM, NT handle (cranvr's IOSurface path of DXMT patch 0019, by the surface's ID)
 +//   fence        a shared ID3D11Fence, NT handle: the first process signals 1, the second waits for it and signals 2,
-+//                and the first waits for 2. In Wine 11.10 the second process cannot open it: DXMT's OpenSharedFence
-+//                reads the fence's private data with D3DKMTQueryResourceInfoFromNtHandle, which Wine answers for
-+//                resources only, and DXMT's CreateFence never stores the data (Wine's D3DKMT_ESCAPE_UPDATE_RESOURCE_WINE
-+//                takes resources only too, and DXMT's check of it is the wrong way round). The program then counts
-+//                the cycles whose fence did not open and goes on; the first process still makes and shares the
-+//                fence, which put a name in launchd before DXMT patch 0020.
++//                then the first waits for 2. In Wine 11.10 the second process cannot open it. DXMT's
++//                OpenSharedFence reads the fence's private data with D3DKMTQueryResourceInfoFromNtHandle, which Wine
++//                answers for resources only. DXMT's CreateFence never stores the data either: Wine's
++//                D3DKMT_ESCAPE_UPDATE_RESOURCE_WINE takes resources only too. DXMT checks its result the wrong way
++//                round. The program then counts the cycles whose fence did not open and goes on. The first process
++//                still makes and shares the fence, which put a name in launchd before DXMT patch 0020.
 +// The first process then releases everything and starts the next cycle. The second releases what it opened at the
 +// end of each cycle.
 +//
-+// At the end the first process tests the size check of the IOSurface path: it shares an IOSurface texture, releases
-+// it, and makes IOSurface textures of another width until macOS gives one of them the ID of the released surface
-+// (macOS reuses the IDs of freed surfaces at once). The second process must then refuse to open the handle of the
-+// released texture, because its ID names a surface of another size now.
++// At the end the first process tests the size check of the IOSurface path. It shares an IOSurface texture and
++// releases it. Then it makes IOSurface textures of another width until macOS gives one of them the ID of the released
++// surface (macOS reuses the IDs of freed surfaces at once). The second process must then refuse to open the handle of
++// the released texture, because its ID names a surface of another size now.
 +//
 +// Usage: shared_churn.exe [--cycles N] [--width W] [--height H] [--signal FILE]
 +// The textures are W x H (default 640 x 333). With --signal FILE the program stops three times, so that a script can
@@ -621,7 +621,7 @@ new file mode 100644
 +            CloseHandle(handle);
 +            if (reply != "ok")
 +                return fail(("size check: " + reply).c_str());
-+            std::printf("shared_churn: the released texture's ID %u named a %ux%u surface, and the second process "
++            std::printf("shared_churn: the released texture's ID %u named a %ux%u surface; the second process "
 +                        "refused it (attempt %d)\n",
 +                        id, newWidth, height, attempt + 1);
 +            return true;
