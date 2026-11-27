@@ -2,8 +2,9 @@ name: Release
 
 # A vMAJOR.MINOR.PATCH tag builds the Mac app and the headset APK of that commit and publishes
 # them as a GitHub release. A pull request that changes the release setup builds both and
-# publishes nothing. The runners are GitHub's: the repository is public, so it uses no runner of
-# its own.
+# publishes nothing. A tag run builds on the owner's runners: the Mac runner takes jobs only while
+# its Mac sits idle on power, or after the owner agrees. A pull request builds on GitHub's runners,
+# because code from a fork must never run on the owner's machines.
 on:
   push:
     tags:
@@ -26,7 +27,7 @@ env:
 jobs:
   mac:
     name: Mac app
-    runs-on: macos-latest
+    runs-on: ${{ github.event_name == 'push' && fromJSON('["self-hosted", "macOS", "ARM64", "idle-mac", "apple-signing"]') || 'macos-latest' }}
     timeout-minutes: 60
     outputs:
       signed: ${{ steps.build.outputs.signed }}
@@ -37,6 +38,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
         with:
           cache-bin: false
       - name: Version
@@ -76,7 +78,7 @@ jobs:
 
   headset:
     name: Headset APK
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'push' && fromJSON('["self-hosted", "Linux", "X64", "samarch1"]') || 'ubuntu-latest' }}
     timeout-minutes: 60
     outputs:
       signed: ${{ steps.build.outputs.signed }}
@@ -95,15 +97,18 @@ jobs:
         with:
           targets: aarch64-linux-android
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
         with:
           workspaces: client
           cache-bin: false
       - name: Install the NDK, zsh and cargo-ndk
         run: |
-          sudo apt-get update && sudo apt-get install -y zsh
-          sdkmanager "ndk;28.2.13676358"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
-          cargo install cargo-ndk --locked
+          command -v zsh >/dev/null || { sudo apt-get update && sudo apt-get install -y zsh; }
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          ndk="$ANDROID_HOME/ndk/28.2.13676358"
+          [ -d "$ndk" ] || sdkmanager "ndk;28.2.13676358"
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          [ -x "$HOME/.cargo/bin/cargo-ndk" ] || cargo install cargo-ndk --locked
       - name: Version
         run: bash scripts/release/version.sh >> "$GITHUB_ENV"
       - name: Restore the upload key
