@@ -56,6 +56,11 @@ pub const TRACKING_FILE: &str = "tracking-features.txt";
 /// patch raises them to the Quest 3 panel size).
 pub const MAX_VIEW: (u32, u32) = (2064, 2208);
 
+/// The size that the runtime takes for an eye of `eye_size`: even, and within what it accepts.
+pub fn view_size(eye_size: (u32, u32)) -> (u32, u32) {
+    (eye_size.0.min(MAX_VIEW.0) & !1, eye_size.1.min(MAX_VIEW.1) & !1)
+}
+
 pub(crate) mod msg {
     pub const HELLO: u16 = 1;
     pub const HELLO_ACK: u16 = 2;
@@ -214,6 +219,11 @@ pub struct RuntimeLink {
     control_file: PathBuf,
     port: u16,
     token: String,
+    /// The eye size and the refresh rate in the control file now
+    written: Mutex<((u32, u32), u32)>,
+    /// The eye size in the control file when the connected game's runtime connected: the size that
+    /// the game read at its start
+    game_eye: Mutex<Option<(u32, u32)>>,
 }
 
 impl RuntimeLink {
@@ -241,6 +251,8 @@ impl RuntimeLink {
             control_file: control_file.to_owned(),
             port,
             token: random_token()?,
+            written: Mutex::new(((0, 0), 0)),
+            game_eye: Mutex::new(None),
         });
         link.write_control_file(eye_size, fps)?;
         // A file from an earlier run names a headset that is gone
@@ -253,6 +265,7 @@ impl RuntimeLink {
                         warn!("Game runtime connection: {e}");
                     }
                     *link.writer.lock().unwrap() = None;
+                    *link.game_eye.lock().unwrap() = None;
                     link.requested.store(0, Ordering::Relaxed);
                     link.hand_interaction.store(false, Ordering::Relaxed);
                     events.send(GameEvent::Disconnected).ok();
@@ -279,19 +292,29 @@ impl RuntimeLink {
         Ok((link, receiver))
     }
 
-    /// Rewrites the control file with the per-eye size the game should render. Even, and within
-    /// what the runtime accepts.
     /// The folder of the control file, where the runtime also reads `game-sizes.txt`
     pub fn control_dir(&self) -> &Path {
         self.control_file.parent().unwrap_or(Path::new("."))
     }
 
+    /// Rewrites the control file with the per-eye size the game should render. Even, and within
+    /// what the runtime accepts.
     pub fn write_control_file(&self, eye_size: (u32, u32), fps: u32) -> std::io::Result<()> {
-        let w = eye_size.0.min(MAX_VIEW.0) & !1;
-        let h = eye_size.1.min(MAX_VIEW.1) & !1;
+        let (w, h) = view_size(eye_size);
         // The refresh rate field needs cranvr's runtime patch; the stock runtime rejects it
         fs::write(&self.control_file, format!("{} {} {w} {h} {fps}\n", self.port, self.token))?;
+        *self.written.lock().unwrap() = ((w, h), fps);
         fs::set_permissions(&self.control_file, fs::Permissions::from_mode(0o600))
+    }
+
+    /// The eye size and the refresh rate that the control file holds now.
+    pub fn written(&self) -> ((u32, u32), u32) {
+        *self.written.lock().unwrap()
+    }
+
+    /// The eye size that the connected game read at its start, or `None` while no game runs.
+    pub fn game_eye(&self) -> Option<(u32, u32)> {
+        *self.game_eye.lock().unwrap()
     }
 
     /// Tells the frame loop that the headset sent a new pose.
@@ -335,6 +358,8 @@ impl RuntimeLink {
         fs::remove_file(&program_file).ok();
         self.requested.store(0, Ordering::Relaxed);
         self.hand_interaction.store(false, Ordering::Relaxed);
+        // The runtime connects when its game creates the session, close after the game read its view size
+        *self.game_eye.lock().unwrap() = Some(self.written().0);
         info!("Game runtime connected: {renderer}, {}", program.as_deref().unwrap_or("program not named"));
 
         *self.last_sent.lock().unwrap() = Instant::now();
@@ -939,6 +964,33 @@ mod tests {
         // The profiles go once per reset
         link.controller(8, 1, &motion, Some(&motion));
         assert_eq!(read_message(&mut runtime).unwrap().0, msg::CONTROLLER_MOTION_AIM);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_running_game_keeps_the_size_that_it_read_at_its_start() {
+        let dir = std::env::temp_dir().join(format!("cranvr-link-kept-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let control = dir.join("control.txt");
+        let (link, events) = RuntimeLink::start(&control, (1177, 1233), 120, |_| ()).unwrap();
+        assert_eq!(link.written(), ((1176, 1232), 120), "the file holds even sizes");
+        assert_eq!(link.game_eye(), None, "no game runs yet");
+        let fields: Vec<String> = fs::read_to_string(&control).unwrap().split_whitespace().map(str::to_string).collect();
+        let mut runtime = TcpStream::connect(("127.0.0.1", fields[0].parse::<u16>().unwrap())).unwrap();
+        let mut hello = PROTOCOL_VERSION.to_le_bytes().to_vec();
+        hello.extend_from_slice(fields[1].as_bytes());
+        hello.extend_from_slice(&7u64.to_le_bytes());
+        hello.extend_from_slice(&0u16.to_le_bytes());
+        runtime.write_all(&message(msg::HELLO, &hello)).unwrap();
+        assert!(matches!(events.recv_timeout(Duration::from_secs(2)).unwrap(), GameEvent::Connected { .. }));
+        assert_eq!(link.game_eye(), Some((1176, 1232)));
+        // A headset with another eye links: the file changes, the running game keeps its size
+        link.write_control_file((874, 914), 120).unwrap();
+        assert_eq!(link.written(), ((874, 914), 120));
+        assert_eq!(link.game_eye(), Some((1176, 1232)));
+        drop(runtime);
+        assert!(matches!(events.recv_timeout(Duration::from_secs(2)).unwrap(), GameEvent::Disconnected));
+        assert_eq!(link.game_eye(), None, "the game is gone");
         fs::remove_dir_all(&dir).ok();
     }
 

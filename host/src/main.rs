@@ -8,6 +8,7 @@ mod desktop_layer;
 mod display_modes;
 mod eye_check;
 mod game_audio;
+mod game_eye;
 mod game_sizes;
 mod gpu_health;
 mod hand_controller;
@@ -179,8 +180,9 @@ fn usage() -> ! {
     std::process::exit(2)
 }
 
-fn parse_args() -> (Options, DesktopOptions, PathBuf) {
-    let mut options = Options {
+/// The host's options before the command line changes any.
+fn default_options() -> Options {
+    Options {
         native_port: 9950,
         fps: 120.0,
         eye_width: 0,
@@ -199,7 +201,21 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
         microphone: true,
         unscale_displays: true,
         hand_controllers: true,
-    };
+    }
+}
+
+/// Picks the eye widths that the command line left open. A width that the user gave counts for
+/// every client. Otherwise a client that takes no foveation gets the size of the unfoveated table.
+fn settle_eye_widths(options: &mut Options) {
+    options.eye_width_given = options.eye_width != 0;
+    options.eye_width_unfoveated = if options.eye_width == 0 { default_eye_width(false, options.fps as u32) } else { 0 };
+    if options.eye_width == 0 {
+        options.eye_width = default_eye_width(options.foveation != FoveationLevel::Off, options.fps as u32);
+    }
+}
+
+fn parse_args() -> (Options, DesktopOptions, PathBuf) {
+    let mut options = default_options();
     let mut desktop = DesktopOptions {
         enabled: false,
         pointer_pitch: -40.0,
@@ -252,13 +268,7 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
             _ => usage(),
         }
     }
-    // A width that the user gave counts for every client. Otherwise a client that takes no
-    // foveation gets the size of the unfoveated table below.
-    options.eye_width_given = options.eye_width != 0;
-    options.eye_width_unfoveated = if options.eye_width == 0 { default_eye_width(false, options.fps as u32) } else { 0 };
-    if options.eye_width == 0 {
-        options.eye_width = default_eye_width(options.foveation != FoveationLevel::Off, options.fps as u32);
-    }
+    settle_eye_widths(&mut options);
     (options, desktop, config_dir)
 }
 
@@ -373,19 +383,33 @@ fn native_config(
         audio: options.game_audio,
         microphone: options.microphone.then(|| config_dir.join("microphone.pcm")),
         tcp_media: options.tcp,
-        wishes: HostWishes {
-            // A foveated eye takes the size that the headset asks for: its recommended size, within
-            // its decoder's limits.
-            eye_width: if options.eye_width_given || options.foveation == FoveationLevel::Off { options.eye_width } else { 0 },
-            eye_width_unfoveated: options.eye_width_unfoveated,
-            refresh_hz: options.fps,
-            bitrate_bps: options.mbps * 1_000_000,
-            codecs: vec![Codec::Hevc],
-            foveation: options.foveation.config().map(Into::into),
-            full_range: true,
-            slices: 1,
-        },
+        wishes: wishes(options),
     }
+}
+
+/// What the host wants from a headset's stream. The link negotiates with these, and so does the
+/// size for a game that starts before any link (game_eye.rs).
+fn wishes(options: &Options) -> HostWishes {
+    HostWishes {
+        // A foveated eye takes the size that the headset asks for: its recommended size, within
+        // its decoder's limits.
+        eye_width: if options.eye_width_given || options.foveation == FoveationLevel::Off { options.eye_width } else { 0 },
+        eye_width_unfoveated: options.eye_width_unfoveated,
+        refresh_hz: options.fps,
+        bitrate_bps: options.mbps * 1_000_000,
+        codecs: vec![Codec::Hevc],
+        foveation: options.foveation.config().map(Into::into),
+        full_range: true,
+        slices: 1,
+    }
+}
+
+/// The options of `cranvr-host --fps FPS --foveation LEVEL [--eye-width WIDTH]`, for tests.
+#[cfg(test)]
+fn options_for(fps: f32, foveation: FoveationLevel, eye_width: u32) -> Options {
+    let mut options = Options { fps, foveation, eye_width, ..default_options() };
+    settle_eye_widths(&mut options);
+    options
 }
 
 fn main() {
@@ -471,9 +495,18 @@ fn main() {
         let headset = Arc::clone(&headset);
         let on_haptic = move |h: runtime_link::Haptic| headset.send_haptics(h);
         let control_file = config_dir.join("runtime-control.txt");
-        RuntimeLink::start(&control_file, runtime_link::MAX_VIEW, options.fps as u32, on_haptic).expect("runtime control socket")
+        // A game that starts before any headset links renders at the eye that a Quest 3 would get.
+        // A whole Quest 3 eye here gave such a game 2.8 times the pixels of the stream (#170).
+        let (eye, fps) = game_eye::before_link(&wishes(&options), options.game_scale).unwrap_or((runtime_link::MAX_VIEW, options.fps as u32));
+        RuntimeLink::start(&control_file, eye, fps, on_haptic).expect("runtime control socket")
     };
-    info!("Game runtime control file: {}", link.control_file().display());
+    let (eye, fps) = link.written();
+    info!(
+        "Game runtime control file: {}; a game that starts before a headset links renders {}x{} per eye at {fps} Hz, as for a Quest 3",
+        link.control_file().display(),
+        eye.0,
+        eye.1
+    );
 
     {
         let headset = Arc::clone(&headset);
@@ -517,9 +550,15 @@ fn main() {
                 let level = if n.foveated { options.foveation } else { FoveationLevel::Off };
                 // Games that start from now on render at the stream's eye size. The file comes before the status
                 // line, so a game that starts at the line gets this size (scripts/e2e.sh starts its program there).
-                let scaled = |v: u32| (v as f32 * options.game_scale).round() as u32;
-                if let Err(e) = link.write_control_file((scaled(n.eye_width), scaled(n.eye_height)), n.fps.round() as u32) {
+                let eye = game_eye::scaled([n.eye_width, n.eye_height], options.game_scale);
+                if let Err(e) = link.write_control_file(eye, n.fps.round() as u32) {
                     warn!("Game runtime control file: {e}");
+                }
+                // A game reads its size once, at its start: a running game keeps the size that it read
+                if let Some(kept) = link.game_eye().filter(|kept| *kept != link.written().0) {
+                    let message = game_eye::kept_message(kept, link.written().0);
+                    warn!("{message}");
+                    status::emit(json!({"type": "game_eye", "kept": [kept.0, kept.1], "eye": [link.written().0 .0, link.written().0 .1], "message": message}));
                 }
                 status::emit(json!({"type": "headset", "connected": true, "eye": [n.eye_width, n.eye_height], "fps": n.fps, "foveated": n.foveated, "foveation": level.name(), "ip": client_ip.to_string(), "cable": cable}));
                 *shared.stream.lock().unwrap() = Some(negotiated).filter(|n| n.codec == Codec::Hevc);

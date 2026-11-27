@@ -1157,3 +1157,21 @@ fn a_press_on_the_headsets_page_comes_as_a_line() {
     assert_eq!(crate::status::latest("headset_page").unwrap()["page"]["id"], "headset");
     assert!(!crate::status::headset_page("not json"));
 }
+
+#[test]
+fn a_quest_3_link_gives_the_game_the_size_that_the_host_wrote_before_the_link() {
+    use crate::game_eye;
+    use cranvr_common::foveation::FoveationLevel;
+    for (level, fps, scale) in [(FoveationLevel::Off, 120.0, 1.0), (FoveationLevel::Off, 90.0, 0.7), (FoveationLevel::Medium, 120.0, 0.7), (FoveationLevel::High, 72.0, 0.5)] {
+        let port = free_port();
+        let wishes = crate::wishes(&crate::options_for(fps, level, 0));
+        let before = game_eye::before_link(&wishes, scale).unwrap();
+        let (_headset, mut events) = start(Config { wishes, ..config(port) }).unwrap();
+        let client = ClientLink::connect(([127, 0, 0, 1], port).into(), &game_eye::quest_3_caps(), &identity(), None, Duration::from_secs(10)).unwrap();
+        let Event::Connected { stream, .. } = wait_for(&mut *events, |e| matches!(e, Event::Connected { .. })) else { unreachable!() };
+        let linked = (game_eye::scaled([stream.eye_width, stream.eye_height], scale), stream.fps.round() as u32);
+        assert_eq!(linked, before, "{level:?} at {fps} Hz and {scale}");
+        assert_eq!(stream.foveated, level != FoveationLevel::Off);
+        client.duplex.close();
+    }
+}
