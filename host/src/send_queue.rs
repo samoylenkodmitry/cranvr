@@ -25,8 +25,8 @@ pub enum Push {
     /// The frame waits for the send.
     Queued,
     /// The frame went, or older ones went for it. `wants_key`: the queue takes key frames only from
-    /// now on, so the encoder should make the next frame a key frame. It is true once for each run
-    /// of drops.
+    /// now on, so the encoder should make the next frame a key frame. It is true at the first drop
+    /// of a run of drops, and again after each `ASK_AGAIN` frames without a key frame.
     Dropped { wants_key: bool },
 }
 
@@ -39,6 +39,13 @@ pub struct Counts {
     pub most: usize,
 }
 
+/// The frames that may come without a key frame after the queue asked for one, before it asks again.
+/// The encoder holds up to two frames (`MAX_IN_FLIGHT` in main.rs) and the job queue one more when the
+/// request comes, so three frames without a key frame are normal. A request can also get lost: an
+/// encode that fails, or a frame that VideoToolbox drops, takes it along. Without a new request the
+/// stream would then send nothing until the encoder's next key frame on its timer, 10 s later.
+pub const ASK_AGAIN: u32 = 6;
+
 pub struct SendQueue<T> {
     depth: usize,
     state: Mutex<State<T>>,
@@ -50,6 +57,8 @@ struct State<T> {
     frames: VecDeque<(T, bool)>,
     /// A dropped frame left the frames after it without their reference: only a key frame may come
     wants_key: bool,
+    /// The frames dropped since the last request of a key frame
+    since_ask: u32,
     counts: Counts,
     closed: bool,
 }
@@ -59,7 +68,7 @@ impl<T> SendQueue<T> {
     pub fn new(depth: usize) -> Self {
         Self {
             depth: depth.max(1),
-            state: Mutex::new(State { frames: VecDeque::with_capacity(depth.max(1)), wants_key: false, counts: Counts::default(), closed: false }),
+            state: Mutex::new(State { frames: VecDeque::with_capacity(depth.max(1)), wants_key: false, since_ask: 0, counts: Counts::default(), closed: false }),
             ready: Condvar::new(),
         }
     }
@@ -69,7 +78,12 @@ impl<T> SendQueue<T> {
         let mut state = self.state.lock().unwrap();
         if state.wants_key && !key {
             state.counts.dropped += 1;
-            return Push::Dropped { wants_key: false };
+            state.since_ask += 1;
+            let again = state.since_ask >= ASK_AGAIN;
+            if again {
+                state.since_ask = 0;
+            }
+            return Push::Dropped { wants_key: again };
         }
         // A key frame refers to no frame before it: the frames after it can be decoded again
         state.wants_key = false;
@@ -87,6 +101,7 @@ impl<T> SendQueue<T> {
                 // This frame refers to a dropped one too
                 state.counts.dropped += 1;
                 state.wants_key = true;
+                state.since_ask = 0;
                 return Push::Dropped { wants_key: true };
             }
         }

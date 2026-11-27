@@ -1,4 +1,4 @@
-use super::{Push, SendQueue};
+use super::{Push, SendQueue, ASK_AGAIN};
 
 const DEPTH: usize = 3;
 
@@ -10,16 +10,17 @@ struct Frame {
 }
 
 /// An encoder that makes a key frame first and when the queue asks for one, as the host's does
-/// through `force_idr`.
+/// through `force_idr`. It loses the first `lost` requests, as a failed encode does.
 struct Encoder {
     next: u32,
     key_wanted: bool,
+    lost: u32,
     pushes: Vec<Push>,
 }
 
 impl Encoder {
     fn new() -> Self {
-        Self { next: 0, key_wanted: true, pushes: Vec::new() }
+        Self { next: 0, key_wanted: true, lost: 0, pushes: Vec::new() }
     }
 
     fn push(&mut self, queue: &SendQueue<Frame>) {
@@ -27,7 +28,11 @@ impl Encoder {
         self.next += 1;
         let push = queue.push(frame, frame.key);
         if push == (Push::Dropped { wants_key: true }) {
-            self.key_wanted = true;
+            if self.lost > 0 {
+                self.lost -= 1;
+            } else {
+                self.key_wanted = true;
+            }
         }
         self.pushes.push(push);
     }
@@ -157,4 +162,27 @@ fn a_waiting_send_gets_the_next_frame() {
     std::thread::sleep(std::time::Duration::from_millis(20));
     queue.push(Frame { number: 0, key: true }, true);
     assert_eq!(sender.join().unwrap(), Some(Frame { number: 0, key: true }));
+}
+
+#[test]
+fn a_lost_key_frame_request_is_asked_again() {
+    let queue = SendQueue::new(DEPTH);
+    let (mut encoder, mut decoder) = (Encoder::new(), Decoder::default());
+    encoder.push(&queue);
+    decoder.take(queue.pop().unwrap());
+    // A blocked send fills the queue, and the encoder loses the queue's request for a key frame
+    encoder.lost = 1;
+    for _ in 0..=DEPTH {
+        encoder.push(&queue);
+    }
+    assert_eq!(encoder.pushes.last(), Some(&Push::Dropped { wants_key: true }));
+    // The send runs again. The frames that come without a key frame go, and the queue asks again.
+    let mut waited = 0;
+    while try_pop(&queue).is_none() {
+        encoder.push(&queue);
+        waited += 1;
+        assert!(waited <= ASK_AGAIN + 1, "no key frame came after {waited} frames");
+    }
+    assert_eq!(waited, ASK_AGAIN + 1, "the second request came after {ASK_AGAIN} frames");
+    decoder.take_all(&queue);
 }
