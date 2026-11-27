@@ -22,14 +22,16 @@
 //! - a cable that comes out during a recording leaves the headset recording. The gem and the window
 //!   say so. When the cable comes back, the app stops the recorder and saves what it recorded.
 //!
-//! The app knows the recorder's real state from the headset's videos: a recording's file grows. A
-//! start while a file grows refuses, since a recording of the headset's own menu runs. A start counts
-//! only once its file grows. A file of an earlier name that grows counts too.
+//! The app knows the recorder's real state from the headset's videos: the recorder writes the `mdat`
+//! box of a file only at its stop, so a file without one that was written in the last 20 s is being
+//! recorded (`mp4_writing`). A start while such a file exists refuses, since a recording of the
+//! headset's own menu runs. A start counts only once its file shows. A file of an earlier name that
+//! grew counts too.
 //!
 //! The Quest's storage is small, so the app deletes the headset's copy once the Mac's file is safe:
 //! the pulled file has the headset's size and the final file passed its check (the picture's length
 //! and its sound, recording_mux.rs). When the final file cannot be made, the headset's file itself
-//! becomes the final file, with the headset's own sound. A file that the app did not record, such as
+//! becomes the final file, with the headset's own sound, and the headset keeps its copy. A file that the app did not record, such as
 //! one of the headset's own menu, the app never touches.
 //!
 //! The work runs on a thread of its own, so the window never waits for adb. The host passes the
@@ -118,7 +120,15 @@ pub(crate) struct Video {
     pub bytes: u64,
     #[serde(default)]
     pub writing: bool,
+    /// The seconds since its last write, on the headset's clock
+    #[serde(default)]
+    pub age_s: u64,
 }
+
+/// A file with no `mdat` box whose last write is older than this is no recording that runs: its
+/// recorder died, as with a flat battery, and never finished it. The headset's recorder writes its
+/// first data about 5 s after its start and then every few seconds.
+const WRITE_RECENT_S: u64 = 20;
 
 /// Whether the first bytes of an MP4 file say that its writer still writes it. The headset's recorder
 /// (Android's MPEG4Writer) starts a file with `ftyp` and `free` boxes that keep room, and writes the
@@ -551,8 +561,8 @@ impl<D: Device, O: Out> Recorder<D, O> {
                 };
                 std::fs::remove_file(&made).ok();
                 std::fs::rename(&local, &out).map_err(|e| Unsaved::Later(format!("{}: {e}", out.display())))?;
-                let kept = std::fs::metadata(&out).map(|meta| meta.len()).unwrap_or(0);
-                json!({"sound": {"source": "headset", "why": format!("the Mac's sound could not be added: {why}")}, "checked": kept == video.bytes})
+                // Nothing checked that this copy plays: the headset keeps its own
+                json!({"sound": {"source": "headset", "why": format!("the Mac's sound could not be added: {why}")}, "checked": false})
             }
         };
         if numbers["checked"] == true {
@@ -561,7 +571,7 @@ impl<D: Device, O: Out> Recorder<D, O> {
                 Err(e) => self.out.log(&format!("the headset keeps its copy {}: its delete failed ({e})", video.name)),
             }
         } else {
-            self.out.log(&format!("the headset keeps its copy {}: the Mac's file did not pass its check", video.name));
+            self.out.log(&format!("the headset keeps its copy {}: no check passed the Mac's file", video.name));
         }
         Ok((out, numbers))
     }
@@ -586,13 +596,14 @@ impl<D: Device, O: Out> Recorder<D, O> {
     }
 }
 
-/// A line of the headset's list of videos: `SIZE xHEX NAME`
-fn parse_video(line: &str) -> Option<Video> {
-    let (bytes, rest) = line.split_once(' ')?;
-    let (hex, name) = rest.split_once(' ')?;
+/// A line of the headset's list of videos, `SIZE MTIME xHEX NAME`, at the headset's time `now`
+fn parse_video(line: &str, now: u64) -> Option<Video> {
+    let mut parts = line.splitn(4, ' ');
+    let (bytes, written, hex, name) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
     let hex = hex.strip_prefix('x')?;
     let header: Vec<u8> = (0..hex.len() / 2).filter_map(|at| u8::from_str_radix(hex.get(at * 2..at * 2 + 2)?, 16).ok()).collect();
-    Some(Video { name: name.to_string(), bytes: bytes.parse().ok()?, writing: mp4_writing(&header) })
+    let age_s = now.saturating_sub(written.parse().ok()?);
+    Some(Video { name: name.to_string(), bytes: bytes.parse().ok()?, writing: mp4_writing(&header) && age_s < WRITE_RECENT_S, age_s })
 }
 
 /// A reason of a failure that a later try may not have
@@ -869,17 +880,16 @@ impl Device for Real {
     }
 
     fn videos(&self, serial: &str) -> Result<Vec<Video>, String> {
-        // A folder that does not exist yet holds no videos: the headset has recorded nothing yet. Each
-        // line holds a video's size, its first 64 bytes in hex and its name.
-        let line = format!("cd {VIDEOS} 2> /dev/null && for f in *.mp4; do [ -e \"$f\" ] && echo \"$(stat -c %s \"$f\") x$(head -c 64 \"$f\" | od -An -tx1 | tr -d ' \\n') $f\"; done; echo end");
+        // A folder that does not exist yet holds no videos: the headset has recorded nothing yet. The
+        // first line holds the headset's time, each other line a video's size, the time of its last
+        // write, its first 64 bytes in hex and its name.
+        let line = format!("date +now%s; cd {VIDEOS} 2> /dev/null && for f in *.mp4; do [ -e \"$f\" ] && echo \"$(stat -c '%s %Y' \"$f\") x$(head -c 64 \"$f\" | od -An -tx1 | tr -d ' \\n') $f\"; done; echo end");
         let listed = Self::adb(serial, &["shell", &line], ADB_CALL)?;
         if !listed.lines().any(|line| line.trim() == "end") {
             return Err(format!("the headset's list of videos ended early: {}", listed.trim()));
         }
-        Ok(listed
-            .lines()
-            .filter_map(|line| parse_video(line.trim()))
-            .collect())
+        let now = listed.lines().find_map(|line| line.trim().strip_prefix("now")?.parse::<u64>().ok()).ok_or("the headset's list of videos has no time")?;
+        Ok(listed.lines().filter_map(|line| parse_video(line.trim(), now)).collect())
     }
 
     /// Runs the program on the headset: `start` or `stop`

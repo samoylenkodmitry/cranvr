@@ -59,7 +59,10 @@ fn end_on_signals() {
             eprintln!("cranvr: a signal ends the app");
             recorder::stop_at_exit();
             backend::stop_host();
-            std::process::exit(0);
+            // The window's loop still runs on the main thread: no exit handler of AppKit or Metal
+            // may wait for it
+            // SAFETY: _exit ends the process at once, which is the purpose here
+            unsafe { libc::_exit(0) };
         })
         .ok();
 }

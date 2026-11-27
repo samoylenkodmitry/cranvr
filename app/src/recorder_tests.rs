@@ -88,7 +88,7 @@ impl Device for Fake {
                 quest.starts += 1;
                 let name = quest.append_to.clone().unwrap_or_else(|| format!("dev.cranvr.client-2026112{}-0.mp4", quest.starts));
                 if !quest.files.iter().any(|video| video.name == name) {
-                    quest.files.push(Video { name: name.clone(), bytes: 0, writing: true });
+                    quest.files.push(Video { name: name.clone(), bytes: 0, writing: true, age_s: 0 });
                 }
                 quest.recording = Some(name);
             }
@@ -204,7 +204,7 @@ fn a_press_starts_a_recording_and_the_next_press_saves_it() {
 #[test]
 fn a_start_while_the_headsets_recorder_records_refuses() {
     let (fake, movies) = (Fake::new(), Movies::new("busy"));
-    fake.quest().files.push(Video { name: "dev.cranvr.client-20261127-131219-0.mp4".into(), bytes: 5000, writing: true });
+    fake.quest().files.push(Video { name: "dev.cranvr.client-20261127-131219-0.mp4".into(), bytes: 5000, writing: true, age_s: 0 });
     fake.quest().recording = Some("dev.cranvr.client-20261127-131219-0.mp4".into());
     let (mut recorder, lines) = recorder(&fake, &movies);
     recorder.press(false);
@@ -261,7 +261,7 @@ fn a_quit_stops_the_recorder_and_the_next_start_saves_the_recording() {
 fn a_file_of_an_earlier_name_that_grew_counts() {
     let (fake, movies) = (Fake::new(), Movies::new("grew"));
     let old = "dev.cranvr.client-20261127-120000-0.mp4";
-    fake.quest().files.push(Video { name: old.into(), bytes: 5000, writing: false });
+    fake.quest().files.push(Video { name: old.into(), bytes: 5000, writing: false, age_s: 600 });
     fake.quest().append_to = Some(old.into());
     let (mut recorder, lines) = recorder(&fake, &movies);
     recorder.press(false);
@@ -294,7 +294,8 @@ fn the_headset_keeps_its_copy_until_the_macs_file_passes_its_check() {
     assert_eq!(fake.quest().removed.len(), 1);
 }
 
-// A final file that cannot be made leaves the headset's own file as the recording, with its own sound
+// A final file that cannot be made leaves the headset's own file as the recording, with its own sound.
+// Nothing checked that copy, so the headset keeps its own.
 #[test]
 fn a_final_file_that_fails_keeps_the_headsets_file_as_the_recording() {
     let (fake, movies) = (Fake::new(), Movies::new("fails"));
@@ -305,7 +306,8 @@ fn a_final_file_that_fails_keeps_the_headsets_file_as_the_recording() {
     let (files, parts) = movies.listed();
     assert_eq!((files.len(), parts.len()), (1, 0), "{:?}", lines.0);
     assert!(lines.any("the Mac's sound could not be added: AVFoundation failed"), "{:?}", lines.0);
-    assert_eq!(fake.quest().removed.len(), 1, "the copy on the Mac has the headset's size");
+    assert!(fake.quest().removed.is_empty(), "the headset keeps its copy");
+    assert!(lines.any("the headset keeps its copy"), "{:?}", lines.0);
 }
 
 // A cable that comes out during a recording: the headset records on, a press says why it cannot stop,
@@ -429,7 +431,9 @@ fn the_header_says_whether_the_headsets_recorder_still_writes_a_file() {
     // A file that the recorder did not make, such as a copied video with its moov first
     assert!(!mp4_writing(&hex("0000001c667479706d703431000002006d70343169736f366d7034310000ffff6d6f6f76")));
     assert!(!mp4_writing(b"not a video at all"));
-    let line = format!("2621512 x{WRITTEN} dev.cranvr.client-20261127-141739-0.mp4");
-    assert_eq!(parse_video(&line), Some(Video { name: "dev.cranvr.client-20261127-141739-0.mp4".into(), bytes: 2_621_512, writing: true }));
-    assert_eq!(parse_video(&format!("696810515 x{WHOLE} a.mp4")).map(|video| video.writing), Some(false));
+    let line = format!("2621512 1795786000 x{WRITTEN} dev.cranvr.client-20261127-141739-0.mp4");
+    assert_eq!(parse_video(&line, 1_795_786_003), Some(Video { name: "dev.cranvr.client-20261127-141739-0.mp4".into(), bytes: 2_621_512, writing: true, age_s: 3 }));
+    assert_eq!(parse_video(&format!("696810515 1795780000 x{WHOLE} a.mp4"), 1_795_786_003).map(|video| video.writing), Some(false));
+    // A file that a dead recorder never finished stops counting as written once it is old
+    assert_eq!(parse_video(&line, 1_795_786_000 + 120).map(|video| video.writing), Some(false));
 }
