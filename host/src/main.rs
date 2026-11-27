@@ -25,6 +25,7 @@ mod runtime_link;
 mod screen_capture;
 mod session;
 mod status;
+mod send_queue;
 mod test_bitrate;
 mod test_input;
 mod tracking;
@@ -41,6 +42,7 @@ use log::{error, info, warn};
 use pose::Pose;
 use render::{ComposeParams, Params, RenderError, Renderer};
 use runtime_link::{GameEvent, GameFrame, RuntimeLink, Swapchains};
+use send_queue::{Push, SendQueue};
 use serde_json::json;
 use session::{Negotiated, Options};
 use std::{
@@ -804,6 +806,45 @@ impl FrameNote {
     }
 }
 
+/// Hands an encoded frame of the eye stream to the queue of the send. A drop that leaves the frames
+/// after it without their reference asks the encoder for a key frame.
+fn queue_frame(queue: &SendQueue<EncodedFrame>, force_idr: &AtomicBool, frame: EncodedFrame) {
+    let key = frame.is_idr;
+    if queue.push(frame, key) == (Push::Dropped { wants_key: true }) {
+        force_idr.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The thread `video-send`: sends the frames of the queue to the headset with their notes, until the
+/// queue closes.
+fn send_frames(queue: &SendQueue<EncodedFrame>, headset: &dyn Headset, notes: &Mutex<VecDeque<FrameNote>>) {
+    let mut last_config: Option<Vec<u8>> = None;
+    while let Some(frame) = queue.pop() {
+        if let Some(config) = frame.config_nals {
+            if last_config.as_ref() != Some(&config) {
+                headset.set_decoder_config(config.clone());
+                last_config = Some(config);
+            }
+        }
+        let note = FrameNote::take(notes, frame.timestamp_ns);
+        headset.send_frame(OutFrame {
+            plan: note.plan,
+            sample_ns: frame.timestamp_ns,
+            idr: frame.is_idr,
+            eye_poses: note.eye_poses,
+            slices: vec![FrameSlice { rect: note.rect, data: frame.data }],
+        });
+    }
+}
+
+/// The frames of the eye stream that may wait for the send (`send_queue.rs`). On a Quest 3 at 120 Hz with the moving
+/// test game at 200 Mbps (#157), at most one frame waited in each of 57 seconds over the USB network (UDP, a send of
+/// 0.6 to 0.9 ms) and over `adb reverse` (TCP, 0.25 ms), and in each of 12 seconds of the probe over TCP. Two more frames
+/// let a send take up to two periods longer now and then, as under the Mac's load, before a frame goes. A frame then
+/// waits at most 25 ms at 120 Hz: behind a link of 60 Mbps the time from the pose to the display was 98 to 118 ms,
+/// against 0.45 to 2.5 s without the bound.
+const SEND_QUEUE_DEPTH: usize = 3;
+
 /// A planned frame may reuse the sample of the frame before it this many times in a row.
 const MAX_REPEATS: u64 = 2;
 
@@ -1042,7 +1083,8 @@ fn frame_loop(
     let mut screen: Option<desktop::Screen> = None;
     let mut desktop_seq = 0u64;
 
-    let (sender, receiver) = mpsc::channel::<EncodedFrame>();
+    // The frames between the encoder and the send (#157)
+    let queue = Arc::new(SendQueue::new(SEND_QUEUE_DEPTH));
     // Encoder time of the frames encoded since the last stats line, and their count
     let encoder_time_us = Arc::new(AtomicU64::new(0));
     let encoded_frames = Arc::new(AtomicU64::new(0));
@@ -1056,38 +1098,28 @@ fn frame_loop(
     // frame's tracking sample.
     let notes = Arc::new(Mutex::new(VecDeque::<FrameNote>::new()));
     {
-        let headset = Arc::clone(&headset);
-        let notes = Arc::clone(&notes);
-        let (encoder_time_us, encoded_frames, encoded_bytes) = (Arc::clone(&encoder_time_us), Arc::clone(&encoded_frames), Arc::clone(&encoded_bytes));
-        let encode_times = Arc::clone(&encode_times);
+        let (headset, queue, notes) = (Arc::clone(&headset), Arc::clone(&queue), Arc::clone(&notes));
         thread::Builder::new()
             .name("video-send".into())
             .spawn(move || {
                 realtime_thread();
-                let mut last_config: Option<Vec<u8>> = None;
-                for frame in receiver {
-                    encoder_time_us.fetch_add(frame.encode_time.as_micros() as u64, Ordering::Relaxed);
-                    encoded_frames.fetch_add(1, Ordering::Relaxed);
-                    encode_times.lock().unwrap().push(frame.encode_time.as_micros().min(u128::from(u32::MAX)) as u32);
-                    encoded_bytes.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
-                    if let Some(config) = frame.config_nals {
-                        if last_config.as_ref() != Some(&config) {
-                            headset.set_decoder_config(config.clone());
-                            last_config = Some(config);
-                        }
-                    }
-                    let note = FrameNote::take(&notes, frame.timestamp_ns);
-                    headset.send_frame(OutFrame {
-                        plan: note.plan,
-                        sample_ns: frame.timestamp_ns,
-                        idr: frame.is_idr,
-                        eye_poses: note.eye_poses,
-                        slices: vec![FrameSlice { rect: note.rect, data: frame.data }],
-                    });
-                }
+                send_frames(&queue, &*headset, &notes);
             })
             .unwrap();
     }
+    // Where the encoder's frames go, on its own thread: the counts of the stats line, then the queue
+    let output: Arc<dyn Fn(EncodedFrame) + Send + Sync> = {
+        let (queue, shared) = (Arc::clone(&queue), Arc::clone(&shared));
+        let (encoder_time_us, encoded_frames, encoded_bytes) = (Arc::clone(&encoder_time_us), Arc::clone(&encoded_frames), Arc::clone(&encoded_bytes));
+        let encode_times = Arc::clone(&encode_times);
+        Arc::new(move |frame: EncodedFrame| {
+            encoder_time_us.fetch_add(frame.encode_time.as_micros() as u64, Ordering::Relaxed);
+            encoded_frames.fetch_add(1, Ordering::Relaxed);
+            encode_times.lock().unwrap().push(frame.encode_time.as_micros().min(u128::from(u32::MAX)) as u32);
+            encoded_bytes.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
+            queue_frame(&queue, &shared.force_idr, frame);
+        })
+    };
 
     // One frame may wait while another encodes
     let (jobs, job_receiver) = mpsc::sync_channel::<EncodeJob>(1);
@@ -1112,6 +1144,8 @@ fn frame_loop(
     let mut tick_at = Instant::now();
     // The frames handed to the encoder since the last tick
     let mut tick_sent = 0u32;
+    // The frames that the queue before the send dropped since the last stats line, and the most that waited
+    let (mut send_dropped, mut send_most) = (0u32, 0usize);
     let (mut count, mut game_count, mut gpu_ms, mut gpu_exec_ms, mut since) = (0u32, 0u32, 0.0f64, 0.0f64, Instant::now());
     // Stats windows in a row in which a running game made fewer frames than the headset shows
     let mut slow_windows = 0u32;
@@ -1235,6 +1269,7 @@ fn frame_loop(
             }));
             (count, game_count, gpu_ms, gpu_exec_ms, since) = (0, 0, 0.0, 0.0, Instant::now());
             (no_sample, no_buffer, busy, dropped, missing) = (0, 0, 0, 0, 0);
+            (send_dropped, send_most) = (0, 0);
             encoded_frames.store(0, Ordering::Relaxed);
             encoder_time_us.store(0, Ordering::Relaxed);
             encode_times.lock().unwrap().clear();
@@ -1253,7 +1288,8 @@ fn frame_loop(
             tick_at = Instant::now();
             let config = eye_encoder_config([eye_w * 2, eye_h], stream.fps, stream.full_range, bitrate, strict_rate);
             time_line = TimeLine::new(stream.fps);
-            encoder = match Encoder::new(&config, sender.clone()) {
+            let deliver = Arc::clone(&output);
+            encoder = match Encoder::with_output(&config, move |frame| deliver(frame)) {
                 Ok(e) => {
                     info!(
                         "Encoder: HEVC {}x{} at {} Hz{}",
@@ -1317,6 +1353,7 @@ fn frame_loop(
             }
             control.hold();
             tick_sent = 0;
+            queue.take_counts();
             tick_at = Instant::now();
         }
         if was_paused && !paused && game.connected {
@@ -1547,13 +1584,15 @@ fn frame_loop(
                 control = bitrate::Control::new(ceiling, bitrate::start_for(ceiling, w.cable, stream.fps), stream.fps);
             }
             let sent = std::mem::take(&mut tick_sent);
+            let queued = queue.take_counts();
+            (send_dropped, send_most) = (send_dropped + queued.dropped, send_most.max(queued.most));
             let change = window.filter(|_| fixed.is_none()).and_then(|w| {
                 let network_ms = w.network_ms / f64::from(w.network_frames.max(1));
-                control.tick(Some(bitrate::Second { frames: w.frames, missed: w.missed(), sent, network_ms }))
+                control.tick(Some(bitrate::Second { frames: w.frames, missed: w.missed(), sent, dropped: queued.dropped, network_ms }))
             });
             let wanted = fixed.map_or(control.target(), |m| m * 1_000_000);
             if let Some(w) = window.filter(|_| change.is_some() || test_bitrate::active()) {
-                info!("{}", bitrate::describe(&w, sent, change, wanted));
+                info!("{}", bitrate::describe(&w, sent, queued, change, wanted));
             }
             if wanted != bitrate {
                 bitrate = wanted;
@@ -1659,11 +1698,13 @@ fn frame_loop(
                 "mbps": bitrate / 1_000_000,
                 "mbps_set": mbps,
                 "sent_mbps": sent_mbps,
+                "send_dropped": send_dropped,
+                "send_waited_most": send_most,
                 "audio_s": audio_s,
                 "latency": latency,
             }));
             info!(
-                "{:.1} fps ({game_count} game frames), render {:.2} ms (GPU {:.2} ms), encode {:.2} ms (p95 {encode_p95_ms:.2} ms), {sent_mbps:.1} Mbps of {} Mbps target ({mbps} set), skipped: {no_sample} no new pose, {paused_frames} loop turns while the headset's app had no focus, {no_buffer} no buffer, {busy} encoder busy, {dropped} game frames replaced, {missing} unknown images; desktop layer {layer_fps:.1} fps; poses {poses}",
+                "{:.1} fps ({game_count} game frames), render {:.2} ms (GPU {:.2} ms), encode {:.2} ms (p95 {encode_p95_ms:.2} ms), {sent_mbps:.1} Mbps of {} Mbps target ({mbps} set), skipped: {no_sample} no new pose, {paused_frames} loop turns while the headset's app had no focus, {no_buffer} no buffer, {busy} encoder busy, {dropped} game frames replaced, {missing} unknown images; send queue: up to {send_most} frames waited, {send_dropped} dropped; desktop layer {layer_fps:.1} fps; poses {poses}",
                 count as f64 / secs,
                 gpu_ms / n,
                 gpu_exec_ms / n,
@@ -1690,6 +1731,7 @@ fn frame_loop(
             }
             (count, game_count, gpu_ms, gpu_exec_ms, since) = (0, 0, 0.0, 0.0, Instant::now());
             (no_sample, no_buffer, busy, dropped, missing, paused_frames) = (0, 0, 0, 0, 0, 0);
+            (send_dropped, send_most) = (0, 0);
         }
     }
 }
@@ -1705,6 +1747,126 @@ mod foveation_levels;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A headset whose send waits while its gate is shut, as a TCP write behind a slow link does. It
+    /// keeps the sample and the key flag of each frame that it sent.
+    #[derive(Default)]
+    struct SlowHeadset {
+        shut: Mutex<bool>,
+        changed: std::sync::Condvar,
+        /// The sample of the frame whose send waits at the gate
+        waiting: Mutex<Option<u64>>,
+        sent: Mutex<Vec<(u64, bool)>>,
+    }
+
+    impl SlowHeadset {
+        fn set_shut(&self, shut: bool) {
+            *self.shut.lock().unwrap() = shut;
+            self.changed.notify_all();
+        }
+
+        /// Waits until `done` holds for the frames sent so far
+        fn wait_until(&self, done: impl Fn(&[(u64, bool)], Option<u64>) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done(&self.sent.lock().unwrap(), *self.waiting.lock().unwrap()) {
+                assert!(Instant::now() < deadline, "the send thread did not get there in 5 s");
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    impl Headset for SlowHeadset {
+        fn until_next_vsync(&self) -> Option<Duration> {
+            None
+        }
+        fn motion(&self, _device: Device, _sample_ns: u64) -> Option<pose::DeviceMotion> {
+            None
+        }
+        fn set_decoder_config(&self, _config: Vec<u8>) {}
+        fn send_frame(&self, frame: OutFrame) {
+            let mut shut = self.shut.lock().unwrap();
+            *self.waiting.lock().unwrap() = Some(frame.sample_ns);
+            while *shut {
+                shut = self.changed.wait(shut).unwrap();
+            }
+            *self.waiting.lock().unwrap() = None;
+            self.sent.lock().unwrap().push((frame.sample_ns, frame.idr));
+        }
+        fn frame_submitted(&self, _sample_ns: u64) {}
+        fn take_link_window(&self) -> Option<headset::LinkWindow> {
+            None
+        }
+        fn link_is_cable(&self) -> Option<bool> {
+            None
+        }
+        fn send_haptics(&self, _haptic: runtime_link::Haptic) {}
+        fn take_stats(&self) -> Option<serde_json::Value> {
+            None
+        }
+    }
+
+    /// The encoder's side: frames numbered one by one, a key frame first and when the queue asked for one
+    struct FakeEncoder {
+        next: u64,
+        force_idr: AtomicBool,
+    }
+
+    impl FakeEncoder {
+        fn encode(&mut self, queue: &SendQueue<EncodedFrame>) {
+            let is_idr = self.force_idr.swap(false, Ordering::Relaxed);
+            let frame = EncodedFrame { timestamp_ns: self.next, is_idr, config_nals: None, data: vec![0; 1000], encode_time: Duration::ZERO };
+            self.next += 1;
+            queue_frame(queue, &self.force_idr, frame);
+        }
+    }
+
+    #[test]
+    fn a_blocked_send_costs_frames_and_the_stream_goes_on_from_a_key_frame() {
+        let (queue, headset, notes) = (Arc::new(SendQueue::new(SEND_QUEUE_DEPTH)), Arc::new(SlowHeadset::default()), Arc::new(Mutex::new(VecDeque::new())));
+        let sender = {
+            let (queue, headset, notes) = (Arc::clone(&queue), Arc::clone(&headset), Arc::clone(&notes));
+            thread::spawn(move || send_frames(&queue, &*headset, &notes))
+        };
+        let mut encoder = FakeEncoder { next: 1, force_idr: AtomicBool::new(true) };
+        // A steady link sends every frame
+        for n in 1..=20 {
+            encoder.encode(&queue);
+            headset.wait_until(|sent, _| sent.len() == n);
+        }
+        assert_eq!(queue.take_counts().dropped, 0);
+        // The send blocks on frame 21, and a second of frames comes behind it
+        headset.set_shut(true);
+        encoder.encode(&queue);
+        headset.wait_until(|_, waiting| waiting == Some(21));
+        for _ in 0..120 {
+            encoder.encode(&queue);
+        }
+        let counts = queue.take_counts();
+        assert!(counts.most <= SEND_QUEUE_DEPTH, "{} frames waited", counts.most);
+        assert!(counts.dropped as usize >= 120 - SEND_QUEUE_DEPTH, "{} frames dropped", counts.dropped);
+        // The send runs again: the frames that waited go out, then each new frame
+        headset.set_shut(false);
+        headset.wait_until(|_, waiting| waiting.is_none() && queue.waiting() == 0);
+        for _ in 0..20 {
+            encoder.encode(&queue);
+            let newest = encoder.next - 1;
+            headset.wait_until(|sent, _| sent.last().is_some_and(|(sample, _)| *sample == newest));
+        }
+        queue.close();
+        sender.join().unwrap();
+        // The headset could decode each frame: a frame that is not a key frame came right after the frame before it
+        let sent = headset.sent.lock().unwrap();
+        for pair in sent.windows(2) {
+            let ((before, _), (after, key)) = (pair[0], pair[1]);
+            assert!(key || after == before + 1, "frame {after} came after {before}: its reference is gone");
+        }
+        // Behind the block: a key frame and at most the depth of frames from the time of the block
+        let after_block: Vec<_> = sent.iter().filter(|(sample, _)| *sample > 21).collect();
+        assert!(after_block[0].1, "the first frame after the block is {:?}", after_block[0]);
+        let from_the_block = after_block.iter().filter(|(sample, _)| *sample <= 141).count();
+        assert!(from_the_block <= SEND_QUEUE_DEPTH, "{from_the_block} frames from the time of the block went out late");
+        assert_eq!(sent.iter().filter(|(sample, _)| *sample > 141).count(), 20, "every frame after the block went out");
+    }
 
     #[test]
     fn a_stalled_game_gives_the_desktop_back() {

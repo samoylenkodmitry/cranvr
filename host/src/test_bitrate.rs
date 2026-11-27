@@ -8,9 +8,12 @@
 //! - `cap`: the host sends at most this many Mbps, as a slower link would carry. A frame that a
 //!   link of that rate could not carry within `QUEUE_LIMIT` after the frames before it is dropped,
 //!   as a full queue of a router drops it. The frames that pass go out at once. The cap stands for
-//!   a link that gets worse while it streams, which a test cannot make on demand. An earlier cap
-//!   held each frame for its time on the slower link. That blocked the host's sending thread, the
-//!   encoded frames piled up behind it and went out all at once when the cap ended.
+//!   a link that gets worse while it streams, which a test cannot make on demand.
+//! - `slow`: the host's send of a frame waits for the frame's time on a link of this many Mbps
+//!   before it sends, as a TCP write waits over a link that carries less than the stream (`adb
+//!   reverse`). The sending thread blocks. Before #157 the encoded frames piled up behind it without
+//!   a bound and went out all at once when the slow part ended; now the queue before the send drops
+//!   them (`send_queue.rs`).
 
 use std::{
     path::PathBuf,
@@ -28,6 +31,7 @@ const QUEUE_LIMIT: Duration = Duration::from_millis(50);
 pub struct Knob {
     pub fixed_mbps: Option<u64>,
     pub cap_mbps: Option<u64>,
+    pub slow_mbps: Option<u64>,
 }
 
 impl Knob {
@@ -39,6 +43,7 @@ impl Knob {
             match name {
                 "fixed" => knob.fixed_mbps = Some(value).filter(|v| *v > 0),
                 "cap" => knob.cap_mbps = Some(value).filter(|v| *v > 0),
+                "slow" => knob.slow_mbps = Some(value).filter(|v| *v > 0),
                 _ => {}
             }
         }
@@ -97,14 +102,21 @@ pub fn passes_cap(bytes: usize) -> bool {
     true
 }
 
+/// How long the send of a frame of `bytes` waits on the test's slow link. `None` without one.
+pub fn slow_wait(bytes: usize) -> Option<Duration> {
+    let slow = current(&mut source().lock().unwrap()).slow_mbps?;
+    Some(Duration::from_secs_f64(bytes as f64 * 8.0 / (slow as f64 * 1e6)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::Knob;
 
     #[test]
-    fn the_words_set_the_fixed_bitrate_and_the_cap() {
-        assert_eq!(Knob::parse("fixed=80 cap=40"), Knob { fixed_mbps: Some(80), cap_mbps: Some(40) });
-        assert_eq!(Knob::parse("cap=25\n"), Knob { fixed_mbps: None, cap_mbps: Some(25) });
+    fn the_words_set_the_fixed_bitrate_the_cap_and_the_slow_link() {
+        assert_eq!(Knob::parse("fixed=80 cap=40"), Knob { fixed_mbps: Some(80), cap_mbps: Some(40), slow_mbps: None });
+        assert_eq!(Knob::parse("cap=25\n"), Knob { fixed_mbps: None, cap_mbps: Some(25), slow_mbps: None });
+        assert_eq!(Knob::parse("slow=60"), Knob { slow_mbps: Some(60), ..Knob::default() });
         assert_eq!(Knob::parse("fixed=0 cap=x other=3"), Knob::default());
     }
 }

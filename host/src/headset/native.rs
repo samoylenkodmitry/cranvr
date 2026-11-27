@@ -1376,6 +1376,11 @@ impl Session {
         stats.decode += ms(t.decode_end.saturating_sub(t.received));
         stats.decode_queue += ms(t.picked.saturating_sub(t.decode_end));
         stats.vsync_wait += ms(t.display_time.saturating_sub(t.picked));
+        {
+            let mut window = self.window.lock().unwrap();
+            window.display_frames += 1;
+            window.display_ms += ms(t.display_time.saturating_sub(t.tracking_sample));
+        }
         if let Some(sent) = sent_on_client {
             let network = ms(t.received.saturating_sub(sent));
             stats.pose_to_send += ms(sent.saturating_sub(t.tracking_sample));
@@ -1502,6 +1507,10 @@ impl Headset for Native {
         // A test of the bitrate's control drops the frames that a slower link would drop. Such a frame
         // counts as sent and never reaches the headset, as a lost one.
         let lost = !crate::test_bitrate::passes_cap(frame.slices.iter().map(|s| s.data.len()).sum());
+        // A test of a slow link holds the send for the frame's time on it, as a TCP write over such a link waits
+        if let Some(wait) = crate::test_bitrate::slow_wait(frame.slices.iter().map(|s| s.data.len()).sum()) {
+            thread::sleep(wait);
+        }
         let send_started = Instant::now();
         let mut sent_bytes = 0;
         let (mut data_packets, mut parity_packets) = (0u64, 0u64);
