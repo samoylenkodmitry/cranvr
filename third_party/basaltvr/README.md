@@ -227,6 +227,20 @@ applies these patches and builds both parts.
 - `tests/d3d11_runtime_smoke.cpp` checks the four numbers, creates a swapchain at the limit and expects one pixel
   more to be refused.
 
+`0019-smoke-accepts-a-sleeping-controller.patch`
+
+- `tests/d3d11_runtime_smoke.cpp` knew two kinds of left controller: none (no interaction profile, as with no
+  control daemon) and a live one (`BASALT_REQUIRE_CONTROLLER_INPUT=1`, or the native daemon's injected controller).
+  cranvr-host gives a game the Touch profile of both hands at its start, also while the headset's controllers
+  sleep, as Unity needs. On a Quest on a desk the program then failed: with no variable it expected no profile, and
+  with `BASALT_REQUIRE_CONTROLLER_INPUT=1` it waited 30 s for a controller that sent nothing (cranvr issue #173).
+- `BASALT_ACCEPT_MISSING_CONTROLLER=1` is a third mode. The left hand may have the Touch profile with inactive
+  actions, or no profile. The program syncs for up to a second for the host's profiles, which follow its HelloAck.
+  The bound sources, their localized names and the profile's events follow the profile. The squeeze's value, the
+  pose's state and the controller's locations count only while they are active or tracked: a controller may wake
+  during the run, so each check judges its own moment. The program waits for no controller. The two old modes
+  stay as they were.
+
 ## patches/dxmt
 
 `0005-public-atomic-for-new-metal-compiler.patch`: DXMT 0.80 calls a private Metal builtin

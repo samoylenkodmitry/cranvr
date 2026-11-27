@@ -639,9 +639,15 @@ start_program() {
     view_size=${view_width}x${view_height}
     export BASALT_EXPECT_VIEW_WIDTH=${view_width} BASALT_EXPECT_VIEW_HEIGHT=${view_height}
     # The program checks the left controller: the probe's follows its script. The host gives a game the Touch profile of
-    # both hands at its start, so the program's check of no controller fails under the host. With a Quest the program
-    # waits up to 30 s for the left controller, which must be awake.
-    export BASALT_REQUIRE_HEAD_POSE=1 BASALT_EXPECT_IOSURFACE=1 BASALT_REQUIRE_CONTROLLER_INPUT=1
+    # both hands at its start, so the program's check of no controller fails under the host. A Quest on a desk has
+    # sleeping controllers: the program then accepts a Touch profile with inactive actions and checks the controller's
+    # values only while they are active (runtime patch 0019, #173).
+    export BASALT_REQUIRE_HEAD_POSE=1 BASALT_EXPECT_IOSURFACE=1
+    if [[ ${client} == quest ]]; then
+        export BASALT_ACCEPT_MISSING_CONTROLLER=1
+    else
+        export BASALT_REQUIRE_CONTROLLER_INPUT=1
+    fi
     print -r "Starting ${wine} in Wine at a view of ${view_size} (log: ${work}/game.log)"
     local mute=(--mute)
     (( sound )) && mute=()
