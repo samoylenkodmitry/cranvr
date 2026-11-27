@@ -82,7 +82,7 @@ for stage in live warm churned; do
     print "${stage}: processes ${pids}: launchd ${line}"
     : > "${signal}.${stage}"
 done
-wait ${program} || true
+wait ${program} && program_code=0 || program_code=$?
 grep -h "shared_churn:" "${work}/program.log" | grep -v "measure" || true
 grep -h "the ID names another surface now" "${work}/program.log" | sed 's/^/DXMT: /' || true
 # The surfaces go a few milliseconds after their last owner
@@ -97,6 +97,8 @@ print "After: the program's processes ${pids}: launchd ${after_pids}"
 
 bad=()
 grep -q "shared_churn: PASS" "${work}/program.log" || bad+=("the program did not pass")
+# A program that prints its verdict and then ends with an error fails too (#169)
+(( program_code == 0 )) || bad+=("the program ended with exit code ${program_code}")
 grep -q "refused it" "${work}/program.log" && ! grep -q "the ID names another surface now" "${work}/program.log" &&
     bad+=("the second process refused the forged ID, but DXMT logged no size check")
 field() { print -r -- "$1" | awk -v key="$2" '{ for (i = 1; i < NF; i++) if ($i == key) { print $(i + 1); exit } }'; }

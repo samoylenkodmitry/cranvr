@@ -62,16 +62,24 @@ sleep 2
 "${root}/target/release/cranvr-fake-game" --control "${cfg}/runtime-control.txt" --fps 72 --seconds $(( seconds )) > "${work}/game.log" 2>&1 &
 game=$!
 sleep $(( seconds ))
+# The game and the client still run at the end, or ended on their own without an error (#169)
+ended=()
+for name pid in "the fake game" ${game} "the client" ${client}; do
+    kill -0 ${pid} 2>/dev/null && continue
+    wait ${pid} && code=0 || code=$?
+    (( code == 0 )) || ended+=("${name} ended with exit code ${code}")
+done
 cleanup
 wait 2>/dev/null
 
 print "logs in ${work}"
-python3 - "${work}" <<'EOF'
+python3 - "${work}" "${(@)ended}" <<'EOF'
 import re, sys
 work = sys.argv[1]
+ended = sys.argv[2:]
 host = open(f"{work}/host.out", errors="replace").read().splitlines()
 client = open(f"{work}/client.log", errors="replace").read().splitlines()
-problems = []
+problems = list(ended)
 
 quiet = [l for l in host if re.search(r"Native displays: \d+ known, 0 shown, a game runs; in the last [\d.]+ s: 0 pictures captured, 0 encoded, 0 sent, 0 cursor datagrams sent", l)]
 busy = [l for l in host if "a game runs" in l and "Native displays" in l and not re.search(r"0 pictures captured, 0 encoded, 0 sent, 0 cursor", l)]
