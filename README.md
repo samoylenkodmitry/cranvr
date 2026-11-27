@@ -43,6 +43,7 @@ Beat Saber and Serious Sam VR: The Last Hope run. Other Steam VR games may run. 
 - Hold the left controller's menu button or B to open the hand menu. A press on the ball above the left controller opens it too. The menu shows or hides the panels, starts games and opens the settings.
 - The Mac's displays show as panels. Point at a panel to move the Mac's mouse. Pull the trigger to click. Push the thumbstick to scroll.
 - Point at the handle under a panel and hold the trigger to move the panel.
+- With your hands and no controller, touch a button, the ball, the gem or a display's panel with your index fingertip to press it. A touch on a display clicks the Mac's mouse at that point. From farther away, point with your hand and pinch.
 
 ## Record what you see
 
