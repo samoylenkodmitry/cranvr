@@ -127,6 +127,9 @@ pub struct Second {
     pub missed: u32,
     /// Frames that the host handed to the encoder
     pub sent: u32,
+    /// Frames that the queue before the send dropped because the send did not keep up
+    /// (`send_queue.rs`). The headset never gets them, so they count as unreported.
+    pub dropped: u32,
     /// The average time of a frame from the start of its send to its last packet, in ms
     pub network_ms: f64,
 }
@@ -212,7 +215,11 @@ impl Control {
     /// One second passed with these reports, or none. Returns the change of the target, if any.
     pub fn tick(&mut self, second: Option<Second>) -> Option<Change> {
         self.probe_in = self.probe_in.saturating_sub(1);
-        let Some(second) = second.filter(|s| s.frames >= self.min_frames) else {
+        // A second whose frames the queue before the send dropped, so that few reached the link, tells of a full
+        // link. Its few reports are no sign of a headset that shows no stream (#157): such a second counted as one
+        // before, and two of them dropped the target to the floor and then started the control again at its start.
+        let full_link = |s: &Second| s.dropped > 0 && s.sent.saturating_sub(s.dropped) < self.min_frames;
+        let Some(second) = second.filter(|s| s.frames >= self.min_frames || full_link(s)) else {
             // Frames went out and the headset reported few: it shows no stream. Few frames went out:
             // a slow game, which says nothing.
             return match second {
@@ -313,7 +320,7 @@ fn whole_mbps(bps: u64) -> u64 {
 
 /// The log line of one second of the link: what the headset reported, what the host sent, and the
 /// target with its change.
-pub fn describe(w: &crate::headset::LinkWindow, encoded: u32, change: Option<Change>, target: u64) -> String {
+pub fn describe(w: &crate::headset::LinkWindow, encoded: u32, queued: crate::send_queue::Counts, change: Option<Change>, target: u64) -> String {
     let per = |sum: f64, n: u32| sum / f64::from(n.max(1));
     let change = match change {
         Some(Change::Cut { from, to, share }) => {
@@ -327,10 +334,13 @@ pub fn describe(w: &crate::headset::LinkWindow, encoded: u32, change: Option<Cha
         None => String::new(),
     };
     format!(
-        "Eye stream link: {encoded} frames encoded, {} reported, {} late, {} replaced; network {:.2} ms (most {:.2}); {} frames sent, {:.1} KB a frame, send {:.2} ms (most {:.2}), {} sends refused; target {} Mbps{change}",
+        "Eye stream link: {encoded} frames encoded, {} dropped before the send (up to {} waited), {} reported, {} late, {} replaced; pose to display {:.1} ms; network {:.2} ms (most {:.2}); {} frames sent, {:.1} KB a frame, send {:.2} ms (most {:.2}), {} sends refused; target {} Mbps{change}",
+        queued.dropped,
+        queued.most,
         w.frames,
         w.late,
         w.replaced,
+        per(w.display_ms, w.display_frames),
         per(w.network_ms, w.network_frames),
         w.network_max_ms,
         w.sent_frames,

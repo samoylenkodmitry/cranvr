@@ -133,6 +133,9 @@ pub struct LinkWindow {
     pub send_max_ms: f64,
     /// UDP packets that the system refused for lack of buffer space
     pub refused_sends: u64,
+    /// Frames with a display time, and the sum of their times from the pose to the display, in ms
+    pub display_frames: u32,
+    pub display_ms: f64,
     /// This is the first look at a new session
     pub first: bool,
     /// The session runs over a USB cable

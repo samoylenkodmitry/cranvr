@@ -54,7 +54,7 @@ fn run(control: &mut Control, link: &mut Link, seconds: usize) -> (Vec<u64>, Vec
 
 /// A second in which the host sent `frames` and the headset reported them all, `missed` of them late
 fn second(frames: u32, missed: u32) -> Second {
-    Second { frames, missed, sent: frames, network_ms: 2.0 }
+    Second { frames, missed, sent: frames, dropped: 0, network_ms: 2.0 }
 }
 
 fn calm() -> Option<Second> {
@@ -151,19 +151,19 @@ fn a_headset_that_shows_no_stream_gets_the_floor_and_the_start_again_when_it_sho
         control.tick(calm());
     }
     // Room at Passthrough and no game: the headset decodes the frames and reports none
-    let unseen = Some(Second { frames: 0, missed: 0, sent: 120, network_ms: 0.0 });
+    let unseen = Some(Second { frames: 0, missed: 0, sent: 120, dropped: 0, network_ms: 0.0 });
     assert_eq!(control.tick(unseen), None);
     assert_eq!(control.tick(unseen), Some(Change::Unseen { from: 200 * MBPS, to: FLOOR_BPS }));
     for _ in 0..60 {
         assert_eq!(control.tick(unseen), None);
         assert_eq!(control.tick(None), None);
-        assert_eq!(control.tick(Some(Second { frames: 10, missed: 10, sent: 120, network_ms: 1.0 })), None, "a few reports are no stream shown");
+        assert_eq!(control.tick(Some(Second { frames: 10, missed: 10, sent: 120, dropped: 0, network_ms: 1.0 })), None, "a few reports are no stream shown");
     }
     assert_eq!(control.target(), FLOOR_BPS);
     // A game starts and the headset shows it. Its first reports also count the frames that the
     // headset replaced while it showed nothing (31 of the display lock's 32 in flight), and a part
     // of the second came before the first report.
-    let first = Some(Second { frames: 100, missed: 31, sent: 120, network_ms: 4.0 });
+    let first = Some(Second { frames: 100, missed: 31, sent: 120, dropped: 0, network_ms: 4.0 });
     assert_eq!(control.tick(first), Some(Change::Seen { from: FLOOR_BPS, to: 200 * MBPS }));
     for _ in 0..20 {
         assert_eq!(control.tick(calm()), None);
@@ -178,9 +178,9 @@ fn the_last_second_before_the_stream_hides_cuts_nothing_that_stays() {
     for _ in 0..5 {
         control.tick(calm());
     }
-    control.tick(Some(Second { frames: 60, missed: 0, sent: 120, network_ms: 4.0 }));
+    control.tick(Some(Second { frames: 60, missed: 0, sent: 120, dropped: 0, network_ms: 4.0 }));
     for _ in 0..5 {
-        control.tick(Some(Second { frames: 0, missed: 0, sent: 120, network_ms: 0.0 }));
+        control.tick(Some(Second { frames: 0, missed: 0, sent: 120, dropped: 0, network_ms: 0.0 }));
     }
     // The next game starts at the full start, whatever that last second did
     assert!(matches!(control.tick(Some(second(120, 31))), Some(Change::Seen { to, .. }) if to == 200 * MBPS));
@@ -194,13 +194,47 @@ fn frames_that_the_headset_does_not_report_count_as_missed() {
     }
     // A link that delays the frames more and more: the headset reports 60 of the 120 frames sent,
     // all of them on time
-    let cut = control.tick(Some(Second { frames: 60, missed: 0, sent: 120, network_ms: 9.0 }));
+    let cut = control.tick(Some(Second { frames: 60, missed: 0, sent: 120, dropped: 0, network_ms: 9.0 }));
     assert!(matches!(cut, Some(Change::Cut { from, .. }) if from == 200 * MBPS), "{cut:?}");
     // The frames of the last 40 ms of a calm second are still on their way: no cut
     let mut control = Control::new(200 * MBPS, 200 * MBPS, FPS);
     for _ in 0..20 {
-        assert_eq!(control.tick(Some(Second { frames: 115, missed: 1, sent: 120, network_ms: 4.5 })), None);
+        assert_eq!(control.tick(Some(Second { frames: 115, missed: 1, sent: 120, dropped: 0, network_ms: 4.5 })), None);
     }
+}
+
+#[test]
+fn frames_that_the_queue_before_the_send_dropped_cut_and_are_no_hidden_stream() {
+    let mut control = Control::new(200 * MBPS, 200 * MBPS, FPS);
+    for _ in 0..5 {
+        control.tick(calm());
+    }
+    // The send blocks: the queue drops most frames, few reach the link and the headset reports those few
+    let blocked = Some(Second { frames: 12, missed: 0, sent: 120, dropped: 105, network_ms: 30.0 });
+    let cut = control.tick(blocked);
+    assert!(matches!(cut, Some(Change::Cut { from, to, .. }) if from == 200 * MBPS && to == 100 * MBPS), "{cut:?}");
+    // The seconds after it go on cutting, and none of them takes the target to the floor as a stream that nobody sees
+    let mut changes = Vec::new();
+    for _ in 0..4 {
+        changes.extend(control.tick(blocked));
+    }
+    assert!(changes.iter().all(|c| matches!(c, Change::Cut { .. })), "{changes:?}");
+    assert!(control.target() < 100 * MBPS && control.target() > FLOOR_BPS, "{}", control.target());
+    // A slower link that carries half of the frames: the dropped ones count as missed
+    let mut control = Control::new(200 * MBPS, 200 * MBPS, FPS);
+    for _ in 0..5 {
+        control.tick(calm());
+    }
+    let half = control.tick(Some(Second { frames: 60, missed: 0, sent: 120, dropped: 60, network_ms: 6.0 }));
+    assert!(matches!(half, Some(Change::Cut { from, .. }) if from == 200 * MBPS), "{half:?}");
+    // A stream that nobody sees still falls to the floor: its frames reached the link
+    let mut control = Control::new(200 * MBPS, 200 * MBPS, FPS);
+    for _ in 0..5 {
+        control.tick(calm());
+    }
+    let unseen = Some(Second { frames: 0, missed: 0, sent: 120, dropped: 2, network_ms: 0.0 });
+    assert_eq!(control.tick(unseen), None);
+    assert_eq!(control.tick(unseen), Some(Change::Unseen { from: 200 * MBPS, to: FLOOR_BPS }));
 }
 
 #[test]

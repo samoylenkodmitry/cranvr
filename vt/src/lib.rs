@@ -215,7 +215,7 @@ const RATE_WINDOWS: [(f64, f64); 1] = [(1.0, 1.0)];
 
 /// What the output callback needs: where frames go, and when each frame went in.
 struct Output {
-    sender: Sender<EncodedFrame>,
+    deliver: Box<dyn Fn(EncodedFrame) + Send + Sync>,
     submitted: Mutex<VecDeque<(u64, Instant)>>,
 }
 
@@ -243,8 +243,16 @@ unsafe impl Sync for Encoder {}
 impl Encoder {
     /// Encoded frames arrive on `sender`, from a VideoToolbox thread.
     pub fn new(config: &EncoderConfig, sender: Sender<EncodedFrame>) -> Result<Self, String> {
+        Self::with_output(config, move |frame| {
+            sender.send(frame).ok();
+        })
+    }
+
+    /// Encoded frames go to `deliver`, on a VideoToolbox thread. A caller whose
+    /// consumer may fall behind bounds what waits for it there (the host's eye stream, #157).
+    pub fn with_output(config: &EncoderConfig, deliver: impl Fn(EncodedFrame) + Send + Sync + 'static) -> Result<Self, String> {
         unsafe {
-            let output = Box::into_raw(Box::new(Output { sender, submitted: Mutex::new(VecDeque::new()) }));
+            let output = Box::into_raw(Box::new(Output { deliver: Box::new(deliver), submitted: Mutex::new(VecDeque::new()) }));
             let format = if config.full_range {
                 kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
             } else {
@@ -444,7 +452,7 @@ extern "C" fn output_callback(
     }
     if let Some(mut frame) = unsafe { read_sample(sample, timestamp_ns) } {
         frame.encode_time = submitted.map_or(Duration::ZERO, |at| at.elapsed());
-        output.sender.send(frame).ok();
+        (output.deliver)(frame);
     }
 }
 
