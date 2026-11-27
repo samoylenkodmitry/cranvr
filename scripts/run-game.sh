@@ -38,6 +38,10 @@
 # host with its own config dir, such as the one of scripts/e2e.sh.
 
 set -euo pipefail
+# zsh lowers the priority of a background job by 5 ("nice") unless this option is off. The program runs
+# as a background job below. The cranvr app starts a game at normal priority. With the option on, every
+# game of scripts/e2e.sh ran at nice 5 and lost CPU time to the Mac's other work (#155).
+unsetopt BG_NICE
 
 home=${CRANVR_HOME:-$HOME/Library/Application Support/cranvr}
 wine_root=${home}/wine/engine
