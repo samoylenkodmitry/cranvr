@@ -80,12 +80,9 @@ impl Sizes {
                 replace(&self.rates, program, &format!("{old:.3} {fps:.1} {program}"));
             }
             Step::Back { new, .. } => {
-                // The full size needs no line: the app then lists no learned size for the game
-                if new < 1.0 - 0.001 {
-                    replace(&self.sizes, program, &format!("{new:.3} {program}"));
-                } else {
-                    remove(&self.sizes, program);
-                }
+                // A line stays also at the full size: the app lists it, and its Forget button clears it
+                // together with the rates line, which holds the game at this share
+                replace(&self.sizes, program, &format!("{new:.3} {program}"));
                 // The rates line keeps the share from before the step and its frame rate. Its share is
                 // the game's share again, so the next start takes no step.
             }
@@ -136,26 +133,10 @@ fn lines(path: &Path) -> Vec<String> {
 
 /// Writes `line` in place of the program's line, or at the end.
 fn replace(path: &Path, program: &str, line: &str) {
-    let mut kept = others(path, program);
+    let mut kept: Vec<String> =
+        lines(path).into_iter().filter(|l| !l.split_once(' ').is_some_and(|(_, rest)| ends_with_program(rest, program))).collect();
     kept.push(line.to_string());
-    write(path, &kept);
-}
-
-/// Takes the program's line out of the file.
-fn remove(path: &Path, program: &str) {
-    if path.exists() {
-        write(path, &others(path, program));
-    }
-}
-
-/// The lines of the file that name another program
-fn others(path: &Path, program: &str) -> Vec<String> {
-    lines(path).into_iter().filter(|l| !l.split_once(' ').is_some_and(|(_, rest)| ends_with_program(rest, program))).collect()
-}
-
-fn write(path: &Path, lines: &[String]) {
-    let text = if lines.is_empty() { String::new() } else { lines.join("\n") + "\n" };
-    if let Err(e) = fs::write(path, text) {
+    if let Err(e) = fs::write(path, kept.join("\n") + "\n") {
         warn!("Game sizes: cannot write {}: {e}", path.display());
     }
 }
@@ -242,9 +223,9 @@ mod tests {
         let (old, new) = back(sizes.learn(GAME, &[99.0; WINDOWS], 120.0));
         assert!(near(old, first) && new == 1.0, "{old} {new}");
         assert_eq!(sizes.share(GAME), 1.0);
-        // The full size needs no line: the app lists no learned size for the game
+        // The line stays at the full size, so the app lists the game and can forget what it learned
         let text = fs::read_to_string(dir.join("game-sizes.txt")).unwrap();
-        assert!(!text.contains("Some Game"), "{text}");
+        assert!(text.contains(&format!("1.000 {GAME}")), "{text}");
         assert!(text.contains(other), "{text}");
         // Every later start keeps the full size
         for _ in 0..3 {
