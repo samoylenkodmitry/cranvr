@@ -39,7 +39,7 @@ mkdir -p ${home}
 # The entries that the walk changes stand in the file, so the check shows their change
 print '{"desktop": false, "game_audio": false, "game_msaa_limit": 2, "autostart": true, "connection": "Automatic", "microphone": "Headset", "wine": {"mac_window": false}, "headset_room": "scene", "headset_volume": 150, "headset_interface": null, "launch": {}}' > ${home}/app.json
 cp ${home}/app.json ${work}/app.before.json
-CRANVR_HOME=${home} CRANVR_NATIVE_PORT=${port} CRANVR_TEST_TRUST_ALL=1 CRANVR_HOST_BIN=${root}/target/release/cranvr-host \
+CRANVR_HOME=${home} CRANVR_NATIVE_PORT=${port} CRANVR_TEST_TRUST_ALL=1 CRANVR_TEST_LOOPBACK=1 CRANVR_HOST_BIN=${root}/target/release/cranvr-host \
     ${root}/target/release/cranvr --headless < /dev/null > ${work}/app.log 2>&1 &
 app=$!
 ${adb_cmd} logcat -c

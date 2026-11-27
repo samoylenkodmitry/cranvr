@@ -85,7 +85,7 @@ state() {
 lan=$(ipconfig getifaddr en0 || ipconfig getifaddr en1)
 forget=127.0.0.1:${port}${lan:+,${lan}:${port}}
 print "cut starts $(date +%T)"
-${root}/target/release/cranvr-host --status --fps 120 --mbps 200 --native-port ${port} --config-dir ${home} --trust-all --tcp --foveation off < ${input} > ${host_log} 2>&1 &
+${root}/target/release/cranvr-host --status --fps 120 --mbps 200 --native-port ${port} --config-dir ${home} --trust-all --tcp --loopback --foveation off < ${input} > ${host_log} 2>&1 &
 host=$!
 exec 3> ${input}
 sleep 1

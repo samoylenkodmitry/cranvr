@@ -2,15 +2,25 @@
 //! put where the user heard it (recording_align.rs), as an MP4 file.
 //!
 //! `cranvr-host --mux-recording VIDEO DIR OUT` reads the headset's file `VIDEO` and the sound of the
-//! recording in `DIR` (recording_sound.rs) and writes `OUT`. AVFoundation does the work. An export
-//! makes AAC of the Mac's sound, with the headset's microphone mixed in when the recording took it.
-//! A composition then puts the picture's track as it is, with no new encode, beside that sound.
-//! The process prints one status line with the file's numbers.
+//! recording in `DIR` (recording_sound.rs) and writes `OUT`. AVFoundation does the work. The process
+//! builds the sound of the whole picture in the picture's time, makes AAC of it and puts the
+//! picture's track as it is, with no new encode, beside it. It then opens `OUT` again and checks it
+//! against `VIDEO`. It prints one status line with the file's numbers, the loudness of both sounds
+//! among them, and `checked` when the file passed.
 //!
-//! The Mac's sound replaces the headset's track: it has no loss and nothing of the headset's own
-//! sounds. A recording without the Mac's sound keeps the headset's track.
+//! Which sound the file takes:
+//! - the Mac's sound where it matched the headset's own track: it has no loss and nothing of the
+//!   headset's own sounds. Where it does not cover the picture, as after a crash of the app that
+//!   recorded it, the headset's track fills in;
+//! - the headset's own track when the Mac's sound was silent while the headset heard sound, and when
+//!   both had sound that did not match: the headset's track is in time with the picture for sure;
+//! - the Mac's sound at the times of the start when the headset heard nothing to match;
+//! - the headset's track as it is when the recording has no sound of the Mac's.
 
-use crate::{recording_align, wav};
+use crate::{
+    recording_align::{self, Alignment},
+    wav,
+};
 use block2::RcBlock;
 use objc2::{rc::Retained, runtime::AnyObject, AnyThread};
 use objc2_av_foundation::{
@@ -28,8 +38,6 @@ use std::{
 };
 
 const RATE: f64 = wav::SAMPLE_RATE as f64;
-/// The search for the lag spans this far on each side of the guess from the start's times, in s
-const SEARCH_SPAN: f64 = 2.0;
 /// The headset's recorder shows its first frame about this long after it answers that it started,
 /// in s: the first frame came 0.15 s before the answer in a recording whose sound matched at 0.99
 /// (2026-11-27). Only a recording with no sound to match falls back on it.
@@ -39,6 +47,8 @@ const FIRST_FRAME_AFTER_START: f64 = -0.15;
 const MICROPHONE_LATER: f64 = 0.02;
 /// The longest wait for one export of AVFoundation
 const EXPORT_WAIT: Duration = Duration::from_secs(600);
+/// The final file's picture may differ from the headset's by this much and pass its check, in s
+const CHECK_SLACK: f64 = 0.05;
 
 /// Writes the final file and returns its numbers for the app.
 pub fn run(video: &Path, dir: &Path, out: &Path) -> Result<Value, String> {
@@ -46,29 +56,27 @@ pub fn run(video: &Path, dir: &Path, out: &Path) -> Result<Value, String> {
     let at = |key: &str| times[key].as_u64();
     let quest = asset(video);
     let video_track = track(&quest, kind(unsafe { AVMediaTypeVideo }))?.ok_or("the headset's file has no picture")?;
-    let heard = track(&quest, kind(unsafe { AVMediaTypeAudio }))?;
-    let sound = wav::read(&dir.join("sound.wav")).ok().filter(|(channels, samples)| *channels == 2 && samples.len() > 2 * wav::SAMPLE_RATE as usize);
-    let composition = unsafe { AVMutableComposition::composition() };
+    let heard_track = track(&quest, kind(unsafe { AVMediaTypeAudio }))?;
     let video_range = unsafe { video_track.timeRange() };
+    let picture_s = seconds(video_range.duration);
+    let composition = unsafe { AVMutableComposition::composition() };
     insert(&composition, unsafe { AVMediaTypeVideo }, &video_track, video_range, zero())?;
     let mut numbers = json!({});
     // The tracks in the composition need their assets alive until the export of the composition ends
     let mut sources = Vec::new();
-    match (sound, at("sound_first_ns")) {
-        (Some((_, mut stereo)), Some(sound_first)) => {
-            let guess = at("start_mark_ns").map_or(0.0, |mark| (mark as f64 - sound_first as f64) * 1e-9 + FIRST_FRAME_AFTER_START);
-            let (lag, method) = match heard.as_ref().map(|track| read_pcm(&quest, track)).transpose()? {
-                Some((start, samples)) => match recording_align::find(&samples, &recording_align::mono(&stereo), guess + start, SEARCH_SPAN) {
-                    Some(found) => (found.seconds() - start, json!({"matched": found.matched})),
-                    None => (guess, json!("the start's times: the headset heard no sound to match")),
-                },
-                None => (guess, json!("the start's times: the headset's file has no sound")),
+    let mac = wav::read(&dir.join("sound.wav")).ok().filter(|(channels, samples)| *channels == 2 && samples.len() > 2 * wav::SAMPLE_RATE as usize);
+    let with_sound = match (mac, at("sound_first_ns")) {
+        (Some((_, mac)), Some(sound_first)) => {
+            let heard = heard_track.as_ref().map(|track| read_pcm(&quest, track)).transpose()?;
+            let guess = at("start_mark_ns").map(|mark| (mark as f64 - sound_first as f64) * 1e-9 + FIRST_FRAME_AFTER_START);
+            let microphone = match (wav::read(&dir.join("microphone.wav")), at("microphone_first_ns")) {
+                (Ok((1, voice)), Some(first)) => Some((voice, (first as f64 - sound_first as f64) * 1e-9 - MICROPHONE_LATER)),
+                _ => None,
             };
-            if let (Ok((1, voice)), Some(first)) = (wav::read(&dir.join("microphone.wav")), at("microphone_first_ns")) {
-                let offset = (first as f64 - sound_first as f64) * 1e-9 - MICROPHONE_LATER;
-                mix(&mut stereo, &voice, (offset * RATE).round() as i64);
-                numbers["microphone"] = json!(true);
-            }
+            let (stereo, sound) = final_sound(&mac, heard.as_ref(), microphone.as_ref(), guess, (picture_s * RATE).round() as usize);
+            // The microphone's loudness, or false for a recording without it
+            numbers["microphone"] = microphone.as_ref().map_or(json!(false), |(voice, _)| recording_align::level(voice, 1));
+            numbers["sound"] = sound;
             let mixed = dir.join("final-sound.wav");
             let mut writer = wav::WavWriter::create(&mixed, 2).map_err(|e| format!("the sound: {e}"))?;
             writer.write_samples(&stereo).map_err(|e| format!("the sound: {e}"))?;
@@ -78,31 +86,125 @@ pub fn run(video: &Path, dir: &Path, out: &Path) -> Result<Value, String> {
             let aac_asset = asset(&aac);
             let sound_track = track(&aac_asset, kind(unsafe { AVMediaTypeAudio }))?.ok_or("the AAC sound has no track")?;
             sources.push(aac_asset);
-            let sound_range = unsafe { sound_track.timeRange() };
-            // The sound's time `lag` plays at the picture's start
-            let skip = lag.max(0.0);
-            let length = (seconds(sound_range.duration) - skip).min(seconds(video_range.duration) + lag.min(0.0));
-            if length > 0.0 {
-                let range = unsafe { CMTimeRange::new(time(skip), time(length)) };
-                insert(&composition, unsafe { AVMediaTypeAudio }, &sound_track, range, time((-lag).max(0.0)))?;
-            }
-            numbers["sound"] = json!({"source": "mac", "lag_s": lag, "guess_s": guess, "found_by": method});
+            let length = seconds(unsafe { sound_track.timeRange() }.duration).min(picture_s);
+            insert(&composition, unsafe { AVMediaTypeAudio }, &sound_track, unsafe { CMTimeRange::new(zero(), time(length)) }, zero())?;
+            true
         }
         _ => {
-            if let Some(heard) = heard {
+            let with_sound = heard_track.is_some();
+            if let Some(heard) = heard_track {
                 insert(&composition, unsafe { AVMediaTypeAudio }, &heard, unsafe { heard.timeRange() }, zero())?;
+                numbers["sound"] = json!({"source": "headset", "why": "no sound of the Mac's: System Audio Recording may be off"});
+            } else {
+                numbers["sound"] = json!({"source": "none", "why": "neither the Mac nor the headset recorded sound"});
             }
-            numbers["sound"] = json!({"source": "headset", "why": "no sound of the Mac's: System Audio Recording may be off"});
+            with_sound
         }
-    }
+    };
     export(&composition, unsafe { AVAssetExportPresetPassthrough }, out, unsafe { AVFileTypeMPEG4 })?;
     drop(sources);
     let size = unsafe { video_track.naturalSize() };
     numbers["width"] = json!(size.width);
     numbers["height"] = json!(size.height);
     numbers["fps"] = json!(unsafe { video_track.nominalFrameRate() });
-    numbers["seconds"] = json!(seconds(video_range.duration));
+    numbers["seconds"] = json!(picture_s);
+    numbers["tap"] = json!({"starts": times["tap_starts"], "gaps": times["gaps"], "filled_s": times["filled_s"], "first_sound_after_ms": times["first_sound_after_ms"], "ended": times["ended"]});
+    numbers["checked"] = json!(check(out, picture_s, with_sound)?);
     Ok(numbers)
+}
+
+/// The sound of the whole picture, `frames` stereo frames from its start, and what the log says of
+/// it. `mac` is the Mac's sound, `heard` the headset's own track with the picture's time of its first
+/// sample, `microphone` the headset's microphone with its time in the Mac's sound, and `guess` the
+/// Mac sound's time at the picture's start from the times of the start.
+fn final_sound(mac: &[i16], heard: Option<&(f64, Vec<i16>)>, microphone: Option<&(Vec<i16>, f64)>, guess: Option<f64>, frames: usize) -> (Vec<i16>, Value) {
+    let mac_level = recording_align::level(mac, 2);
+    let heard_level = heard.map(|(_, stereo)| recording_align::level(stereo, 2));
+    let has = |level: &Value| level["sound_s"].as_u64().unwrap_or(0) > 0;
+    let heard_has = heard_level.as_ref().is_some_and(has);
+    let alignment = heard.and_then(|(start, stereo)| recording_align::align(&recording_align::mono(stereo), *start, &recording_align::mono(mac)));
+    let mut mixed = mac.to_vec();
+    if let Some((voice, at)) = microphone {
+        mix(&mut mixed, voice, (at * RATE).round() as i64);
+    }
+    let mut sound = json!({"mac": mac_level, "headset": heard_level, "guess_s": guess});
+    let use_headset = match &alignment {
+        Some(_) => None,
+        None if heard_has && !has(&mac_level) => Some("the Mac's sound was silent while the headset heard sound"),
+        None if heard_has => Some("the Mac's sound and the headset's did not match"),
+        None => None,
+    };
+    let stereo = match (use_headset, heard) {
+        (Some(why), Some(heard)) => {
+            sound["source"] = json!("headset");
+            sound["why"] = json!(why);
+            let mut stereo = picture_timed(heard, frames);
+            // The microphone has the Mac's time; the times of the start put it in the picture's
+            if let (Some((voice, at)), Some(guess)) = (microphone, guess) {
+                mix(&mut stereo, voice, ((at - guess) * RATE).round() as i64);
+            }
+            stereo
+        }
+        _ => {
+            let placement = match &alignment {
+                Some(Alignment { offset_s, rate, windows, tried, matched, spread_ms }) => {
+                    sound["found_by"] = json!({"windows": windows, "tried": tried, "matched": matched, "spread_ms": spread_ms});
+                    sound["drift_ppm"] = json!((rate * 1e6 * 10.0).round() / 10.0);
+                    (*offset_s, *rate)
+                }
+                None => {
+                    let why = match heard {
+                        None => "the start's times: the headset's file has no sound",
+                        Some(_) => "the start's times: the headset heard no sound to match",
+                    };
+                    sound["found_by"] = json!(why);
+                    (guess.unwrap_or(0.0), 0.0)
+                }
+            };
+            sound["source"] = json!("mac");
+            sound["offset_s"] = json!(placement.0);
+            let (mut stereo, covered) = recording_align::place(&mixed, placement, frames);
+            // Where the Mac's sound ends early, as after a crash of the app, the headset's track fills in
+            if let Some(heard) = heard {
+                let filler = picture_timed(heard, frames);
+                let mut filled = 0;
+                for (frame, _) in covered.iter().enumerate().filter(|(_, covered)| !**covered) {
+                    stereo[frame * 2..frame * 2 + 2].copy_from_slice(&filler[frame * 2..frame * 2 + 2]);
+                    filled += 1;
+                }
+                sound["from_headset_s"] = json!((f64::from(filled) / RATE * 10.0).round() / 10.0);
+            }
+            stereo
+        }
+    };
+    (stereo, sound)
+}
+
+/// The headset's own track in the picture's time: `frames` stereo frames from the picture's start.
+fn picture_timed((start, stereo): &(f64, Vec<i16>), frames: usize) -> Vec<i16> {
+    let first = (start * RATE).round() as i64;
+    let mut out = vec![0_i16; frames * 2];
+    for frame in 0..frames {
+        let Some(at) = usize::try_from(frame as i64 - first).ok().filter(|at| at * 2 + 1 < stereo.len()) else { continue };
+        out[frame * 2] = stereo[at * 2];
+        out[frame * 2 + 1] = stereo[at * 2 + 1];
+    }
+    out
+}
+
+/// Opens the final file again and checks it against the headset's picture of `picture_s` seconds:
+/// its picture has the same length, and it has sound when the recording had sound.
+fn check(out: &Path, picture_s: f64, with_sound: bool) -> Result<bool, String> {
+    let made = asset(out);
+    let video = track(&made, kind(unsafe { AVMediaTypeVideo }))?.ok_or("the final file has no picture")?;
+    let length = seconds(unsafe { video.timeRange() }.duration);
+    if (length - picture_s).abs() > CHECK_SLACK {
+        return Err(format!("the final file's picture lasts {length:.3} s, the headset's {picture_s:.3} s"));
+    }
+    if with_sound && track(&made, kind(unsafe { AVMediaTypeAudio }))?.is_none() {
+        return Err("the final file has no sound".into());
+    }
+    Ok(true)
 }
 
 fn kind(media: Option<&'static AVMediaType>) -> &'static AVMediaType {
@@ -127,7 +229,7 @@ fn insert(composition: &AVMutableComposition, media: Option<&'static AVMediaType
     })
 }
 
-/// The sound of `track` as one channel of 16-bit samples at 48 kHz, with the time of its first
+/// The sound of `track` as interleaved stereo of 16-bit samples at 48 kHz, with the time of its first
 /// sample in the file, in s.
 fn read_pcm(asset: &AVAsset, track: &AVAssetTrack) -> Result<(f64, Vec<i16>), String> {
     let reader = unsafe { AVAssetReader::assetReaderWithAsset_error(asset) }.map_err(|e| format!("the headset's sound: {}", e.localizedDescription()))?;
@@ -135,7 +237,7 @@ fn read_pcm(asset: &AVAsset, track: &AVAssetTrack) -> Result<(f64, Vec<i16>), St
     let values: [Retained<AnyObject>; 7] = [
         number(NSNumber::new_u32(u32::from_be_bytes(*b"lpcm"))),
         number(NSNumber::new_f64(RATE)),
-        number(NSNumber::new_u32(1)),
+        number(NSNumber::new_u32(2)),
         number(NSNumber::new_u32(16)),
         number(NSNumber::new_bool(false)),
         number(NSNumber::new_bool(false)),

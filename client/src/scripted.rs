@@ -89,6 +89,12 @@
 //!   value that holds and drags it to the next value. `walk_wait_ms` sets the wait before the first
 //!   press (500 by default). The log names each aim ("scripted ui3d:"),
 //!   and the host's app saves each change in its `app.json`.
+//! - `scripted_pointer=record_row` presses the hand menu's row "Record what I see" on the menu in front
+//!   of the user (launch it with `hand_menu=open`, `interface=flat` and `default_places`), as
+//!   `press` does. The left controller is missing. Once the host's menu came, the right controller
+//!   presses the row's Record, points away for `record_ms` (6000 by default) while the recording
+//!   runs, then presses the row's Stop, where the taller row of a running recording puts it. The log
+//!   names the aims ("scripted record row:").
 //! - `scripted_pointer=away` holds the left controller still, low and to the left out of view, and
 //!   the right one is missing: a capture shows no controller, and no ball for a look.
 //! - `scripted_pointer=hologram` changes every control of the Stream page as a hologram (#111,
@@ -186,6 +192,10 @@ pub fn install_once() {
         }
         if args.string("scripted_pointer") == Some("gem") {
             gem_walk(args.int("gem_wait_ms").and_then(|ms| u64::try_from(ms).ok()).unwrap_or(12_000));
+            return;
+        }
+        if args.string("scripted_pointer") == Some("record_row") {
+            walk_after_menu("record row", missing(Hand::Left), record_row_script);
             return;
         }
         if args.string("scripted_pointer") == Some("menu") {
@@ -885,6 +895,39 @@ fn ui3d_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
             .holding(Duration::from_millis(300), pull)
             .holding(Duration::from_millis(800), rest);
     }
+    Some(right.moving_to(Duration::from_millis(1), (at, away_from(at)), rest))
+}
+
+/// The walk of `scripted_pointer=record_row` (see the file's notes).
+fn record_row_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
+    use crate::{console::Interface, displays::displays, menu_place::MenuPlace, panel_layout::Layout};
+    use cranvr_proto::message::Recording;
+    let rest = ScriptedButtons::default();
+    let pull = ScriptedButtons { trigger: 1.0, ..rest };
+    let pages = menu.listed();
+    let layout = Layout::default();
+    let displays_view = displays().menu_view();
+    // The row's button in the menu of the Mac's state `state`: the row is taller while a recording
+    // runs, and the menu with it
+    let button = |state: &Recording| {
+        let input = menu_model::MenuInput { layout: &layout, console_open: false, displays: &displays_view, wishes: Default::default(), place: MenuPlace::View, adding: false, pages: &pages, costs: true, recording: Some(state) };
+        let rows = menu_model::rows(&input);
+        let height = menu_model::height(&rows, Interface::Flat);
+        let [x, y] = menu_model::button_center(&rows, menu_model::MenuAction::ToggleRecording, Interface::Flat)?;
+        Some((on_view_menu(height, x, y), height))
+    };
+    let (record, idle_height) = button(&Recording::default())?;
+    let (stop, running_height) = button(&Recording { running: true, ..Default::default() })?;
+    let at = PRESS_AT;
+    let length = launch_args().int("record_ms").and_then(|ms| u64::try_from(ms).ok()).unwrap_or(6000);
+    let press = |script: ScriptedController, target: [f32; 3]| {
+        script.moving_to(Duration::from_millis(1), (at, target), rest).holding(Duration::from_millis(1200), rest).holding(Duration::from_millis(300), pull).holding(Duration::from_millis(500), rest)
+    };
+    log::info!("scripted record row: the menu in view is {idle_height:.0} dp tall with the row's Record at {record:?}, {running_height:.0} dp with its Stop at {stop:?}, {length} ms apart");
+    let mut right = ScriptedController::new(Hand::Right, at, away_from(at)).holding(Duration::from_millis(500), rest);
+    right = press(right, record);
+    right = right.moving_to(Duration::from_millis(1), (at, away_from(at)), rest).holding(Duration::from_millis(length), rest);
+    right = press(right, stop);
     Some(right.moving_to(Duration::from_millis(1), (at, away_from(at)), rest))
 }
 

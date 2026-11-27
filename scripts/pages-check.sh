@@ -55,7 +55,7 @@ cp ${home}/app.json ${work}/app.before.json
 rm -f ${work}/input
 mkfifo ${work}/input
 exec 3<>${work}/input
-CRANVR_HOME=${home} CRANVR_NATIVE_PORT=${port} CRANVR_TEST_TRUST_ALL=1 CRANVR_HOST_BIN=${root}/target/release/cranvr-host \
+CRANVR_HOME=${home} CRANVR_NATIVE_PORT=${port} CRANVR_TEST_TRUST_ALL=1 CRANVR_TEST_LOOPBACK=1 CRANVR_HOST_BIN=${root}/target/release/cranvr-host \
     ${root}/target/release/cranvr --headless < ${work}/input > ${work}/app.log 2>&1 &
 app=$!
 ${adb_cmd} logcat -c

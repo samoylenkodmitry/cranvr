@@ -69,7 +69,7 @@ wait_log() {
 lan=$(ipconfig getifaddr en0 || ipconfig getifaddr en1)
 forget=127.0.0.1:${port}${lan:+,${lan}:${port}}
 print "cut starts $(date +%T)"
-CRANVR_HOME=${home} CRANVR_NATIVE_PORT=${port} CRANVR_TEST_TRUST_ALL=1 CRANVR_HOST_BIN=${root}/target/release/cranvr-host CRANVR_RECORDINGS=${records} \
+CRANVR_HOME=${home} CRANVR_NATIVE_PORT=${port} CRANVR_TEST_TRUST_ALL=1 CRANVR_TEST_LOOPBACK=1 CRANVR_HOST_BIN=${root}/target/release/cranvr-host CRANVR_RECORDINGS=${records} \
     ${root}/target/release/cranvr --headless < /dev/null > ${work}/app.log 2>&1 &
 app=$!
 sleep 2

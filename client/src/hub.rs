@@ -826,6 +826,15 @@ impl Hub {
         (current != 0 && slot.link == current).then(|| slot.state.clone())
     }
 
+    /// Whether the Mac's last state said that a recording ran when the link that sent it ended. The
+    /// headset's own recorder records on without the Mac, and the Mac saves the recording once a link
+    /// is back.
+    pub fn recording_lost(&self) -> bool {
+        let current = self.current.load(Ordering::Acquire);
+        let slot = self.recording.lock().unwrap();
+        slot.state.running && slot.link != 0 && slot.link != current
+    }
+
     /// Asks the Mac to start a recording of what the headset shows, or to stop the one that runs.
     pub fn toggle_recording(&self) {
         self.send_request(&cranvr_common::menu::Request::Run { id: "recording.toggle".into(), subject: None });

@@ -32,6 +32,7 @@ mod status;
 mod send_queue;
 mod test_bitrate;
 mod test_input;
+mod test_sound;
 mod tracking;
 mod virtual_display;
 mod wav;
@@ -129,7 +130,7 @@ impl Default for Views {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: cranvr-host [--native-port PORT] [--fps 72|80|90|120, default 120] [--eye-width PIXELS] [--mbps N] [--trust-all] [--no-cable] [--discovery-port N] [--no-display-lock] [--tcp] [--foveation off|low|medium|high] [--game-scale F] [--strict-rate-control] [--no-game-audio] [--no-microphone] [--no-hand-controllers] [--desktop] [--desktop-fps N] [--virtual-display WxH] [--vr-main-display] [--pointer-pitch DEG] [--screen-in-view] [--no-desktop-layer] [--config-dir DIR] [--status]\n\
+        "usage: cranvr-host [--native-port PORT] [--fps 72|80|90|120, default 120] [--eye-width PIXELS] [--mbps N] [--trust-all] [--no-cable] [--discovery-port N] [--loopback] [--no-display-lock] [--tcp] [--foveation off|low|medium|high] [--game-scale F] [--strict-rate-control] [--no-game-audio] [--no-microphone] [--no-hand-controllers] [--desktop] [--desktop-fps N] [--virtual-display WxH] [--vr-main-display] [--pointer-pitch DEG] [--screen-in-view] [--no-desktop-layer] [--config-dir DIR] [--status]\n\
          \n  --native-port N   the TCP port to listen on (default 9950)\
          \n  --trust-all       accept any client on the network without a pairing (for tests)\
          \n  A headset that the host does not know waits for the user: the cranvr app on this Mac\
@@ -142,6 +143,9 @@ fn usage() -> ! {
          \n                    takes `cable on` and `cable off` on its input.\
          \n  --discovery-port N  the UDP port that answers the headsets' search for this Mac\
          \n                    (default 9950; 0 turns it off)\
+         \n  --loopback        listen on 127.0.0.1 alone, with no USB network listener and no\
+         \n                    discovery: a test host that `adb reverse` reaches, which never asks\
+         \n                    macOS for Local Network access\
          \n  --no-display-lock render at the arrival of each pose, not at a time that follows the\
          \n                    headset's display (for comparison)\
          \n  --tcp             send the media over TCP to every headset instead of UDP\
@@ -194,6 +198,7 @@ fn default_options() -> Options {
         eye_width_given: false,
         mbps: 100,
         trust_all: false,
+        loopback: false,
         cable: true,
         discovery_port: Some(cranvr_proto::discovery::DEFAULT_PORT),
         display_lock: true,
@@ -244,6 +249,7 @@ fn parse_args() -> (Options, DesktopOptions, PathBuf) {
             "--eye-width" => options.eye_width = value().parse().unwrap_or_else(|_| usage()),
             "--mbps" => options.mbps = value().parse().unwrap_or_else(|_| usage()),
             "--trust-all" => options.trust_all = true,
+            "--loopback" => options.loopback = true,
             "--no-cable" => options.cable = false,
             "--discovery-port" => {
                 // 0 turns discovery off
@@ -299,6 +305,15 @@ fn start_game_audio() {
     thread::Builder::new()
         .name("game-audio".into())
         .spawn(|| {
+            // A test's made-up sound needs no permission and no tap
+            if test_sound::configured().is_some() {
+                info!("Game audio: the test sound of CRANVR_TEST_SOUND plays in place of the tap");
+                status::emit(json!({"type": "audio", "ok": true}));
+                if let Err(e) = test_sound::run(headset::native::audio::send, &std::sync::atomic::AtomicBool::new(false)) {
+                    warn!("Game audio: {e}");
+                }
+                return;
+            }
             let mut told = None;
             loop {
                 let access = system_audio::access();
@@ -377,7 +392,9 @@ fn native_config(
         identity: pairing::host_identity(config_dir),
         pairings: Arc::new(pairing::Pairings::load(config_dir)),
         name: pairing::mac_name(),
-        discovery_port: options.discovery_port,
+        // A loopback host answers no search on the network
+        discovery_port: options.discovery_port.filter(|_| !options.loopback),
+        loopback: options.loopback,
         approval_wait: cranvr_proto::message::APPROVAL_WAIT,
         approve_loopback: false,
         trust_all: options.trust_all,

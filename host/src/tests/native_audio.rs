@@ -26,6 +26,7 @@ fn the_sound_reaches_the_client_in_datagrams_of_five_milliseconds() {
         approval_wait: Duration::from_secs(30),
         approve_loopback: false,
         trust_all: false,
+        loopback: false,
         cable: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         display_lock: false,
         desktop: Default::default(),

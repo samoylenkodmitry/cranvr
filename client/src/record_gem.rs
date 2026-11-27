@@ -11,7 +11,9 @@
 //!   shows the reason beside the gem for 3 s.
 //!
 //! A line beside the gem also shows the Mac's notes for 3 s, such as "Saved: NAME", and "Starting..."
-//! or "Stopping..." after a press until the Mac's state changes. The gem shows in games too, as the
+//! or "Stopping..." after a press until the Mac's state changes. A link that ends while a recording
+//! runs leaves the headset's recorder recording: the gem stays red, and a press says that the Mac
+//! saves the recording once the link is back. The gem shows in games too, as the
 //! ball does, and hides while neither the left controller nor the left hand is tracked. A hidden gem
 //! composes nothing. The hand menu's row "Record what I see" and the Mac window's Record button
 //! share the state.
@@ -44,6 +46,9 @@ const NOTE_TIME: Duration = Duration::from_secs(3);
 const POLL: Duration = Duration::from_millis(250);
 /// The line beside the gem, in dp
 const NOTE_SIZE: [f32; 2] = [300.0, 34.0];
+
+/// What a press says while the link that ran a recording is gone
+pub const LINK_LOST: &str = "No link to the Mac: the headset records on, and the Mac saves the recording when the link is back";
 
 const GREEN: Color = Color(0.25, 1.0, 0.42, 1.0);
 const RED: Color = Color(1.0, 0.16, 0.12, 1.0);
@@ -78,13 +83,19 @@ pub fn look(recording: Option<&Recording>, hovered: bool, glass: Color) -> Look 
     }
 }
 
-/// Why a press cannot start or stop a recording now, or `None` while it can.
+/// Why a press cannot start or stop a recording now, or `None` while it can. The Mac sends no reason
+/// with a recording that runs: such a reason comes from `state`, a recording whose link ended.
 pub fn blocked(recording: Option<&Recording>) -> Option<String> {
     match recording {
         None => Some("Connect to the Mac to record".into()),
-        Some(state) if state.running => None,
         Some(state) => state.blocked.clone(),
     }
+}
+
+/// The state that the gem shows: the Mac's, or a recording that ran when its link ended, which the
+/// headset's recorder goes on with.
+pub fn gem_state() -> Option<Recording> {
+    hub().recording().or_else(|| hub().recording_lost().then(|| Recording { running: true, blocked: Some(LINK_LOST.into()), ..Default::default() }))
 }
 
 /// The gem and its line, on the left controller or the left hand while one is tracked.
@@ -107,7 +118,7 @@ pub fn RecordGem(state: HandState, theme: Theme) {
         None
     };
     let Some(anchor) = anchor else { return };
-    let recording = rememberMutableStateOf(|| hub().recording());
+    let recording = rememberMutableStateOf(gem_state);
     LaunchedEffect((), async move |_| {
         let mut seen = hub().recording_changes();
         loop {
@@ -115,7 +126,7 @@ pub fn RecordGem(state: HandState, theme: Theme) {
             let now = hub().recording_changes();
             if now != seen {
                 seen = now;
-                recording.set(hub().recording());
+                recording.set(gem_state());
             }
         }
     });

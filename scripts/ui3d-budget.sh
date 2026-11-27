@@ -42,7 +42,7 @@ export CLIENT_LINK_WAIT=${CLIENT_LINK_WAIT:-40}
 home=${work}/host
 mkdir -p ${home}
 print '{"fps": 120, "desktop": false, "game_audio": false, "hand_controllers": false, "microphone": "Headset", "connection": "Automatic", "launch": {}}' > ${home}/app.json
-CRANVR_HOME=${home} CRANVR_NATIVE_PORT=${port} CRANVR_TEST_TRUST_ALL=1 CRANVR_HOST_BIN=${root}/target/release/cranvr-host \
+CRANVR_HOME=${home} CRANVR_NATIVE_PORT=${port} CRANVR_TEST_TRUST_ALL=1 CRANVR_TEST_LOOPBACK=1 CRANVR_HOST_BIN=${root}/target/release/cranvr-host \
     ${root}/target/release/cranvr --headless < /dev/null > ${work}/app.log 2>&1 &
 host=$!
 host_log=${home}/host.log
