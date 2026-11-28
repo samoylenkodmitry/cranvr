@@ -603,18 +603,27 @@ pub fn run_program(path: &Path) -> Result<(), String> {
 /// Makes Steam run with the cloud files of the game `app_id` on this Mac, before the game starts. Steam downloads
 /// a game's cloud files only at its own start (steam_cloud.rs). So a Steam that runs starts again when the game's
 /// cache lists files that are not in sync. After a start of Steam the game waits for Steam's look at its files.
-/// A game whose files do not come does not start: the error and the game's row say why.
+/// A game whose files do not come does not start: the error and the game's row say why. A conflict needs the
+/// user's choice in Steam, and a Steam in offline mode looks at no file, so neither waits for a new start of Steam.
 fn steam_for(app_id: &str) -> Result<(), String> {
     let steam = steam_dir();
-    let account = steam_cloud::account(&steam);
-    let cache = account.and_then(|account| steam_cloud::Cache::of(&steam, account, app_id));
+    let login = steam_cloud::login(&steam);
+    let cache = login.and_then(|login| steam_cloud::Cache::of(&steam, login.account, app_id));
     let refuse = |refusal: steam_cloud::Refusal| {
         let words = refusal.words();
         steam_cloud::set_note(app_id, Some(words.clone()));
         words
     };
     steam_cloud::set_note(app_id, None);
-    let waiting = cache.map_or(0, |cache| cache.waiting);
+    let files = cache.map(|cache| cache.files).unwrap_or_default();
+    if files.conflict > 0 {
+        return Err(refuse(steam_cloud::Refusal::Conflict { files: files.conflict }));
+    }
+    let waiting = files.waiting();
+    let offline = login.is_some_and(|login| login.offline);
+    if offline && waiting > 0 {
+        return Err(refuse(steam_cloud::Refusal::Offline { waiting }));
+    }
     if running() {
         if waiting == 0 {
             return Ok(());
@@ -627,7 +636,8 @@ fn steam_for(app_id: &str) -> Result<(), String> {
             return Err(refuse(steam_cloud::Refusal::SteamStays));
         }
     }
-    let look = account.map(|account| steam_cloud::Look::before_start(&steam, account, app_id));
+    // Steam in offline mode writes no line about a game's files: the game starts with the files of Steam's last look
+    let look = login.filter(|login| !login.offline).map(|login| steam_cloud::Look::before_start(&steam, login.account, app_id));
     if waiting > 0 {
         steam_cloud::set_note(app_id, Some(steam_cloud::waiting_note(waiting)));
     }
@@ -641,7 +651,9 @@ fn steam_for(app_id: &str) -> Result<(), String> {
     if let Some(look) = look {
         look.wait(steam_cloud::SYNC_TIME, running).map_err(refuse)?;
     }
-    if cache.is_some() {
+    if offline && cache.is_some() {
+        backend::log(format!("Steam runs in offline mode: app {app_id} starts with the cloud files of Steam's last look."));
+    } else if cache.is_some() {
         backend::log(format!("The cloud files of app {app_id} are on this Mac, {:.1} s after cranvr started Steam.", since.elapsed().as_secs_f32()));
     }
     steam_cloud::set_note(app_id, None);
