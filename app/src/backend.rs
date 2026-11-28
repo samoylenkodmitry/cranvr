@@ -480,10 +480,11 @@ pub struct Model {
     /// The virtual display is the main display now: a headset streams
     pub vr_main: bool,
     pub stats: Option<Stats>,
-    /// The last stats line of the host that showed a live stream: frames went out, or the
-    /// headset's app paused the stream. Before the first one, the headset's connection. The host
-    /// sends a stats line every 5 s while frames go out or the stream pauses. A line that says that
-    /// the frames stopped does not count.
+    /// The last stats line of the host that showed a live stream: frames went out, the headset's
+    /// app paused the stream, or the stream waits for the headset's poses (a headset on a desk in a
+    /// dark room, issue #234). Before the first one, the headset's connection. The host sends a
+    /// stats line every 5 s while frames go out or the stream pauses. A line that says that the
+    /// frames stopped for another reason does not count.
     pub stats_at: Option<Instant>,
     /// The host's state in native mode, once it has said it
     pub native: Option<Native>,
@@ -666,7 +667,9 @@ impl Model {
                 self.notice = Some((notice, Instant::now() + crate::black_eye::NOTICE_TIME));
             }
             Some("stats") => {
-                let live = v["fps"].as_f64().unwrap_or(0.0) > 0.0 || v["paused"].as_bool().unwrap_or(false);
+                let live = v["fps"].as_f64().unwrap_or(0.0) > 0.0
+                    || v["paused"].as_bool().unwrap_or(false)
+                    || v["waits_for_pose"].as_bool().unwrap_or(false);
                 if live {
                     self.stats_at = Some(Instant::now());
                 }
@@ -1411,6 +1414,21 @@ mod tests {
         model.game = None;
         model.apply_status(&serde_json::json!({"type": "headset", "connected": false}));
         assert!(!model.stream_stalled(stats_at + Duration::from_secs(60)), "no headset");
+    }
+
+    #[test]
+    fn a_stream_that_waits_for_the_headsets_poses_does_not_stall() {
+        // A headset on a desk in a dark room: linked, focused and without a head pose (issue #234)
+        let mut model = Model { headset: Some(Headset::default()), ..Default::default() };
+        let now = Instant::now();
+        model.apply_status(&serde_json::json!({"type": "stats", "fps": 0.0, "stopped": true, "waits_for_pose": true}));
+        let waits_at = model.stats_at.expect("a stream that waits for poses is alive");
+        assert!(waits_at >= now);
+        assert!(!model.stream_stalled(waits_at + Duration::from_secs(14)));
+        // Frames that stop while poses come still stall the stream
+        model.apply_status(&serde_json::json!({"type": "stats", "fps": 0.0, "stopped": true, "waits_for_pose": false}));
+        assert_eq!(model.stats_at, Some(waits_at));
+        assert!(model.stream_stalled(waits_at + Duration::from_secs(16)));
     }
 
     fn host_options(settings: &Settings) -> Vec<String> {
