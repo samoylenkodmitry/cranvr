@@ -504,7 +504,7 @@ unsafe fn parameter_sets(format: CMFormatDescriptionRef) -> Option<Vec<u8>> {
 /// Scales pictures into a buffer of another size (VTPixelTransferSession). A smaller picture averages
 /// the pixels that each of its pixels covers. ScreenCaptureKit's own scaling blurs small text far more:
 /// in `scripts/sharpness/mac-check.sh` text of 12 points kept 23 % of the gaps between its letters at
-/// 2560 pixels across from a display of 3840 pixels, and 77 to 80 % with this scaling.
+/// 2560 pixels across from a display of 3840 pixels. With this scaling it kept 77 to 80 %.
 pub struct Scaler(*mut c_void);
 
 unsafe impl Send for Scaler {}

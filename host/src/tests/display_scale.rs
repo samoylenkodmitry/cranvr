@@ -3,7 +3,7 @@
 //! The host captures a display at its own pixels and the encoder's scaler shrinks the picture to the
 //! width that the client asks for (`Conversion`). The test sends a capture of 3840 x 2160 with lines
 //! two pixels wide through a stream of 2560 x 1440 and decodes it. The picture must come out whole
-//! at the stream's size, and the lines must keep their contrast. ScreenCaptureKit's own scaling kept
+//! at the stream's size. The lines must keep their contrast. ScreenCaptureKit's own scaling kept
 //! 30 % of it in `scripts/sharpness/mac-check.sh`, this scaling 59 %.
 
 use super::*;
@@ -12,7 +12,7 @@ use cranvr_vt::{DecodedFrame, Decoder};
 const SOURCE: [u32; 2] = [3840, 2160];
 const STREAM: [u32; 2] = [2560, 1440];
 
-/// The capture: mid grey, and lines two pixels wide across its left half
+/// The capture: lines two pixels wide across its left half, mid grey on its right half
 fn capture() -> PixelBuffer {
     let config = EncoderConfig { width: SOURCE[0], height: SOURCE[1], fps: 30.0, bitrate_bps: 20_000_000, full_range: true, strict_rate: false, key_every: None, max_qp: None, real_time: false };
     let (sender, _frames) = mpsc::channel();

@@ -1,9 +1,9 @@
 #!/bin/zsh
 # Measures the sharpness of a display's panel in the headset (issue #222). A test host on PORT makes a
-# virtual display of 1920 x 1080 points (3840 x 2160 pixels) that only the stream shows, and show.swift
+# virtual display of 1920 x 1080 points (3840 x 2160 pixels) that only the stream shows. show.swift
 # puts the test pattern on it (pattern.swift). For each CASE the client starts in its virtual room
-# (`room=scene`) with the display's panel at a known width and distance (`display_place`), and the
-# script takes one screen capture. measure.swift reads the pattern in the left eye and prints the
+# (`room=scene`) with the display's panel at a known width and distance (`display_place`). The script
+# takes one screen capture. measure.swift reads the pattern in the left eye and prints the
 # contrast of the lines and the smallest text whose letters stay apart. capture-check.py then keeps the
 # capture in CAPTURES or deletes it.
 #
@@ -13,7 +13,7 @@
 #
 # Usage: scripts/sharpness/headset-check.sh SERIAL WORKDIR [CAPTURES] CASE...
 #   CAPTURES  a folder for the captures that pass capture-check.py, or `-` to delete every capture
-#   CASE      WIDTH,DISTANCE in meters, and `:PIXELS` for the widest picture to ask for, such as
+#   CASE      WIDTH,DISTANCE in meters, then `:PIXELS` for the widest picture to ask for, such as
 #             1.6,1.5 (the panel's default size and distance) or 3.0,1.5:2560
 # Environment: CRANVR_SHARPNESS_PORT (9961 by default). `cargo build --release -p cranvr-host` must
 # have built the host. The client must be a build of scripts/build-client.sh from this tree. Hold the
