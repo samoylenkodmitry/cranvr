@@ -77,7 +77,10 @@ pub use wire::{Error, Nanos};
 ///
 /// Version 17 adds [`message::HostMsg::Recording`]: the state of the Mac's recording of what the
 /// headset shows, for the gem on the left hand and the hand menu.
-pub const PROTOCOL_VERSION: u16 = 17;
+///
+/// Version 18 adds [`message::HostMsg::GameScreen`]: a game's loading screen and its message to the
+/// user, which the headset shows as text.
+pub const PROTOCOL_VERSION: u16 = 18;
 
 /// The largest datagram, in bytes, sealed: the counter and the tag are in it. A media packet and
 /// any datagram message fit in it. A typical path MTU of 1500 bytes minus the IP and UDP headers

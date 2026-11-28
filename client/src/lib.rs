@@ -24,6 +24,7 @@ mod display_wish;
 mod displays;
 mod discovery;
 mod focus;
+mod game_screen;
 mod gaze;
 mod hand_menu;
 mod hands;

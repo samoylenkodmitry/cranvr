@@ -282,6 +282,16 @@ applies these patches and builds both parts.
   texture must be done within 3 seconds.
 - With stock DXMT 0.80 and cranvr's patches up to 0021 the second process read zeros of rgba16f in the second cycle.
 
+`0023-mailbox-messages.patch`
+
+- The runtime offers `XR_CRANVR_mailbox`, cranvr's extension, with the graphics extension. Its function
+  `xrSendMailboxMessageCRANVR(instance, address, message)` takes a message that a game sent through OpenVR's mailbox
+  (`IVRMailbox`), which OpenComposite hands over (its patch 0017). The runtime sends it to cranvr-host unchanged as
+  control message 25 (`MAILBOX_MESSAGE`: the address and the message, each with a 16-bit length). cranvr-host makes
+  the game's loading screen from it.
+- A message is dropped with a note when no host is connected or when it does not fit into
+  `BASALT_CONTROL_MAX_MESSAGE_LENGTH` (4096 bytes with its type). The longest message of Half-Life: Alyx has 412 bytes.
+
 ## patches/dxmt
 
 `0005-public-atomic-for-new-metal-compiler.patch`: DXMT 0.80 calls a private Metal builtin

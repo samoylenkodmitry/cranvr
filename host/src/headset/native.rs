@@ -40,7 +40,7 @@ use cranvr_proto::{
     link::{HostLink, HostListener, HostSide, Incoming, MediaMode, Pending},
     media::{FrameMeta, DEFAULT_SHARD_LEN},
     message::{
-        buttons, display_index, negotiate, ClientDatagram, ClientMsg, FrameTiming, Focus, HostDatagram, HostMsg, HostWishes, Input,
+        buttons, display_index, negotiate, ClientDatagram, ClientMsg, FrameTiming, Focus, GameScreen, HostDatagram, HostMsg, HostWishes, Input,
         InputHold, LossReport, Ping, Pong, Recording, RejectReason, Tracking, Views as ProtoViews, UPDATE_HEADSET, UPDATE_MAC,
     },
     motion::extrapolate,
@@ -134,6 +134,8 @@ struct Shared {
     wish: Mutex<Features>,
     /// The state of the app's recording of what the headset shows. A new session gets it at once.
     recording: Mutex<Recording>,
+    /// What the game shows between its scenes. A new session gets it at once while it shows.
+    game_screen: Mutex<Option<GameScreen>>,
 }
 
 /// The most threads that hold a client for the user's answer at once. A device that opens many
@@ -277,7 +279,7 @@ pub fn start(config: Config) -> std::io::Result<(Arc<dyn Headset>, Box<dyn Event
     }
     announce(&config);
     let (events, receiver) = mpsc::channel();
-    let shared = Arc::new(Shared { events, session: Mutex::new(None), decoder_config: Mutex::new(None), starting: Mutex::new(()), asking: Asking::default(), handshakes: Handshakes::default(), wish: Mutex::new(Features::NONE), recording: Mutex::new(Recording::default()) });
+    let shared = Arc::new(Shared { events, session: Mutex::new(None), decoder_config: Mutex::new(None), starting: Mutex::new(()), asking: Asking::default(), handshakes: Handshakes::default(), wish: Mutex::new(Features::NONE), recording: Mutex::new(Recording::default()), game_screen: Mutex::new(None) });
     {
         let shared = Arc::clone(&shared);
         let config = Arc::new(config);
@@ -325,8 +327,9 @@ fn start_discovery(port: u16, config: &Config) {
 /// to a headset's request, with the key that the status line shows. `cable on` or `cable off` is the
 /// user's Connection choice: off for Wi-Fi. `menu open` opens the hand menu of the connected headset.
 /// `headset JSON` is a press of the app on the headset's own page (`HostMsg::HeadsetRequest`).
-/// `recording JSON` is the state of the app's recording (`HostMsg::Recording`). A person who runs the
-/// host by hand may type them.
+/// `recording JSON` is the state of the app's recording (`HostMsg::Recording`). `screen JSON` shows a
+/// game's screen in the headset (`HostMsg::GameScreen`, `null` hides it), for a check of the headset's
+/// panel with no game. A person who runs the host by hand may type them.
 pub fn read_input(pairings: Arc<Pairings>, cable: Arc<AtomicBool>, headset: Arc<dyn Headset>) {
     thread::Builder::new()
         .name("native-input".into())
@@ -354,6 +357,10 @@ pub fn read_input(pairings: Arc<Pairings>, cable: Arc<AtomicBool>, headset: Arc<
                         info!("Native protocol: the recording runs: {}, blocked: {:?}", state.running, state.blocked);
                         headset.set_recording(state);
                     }
+                    Some(Command::Screen(screen)) => {
+                        info!("Native protocol: the input shows a game's screen: {}", crate::game_screen::describe(screen.as_ref()));
+                        headset.set_game_screen(screen);
+                    }
                     Some(Command::Headset(request)) => {
                         if headset.send_headset_request(&request) {
                             info!("Native protocol: the app asks the headset for {request}");
@@ -368,7 +375,7 @@ pub fn read_input(pairings: Arc<Pairings>, cable: Arc<AtomicBool>, headset: Arc<
 }
 
 /// A line of the host's input.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 enum Command {
     /// The user's answer to the headset with this key
     Answer { allow: bool, key: [u8; KEY_LEN] },
@@ -380,13 +387,18 @@ enum Command {
     Headset(String),
     /// The state of the app's recording of what the headset shows
     Recording(Recording),
+    /// A game's screen to show in the headset, or `None` to hide it
+    Screen(Option<GameScreen>),
 }
 
 /// `allow KEY`, `deny KEY` (the key is 64 hex digits), `cable on`, `cable off`, `menu open`,
-/// `headset JSON` or `recording JSON`.
+/// `headset JSON`, `recording JSON` or `screen JSON`.
 fn parse_command(line: &str) -> Option<Command> {
     if let Some(state) = line.strip_prefix("recording ") {
         return serde_json::from_str(state.trim()).ok().map(Command::Recording);
+    }
+    if let Some(screen) = line.strip_prefix("screen ") {
+        return serde_json::from_str(screen.trim()).ok().map(Command::Screen);
     }
     if let Some(request) = line.strip_prefix("headset ") {
         let request = request.trim();
@@ -646,6 +658,11 @@ fn run_session(shared: &Shared, session: &Arc<Session>, stream: cranvr_proto::me
     }
     let recording = shared.recording.lock().unwrap().clone();
     session.link.duplex.send_control(&HostMsg::Recording(recording)).ok();
+    // A headset that connects during a load sees the game's screen. With none it gets no message.
+    let screen = shared.game_screen.lock().unwrap().clone();
+    if screen.is_some() {
+        session.link.duplex.send_control(&HostMsg::GameScreen(screen)).ok();
+    }
     thread::scope(|scope| {
         scope.spawn(|| ping_loop(session));
         if session.link.duplex.has_udp() {
@@ -1693,6 +1710,15 @@ impl Headset for Native {
         if let Some(session) = self.shared.session() {
             if let Err(e) = session.link.duplex.send_control(&HostMsg::Recording(state)) {
                 warn!("Native protocol: the recording's state did not go out: {e}");
+            }
+        }
+    }
+
+    fn set_game_screen(&self, screen: Option<GameScreen>) {
+        *self.shared.game_screen.lock().unwrap() = screen.clone();
+        if let Some(session) = self.shared.session() {
+            if let Err(e) = session.link.duplex.send_control(&HostMsg::GameScreen(screen)) {
+                warn!("Native protocol: the game's screen did not go out: {e}");
             }
         }
     }

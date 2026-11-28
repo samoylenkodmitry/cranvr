@@ -251,6 +251,10 @@ pub trait Headset: Send + Sync {
     /// now and at each new connection.
     fn set_recording(&self, _state: cranvr_proto::message::Recording) {}
 
+    /// What the game shows between its scenes (`game_screen.rs`), or `None` while it shows nothing.
+    /// The link sends it to the headset now and at a new connection while a screen shows.
+    fn set_game_screen(&self, _screen: Option<cranvr_proto::message::GameScreen>) {}
+
     /// The tracking features that a game uses now. The link asks the headset for these, within what
     /// the headset offers, and for nothing else. It asks again at each new connection.
     fn set_tracking_wish(&self, _wish: Features) {}

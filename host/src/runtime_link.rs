@@ -22,10 +22,20 @@
 //! `TRACKING_REQUEST`. The host then asks the headset for hands and sends each hand's poses and
 //! gestures (`HAND_INTERACTION`), which it makes from the joints (see `hand_interaction.rs`).
 //!
+//! A game's mailbox messages are cranvr's extension too (runtime patch 0023, message 25). A game that
+//! speaks OpenVR tells SteamVR what its loading screen shows through OpenVR's mailbox. OpenComposite
+//! hands each message to the runtime, and the runtime sends it here unchanged. `game_screen.rs` makes
+//! the screen that the headset shows from them.
+//!
 //! The runtime finds the host through a control file: "<port> <token> <eye width> <eye height>".
 //! The launcher passes the file's Windows path to the game in the `BASALT_CONTROL` variable.
 
-use crate::{hand_interaction::HandInteraction, pose::DeviceMotion};
+use crate::{
+    game_screen::{self, Screen},
+    hand_interaction::HandInteraction,
+    pose::DeviceMotion,
+};
+use cranvr_proto::message::GameScreen;
 use cranvr_proto::tracking::{Body, Eyes, Face, Features, Joint, BODY_JOINTS, FACE_CONFIDENCES, FACE_WEIGHTS, FULL_BODY_JOINTS, HAND_JOINTS};
 use log::{info, warn};
 use cranvr_common::inputs::QUEST_TOUCH_PROFILE_ID;
@@ -37,7 +47,7 @@ use std::{
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
@@ -49,6 +59,10 @@ const TOKEN_LENGTH: usize = 32;
 const MAX_MESSAGE: u32 = 4096;
 /// The longest silence toward the runtime; it gives up after 5 seconds
 const KEEPALIVE: Duration = Duration::from_secs(1);
+/// How long a game's screen stays after its runtime's connection ended. OpenComposite ends its first
+/// session when the game submits its first frame and makes a new one at once (28 ms in a start of
+/// Half-Life: Alyx), often while the game loads. A game that ended makes no new connection.
+const SCREEN_AFTER_DISCONNECT: Duration = if cfg!(test) { Duration::from_millis(300) } else { Duration::from_secs(3) };
 /// The file next to the control file with the features that the headset offers, as words
 pub const TRACKING_FILE: &str = "tracking-features.txt";
 /// The runtime accepts per-eye sizes up to this (BASALT_CONTROL_MAX_VIEW_*; cranvr's runtime
@@ -88,6 +102,8 @@ pub(crate) mod msg {
     pub const EYE_GAZE: u16 = 23;
     /// cranvr's runtime patch 0012: the poses and gestures of a hand for XR_EXT_hand_interaction
     pub const HAND_INTERACTION: u16 = 24;
+    /// cranvr's runtime patch 0023: a game's mailbox message (runtime to host)
+    pub const MAILBOX_MESSAGE: u16 = 25;
 }
 
 /// The bit of `TRACKING_REQUEST` with which the runtime asks for the hand interaction profile
@@ -223,16 +239,23 @@ pub struct RuntimeLink {
     /// The eye size in the control file when the connected game's runtime connected: the size that
     /// the game read at its start
     game_eye: Mutex<Option<(u32, u32)>>,
+    /// What the game's mailbox messages show now
+    screen: Mutex<Screen>,
+    /// Gets each change of the game's screen
+    on_screen: Box<dyn Fn(Option<GameScreen>) + Send + Sync>,
+    /// The runtime connections that said hello so far
+    connections: AtomicU64,
 }
 
 impl RuntimeLink {
     /// Listens on 127.0.0.1 and writes the control file. Game events arrive on the returned
-    /// receiver; haptics go to `on_haptic`.
+    /// receiver; haptics go to `on_haptic` and each change of the game's screen to `on_screen`.
     pub fn start(
         control_file: &Path,
         eye_size: (u32, u32),
         fps: u32,
         on_haptic: impl Fn(Haptic) + Send + 'static,
+        on_screen: impl Fn(Option<GameScreen>) + Send + Sync + 'static,
     ) -> std::io::Result<(Arc<Self>, mpsc::Receiver<GameEvent>)> {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let port = listener.local_addr()?.port();
@@ -252,6 +275,9 @@ impl RuntimeLink {
             token: random_token()?,
             written: Mutex::new(((0, 0), 0)),
             game_eye: Mutex::new(None),
+            screen: Mutex::new(Screen::default()),
+            on_screen: Box::new(on_screen),
+            connections: AtomicU64::new(0),
         });
         link.write_control_file(eye_size, fps)?;
         // A file from an earlier run names a headset that is gone
@@ -268,6 +294,7 @@ impl RuntimeLink {
                     link.requested.store(0, Ordering::Relaxed);
                     link.hand_interaction.store(false, Ordering::Relaxed);
                     events.send(GameEvent::Disconnected).ok();
+                    link.hide_screen_unless_reconnected();
                 }
             })?;
         }
@@ -361,6 +388,7 @@ impl RuntimeLink {
         // The runtime connects when its game creates the session, close after the game read its view size
         *self.game_eye.lock().unwrap() = Some(self.written().0);
         info!("Game runtime connected: {renderer}, {}", program.as_deref().unwrap_or("program not named"));
+        self.connections.fetch_add(1, Ordering::Relaxed);
 
         *self.last_sent.lock().unwrap() = Instant::now();
         *self.writer.lock().unwrap() = Some(stream.try_clone().map_err(|e| e.to_string())?);
@@ -446,6 +474,13 @@ impl RuntimeLink {
                         info!("Game runtime: the game uses {}", if words.is_empty() { "no tracking".to_string() } else { words.join(", ") });
                     }
                 }
+                msg::MAILBOX_MESSAGE => {
+                    let length = r.u16()? as usize;
+                    let address = String::from_utf8_lossy(r.bytes(length)?).into_owned();
+                    let length = r.u16()? as usize;
+                    let text = String::from_utf8_lossy(r.bytes(length)?).into_owned();
+                    self.on_mailbox(&address, &text);
+                }
                 msg::TEARDOWN => {
                     info!("Game runtime closed the session");
                     return Ok(());
@@ -453,6 +488,41 @@ impl RuntimeLink {
                 other => warn!("Game runtime sent unknown message {other}"),
             }
         }
+    }
+
+    /// A message that the game sent to a mailbox: the screen changes as `game_screen.rs` reads it.
+    fn on_mailbox(&self, address: &str, text: &str) {
+        // The messages are JSON over several lines: the log keeps them on one
+        let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        info!("Game mailbox: {} bytes to {address}: {flat}", text.len());
+        let shown = {
+            let mut screen = self.screen.lock().unwrap();
+            screen.apply(game_screen::read(text)).then(|| screen.shown().cloned())
+        };
+        if let Some(shown) = shown {
+            info!("Game screen: {}", game_screen::describe(shown.as_ref()));
+            (self.on_screen)(shown);
+        }
+    }
+
+    /// The game's screen hides when no runtime connected again a while after the connection ended,
+    /// so a game that ended leaves nothing in the headset and a game that restarts its session keeps
+    /// its screen.
+    fn hide_screen_unless_reconnected(self: &Arc<Self>) {
+        if self.screen.lock().unwrap().shown().is_none() {
+            return;
+        }
+        let connections = self.connections.load(Ordering::Relaxed);
+        let link = Arc::clone(self);
+        let watch = move || {
+            thread::sleep(SCREEN_AFTER_DISCONNECT);
+            if link.connections.load(Ordering::Relaxed) != connections || !link.screen.lock().unwrap().clear() {
+                return;
+            }
+            info!("Game screen: nothing shows, as no game is connected");
+            (link.on_screen)(None);
+        };
+        thread::Builder::new().name("game-screen-end".into()).spawn(watch).ok();
     }
 
     // The Quest Touch profile for both hands
@@ -793,6 +863,10 @@ impl Swapchains {
 }
 
 #[cfg(test)]
+#[path = "tests/runtime_mailbox.rs"]
+mod mailbox_tests;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn a_hand_that_is_quiet_hears_no_more_stops() {
@@ -826,7 +900,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cranvr-link-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let control = dir.join("control.txt");
-        let (link, events) = RuntimeLink::start(&control, (1600, 1700), 120, |_| ()).unwrap();
+        let (link, events) = RuntimeLink::start(&control, (1600, 1700), 120, |_| (), |_| ()).unwrap();
         let text = fs::read_to_string(&control).unwrap();
         let fields: Vec<&str> = text.split_whitespace().collect();
         assert_eq!(fields.len(), 5);
@@ -919,7 +993,7 @@ mod tests {
     fn a_runtime_gets_both_poses_of_a_hand_in_one_message() {
         let dir = std::env::temp_dir().join(format!("cranvr-link-aim-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let (link, events) = RuntimeLink::start(&dir.join("control.txt"), (1600, 1700), 120, |_| ()).unwrap();
+        let (link, events) = RuntimeLink::start(&dir.join("control.txt"), (1600, 1700), 120, |_| (), |_| ()).unwrap();
         let mut runtime = connected_runtime(&link);
         assert!(matches!(events.recv_timeout(Duration::from_secs(2)).unwrap(), GameEvent::Connected { .. }));
 
@@ -954,7 +1028,7 @@ mod tests {
     fn controllers_that_come_back_after_a_reset_get_their_profiles_again() {
         let dir = std::env::temp_dir().join(format!("cranvr-link-reset-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let (link, _events) = RuntimeLink::start(&dir.join("control.txt"), (1600, 1700), 120, |_| ()).unwrap();
+        let (link, _events) = RuntimeLink::start(&dir.join("control.txt"), (1600, 1700), 120, |_| (), |_| ()).unwrap();
         let mut runtime = connected_runtime(&link);
         let motion = DeviceMotion { pose: Pose { orientation: Quat::IDENTITY, position: Vec3::new(0.2, 1.2, -0.4) }, linear_velocity: Vec3::ZERO, angular_velocity: Vec3::ZERO };
         // No pose flows, as while the user sets up the room: the keepalive resets the input
@@ -973,7 +1047,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cranvr-link-kept-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let control = dir.join("control.txt");
-        let (link, events) = RuntimeLink::start(&control, (1177, 1233), 120, |_| ()).unwrap();
+        let (link, events) = RuntimeLink::start(&control, (1177, 1233), 120, |_| (), |_| ()).unwrap();
         assert_eq!(link.written(), ((1176, 1232), 120), "the file holds even sizes");
         assert_eq!(link.game_eye(), None, "no game runs yet");
         let fields: Vec<String> = fs::read_to_string(&control).unwrap().split_whitespace().map(str::to_string).collect();
@@ -1000,7 +1074,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cranvr-link-token-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let control = dir.join("control.txt");
-        let (link, _events) = RuntimeLink::start(&control, (1600, 1700), 72, |_| ()).unwrap();
+        let (link, _events) = RuntimeLink::start(&control, (1600, 1700), 72, |_| (), |_| ()).unwrap();
         let port: u16 = fs::read_to_string(&control).unwrap().split_whitespace().next().unwrap().parse().unwrap();
         let mut runtime = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let mut hello = PROTOCOL_VERSION.to_le_bytes().to_vec();

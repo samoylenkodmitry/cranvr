@@ -72,7 +72,7 @@ struct Rig {
 fn rig(name: &str, hand_controllers: bool) -> Rig {
     let dir = std::env::temp_dir().join(format!("cranvr-tracking-test-{name}-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
-    let (link, events) = RuntimeLink::start(&dir.join("control.txt"), (1600, 1700), 120, |_| ()).unwrap();
+    let (link, events) = RuntimeLink::start(&dir.join("control.txt"), (1600, 1700), 120, |_| (), |_| ()).unwrap();
     let text = fs::read_to_string(link.control_file()).unwrap();
     let fields: Vec<&str> = text.split_whitespace().collect();
     let mut runtime = TcpStream::connect(("127.0.0.1", fields[0].parse::<u16>().unwrap())).unwrap();

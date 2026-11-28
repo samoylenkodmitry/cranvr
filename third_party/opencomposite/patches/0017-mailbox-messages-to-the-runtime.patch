@@ -1,0 +1,172 @@
+diff --git i/CMakeLists.txt w/CMakeLists.txt
+index 82c0789..d8635b7 100644
+--- i/CMakeLists.txt
++++ w/CMakeLists.txt
+@@ -440,6 +440,7 @@ add_library(OCCore STATIC
+ 
+ 	RuntimeExtensions/openxr_extension_helpers.h
+ 	RuntimeExtensions/XR_MNDX_xdev_space.h
++	RuntimeExtensions/XR_CRANVR_mailbox.h
+ 	# Ensuring vrtypes.h exists should mean the rest of our generated interfaces exists
+ 	${GENERATED_DIR}/interfaces/vrtypes.h
+ )
+diff --git i/DrvOpenXR/DrvOpenXR.cpp w/DrvOpenXR/DrvOpenXR.cpp
+index f6c7ed2..a1a55f0 100644
+--- i/DrvOpenXR/DrvOpenXR.cpp
++++ w/DrvOpenXR/DrvOpenXR.cpp
+@@ -9,6 +9,7 @@
+ #include "../OpenOVR/Misc/xr_ext.h"
+ #include "../OpenOVR/Reimpl/BaseInput.h"
+ #include "../RuntimeExtensions/XR_MNDX_xdev_space.h"
++#include "../RuntimeExtensions/XR_CRANVR_mailbox.h"
+ #include "XrBackend.h"
+ #include "XrGenericTracker.h"
+ #include "generated/static_bases.gen.h"
+@@ -228,6 +229,10 @@ IBackend* DrvOpenXR::CreateOpenXRBackend(const char* startupInfo)
+ 	if (availableExtensions.count(XR_EXT_HAND_TRACKING_EXTENSION_NAME))
+ 		extensions.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
+ 
++	// cranvr: the game's mailbox messages, such as its loading screen, go to cranvr-host through the runtime
++	if (availableExtensions.count(XR_CRANVR_MAILBOX_EXTENSION_NAME))
++		extensions.push_back(XR_CRANVR_MAILBOX_EXTENSION_NAME);
++
+ 	if (availableExtensions.count(XR_MNDX_XDEV_SPACE_EXTENSION_NAME))
+ 		extensions.push_back(XR_MNDX_XDEV_SPACE_EXTENSION_NAME);
+ 
+diff --git i/OpenOVR/Misc/xr_ext.h w/OpenOVR/Misc/xr_ext.h
+index 7093fa7..fd7e2e8 100644
+--- i/OpenOVR/Misc/xr_ext.h
++++ w/OpenOVR/Misc/xr_ext.h
+@@ -39,6 +39,7 @@
+ 
+ #include "../RuntimeExtensions/XR_FB_display_refresh_rate.h"
+ #include "../RuntimeExtensions/XR_MNDX_xdev_space.h"
++#include "../RuntimeExtensions/XR_CRANVR_mailbox.h"
+ #include <openxr/openxr_platform.h>
+ 
+ #include <vector>
+@@ -78,6 +79,14 @@ public:
+ 	}
+ 	bool xrMndxXdevSpace_Available() { return pfnxrCreateXDevSpaceMNDX != nullptr; }
+ 
++	// cranvr: XR_CRANVR_mailbox, which hands a game's mailbox messages to cranvr's runtime
++	bool xrSendMailboxMessageCRANVR_Available() { return pfnXrSendMailboxMessageCRANVR != nullptr; }
++	XrResult xrSendMailboxMessageCRANVR(XrInstance instance, const char* address, const char* message)
++	{
++		OOVR_FALSE_ABORT(pfnXrSendMailboxMessageCRANVR);
++		return pfnXrSendMailboxMessageCRANVR(instance, address, message);
++	}
++
+ 	XrResult xrGetVisibilityMaskKHR(
+ 	    XrSession session,
+ 	    XrViewConfigurationType viewConfigurationType,
+@@ -219,6 +228,7 @@ public:
+ private:
+ 	PFN_xrGetVisibilityMaskKHR pfnXrGetVisibilityMaskKHR = nullptr;
+ 	PFN_xrGetDisplayRefreshRateFB pfnXrGetDisplayRefreshRateFB = nullptr;
++	PFN_xrSendMailboxMessageCRANVR pfnXrSendMailboxMessageCRANVR = nullptr;
+ 	PFN_xrCreateHandTrackerEXT pfnXrCreateHandTrackerExt = nullptr;
+ 	PFN_xrDestroyHandTrackerEXT pfnXrDestroyHandTrackerExt = nullptr;
+ 	PFN_xrLocateHandJointsEXT pfnXrLocateHandJointsExt = nullptr;
+diff --git i/OpenOVR/Misc/xrutil.cpp w/OpenOVR/Misc/xrutil.cpp
+index fde22e9..909a4af 100644
+--- i/OpenOVR/Misc/xrutil.cpp
++++ w/OpenOVR/Misc/xrutil.cpp
+@@ -29,6 +29,7 @@ XrExt::XrExt(XrGraphicsApiSupportedFlags apis, const std::vector<const char*>& e
+ 	// Check the extensions we have selected, and don't fetch functions if we're not allowed to use them
+ 	bool hasVisMask = false;
+ 	bool hasDisplayRefreshRate = false;
++	bool hasMailbox = false;
+ 	bool hasHandTracking = false;
+ 	bool xdevSpace = false;
+ 	for (const char* ext : extensions) {
+@@ -36,6 +37,8 @@ XrExt::XrExt(XrGraphicsApiSupportedFlags apis, const std::vector<const char*>& e
+ 			hasVisMask = true;
+ 		if (strcmp(ext, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME) == 0)
+ 			hasDisplayRefreshRate = true;
++		if (strcmp(ext, XR_CRANVR_MAILBOX_EXTENSION_NAME) == 0)
++			hasMailbox = true;
+ 		if (strcmp(ext, XR_EXT_HAND_TRACKING_EXTENSION_NAME) == 0)
+ 			hasHandTracking = true;
+ 		if (strcmp(ext, XR_EXT_HP_MIXED_REALITY_CONTROLLER_EXTENSION_NAME) == 0)
+@@ -53,6 +56,9 @@ XrExt::XrExt(XrGraphicsApiSupportedFlags apis, const std::vector<const char*>& e
+ 	if (hasDisplayRefreshRate)
+ 		XR_BIND_OPT(xrGetDisplayRefreshRateFB, pfnXrGetDisplayRefreshRateFB);
+ 
++	if (hasMailbox)
++		XR_BIND_OPT(xrSendMailboxMessageCRANVR, pfnXrSendMailboxMessageCRANVR);
++
+ 	if (hasHandTracking) {
+ 		XR_BIND(xrCreateHandTrackerEXT, pfnXrCreateHandTrackerExt);
+ 		XR_BIND(xrDestroyHandTrackerEXT, pfnXrDestroyHandTrackerExt);
+diff --git i/OpenOVR/Reimpl/BaseMailbox.cpp w/OpenOVR/Reimpl/BaseMailbox.cpp
+index 2512022..7ea2bf2 100644
+--- i/OpenOVR/Reimpl/BaseMailbox.cpp
++++ w/OpenOVR/Reimpl/BaseMailbox.cpp
+@@ -4,6 +4,9 @@
+ 
+ #include "BaseMailbox.h"
+ 
++#include "Misc/xr_ext.h"
++#include "Misc/xrutil.h"
++
+ typedef BaseMailbox::MboxErr MboxErr;
+ 
+ MboxErr BaseMailbox::RegisterMailbox(const char* name, OOVR_mbox_handle* handle)
+@@ -22,9 +25,21 @@ MboxErr BaseMailbox::UnregisterMailbox(OOVR_mbox_handle mbox)
+ 	return VR_MBox_None;
+ }
+ 
+-MboxErr BaseMailbox::SendMessage(OOVR_mbox_handle mbox, const char* type, const char* message)
++// cranvr: the second argument is the address of the mailbox that the message goes to, such as "hlvr/interstitials". The
++// runtime passes the message to cranvr-host, which shows a game's loading screen and its messages in the headset.
++MboxErr BaseMailbox::SendMessage(OOVR_mbox_handle mbox, const char* address, const char* message)
+ {
+-	OOVR_LOGF("Pretending to send mailbox message, type '%s' contents '%s'", type, message);
++	if (address == nullptr || message == nullptr)
++		return VR_MBox_None;
++	if (xr_ext == nullptr || !xr_ext->xrSendMailboxMessageCRANVR_Available()) {
++		OOVR_LOGF("The runtime takes no mailbox messages: ignoring a message to '%s', contents '%s'", address, message);
++		return VR_MBox_None;
++	}
++	const XrResult result = xr_ext->xrSendMailboxMessageCRANVR(xr_instance, address, message);
++	if (XR_FAILED(result))
++		OOVR_LOGF("The runtime refused a mailbox message to '%s' with %d, contents '%s'", address, (int)result, message);
++	else
++		OOVR_LOGF("Handed a mailbox message to '%s' to the runtime, contents '%s'", address, message);
+ 	return VR_MBox_None;
+ }
+ 
+diff --git i/OpenOVR/Reimpl/BaseMailbox.h w/OpenOVR/Reimpl/BaseMailbox.h
+index 6424729..6a9df94 100644
+--- i/OpenOVR/Reimpl/BaseMailbox.h
++++ w/OpenOVR/Reimpl/BaseMailbox.h
+@@ -19,7 +19,7 @@ public:
+ 
+ 	MboxErr UnregisterMailbox(OOVR_mbox_handle mbox);
+ 
+-	MboxErr SendMessage(OOVR_mbox_handle mbox, const char* type, const char* message);
++	MboxErr SendMessage(OOVR_mbox_handle mbox, const char* address, const char* message);
+ 
+ 	MboxErr ReadMessage(OOVR_mbox_handle mbox, char* outBuf, uint32_t outBufLen, uint32_t* msgLen);
+ };
+diff --git i/RuntimeExtensions/XR_CRANVR_mailbox.h w/RuntimeExtensions/XR_CRANVR_mailbox.h
+new file mode 100644
+index 0000000..a4e85d5
+--- /dev/null
++++ w/RuntimeExtensions/XR_CRANVR_mailbox.h
+@@ -0,0 +1,14 @@
++// cranvr: XR_CRANVR_mailbox, an extension of cranvr's OpenXR runtime (BasaltVR with cranvr's patches). A game sends
++// messages to SteamVR through OpenVR's IVRMailbox, such as what its loading screen shows. OpenComposite hands each
++// message to the runtime, which passes it to cranvr-host unchanged. The host knows what a game's messages mean.
++#pragma once
++
++#include <openxr/openxr.h>
++
++#ifndef XR_CRANVR_mailbox
++#define XR_CRANVR_mailbox 1
++#define XR_CRANVR_MAILBOX_EXTENSION_NAME "XR_CRANVR_mailbox"
++// `address` is the mailbox that the message goes to, such as "game/interstitials". `message` is the message as the game
++// sent it. Both are UTF-8 text.
++typedef XrResult(XRAPI_PTR* PFN_xrSendMailboxMessageCRANVR)(XrInstance instance, const char* address, const char* message);
++#endif

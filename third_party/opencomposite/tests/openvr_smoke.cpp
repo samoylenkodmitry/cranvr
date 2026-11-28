@@ -67,8 +67,15 @@
 // makes OpenComposite restart its session on the game's device. The second thread's calls must neither crash nor see the
 // session that the restart destroys (cranvr issue #216).
 //
+// --mailbox sends a loading screen through OpenVR's mailbox (IVRMailbox_001), as Half-Life: Alyx does: the message
+// "begin_loading" of the game's first level before the first submit, "show_message" with "Press Trigger To Start" after
+// 30 frames, which come after OpenComposite's restart of its session, and "end_loading" after 90 frames, while the
+// probe still streams. The messages go to the address "smoke/interstitials": the host knows them by their type, not by
+// the game's address.
+// scripts/e2e.sh --openvr-mailbox checks that the probe gets the screens in this order.
+//
 // Usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--trace-poses] [--actions MODE] [--expect-hz N] [--overlay] [--format F]
-//                         [--threads] [--gl | --vulkan [--samples N]] [--load-only --runtime DIR] [--app-type TYPE [--runtime DIR]]
+//                         [--threads] [--mailbox] [--gl | --vulkan [--samples N]] [--load-only --runtime DIR] [--app-type TYPE [--runtime DIR]]
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -103,7 +110,30 @@
 #include "openvr-2.5.1.h"
 #include "custom_interfaces/IVRClientCore_003.h"
 
+// The mailbox of OpenVR that Half-Life: Alyx uses (IVRMailbox_001). No SDK holds it. The order of the methods is the
+// one that OpenComposite answers (its custom_interfaces/IVRMailbox_001.h). The third method is SendMessage there, a
+// name that windows.h takes for a macro. The class stands outside the anonymous namespace: GCC knows every class
+// that derives from a class of internal linkage, finds none here and takes a call of its methods for one that never
+// runs.
+class Mailbox {
+public:
+	virtual uint32_t RegisterMailbox(const char* name, uint64_t* handle) = 0;
+	virtual uint32_t UnregisterMailbox(uint64_t handle) = 0;
+	virtual uint32_t Send(uint64_t handle, const char* address, const char* message) = 0;
+	virtual uint32_t ReadMessage(uint64_t handle, char* buffer, uint32_t length, uint32_t* written) = 0;
+};
+
 namespace {
+
+// The messages of Half-Life: Alyx at the start of its first level, in the form that OpenComposite logged, with lines of
+// this program in place of the game's tip and description
+const char* const kBeginLoading = "{\n\t\"type\": \"begin_loading\",\n\t\"mapName\": \"a1_intro_world\",\n\t\"chapter\": \"\",\n"
+                                  "\t\"tipText\": \"TIP: This line stands for a game's tip. It is long enough to wrap on the panel in the headset.\",\n"
+                                  "\t\"description\": \"This line stands for the description of the level. A game sends a few sentences here while it loads, so the panel shows three or four lines of it.\",\n"
+                                  "\t\"loadingText\": \"LOADING\",\n\t\"facingAngle\": 0.000000\n}";
+const char* const kShowMessage = "{\n\t\"type\": \"show_message\",\n\t\"text\": \"Press Trigger To Start\"\n}";
+const char* const kEndLoading = "{\n\t\"type\": \"end_loading\"\n}";
+const char* const kMailboxAddress = "smoke/interstitials";
 
 void say(const char* format, ...) __attribute__((format(printf, 1, 2)));
 void say(const char* format, ...)
@@ -1138,7 +1168,7 @@ int main(int argc, char** argv)
 {
 	double seconds = 15;
 	bool expect_input = false, load_only = false, no_input = false, trace_poses = false, with_overlay = false, with_gl = false, with_vulkan = false,
-	     with_threads = false;
+	     with_threads = false, with_mailbox = false;
 	uint32_t sample_count = 1;
 	// The eye textures' share of the recommended size: Serious Sam VR renders at 1.118 times it
 	double scale = 1.0;
@@ -1168,6 +1198,8 @@ int main(int argc, char** argv)
 			with_overlay = true;
 		} else if (!std::strcmp(argv[i], "--threads")) {
 			with_threads = true;
+		} else if (!std::strcmp(argv[i], "--mailbox")) {
+			with_mailbox = true;
 		} else if (!std::strcmp(argv[i], "--gl")) {
 			with_gl = true;
 		} else if (!std::strcmp(argv[i], "--vulkan")) {
@@ -1209,7 +1241,7 @@ int main(int argc, char** argv)
 			g_runtime_path = argv[++i];
 			g_runtime_given = true;
 		} else {
-			std::fprintf(stderr, "usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--actions MODE] [--expect-hz N] [--overlay] [--format F] [--scale S] [--threads] [--gl | --vulkan [--samples N]] [--load-only --runtime DIR] [--app-type TYPE [--runtime DIR]]\n");
+			std::fprintf(stderr, "usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--actions MODE] [--expect-hz N] [--overlay] [--format F] [--scale S] [--threads] [--mailbox] [--gl | --vulkan [--samples N]] [--load-only --runtime DIR] [--app-type TYPE [--runtime DIR]]\n");
 			return 2;
 		}
 	}
@@ -1247,6 +1279,19 @@ int main(int argc, char** argv)
 		return fail("no compositor");
 	}
 	say("initialised, runtime %s", g_runtime_path.c_str());
+	Mailbox* mailbox = nullptr;
+	uint64_t mailbox_handle = 0;
+	if (with_mailbox) {
+		vr::EVRInitError mailbox_error = vr::VRInitError_None;
+		mailbox = static_cast<Mailbox*>(VR_GetGenericInterface("IVRMailbox_001", &mailbox_error));
+		if (!mailbox) {
+			say("the runtime has no IVRMailbox_001 (error %d)", mailbox_error);
+			return fail("no mailbox");
+		}
+		mailbox->RegisterMailbox("smoke/mailbox", &mailbox_handle);
+		mailbox->Send(mailbox_handle, kMailboxAddress, kBeginLoading);
+		say("mailbox: sent begin_loading");
+	}
 	ActionTest actions;
 	if (!actions_mode.empty() && !actions.setup(actions_mode)) {
 		return fail("the action manifest did not load");
@@ -1558,6 +1603,14 @@ int main(int argc, char** argv)
 		compositor->PostPresentHandoff();
 		handoff_time += since(mark);
 		frames++;
+		if (mailbox && frames == 30) {
+			mailbox->Send(mailbox_handle, kMailboxAddress, kShowMessage);
+			say("mailbox: sent show_message");
+		}
+		if (mailbox && frames == 90) {
+			mailbox->Send(mailbox_handle, kMailboxAddress, kEndLoading);
+			say("mailbox: sent end_loading");
+		}
 		if (!actions_mode.empty()) {
 			actions.frame(poses);
 		}
@@ -1646,6 +1699,9 @@ int main(int argc, char** argv)
 	}
 
 	frames_end = true;
+	if (mailbox) {
+		mailbox->UnregisterMailbox(mailbox_handle);
+	}
 	if (caller.joinable()) {
 		caller.join();
 		say("the second thread made %llu OpenVR calls", static_cast<unsigned long long>(thread_calls.load()));

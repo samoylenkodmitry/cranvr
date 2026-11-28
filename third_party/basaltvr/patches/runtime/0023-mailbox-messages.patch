@@ -1,0 +1,292 @@
+diff --git i/runtime/pe/basalt_control_protocol.h w/runtime/pe/basalt_control_protocol.h
+index b077592..8d7050c 100644
+--- i/runtime/pe/basalt_control_protocol.h
++++ w/runtime/pe/basalt_control_protocol.h
+@@ -135,6 +135,18 @@
+  *         f32 linear_velocity[3], f32 angular_velocity[3]
+  */
+ 
++/*
++ * cranvr: a game's mailbox messages (message 25). A game that speaks OpenVR sends messages to
++ * SteamVR through IVRMailbox, such as what its loading screen shows. An OpenVR runtime on top of
++ * this runtime (OpenComposite) hands each message to the runtime through the extension
++ * XR_CRANVR_mailbox, and the runtime passes it on unchanged. The daemon knows what the messages of
++ * a game mean. A message that comes while no daemon is connected goes out at the next connection, in
++ * order. A message that does not fit into BASALT_CONTROL_MAX_MESSAGE_LENGTH is dropped.
++ *   MAILBOX_MESSAGE (runtime -> daemon)
++ *     u16 address_length, the address in UTF-8 (such as "game/interstitials"),
++ *     u16 message_length, the message in UTF-8 (a JSON object in the games known so far)
++ */
++
+ #define BASALT_CONTROL_PROTOCOL_VERSION 9u
+ #define BASALT_CONTROL_TOKEN_LENGTH 32u
+ #define BASALT_CONTROL_MAX_MESSAGE_LENGTH 4096u
+@@ -172,6 +184,7 @@ enum {
+     BASALT_MSG_FACE_TRACKING = 22,
+     BASALT_MSG_EYE_GAZE = 23,
+     BASALT_MSG_HAND_INTERACTION = 24,
++    BASALT_MSG_MAILBOX_MESSAGE = 25,
+ };
+ 
+ /* Bits of TRACKING_REQUEST and of tracking-features.txt's words. FACE_VISUAL and FACE_AUDIO
+diff --git i/runtime/pe/control.cpp w/runtime/pe/control.cpp
+index 1dd5c6b..3b8cad3 100644
+--- i/runtime/pe/control.cpp
++++ w/runtime/pe/control.cpp
+@@ -1602,6 +1602,40 @@ uint32_t queryTextureIOSurfaceId(ID3D11Texture2D* texture) {
+     return id;
+ }
+ 
++// cranvr: the mailbox messages that wait for a daemon. OpenComposite restarts its session at the game's first frame, and
++// the connection to the daemon ends with the old session: a message of the gap waits for the new connection. The
++// newest messages wait, the oldest go when more come.
++constexpr size_t kMailboxCapacity = BASALT_CONTROL_MAX_MESSAGE_LENGTH - sizeof(uint16_t);
++constexpr uint32_t kHeldMailboxMessages = 8;
++struct HeldMailboxMessage {
++    size_t length;
++    uint8_t payload[kMailboxCapacity];
++};
++SRWLOCK gMailboxLock = SRWLOCK_INIT;
++HeldMailboxMessage gHeldMailbox[kHeldMailboxMessages];
++uint32_t gHeldMailboxFirst = 0;
++uint32_t gHeldMailboxCount = 0;
++
++// The socket of a connected daemon, or INVALID_SOCKET
++SOCKET mailboxSocket() {
++    AcquireSRWLockShared(&gControlLock);
++    const SOCKET socket = gSocket != INVALID_SOCKET && !gReceiverFailed ? gSocket : INVALID_SOCKET;
++    ReleaseSRWLockShared(&gControlLock);
++    return socket;
++}
++
++// Sends the messages that wait, in their order. The caller holds gMailboxLock.
++void sendHeldMailboxMessagesLocked(SOCKET socket) {
++    while (gHeldMailboxCount > 0) {
++        const HeldMailboxMessage& held = gHeldMailbox[gHeldMailboxFirst];
++        if (!sendMessage(socket, BASALT_MSG_MAILBOX_MESSAGE, held.payload, held.length)) {
++            return;
++        }
++        gHeldMailboxFirst = (gHeldMailboxFirst + 1) % kHeldMailboxMessages;
++        --gHeldMailboxCount;
++    }
++}
++
+ void controlSessionCreated(XrSession session, ID3D11Device* device) {
+     if (!basaltGateEnabled() || !probeSessionIOSurface(device)) {
+         return;
+@@ -1738,6 +1772,13 @@ void controlSessionCreatedWith(XrSession session, FrameSync* sync, const char* r
+         return;
+     }
+     ReleaseSRWLockExclusive(&gControlLock);
++    // cranvr: the game's mailbox messages of the time without a daemon
++    AcquireSRWLockExclusive(&gMailboxLock);
++    const SOCKET socket = mailboxSocket();
++    if (socket != INVALID_SOCKET) {
++        sendHeldMailboxMessagesLocked(socket);
++    }
++    ReleaseSRWLockExclusive(&gMailboxLock);
+ }
+ 
+ void controlSessionDestroyed(XrSession session) {
+@@ -2262,6 +2303,45 @@ void controlRequestTracking(XrSession session, uint32_t features) {
+     }
+ }
+ 
++bool controlSendMailboxMessage(const char* address, const char* message) {
++    const size_t addressLength = std::strlen(address);
++    const size_t messageLength = std::strlen(message);
++    if (2 * sizeof(uint16_t) + addressLength + messageLength > kMailboxCapacity) {
++        note("cranvr: a mailbox message to %s has %zu bytes, more than the daemon takes: it is dropped\n", address, messageLength);
++        return false;
++    }
++    AcquireSRWLockExclusive(&gMailboxLock);
++    const SOCKET socket = mailboxSocket();
++    if (socket != INVALID_SOCKET) {
++        sendHeldMailboxMessagesLocked(socket);
++    }
++    HeldMailboxMessage* slot = nullptr;
++    if (socket == INVALID_SOCKET || gHeldMailboxCount > 0) {
++        if (gHeldMailboxCount == kHeldMailboxMessages) {
++            gHeldMailboxFirst = (gHeldMailboxFirst + 1) % kHeldMailboxMessages;
++            --gHeldMailboxCount;
++        }
++        slot = &gHeldMailbox[(gHeldMailboxFirst + gHeldMailboxCount) % kHeldMailboxMessages];
++        ++gHeldMailboxCount;
++        note("cranvr: no daemon is connected: a mailbox message to %s waits for the next connection\n", address);
++    }
++    static uint8_t sending[kMailboxCapacity];
++    uint8_t* payload = slot != nullptr ? slot->payload : sending;
++    MessageWriter writer(payload, kMailboxCapacity);
++    writer.u16(static_cast<uint16_t>(addressLength));
++    writer.bytes(address, addressLength);
++    writer.u16(static_cast<uint16_t>(messageLength));
++    writer.bytes(message, messageLength);
++    bool sent = false;
++    if (slot != nullptr) {
++        slot->length = writer.length();
++    } else {
++        sent = writer.ok() && sendMessage(socket, BASALT_MSG_MAILBOX_MESSAGE, payload, writer.length());
++    }
++    ReleaseSRWLockExclusive(&gMailboxLock);
++    return sent;
++}
++
+ bool controlHandState(XrSession session, uint32_t hand, XrTime locateTime, ControlHandState* state) {
+     if (state == nullptr || hand > 1) {
+         return false;
+diff --git i/runtime/pe/control.hpp w/runtime/pe/control.hpp
+index d0f6927..bef74d5 100644
+--- i/runtime/pe/control.hpp
++++ w/runtime/pe/control.hpp
+@@ -57,6 +57,11 @@ void controlSessionCreated(XrSession session, ID3D11Device* device);
+ void controlSessionCreatedWith(XrSession session, FrameSync* sync, const char* renderer);
+ void controlSessionDestroyed(XrSession session);
+ 
++// cranvr: sends a game's mailbox message to the daemon (BASALT_MSG_MAILBOX_MESSAGE). A message that comes
++// while no daemon is connected waits for the next connection; the newest 8 wait. A message that does not
++// fit into one control message is dropped. True when the message went out at once.
++bool controlSendMailboxMessage(const char* address, const char* message);
++
+ // True only while the daemon handshake is complete for the live session.
+ bool controlActive(XrSession session);
+ 
+diff --git i/runtime/pe/runtime.cpp w/runtime/pe/runtime.cpp
+index da74a2a..05aab02 100644
+--- i/runtime/pe/runtime.cpp
++++ w/runtime/pe/runtime.cpp
+@@ -1,5 +1,7 @@
+ #include "runtime.hpp"
+ 
++#include "control.hpp"
++
+ #include <windows.h>
+ 
+ #include <openxr/openxr_reflection.h>
+@@ -21,6 +23,7 @@ bool gVulkanEnableEnabled = false;
+ bool gVulkanEnable2Enabled = false;
+ bool gDisplayRefreshRateEnabled = false;
+ bool gHandInteractionEnabled = false;
++bool gMailboxEnabled = false;
+ 
+ XrResult XRAPI_CALL basaltEnumerateInstanceExtensionProperties(
+     const char* layerName,
+@@ -48,9 +51,12 @@ XrResult XRAPI_CALL basaltEnumerateInstanceExtensionProperties(
+     // extension asks a runtime with controllers to map them), so it needs no headset feature. It
+     // comes with the graphics extension, as the refresh rate does.
+     const uint32_t handInteractionCount = graphicsAvailable ? 1u : 0u;
++    // cranvr: XR_CRANVR_mailbox carries a game's OpenVR mailbox messages to cranvr-host. It comes with
++    // the graphics extension, as the refresh rate does.
++    const uint32_t mailboxCount = graphicsAvailable ? 1u : 0u;
+     const uint32_t vulkanCount = vulkanAvailable ? 2u : 0u;
+     const uint32_t total =
+-        (d3d11Available ? 1u : 0u) + vulkanCount + trackingCount + displayCount + handInteractionCount;
++        (d3d11Available ? 1u : 0u) + vulkanCount + trackingCount + displayCount + handInteractionCount + mailboxCount;
+     *propertyCountOutput = total;
+     if (propertyCapacityInput == 0) {
+         return XR_SUCCESS;
+@@ -118,6 +124,12 @@ XrResult XRAPI_CALL basaltEnumerateInstanceExtensionProperties(
+         properties[next].extensionVersion = XR_EXT_hand_interaction_SPEC_VERSION;
+         ++next;
+     }
++    if (mailboxCount != 0) {
++        std::strncpy(properties[next].extensionName, XR_CRANVR_MAILBOX_EXTENSION_NAME, XR_MAX_EXTENSION_NAME_SIZE - 1);
++        properties[next].extensionName[XR_MAX_EXTENSION_NAME_SIZE - 1] = '\0';
++        properties[next].extensionVersion = XR_CRANVR_mailbox_SPEC_VERSION;
++        ++next;
++    }
+     return XR_SUCCESS;
+ }
+ 
+@@ -174,6 +186,7 @@ XrResult XRAPI_CALL basaltCreateInstance(
+     bool enableVulkan2 = false;
+     bool enableDisplayRefreshRate = false;
+     bool enableHandInteraction = false;
++    bool enableMailbox = false;
+     uint32_t enabledTracking = 0;
+     for (uint32_t index = 0; index < createInfo->enabledExtensionCount; ++index) {
+         const char* extensionName = createInfo->enabledExtensionNames[index];
+@@ -196,6 +209,11 @@ XrResult XRAPI_CALL basaltCreateInstance(
+             enableHandInteraction = true;
+             continue;
+         }
++        if (std::strcmp(extensionName, XR_CRANVR_MAILBOX_EXTENSION_NAME) == 0 &&
++            (basalt::isD3D11RuntimeAvailable() || basalt::isVulkanRuntimeOffered())) {
++            enableMailbox = true;
++            continue;
++        }
+         if (std::strcmp(extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0 ||
+             std::strcmp(extensionName, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME) == 0) {
+             if (!basalt::isVulkanRuntimeOffered()) {
+@@ -231,6 +249,7 @@ XrResult XRAPI_CALL basaltCreateInstance(
+     gVulkanEnable2Enabled = enableVulkan2;
+     gDisplayRefreshRateEnabled = enableDisplayRefreshRate;
+     gHandInteractionEnabled = enableHandInteraction;
++    gMailboxEnabled = enableMailbox;
+     gNextInstanceHandle += kInstanceHandleStride;
+     *instance = gLiveInstance;
+     ReleaseSRWLockExclusive(&gInstanceLock);
+@@ -253,6 +272,7 @@ XrResult XRAPI_CALL basaltDestroyInstance(XrInstance instance) {
+     gVulkanEnableEnabled = false;
+     gVulkanEnable2Enabled = false;
+     gHandInteractionEnabled = false;
++    gMailboxEnabled = false;
+     gDisplayRefreshRateEnabled = false;
+     ReleaseSRWLockExclusive(&gInstanceLock);
+     basalt::setEnabledTrackingExtensions(0);
+@@ -383,6 +403,27 @@ bool isHandInteractionEnabled(XrInstance instance) {
+     return enabled;
+ }
+ 
++bool isMailboxEnabled(XrInstance instance) {
++    if (instance == XR_NULL_HANDLE) {
++        return false;
++    }
++    AcquireSRWLockShared(&gInstanceLock);
++    const bool enabled = instance == gLiveInstance && gMailboxEnabled;
++    ReleaseSRWLockShared(&gInstanceLock);
++    return enabled;
++}
++
++XrResult XRAPI_CALL sendMailboxMessage(XrInstance instance, const char* address, const char* message) {
++    if (!isMailboxEnabled(instance)) {
++        return XR_ERROR_HANDLE_INVALID;
++    }
++    if (address == nullptr || message == nullptr) {
++        return XR_ERROR_VALIDATION_FAILURE;
++    }
++    controlSendMailboxMessage(address, message);
++    return XR_SUCCESS;
++}
++
+ bool isD3D11ExtensionEnabled(XrInstance instance) {
+     if (instance == XR_NULL_HANDLE) {
+         return false;
+@@ -519,6 +560,8 @@ XrResult XRAPI_CALL getInstanceProcAddr(
+     } else if (std::strcmp(name, "xrEnumerateDisplayRefreshRatesFB") == 0 &&
+                isDisplayRefreshRateEnabled(instance)) {
+         *function = asVoidFunction(enumerateDisplayRefreshRates);
++    } else if (std::strcmp(name, "xrSendMailboxMessageCRANVR") == 0 && isMailboxEnabled(instance)) {
++        *function = asVoidFunction(sendMailboxMessage);
+     } else if (std::strcmp(name, "xrGetDisplayRefreshRateFB") == 0 &&
+                isDisplayRefreshRateEnabled(instance)) {
+         *function = asVoidFunction(getDisplayRefreshRate);
+diff --git i/runtime/pe/runtime.hpp w/runtime/pe/runtime.hpp
+index fa4105d..a7015ad 100644
+--- i/runtime/pe/runtime.hpp
++++ w/runtime/pe/runtime.hpp
+@@ -128,6 +128,15 @@ bool vulkanSwapchainViewForExport(
+ bool isDisplayRefreshRateEnabled(XrInstance instance);
+ // cranvr: XR_EXT_hand_interaction, which input.cpp serves
+ bool isHandInteractionEnabled(XrInstance instance);
++// cranvr: XR_CRANVR_mailbox, the messages that a game sends through OpenVR's IVRMailbox. An OpenVR
++// runtime on top of this one (OpenComposite) hands each message over, and the runtime passes it to
++// the daemon (BASALT_MSG_MAILBOX_MESSAGE). It succeeds also when no daemon takes the message.
++#define XR_CRANVR_mailbox 1
++#define XR_CRANVR_mailbox_SPEC_VERSION 1
++#define XR_CRANVR_MAILBOX_EXTENSION_NAME "XR_CRANVR_mailbox"
++typedef XrResult(XRAPI_PTR* PFN_xrSendMailboxMessageCRANVR)(XrInstance instance, const char* address, const char* message);
++bool isMailboxEnabled(XrInstance instance);
++XrResult XRAPI_CALL sendMailboxMessage(XrInstance instance, const char* address, const char* message);
+ // XR_FB_display_refresh_rate (frame.cpp): the rate of cranvr-host's headset is the only rate
+ XrResult XRAPI_CALL enumerateDisplayRefreshRates(
+     XrSession session, uint32_t capacityInput, uint32_t* countOutput, float* rates);

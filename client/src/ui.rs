@@ -38,7 +38,7 @@ use cranpose_xr::{
     FollowingSubspace, Hand as XrHand, InputSource, Pose, SpatialFrameEffect, SpatialPanel, StreamedScene, SubspaceModifier,
 };
 use cranvr_common::controls::Action as ControlAction;
-use cranvr_proto::clock::now_ns;
+use cranvr_proto::{clock::now_ns, message::GameScreen};
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
 /// The sizes in dp that the connect and stats panels start at. The user can make them larger.
@@ -102,7 +102,7 @@ fn Client() {
     crate::scripted::install_once();
     // The saved Room and Volume settings apply before any panel or link needs them
     hub().load_settings();
-    let Link { snapshot, frames } = link();
+    let Link { snapshot, frames, game_screen } = link();
     let console = rememberMutableStateOf(|| hub().console());
     let backdrop = rememberMutableStateOf(|| hub().backdrop());
     // Which panels show: the room's choice, saved, or the game's, which ends with the game
@@ -314,6 +314,8 @@ fn Client() {
         }
         Behind(backdrop, frames);
     });
+    // The game's screen shows in a game whatever the hands do: it tells the user what the game waits for
+    crate::game_screen::GameScreenPanel(game_screen);
     // A menu that a button opened shows while the hands belong to the game too: the user asked for it
     if !hands_in_game.get() || menu_open.get() {
         let view = console.get();
@@ -395,7 +397,7 @@ pub fn PhoneApp() {
 #[composable]
 fn Phone() {
     hub().attach_phone();
-    let Link { snapshot, frames } = link();
+    let Link { snapshot, frames, game_screen } = link();
     let address = address_field();
     let panels = rememberMutableStateOf(|| true);
     let streaming = snapshot.get().state == LinkState::Streaming;
@@ -415,6 +417,8 @@ fn Phone() {
                 hub().set_screen([(width * density).round() as u32, (height * density).round() as u32]);
             }
             PhonePicture(frames);
+            // The game's screen shows over the picture, the panels over both
+            crate::game_screen::ScreenText(game_screen, Modifier::empty().fill_max_width().background(PANEL_COLOR).padding(24.0));
             if panels.get() {
                 PhonePanels(snapshot, address, panels);
             }
@@ -492,6 +496,8 @@ fn PhoneButtons(panels: MutableState<bool>) {
 struct Link {
     snapshot: MutableState<Snapshot>,
     frames: MutableState<Option<DecodedFrames>>,
+    /// The game's loading screen and its message (see `game_screen.rs`)
+    game_screen: MutableState<Option<GameScreen>>,
 }
 
 /// Starts the effects that copy the hub's state into Cranpose state and keep the link up. The
@@ -502,9 +508,19 @@ fn link() -> Link {
     // and the Mac behind the USB cable, which a headset on the cable shows first
     crate::usb::start(hub());
     let snapshot = rememberMutableStateOf(|| hub().snapshot());
-    LaunchedEffect((), async move |_| loop {
-        snapshot.set(hub().snapshot());
-        delay(POLL).await;
+    let game_screen = rememberMutableStateOf(|| hub().game_screen());
+    LaunchedEffect((), async move |_| {
+        // The screen is copied only when the host changed it
+        let mut screen_seen = hub().game_screen_changes();
+        loop {
+            snapshot.set(hub().snapshot());
+            let changes = hub().game_screen_changes();
+            if changes != screen_seen {
+                screen_seen = changes;
+                game_screen.set(hub().game_screen());
+            }
+            delay(POLL).await;
+        }
     });
     // A link that streamed and ended without the user's say connects again, as after a restart of
     // the host that a setting of the console asks for
@@ -524,7 +540,7 @@ fn link() -> Link {
             delay(STREAM_POLL).await;
         }
     });
-    Link { snapshot, frames }
+    Link { snapshot, frames, game_screen }
 }
 
 pub(crate) fn text_style(size: f32, color: Color, weight: Option<FontWeight>) -> TextStyle {
