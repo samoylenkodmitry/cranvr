@@ -987,7 +987,7 @@ const NO_WISH: DesktopWish = DesktopWish { enabled: false, max_width: 0, max_fps
 /// shown logs zero pictures.
 pub fn uplink(link: &ClientLink, stop: &AtomicBool) {
     let owner = displays();
-    if !owner.slots[0].inner.lock().unwrap().active || cranpose::launch_args().boolean("desktop") == Some(false) {
+    if !owner.slots[0].inner.lock().unwrap().active || crate::launch::args().boolean("desktop") == Some(false) {
         return;
     }
     let mut last_key = [Instant::now() - KEY_REQUEST_GAP; SLOTS];

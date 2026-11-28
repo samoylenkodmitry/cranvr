@@ -64,7 +64,7 @@ pub fn on_frame(read: &Read, now: Nanos) {
 /// The launch argument `console_place=ahead` puts the default a meter straight ahead of the head and
 /// upright, for a capture that shows the whole page.
 pub fn start_place() -> Pose {
-    let default = if cranpose::launch_args().string("console_place") == Some("ahead") {
+    let default = if crate::launch::args().string("console_place") == Some("ahead") {
         Pose::IDENTITY
     } else {
         SubspaceModifier::new().offset(START_OFFSET[0], START_OFFSET[1], START_OFFSET[2]).rotate(-START_TILT_DEGREES, 0.0, 0.0).pose()

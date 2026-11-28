@@ -24,7 +24,7 @@ use crate::{
     hub::Hub,
     usb_network::{self, NetworkRoute},
 };
-use cranpose::launch_args;
+use crate::launch;
 use cranvr_proto::{
     discovery::DEFAULT_PORT,
     identity::{fingerprint, FINGERPRINT_LEN, KEY_LEN},
@@ -49,7 +49,7 @@ const IDLE: Duration = Duration::from_millis(500);
 /// uses too. The launch argument `usb_port` changes it, for a test host on another port.
 pub fn port() -> u16 {
     static PORT: OnceLock<u16> = OnceLock::new();
-    *PORT.get_or_init(|| launch_args().int("usb_port").and_then(|port| u16::try_from(port).ok()).unwrap_or(DEFAULT_PORT))
+    *PORT.get_or_init(|| launch::args().int("usb_port").and_then(|port| u16::try_from(port).ok()).unwrap_or(DEFAULT_PORT))
 }
 
 /// The address behind the cable

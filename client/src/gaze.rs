@@ -16,7 +16,7 @@
 //!
 //! The file has no Cranpose state, so a test drives it with plain values.
 
-use cranpose::launch_args;
+use crate::launch;
 use cranpose_xr::Pose;
 use std::time::Duration;
 
@@ -31,7 +31,7 @@ pub const DWELL: Duration = Duration::from_secs(1);
 
 /// The ball's angle below the eyes in this launch, in degrees
 pub fn pitch() -> f32 {
-    launch_args().string("gaze_pitch").and_then(|text| text.parse::<f32>().ok()).filter(|p| p.is_finite()).unwrap_or(PITCH_DEGREES)
+    launch::args().string("gaze_pitch").and_then(|text| text.parse::<f32>().ok()).filter(|p| p.is_finite()).unwrap_or(PITCH_DEGREES)
 }
 
 /// The ball's offset from the subspace's origin, which lies a meter ahead of the eyes, in dp

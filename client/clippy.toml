@@ -1,0 +1,6 @@
+# The client takes launch arguments only through crate::launch::args, which drops the arguments of a
+# launch that did not come through the entry for adb (client/src/launch.rs)
+disallowed-methods = [
+    { path = "cranpose_services::launch_args::launch_args", reason = "read launch arguments through crate::launch::args" },
+    { path = "cranpose_services::launch_args::local_launch_args", reason = "read launch arguments through crate::launch::args" },
+]

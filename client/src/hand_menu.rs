@@ -70,7 +70,7 @@ use crate::{
     ui::{text_style, ACCENT_COLOR, KEY_COLOR, MUTED_COLOR, PANEL_COLOR, STOP_COLOR, TEXT_COLOR},
 };
 use crate::place;
-use cranpose::launch_args;
+use crate::launch;
 use cranpose::prelude::*;
 use cranpose::text::FontWeight;
 use cranpose_xr::{local_spatial_capabilities, FollowMode, FollowTarget, FollowingSubspace, Hand, HandJointType, Pose, SpatialPanel, SubspaceModifier, TrackedDimensions};
@@ -178,7 +178,7 @@ pub fn frame() -> HandFrame {
 /// or the view, which they follow softly. A launch may fix the head for a test on a desk (see the
 /// file's notes).
 fn anchor(place: MenuPlace) -> (FollowTarget, HandFrame) {
-    match launch_args().string("hand_anchor") {
+    match launch::args().string("hand_anchor") {
         Some("view") => (FollowTarget::View(FollowMode::Snap(TrackedDimensions::TranslationAndYaw)), ON_VIEW),
         Some("head") => (FollowTarget::View(FollowMode::Tight(TrackedDimensions::All)), ON_VIEW),
         _ => match place {
@@ -228,13 +228,13 @@ pub fn hand_display_start(frame: HandFrame, size: [f32; 2]) -> Pose {
 
 /// Whether the launch opens the menu at the start (the extra `hand_menu` with the value `open`).
 pub fn open_on_launch() -> bool {
-    launch_args().string("hand_menu") == Some("open")
+    launch::args().string("hand_menu") == Some("open")
 }
 
 /// Whether a flat window shows the menu: a test asks for it with the extra `hand_menu`. The menu then
 /// stands among the panels of the room, so a screenshot of the window shows its rows and words.
 pub fn flat_menu() -> bool {
-    !local_spatial_capabilities().current().is_spatial_ui_enabled() && launch_args().string("hand_menu").is_some()
+    !local_spatial_capabilities().current().is_spatial_ui_enabled() && launch::args().string("hand_menu").is_some()
 }
 
 /// What the hand's panels share with the app.

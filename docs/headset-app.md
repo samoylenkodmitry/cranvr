@@ -13,7 +13,7 @@
 - A controller's ray starts at the tip of its drawn model (the node `laser_begin` of the runtime's model), on the line of the runtime's aim pose.
 - A `SpatialFrameEffect` runs once for each headset frame. It hands the head pose, the eye views, both controllers and the predicted display time to the thread that sends the tracking.
 
-The launch arguments are intent extras on Android (`adb shell am start -n dev.cranvr.client/dev.cranpose.android.CranposeActivity --es host 192.168.1.20:9950 --ez connect true`) and `--name=value` on a desktop (`--host=192.168.1.20:9950 --connect`):
+The launch arguments are intent extras on Android (`adb shell am start -n dev.cranvr.client/dev.cranvr.client.AdbStart --es host 192.168.1.20:9950 --ez connect true`) and `--name=value` on a desktop (`--host=192.168.1.20:9950 --connect`). On Android the client takes the extras only from a launch through `dev.cranvr.client.AdbStart`. That alias of the activity requires the permission DUMP, which the shell user of adb and the system hold. Another app's launch of the plain activity gives no arguments, so it cannot make the client forget a paired Mac's key or link to another host (`client/src/launch.rs`):
 
 | Argument | Meaning |
 |---|---|

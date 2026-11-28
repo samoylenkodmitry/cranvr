@@ -31,7 +31,7 @@ fn pose_key(name: &str) -> String {
 fn default_places() -> bool {
     use std::sync::OnceLock;
     static DEFAULT: OnceLock<bool> = OnceLock::new();
-    *DEFAULT.get_or_init(|| cranpose::launch_args().boolean("default_places").unwrap_or(false))
+    *DEFAULT.get_or_init(|| crate::launch::args().boolean("default_places").unwrap_or(false))
 }
 
 /// The pose of the panel `name` where the user left it, if the user carried it. The next start

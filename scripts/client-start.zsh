@@ -11,15 +11,20 @@
 #   default) for a new "Headset connected" line in HOST_LOG. It calls the function
 #   `client_waiting` once a second while it waits, when the caller defines one (a test port sets its
 #   adb reverse again there). It sets:
-#     client_result  alive, crashed, ended (the link or the process ended with no crash) or unlinked
+#     client_result  alive, crashed, ended (the link or the process ended with no crash), unlinked or
+#                    old (the installed client has no entry for adb: install a build from main)
 #     client_crash   the fatal signal line and the top frames of a crash
 #     client_linked  the host's time of the new link line
 # quest_ready
 #   Waits up to 40 s until adb lists the Quest as a device again: a change of the headset's USB
 #   functions takes adb away for a moment.
+# client_has_entry
+#   Succeeds when the installed client has the entry for adb, so a start with extras can work.
 
 readonly CLIENT_PACKAGE=dev.cranvr.client
-readonly CLIENT_ACTIVITY=dev.cranvr.client/dev.cranpose.android.CranposeActivity
+# The client takes launch extras only through this alias, which only adb's shell may start
+# (client/src/launch.rs)
+readonly CLIENT_ACTIVITY=dev.cranvr.client/dev.cranvr.client.AdbStart
 
 quest_ready() {
     local i
@@ -28,6 +33,11 @@ quest_ready() {
         sleep 1
     done
     return 1
+}
+
+# Whether the installed client has the entry for adb. A query of the package manager starts nothing.
+client_has_entry() {
+    ${adb_cmd} shell cmd package resolve-activity --brief -n ${CLIENT_ACTIVITY} 2> /dev/null | grep -q AdbStart
 }
 
 client_pid() {
@@ -50,7 +60,11 @@ client_start() {
     quest_ready || return 0
     links=$(grep -c "Headset connected" ${host_log})
     since=$(${adb_cmd} shell date "'+%m-%d %H:%M:%S.000'" | tr -d '\r')
-    ${adb_cmd} shell am start -n ${CLIENT_ACTIVITY} "$@" > /dev/null 2>&1
+    if ${adb_cmd} shell am start -n ${CLIENT_ACTIVITY} "$@" 2>&1 | grep -q "does not exist"; then
+        print -u2 "client-start: the installed client has no ${CLIENT_ACTIVITY#*/}: install a build from main"
+        client_result=old
+        return 0
+    fi
     for i in {1..${wait_s}}; do
         sleep 1
         (( $(grep -c "Headset connected" ${host_log}) > links )) && break

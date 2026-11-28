@@ -10,13 +10,14 @@
 //! test on a headset whose user saw the line already.
 
 use crate::menu_place::{other, MenuPlace};
-use cranpose::{launch_args, preferences};
+use crate::launch;
+use cranpose::preferences;
 use cranvr_common::controls::{Action, Control, Controls, Hand};
 
 const SEEN_KEY: &str = "menu_hint_seen";
 
 fn first_start_on_launch() -> bool {
-    launch_args().boolean("first_start").unwrap_or(false)
+    launch::args().boolean("first_start").unwrap_or(false)
 }
 
 /// Whether the line shows at the start: the user never opened the menu.
@@ -28,7 +29,7 @@ pub fn wanted_at_start() -> bool {
 /// that opened the menu without `first_start` marked the line seen for a user who had not seen it:
 /// the line then shows again from the next start.
 pub fn forget_on_launch() {
-    if !launch_args().boolean("forget_menu_hint").unwrap_or(false) {
+    if !launch::args().boolean("forget_menu_hint").unwrap_or(false) {
         return;
     }
     match preferences().remove(SEEN_KEY) {

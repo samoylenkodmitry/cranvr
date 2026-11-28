@@ -17,5 +17,22 @@
         <activity
             android:name="dev.cranpose.android.CranposeActivity"
             android:screenOrientation="sensorLandscape" />
+        <!-- The entry for adb. Only a caller that holds DUMP may start it: the shell user of adb
+             and the system. An app gets DUMP only when someone grants it with adb. The client
+             takes launch arguments only from a launch through this entry (client/src/launch.rs),
+             so another app cannot make it forget a paired Mac's key or link to another host. -->
+        <activity-alias
+            android:name="dev.cranvr.client.AdbStart"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:targetActivity="dev.cranpose.android.CranposeActivity">
+            <!-- A start through an alias reads the native library's name from the alias's own
+                 meta-data, both in Cranpose's loader and in NativeActivity. Without it the start
+                 looks for the library "main" and fails. The Cranpose plugin names the library after
+                 the crate cranvr-client. -->
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="cranvr_client" />
+        </activity-alias>
     </application>
 </manifest>

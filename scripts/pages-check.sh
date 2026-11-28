@@ -67,7 +67,7 @@ ${adb_cmd} shell am broadcast -a com.oculus.vrpowermanager.prox_close > /dev/nul
 extras=(--es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room scene --ez default_places true --ez save_choices false --ez first_start true --es shown connection,stats,display1 --es scripted_pointer pages --es forget_host_key 127.0.0.1:${port})
 [[ -n ${walk} ]] && extras+=(--es scripted_pages ${walk})
 [[ -n ${actions} ]] && extras+=(--es scripted_actions ${actions})
-${adb_cmd} shell am start -n dev.cranvr.client/dev.cranpose.android.CranposeActivity ${extras} > /dev/null
+${adb_cmd} shell am start -n dev.cranvr.client/dev.cranvr.client.AdbStart ${extras} > /dev/null
 sleep ${seconds}
 # The window's presses on the headset's own page: the stream numbers show or hide, the panels recenter
 print '{"action":"run","id":"headset.panel","subject":"stats"}' >&3

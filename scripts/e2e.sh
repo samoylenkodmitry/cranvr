@@ -801,7 +801,7 @@ case ${client} in
         # when it has not linked in 15 s.
         sleep 1
         for attempt in 1 2; do
-            "${adb_cmd[@]}" shell am start -n "${package}/dev.cranpose.android.CranposeActivity" \
+            "${adb_cmd[@]}" shell am start -n "${package}/dev.cranvr.client.AdbStart" \
                 "${launch[@]}" --ez connect true --es room "${room}" >/dev/null
             for i in {1..30}; do
                 headset_connected && break

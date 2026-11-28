@@ -49,7 +49,7 @@ ${adb_cmd} reverse tcp:${port} tcp:${port} > /dev/null
 ${adb_cmd} shell am force-stop dev.cranvr.client
 ${adb_cmd} shell am broadcast -a com.oculus.vrpowermanager.prox_close > /dev/null
 extras=(--es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room none --es interface 3d --ei walk_wait_ms 5000 --ez log_poses true --ez default_places true --ez save_choices false --ez first_start true --es shown none --es scripted_pointer ui3d --es forget_host_key 127.0.0.1:${port})
-${adb_cmd} shell am start -n dev.cranvr.client/dev.cranpose.android.CranposeActivity ${extras} > /dev/null
+${adb_cmd} shell am start -n dev.cranvr.client/dev.cranvr.client.AdbStart ${extras} > /dev/null
 # A capture a moment after each of these lines: the menu has shown, the console has shown its page
 marks=("the hand menu opens:0.7:menu" "the hand menu opens:0.6:front" "the console shows the page stream:1.4:stream" "the console shows the page headset:1.4:headset")
 end=$((SECONDS + seconds))

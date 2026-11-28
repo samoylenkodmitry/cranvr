@@ -26,7 +26,7 @@ use crate::{
     panel_layout::layer_rank,
     ui::{text_style, PANEL_COLOR, TEXT_COLOR},
 };
-use cranpose::launch_args;
+use crate::launch;
 use cranpose::prelude::*;
 use cranpose_xr::{local_spatial_capabilities, FollowMode, FollowTarget, FollowingSubspace, GemGlow, Hand, HandJointType, HologramStage, SpatialGem, SpatialHologram, SpatialPanel, SubspaceModifier, TrackedDimensions};
 use cranvr_proto::message::Recording;
@@ -105,10 +105,10 @@ pub fn RecordGem(state: HandState, theme: Theme) {
         return;
     }
     // A launch may leave the gem out, for a measure of what it costs
-    if launch_args().boolean("record_gem") == Some(false) {
+    if launch::args().boolean("record_gem") == Some(false) {
         return;
     }
-    let anchor = if launch_args().string("hand_anchor") == Some("view") {
+    let anchor = if launch::args().string("hand_anchor") == Some("view") {
         Some(Anchor::View)
     } else if state.present.get()[0] {
         Some(Anchor::Controller)
