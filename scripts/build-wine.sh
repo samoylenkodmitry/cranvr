@@ -104,7 +104,12 @@ configure_args=(--enable-win64 --with-mingw --without-x --without-freetype --wit
     --without-pulse --without-alsa --without-cups --without-gstreamer --without-vulkan --without-opencl
     --without-pcap --without-usb --without-v4l2 --without-gphoto --without-sane --without-krb5
     --disable-tests)
-configure_line="MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET} ${configure_args[*]}"
+# Source paths in assert and log strings start at the source folder: the game support is public and holds no path of
+# the Mac that built it. Wine compiles its Mac files with CFLAGS and its Windows files with CROSSCFLAGS, both "-g -O2"
+# by default.
+prefix_map="-ffile-prefix-map=${dir}=wine -ffile-prefix-map=${build}/wine=build"
+compile_flags="-g -O2 ${prefix_map}"
+configure_line="MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET} ${configure_args[*]} CFLAGS=${compile_flags} CROSSCFLAGS=${compile_flags}"
 if [[ ! -f ${build}/wine/Makefile || $(cat "${build}/wine/configure-line.txt" 2>/dev/null) != "${configure_line}" ]]; then
     # Objects of another configuration would stay: start from an empty folder
     rm -rf "${build}/wine"
@@ -113,8 +118,9 @@ if [[ ! -f ${build}/wine/Makefile || $(cat "${build}/wine/configure-line.txt" 2>
     # Only the nine files of this build are used: the game support keeps the rest of Gcenx's Wine. So every
     # optional library is off. winemac.so and opengl32.so need none of them. ntdll.so unwinds with the system's
     # unwinder, as Gcenx's does, so configure keeps it.
-    (cd "${build}/wine" && CC="clang -arch x86_64" CXX="clang++ -arch x86_64" arch -x86_64 "${dir}/configure" \
-        "${configure_args[@]}" > configure.log 2>&1) || { tail -20 "${build}/wine/configure.log" >&2; exit 1; }
+    (cd "${build}/wine" && CC="clang -arch x86_64" CXX="clang++ -arch x86_64" CFLAGS=${compile_flags} \
+        CROSSCFLAGS=${compile_flags} arch -x86_64 "${dir}/configure" "${configure_args[@]}" > configure.log 2>&1) \
+        || { tail -20 "${build}/wine/configure.log" >&2; exit 1; }
     print -r -- "${configure_line}" > "${build}/wine/configure-line.txt"
 fi
 

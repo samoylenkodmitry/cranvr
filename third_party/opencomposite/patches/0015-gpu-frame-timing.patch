@@ -1,0 +1,280 @@
+diff --git c/DrvOpenXR/XrBackend.cpp i/DrvOpenXR/XrBackend.cpp
+index 5f21fe7..dcab240 100644
+--- c/DrvOpenXR/XrBackend.cpp
++++ i/DrvOpenXR/XrBackend.cpp
+@@ -39,6 +39,7 @@
+ 
+ #if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+ #include "tmp_gfx/TemporaryD3D11.h"
++#include "../OpenOVR/Compositor/dx11compositor.h"
+ #endif
+ 
+ #include <algorithm>
+@@ -438,6 +439,13 @@ void XrBackend::WaitForTrackingData()
+ 		OOVR_FAILED_XR_ABORT(xrBeginFrame(xr_session.get(), &beginInfo));
+ 	}
+ 
++	auto now = std::chrono::steady_clock::now();
++	if (lastWaitGetPoses.time_since_epoch().count())
++		clientFrameIntervalMs = std::chrono::duration<float, std::milli>(now - lastWaitGetPoses).count();
++	lastWaitGetPoses = now;
++	if (frameTimer)
++		frameTimer->Begin();
++
+ 	xr_gbl->ClearCachedViews();
+ 
+ 	XrSpace projectionSpace = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
+@@ -481,6 +489,17 @@ void XrBackend::StoreEyeTexture(
+ {
+ 	CheckOrInitCompositors(texture);
+ 
++#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
++	if (!frameTimer && texture->eType == vr::TextureType_DirectX) {
++		ID3D11Device* device = nullptr;
++		((ID3D11Texture2D*)texture->handle)->GetDevice(&device);
++		if (device) {
++			frameTimer = CreateDX11FrameTimer(device);
++			device->Release();
++		}
++	}
++#endif
++
+ 	XrCompositionLayerProjectionView& layer = projectionViews[eye];
+ 	layer.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+ 
+@@ -576,6 +595,9 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
+ 	info.layers = headers;
+ 	info.layerCount = layer_count;
+ 
++	if (frameTimer)
++		frameTimer->End();
++
+ 	OOVR_FAILED_XR_SOFT_ABORT(xrEndFrame(xr_session.get(), &info));
+ 
+ 	BaseSystem* sys = GetUnsafeBaseSystem();
+@@ -695,20 +717,23 @@ bool XrBackend::GetFrameTiming(OOVR_Compositor_FrameTiming* pTiming, uint32_t un
+ 		pTiming->m_nNumDroppedFrames = 0; // number of additional times previous frame was scanned out
+ 		pTiming->m_nReprojectionFlags = 0;
+ 
+-		// Just use sensible values until GPU timers implemented
+-		pTiming->m_flPreSubmitGpuMs = 8.0f;
+-		pTiming->m_flPostSubmitGpuMs = 1.0f;
+-		pTiming->m_flTotalRenderGpuMs = 9.0f;
+-
+ 		// Use very conservative guesses for these. They are used in F1 22 for dynamic resolution calculations but are not something that is provided
+ 		// through OpenXR. Using conservative values will give a bit more headroom for the game to target realistic frame times.
+ 		pTiming->m_flCompositorRenderGpuMs = 1.5f; // time spend performing distortion correction, rendering chaperone, overlays, etc.
++
++		// cranvr: the game's measured GPU time (FrameTimer), with the compositor's guess on top as SteamVR's total
++		// holds the compositor's work. Without a measure the fixed values stay: a Vulkan or OpenGL game, or the first
++		// frames.
++		std::optional<float> gpuMs = frameTimer ? frameTimer->LastMs() : std::nullopt;
++		pTiming->m_flPreSubmitGpuMs = gpuMs ? *gpuMs : 8.0f;
++		pTiming->m_flPostSubmitGpuMs = gpuMs ? 0.0f : 1.0f;
++		pTiming->m_flTotalRenderGpuMs = gpuMs ? *gpuMs + pTiming->m_flCompositorRenderGpuMs : 9.0f;
+ 		pTiming->m_flCompositorRenderCpuMs = 3.0f; // time spent on cpu submitting the above work for this frame
+ 
+ 		pTiming->m_flCompositorIdleCpuMs = 0.1f;
+ 
+ 		/** Miscellaneous measured intervals. */
+-		pTiming->m_flClientFrameIntervalMs = 11.1f; // time between calls to WaitGetPoses
++		pTiming->m_flClientFrameIntervalMs = clientFrameIntervalMs > 0.0f ? clientFrameIntervalMs : 11.1f; // time between calls to WaitGetPoses
+ 		pTiming->m_flPresentCallCpuMs = 0.0f; // time blocked on call to present (usually 0.0, but can go long)
+ 		pTiming->m_flWaitForPresentCpuMs = 0.0f; // time spent spin-waiting for frame index to change (not near-zero indicates wait object failure)
+ 		pTiming->m_flSubmitFrameMs = 0.0f; // time spent in IVRCompositor::Submit (not near-zero indicates driver issue)
+diff --git c/DrvOpenXR/XrBackend.h i/DrvOpenXR/XrBackend.h
+index 64bbbd8..3a55dd1 100644
+--- c/DrvOpenXR/XrBackend.h
++++ i/DrvOpenXR/XrBackend.h
+@@ -9,6 +9,7 @@
+ #include "XrController.h"
+ #include "XrHMD.h"
+ 
++#include <chrono>
+ #include <memory>
+ #include <vector>
+ #include <mutex>
+@@ -71,6 +72,12 @@ private:
+ 	void CheckOrInitCompositors(const vr::Texture_t* tex);
+ 	std::unique_ptr<Compositor> compositors[XruEyeCount];
+ 	std::unique_ptr<Compositor> skybox_compositor;
++
++	// cranvr: the GPU time of the game's frames for GetFrameTiming, once the game submitted a Direct3D 11 texture
++	std::unique_ptr<FrameTimer> frameTimer;
++	// cranvr: the time between the last two calls of WaitGetPoses, in milliseconds
++	float clientFrameIntervalMs = 0.0f;
++	std::chrono::steady_clock::time_point lastWaitGetPoses;
+ 	std::vector<std::shared_ptr<Compositor>> overlay_compositors;
+ 
+ 	/**
+diff --git c/OpenOVR/Compositor/compositor.h i/OpenOVR/Compositor/compositor.h
+index 5277aef..60d7b2c 100644
+--- c/OpenOVR/Compositor/compositor.h
++++ i/OpenOVR/Compositor/compositor.h
+@@ -59,3 +59,22 @@ protected:
+ 	// we do fiddle with it a bit to get the SRGB stuff done correctly.
+ 	int64_t createInfoFormat;
+ };
++
++/**
++ * cranvr: the GPU time of a game's frames on the game's own device, from the return of WaitGetPoses to the frame's
++ * last submit. IVRCompositor::GetFrameTiming reports it. A game that sizes its images by the frame time (Half-Life:
++ * Alyx's auto fidelity) read a fixed 9 ms before and stayed at its smallest size at 120 Hz.
++ */
++class FrameTimer {
++public:
++	virtual ~FrameTimer() = default;
++
++	/** The frame's GPU work begins: WaitGetPoses returned */
++	virtual void Begin() = 0;
++
++	/** The frame's GPU work ends: the game submitted both eyes */
++	virtual void End() = 0;
++
++	/** The GPU time of the newest frame that the GPU finished, in milliseconds, or none before the first */
++	virtual std::optional<float> LastMs() = 0;
++};
+diff --git c/OpenOVR/Compositor/dx11compositor.cpp i/OpenOVR/Compositor/dx11compositor.cpp
+index cbe7e78..1a12fda 100644
+--- c/OpenOVR/Compositor/dx11compositor.cpp
++++ i/OpenOVR/Compositor/dx11compositor.cpp
+@@ -746,3 +746,126 @@ bool DX11Compositor::GetFormatInfo(DXGI_FORMAT format, DX11Compositor::DxgiForma
+ }
+ 
+ #endif
++
++// cranvr: four frames of queries: the GPU finishes a frame one or two frames after its submit, and a frame whose
++// queries have no answer yet keeps its slot. GetData never waits (D3D11_ASYNC_GETDATA_DONOTFLUSH).
++class DX11FrameTimer : public FrameTimer {
++public:
++	explicit DX11FrameTimer(ID3D11Device* device)
++	    : device(device)
++	{
++		device->AddRef();
++		device->GetImmediateContext(&context);
++		for (Frame& frame : frames) {
++			D3D11_QUERY_DESC disjoint{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
++			D3D11_QUERY_DESC stamp{ D3D11_QUERY_TIMESTAMP, 0 };
++			if (FAILED(device->CreateQuery(&disjoint, &frame.disjoint)) || FAILED(device->CreateQuery(&stamp, &frame.begin))
++			    || FAILED(device->CreateQuery(&stamp, &frame.end))) {
++				OOVR_LOG("cranvr: no timestamp queries on the game's device: GetFrameTiming reports fixed times");
++				usable = false;
++				return;
++			}
++		}
++		OOVR_LOG("cranvr: GetFrameTiming reports the GPU time of the game's frames");
++	}
++
++	~DX11FrameTimer() override
++	{
++		for (Frame& frame : frames) {
++			for (ID3D11Query* query : { frame.disjoint, frame.begin, frame.end })
++				if (query)
++					query->Release();
++		}
++		context->Release();
++		device->Release();
++	}
++
++	void Begin() override
++	{
++		if (!usable || open)
++			return;
++		Collect();
++		Frame& frame = frames[current];
++		// The GPU has not answered for this slot yet: this frame goes untimed
++		if (frame.pending)
++			return;
++		context->Begin(frame.disjoint);
++		context->End(frame.begin);
++		open = true;
++	}
++
++	void End() override
++	{
++		if (!open)
++			return;
++		Frame& frame = frames[current];
++		context->End(frame.end);
++		context->End(frame.disjoint);
++		frame.pending = true;
++		frame.order = ++submitted;
++		current = (current + 1) % frameCount;
++		open = false;
++	}
++
++	std::optional<float> LastMs() override
++	{
++		Collect();
++		return lastMs;
++	}
++
++private:
++	struct Frame {
++		ID3D11Query* disjoint = nullptr;
++		ID3D11Query* begin = nullptr;
++		ID3D11Query* end = nullptr;
++		bool pending = false;
++		uint64_t order = 0;
++	};
++	static constexpr int frameCount = 4;
++
++	void Collect()
++	{
++		for (Frame& frame : frames) {
++			if (!frame.pending)
++				continue;
++			D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint{};
++			UINT64 begin = 0, end = 0;
++			constexpr UINT noFlush = D3D11_ASYNC_GETDATA_DONOTFLUSH;
++			if (context->GetData(frame.disjoint, &disjoint, sizeof(disjoint), noFlush) != S_OK
++			    || context->GetData(frame.begin, &begin, sizeof(begin), noFlush) != S_OK
++			    || context->GetData(frame.end, &end, sizeof(end), noFlush) != S_OK)
++				continue;
++			frame.pending = false;
++			if (disjoint.Disjoint || !disjoint.Frequency || end < begin || frame.order < newestOrder)
++				continue;
++			newestOrder = frame.order;
++			lastMs = (float)((double)(end - begin) * 1000.0 / (double)disjoint.Frequency);
++			sumMs += *lastMs;
++			maxMs = std::max(maxMs, *lastMs);
++			// A line every 600 timed frames (5 s at 120 Hz) says what the game reads
++			if (++timed % 600 == 0) {
++				OOVR_LOGF("cranvr: the game's frames took %.2f ms of GPU time on average, at most %.2f ms, in the last 600 timed frames", sumMs / 600.0f, maxMs);
++				sumMs = 0.0f;
++				maxMs = 0.0f;
++			}
++		}
++	}
++
++	ID3D11Device* device;
++	ID3D11DeviceContext* context = nullptr;
++	Frame frames[frameCount];
++	int current = 0;
++	bool open = false;
++	bool usable = true;
++	uint64_t submitted = 0;
++	uint64_t newestOrder = 0;
++	std::optional<float> lastMs;
++	uint64_t timed = 0;
++	float sumMs = 0.0f;
++	float maxMs = 0.0f;
++};
++
++std::unique_ptr<FrameTimer> CreateDX11FrameTimer(ID3D11Device* device)
++{
++	return std::make_unique<DX11FrameTimer>(device);
++}
+diff --git c/OpenOVR/Compositor/dx11compositor.h i/OpenOVR/Compositor/dx11compositor.h
+index 3bf83d5..7b7f4d8 100644
+--- c/OpenOVR/Compositor/dx11compositor.h
++++ i/OpenOVR/Compositor/dx11compositor.h
+@@ -66,3 +66,8 @@ protected:
+ 	 */
+ 	static bool GetFormatInfo(DXGI_FORMAT format, DxgiFormatInfo& out);
+ };
++
++#ifdef SUPPORT_DX
++/** cranvr: a FrameTimer of timestamp queries on the game's Direct3D 11 device */
++std::unique_ptr<FrameTimer> CreateDX11FrameTimer(ID3D11Device* device);
++#endif

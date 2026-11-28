@@ -340,7 +340,7 @@ former behavior back for a comparison. The log says once which vertex shader thi
 Patches 0013 to 0018 run SteamVR for Windows under Wine (cranvr's SteamVR mode, `steamvr/driver_cranvr.cpp`). Each
 applies on its own to DXMT v0.80. The build script checks the whole set in order (runtime patch 0014), because patch
 0019 changes lines of BasaltVR's 0001. Patch 0020 changes lines of 0013, 0014, 0018 and 0019. Patch 0021 changes lines of 0020.
-Patch 0022 changes lines of 0019 and 0020.
+Patch 0022 changes lines of 0019 and 0020. Patch 0023 changes lines of 0013 and 0020.
 
 `0013-shared-buffers-between-processes.patch`: SteamVR's compositor makes a constant buffer with
 `D3D11_RESOURCE_MISC_SHARED` and stops at start when the buffer has no shared handle ("Failed to create shared frame
@@ -445,3 +445,20 @@ IOSurface ID costs nothing. A slot's section costs about half a millisecond to m
 watch thread sets the event of a process that ended to the value that a GPU of this process waits for.
 `src/dxmt/dxmt_shared_order.hpp` gives the reasons and the costs. `DXMT_SHARED_ORDER=0` turns the order off.
 `DXMT_SHARED_ORDER_STATS=1` times each encoded wait. `scripts/shared-churn.sh` checks it (runtime patch 0022).
+
+`0023-shared-resources-outlive-their-device.patch`: DXMT lets a device go before its resources, as the Direct3D 11
+documentation allows. A shared texture or buffer freed its D3DKMT allocation in its destructor through its device, with
+a virtual call. An application that released the device first crashed there. SteamVR's client in Steam does so when
+SteamVR quits after a game: it releases shared textures after their device. Steam for Windows
+ended a few seconds after each SteamVR run of Half-Life: Alyx (cranvr issue #197). Its six crash dumps show
+`~DeviceTexture` calling through the dead device: a call to address 0, to 0x9fa or `__cxa_pure_virtual`. The DXGI
+device now keeps its D3DKMT device in a `KmtDevice` with a reference count (util_d3dkmt.h). A texture or buffer with an
+allocation keeps a reference and frees the allocation through it, so the D3DKMT device lives until its DXGI device and
+its last shared resource let go.
+
+`0024-no-build-paths.patch`: the game support is public, and winemetal.so held the full paths of airconv's three
+shaders under the home folder of the Mac that built it (cranvr issue #200). The Metal compiler writes a shader's path
+into the module as `source_filename` and `air.source_file_name`, and no option of it changes either name.
+`tools/metal-air.sh` compiles a shader, names the module by the shader's file name in the text form (`air-opt -S`) and
+assembles it again (`air-as`). meson.build maps the source folder to `dxmt` (`-ffile-prefix-map`) for C and C++ on
+both machines, as `scripts/build-wine.sh` does for Wine and `scripts/build-opencomposite.sh` for OpenComposite.
