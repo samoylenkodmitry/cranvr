@@ -13,7 +13,11 @@
 //!   more than twice that.
 //!
 //! A flicker between states never counts. The host reports the symptom once for each game run (see
-//! `status.rs`, the `black_eye` line).
+//! `status.rs`, the `black_eye` line). Both symptoms are faults of a game's first picture. Once both
+//! eyes show content at one check, the game draws both eyes, and the checks end for the run. A
+//! later black stretch is a dark scene or a level load: Half-Life: Alyx drew black frames at 9 a
+//! second for more than 90 seconds while it loaded its first level from its menu, and the restart
+//! that a report asks for ended the load.
 //!
 //! The grid has 4096 samples because a menu in a dark room lights few pixels. A game that showed the
 //! spectrum bars of its menu in the left eye and nothing in the right eye lit about 0.5 percent of the
@@ -249,13 +253,20 @@ pub struct Detector {
     streak: u32,
     /// The checks in a row with two black eyes
     dark: u32,
-    reported: bool,
+    /// The run needs no more checks: it reported its symptom, or both eyes showed content
+    done: bool,
 }
 
 impl Detector {
     /// One check. Returns the symptom once: at the check that completes a streak.
     pub fn check(&mut self, left: &Grid, right: &Grid) -> Option<Symptom> {
-        if self.reported {
+        if self.done {
+            return None;
+        }
+        if left.has_content() && right.has_content() {
+            // The game draws both eyes. A black stretch after this is its own picture, such as a
+            // level load, and a restart would end it.
+            self.done = true;
             return None;
         }
         self.streak = if left.has_content() && right.is_black() { self.streak + 1 } else { 0 };
@@ -267,7 +278,7 @@ impl Detector {
         } else {
             None
         };
-        self.reported = symptom.is_some();
+        self.done = symptom.is_some();
         symptom
     }
 
@@ -291,9 +302,9 @@ pub struct Watch {
 
 impl Watch {
     /// Whether the next game frame should be checked: about once a second, and never after the
-    /// report.
+    /// report or after both eyes showed content, so a game that draws both eyes costs no checks.
     pub fn due(&self) -> bool {
-        !self.detector.reported && self.last.is_none_or(|last| last.elapsed() >= INTERVAL)
+        !self.detector.done && self.last.is_none_or(|last| last.elapsed() >= INTERVAL)
     }
 
     /// Checks the two eyes of a frame (the images and their rects). Returns the symptom once, when it
@@ -396,14 +407,23 @@ mod tests {
         checks.push((grid(1, 255), black()));
         checks.extend(repeated(black, black, DARK_CHECKS as usize - 1));
         assert_eq!(reported_at(&mut detector, &checks), None);
-        // A scene between two dark stretches resets it too
+        // A lit left eye in the dark resets it, and a full stretch after it reports
         let mut checks = repeated(black, black, DARK_CHECKS as usize - 1);
-        checks.push((lit(), lit()));
-        checks.extend(repeated(black, black, DARK_CHECKS as usize - 1));
-        assert_eq!(reported_at(&mut Detector::default(), &checks), None);
-        // A full stretch after the scene reports
-        checks.push((black(), black()));
+        checks.push((lit(), grid(1, 255)));
+        checks.extend(repeated(black, black, DARK_CHECKS as usize));
         assert_eq!(reported_at(&mut Detector::default(), &checks), Some(checks.len()));
+    }
+
+    #[test]
+    fn a_dark_stretch_after_a_picture_in_both_eyes_never_reports() {
+        // Half-Life: Alyx: its menu in both eyes, then a level load of black frames for more than
+        // 90 seconds. A report then ended the load.
+        let mut detector = Detector::default();
+        let mut checks = repeated(black, black, 15);
+        checks.push((lit(), lit()));
+        checks.extend(repeated(black, black, DARK_CHECKS as usize * 3));
+        checks.extend(repeated(lit, black, CHECKS_IN_A_ROW as usize * 3));
+        assert_eq!(reported_at(&mut detector, &checks), None);
     }
 
     #[test]
@@ -600,7 +620,19 @@ mod tests {
         let mut watch = Watch::default();
         assert!(watch.due());
         assert_eq!(watch.check([&both, &both], [[0, 0, 64, 64]; 2]), None);
+        // Both eyes showed content: the run needs no more checks
+        assert!(!watch.due());
+    }
+
+    #[test]
+    fn a_watch_waits_between_checks_while_the_eyes_are_dark() {
+        let dark = PixelBuffer::new_bgra(64, 64).expect("buffer");
+        let mut watch = Watch::default();
+        assert!(watch.due());
+        assert_eq!(watch.check([&dark, &dark], [[0, 0, 64, 64]; 2]), None);
         // The clock gates the next check
         assert!(!watch.due());
+        watch.last = Some(Instant::now() - INTERVAL);
+        assert!(watch.due());
     }
 }
