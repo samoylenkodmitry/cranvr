@@ -62,8 +62,13 @@
 // each image into the runtime's images on the GPU: a resolve for samples, a blit for a format that the runtime does
 // not offer. scripts/e2e.sh --openvr-vulkan runs it.
 //
+// --threads calls OpenVR from a second thread for the whole run, as Source 2 games do: the poses of every device, the
+// projection of an eye and the controllers' state (with --actions the actions' data). The first submit of the frame loop
+// makes OpenComposite restart its session on the game's device. The second thread's calls must neither crash nor see the
+// session that the restart destroys (cranvr issue #216).
+//
 // Usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--trace-poses] [--actions MODE] [--expect-hz N] [--overlay] [--format F]
-//                         [--gl | --vulkan [--samples N]] [--load-only --runtime DIR] [--app-type TYPE [--runtime DIR]]
+//                         [--threads] [--gl | --vulkan [--samples N]] [--load-only --runtime DIR] [--app-type TYPE [--runtime DIR]]
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -77,6 +82,7 @@
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cmath>
@@ -88,6 +94,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1130,7 +1137,8 @@ int refused_type(vr::EVRApplicationType type)
 int main(int argc, char** argv)
 {
 	double seconds = 15;
-	bool expect_input = false, load_only = false, no_input = false, trace_poses = false, with_overlay = false, with_gl = false, with_vulkan = false;
+	bool expect_input = false, load_only = false, no_input = false, trace_poses = false, with_overlay = false, with_gl = false, with_vulkan = false,
+	     with_threads = false;
 	uint32_t sample_count = 1;
 	// The eye textures' share of the recommended size: Serious Sam VR renders at 1.118 times it
 	double scale = 1.0;
@@ -1158,6 +1166,8 @@ int main(int argc, char** argv)
 			trace_poses = true;
 		} else if (!std::strcmp(argv[i], "--overlay")) {
 			with_overlay = true;
+		} else if (!std::strcmp(argv[i], "--threads")) {
+			with_threads = true;
 		} else if (!std::strcmp(argv[i], "--gl")) {
 			with_gl = true;
 		} else if (!std::strcmp(argv[i], "--vulkan")) {
@@ -1199,7 +1209,7 @@ int main(int argc, char** argv)
 			g_runtime_path = argv[++i];
 			g_runtime_given = true;
 		} else {
-			std::fprintf(stderr, "usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--actions MODE] [--expect-hz N] [--overlay] [--format F] [--scale S] [--gl | --vulkan [--samples N]] [--load-only --runtime DIR] [--app-type TYPE [--runtime DIR]]\n");
+			std::fprintf(stderr, "usage: openvr_smoke.exe [--seconds N] [--expect-input] [--no-input] [--actions MODE] [--expect-hz N] [--overlay] [--format F] [--scale S] [--threads] [--gl | --vulkan [--samples N]] [--load-only --runtime DIR] [--app-type TYPE [--runtime DIR]]\n");
 			return 2;
 		}
 	}
@@ -1442,6 +1452,33 @@ int main(int argc, char** argv)
 		return spent;
 	};
 
+	// The second thread of --threads, from before the first submit to the end of the frame loop
+	std::atomic<bool> frames_end{ false };
+	std::atomic<uint64_t> thread_calls{ 0 };
+	std::thread caller;
+	if (with_threads) {
+		caller = std::thread([&] {
+			vr::TrackedDevicePose_t thread_poses[vr::k_unMaxTrackedDeviceCount];
+			while (!frames_end) {
+				system->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0.0f, thread_poses, vr::k_unMaxTrackedDeviceCount);
+				float left_tan = 0, right_tan = 0, top_tan = 0, bottom_tan = 0;
+				system->GetProjectionRaw(vr::Eye_Left, &left_tan, &right_tan, &top_tan, &bottom_tan);
+				if (!actions_mode.empty()) {
+					vr::InputDigitalActionData_t digital{};
+					actions.input->GetDigitalActionData(actions.button_a, &digital, sizeof(digital), vr::k_ulInvalidInputValueHandle);
+					vr::InputPoseActionData_t pose{};
+					actions.input->GetPoseActionDataForNextFrame(actions.hand, vr::TrackingUniverseStanding, &pose, sizeof(pose), actions.left);
+				} else if (!no_input) {
+					vr::VRControllerState_t state{};
+					system->GetControllerState(system->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_LeftHand), &state, sizeof(state));
+				}
+				thread_calls += 4;
+				SwitchToThread();
+			}
+		});
+		say("a second thread calls OpenVR during the run");
+	}
+
 	while (std::chrono::duration<double>(Clock::now() - begin).count() < seconds) {
 		Clock::time_point mark = Clock::now();
 		const vr::EVRCompositorError wait = compositor->WaitGetPoses(poses, vr::k_unMaxTrackedDeviceCount, nullptr, 0);
@@ -1608,6 +1645,11 @@ int main(int argc, char** argv)
 		input_time += since(mark);
 	}
 
+	frames_end = true;
+	if (caller.joinable()) {
+		caller.join();
+		say("the second thread made %llu OpenVR calls", static_cast<unsigned long long>(thread_calls.load()));
+	}
 	const double elapsed = std::chrono::duration<double>(Clock::now() - begin).count();
 	say("%llu frames in %.1f s (%.1f per second), %llu valid head poses, %llu wait errors, %llu submit errors (first %d)",
 	    static_cast<unsigned long long>(frames), elapsed, static_cast<double>(frames) / elapsed, static_cast<unsigned long long>(valid_poses),

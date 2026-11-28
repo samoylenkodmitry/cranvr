@@ -1,0 +1,556 @@
+diff --git c/DrvOpenXR/DrvOpenXR.cpp w/DrvOpenXR/DrvOpenXR.cpp
+index f8b0207..f6c7ed2 100644
+--- c/DrvOpenXR/DrvOpenXR.cpp
++++ w/DrvOpenXR/DrvOpenXR.cpp
+@@ -350,6 +350,8 @@ void DrvOpenXR::SetupSession()
+ 
+ void DrvOpenXR::ShutdownSession()
+ {
++	// cranvr: no other thread may use the session or xr_gbl while they go (see SessionWrapper in xrutil.h)
++	auto lock = xr_session.lock();
+ 	BackendManager* instance = BackendManager::InstancePtr();
+ 	// Is it already being shut down?
+ 	// Note that this is indirectly called by the XrBackend destructor, which will have
+@@ -393,6 +395,7 @@ void DrvOpenXR::ShutdownSession()
+ 
+ void DrvOpenXR::FullShutdown()
+ {
++	auto lock = xr_session.lock();
+ 	if (xr_session.get())
+ 		ShutdownSession();
+ 
+diff --git c/DrvOpenXR/XrBackend.cpp w/DrvOpenXR/XrBackend.cpp
+index dcab240..8489454 100644
+--- c/DrvOpenXR/XrBackend.cpp
++++ w/DrvOpenXR/XrBackend.cpp
+@@ -46,6 +46,7 @@
+ #include <chrono>
+ #include <cinttypes>
+ #include <mutex>
++#include <optional>
+ 
+ using namespace vr;
+ 
+@@ -189,6 +190,13 @@ static void find_queue_family_and_queue_idx(VkDevice dev, VkPhysicalDevice pdev,
+ /* Submitting Frames */
+ void XrBackend::CheckOrInitCompositors(const vr::Texture_t* tex)
+ {
++	// cranvr: the restart destroys the session and xr_gbl. The exclusive lock waits until no other thread is inside an
++	// OpenVR call and keeps new calls out until the new session runs (see SessionWrapper in xrutil.h). A second thread
++	// that waited for the lock finds the restart done.
++	std::optional<SessionLock> restartLock;
++	if (!usingApplicationGraphicsAPI)
++		restartLock.emplace(xr_session, true);
++
+ 	// Check we're using the session with the application's device
+ 	if (!usingApplicationGraphicsAPI) {
+ 		usingApplicationGraphicsAPI = true;
+@@ -1174,6 +1182,9 @@ void XrBackend::CreateGenericTrackers()
+ 
+ void XrBackend::MaybeRestartForInputs()
+ {
++	// cranvr: the exclusive lock comes before inputRestartMutex. QueryForInteractionProfile holds the shared lock while it
++	// waits for inputRestartMutex, so a wait for the exclusive lock with inputRestartMutex held would never end.
++	auto sessionLock = xr_session.lock();
+ 	// if we haven't attached any actions to the session (infoSet or game actions), no need to restart
+ 	const std::lock_guard<std::mutex> lock(inputRestartMutex);
+ 	BaseInput* input = GetUnsafeBaseInput();
+diff --git c/DrvOpenXR/XrBackend.h w/DrvOpenXR/XrBackend.h
+index 3a55dd1..35772d8 100644
+--- c/DrvOpenXR/XrBackend.h
++++ w/DrvOpenXR/XrBackend.h
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include "XrDriverPrivate.h"
+ 
+ #include "XrController.h"
+@@ -107,7 +108,8 @@ private:
+ 	void BindInfoSet();
+ 
+ 	// Whether we've restarted the session to use the application's rendering API yet
+-	bool usingApplicationGraphicsAPI = false;
++	// cranvr: atomic, as CheckOrInitCompositors reads it before it takes the session's lock
++	std::atomic<bool> usingApplicationGraphicsAPI = false;
+ 
+ 	// The views for the two main eye layers
+ 	XrCompositionLayerProjectionView projectionViews[XruEyeCount];
+diff --git c/DrvOpenXR/XrHMD.cpp w/DrvOpenXR/XrHMD.cpp
+index 7e299bf..7fa64ff 100644
+--- c/DrvOpenXR/XrHMD.cpp
++++ w/DrvOpenXR/XrHMD.cpp
+@@ -245,25 +245,11 @@ void XrHMD::GetPose(vr::ETrackingUniverseOrigin origin, vr::TrackedDevicePose_t*
+ {
+ 	// TODO use ETrackingStateType
+ 
+-	/* HACK: it would be cleaner to have the xr_gbl access behind a lock_shared, however in Sairento,
+-	   the game may submit its first frame while simulataneously calling GetControllerStateWithPose,
+-	   resulting in the following sequence of events:
+-	   1. Game calls BaseCompositor::Submit, which gets a lock_shared on the session (see the function for why)
+-	   2. Submit calls XrBackend::StoreEyeTexture, which calls XrBackend::CheckOrInitCompositors, which calls
+-	      DrvOpenXR::SetupSession, which attempts to get an exclusive lock on the session. However, it doesn't actually
+-	      get an exclusive lock, but instead just reuses shared lock that we acquired back in BaseCompositor::Submit,
+-	      because our session lock implemention only checks if the thread already has a lock on the session,
+-	      not whether it is exclusive or shared.
+-	   3. SetupSession deletes the session and xr_gbl, and GetPose simultaneously tries to access xr_gbl since at this point
+-	      these both have shared locks on the session: segfault because xr_gbl is null right now!
+-	   A solution around this would be to implement lock upgrading, but initial testing showed that that seems to be
+-	   a lot of work for little gain in this small edge case, especially when we can just sleep for a little bit and
+-	   still avoid the problem of xr_gbl being null, which should only happen on session restart anyway.
+-	   Perhaps redesigning the locking mechanism would be a more fruitful venture in the future.
+-	*/
+-	while (!xr_gbl) {
+-		using namespace std::chrono_literals;
+-		std::this_thread::sleep_for(20ms);
++	// cranvr: the caller's OpenVR entry point holds the session's shared lock, so a restart cannot delete xr_gbl
++	// during this call (see SessionWrapper in xrutil.h). xr_gbl is null only outside a session.
++	if (!xr_gbl) {
++		*pose = {};
++		return;
+ 	}
+ 	xr_utils::PoseFromSpace(pose, xr_gbl->viewSpace, origin);
+ }
+diff --git c/OpenOVR/Misc/xrutil.cpp w/OpenOVR/Misc/xrutil.cpp
+index f6d3088..fde22e9 100644
+--- c/OpenOVR/Misc/xrutil.cpp
++++ w/OpenOVR/Misc/xrutil.cpp
+@@ -261,23 +261,60 @@ void SessionWrapper::reset()
+ }
+ 
+ SessionLock::SessionLock(SessionWrapper& p, bool exclusive)
+-    : parent(p)
++    : parent(p), exclusive(exclusive)
+ {
+-	if (!thread_owns_lock) {
+-		if (exclusive)
+-			lock = std::unique_lock(p.mutex);
+-		else
+-			shared_lock = std::shared_lock(p.mutex);
++	if (!exclusive) {
++		if (exclusiveDepth == 0 && sharedDepth == 0) {
++			std::unique_lock<std::mutex> lock(p.mutex);
++			p.changed.wait(lock, [&p] { return !p.writer && p.waitingWriters == 0; });
++			p.readers++;
++		}
++		sharedDepth++;
++		return;
++	}
+ 
+-		thread_owns_lock = true;
+-		owner = true;
++	if (exclusiveDepth == 0) {
++		bool upgrade = sharedDepth > 0;
++		auto start = std::chrono::steady_clock::now();
++		{
++			std::unique_lock<std::mutex> lock(p.mutex);
++			// The thread's own share would keep the exclusive lock from ever coming
++			if (upgrade)
++				p.readers--;
++			p.waitingWriters++;
++			p.changed.notify_all();
++			p.changed.wait(lock, [&p] { return p.readers == 0 && !p.writer; });
++			p.waitingWriters--;
++			p.writer = true;
++		}
++		if (upgrade) {
++			float waitedMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
++			OOVR_LOGF("Session restart: waited %.2f ms for the OpenVR calls of other threads to end", waitedMs);
++		}
+ 	}
++	exclusiveDepth++;
+ }
+ 
+ SessionLock::~SessionLock()
+ {
+-	if (owner)
+-		thread_owns_lock = false;
++	if (!exclusive) {
++		if (--sharedDepth == 0 && exclusiveDepth == 0) {
++			std::lock_guard<std::mutex> lock(parent.mutex);
++			parent.readers--;
++			if (parent.readers == 0 && parent.waitingWriters > 0)
++				parent.changed.notify_all();
++		}
++		return;
++	}
++
++	if (--exclusiveDepth == 0) {
++		std::lock_guard<std::mutex> lock(parent.mutex);
++		parent.writer = false;
++		// A thread that took the exclusive lock inside an entry point gets its share back at once
++		if (sharedDepth > 0)
++			parent.readers++;
++		parent.changed.notify_all();
++	}
+ }
+ 
+ SessionLock::operator XrSession&() { return parent.session; }
+diff --git c/OpenOVR/Misc/xrutil.h w/OpenOVR/Misc/xrutil.h
+index ef9357a..f611b2e 100644
+--- c/OpenOVR/Misc/xrutil.h
++++ w/OpenOVR/Misc/xrutil.h
+@@ -2,6 +2,7 @@
+ 
+ #include "generated/interfaces/vrtypes.h"
+ #include <array>
++#include <condition_variable>
+ #include <mutex>
+ #include <openxr/openxr.h>
+ #include <shared_mutex>
+@@ -103,9 +104,24 @@ private:
+ 
+ class SessionLock;
+ // A wrapper around the XrSession to prevent session destruction while it's being accessed
++//
++// cranvr: every OpenVR entry point holds the shared lock (the generated stubs take it), so a game's other threads
++// never see the session or xr_gbl while a restart destroys and remakes them. A restart takes the exclusive lock.
++// The restart at a game's first submit runs inside IVRCompositor::Submit, which holds the shared lock: the thread
++// gives up its share while it waits for the exclusive lock, and it turns the exclusive lock back into its share in
++// one step, so no other restart runs before Submit returns. Both locks are reentrant for one thread. A thread that
++// waits for the exclusive lock keeps new readers out, so a game that calls OpenVR all the time cannot starve it.
+ class SessionWrapper {
+ 
+-	std::shared_mutex mutex;
++	std::mutex mutex;
++	std::condition_variable changed;
++	// The fields below change under mutex only.
++	// The number of threads that hold the shared lock
++	int readers = 0;
++	// A thread holds the exclusive lock
++	bool writer = false;
++	// The number of threads that wait for the exclusive lock
++	int waitingWriters = 0;
+ 	XrSession session = XR_NULL_HANDLE;
+ 	friend SessionLock;
+ 
+@@ -118,7 +134,7 @@ public:
+ 	/*
+ 	 * Provides a RAII-style lock on accesses to the XrSession. Prevents any other thread from obtaining get() or lock_shared().
+ 	 */
+-	SessionLock lock();
++	[[nodiscard]] SessionLock lock();
+ 
+ 	/*
+ 	 * Provides a RAII-style lock on modification to the XrSession. Prevents any other thread from obtaining lock().
+@@ -135,15 +151,18 @@ public:
+ // It gets a shared_lock or lock on the session mutex and the mutex gets unlocked (on destruction)
+ // after whatever function call needs the session completes.
+ class SessionLock {
+-	std::shared_lock<std::shared_mutex> shared_lock;
+-	std::unique_lock<std::shared_mutex> lock;
+ 	SessionWrapper& parent;
+-	bool owner = false;
+-	inline static thread_local bool thread_owns_lock = false;
++	bool exclusive;
++	// The number of live locks of each kind on this thread. The thread holds the exclusive lock while
++	// exclusiveDepth > 0, else the shared lock while sharedDepth > 0.
++	inline static thread_local int sharedDepth = 0;
++	inline static thread_local int exclusiveDepth = 0;
+ 
+ public:
+ 	SessionLock(SessionWrapper& p, bool exclusive);
+ 	~SessionLock();
++	SessionLock(const SessionLock&) = delete;
++	SessionLock& operator=(const SessionLock&) = delete;
+ 	operator XrSession&();
+ };
+ 
+diff --git c/OpenOVR/Reimpl/CVRClientCore.cpp w/OpenOVR/Reimpl/CVRClientCore.cpp
+index 98cf244..e134b2a 100644
+--- c/OpenOVR/Reimpl/CVRClientCore.cpp
++++ w/OpenOVR/Reimpl/CVRClientCore.cpp
+@@ -1,6 +1,7 @@
+ #include "stdafx.h"
+ #define GENFILE
+ #include "BaseCommon.h"
++#include "Misc/xrutil.h"
+ 
+ GEN_INTERFACE("ClientCore", "003", CUSTOM)
+ GEN_INTERFACE("ClientCore", "002", CUSTOM)
+@@ -9,6 +10,8 @@ GEN_INTERFACE("ClientCore", "002", CUSTOM)
+ 
+ vr::EVRInitError CVRClientCore_002::Init(vr::EVRApplicationType eApplicationType)
+ {
++	// cranvr: as the generated stubs do (see SessionWrapper in xrutil.h)
++	auto sessionLock = xr_session.lock_shared();
+ 	// This is how the DLL does it with the old InitInternal
+ 	return base->Init(eApplicationType, NULL);
+ }
+diff --git c/OpenOVR/Reimpl/CVRCompositor.cpp w/OpenOVR/Reimpl/CVRCompositor.cpp
+index cf67eb4..1824f64 100644
+--- c/OpenOVR/Reimpl/CVRCompositor.cpp
++++ w/OpenOVR/Reimpl/CVRCompositor.cpp
+@@ -1,6 +1,7 @@
+ #include "stdafx.h"
+ #define GENFILE
+ #include "BaseCommon.h"
++#include "Misc/xrutil.h"
+ 
+ GEN_INTERFACE("Compositor", "009")
+ GEN_INTERFACE("Compositor", "012")
+@@ -32,11 +33,14 @@ using namespace vr;
+ IVRCompositor_015::EVRCompositorError CVRCompositor_015::RequestScreenshot(EVRScreenshotType type,
+     const char* pchDestinationFileName, const char* pchVRDestinationFileName)
+ {
++	// cranvr: as the generated stubs do (see SessionWrapper in xrutil.h)
++	auto sessionLock = xr_session.lock_shared();
+ 
+ 	STUBBED();
+ }
+ 
+ EVRScreenshotType CVRCompositor_015::GetCurrentScreenshotType()
+ {
++	auto sessionLock = xr_session.lock_shared();
+ 	STUBBED();
+ }
+diff --git c/OpenOVR/Reimpl/CVRInput.cpp w/OpenOVR/Reimpl/CVRInput.cpp
+index 9ae1e9d..e63a017 100644
+--- c/OpenOVR/Reimpl/CVRInput.cpp
++++ w/OpenOVR/Reimpl/CVRInput.cpp
+@@ -1,6 +1,7 @@
+ #include "stdafx.h"
+ #define GENFILE
+ #include "BaseCommon.h"
++#include "Misc/xrutil.h"
+ 
+ GEN_INTERFACE("Input", "004")
+ GEN_INTERFACE("Input", "005")
+@@ -15,6 +16,8 @@ GEN_INTERFACE("Input", "011")
+ // Prior to IVRInput_005 / OpenVR 1.1.3 the input layer had a slightly different format, so adapt that
+ vr::EVRInputError CVRInput_004::GetSkeletalActionData(vr::VRActionHandle_t action, vr::IVRInput_004::InputSkeletalActionData_t* pActionData, uint32_t unActionDataSize, vr::VRInputValueHandle_t ulRestrictToDevice)
+ {
++	// cranvr: as the generated stubs do (see SessionWrapper in xrutil.h)
++	auto sessionLock = xr_session.lock_shared();
+ 	// Set the size to what the main method is expecting
+ 	OOVR_FALSE_ABORT(unActionDataSize == sizeof(vr::IVRInput_004::InputSkeletalActionData_t));
+ 	unActionDataSize = sizeof(OOVR_InputSkeletalActionData_t);
+diff --git c/OpenOVR/Reimpl/CVROverlay.cpp w/OpenOVR/Reimpl/CVROverlay.cpp
+index 49414b4..da4a095 100644
+--- c/OpenOVR/Reimpl/CVROverlay.cpp
++++ w/OpenOVR/Reimpl/CVROverlay.cpp
+@@ -1,6 +1,7 @@
+ #include "stdafx.h"
+ #define GENFILE
+ #include "BaseCommon.h"
++#include "Misc/xrutil.h"
+ 
+ GEN_INTERFACE("Overlay", "007")
+ GEN_INTERFACE("Overlay", "010")
+@@ -27,6 +28,8 @@ GEN_INTERFACE("Overlay", "028")
+ 
+ bool CVROverlay_007::PollNextOverlayEvent(vr::VROverlayHandle_t ulOverlayHandle, vr::VREvent_t* pEvent)
+ {
++	// cranvr: as the generated stubs do (see SessionWrapper in xrutil.h)
++	auto sessionLock = xr_session.lock_shared();
+ 	return base->PollNextOverlayEvent(ulOverlayHandle, pEvent, sizeof(vr::VREvent_t));
+ }
+ 
+@@ -34,6 +37,7 @@ vr::EVROverlayError CVROverlay_011::GetOverlayTexture(vr::VROverlayHandle_t ulOv
+     void* pNativeTextureRef, uint32_t* pWidth, uint32_t* pHeight, uint32_t* pNativeFormat, EGraphicsAPIConvention* pAPI,
+     vr::EColorSpace* pColorSpace)
+ {
++	auto sessionLock = xr_session.lock_shared();
+ 
+ 	// It should be fairly simple, but it's unlikely to be used so I can't be bothered implementing it now
+ 	STUBBED();
+@@ -43,6 +47,7 @@ vr::EVROverlayError CVROverlay_013::GetOverlayTexture(vr::VROverlayHandle_t ulOv
+     void* pNativeTextureRef, uint32_t* pWidth, uint32_t* pHeight, uint32_t* pNativeFormat, EGraphicsAPIConvention* pAPI,
+     vr::EColorSpace* pColorSpace)
+ {
++	auto sessionLock = xr_session.lock_shared();
+ 
+ 	// It should be fairly simple, but it's unlikely to be used so I can't be bothered implementing it now
+ 	STUBBED();
+diff --git c/OpenOVR/Reimpl/CVRRenderModels.cpp w/OpenOVR/Reimpl/CVRRenderModels.cpp
+index 2237b38..54d34e9 100644
+--- c/OpenOVR/Reimpl/CVRRenderModels.cpp
++++ w/OpenOVR/Reimpl/CVRRenderModels.cpp
+@@ -1,6 +1,7 @@
+ #include "stdafx.h"
+ #define GENFILE
+ #include "BaseCommon.h"
++#include "Misc/xrutil.h"
+ 
+ GEN_INTERFACE("RenderModels", "002")
+ GEN_INTERFACE("RenderModels", "004")
+@@ -11,15 +12,19 @@ GEN_INTERFACE("RenderModels", "006")
+ 
+ bool CVRRenderModels_002::LoadRenderModel(const char* pchRenderModelName, vr::IVRRenderModels_002::RenderModel_t** ppRenderModel)
+ {
++	// cranvr: as the generated stubs do (see SessionWrapper in xrutil.h)
++	auto sessionLock = xr_session.lock_shared();
+ 	return base->LoadRenderModel_Async(pchRenderModelName, (OOVR_RenderModel_t**)ppRenderModel);
+ }
+ 
+ bool CVRRenderModels_002::LoadTexture(vr::IVRRenderModels_002::TextureID_t textureId, vr::IVRRenderModels_002::RenderModel_TextureMap_t** ppTexture)
+ {
++	auto sessionLock = xr_session.lock_shared();
+ 	return base->LoadTexture_Async((OOVR_TextureID_t)textureId, (OOVR_RenderModel_TextureMap_t**)ppTexture);
+ }
+ 
+ bool CVRRenderModels_002::GetComponentState(const char* pchRenderModelName, const char* pchComponentName, const vr::VRControllerState_t* pControllerState, vr::IVRRenderModels_002::RenderModel_ComponentState_t* pComponentState)
+ {
++	auto sessionLock = xr_session.lock_shared();
+ 	return base->GetComponentState(pchRenderModelName, pchComponentName, pControllerState, nullptr, (OOVR_RenderModel_ComponentState_t*)pComponentState);
+ }
+diff --git c/OpenOVR/Reimpl/CVRServerDriverHost.cpp w/OpenOVR/Reimpl/CVRServerDriverHost.cpp
+index 3aab148..9700ca7 100644
+--- c/OpenOVR/Reimpl/CVRServerDriverHost.cpp
++++ w/OpenOVR/Reimpl/CVRServerDriverHost.cpp
+@@ -1,6 +1,7 @@
+ #include "stdafx.h"
+ #define GENFILE
+ #include "BaseCommon.h"
++#include "Misc/xrutil.h"
+ 
+ GEN_INTERFACE("ServerDriverHost", "005", DRIVER)
+ 
+@@ -64,6 +65,8 @@ private:
+ bool CVRServerDriverHost_005::TrackedDeviceAdded(const char* serialNumber, vr::ETrackedDeviceClass deviceClass,
+     ITrackedDeviceServerDriver005* pDriver)
+ {
++	// cranvr: as the generated stubs do (see SessionWrapper in xrutil.h)
++	auto sessionLock = xr_session.lock_shared();
+ 
+ 	// TODO implement
+ 	OCTrackedDeviceDriver* driver = new OCTrackedDeviceDriver_005(serialNumber, deviceClass, pDriver);
+@@ -72,5 +75,6 @@ bool CVRServerDriverHost_005::TrackedDeviceAdded(const char* serialNumber, vr::E
+ 
+ void CVRServerDriverHost_005::TrackedDevicePoseUpdated(uint32_t unWhichDevice, const DriverPose_t005& newPose, uint32_t unPoseStructSize)
+ {
++	auto sessionLock = xr_session.lock_shared();
+ 	base->TrackedDevicePoseUpdated(unWhichDevice, (OCDriverPose_t&)newPose, unPoseStructSize);
+ }
+diff --git c/OpenOVR/Reimpl/CVRSettings.cpp w/OpenOVR/Reimpl/CVRSettings.cpp
+index 30adf22..c8a15f5 100644
+--- c/OpenOVR/Reimpl/CVRSettings.cpp
++++ w/OpenOVR/Reimpl/CVRSettings.cpp
+@@ -1,6 +1,7 @@
+ #include "stdafx.h"
+ #define GENFILE
+ #include "BaseCommon.h"
++#include "Misc/xrutil.h"
+ 
+ GEN_INTERFACE("Settings", "001")
+ GEN_INTERFACE("Settings", "002")
+@@ -13,21 +14,26 @@ typedef vr::IVRSettings_001::EVRSettingsError EVRSettingsError001;
+ 
+ bool CVRSettings_001::GetBool(const char* pchSection, const char* pchSettingsKey, bool bDefaultValue, EVRSettingsError001* peError)
+ {
++	// cranvr: as the generated stubs do (see SessionWrapper in xrutil.h)
++	auto sessionLock = xr_session.lock_shared();
+ 	return base->GetBool(pchSection, pchSettingsKey, (EVRSettingsErrorBase*)peError);
+ }
+ int32_t CVRSettings_001::GetInt32(const char* pchSection, const char* pchSettingsKey, int32_t nDefaultValue, EVRSettingsError001* peError)
+ {
++	auto sessionLock = xr_session.lock_shared();
+ 	return base->GetInt32(pchSection, pchSettingsKey, (EVRSettingsErrorBase*)peError);
+ };
+ 
+ float CVRSettings_001::GetFloat(const char* pchSection, const char* pchSettingsKey, float flDefaultValue, EVRSettingsError001* peError)
+ {
++	auto sessionLock = xr_session.lock_shared();
+ 	return base->GetFloat(pchSection, pchSettingsKey, (EVRSettingsErrorBase*)peError);
+ };
+ 
+ void CVRSettings_001::GetString(const char* pchSection, const char* pchSettingsKey, char* pchValue, uint32_t unValueLen,
+     const char* pchDefaultValue, EVRSettingsError001* peError)
+ {
++	auto sessionLock = xr_session.lock_shared();
+ 
+ 	base->GetString(pchSection, pchSettingsKey, pchValue, unValueLen, (EVRSettingsErrorBase*)peError);
+ };
+diff --git c/OpenOVR/Reimpl/CVRSystem.cpp w/OpenOVR/Reimpl/CVRSystem.cpp
+index f425085..96a59e4 100644
+--- c/OpenOVR/Reimpl/CVRSystem.cpp
++++ w/OpenOVR/Reimpl/CVRSystem.cpp
+@@ -1,6 +1,7 @@
+ #include "stdafx.h"
+ #define GENFILE
+ #include "BaseCommon.h"
++#include "Misc/xrutil.h"
+ 
+ GEN_INTERFACE("System", "009")
+ GEN_INTERFACE("System", "011")
+@@ -22,43 +23,52 @@ GEN_INTERFACE("System", "026")
+ // Old methods that don't take size arguments
+ bool CVRSystem_009::PollNextEvent(vr::VREvent_t* pEvent)
+ {
++	// cranvr: as the generated stubs do (see SessionWrapper in xrutil.h)
++	auto sessionLock = xr_session.lock_shared();
+ 	return base->PollNextEvent(pEvent, sizeof(vr::VREvent_t));
+ }
+ 
+ bool CVRSystem_009::PollNextEventWithPose(vr::ETrackingUniverseOrigin eOrigin, vr::VREvent_t* pEvent, vr::TrackedDevicePose_t* pTrackedDevicePose)
+ {
++	auto sessionLock = xr_session.lock_shared();
+ 	return base->PollNextEventWithPose(eOrigin, pEvent, sizeof(vr::VREvent_t), pTrackedDevicePose);
+ }
+ 
+ bool CVRSystem_009::GetControllerState(vr::TrackedDeviceIndex_t unControllerDeviceIndex, vr::VRControllerState_t* pControllerState)
+ {
++	auto sessionLock = xr_session.lock_shared();
+ 	return base->GetControllerState(unControllerDeviceIndex, pControllerState, sizeof(vr::VRControllerState001_t));
+ }
+ 
+ bool CVRSystem_009::GetControllerStateWithPose(vr::ETrackingUniverseOrigin eOrigin, vr::TrackedDeviceIndex_t unControllerDeviceIndex,
+     vr::VRControllerState_t* pControllerState, vr::TrackedDevicePose_t* pTrackedDevicePose)
+ {
++	auto sessionLock = xr_session.lock_shared();
+ 	return base->GetControllerStateWithPose(eOrigin, unControllerDeviceIndex, pControllerState, sizeof(vr::VRControllerState001_t), pTrackedDevicePose);
+ }
+ 
+ bool CVRSystem_011::GetControllerState(vr::TrackedDeviceIndex_t unControllerDeviceIndex, vr::VRControllerState_t* pControllerState)
+ {
++	auto sessionLock = xr_session.lock_shared();
+ 	return base->GetControllerState(unControllerDeviceIndex, pControllerState, sizeof(vr::VRControllerState001_t));
+ }
+ 
+ bool CVRSystem_011::GetControllerStateWithPose(vr::ETrackingUniverseOrigin eOrigin, vr::TrackedDeviceIndex_t unControllerDeviceIndex,
+     vr::VRControllerState_t* pControllerState, vr::TrackedDevicePose_t* pTrackedDevicePose)
+ {
++	auto sessionLock = xr_session.lock_shared();
+ 	return base->GetControllerStateWithPose(eOrigin, unControllerDeviceIndex, pControllerState, sizeof(vr::VRControllerState001_t), pTrackedDevicePose);
+ }
+ 
+ bool CVRSystem_012::GetControllerState(vr::TrackedDeviceIndex_t unControllerDeviceIndex, vr::VRControllerState_t* pControllerState)
+ {
++	auto sessionLock = xr_session.lock_shared();
+ 	return base->GetControllerState(unControllerDeviceIndex, pControllerState, sizeof(vr::VRControllerState001_t));
+ }
+ 
+ bool CVRSystem_012::GetControllerStateWithPose(vr::ETrackingUniverseOrigin eOrigin, vr::TrackedDeviceIndex_t unControllerDeviceIndex,
+     vr::VRControllerState_t* pControllerState, vr::TrackedDevicePose_t* pTrackedDevicePose)
+ {
++	auto sessionLock = xr_session.lock_shared();
+ 	return base->GetControllerStateWithPose(eOrigin, unControllerDeviceIndex, pControllerState, sizeof(vr::VRControllerState001_t), pTrackedDevicePose);
+ }
+diff --git c/scripts/stubs.py w/scripts/stubs.py
+index f7edb8f..b9341a2 100644
+--- c/scripts/stubs.py
++++ w/scripts/stubs.py
+@@ -91,6 +91,7 @@ with open(output_dir / "stubs.gen.cpp", "w", newline='\n') as impl:
+     impl.write('#include "Reimpl/Interfaces.h"\n')
+     impl.write(f'#include "{bases_header_fn.name}"\n')
+     impl.write('#include "Misc/Config.h"\n')
++    impl.write('#include "Misc/xrutil.h"\n')
+ 
+     for iface in interfaces:
+         codegen.write_stubs(impl, iface)
+diff --git c/scripts/stubs/codegen.py w/scripts/stubs/codegen.py
+index dd43544..0456499 100644
+--- c/scripts/stubs/codegen.py
++++ w/scripts/stubs/codegen.py
+@@ -114,7 +114,10 @@ std::shared_ptr<{cls}> GetCreate{getter_name}() {{
+             else:
+                 call = f"{return_str} base->{f.name}({nargs});"
+ 
++            # cranvr: each entry point holds the session's shared lock, so a session restart on another
++            # thread waits for the call to end (see SessionWrapper in xrutil.h)
+             fi.write(f"{f.return_type} {cname}::{f.name}({f.args_str()}) {{\n"
++                     "\tauto sessionLock = xr_session.lock_shared();\n"
+                      "\tif (oovr_global_configuration.LogAllOpenVRCalls())\n"
+                      f"\t\tOOVR_LOG(\"Entered function (from interface {ver.namespace()})\");\n"
+                      f"\t{call}\n}}\n")
