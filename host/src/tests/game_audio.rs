@@ -33,6 +33,29 @@ fn interleaved_mono_16_bit_plays_on_both_sides() {
     assert_eq!(samples(&out), [7, 7, -9, -9]);
 }
 
+// Core Audio may hand planar buffers of different lengths. The frames that both hold come out,
+// and nothing reads past the shorter buffer.
+#[test]
+fn planar_buffers_of_different_lengths_give_the_frames_that_both_hold() {
+    let description = StreamDescription { bits_per_channel: 16, format_flags: FORMAT_FLAG_NON_INTERLEAVED, ..Default::default() };
+    let (long, short) = ([1i16, 2, 3, 4], [-1i16, -2]);
+    let out = unsafe { interleave(&description, &[buffer(1, &long), buffer(1, &short)]) }.unwrap();
+    assert_eq!(samples(&out), [1, -1, 2, -2]);
+    let out = unsafe { interleave(&description, &[buffer(1, &short), buffer(1, &long)]) }.unwrap();
+    assert_eq!(samples(&out), [-1, 1, -2, 2]);
+}
+
+// A buffer may come without data: the block counts it as unreadable instead of reading address 0
+#[test]
+fn a_buffer_without_data_is_unreadable() {
+    let empty = AudioBuffer { channels: 2, bytes: 4096, data: std::ptr::null() };
+    let interleaved = StreamDescription { bits_per_channel: 16, ..Default::default() };
+    assert!(unsafe { interleave(&interleaved, &[empty]) }.is_none());
+    let planar = StreamDescription { format_flags: FORMAT_FLAG_FLOAT | FORMAT_FLAG_NON_INTERLEAVED, bits_per_channel: 32, ..Default::default() };
+    let left = [0.5f32; 4];
+    assert!(unsafe { interleave(&planar, &[buffer(1, &left), empty]) }.is_none());
+}
+
 fn stereo(frames: &[[i16; 2]]) -> Vec<u8> {
     frames.iter().flat_map(|[l, r]| [l.to_ne_bytes(), r.to_ne_bytes()]).flatten().collect()
 }

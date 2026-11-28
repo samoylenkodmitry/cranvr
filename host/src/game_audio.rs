@@ -145,41 +145,78 @@ struct AudioBuffer {
 /// The buffers of a list: at most 8, one per channel when the samples are not interleaved
 const MAX_BUFFERS: usize = 8;
 
+/// The samples of one buffer of a list, in the stream's format
+#[derive(Clone, Copy)]
+enum Samples<'a> {
+    Float(&'a [f32]),
+    Int(&'a [i16]),
+}
+
+impl<'a> Samples<'a> {
+    /// The samples of `buffer`. `None` for a buffer without data, or with data at an address that does
+    /// not suit the samples' type.
+    ///
+    /// # Safety
+    /// A `data` that is not null points at `bytes` bytes that stay valid for `'a`.
+    unsafe fn of(buffer: &'a AudioBuffer, float: bool) -> Option<Self> {
+        unsafe fn slice<T>(buffer: &AudioBuffer) -> Option<&[T]> {
+            let data = buffer.data.cast::<T>();
+            // SAFETY: the caller's promise covers the bytes; the slice holds whole samples only
+            (!data.is_null() && data.is_aligned()).then(|| unsafe { std::slice::from_raw_parts(data, buffer.bytes as usize / size_of::<T>()) })
+        }
+        Some(if float { Self::Float(slice(buffer)?) } else { Self::Int(slice(buffer)?) })
+    }
+
+    fn len(self) -> usize {
+        match self {
+            Self::Float(samples) => samples.len(),
+            Self::Int(samples) => samples.len(),
+        }
+    }
+
+    fn at(self, index: usize) -> i16 {
+        match self {
+            Self::Float(samples) => (samples[index].clamp(-1.0, 1.0) * i16::MAX as f32) as i16,
+            Self::Int(samples) => samples[index],
+        }
+    }
+}
+
 /// Reads float or 16-bit samples, planar or interleaved, as interleaved 16-bit stereo. A mono
-/// source plays on both sides; channels past the second are dropped.
+/// source plays on both sides; channels past the second are dropped. A buffer without data gives
+/// `None`. Planar buffers of different lengths give the frames that both hold.
+///
+/// # Safety
+/// The `data` of each buffer that is not null points at its `bytes` bytes.
 unsafe fn interleave(description: &StreamDescription, buffers: &[AudioBuffer]) -> Option<Vec<u8>> {
     let float = description.format_flags & FORMAT_FLAG_FLOAT != 0;
     let bytes_per_sample = (description.bits_per_channel / 8) as usize;
     if !(float && bytes_per_sample == 4 || !float && bytes_per_sample == 2) {
         return None;
     }
-    let read = |buffer: &AudioBuffer, index: usize| -> i16 {
-        if float {
-            let value = *(buffer.data as *const f32).add(index);
-            (value.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
-        } else {
-            *(buffer.data as *const i16).add(index)
-        }
-    };
     let planar = description.format_flags & FORMAT_FLAG_NON_INTERLEAVED != 0;
     let mut out = Vec::new();
     if planar {
-        let first = buffers.first()?;
-        let second = buffers.get(1).unwrap_or(first);
-        let frames = first.bytes as usize / bytes_per_sample;
+        let first = Samples::of(buffers.first()?, float)?;
+        let second = match buffers.get(1) {
+            Some(buffer) => Samples::of(buffer, float)?,
+            None => first,
+        };
+        let frames = first.len().min(second.len());
         out.reserve(frames * CHANNELS * 2);
         for i in 0..frames {
-            out.extend_from_slice(&read(first, i).to_ne_bytes());
-            out.extend_from_slice(&read(second, i).to_ne_bytes());
+            out.extend_from_slice(&first.at(i).to_ne_bytes());
+            out.extend_from_slice(&second.at(i).to_ne_bytes());
         }
     } else {
         let buffer = buffers.first()?;
+        let samples = Samples::of(buffer, float)?;
         let channels = (buffer.channels as usize).max(1);
-        let frames = buffer.bytes as usize / bytes_per_sample / channels;
+        let frames = samples.len() / channels;
         out.reserve(frames * CHANNELS * 2);
         for i in 0..frames {
-            let left = read(buffer, i * channels);
-            let right = if channels > 1 { read(buffer, i * channels + 1) } else { left };
+            let left = samples.at(i * channels);
+            let right = if channels > 1 { samples.at(i * channels + 1) } else { left };
             out.extend_from_slice(&left.to_ne_bytes());
             out.extend_from_slice(&right.to_ne_bytes());
         }

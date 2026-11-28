@@ -430,7 +430,17 @@ fn run(
     };
     // A phone that did not measure its screen in time still connects, at an ordinary rate
     let phone_info = (device == Device::Phone).then(|| hub.phone().unwrap_or(PhoneInfo { screen: [1920, 1080], refresh_hz: 60.0 }));
-    let identity = crate::settings::identity();
+    let identity = match crate::settings::identity() {
+        Ok(identity) => identity,
+        Err(e) => {
+            // Without the system's random numbers the headset has no key of its own, and a key
+            // from the clock would be easy to guess
+            let message = format!("this headset has no key for pairing: the system gave no random numbers ({e})");
+            log::warn!("{message}");
+            hub.report(id, |snapshot| snapshot.state = LinkState::Failed(message));
+            return;
+        }
+    };
     let caps = device_caps(Media { tcp_only: tcp_media, cable: by_cable }, headset.as_ref(), phone_info, views);
     log::info!(
         "Hello: {} with {}x{} pixels an eye, refresh rates {:?}, fov {:?}, eyes at {:?}",

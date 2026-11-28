@@ -21,6 +21,7 @@ mod pacer;
 mod pairing;
 mod pose;
 mod pose_gaps;
+mod private_file;
 mod recording_align;
 mod recording_mux;
 mod recording_sound;
