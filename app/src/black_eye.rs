@@ -111,7 +111,14 @@ pub enum Outcome {
 pub fn apply(launch: &mut BTreeMap<String, GameOptions>, known: &[String], program: Option<&str>, images: EyeImages) -> Outcome {
     let pass = Pass::first(images);
     let Some(program) = program.filter(|program| !program.is_empty()) else { return Outcome::Unknown { pass } };
-    let key = launch.keys().chain(known).find(|key| key.eq_ignore_ascii_case(program)).cloned().unwrap_or_else(|| program.to_owned());
+    // The exact spelling wins over another entry of the same program in another case
+    let key = launch
+        .keys()
+        .chain(known)
+        .find(|key| key.as_str() == program)
+        .or_else(|| launch.keys().chain(known).find(|key| key.eq_ignore_ascii_case(program)))
+        .cloned()
+        .unwrap_or_else(|| program.to_owned());
     let options = launch.entry(key.clone()).or_default();
     if options.eye_one_pass {
         return Outcome::Leave { program: key, pass: Pass::Both };

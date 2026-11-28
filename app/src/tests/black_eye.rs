@@ -152,6 +152,16 @@ fn a_program_takes_the_spelling_of_the_listed_game_or_of_its_entry() {
 }
 
 #[test]
+fn a_program_with_entries_in_two_spellings_takes_its_own() {
+    // "C:\\Games\\Some Game\\Game.exe" sorts before PROGRAM, so a match by case alone took it
+    let other = "C:\\Games\\Some Game\\Game.exe".to_owned();
+    let mut launch = BTreeMap::from([(other.clone(), GameOptions::default()), (PROGRAM.to_owned(), GameOptions::default())]);
+    assert_eq!(apply(&mut launch, &[], Some(PROGRAM), OPENXR), Outcome::Restart { program: PROGRAM.to_owned(), pass: Pass::Each });
+    assert!(launch[PROGRAM].eye_per_pass);
+    assert!(!launch[&other].eye_per_pass);
+}
+
+#[test]
 fn the_first_report_restarts_the_game_and_later_reports_do_not() {
     let game = Game { app_id: "1".into(), name: "Some Game".into(), exe: Some(PathBuf::from("/Users/x/game.exe")), ..Default::default() };
     let program = "Z:\\Users\\x\\game.exe";
