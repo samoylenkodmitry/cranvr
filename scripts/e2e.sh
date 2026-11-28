@@ -7,7 +7,7 @@
 #                       [--quest [SERIAL] [--room scene|passthrough] | --native-tcp] [--native-drop PERCENT] [--native-port PORT]
 #                       [--host-arg ARG]... [--probe-arg ARG]... [--report FILE]
 #                       [--tracking [FEATURES] | --hand-controllers | --tracking-wine | --hand-interaction [hand|both]
-#                        | --openvr-wine | --openvr-actions MODE | --openvr-overlay | --openvr-gl | --openvr-vulkan | --steamvr
+#                        | --openvr-wine | --openvr-actions MODE | --openvr-overlay | --openvr-mailbox | --openvr-gl | --openvr-vulkan | --steamvr
 #                        | --xr-vulkan [enable2|enable1|array]
 #                        | --swapchain-churn d3d11|d3d11-array|vulkan|vulkan-array [--churn-cycles N] [--churn-frames]]
 #                       [--openvr-arg ARG]...
@@ -71,6 +71,11 @@
 #   --openvr-overlay  the same program with an overlay up for the whole run (a loading screen's). The runtime takes
 #                 no quad layer, so OpenComposite leaves the overlay out; the run fails when the host counts fewer
 #                 game frames than half of the rate. Implies --openvr-wine.
+#   --openvr-mailbox  the same program sends a loading screen through OpenVR's mailbox, as Half-Life: Alyx does
+#                 (openvr_smoke.exe --mailbox): "begin_loading" before its first frame, "show_message" after OpenComposite's
+#                 restart of its session and "end_loading" a second later. The run fails unless the probe gets three
+#                 screens in this order: the load with its words and lines, the load with the message, and none.
+#                 Implies --openvr-wine.
 #   --openvr-gl   the same program with OpenGL, as Google Earth VR draws: it asks Wine for an OpenGL 3.2 context with the
 #                 compatibility profile, draws with a shader of GLSL 1.10 and submits one OpenGL texture with both eyes
 #                 side by side. OpenComposite copies it into the runtime's Direct3D 11 images. The run checks the
@@ -225,7 +230,7 @@ root=${0:A:h:h}
 source "${root}/scripts/guardian.sh"
 seconds=12 seconds_given=0 fps=120 fps_given=0 game=0 desktop=0 sound=0 client=mac serial="" report=""
 displays=1 hold=0 hand_hold=0 displays_in_game=0 display_test=0
-tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 hand_interaction="" openvr_wine=0 openvr_actions="" openvr_overlay=0 openvr_gl=0 steamvr=0 face_source=audio
+tracking=0 tracking_features=hands,body,full_body,face,eyes hand_controllers=0 tracking_wine=0 hand_interaction="" openvr_wine=0 openvr_actions="" openvr_overlay=0 openvr_mailbox=0 openvr_gl=0 steamvr=0 face_source=audio
 openvr_vulkan=0 openvr_args=() xr_vulkan="" swapchain_churn="" churn_cycles=1000 churn_cycles_given=0 churn_frames=0
 game_stall="" moving=0
 wine="" wine_args=() wine_given=0
@@ -249,6 +254,7 @@ while (( $# )); do
             [[ ${hand_interaction} == (hand|both) ]] || { print -u2 -r -- "--hand-interaction takes hand or both"; exit 2; } ;;
         --openvr-wine) openvr_wine=1; shift ;;
         --openvr-overlay) openvr_wine=1 openvr_overlay=1; shift ;;
+        --openvr-mailbox) openvr_wine=1 openvr_mailbox=1; shift ;;
         --openvr-gl) openvr_wine=1 openvr_gl=1; shift ;;
         --openvr-vulkan) openvr_wine=1 openvr_vulkan=1; shift ;;
         --openvr-arg) openvr_args+=("$2"); shift 2 ;;
@@ -333,6 +339,7 @@ if (( openvr_wine )); then
     wine_args=(--seconds ${program_seconds} --expect-input)
     [[ -z ${openvr_actions} ]] || wine_args+=(--actions "${openvr_actions}")
     (( ! openvr_overlay )) || wine_args+=(--overlay)
+    (( ! openvr_mailbox )) || wine_args+=(--mailbox)
     (( ! openvr_gl )) || wine_args+=(--gl)
     (( ! openvr_vulkan )) || wine_args+=(--vulkan)
     wine_args+=("${openvr_args[@]}")
@@ -888,6 +895,21 @@ if not counts:
 mean = sum(counts) / len(counts) / 5.0
 print("overlay: the host got %.1f game frames a second at %g Hz (windows: %s)" % (mean, fps, counts))
 sys.exit(0 if mean >= 0.5 * fps else 1)
+PYTHON
+    fi
+    if (( openvr_mailbox )); then
+        # The game's screens reach the headset in the order of the program's messages
+        python3 -I - "${work}/probe.log" <<'PYTHON' || { print -u2 "The probe did not get the program's loading screen in order; see ${work}/probe.log"; openvr_exit=1; }
+import json, sys
+screens = [json.loads(line.split("probe: game screen ", 1)[1]) for line in open(sys.argv[1], errors="replace") if "probe: game screen " in line]
+for screen in screens:
+    print("mailbox: the probe got %s" % json.dumps(screen))
+expected = len(screens) == 3 and screens[2] is None
+if expected:
+    load, message = screens[0], screens[1]
+    expected = (load["loading"] == "LOADING" and len(load["lines"]) == 2 and load["message"] is None and load["facing_deg"] == 0.0
+                and message["message"] == "Press Trigger To Start" and message["lines"] == load["lines"])
+sys.exit(0 if expected else 1)
 PYTHON
     fi
     # The picture of each eye reaches the host the right way up: the program's upper half is bright, its lower half nearly black

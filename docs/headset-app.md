@@ -188,7 +188,7 @@ The client ranks its panels with `SubspaceModifier::layer_priority` (`panel_layo
 | Rank | Panels | Why |
 |---|---|---|
 | 3 | the Mac's cursor ring over a display | The displays come first. On a runtime with no depth test, a ring in the projection layer can draw under the layer of its display. |
-| 2 | the console and the connect panel | Most of their text is 20 to 22 mm tall at 0.6 to 1 m, which is 1.3 to 2 degrees. |
+| 2 | the console, the connect panel and the game's loading screen | Most of their text is 20 to 22 mm tall at 0.6 to 1 m, which is 1.3 to 2 degrees. The loading screen's text is 34 to 64 mm tall at 1.5 m, which is 1.3 to 2.4 degrees. |
 | 1 | the hand menu: the ball and the menu | Its text is 20 to 26 mm tall at 45 cm, which is 2.5 to 3.3 degrees. It stays readable when it shows softer. |
 | 0 | the stream numbers | The user reads them only to check the link. |
 
@@ -203,6 +203,10 @@ The host gives the game rest values for a held hand: no button, no touch, no tri
 Cranpose gives each hand a pointer of its own, and a pointer event carries the id of its pointer: `PointerId(1)` for the left hand and `PointerId(2)` for the right hand (Cranpose#2432). The client therefore knows which hand's ray is on a panel (`hover.rs`). The root of each panel of the app reads the events of its pointers with `pointer_input` (`hover_modifier`), and a display's surface reads them in its own callback. An event with another id comes from the window's mouse. It counts for both hands. A pull on a panel keeps the hand held until the trigger lets go, also when the ray leaves the panel during the press. A hand stays held for 150 ms after the ray left the last panel, and for 1.5 seconds while the hand menu is open and the hand works it: the other hand of a menu on a hand, or the hand that points at a menu in front of the user. A grab of a panel's handle (the carry sphere under a panel, the resize sphere at its corner) holds the hands whose triggers are down from its start to its end.
 
 What the app cannot know without more from Cranpose: that a hand's ray is on a handle. A handle gives the app no hover and no hand, only the start and the end of a grab. The pull that starts a grab therefore reaches the game for the frames before the grab's start. `XrFrame` or the pointer's events would have to name the panel or the handle that each hand's ray meets for an exact answer.
+
+### The game's loading screen
+
+A game that loads tells the user what it waits for: its loading words, a tip and a message such as "Press Trigger To Start" (see "A game's loading screen" in games.md). The client shows them as plain text on a panel of 1.2 m by 0.56 m, 1.5 m away at the height of the head (`game_screen.rs`). A screen with a direction stands in the game's room at that direction, as SteamVR puts the game's own screen: the room's origin is the game's middle, and its forward direction is the game's. A screen without a direction stands in front of the head where it looked when the screen showed. The panel keeps its place while one load shows, so a new message does not move it. It shows in a game whatever the hands do, and its layer has the rank of the console (2). It goes when the game ends the load, when the game ends and when the link ends. The client copies the screen from the hub only when the host changed it, and composes nothing while no screen shows. The phone shows the same words over its picture.
 
 ### Controls
 

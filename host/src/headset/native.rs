@@ -40,7 +40,7 @@ use cranvr_proto::{
     link::{HostLink, HostListener, HostSide, Incoming, MediaMode, Pending},
     media::{FrameMeta, DEFAULT_SHARD_LEN},
     message::{
-        buttons, display_index, negotiate, ClientDatagram, ClientMsg, FrameTiming, Focus, HostDatagram, HostMsg, HostWishes, Input,
+        buttons, display_index, negotiate, ClientDatagram, ClientMsg, FrameTiming, Focus, GameScreen, HostDatagram, HostMsg, HostWishes, Input,
         InputHold, LossReport, Ping, Pong, Recording, RejectReason, Tracking, Views as ProtoViews, UPDATE_HEADSET, UPDATE_MAC,
     },
     motion::extrapolate,
@@ -134,6 +134,8 @@ struct Shared {
     wish: Mutex<Features>,
     /// The state of the app's recording of what the headset shows. A new session gets it at once.
     recording: Mutex<Recording>,
+    /// What the game shows between its scenes. A new session gets it at once while it shows.
+    game_screen: Mutex<Option<GameScreen>>,
 }
 
 /// The most threads that hold a client for the user's answer at once. A device that opens many
@@ -277,7 +279,7 @@ pub fn start(config: Config) -> std::io::Result<(Arc<dyn Headset>, Box<dyn Event
     }
     announce(&config);
     let (events, receiver) = mpsc::channel();
-    let shared = Arc::new(Shared { events, session: Mutex::new(None), decoder_config: Mutex::new(None), starting: Mutex::new(()), asking: Asking::default(), handshakes: Handshakes::default(), wish: Mutex::new(Features::NONE), recording: Mutex::new(Recording::default()) });
+    let shared = Arc::new(Shared { events, session: Mutex::new(None), decoder_config: Mutex::new(None), starting: Mutex::new(()), asking: Asking::default(), handshakes: Handshakes::default(), wish: Mutex::new(Features::NONE), recording: Mutex::new(Recording::default()), game_screen: Mutex::new(None) });
     {
         let shared = Arc::clone(&shared);
         let config = Arc::new(config);
@@ -646,6 +648,11 @@ fn run_session(shared: &Shared, session: &Arc<Session>, stream: cranvr_proto::me
     }
     let recording = shared.recording.lock().unwrap().clone();
     session.link.duplex.send_control(&HostMsg::Recording(recording)).ok();
+    // A headset that connects during a load sees the game's screen. With none it gets no message.
+    let screen = shared.game_screen.lock().unwrap().clone();
+    if screen.is_some() {
+        session.link.duplex.send_control(&HostMsg::GameScreen(screen)).ok();
+    }
     thread::scope(|scope| {
         scope.spawn(|| ping_loop(session));
         if session.link.duplex.has_udp() {
@@ -1693,6 +1700,15 @@ impl Headset for Native {
         if let Some(session) = self.shared.session() {
             if let Err(e) = session.link.duplex.send_control(&HostMsg::Recording(state)) {
                 warn!("Native protocol: the recording's state did not go out: {e}");
+            }
+        }
+    }
+
+    fn set_game_screen(&self, screen: Option<GameScreen>) {
+        *self.shared.game_screen.lock().unwrap() = screen.clone();
+        if let Some(session) = self.shared.session() {
+            if let Err(e) = session.link.duplex.send_control(&HostMsg::GameScreen(screen)) {
+                warn!("Native protocol: the game's screen did not go out: {e}");
             }
         }
     }

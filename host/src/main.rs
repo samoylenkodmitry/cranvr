@@ -9,6 +9,7 @@ mod display_modes;
 mod eye_check;
 mod game_audio;
 mod game_eye;
+mod game_screen;
 mod game_sizes;
 mod gpu_health;
 mod hand_controller;
@@ -543,13 +544,14 @@ fn main() {
     });
 
     let (link, game_events) = {
-        let headset = Arc::clone(&headset);
-        let on_haptic = move |h: runtime_link::Haptic| headset.send_haptics(h);
+        let (haptics, screens) = (Arc::clone(&headset), Arc::clone(&headset));
+        let on_haptic = move |h: runtime_link::Haptic| haptics.send_haptics(h);
+        let on_screen = move |screen| screens.set_game_screen(screen);
         let control_file = config_dir.join("runtime-control.txt");
         // A game that starts before any headset links renders at the eye that a Quest 3 would get.
         // A whole Quest 3 eye here gave such a game 2.8 times the pixels of the stream (#170).
         let (eye, fps) = game_eye::before_link(&wishes(&options), options.game_scale).unwrap_or((runtime_link::MAX_VIEW, options.fps as u32));
-        RuntimeLink::start(&control_file, eye, fps, on_haptic).expect("runtime control socket")
+        RuntimeLink::start(&control_file, eye, fps, on_haptic, on_screen).expect("runtime control socket")
     };
     let (eye, fps) = link.written();
     info!(

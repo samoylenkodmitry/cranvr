@@ -351,6 +351,27 @@ pub enum HostMsg {
     /// sends it when the client connects and when it changes. The client starts and stops a
     /// recording with the console's request `{"action": "run", "id": "recording.toggle"}`.
     Recording(Recording),
+    /// What the game shows between its scenes (see [`GameScreen`]), or `None` while it shows
+    /// nothing. The host sends it when it changes, and when the client connects while a screen
+    /// shows.
+    GameScreen(Option<GameScreen>),
+}
+
+/// A game's loading screen and its message to the user, as text. A game that speaks OpenVR tells
+/// SteamVR what to show between its scenes, and SteamVR draws it. The host makes this screen from
+/// the game's messages (host/src/game_screen.rs). The client shows it in front of the user. Every
+/// field holds plain text.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GameScreen {
+    /// The words of a load, such as "LOADING", while the game loads
+    pub loading: Option<String>,
+    /// More lines of the load, such as a tip, in the order in which they show
+    pub lines: Vec<String>,
+    /// A message to the user, such as "Press Trigger To Start"
+    pub message: Option<String>,
+    /// Where the screen stands: a turn in degrees about the game's up axis, from the game's forward
+    /// direction toward its left, as OpenVR turns. `None` puts the screen in front of the user.
+    pub facing_deg: Option<f32>,
 }
 
 /// The state of the recording of what the headset shows: the cranvr app on the Mac drives the

@@ -24,7 +24,7 @@ use cranvr_common::controls::{Action as ControlAction, Control, Controls, Hand, 
 use cranvr_common::foveation::{Foveation, FoveationConfig};
 use cranvr_proto::{
     clock::now_ns,
-    message::{Focus, FoveationParams, Input, Recording},
+    message::{Focus, FoveationParams, GameScreen, Input, Recording},
     wire::{Fov, Nanos, Pose},
 };
 use std::{
@@ -392,6 +392,16 @@ pub struct Hub {
     settings_loaded: AtomicBool,
     /// The Mac's state of its recording of what the headset shows (see `record_gem.rs`)
     recording: Mutex<RecordingSlot>,
+    /// What the game shows between its scenes (see `game_screen.rs`)
+    game_screen: Mutex<GameScreenSlot>,
+}
+
+/// The game's screen, the connection that sent it and a count of its changes
+#[derive(Default)]
+struct GameScreenSlot {
+    link: u64,
+    screen: Option<GameScreen>,
+    changes: u64,
 }
 
 /// The state of the Mac's recording, the connection that sent it and a count of its changes
@@ -438,6 +448,7 @@ pub fn hub() -> &'static Hub {
         told_choices: AtomicU64::new(0),
         settings_loaded: AtomicBool::new(false),
         recording: Mutex::new(RecordingSlot::default()),
+        game_screen: Mutex::new(GameScreenSlot::default()),
     })
 }
 
@@ -811,6 +822,34 @@ impl Hub {
         slot.link = id;
         slot.state = state;
         slot.changes += 1;
+    }
+
+    /// What the game shows between its scenes (`HostMsg::GameScreen`).
+    pub(crate) fn set_game_screen(&self, id: u64, screen: Option<GameScreen>) {
+        if self.current.load(Ordering::Acquire) != id {
+            return;
+        }
+        match &screen {
+            Some(shown) => log::info!("the game's screen: {:?}, {} lines, message {:?}, facing {:?}", shown.loading, shown.lines.len(), shown.message, shown.facing_deg),
+            None => log::info!("the game's screen hides"),
+        }
+        let mut slot = self.game_screen.lock().unwrap();
+        slot.link = id;
+        slot.screen = screen;
+        slot.changes += 1;
+    }
+
+    /// A count that changes with the game's screen and with the link, so a look that finds it
+    /// unchanged copies nothing.
+    pub fn game_screen_changes(&self) -> (u64, u64) {
+        (self.game_screen.lock().unwrap().changes, self.current.load(Ordering::Acquire))
+    }
+
+    /// The game's screen, while the link that sent it runs. A link that ends takes its screen along.
+    pub fn game_screen(&self) -> Option<GameScreen> {
+        let current = self.current.load(Ordering::Acquire);
+        let slot = self.game_screen.lock().unwrap();
+        (current != 0 && slot.link == current).then(|| slot.screen.clone()).flatten()
     }
 
     /// A count that changes with the recording's state and with the link, so a look that finds it

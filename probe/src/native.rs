@@ -615,6 +615,10 @@ fn read_loop(shared: &Arc<Shared>, units: &mpsc::Sender<Received>, udp: bool) {
                 println!("probe: the host says that a game {}", if runs { "runs" } else { "does not run" });
             }
         }
+        // One line per screen with its JSON, so a test reads the messages of a game in their order
+        Incoming::Control(HostMsg::GameScreen(screen)) => {
+            println!("probe: game screen {}", serde_json::to_string(&screen).unwrap_or_default());
+        }
         Incoming::Control(HostMsg::Bye) => shared.stop.store(true, Ordering::Relaxed),
         Incoming::Control(HostMsg::OpenMenu) => println!("probe: the host asks to open the hand menu"),
         Incoming::Control(HostMsg::Microphone(record)) => {

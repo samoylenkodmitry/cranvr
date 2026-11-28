@@ -763,6 +763,7 @@ fn read_loop(s: &Shared<'_>, units: mpsc::Sender<Received>, udp: bool) -> Error 
         Incoming::Control(HostMsg::Microphone(record)) => crate::microphone::on_wish(s.link, record),
         Incoming::Control(HostMsg::OpenMenu) => s.hub.ask_for_menu(),
         Incoming::Control(HostMsg::Recording(state)) => s.hub.set_recording(s.id, state),
+        Incoming::Control(HostMsg::GameScreen(screen)) => s.hub.set_game_screen(s.id, screen),
         Incoming::Control(HostMsg::Bye) => {
             s.stop.store(true, Ordering::Relaxed);
             s.link.duplex.close();

@@ -58,6 +58,13 @@ fn the_display_messages_round_trip() {
     round_trip(HostMsg::DisplayStream { stream: 3, params: Some(params(3)) });
     round_trip(HostMsg::DisplayStream { stream: 3, params: None });
     round_trip(HostMsg::GameRuns(true));
+    round_trip(HostMsg::GameScreen(Some(GameScreen {
+        loading: Some("LOADING".into()),
+        lines: vec!["CITY 17: a city".into()],
+        message: Some("Press Trigger To Start".into()),
+        facing_deg: Some(90.0),
+    })));
+    round_trip(HostMsg::GameScreen(None));
     round_trip(ClientDatagram::DisplayMouse { stream: 2, mouse: Mouse { seq: 1, sent: 5, hit: Some([0.5, 0.5]), buttons: 3, scroll: [0.0, 0.5] } });
     round_trip(HostDatagram::DisplayCursor { stream: 2, cursor: Cursor { seq: 8, u: 0.25, v: 0.75, on: true } });
     let input = Input { sample_time: 77, hands: [HandInput { trigger: 0.5, ..Default::default() }, HandInput { buttons: buttons::PRIMARY, ..Default::default() }] };
