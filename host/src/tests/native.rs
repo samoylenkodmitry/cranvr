@@ -745,6 +745,31 @@ fn a_second_unknown_headset_gets_busy_while_the_first_waits() {
     first_client.join().unwrap().err();
 }
 
+// A peer on the network can open connections to the host and send nothing. Each handshake runs on
+// a thread of its own, so a headset connects at once beside them. One address gets at most
+// MAX_HANDSHAKES_PER_ADDRESS places: the host closes its next connection at once.
+#[test]
+fn connections_that_send_nothing_hold_back_no_headset() {
+    let port = free_port();
+    let (_headset, mut events) = start(config(port)).unwrap();
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let silent: Vec<std::net::TcpStream> = (0..MAX_HANDSHAKES_PER_ADDRESS - 1).map(|_| std::net::TcpStream::connect(addr).unwrap()).collect();
+    let started = Instant::now();
+    let client = ClientLink::connect(addr, &caps("Headset"), &identity(), None, Duration::from_secs(10)).unwrap();
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(2), "the headset waited {took:?} behind {} silent connections", silent.len());
+    wait_for(&mut *events, |e| matches!(e, Event::Connected { .. }));
+    client.duplex.close();
+    let last = std::net::TcpStream::connect(addr).unwrap();
+    let mut refused = std::net::TcpStream::connect(addr).unwrap();
+    refused.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut byte = [0u8; 1];
+    let started = Instant::now();
+    assert!(matches!(std::io::Read::read(&mut refused, &mut byte), Ok(0) | Err(_)));
+    assert!(started.elapsed() < Duration::from_secs(1), "the connection past the limit stayed open {:?}", started.elapsed());
+    drop((silent, last));
+}
+
 #[test]
 fn a_headset_on_this_mac_needs_no_approval() {
     let port = free_port();

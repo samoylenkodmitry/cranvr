@@ -52,7 +52,7 @@ use crate::hand_mask::HandMask;
 use serde_json::{json, Value};
 use std::{
     collections::VecDeque,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, RecvTimeoutError},
@@ -128,6 +128,8 @@ struct Shared {
     starting: Mutex<()>,
     /// The threads that hold a client for the user's answer
     asking: Asking,
+    /// The connections in their handshake
+    handshakes: Handshakes,
     /// The tracking features that a game uses now. A new session gets them at once.
     wish: Mutex<Features>,
     /// The state of the app's recording of what the headset shows. A new session gets it at once.
@@ -159,6 +161,43 @@ impl Asking {
 impl Drop for AskingPlace {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// The most connections in their handshake at once, and from one address. Each handshake runs on a
+/// thread of its own and ends within `HANDSHAKE_TIMEOUT`, so a peer that connects and sends nothing
+/// holds a place for at most that long. The limit for one address keeps one peer from taking
+/// every place.
+const MAX_HANDSHAKES: usize = 32;
+const MAX_HANDSHAKES_PER_ADDRESS: usize = 4;
+
+/// The addresses of the connections in their handshake, one entry for each
+#[derive(Default)]
+struct Handshakes(Arc<Mutex<Vec<IpAddr>>>);
+
+/// A place among the handshakes. It frees the place when it goes.
+struct HandshakePlace {
+    running: Arc<Mutex<Vec<IpAddr>>>,
+    ip: IpAddr,
+}
+
+impl Handshakes {
+    fn enter(&self, ip: IpAddr) -> Option<HandshakePlace> {
+        let mut running = self.0.lock().unwrap();
+        if running.len() >= MAX_HANDSHAKES || running.iter().filter(|seen| **seen == ip).count() >= MAX_HANDSHAKES_PER_ADDRESS {
+            return None;
+        }
+        running.push(ip);
+        Some(HandshakePlace { running: Arc::clone(&self.0), ip })
+    }
+}
+
+impl Drop for HandshakePlace {
+    fn drop(&mut self) {
+        let mut running = self.running.lock().unwrap();
+        if let Some(at) = running.iter().position(|seen| *seen == self.ip) {
+            running.swap_remove(at);
+        }
     }
 }
 
@@ -238,7 +277,7 @@ pub fn start(config: Config) -> std::io::Result<(Arc<dyn Headset>, Box<dyn Event
     }
     announce(&config);
     let (events, receiver) = mpsc::channel();
-    let shared = Arc::new(Shared { events, session: Mutex::new(None), decoder_config: Mutex::new(None), starting: Mutex::new(()), asking: Asking::default(), wish: Mutex::new(Features::NONE), recording: Mutex::new(Recording::default()) });
+    let shared = Arc::new(Shared { events, session: Mutex::new(None), decoder_config: Mutex::new(None), starting: Mutex::new(()), asking: Asking::default(), handshakes: Handshakes::default(), wish: Mutex::new(Features::NONE), recording: Mutex::new(Recording::default()) });
     {
         let shared = Arc::clone(&shared);
         let config = Arc::new(config);
@@ -381,61 +420,82 @@ fn version_notice(error: &ProtoError) -> Option<String> {
     ))
 }
 
+/// Takes each connection and runs its handshake on a thread of its own, so a peer that connects
+/// and sends nothing holds back no headset.
 fn accept_loop(listener: HostListener, config: Arc<Config>, shared: Arc<Shared>) {
+    let listener = Arc::new(listener);
     loop {
-        let pending = match listener.accept() {
-            Ok(pending) => pending,
-            // A connection that ends before the client's key is a probe: the headset app asks a
-            // cabled Mac every second whether it answers (see `cranvr_proto::link::probe_host`).
-            Err(ProtoError::Closed) => {
-                debug!("Native protocol: a connection ended before its hello");
-                continue;
-            }
+        let connecting = match listener.connecting() {
+            Ok(connecting) => connecting,
             Err(e) => {
-                warn!("Native protocol: a connection failed before its hello: {e}");
-                if let Some(message) = version_notice(&e) {
-                    status::emit(json!({"type": "network", "problem": "incompatible_client", "message": message}));
-                }
+                warn!("Native protocol: a connection was not taken: {e}");
                 continue;
             }
         };
-        let name = display_name(&pending.caps.name);
-        if pending.caps.cable && !config.cable.load(Ordering::Relaxed) {
-            // The headset probed the cable a moment before the user chose Wi-Fi. It connects over
-            // Wi-Fi next, because the preamble of its next probe says that the cable is off.
-            info!("Native protocol: {name} at {} came over the USB cable, and the user chose Wi-Fi", pending.peer);
-            pending.reject(RejectReason::WiFiOnly);
+        let Some(place) = shared.handshakes.enter(connecting.peer.ip()) else {
+            // The dropped connection closes at once. A flood of them must not fill the log.
+            debug!("Native protocol: {} was refused: too many handshakes run", connecting.peer);
             continue;
-        }
-        if shared.session().is_some() {
-            warn!("Native protocol: {name} at {} was refused: another headset is connected", pending.peer);
-            pending.reject(RejectReason::Busy);
-            continue;
-        }
-        // A client on this Mac needs no pairing. For another one the host looks up the key.
-        // The handshake proved that the client holds it, so a client cannot claim the key of
-        // another client.
-        let known = config.trust_all
-            || (pending.peer.ip().is_loopback() && !config.approve_loopback)
-            || config.pairings.contains(&pending.client_key);
-        if known {
-            start_session(&config, &shared, pending, &name);
-        } else {
-            let (config, shared) = (Arc::clone(&config), Arc::clone(&shared));
-            let Some(place) = shared.asking.enter() else {
-                warn!("Native protocol: {name} at {} was refused: too many headsets wait for the user", pending.peer);
-                pending.reject(RejectReason::Busy);
-                continue;
-            };
-            let spawned = thread::Builder::new().name("native-approval".into()).spawn(move || {
-                let _place = place;
-                ask_user(&config, &shared, pending, &name)
-            });
-            if let Err(e) = spawned {
-                warn!("Native protocol: no thread for an approval: {e}");
-            }
+        };
+        let (listener, config, shared) = (Arc::clone(&listener), Arc::clone(&config), Arc::clone(&shared));
+        let spawned = thread::Builder::new().name("native-handshake".into()).spawn(move || {
+            let pending = listener.handshake(connecting);
+            drop(place);
+            serve(pending, &config, &shared);
+        });
+        if let Err(e) = spawned {
+            warn!("Native protocol: no thread for a handshake: {e}");
         }
     }
+}
+
+/// Decides about a client after its handshake: a session, a refusal or the user's answer
+fn serve(pending: Result<Pending, ProtoError>, config: &Config, shared: &Arc<Shared>) {
+    let pending = match pending {
+        Ok(pending) => pending,
+        // A connection that ends before the client's key is a probe: the headset app asks a
+        // cabled Mac every second whether it answers (see `cranvr_proto::link::probe_host`).
+        Err(ProtoError::Closed) => {
+            debug!("Native protocol: a connection ended before its hello");
+            return;
+        }
+        Err(e) => {
+            warn!("Native protocol: a connection failed before its hello: {e}");
+            if let Some(message) = version_notice(&e) {
+                status::emit(json!({"type": "network", "problem": "incompatible_client", "message": message}));
+            }
+            return;
+        }
+    };
+    let name = display_name(&pending.caps.name);
+    if pending.caps.cable && !config.cable.load(Ordering::Relaxed) {
+        // The headset probed the cable a moment before the user chose Wi-Fi. It connects over
+        // Wi-Fi next, because the preamble of its next probe says that the cable is off.
+        info!("Native protocol: {name} at {} came over the USB cable, and the user chose Wi-Fi", pending.peer);
+        pending.reject(RejectReason::WiFiOnly);
+        return;
+    }
+    if shared.session().is_some() {
+        warn!("Native protocol: {name} at {} was refused: another headset is connected", pending.peer);
+        pending.reject(RejectReason::Busy);
+        return;
+    }
+    // A client on this Mac needs no pairing. For another one the host looks up the key.
+    // The handshake proved that the client holds it, so a client cannot claim the key of
+    // another client.
+    let known = config.trust_all
+        || (pending.peer.ip().is_loopback() && !config.approve_loopback)
+        || config.pairings.contains(&pending.client_key);
+    if known {
+        start_session(config, shared, pending, &name);
+        return;
+    }
+    let Some(_place) = shared.asking.enter() else {
+        warn!("Native protocol: {name} at {} was refused: too many headsets wait for the user", pending.peer);
+        pending.reject(RejectReason::Busy);
+        return;
+    };
+    ask_user(config, shared, pending, &name);
 }
 
 /// How an approval ended.

@@ -7,7 +7,7 @@ mod common;
 use common::{caps, host_identity, identity, meta, Rng};
 use cranvr_proto::{
     fec::ParityController,
-    link::{probe_host, ClientLink, ConnectObserver, HostLink, HostListener, Incoming, MediaMode},
+    link::{probe_host, ClientLink, ConnectObserver, HostLink, HostListener, Incoming, MediaMode, HANDSHAKE_TIMEOUT},
     media::{FrameReceiver, DEFAULT_SHARD_LEN},
     message::*,
     wire::{Codec, Error, Fov, Motion, Pose},
@@ -17,7 +17,7 @@ use std::{
     net::TcpStream,
     sync::{mpsc, Arc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -615,4 +615,27 @@ fn a_session_over_a_link_local_address_carries_udp_media() {
     assert_eq!(inbox.recv_timeout(WAIT).unwrap(), (7, payload));
     host.duplex.close();
     client.duplex.close();
+}
+
+// A client that sends a byte now and then waits less than the timeout of each read. The whole
+// handshake still ends at one deadline, so such a client holds no thread of the host for long.
+#[test]
+fn a_client_that_trickles_its_preamble_is_cut_at_the_handshake_deadline() {
+    let listener = HostListener::bind("127.0.0.1:0", host_identity()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        let mut tcp = TcpStream::connect(addr).unwrap();
+        // Six bytes 2 s apart: without the deadline the preamble alone would take 10 s
+        for byte in client_preamble(cranvr_proto::PROTOCOL_VERSION) {
+            if tcp.write_all(&[byte]).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_secs(2));
+        }
+    });
+    let started = Instant::now();
+    let cut = listener.accept();
+    let took = started.elapsed();
+    assert!(cut.is_err());
+    assert!(took >= HANDSHAKE_TIMEOUT && took < HANDSHAKE_TIMEOUT + Duration::from_millis(500), "the handshake ended after {took:?}");
 }
