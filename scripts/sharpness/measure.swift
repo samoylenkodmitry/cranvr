@@ -2,7 +2,8 @@
 // capture, a decoded picture of the display's stream or the pattern itself (issue #222).
 //
 // The script finds the four colored squares of the pattern and maps the pattern onto the picture with the
-// projection that they give. It reads the picture's luma along each element of the pattern and prints:
+// projection that they give. Of the patches of each square's color, it takes the four whose places keep
+// the pattern's shape. It reads the picture's luma along each element of the pattern and prints:
 //   - scale: the picture's pixels to one pixel of the pattern, across;
 //   - the contrast of each grating (lines of 1 and 2 pixels) as a share of the pattern's own contrast:
 //     the amplitude of the grating's frequency over the picture's range from ink to paper;
@@ -18,7 +19,8 @@
 //   --frame   the picture is the whole display at any size, such as a decoded picture of its stream:
 //             the script maps the pattern by the sizes and looks for no squares
 //   --json    writes the numbers to OUT as JSON as well
-// It exits 3 when it does not find the pattern.
+// It exits 3 when it does not find the pattern: no four patches keep its shape within 5 %, or a block's
+// ink and paper differ by less than 40 levels of 255.
 import CoreGraphics
 import Foundation
 import ImageIO
@@ -102,8 +104,8 @@ struct Homography {
     }
 }
 
-// Finds the largest patch of a marker's color and returns its center
-func findMarker(_ picture: Picture, color: String, columns: Range<Int>) -> (Double, Double, Int)? {
+// Finds the patches of a marker's color, the largest first: their centers and sizes in pixels
+func findMarkers(_ picture: Picture, color: String, columns: Range<Int>) -> [(Double, Double, Int)] {
     let (w, h) = (picture.width, picture.height)
     func matches(_ i: Int) -> Bool {
         let r = Int(picture.rgb[4 * i]), g = Int(picture.rgb[4 * i + 1]), b = Int(picture.rgb[4 * i + 2])
@@ -115,7 +117,7 @@ func findMarker(_ picture: Picture, color: String, columns: Range<Int>) -> (Doub
         }
     }
     var seen = [Bool](repeating: false, count: w * h)
-    var best: (Double, Double, Int)?
+    var found: [(Double, Double, Int)] = []
     var stack: [Int] = []
     for y in 0..<h {
         for x in columns where !seen[y * w + x] {
@@ -137,10 +139,38 @@ func findMarker(_ picture: Picture, color: String, columns: Range<Int>) -> (Doub
                     }
                 }
             }
-            if n >= 4 && n > (best?.2 ?? 0) { best = (sx / Double(n), sy / Double(n), n) }
+            if n >= 4 { found.append((sx / Double(n), sy / Double(n), n)) }
         }
     }
-    return best
+    return Array(found.sorted { $0.2 > $1.2 }.prefix(3))
+}
+
+// How far four points stand from the best affine map of the layout's four points, as a share of the
+// distance between the first two: a few hundredths for the pattern's squares seen in perspective
+func shapeError(_ from: [(Double, Double)], _ to: [(Double, Double)]) -> Double {
+    // Least squares of u = a x + b y + c and of v alike, by the normal equations
+    func fit(_ target: [Double]) -> [Double] {
+        var m = [[Double]](repeating: [0, 0, 0, 0], count: 3)
+        for (i, (x, y)) in from.enumerated() {
+            let row = [x, y, 1.0]
+            for r in 0..<3 {
+                for c in 0..<3 { m[r][c] += row[r] * row[c] }
+                m[r][3] += row[r] * target[i]
+            }
+        }
+        for col in 0..<3 {
+            let pivot = (col..<3).max { abs(m[$0][col]) < abs(m[$1][col]) }!
+            m.swapAt(col, pivot)
+            for row in 0..<3 where row != col {
+                let f = m[row][col] / m[col][col]
+                for k in col..<4 { m[row][k] -= f * m[col][k] }
+            }
+        }
+        return (0..<3).map { m[$0][3] / m[$0][$0] }
+    }
+    let (a, b) = (fit(to.map(\.0)), fit(to.map(\.1)))
+    let error = zip(from, to).map { p, q in hypot(a[0] * p.0 + a[1] * p.1 + a[2] - q.0, b[0] * p.0 + b[1] * p.1 + b[2] - q.1) }.max()!
+    return error / max(hypot(to[1].0 - to[0].0, to[1].1 - to[0].1), 1)
 }
 
 // The pattern in a picture: where it lies and how its elements read
@@ -262,20 +292,35 @@ guard let picture = Picture(path: args[1]), let reference = Picture(path: patter
 }
 let columns = 0..<(leftEye ? picture.width / 2 : picture.width)
 let markers = elements.filter { $0["kind"] as? String == "marker" }
-var from: [(Double, Double)] = [], to: [(Double, Double)] = []
-for marker in markers {
-    let color = marker["color"] as! String, center = marker["center"] as! [Double]
-    if wholeFrame, let size = layout["size"] as? [Double] {
-        from.append((center[0], center[1]))
-        to.append((center[0] * Double(picture.width) / size[0], center[1] * Double(picture.height) / size[1]))
-        continue
+let from: [(Double, Double)] = markers.map { let c = $0["center"] as! [Double]; return (c[0], c[1]) }
+var to: [(Double, Double)] = []
+if wholeFrame, let size = layout["size"] as? [Double] {
+    to = from.map { ($0.0 * Double(picture.width) / size[0], $0.1 * Double(picture.height) / size[1]) }
+} else {
+    // A picture may hold other patches of the squares' colors, such as the host's scene in the room
+    // around the panel: of the largest patches of each color, the four that stand where the
+    // pattern's squares stand count
+    var candidates: [[(Double, Double, Int)]] = []
+    for marker in markers {
+        let color = marker["color"] as! String
+        let found = findMarkers(picture, color: color, columns: columns)
+        guard !found.isEmpty else {
+            print("no pattern: the \(color) square is missing")
+            exit(3)
+        }
+        candidates.append(found)
     }
-    guard let found = findMarker(picture, color: color, columns: columns) else {
-        print("no pattern: the \(color) square is missing")
+    var best: (error: Double, points: [(Double, Double)])?
+    for a in candidates[0] { for b in candidates[1] { for c in candidates[2] { for d in candidates[3] {
+        let points = [a, b, c, d].map { ($0.0, $0.1) }
+        let error = shapeError(from, points)
+        if error < (best?.error ?? .infinity) { best = (error, points) }
+    }}}}
+    guard let best, best.error < 0.05 else {
+        print(String(format: "no pattern: the colored squares stand %.0f %% off the pattern's shape", 100 * (best?.error ?? 1)))
         exit(3)
     }
-    from.append((center[0], center[1]))
-    to.append((found.0, found.1))
+    to = best.points
 }
 guard let map = Homography(from: from, to: to) else {
     print("no pattern: the squares do not span a plane")
@@ -296,6 +341,11 @@ for polarity in ["black_on_white", "white_on_black"] {
     let (paper, ink) = (level(view, "paper"), level(view, "ink"))
     let (refPaper, refInk) = (level(identity, "paper"), level(identity, "ink"))
     let range = abs(paper - ink), refRange = abs(refPaper - refInk)
+    // The paper and the ink of the pattern differ by far more: a smaller range is another picture
+    guard range >= 40 else {
+        print("no pattern: the \(polarity) block's ink and paper differ by \(Int(range)) levels")
+        exit(3)
+    }
     var out: [String: Any] = ["paper": paper, "ink": ink]
     var gratingText: [String] = []
     for g in mine where g["kind"] as? String == "grating" {
