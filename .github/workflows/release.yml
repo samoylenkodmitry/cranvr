@@ -35,9 +35,11 @@ jobs:
       # Only a tag run signs and notarizes, and only when the owner added the secrets
       SIGN: ${{ github.event_name == 'push' && secrets.CRANVR_MACOS_DEVID_P12_BASE64 != '' && secrets.CRANVR_ASC_API_KEY_P8_BASE64 != '' }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         if: runner.environment == 'github-hosted'
         with:
           cache-bin: false
@@ -64,7 +66,7 @@ jobs:
             zsh scripts/release-app.sh --ad-hoc
           fi
           echo "signed=$SIGN" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: cranvr-mac
           path: target/release/cranvr-*.dmg
@@ -85,18 +87,20 @@ jobs:
     env:
       SIGN: ${{ github.event_name == 'push' && secrets.CRANVR_KEYSTORE_BASE64 != '' }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-java@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6
         with:
           distribution: temurin
           java-version: "17"
-      - uses: android-actions/setup-android@v4
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
         with:
           packages: platform-tools
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: aarch64-linux-android
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         if: runner.environment == 'github-hosted'
         with:
           workspaces: client
@@ -108,7 +112,7 @@ jobs:
           ndk="$ANDROID_HOME/ndk/28.2.13676358"
           [ -d "$ndk" ] || sdkmanager "ndk;28.2.13676358"
           echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
-          [ -x "$HOME/.cargo/bin/cargo-ndk" ] || cargo install cargo-ndk --locked
+          [ -x "$HOME/.cargo/bin/cargo-ndk" ] || cargo install cargo-ndk --version 4.1.2 --locked
       - name: Version
         run: bash scripts/release/version.sh >> "$GITHUB_ENV"
       - name: Restore the upload key
@@ -131,7 +135,7 @@ jobs:
           mkdir -p dist
           cp target/client/cranvr-client.apk "dist/cranvr-client-$CRANVR_VERSION.apk"
           echo "signed=$SIGN" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: cranvr-headset
           path: dist/cranvr-client-*.apk
@@ -149,7 +153,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: artifacts
           merge-multiple: true
