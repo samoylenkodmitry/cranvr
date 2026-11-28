@@ -34,9 +34,15 @@ use std::{
 /// The application ids of cranvr's headset app and of its phone build. A device counts when one of
 /// them is installed, not by its model name.
 const HEADSET_APPS: [&str; 2] = ["dev.cranvr.client", "dev.cranvr.client.phone"];
-/// Where Google publishes the platform-tools for macOS, and their size at the time of writing
-const TOOLS_URL: &str = "https://dl.google.com/android/repository/platform-tools-latest-darwin.zip";
-pub const TOOLS_SIZE: &str = "about 16 MB";
+/// Google's platform-tools for macOS of one version, and their size. The app runs the adb of the zip,
+/// so it takes only the zip of this SHA-256. Google's index (repository2-3.xml) gives the version
+/// and the zip's SHA-1, which the zip of this SHA-256 matches.
+const GOOGLE_TOOLS: ToolsZip<'static> = ToolsZip {
+    url: "https://dl.google.com/android/repository/platform-tools_r37.0.3-darwin.zip",
+    sha256: "df21339b9371fef9b19264404338dc686f59a88a1dce634b963da344909001d6",
+    protocols: "=https",
+};
+pub const TOOLS_SIZE: &str = "about 17 MB";
 /// How often the thread asks adb
 const POLL: Duration = Duration::from_secs(3);
 /// A device without the headset app is asked again after this long: the user may install the app
@@ -596,8 +602,7 @@ pub fn download_tools() {
         status.download = Download::Working("Starting".into());
     }
     thread::spawn(|| {
-        let (url, protocols) = tools_url();
-        let result = fetch_tools(&config_dir(), &url, protocols);
+        let result = fetch_tools(&config_dir(), &GOOGLE_TOOLS);
         update(|s| {
             s.download = match &result {
                 Ok(()) => Download::Idle,
@@ -611,24 +616,30 @@ pub fn download_tools() {
     });
 }
 
-/// The address of the zip. `CRANVR_PLATFORM_TOOLS_URL` replaces it for a test with a local file.
-fn tools_url() -> (String, &'static str) {
-    match env::var("CRANVR_PLATFORM_TOOLS_URL") {
-        Ok(url) => (url, "=https,http,file"),
-        Err(_) => (TOOLS_URL.to_string(), "=https"),
-    }
+/// A zip of the platform-tools, the SHA-256 that it must have and the protocols that curl may use
+/// for it, also after a redirect
+struct ToolsZip<'a> {
+    url: &'a str,
+    sha256: &'a str,
+    protocols: &'a str,
 }
 
-fn fetch_tools(dir: &Path, url: &str, protocols: &str) -> Result<(), String> {
+/// The SHA-256 of a file, in hex
+fn sha256_of(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    Ok(Sha256::digest(fs::read(path)?).iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn fetch_tools(dir: &Path, tools: &ToolsZip<'_>) -> Result<(), String> {
     fs::create_dir_all(dir).map_err(|e| format!("The folder {} cannot be made: {e}", dir.display()))?;
     let zip = dir.join("platform-tools.zip.part");
     let unpacked = dir.join("platform-tools-unpacking");
     fs::remove_file(&zip).ok();
     fs::remove_dir_all(&unpacked).ok();
     let mut curl = Command::new("/usr/bin/curl")
-        .args(["--fail", "--silent", "--show-error", "--location", "--proto", protocols, "--tlsv1.2", "--max-time", "900", "--output"])
+        .args(["--fail", "--silent", "--show-error", "--location", "--proto", tools.protocols, "--tlsv1.2", "--max-time", "900", "--output"])
         .arg(&zip)
-        .arg(url)
+        .arg(tools.url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -653,6 +664,11 @@ fn fetch_tools(dir: &Path, url: &str, protocols: &str) -> Result<(), String> {
         }
         fs::remove_file(&zip).ok();
         return Err(format!("The download failed. {}", text.trim().lines().last().unwrap_or("Check the internet connection.")));
+    }
+    let sha256 = sha256_of(&zip).map_err(|e| format!("The download cannot be read: {e}"));
+    if sha256.as_deref() != Ok(tools.sha256) {
+        fs::remove_file(&zip).ok();
+        return Err(format!("The download is not the platform-tools that cranvr expects (SHA-256 {}). Try again.", sha256.unwrap_or_else(|e| e)));
     }
     update(|s| s.download = Download::Working("Unpacking".into()));
     let unzip = Command::new("/usr/bin/unzip")
@@ -696,7 +712,7 @@ R52R40K1F2A            device usb:51511296X product:gts7xlwifiser model:SM_T970 
 SERIAL0000001         unauthorized usb:1-1 transport_id:2
 0123456789ABCDEF       offline usb:2-3 transport_id:7
 192.168.1.55:5555      device product:eureka_user model:Quest_3 device:eureka transport_id:5
-adb-2G0YC5ZH-ab._adb-tls-connect._tcp device product:eureka_user model:Quest_3 device:eureka transport_id:6
+adb-SERIAL-ab._adb-tls-connect._tcp device product:eureka_user model:Quest_3 device:eureka transport_id:6
 emulator-5554          device product:sdk_gphone64 model:sdk device:emu64 transport_id:1
 
 ";
@@ -826,26 +842,38 @@ emulator-5554          device product:sdk_gphone64 model:sdk device:emu64 transp
     #[test]
     fn the_download_unpacks_the_platform_tools_and_checks_that_adb_runs() {
         let root = env::temp_dir().join(format!("cranvr-usb-test-{}", std::process::id()));
-        let tools = root.join("zip-source/platform-tools");
-        fs::create_dir_all(&tools).unwrap();
-        fs::write(tools.join("adb"), "#!/bin/sh\necho 'Android Debug Bridge version 1.0.41'\n").unwrap();
-        fs::set_permissions(tools.join("adb"), fs::Permissions::from_mode(0o755)).unwrap();
+        let source = root.join("zip-source/platform-tools");
+        fs::create_dir_all(&source).unwrap();
+        let pack = |adb: &str| {
+            fs::write(source.join("adb"), adb).unwrap();
+            fs::set_permissions(source.join("adb"), fs::Permissions::from_mode(0o755)).unwrap();
+            let made = Command::new("/usr/bin/zip").args(["-q", "-r"]).arg(root.join("tools.zip")).arg("platform-tools").current_dir(root.join("zip-source")).status().unwrap();
+            assert!(made.success());
+        };
+        let good = "#!/bin/sh\necho 'Android Debug Bridge version 1.0.41'\n";
+        pack(good);
         let zip = root.join("tools.zip");
-        let made = Command::new("/usr/bin/zip").args(["-q", "-r"]).arg(&zip).arg("platform-tools").current_dir(root.join("zip-source")).status().unwrap();
-        assert!(made.success());
-        let (home, url) = (root.join("home"), format!("file://{}", zip.display()));
-        fetch_tools(&home, &url, "=file").unwrap();
+        let (home, url, sha256) = (root.join("home"), format!("file://{}", zip.display()), sha256_of(&zip).unwrap());
+        let pinned = ToolsZip { url: &url, sha256: &sha256, protocols: "=file" };
+        fetch_tools(&home, &pinned).unwrap();
         assert!(is_executable(&own_adb_in(&home)));
         assert!(!home.join("platform-tools.zip.part").exists() && !home.join("platform-tools-unpacking").exists());
         // A second download replaces the first
-        fetch_tools(&home, &url, "=file").unwrap();
+        fetch_tools(&home, &pinned).unwrap();
+        // A zip of another SHA-256 is refused before it is unpacked, and the working copy stays
+        pack("#!/bin/sh\necho 'Android Debug Bridge version 6.6.6'\n");
+        let error = fetch_tools(&home, &pinned).unwrap_err();
+        assert!(error.starts_with("The download is not the platform-tools that cranvr expects"), "{error}");
+        assert_eq!(fs::read_to_string(own_adb_in(&home)).unwrap(), good);
+        assert!(!home.join("platform-tools.zip.part").exists());
         // A file that is no zip fails with words, and leaves the working copy
         fs::write(&zip, "not a zip").unwrap();
-        let error = fetch_tools(&home, &url, "=file").unwrap_err();
+        let garbage = sha256_of(&zip).unwrap();
+        let error = fetch_tools(&home, &ToolsZip { sha256: &garbage, ..pinned }).unwrap_err();
         assert!(error.contains("not a zip"), "{error}");
         assert!(is_executable(&own_adb_in(&home)));
         // A real https address is refused where only files are allowed: the protocol list holds
-        let refused = fetch_tools(&home, "https://example.invalid/x.zip", "=file").unwrap_err();
+        let refused = fetch_tools(&home, &ToolsZip { url: "https://example.invalid/x.zip", ..pinned }).unwrap_err();
         assert!(refused.starts_with("The download failed"), "{refused}");
         fs::remove_dir_all(&root).ok();
     }

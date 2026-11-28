@@ -12,7 +12,8 @@
 # cranvr-game-support-macos.tar.xz, its .sha256, cranvr-opencomposite-source.tar.xz and
 # cranvr-wine-source.tar.xz into OUT_DIR (default target/game-support). The last two are the sources of
 # the OpenComposite and of the patched Wine files in the archive, which the GPL 3 and the LGPL 2.1 ask
-# for: publish them as release files too.
+# for: publish them as release files too. The archive's SHA-256 also goes into
+# scripts/game-support-sha256.txt: the app installs the release of the version file only with it.
 # scripts/install-game-support.sh installs such an archive. The built tree is
 # third_party/basaltvr/src, or $CRANVR_BASALTVR_DIR when the build lives in another checkout.
 #
@@ -369,5 +370,8 @@ archive=${out}/cranvr-game-support-macos.tar.xz
 print "Packing ${archive:t} (this takes a few minutes)"
 tar -C "${stage}" -cf - cranvr-game-support | xz -T0 -6 > "${archive}"
 (cd "${out}" && shasum -a 256 "${archive:t}" > "${archive:t}.sha256")
+# The app downloads the release of the version file and installs it only with this SHA-256
+awk '{print $1}' "${archive}.sha256" > "${cranvr}/scripts/game-support-sha256.txt"
 print "Wrote ${archive} (version ${version}, $(du -h "${archive}" | cut -f1))"
 cat "${archive}.sha256"
+print "Wrote its SHA-256 into scripts/game-support-sha256.txt: commit it with the version file once the release is published"

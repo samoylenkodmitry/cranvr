@@ -163,7 +163,7 @@ done
 vulkan_headers=${build}/vulkan-headers
 if [[ ! -f ${vulkan_headers}/include/vulkan/vulkan_metal.h ]]; then
     mkdir -p "${vulkan_headers}"
-    curl -sSfL -o "${build}/vulkan-headers.tar.gz" "${vulkan_headers_url}"
+    curl --proto '=https' --tlsv1.2 -sSfL -o "${build}/vulkan-headers.tar.gz" "${vulkan_headers_url}"
     if [[ $(shasum -a 256 "${build}/vulkan-headers.tar.gz" | awk '{print $1}') != ${vulkan_headers_sha256} ]]; then
         print -u2 "FAIL: the Vulkan headers from ${vulkan_headers_url} have another SHA-256"
         exit 1

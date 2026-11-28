@@ -24,6 +24,7 @@ objc2 = "0.6"
 objc2-foundation = "0.3"
 dispatch2 = "0.3"
 libc = "0.2.191"
+sha2 = "0.11"
 
 [dev-dependencies]
 # A test moves the mouse over the window's buttons with a headless shell and reads what they draw
