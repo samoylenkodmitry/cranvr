@@ -36,7 +36,8 @@ use std::{
 };
 
 /// The time that handshake reads and writes may take.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The longest time that a handshake takes in all
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often a client that waits for its approval looks at its observer
 const WAIT_POLL: Duration = Duration::from_millis(200);
 /// How much longer than the host a client waits for the host's answer
@@ -377,14 +378,14 @@ fn random_session() -> u64 {
 }
 
 /// Writes one control message, sealed, to a TCP stream that no [`Duplex`] owns yet.
-fn write_control<T: Serialize>(tcp: &mut TcpStream, tx: &mut TcpTx, msg: &T) -> Result<(), Error> {
+fn write_control<T: Serialize>(tcp: &mut impl Write, tx: &mut TcpTx, msg: &T) -> Result<(), Error> {
     let mut buf = PacketBuf::new();
     encode(msg, buf.begin(KIND_CONTROL))?;
     tcp.write_all(tx.seal(&mut buf)?)?;
     Ok(())
 }
 
-fn read_control<T: DeserializeOwned>(tcp: &mut TcpStream, rx: &mut TcpRx, buf: &mut Vec<u8>) -> Result<T, Error> {
+fn read_control<T: DeserializeOwned>(tcp: &mut impl Read, rx: &mut TcpRx, buf: &mut Vec<u8>) -> Result<T, Error> {
     read_tcp_packet_limited(tcp, buf, HANDSHAKE_PACKET_LIMIT)?;
     match rx.open(buf)?.split_first() {
         Some((&KIND_CONTROL, body)) => decode(body),
@@ -394,7 +395,7 @@ fn read_control<T: DeserializeOwned>(tcp: &mut TcpStream, rx: &mut TcpRx, buf: &
 
 /// Writes a flight of the key exchange: a TCP packet of the handshake kind. Nothing in it is
 /// secret. The exchange's signatures make a changed flight fail.
-fn write_flight(tcp: &mut TcpStream, body: &[u8]) -> Result<(), Error> {
+fn write_flight(tcp: &mut impl Write, body: &[u8]) -> Result<(), Error> {
     let mut packet = Vec::with_capacity(5 + body.len());
     packet.extend_from_slice(&(1 + body.len() as u32).to_le_bytes());
     packet.push(KIND_HANDSHAKE);
@@ -405,7 +406,7 @@ fn write_flight(tcp: &mut TcpStream, body: &[u8]) -> Result<(), Error> {
 
 /// Reads a flight of the key exchange whose body has `len` bytes. The length is checked before
 /// the read, so a peer that has proved nothing cannot size a buffer.
-fn read_flight<'a>(tcp: &mut TcpStream, buf: &'a mut Vec<u8>, len: usize) -> Result<&'a [u8], Error> {
+fn read_flight<'a>(tcp: &mut impl Read, buf: &'a mut Vec<u8>, len: usize) -> Result<&'a [u8], Error> {
     read_tcp_packet_limited(tcp, buf, 1 + len)?;
     match buf.split_first() {
         Some((&KIND_HANDSHAKE, body)) if body.len() == len => Ok(body),
@@ -482,35 +483,48 @@ impl HostListener {
         self.identity.public_key()
     }
 
-    /// Waits for a client and runs the version exchange and the key exchange. A client that sends
-    /// bad bytes, speaks another version or cannot prove its key gives an error and the caller
-    /// calls `accept` again.
+    /// Waits for the next TCP connection and reads nothing from it. A host that serves a network
+    /// runs [`HostListener::handshake`] for each connection on a thread of its own, so a peer that
+    /// connects and sends nothing holds back no other client.
+    pub fn connecting(&self) -> Result<Connecting, Error> {
+        let (tcp, peer) = self.listener.accept()?;
+        Ok(Connecting { tcp, peer })
+    }
+
+    /// Waits for a client and runs [`HostListener::handshake`] with it, for a host of one client at
+    /// a time such as a test.
     pub fn accept(&self) -> Result<Pending, Error> {
-        let (mut tcp, peer) = self.listener.accept()?;
+        self.handshake(self.connecting()?)
+    }
+
+    /// Runs the version exchange and the key exchange with a connection, within
+    /// [`HANDSHAKE_TIMEOUT`] in all. A client that sends bad bytes, speaks another version, cannot
+    /// prove its key or is too slow gives an error.
+    pub fn handshake(&self, connecting: Connecting) -> Result<Pending, Error> {
+        let Connecting { tcp, peer } = connecting;
         tcp.set_nodelay(true)?;
-        tcp.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-        tcp.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        let mut timed = Timed { tcp: &tcp, until: Instant::now() + HANDSHAKE_TIMEOUT };
         let mut client_pre = [0u8; CLIENT_PREAMBLE_LEN];
-        tcp.read_exact(&mut client_pre)?;
+        timed.read_exact(&mut client_pre)?;
         let theirs = parse_client_preamble(&client_pre)?;
         // The host answers with its own version, so a client of another one can say which side to update
         let host_pre = host_preamble(PROTOCOL_VERSION, self.cable.load(Ordering::Relaxed));
-        tcp.write_all(&host_pre)?;
+        timed.write_all(&host_pre)?;
         if theirs != PROTOCOL_VERSION {
             return Err(Error::Version { ours: PROTOCOL_VERSION, theirs });
         }
         let mut buf = Vec::new();
         // Flight 1: the client's fresh key. Flight 2: the host's fresh key, its key and its
         // signature over both preambles and both fresh keys.
-        let client_fresh: [u8; KEY_LEN] = read_flight(&mut tcp, &mut buf, CLIENT_HELLO_LEN)?.try_into().expect("checked length");
+        let client_fresh: [u8; KEY_LEN] = read_flight(&mut timed, &mut buf, CLIENT_HELLO_LEN)?.try_into().expect("checked length");
         let fresh = Ephemeral::new()?;
         let host_key = self.identity.public_key();
         let transcript = transcript_hash(&client_pre, &host_pre, &client_fresh, &fresh.public(), &host_key);
         let hello = HostHello { ephemeral: fresh.public(), key: host_key, signature: sign_as_host(&self.identity, &transcript) };
-        write_flight(&mut tcp, &hello.to_bytes())?;
+        write_flight(&mut timed, &hello.to_bytes())?;
         let mut channels = derive(Role::Host, &*fresh.agree(&client_fresh)?, &transcript);
         // Flight 3, sealed: the client's key and its signature over the same transcript
-        read_tcp_packet_limited(&mut tcp, &mut buf, HANDSHAKE_PACKET_LIMIT)?;
+        read_tcp_packet_limited(&mut timed, &mut buf, HANDSHAKE_PACKET_LIMIT)?;
         let auth = match channels.tcp_rx.open(&mut buf)?.split_first() {
             Some((&KIND_HANDSHAKE, body)) => ClientAuth::parse(body)?,
             _ => return Err(Error::Unexpected("expected the client's key")),
@@ -518,10 +532,53 @@ impl HostListener {
         if !verify_client(&auth.key, &transcript, &auth.signature) {
             return Err(Error::Crypto("the client does not hold the key that it claims"));
         }
-        match read_control::<ClientMsg>(&mut tcp, &mut channels.tcp_rx, &mut buf)? {
-            ClientMsg::Hello(caps) => Ok(Pending { tcp, channels, peer, caps, client_key: auth.key, transcript }),
-            _ => Err(Error::Unexpected("the client's first message is not Hello")),
-        }
+        let caps = match read_control::<ClientMsg>(&mut timed, &mut channels.tcp_rx, &mut buf)? {
+            ClientMsg::Hello(caps) => caps,
+            _ => return Err(Error::Unexpected("the client's first message is not Hello")),
+        };
+        // Each later exchange of a pending client waits up to the same time for each read and write
+        tcp.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        tcp.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        Ok(Pending { tcp, channels, peer, caps, client_key: auth.key, transcript })
+    }
+}
+
+/// A TCP connection that [`HostListener::connecting`] took, before any byte of the handshake
+pub struct Connecting {
+    tcp: TcpStream,
+    pub peer: SocketAddr,
+}
+
+/// The connection of a handshake, whose reads and writes all end at one deadline. A timeout for
+/// each read alone lets a client that sends a byte now and then hold the handshake for as long as
+/// it likes.
+struct Timed<'a> {
+    tcp: &'a TcpStream,
+    until: Instant,
+}
+
+impl Timed<'_> {
+    /// The time until the deadline, or a timeout once it passed
+    fn left(&self) -> io::Result<Duration> {
+        self.until.checked_duration_since(Instant::now()).filter(|left| !left.is_zero()).ok_or_else(|| io::ErrorKind::TimedOut.into())
+    }
+}
+
+impl Read for Timed<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.tcp.set_read_timeout(Some(self.left()?))?;
+        (&*self.tcp).read(buf)
+    }
+}
+
+impl Write for Timed<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.tcp.set_write_timeout(Some(self.left()?))?;
+        (&*self.tcp).write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        (&*self.tcp).flush()
     }
 }
 
