@@ -58,6 +58,10 @@ done
 cp "${patches}"/dxmt/*.patch "${dir}/runtime/dxmt-fork/patches/"
 
 cd "${dir}"
+# Source paths in assert and log strings start at the source folder: the game support is public and holds no path of
+# the Mac that built it. CMake and meson read these variables when they configure a fresh build folder. DXMT maps its
+# own folder to dxmt as well (its patch 0024), as scripts/build-wine.sh does for Wine.
+export CFLAGS="-ffile-prefix-map=${dir}=BasaltVR" CXXFLAGS="-ffile-prefix-map=${dir}=BasaltVR"
 # Meson wraps the Mac compiler in sccache when it finds one, and sccache drops -ObjC from DXMT's
 # Mac sources. Name the compilers, keep sccache out of PATH, and drop a build dir that cached it.
 export PATH=$(print -r -- "${PATH}" | tr ':' '\n' | grep -v '\.cargo/bin' | paste -sd: -)

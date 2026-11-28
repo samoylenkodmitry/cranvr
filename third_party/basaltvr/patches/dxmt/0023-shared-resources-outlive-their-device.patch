@@ -1,0 +1,223 @@
+Subject: [PATCH] dxmt: a shared texture or buffer frees its allocation without its device (cranvr)
+
+DXMT lets a device go before its resources, as the Direct3D 11 documentation allows. A shared texture or buffer
+freed its D3DKMT allocation in its destructor through its device: `m_parent->GetLocalD3DKMT()`, a virtual call. An
+application that released the device first crashed in that call. SteamVR's client in Steam does so when SteamVR quits
+after a game: it releases shared textures after their device. Steam for Windows ended a few seconds after every SteamVR
+run of Half-Life: Alyx (cranvr issue #197). Each of its six crash dumps shows
+`~DeviceTexture` calling through a dead device: a call to address 0, to 0x9fa, or `__cxa_pure_virtual`.
+
+- util_d3dkmt.h: `KmtDevice` holds a D3DKMT device and destroys it with its last reference.
+- The DXGI device keeps its D3DKMT device in a `KmtDevice`. `GetKmtDevice` gives it out through IMTLDXGIDevice and
+  MTLD3D11Device.
+- A texture or buffer with an allocation keeps the `KmtDevice` and frees the allocation through it. The D3DKMT device
+  thus lives until its DXGI device and its last shared resource let go.
+
+---
+diff --git i/src/d3d11/d3d11_buffer.cpp w/src/d3d11/d3d11_buffer.cpp
+index b3422d2..4061ea7 100644
+--- i/src/d3d11/d3d11_buffer.cpp
++++ w/src/d3d11/d3d11_buffer.cpp
+@@ -29,6 +29,8 @@ private:
+   /* cranvr: a buffer shared with D3D11_RESOURCE_MISC_SHARED (see d3d11_shared_buffer.hpp) */
+   SharedBufferMemory shared_;
+   D3DKMT_HANDLE local_kmt_ = 0;
++  // cranvr: the D3DKMT device of local_kmt_, which may outlive the buffer's device
++  Rc<KmtDevice> kmt_device_;
+   D3DKMT_HANDLE global_kmt_ = 0;
+ 
+   /* The shared path of the constructor: the buffer lies on the memory of a file mapping. `imported` is the memory
+@@ -57,6 +59,8 @@ private:
+       global_kmt_ = importedGlobal;
+     } else if (!ShareBuffer(device, data, &local_kmt_, &global_kmt_)) {
+       ERR("D3D11Buffer: no D3DKMT allocation for a shared buffer; it has no handle");
++    } else {
++      kmt_device_ = device->GetKmtDevice();
+     }
+     return true;
+   }
+@@ -144,12 +148,8 @@ public:
+   }
+ 
+   ~D3D11Buffer() {
+-    if (local_kmt_) {
+-      D3DKMT_DESTROYALLOCATION destroy = {};
+-      destroy.hDevice = m_parent->GetLocalD3DKMT();
+-      destroy.hResource = local_kmt_;
+-      D3DKMTDestroyAllocation(&destroy);
+-    }
++    if (local_kmt_ && kmt_device_)
++      kmt_device_->destroyAllocation(local_kmt_);
+     if (shared_.mapping)
+       CloseHandle(shared_.mapping);
+   }
+diff --git i/src/d3d11/d3d11_device.cpp w/src/d3d11/d3d11_device.cpp
+index b0fbb6d..cb5e956 100644
+--- i/src/d3d11/d3d11_device.cpp
++++ w/src/d3d11/d3d11_device.cpp
+@@ -1078,6 +1078,10 @@ public:
+     return container_->GetLocalD3DKMT();
+   }
+ 
++  KmtDevice *STDMETHODCALLTYPE GetKmtDevice() override {
++    return container_->GetKmtDevice();
++  }
++
+   HRESULT
+   CreateGraphicsPipeline(MTL_GRAPHICS_PIPELINE_DESC *pDesc,
+                          MTLCompiledGraphicsPipeline **ppPipeline) override {
+@@ -1200,15 +1204,7 @@ public:
+       if (D3DKMTCreateDevice(&create))
+         WARN("Failed to create D3DKMT device");
+       else
+-        local_kmt_ = create.hDevice;
+-    }
+-  }
+-
+-  ~MTLD3D11DXGIDevice() {
+-    if (local_kmt_) {
+-      D3DKMT_DESTROYDEVICE destroy = {};
+-      destroy.hDevice = local_kmt_;
+-      D3DKMTDestroyDevice(&destroy);
++        kmt_device_ = new KmtDevice(create.hDevice);
+     }
+   }
+ 
+@@ -1351,11 +1347,13 @@ public:
+                                  ppSwapChain);
+   }
+ 
+-  D3DKMT_HANDLE STDMETHODCALLTYPE GetLocalD3DKMT() final { return local_kmt_; }
++  D3DKMT_HANDLE STDMETHODCALLTYPE GetLocalD3DKMT() final { return kmt_device_ ? kmt_device_->handle() : 0; }
++
++  KmtDevice *STDMETHODCALLTYPE GetKmtDevice() final { return kmt_device_.ptr(); }
+ 
+ private:
+   Com<IMTLDXGIAdapter> adapter_;
+-  D3DKMT_HANDLE local_kmt_ = 0;
++  Rc<KmtDevice> kmt_device_;
+   std::unique_ptr<Device> device;
+   CommandQueue &cmd_queue_;
+   MTLD3D11DeviceImpl d3d11_device_;
+diff --git i/src/d3d11/d3d11_device.hpp w/src/d3d11/d3d11_device.hpp
+index 37ea5c9..f908c04 100644
+--- i/src/d3d11/d3d11_device.hpp
++++ w/src/d3d11/d3d11_device.hpp
+@@ -34,6 +34,9 @@ public:
+ 
+   virtual D3DKMT_HANDLE STDMETHODCALLTYPE GetLocalD3DKMT() = 0;
+ 
++  // cranvr: the device's D3DKMT device, or null without one. A shared resource keeps it for its allocation.
++  virtual KmtDevice *STDMETHODCALLTYPE GetKmtDevice() = 0;
++
+   virtual HRESULT CreateGraphicsPipeline(MTL_GRAPHICS_PIPELINE_DESC * pDesc,
+                                          MTLCompiledGraphicsPipeline *
+                                              *ppPipeline) = 0;
+diff --git i/src/d3d11/d3d11_texture_device.cpp w/src/d3d11/d3d11_texture_device.cpp
+index 5a124b6..cc6b29d 100644
+--- i/src/d3d11/d3d11_texture_device.cpp
++++ w/src/d3d11/d3d11_texture_device.cpp
+@@ -63,6 +63,8 @@ private:
+   float min_lod = 0.0;
+   D3DKMT_HANDLE local_kmt_ = 0;
+   D3DKMT_HANDLE global_kmt_ = 0;
++  // cranvr: the D3DKMT device of local_kmt_, which may outlive the texture's device
++  Rc<KmtDevice> kmt_device_;
+   // cranvr: the name under which this process serves the texture's port to other processes (winemetal's broker)
+   char served_name_[54] = {};
+   // cranvr: the unique name of a texture that this device made, for its slot in the order (ShareOrder)
+@@ -171,7 +173,7 @@ public:
+       MTLD3D11Device *pDevice, const char *servedName = nullptr, const char *uniqueName = nullptr
+   ) :
+       TResourceBase<tag_texture, IMTLMinLODClampable>(*pDesc, pDevice),
+-      local_kmt_(localHandle), global_kmt_(globalHandle) {
++      local_kmt_(localHandle), global_kmt_(globalHandle), kmt_device_(pDevice->GetKmtDevice()) {
+         this->texture_ = std::move(u_texture);
+         if (servedName)
+           snprintf(served_name_, sizeof(served_name_), "%s", servedName);
+@@ -183,12 +185,8 @@ public:
+     // cranvr: launchd drops the name now: no other process opens the texture through this one after it let go
+     if (served_name_[0])
+       WMTBootstrapUnregister(served_name_);
+-    if (local_kmt_) {
+-      D3DKMT_DESTROYALLOCATION destroy = {};
+-      destroy.hDevice = this->m_parent->GetLocalD3DKMT();
+-      destroy.hResource = local_kmt_;
+-      D3DKMTDestroyAllocation(&destroy);
+-    }
++    if (local_kmt_ && kmt_device_)
++      kmt_device_->destroyAllocation(local_kmt_);
+   }
+ 
+   Rc<StagingResource> staging(UINT) final { return nullptr; }
+@@ -404,6 +402,7 @@ public:
+     }
+     local_kmt_ = LocalHandle;
+     global_kmt_ = GlobalHandle;
++    kmt_device_ = this->m_parent->GetKmtDevice();
+     if (ServedName)
+       snprintf(served_name_, sizeof(served_name_), "%s", ServedName);
+   }
+diff --git i/src/dxgi/dxgi_interfaces.h w/src/dxgi/dxgi_interfaces.h
+index e7e759e..56b3d20 100644
+--- i/src/dxgi/dxgi_interfaces.h
++++ w/src/dxgi/dxgi_interfaces.h
+@@ -19,6 +19,8 @@ DEFINE_COM_INTERFACE("6bfa1657-9cb1-471a-a4fb-7cacf8a81207", IMTLDXGIDevice)
+       IDXGIFactory1 * pFactory, HWND hWnd, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
+       const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc,
+       IDXGISwapChain1 **ppSwapChain) = 0;
++  // cranvr: the device's D3DKMT device, or null without one. A shared resource keeps it for its allocation.
++  virtual dxmt::KmtDevice *STDMETHODCALLTYPE GetKmtDevice() = 0;
+ };
+ 
+ static constexpr IID DXMT_NVEXT_GUID = dxmt::guid::make_guid("ba0af616-4a43-4259-815c-db3b89829905");
+diff --git i/src/util/util_d3dkmt.h w/src/util/util_d3dkmt.h
+index d084648..7826a56 100644
+--- i/src/util/util_d3dkmt.h
++++ w/src/util/util_d3dkmt.h
+@@ -617,4 +617,43 @@ extern "C"
+   }
+ }
+ 
+-#endif
+\ No newline at end of file
++#endif
++#include <atomic>
++
++namespace dxmt {
++
++// cranvr: a D3DKMT device lives until its DXGI device and each shared resource with an allocation of it let go. An
++// application may release a device before its shared textures: SteamVR's client in Steam does at its end. Such a
++// texture then frees its allocation through this, not through the device that is gone.
++class KmtDevice {
++public:
++  explicit KmtDevice(D3DKMT_HANDLE handle) : handle_(handle) {}
++  ~KmtDevice() {
++    D3DKMT_DESTROYDEVICE destroy = {};
++    destroy.hDevice = handle_;
++    D3DKMTDestroyDevice(&destroy);
++  }
++  KmtDevice(const KmtDevice &) = delete;
++  KmtDevice &operator=(const KmtDevice &) = delete;
++
++  D3DKMT_HANDLE handle() const { return handle_; }
++
++  void destroyAllocation(D3DKMT_HANDLE allocation) {
++    D3DKMT_DESTROYALLOCATION destroy = {};
++    destroy.hDevice = handle_;
++    destroy.hResource = allocation;
++    D3DKMTDestroyAllocation(&destroy);
++  }
++
++  void incRef() { refcount_.fetch_add(1u, std::memory_order_acquire); }
++  void decRef() {
++    if (refcount_.fetch_sub(1u, std::memory_order_release) == 1u)
++      delete this;
++  }
++
++private:
++  D3DKMT_HANDLE handle_;
++  std::atomic<uint32_t> refcount_ = {0u};
++};
++
++} // namespace dxmt

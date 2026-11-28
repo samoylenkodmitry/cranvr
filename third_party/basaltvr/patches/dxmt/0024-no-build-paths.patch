@@ -1,0 +1,57 @@
+Subject: [PATCH] dxmt: the build keeps no path of the Mac that built it (cranvr)
+
+The game support is public. winemetal.so held the full paths of the three shaders of airconv under the home folder
+of the Mac that built it: the Metal compiler writes a shader's path into the module as `source_filename` and
+`air.source_file_name` (cranvr issue #200). No option of the Metal compiler changes either name.
+
+- tools/metal-air.sh compiles a shader, names the module by the shader's file name in the text form (`air-opt -S`) and
+  assembles it again (`air-as`). The meson generator of the shaders runs it.
+- meson.build maps the source folder to `dxmt` (`-ffile-prefix-map`) for C and C++ on both machines, as
+  scripts/build-wine.sh does for Wine and scripts/build-opencomposite.sh for OpenComposite. A source path in an
+  assert or a log string then starts at `dxmt/`.
+
+---
+diff --git i/meson.build w/meson.build
+index e10c901..f518e45 100644
+--- i/meson.build
++++ w/meson.build
+@@ -114,9 +114,15 @@ endif
+ 
+ xcrun = find_program('xcrun')
+ 
+-metalir_generator = generator(xcrun,
++# cranvr: source paths in assert and log strings start at the source folder, not at the Mac's home folder
++foreach native : [false, true]
++  add_project_arguments('-ffile-prefix-map=' + meson.project_source_root() + '=dxmt', language : ['c', 'cpp'], native : native)
++endforeach
++
++# cranvr: the shaders' AIR holds no path of the Mac that built them (tools/metal-air.sh)
++metalir_generator = generator(find_program('tools/metal-air.sh'),
+   output    : [ '@BASENAME@.air'],
+-  arguments : [ '-sdk', 'macosx', 'metal', '-o', '@OUTPUT@', '-c', '@INPUT@', '@EXTRA_ARGS@'],
++  arguments : [ '@OUTPUT@', '@INPUT@', '@EXTRA_ARGS@'],
+ )
+ 
+ metallib_generator = generator(xcrun,
+diff --git i/tools/metal-air.sh w/tools/metal-air.sh
+new file mode 100755
+index 0000000..0bc5a96
+--- /dev/null
++++ w/tools/metal-air.sh
+@@ -0,0 +1,16 @@
++#!/bin/sh
++# cranvr: compiles a Metal shader to AIR without the path of the Mac that built it. The Metal compiler writes the
++# shader's full path into the module (source_filename and air.source_file_name). No compiler option changes it, so
++# this names the module by the shader's file name in the text form and assembles it again.
++# Usage: metal-air.sh OUTPUT INPUT [METAL ARGUMENTS...]
++set -eu
++out=$1
++in=$2
++shift 2
++name=$(basename "$in")
++xcrun -sdk macosx metal -o "$out.full" -c "$in" "$@"
++xcrun -sdk macosx air-opt -S "$out.full" -o "$out.ll"
++sed -E -e "s|^source_filename = \".*\"\$|source_filename = \"$name\"|" \
++    -e "s|^(![0-9]+ = !\\{!\")[^\"]*/($name\"\\})\$|\\1\\2|" "$out.ll" > "$out.named.ll"
++xcrun -sdk macosx air-as "$out.named.ll" -o "$out"
++rm -f "$out.full" "$out.ll" "$out.named.ll"
