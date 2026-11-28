@@ -302,6 +302,19 @@ extern "C" {
         destination: CVPixelBufferRef,
     ) -> OSStatus;
     pub fn VTPixelRotationSessionInvalidate(session: *mut c_void);
+
+    // VTPixelTransferSession: scales a picture into another buffer
+    pub static kVTPixelTransferPropertyKey_ScalingMode: CFStringRef;
+    pub static kVTScalingMode_Normal: CFStringRef;
+    pub static kVTPixelTransferPropertyKey_DownsamplingMode: CFStringRef;
+    pub static kVTDownsamplingMode_Average: CFStringRef;
+    pub fn VTPixelTransferSessionCreate(allocator: CFAllocatorRef, out: *mut *mut c_void) -> OSStatus;
+    pub fn VTPixelTransferSessionTransferImage(
+        session: *mut c_void,
+        source: CVPixelBufferRef,
+        destination: CVPixelBufferRef,
+    ) -> OSStatus;
+    pub fn VTPixelTransferSessionInvalidate(session: *mut c_void);
     pub fn VTCompressionSessionPrepareToEncodeFrames(session: VTCompressionSessionRef) -> OSStatus;
     pub fn VTCompressionSessionGetPixelBufferPool(session: VTCompressionSessionRef) -> CVPixelBufferPoolRef;
     pub fn VTCompressionSessionEncodeFrame(

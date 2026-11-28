@@ -175,12 +175,16 @@ impl Capture {
         let display = screen_capture::display(display_id)?;
         let main_id = unsafe { display.displayID() };
         let (points_w, points_h) = unsafe { (display.width() as usize, display.height() as usize) };
-        let width = (points_w * 2).min(max_width) & !1;
-        let height = (width * points_h / points_w.max(1)) & !1;
-
         let filter = unsafe {
             SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &display, &NSArray::new())
         };
+        // A display at 1x has a pixel for each point, a HiDPI display two. A capture past the display's
+        // own pixels would only blow the picture up. The host's CoreGraphics knows no mode of a display
+        // that came after the host started, such as cranvr's own virtual displays: those are HiDPI.
+        let pixels_w = crate::display_modes::pixel_width(main_id).map_or(points_w * 2, |pixels| pixels.min(points_w * 2));
+        let width = pixels_w.min(max_width) & !1;
+        let height = (width * points_h / points_w.max(1)) & !1;
+
         let config = configuration((width, height), yuv, cursor, fps);
         let stream = unsafe { SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, None) };
         let latest: Latest = Arc::default();

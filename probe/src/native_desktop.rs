@@ -20,6 +20,8 @@ use cranvr_proto::{
 };
 use cranvr_vt::{DecodedFrame, Decoder};
 use std::{
+    io::Write,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex,
@@ -75,10 +77,27 @@ pub struct DesktopProbe {
     waiting_key: AtomicBool,
     last_key_request: Mutex<Instant>,
     last_frame: Mutex<Option<u32>>,
+    /// Where the luma of the first key picture and of the last picture goes (`--save-display`)
+    save: Option<PathBuf>,
+    saved: Mutex<SavedPictures>,
+}
+
+/// The pictures that `--save-display` writes at the end: their luma, a byte a pixel
+#[derive(Default)]
+struct SavedPictures {
+    key: Option<DecodedFrame>,
+    last: Option<DecodedFrame>,
+}
+
+/// Writes the luma of `frame` as a binary PGM.
+fn write_pgm(path: &Path, frame: &DecodedFrame) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    write!(file, "P5\n{} {}\n255\n", frame.width, frame.height)?;
+    file.write_all(&frame.luma)
 }
 
 impl DesktopProbe {
-    pub fn new(stream: u8) -> Arc<Self> {
+    pub fn new(stream: u8, save: Option<PathBuf>) -> Arc<Self> {
         let (decoded_sender, decoded) = mpsc::channel();
         Arc::new(Self {
             stream,
@@ -91,6 +110,8 @@ impl DesktopProbe {
             waiting_key: AtomicBool::new(true),
             last_key_request: Mutex::new(Instant::now() - KEY_REQUEST_GAP),
             last_frame: Mutex::new(None),
+            save,
+            saved: Mutex::default(),
         })
     }
 
@@ -144,7 +165,12 @@ impl DesktopProbe {
             }
             HostMsg::DecoderConfig { stream, config, .. } if *stream == self.stream => {
                 *self.config.lock().unwrap() = Some(config.clone());
-                match Decoder::new(config, vec![(0.5, 0.5), (0.1, 0.1)], self.decoded_sender.clone()) {
+                let decoder = if self.save.is_some() {
+                    Decoder::with_luma(config, self.decoded_sender.clone())
+                } else {
+                    Decoder::new(config, vec![(0.5, 0.5), (0.1, 0.1)], self.decoded_sender.clone())
+                };
+                match decoder {
                     Ok(decoder) => {
                         println!("probe: the desktop decoder is ready ({} bytes of parameter sets)", config.len());
                         *self.decoder.lock().unwrap() = Some(decoder);
@@ -203,6 +229,15 @@ impl DesktopProbe {
         totals.last = Some(now);
         if let Some(sent) = clock.lock().unwrap().to_local(unit.meta.sent) {
             totals.network_ms.push(unit.completed.saturating_sub(sent) as f64 / 1e6);
+        }
+        drop(totals);
+        if self.save.is_some() {
+            let mut saved = self.saved.lock().unwrap();
+            if unit.meta.key && saved.key.is_none() {
+                saved.key = Some(frame);
+            } else {
+                saved.last = Some(frame);
+            }
         }
     }
 
@@ -284,6 +319,17 @@ impl DesktopProbe {
 
     /// The numbers, for the end of the run. `Some(ok)` when the desktop was asked for.
     pub fn summary(&self) -> bool {
+        if let Some(prefix) = &self.save {
+            let saved = self.saved.lock().unwrap();
+            for (name, frame) in [("key", saved.key.as_ref()), ("last", saved.last.as_ref().or(saved.key.as_ref()))] {
+                let path = PathBuf::from(format!("{}-{name}.pgm", prefix.display()));
+                match frame.map(|frame| write_pgm(&path, frame)) {
+                    Some(Ok(())) => println!("probe: {}: wrote {}", self.label(), path.display()),
+                    Some(Err(e)) => eprintln!("probe: {}: {}: {e}", self.label(), path.display()),
+                    None => eprintln!("probe: {}: no picture for {}", self.label(), path.display()),
+                }
+            }
+        }
         let totals = self.totals.lock().unwrap();
         let seconds = match (totals.first, totals.last) {
             (Some(first), Some(last)) => last.duration_since(first).as_secs_f64().max(1e-3),

@@ -29,6 +29,8 @@ pub struct DisplayPlan {
     pub in_game: bool,
     /// The most pictures a second that every wish asks for, in place of the client's own rule
     pub max_fps: Option<u8>,
+    /// The widest picture that every wish asks for, in place of the client's own rule
+    pub max_width: Option<u32>,
 }
 
 pub struct DisplaySet {
@@ -88,7 +90,7 @@ impl DisplaySet {
             if info.stream == DESKTOP_STREAM || self.extra(info.stream).is_some() {
                 continue;
             }
-            let probe = DesktopProbe::new(info.stream);
+            let probe = DesktopProbe::new(info.stream, None);
             self.extras.lock().unwrap().push(Arc::clone(&probe));
             if self.wished.load(Ordering::Relaxed) {
                 probe.wish(link, true, self.wish_size());
@@ -121,7 +123,7 @@ impl DisplaySet {
             (false, 2) => (3840, 30),
             (false, _) => (2560, 30),
         };
-        (width, self.plan.max_fps.unwrap_or(fps))
+        (self.plan.max_width.unwrap_or(width), self.plan.max_fps.unwrap_or(fps))
     }
 
     /// Wishes or ends the wish of every display.

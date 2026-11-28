@@ -303,7 +303,7 @@ fn measure(script: &[(Motion, Duration)], format: Format, mbps: u64, spacing: Sp
     let (sender, encoded) = mpsc::channel();
     let Format { tiles, fps } = format;
     let size = [(WIDTH * tiles) as u32, (HEIGHT * tiles) as u32];
-    let mut display = DisplayEncoder::new(size, fps, mbps, sender.clone()).expect("encoder");
+    let mut display = DisplayEncoder::new(size, fps, mbps, sender.clone(), Conversion { source: size, flip: false }).expect("encoder");
     // The old encoder: frames 1 ms apart on the time line, a key frame every 10 s and no cap
     let key_every = Some(Duration::from_secs(10));
     let old = Encoder::new(&EncoderConfig { width: size[0], height: size[1], fps: fps as f32, bitrate_bps: mbps * 1_000_000, full_range: true, strict_rate: false, key_every, max_qp: None, real_time: false }, sender)
@@ -389,7 +389,7 @@ fn measure(script: &[(Motion, Duration)], format: Format, mbps: u64, spacing: Sp
                 index += 1;
                 match spacing {
                     Spacing::Feed => {
-                        display.encode(None, &picture, index).expect("encode");
+                        display.encode(&picture, index).expect("encode");
                         feed.took(&picture, now);
                     }
                     Spacing::OneMs => {

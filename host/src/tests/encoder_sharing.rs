@@ -60,7 +60,7 @@ fn display_loop(fps: u32, video: bool, stop: &AtomicBool) -> (Vec<f64>, usize) {
     // `CRANVR_SHARE_WIDTH=2560` gives the display of a game (2560 x 1440)
     let width: usize = std::env::var("CRANVR_SHARE_WIDTH").ok().and_then(|v| v.parse().ok()).unwrap_or(WIDTH * 2);
     let size = [width as u32, (width * 9 / 16) as u32];
-    let mut display = DisplayEncoder::new(size, fps as i32, DISPLAY_MBPS, sender).expect("display encoder");
+    let mut display = DisplayEncoder::new(size, fps as i32, DISPLAY_MBPS, sender, Conversion { source: size, flip: false }).expect("display encoder");
     // `CRANVR_SHARE_DISPLAY_RT=1` runs the display's session in real time, as the host did before
     if std::env::var("CRANVR_SHARE_DISPLAY_RT").is_ok_and(|v| v == "1") {
         display.encoder.set_real_time(true).expect("real time on");
@@ -102,7 +102,7 @@ fn display_loop(fps: u32, video: bool, stop: &AtomicBool) -> (Vec<f64>, usize) {
         // The host's desktop loop: a picture goes in while the encoder holds none
         if display.in_flight() == 0 {
             if let Some(picture) = feed.next(Some((seq, buffer)), now) {
-                display.encode(None, &picture, seq).expect("display encode");
+                display.encode(&picture, seq).expect("display encode");
                 feed.took(&picture, now);
             }
         }

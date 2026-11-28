@@ -33,7 +33,7 @@ use cranvr_proto::{
     message::{Cursor, DesktopParams, DesktopWish, HostDatagram, HostMsg, Mouse, DESKTOP_STREAM},
     wire::{Codec, Pose, Rect},
 };
-use cranvr_vt::{EncodedFrame, Encoder, EncoderConfig, Flipper, PixelBuffer};
+use cranvr_vt::{EncodedFrame, Encoder, EncoderConfig, Flipper, PixelBuffer, Scaler};
 use std::{
     collections::VecDeque,
     ffi::c_void,
@@ -109,6 +109,10 @@ struct Counters {
     encode_us: AtomicU64,
     /// Microseconds that `send_unit` took, summed
     send_us: AtomicU64,
+    /// Microseconds that the hand-over of each picture to the encoder took, its scaling included, summed
+    submit_us: AtomicU64,
+    /// Pictures handed over
+    submitted: AtomicU64,
     pointer_datagrams: AtomicU64,
     cursor_datagrams: AtomicU64,
 }
@@ -249,7 +253,6 @@ struct Running {
     encoded: Receiver<EncodedFrame>,
     params: DesktopParams,
     wish: DesktopWish,
-    flipper: Option<Flipper>,
     feed: Feed,
     /// The parameter sets that the client has
     config: Option<Vec<u8>>,
@@ -285,6 +288,19 @@ pub(super) struct DisplayEncoder {
     fps: i32,
     mbps: u64,
     sender: Sender<EncodedFrame>,
+    /// Scales a capture of another size to the stream's size
+    scaler: Option<Scaler>,
+    /// Mirrors each picture (`CRANVR_DESKTOP_FLIP=1`)
+    flipper: Option<Flipper>,
+}
+
+/// What a display's encoder does to each capture before it encodes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Conversion {
+    /// The size of the captures in pixels. A capture larger than the stream is scaled down to it.
+    pub source: [u32; 2],
+    /// Mirror each picture top to bottom
+    pub flip: bool,
 }
 
 impl DisplayEncoder {
@@ -292,8 +308,11 @@ impl DisplayEncoder {
     /// go to `sender`. A key frame comes first and when the client lost a picture, never on a timer:
     /// a key frame costs 680 KB at 1920 x 1080 and 2.7 MB at 3840 x 2160 in `display_quality.rs`, and
     /// the client asks for one after each loss and each new decoder.
-    pub(super) fn new(size: [u32; 2], fps: i32, mbps: u64, sender: Sender<EncodedFrame>) -> Result<Self, String> {
-        Ok(Self { encoder: Self::session(size, fps, mbps, &sender, true)?, capped: true, size, fps, mbps, sender })
+    /// `conversion` says what each capture needs first.
+    pub(super) fn new(size: [u32; 2], fps: i32, mbps: u64, sender: Sender<EncodedFrame>, conversion: Conversion) -> Result<Self, String> {
+        let scaler = if conversion.source == size { None } else { Some(Scaler::new()?) };
+        let flipper = if conversion.flip { Some(Flipper::new()?) } else { None };
+        Ok(Self { encoder: Self::session(size, fps, mbps, &sender, true)?, capped: true, size, fps, mbps, sender, scaler, flipper })
     }
 
     fn session([width, height]: [u32; 2], fps: i32, mbps: u64, sender: &Sender<EncodedFrame>, capped: bool) -> Result<Encoder, String> {
@@ -312,23 +331,32 @@ impl DisplayEncoder {
         self.capped
     }
 
-    /// Hands `picture` to the encoder, mirrored first when `flipper` is set. A picture that wants the
-    /// other session starts it: the old session hands over its last frames, and the picture becomes
-    /// the new session's key frame.
-    pub(super) fn encode(&mut self, flipper: Option<&Flipper>, picture: &Picture, timestamp: u64) -> Result<(), String> {
+    /// Hands `picture` to the encoder, scaled to the stream's size and mirrored first when the
+    /// conversion says so. A picture that wants the other session starts it: the old session hands
+    /// over its last frames, and the picture becomes the new session's key frame.
+    pub(super) fn encode(&mut self, picture: &Picture, timestamp: u64) -> Result<(), String> {
         let mut key = picture.key;
         if picture.cap != self.capped {
             self.encoder = Self::session(self.size, self.fps, self.mbps, &self.sender, picture.cap)?;
             self.capped = picture.cap;
             key = true;
         }
-        match flipper {
+        let scaled = match &self.scaler {
+            Some(scaler) => {
+                let buffer = self.encoder.pixel_buffer().ok_or("the encoder has no buffer pool".to_string())?;
+                scaler.scale(&picture.image, &buffer)?;
+                Some(buffer)
+            }
+            None => None,
+        };
+        let image = scaled.as_ref().unwrap_or(&picture.image);
+        match &self.flipper {
             Some(flipper) => {
                 let flipped = self.encoder.pixel_buffer().ok_or("the encoder has no buffer pool".to_string())?;
-                flipper.flip(&picture.image, &flipped)?;
+                flipper.flip(image, &flipped)?;
                 self.encoder.encode(&flipped, picture.presentation, timestamp, key)
             }
-            None => self.encoder.encode(&picture.image, picture.presentation, timestamp, key),
+            None => self.encoder.encode(image, picture.presentation, timestamp, key),
         }
     }
 }
@@ -452,24 +480,28 @@ fn cursor_in_video() -> bool {
     !matches!(std::env::var("CRANVR_DESKTOP_CURSOR_IN_VIDEO").as_deref(), Ok("0"))
 }
 
+/// The size of a display's stream for a capture of `source` pixels and a wish of up to `max_width`
+/// pixels across: the capture's size, or a smaller one of the same shape. Both sides are even, as
+/// the encoder's 4:2:0 pictures need, and the picture is at least 640 pixels wide.
+fn stream_size([width, height]: [u32; 2], max_width: u32) -> [u32; 2] {
+    let scaled = width.min(max_width.max(640)) & !1;
+    [scaled, ((u64::from(scaled) * u64::from(height) / u64::from(width.max(1))) as u32) & !1]
+}
+
 impl Running {
     fn open(options: &Options, wish: DesktopWish, notify: &SyncSender<()>) -> Result<Self, String> {
         let fps = i32::from(wish.max_fps).clamp(1, MAX_FPS);
+        // The capture keeps the display's own pixels: the encoder's scaler shrinks them to the wish
+        // with far less blur than ScreenCaptureKit's own scaling (see `cranvr_vt::Scaler`)
         let capture = Capture::start_with(
             options.display_id,
-            CaptureSpec {
-                max_width: (wish.max_width as usize).max(640),
-                fps,
-                cursor: cursor_in_video(),
-                yuv: true,
-                notify: Some(notify.clone()),
-            },
+            CaptureSpec { max_width: usize::MAX, fps, cursor: cursor_in_video(), yuv: true, notify: Some(notify.clone()) },
         )?;
-        let (width, height) = capture.size;
+        let source = [capture.size.0, capture.size.1];
+        let [width, height] = stream_size(source, wish.max_width);
         let (sender, encoded) = mpsc::channel();
         let mbps = scaled_mbps(options.mbps, [width, height], fps);
-        let encoder = DisplayEncoder::new([width, height], fps, mbps, sender)?;
-        let flipper = if flip_pictures() { Some(Flipper::new()?) } else { None };
+        let encoder = DisplayEncoder::new([width, height], fps, mbps, sender, Conversion { source, flip: flip_pictures() })?;
         let params = DesktopParams {
             stream: options.stream,
             codec: Codec::Hevc,
@@ -478,10 +510,10 @@ impl Running {
             max_fps: fps as f32,
             bitrate_bps: mbps * 1_000_000,
             full_range: true,
-            flipped: flipper.is_some(),
+            flipped: flip_pictures(),
             cursor_in_video: cursor_in_video(),
         };
-        Ok(Self { capture, encoder, encoded, params, wish, flipper, feed: Feed::new(Instant::now(), mbps * 1_000_000), config: None })
+        Ok(Self { capture, encoder, encoded, params, wish, feed: Feed::new(Instant::now(), mbps * 1_000_000), config: None })
     }
 }
 
@@ -562,7 +594,11 @@ fn step(inner: &Inner, session: &Session, run: &mut Running, next_frame: &mut u3
                 inner.counters.captured.fetch_add(1, Ordering::Relaxed);
             }
             let capped = run.encoder.capped();
-            match run.encoder.encode(run.flipper.as_ref(), &picture, now_ns()) {
+            let submit = Instant::now();
+            let result = run.encoder.encode(&picture, now_ns());
+            inner.counters.submit_us.fetch_add(submit.elapsed().as_micros() as u64, Ordering::Relaxed);
+            inner.counters.submitted.fetch_add(1, Ordering::Relaxed);
+            match result {
                 Ok(()) => run.feed.took(&picture, now),
                 Err(e) => warn!("{}: the encoder refused a picture: {e}", inner.label()),
             }
@@ -628,13 +664,44 @@ fn send_frame(inner: &Inner, session: &Session, run: &mut Running, frame: &Encod
 /// The numbers since the last look, for the log line.
 struct LogState {
     at: Instant,
-    seen: (u64, u64, u64, u64, u64, u64, u64),
+    seen: Snapshot,
     mouse: desktop::InjectedCounts,
+}
+
+/// The counters of a display at one time, for the changes since the last log line
+#[derive(Clone, Copy, Default)]
+struct Snapshot {
+    frames: u64,
+    bytes: u64,
+    keys: u64,
+    encode_us: u64,
+    send_us: u64,
+    pointer_datagrams: u64,
+    cursor_datagrams: u64,
+    submit_us: u64,
+    submitted: u64,
+}
+
+impl Snapshot {
+    fn of(c: &Counters) -> Self {
+        let read = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        Self {
+            frames: read(&c.frames),
+            bytes: read(&c.bytes),
+            keys: read(&c.keys),
+            encode_us: read(&c.encode_us),
+            send_us: read(&c.send_us),
+            pointer_datagrams: read(&c.pointer_datagrams),
+            cursor_datagrams: read(&c.cursor_datagrams),
+            submit_us: read(&c.submit_us),
+            submitted: read(&c.submitted),
+        }
+    }
 }
 
 impl LogState {
     fn new() -> Self {
-        Self { at: Instant::now(), seen: (0, 0, 0, 0, 0, 0, 0), mouse: desktop::injected_counts() }
+        Self { at: Instant::now(), seen: Snapshot::default(), mouse: desktop::injected_counts() }
     }
 
     fn maybe_log(&mut self, inner: &Inner) {
@@ -642,31 +709,23 @@ impl LogState {
             return;
         }
         let seconds = self.at.elapsed().as_secs_f64();
-        let c = &inner.counters;
-        let now = (
-            c.frames.load(Ordering::Relaxed),
-            c.bytes.load(Ordering::Relaxed),
-            c.keys.load(Ordering::Relaxed),
-            c.encode_us.load(Ordering::Relaxed),
-            c.send_us.load(Ordering::Relaxed),
-            c.pointer_datagrams.load(Ordering::Relaxed),
-            c.cursor_datagrams.load(Ordering::Relaxed),
-        );
-        let d = |a: u64, b: u64| a.saturating_sub(b);
-        let frames = d(now.0, self.seen.0);
+        let (now, seen) = (Snapshot::of(&inner.counters), self.seen);
+        let frames = now.frames - seen.frames;
         let n = frames.max(1) as f64;
+        let bytes = (now.bytes - seen.bytes) as f64;
         let mouse = desktop::injected_counts();
         info!(
-            "{}: {:.1} pictures a second, {:.1} Mbps, {:.1} KB a picture, {} key, encode {:.2} ms, send {:.2} ms; the client sent {} pointer datagrams, {} cursor datagrams; mouse events: {} moves, {} downs ({} right, {} middle), {} ups, {} px scrolled, {} px scrolled across",
+            "{}: {:.1} pictures a second, {:.1} Mbps, {:.1} KB a picture, {} key, hand-over {:.2} ms, encode {:.2} ms, send {:.2} ms; the client sent {} pointer datagrams, {} cursor datagrams; mouse events: {} moves, {} downs ({} right, {} middle), {} ups, {} px scrolled, {} px scrolled across",
             inner.label(),
             frames as f64 / seconds,
-            d(now.1, self.seen.1) as f64 * 8.0 / seconds / 1e6,
-            d(now.1, self.seen.1) as f64 / n / 1000.0,
-            d(now.2, self.seen.2),
-            d(now.3, self.seen.3) as f64 / n / 1000.0,
-            d(now.4, self.seen.4) as f64 / n / 1000.0,
-            d(now.5, self.seen.5),
-            d(now.6, self.seen.6),
+            bytes * 8.0 / seconds / 1e6,
+            bytes / n / 1000.0,
+            now.keys - seen.keys,
+            (now.submit_us - seen.submit_us) as f64 / (now.submitted - seen.submitted).max(1) as f64 / 1000.0,
+            (now.encode_us - seen.encode_us) as f64 / n / 1000.0,
+            (now.send_us - seen.send_us) as f64 / n / 1000.0,
+            now.pointer_datagrams - seen.pointer_datagrams,
+            now.cursor_datagrams - seen.cursor_datagrams,
             mouse.moves - self.mouse.moves,
             mouse.downs - self.mouse.downs,
             mouse.right_downs - self.mouse.right_downs,
@@ -816,3 +875,7 @@ fn cursor_loop(inner: &Inner, session: &Session) {
 #[cfg(test)]
 #[path = "../../tests/display_quality.rs"]
 mod quality_tests;
+
+#[cfg(test)]
+#[path = "../../tests/display_scale.rs"]
+mod scale_tests;
