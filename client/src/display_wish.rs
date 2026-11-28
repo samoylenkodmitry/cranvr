@@ -24,15 +24,24 @@ const READING_DISTANCE: f32 = 0.35;
 /// The widths that the hand's display asks for. A resize starts a new capture only when it crosses a
 /// step.
 const HAND_STEPS: [u32; 3] = [1920, 2560, 3840];
+/// The display's pixels that the hand's display asks for each pixel of the headset that it covers,
+/// while no game runs. The headset's compositor scales the picture once more. Each scaling blurs small
+/// text. In `scripts/sharpness/model.swift`, a model of that sampling, a display of 3840 pixels at 1x
+/// that the headset shows 2250 pixels wide kept 76 % of the gaps between the letters of 12 point text
+/// from a picture of 3840 pixels and 23 % from a picture of 2560 (issue #222).
+const OVERSAMPLE: f32 = 1.5;
 
 /// The picture's width that the hand's display needs when it is `width_mm` wide: the headset's pixels
 /// across the panel at the reading distance, rounded up to a step. The panel of 42 cm that the hand
-/// starts with spans 62 degrees there, about 1550 of the headset's pixels, and gets 1920. A panel wider
-/// than 55 cm gets 2560.
-pub fn hand_width(width_mm: u32) -> u32 {
+/// starts with spans 62 degrees there, about 1550 of the headset's pixels. During a game it gets 1920.
+/// A panel wider than 55 cm gets 2560 then: the game's eye stream shares the Mac's encoder. With no
+/// game the display asks for `OVERSAMPLE` times the headset's pixels: 2560 at 42 cm and the full 3840
+/// from 48 cm.
+pub fn hand_width(width_mm: u32, in_game: bool) -> u32 {
     let half = width_mm as f32 / 2000.0;
-    let pixels = (2.0 * (half / READING_DISTANCE).atan().to_degrees() * PIXELS_PER_DEGREE).ceil() as u32;
-    HAND_STEPS.into_iter().find(|&step| step >= pixels).unwrap_or(HAND_STEPS[HAND_STEPS.len() - 1])
+    let pixels = 2.0 * (half / READING_DISTANCE).atan().to_degrees() * PIXELS_PER_DEGREE;
+    let needed = (pixels * if in_game { 1.0 } else { OVERSAMPLE }).ceil() as u32;
+    HAND_STEPS.into_iter().find(|&step| step >= needed).unwrap_or(HAND_STEPS[HAND_STEPS.len() - 1])
 }
 
 /// The widest picture and the most pictures a second for a display.
@@ -43,12 +52,12 @@ pub fn hand_width(width_mm: u32) -> u32 {
 /// - Three or four in the room, no game: 2560 pixels across at 30.
 /// - During a game: 2560 pixels across at 30 for a panel in the room. More than two displays in a game
 ///   take 1920 at 30 each.
-/// - The hand's panel: the width that its size needs (see [`hand_width`]) at 30, in a game or not.
+/// - The hand's panel: the width that its size needs (see [`hand_width`]) at 30.
 ///
 /// `limit` is the widest picture that the headset's decoder takes, when it says, or a test's limit.
 pub fn wish_for(place: Place, in_game: bool, shown: usize, limit: Option<u32>) -> DesktopWish {
     let (width, fps) = match (in_game, place, shown) {
-        (_, Place::Hand { width_mm }, _) => (hand_width(width_mm), 30),
+        (_, Place::Hand { width_mm }, _) => (hand_width(width_mm, in_game), 30),
         (true, Place::Room, 0..=2) => (2560, 30),
         (true, Place::Room, _) => (1920, 30),
         (false, Place::Room, 0..=1) => (3840, 60),
@@ -117,28 +126,39 @@ mod tests {
         assert!(room.max_width < free.max_width && room.max_fps < free.max_fps);
         assert!(hand.max_width < room.max_width);
         assert_eq!((hand.max_width, hand.max_fps), (1920, 30));
-        // The hand's display asks the same in the room: it is small there as well
-        assert_eq!(wish_for(Place::Hand { width_mm: 420 }, false, 1, None), hand);
+        // With no game the hand's display asks for more than the headset's pixels, at the same rate
+        let free_hand = wish_for(Place::Hand { width_mm: 420 }, false, 1, None);
+        assert_eq!((free_hand.max_width, free_hand.max_fps), (2560, 30));
     }
 
     #[test]
     fn a_decoder_that_takes_less_limits_the_width() {
         assert_eq!(wish_for(Place::Room, false, 1, Some(2560)).max_width, 2560);
-        assert_eq!(wish_for(Place::Hand { width_mm: 420 }, false, 1, Some(4096)).max_width, 1920);
+        assert_eq!(wish_for(Place::Hand { width_mm: 420 }, true, 1, Some(4096)).max_width, 1920);
         assert_eq!(wish_for(Place::Hand { width_mm: 700 }, false, 1, Some(2048)).max_width, 2048);
     }
 
     #[test]
     fn the_hand_asks_for_the_pixels_that_its_size_needs() {
-        // The hand's display is 28 to 70 cm wide (`display_panel.rs`)
-        assert_eq!(hand_width(280), 1920);
-        assert_eq!(hand_width(420), 1920);
-        assert_eq!(hand_width(550), 1920);
-        assert_eq!(hand_width(560), 2560);
-        assert_eq!(hand_width(700), 2560);
-        // A wider panel never asks for less
-        let widths: Vec<u32> = (280..=700).step_by(10).map(hand_width).collect();
-        assert!(widths.windows(2).all(|pair| pair[0] <= pair[1]));
+        // The hand's display is 28 to 70 cm wide (`display_panel.rs`). During a game it asks for the
+        // headset's pixels across it
+        assert_eq!(hand_width(280, true), 1920);
+        assert_eq!(hand_width(420, true), 1920);
+        assert_eq!(hand_width(550, true), 1920);
+        assert_eq!(hand_width(560, true), 2560);
+        assert_eq!(hand_width(700, true), 2560);
+        // With no game it asks for more, up to the full width of a 4K display
+        assert_eq!(hand_width(280, false), 1920);
+        assert_eq!(hand_width(420, false), 2560);
+        assert_eq!(hand_width(470, false), 2560);
+        assert_eq!(hand_width(480, false), 3840);
+        assert_eq!(hand_width(700, false), 3840);
+        // A wider panel never asks for less, and a game never asks for more
+        for in_game in [true, false] {
+            let widths: Vec<u32> = (280..=700).step_by(10).map(|width| hand_width(width, in_game)).collect();
+            assert!(widths.windows(2).all(|pair| pair[0] <= pair[1]));
+        }
+        assert!((280..=700).step_by(10).all(|width| hand_width(width, true) <= hand_width(width, false)));
     }
 
     #[test]

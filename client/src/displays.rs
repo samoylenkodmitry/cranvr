@@ -1374,7 +1374,7 @@ mod tests {
         layout.toggle_pinned(2);
         let wishes = wishes_of(&layout);
         // Two displays show: the first asks for less, and the one on the hand asks for the hand's size
-        let hand = crate::display_wish::hand_width((crate::display_panel::hand_display_width() * 1000.0).round() as u32);
+        let hand = crate::display_wish::hand_width((crate::display_panel::hand_display_width() * 1000.0).round() as u32, false);
         assert_eq!(wishes[1].map(|w| (w.max_width, w.max_fps)), Some((hand, 30)));
         assert!(hand >= 1920);
         assert_eq!(wishes[0].map(|w| w.max_fps), Some(30));
