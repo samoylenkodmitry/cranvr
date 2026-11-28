@@ -50,7 +50,7 @@ git -C "${dir}" submodule update --init --depth 1 libs/openxr-sdk libs/glm
 
 openvr_header=${dir}/OpenVRHeaders/openvr-2.15.6.h
 if [[ ! -f ${openvr_header} ]]; then
-    curl -sSfL -o "${openvr_header}" "${openvr_header_url}"
+    curl --proto '=https' --tlsv1.2 -sSfL -o "${openvr_header}" "${openvr_header_url}"
 fi
 if [[ $(shasum -a 256 "${openvr_header}" | awk '{print $1}') != ${openvr_header_sha256} ]]; then
     print -u2 "FAIL: ${openvr_header} from ${openvr_header_url} has another SHA-256"
@@ -85,7 +85,7 @@ done
 vulkan_headers=${build}/vulkan-headers
 if [[ ! -f ${vulkan_headers}/include/vulkan/vulkan.h ]]; then
     mkdir -p "${vulkan_headers}"
-    curl -sSfL -o "${build}/vulkan-headers.tar.gz" "${vulkan_headers_url}"
+    curl --proto '=https' --tlsv1.2 -sSfL -o "${build}/vulkan-headers.tar.gz" "${vulkan_headers_url}"
     if [[ $(shasum -a 256 "${build}/vulkan-headers.tar.gz" | awk '{print $1}') != ${vulkan_headers_sha256} ]]; then
         print -u2 "FAIL: the Vulkan headers from ${vulkan_headers_url} have another SHA-256"
         exit 1

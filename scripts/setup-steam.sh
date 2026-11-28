@@ -54,7 +54,13 @@ if [[ ! -f ${steam_dir}/steam.exe ]]; then
         download=$(mktemp -d)
         installer=${download}/SteamSetup.exe
         print "Downloading SteamSetup.exe from Valve"
-        curl -fsSL -o "${installer}" https://cdn.akamai.steamstatic.com/client/installer/SteamSetup.exe
+        # Valve replaces SteamSetup.exe at this address with each release, so no SHA-256 can be pinned
+        # here. The check is the TLS certificate of Valve's own CDN: HTTPS alone, also after a
+        # redirect. Steam then updates itself from the same CDN in the same way. The installer's
+        # Authenticode signature is no check on a Mac: macOS has no tool for it, and the signing
+        # certificate of Valve's current installer has expired (Windows accepts it by its
+        # timestamp). The lines below only catch a file that is no Windows program of Valve's.
+        curl --proto '=https' --tlsv1.2 -fsSL -o "${installer}" https://cdn.akamai.steamstatic.com/client/installer/SteamSetup.exe
     fi
     if [[ $(head -c 2 "${installer}") != MZ ]] || ! grep -q "Valve Corp" "${installer}"; then
         print -u2 "${installer} does not look like Valve's signed Steam installer."

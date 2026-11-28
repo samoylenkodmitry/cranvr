@@ -5,7 +5,7 @@
 Games need Wine with cranvr's DXMT fork and BasaltVR's OpenXR runtime. The app's Play tab has one button, "Set up games". It runs the steps that the Mac still lacks, in this order, with a line of progress for each step:
 
 1. Rosetta 2, which runs Wine's Intel code. macOS asks for an administrator's password. The Play tab says so before the button is pressed.
-2. Game support: the app downloads `cranvr-game-support-macos.tar.xz` (about 240 MB) from the public release at https://github.com/samoylenkodmitry/cranvr-game-support, checks its SHA-256, unpacks it and installs it with `setup-wine.sh`. It takes about 1.2 GB on disk. `scripts/install-game-support.sh [ARCHIVE|URL]` does the same without the app.
+2. Game support: the app downloads `cranvr-game-support-macos.tar.xz` (about 320 MB) of the release at https://github.com/samoylenkodmitry/cranvr-game-support that `scripts/game-support-version.txt` names. It checks the archive against the SHA-256 in `scripts/game-support-sha256.txt`, unpacks it and installs it with `setup-wine.sh`. It takes about 1.2 GB on disk. `scripts/install-game-support.sh [ARCHIVE]` does the same without the app.
 3. Steam for Windows. At the end the Steam window opens. The user signs in there once.
 
 A failed step keeps its message on screen with a Retry button, which runs the steps that are not done. Games on another disk need no setting in cranvr: in the Steam window, Settings, Storage adds a folder on that disk. The Play tab lists the games of every Steam library folder.

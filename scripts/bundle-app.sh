@@ -35,7 +35,7 @@ app=${root}/target/release/cranvr.app
 rm -rf "${app}"
 mkdir -p "${app}/Contents/MacOS" "${app}/Contents/Resources/scripts"
 cp target/release/cranvr target/release/cranvr-host "${app}/Contents/MacOS/"
-cp scripts/setup-wine.sh scripts/setup-steam.sh scripts/install-game-support.sh scripts/run-game.sh scripts/game-support-version.txt "${app}/Contents/Resources/scripts/"
+cp scripts/setup-wine.sh scripts/setup-steam.sh scripts/install-game-support.sh scripts/run-game.sh scripts/game-support-version.txt scripts/game-support-sha256.txt "${app}/Contents/Resources/scripts/"
 cp target/quest-recorder/cranvr-quest-recorder.jar "${app}/Contents/Resources/"
 version=${CRANVR_VERSION:-$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)}
 
