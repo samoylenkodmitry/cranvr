@@ -10,7 +10,10 @@
 # It counts the pixels of the message's color in the left eye of each capture and their middle
 # (scripts/screen-color.py), keeps a capture only when scripts/capture-check.py passes it, and exits 1
 # unless the message shows while the screen shows, stands more to the left when turned, and is gone
-# before and after. The first start of the client after its install only warms up.
+# before and after. The first start of the client only warms up. The headset changes its USB functions
+# about 25 s after that start, which ends the test port's link and drops its `adb reverse`, so the
+# measured start waits until 32 s after it and sets the reverse again. A run in which the link ended
+# is void, and the script exits 2.
 #
 # Usage: scripts/screen-check.sh SERIAL WORKDIR [CAPTURES] [PORT]
 #   CAPTURES  the folder for the captures that pass (none by default: every capture is deleted)
@@ -21,6 +24,7 @@
 # 9950 (scripts/give-back.sh), also after a failure, unless CRANVR_NO_GIVE_BACK is set.
 # CRANVR_GIVE_BACK_APK names a build that give-back.sh installs first.
 set -u
+zmodload zsh/datetime
 serial=$1 work=$2
 captures=${3:-} port=${4:-9961}
 root=${0:A:h:h}
@@ -83,9 +87,14 @@ ${adb_cmd} shell am broadcast -a com.oculus.vrpowermanager.prox_close > /dev/nul
 common=(--es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room scene --ez save_choices false \
     --es panels hidden --ez console false --es forget_host_key ${forget})
 client_start ${host_log} ${common}
+warm=${EPOCHSECONDS}
 print "warm start: ${client_result}"
+while (( EPOCHSECONDS < warm + 32 )); do
+    sleep 1
+done
 ${adb_cmd} shell am force-stop ${CLIENT_PACKAGE}
-sleep 1
+quest_ready
+${adb_cmd} reverse tcp:${port} tcp:${port} > /dev/null 2>&1
 ${adb_cmd} logcat -c
 client_start ${host_log} ${common}
 print "client: ${client_result} ${client_linked}"
