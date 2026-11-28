@@ -998,5 +998,5 @@ impl Sound for SoundProcess {
 }
 
 #[cfg(test)]
-#[path = "recorder_tests.rs"]
+#[path = "tests/recorder.rs"]
 mod tests;
