@@ -68,12 +68,26 @@ pub fn panel_name(stream: u8) -> &'static str {
 /// others stand around it, 1.2 m wide, turned toward the user.
 fn start_of(stream: u8) -> (Pose, f32) {
     let pose = |x: f32, y: f32, z: f32, pitch: f32, yaw: f32| SubspaceModifier::new().offset(x, y, z).rotate(pitch, yaw, 0.0).pose();
+    if let (0, Some((width, distance))) = (stream - DESKTOP_STREAM, test_place()) {
+        return (Pose::at([0.0, 0.0, 1.0 - distance]), width);
+    }
     match stream - DESKTOP_STREAM {
         0 => (Pose::at([0.0, -0.1, -0.5]), 1.6),
         1 => (pose(1300.0, 450.0, 100.0, 0.0, -40.0), 1.2),
         2 => (pose(-1300.0, 450.0, 100.0, 0.0, 40.0), 1.2),
         _ => (pose(0.0, 750.0, 0.0, -30.0, 0.0), 1.2),
     }
+}
+
+/// The width and the distance from the head in meters of the first display's panel, from the launch
+/// extra `display_place` (`WIDTH,DISTANCE`), for a test that measures the panel's picture at a known
+/// size: the panel stands that far straight ahead at eye level. With `default_places` no saved place
+/// moves it.
+fn test_place() -> Option<(f32, f32)> {
+    let args = launch::args();
+    let (width, distance) = args.string("display_place")?.split_once(',')?;
+    let (width, distance) = (width.trim().parse::<f32>().ok()?, distance.trim().parse::<f32>().ok()?);
+    ((WIDTH_RANGE[0]..=WIDTH_RANGE[1]).contains(&width) && (0.2..=10.0).contains(&distance)).then_some((width, distance))
 }
 
 /// Where the first display's panel stands and how wide it is before the user carries it, for the

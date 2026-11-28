@@ -963,12 +963,19 @@ fn decoder_width() -> Option<u32> {
 pub fn wishes_of(layout: &Layout) -> [Option<DesktopWish>; SLOTS] {
     let shown = layout.displays_shown();
     let mut wishes = [None; SLOTS];
+    // A test may ask for less than the rules do (`desktop_width`)
+    let limit = [decoder_width(), launch_width()].into_iter().flatten().min();
     for &stream in &shown {
         if let Some(index) = slot_of(stream) {
-            wishes[index] = Some(wish_for(place_of(layout, stream), layout.in_game(), shown.len(), decoder_width()));
+            wishes[index] = Some(wish_for(place_of(layout, stream), layout.in_game(), shown.len(), limit));
         }
     }
     wishes
+}
+
+/// The widest picture that the launch extra `desktop_width` allows, for a test
+fn launch_width() -> Option<u32> {
+    crate::launch::args().int("desktop_width").and_then(|width| u32::try_from(width).ok()).filter(|&width| width >= 640)
 }
 
 /// The datagram for the mouse on a display

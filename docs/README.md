@@ -5,7 +5,7 @@ The text of a file names a section of another file in quotes, such as "Foveated 
 | File | Sections |
 |---|---|
 | [architecture.md](architecture.md) | The parts of cranvr: What works, Parts |
-| [development.md](development.md) | Build, Run, What you should see, Test without a headset, End-to-end test, Measure a game with a Quest on the desk, Other settings of the host, The eye stream's bitrate |
+| [development.md](development.md) | Build, Run, What you should see, Test without a headset, End-to-end test, Measure a game with a Quest on the desk, Screen captures of a headset on a desk, Other settings of the host, The eye stream's bitrate |
 | [headset-app.md](headset-app.md) | The headset app: Tracking, The eye size and the decoder, Foveated encoding, The console, The hand menu, Panels past the layer limit, The game's loading screen, Controls, Focus and pause, Text entry, The Meta store check, Phone mode, Latency numbers |
 | [connection.md](connection.md) | Finding the Mac, Pairing, The code, Versions, The USB cable, The sealed session, Display lock, Network exposure |
 | [desktop.md](desktop.md) | The desktop panel and the sound, The microphone in games, Several displays, Sharp text on a display's panel, A virtual display for the headset |

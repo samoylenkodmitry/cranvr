@@ -45,8 +45,8 @@ pub fn hand_width(width_mm: u32) -> u32 {
 ///   take 1920 at 30 each.
 /// - The hand's panel: the width that its size needs (see [`hand_width`]) at 30, in a game or not.
 ///
-/// `decoder_width` is the widest picture that the headset's decoder takes, when it says.
-pub fn wish_for(place: Place, in_game: bool, shown: usize, decoder_width: Option<u32>) -> DesktopWish {
+/// `limit` is the widest picture that the headset's decoder takes, when it says, or a test's limit.
+pub fn wish_for(place: Place, in_game: bool, shown: usize, limit: Option<u32>) -> DesktopWish {
     let (width, fps) = match (in_game, place, shown) {
         (_, Place::Hand { width_mm }, _) => (hand_width(width_mm), 30),
         (true, Place::Room, 0..=2) => (2560, 30),
@@ -55,7 +55,7 @@ pub fn wish_for(place: Place, in_game: bool, shown: usize, decoder_width: Option
         (false, Place::Room, 2) => (3840, 30),
         (false, Place::Room, _) => (2560, 30),
     };
-    DesktopWish { enabled: true, max_width: decoder_width.map_or(width, |limit| width.min(limit)), max_fps: fps }
+    DesktopWish { enabled: true, max_width: limit.map_or(width, |limit| width.min(limit)), max_fps: fps }
 }
 
 /// What the menu knows of a display's stream, from the client's own counts.
