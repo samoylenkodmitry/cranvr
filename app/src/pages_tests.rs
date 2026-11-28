@@ -533,3 +533,21 @@ fn the_log_page_carries_the_newest_lines_only_for_a_while_after_the_headset_aske
     let lines = texts(&model);
     assert_eq!((lines.len(), lines.first().map(String::as_str), lines.last().map(String::as_str)), (14, Some("line 16"), Some("line 29")));
 }
+
+#[test]
+fn a_game_s_row_and_page_say_why_its_cloud_files_hold_its_start() {
+    let program = steam::program(&lab()).unwrap();
+    let added_program = steam::program(&added()).unwrap();
+    let mut settings = Settings::default();
+    // A copy of a Steam game names the game's ID in its options, so its note is the game's note
+    settings.launch.insert(added_program.clone(), launch::GameOptions { steam_app_id: "450390".into(), ..Default::default() });
+    let mut model = model_with(vec![lab(), added()]);
+    let note = "Steam has 2 cloud files of this game that are not on this Mac yet.";
+    let notes = |pages: &[Page], id: &str| page(pages, id).items.iter().filter(|item| matches!(item, Item::Text { text, .. } if text == note)).count();
+    assert_eq!(notes(&pages(&settings, &model), PLAY), 0);
+    model.cloud.insert("450390".into(), note.into());
+    let pages = pages(&settings, &model);
+    assert_eq!(notes(&pages, PLAY), 2, "each row of the game shows the words");
+    assert_eq!(notes(&pages, &game_page(&program)), 1);
+    assert_eq!(notes(&pages, &game_page(&added_program)), 1);
+}

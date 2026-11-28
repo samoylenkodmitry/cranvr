@@ -506,6 +506,9 @@ pub struct Model {
     pub steam_running: bool,
     pub steam_signed_in: bool,
     pub games: Vec<crate::steam::Game>,
+    /// The words about a game's Steam Cloud files, by its app ID, for each game whose files need a word
+    /// (steam_cloud.rs)
+    pub cloud: std::collections::HashMap<String, String>,
     /// The game setup that runs now or ran last: the steps with their progress
     pub setup: Option<crate::setup::Setup>,
     /// The version of the game support in the Wine folder, when it has a stamp

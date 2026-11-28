@@ -651,6 +651,7 @@ fn play_page(settings: &Settings, model: &Model) -> Page {
             buttons.push(Button::run("Stop", "steam.stop").styled(Style::Danger).running("Stopping...", busy(model, &pending::Request::StopSteam)));
         }
         items.push(Item::Buttons(Buttons { title: game.name.clone(), detail: vr.label().into(), buttons, hint: String::new() }));
+        items.extend(cloud_note(settings, model, game, &program));
     }
     items.push(Item::Buttons(Buttons {
         buttons: vec![Button::run("Stop Steam and games", "steam.stop").styled(Style::Danger).running("Stopping...", busy(model, &pending::Request::StopSteam))],
@@ -980,7 +981,16 @@ fn game_page_of(settings: &Settings, model: &Model, game: &Game) -> Option<Page>
     if !buttons.is_empty() {
         page.items.push(Item::Buttons(Buttons { buttons, ..Default::default() }));
     }
+    page.items.extend(cloud_note(settings, model, game, &program));
     Some(page)
+}
+
+/// The words about the game's Steam Cloud files under its row: files that are not on this Mac yet, their download
+/// or a start that did not happen (steam_cloud.rs).
+fn cloud_note(settings: &Settings, model: &Model, game: &Game, program: &str) -> Option<Item> {
+    let app_id = steam::app_id(settings.launch.get(program), Some(&game.app_id))?;
+    let text = model.cloud.get(&app_id)?;
+    Some(Item::Text { text: text.clone(), tone: Tone::Warn })
 }
 
 /// The launch options of the program `program` as a page: its VR system, the eye options, cranvr's
