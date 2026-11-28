@@ -13,7 +13,8 @@
 # before and after. The first start of the client only warms up. The headset changes its USB functions
 # about 25 s after that start, which ends the test port's link and drops its `adb reverse`, so the
 # measured start waits until 32 s after it and sets the reverse again. A run in which the link ended
-# is void, and the script exits 2.
+# is void, and the script exits 2. So is a run in which the headset has no head pose: a capture then
+# shows the system's picture and not the app (`head_pose` in scripts/client-start.zsh).
 #
 # Usage: scripts/screen-check.sh SERIAL WORKDIR [CAPTURES] [PORT]
 #   CAPTURES  the folder for the captures that pass (none by default: every capture is deleted)
@@ -84,11 +85,14 @@ sleep 1
 ${adb_cmd} reverse tcp:${port} tcp:${port} > /dev/null 2>&1
 ${adb_cmd} shell am force-stop ${CLIENT_PACKAGE}
 ${adb_cmd} shell am broadcast -a com.oculus.vrpowermanager.prox_close > /dev/null
+${adb_cmd} logcat -c
 common=(--es host 127.0.0.1:${port} --ez connect true --ez usb_network false --es room scene --ez save_choices false \
     --es panels hidden --ez console false --es forget_host_key ${forget})
 client_start ${host_log} ${common}
 warm=${EPOCHSECONDS}
 print "warm start: ${client_result}"
+sleep 3
+head_pose || exit 2
 while (( EPOCHSECONDS < warm + 32 )); do
     sleep 1
 done
@@ -100,6 +104,8 @@ client_start ${host_log} ${common}
 print "client: ${client_result} ${client_linked}"
 [[ ${client_result} == alive ]] || exit 1
 sleep 2
+# A capture of a headset with no head pose shows the system's picture and not the app
+head_pose || exit 2
 shot none
 screen "{\"loading\": \"LOADING\", ${lines}, \"message\": \"Press Trigger To Start\", \"facing_deg\": 0.0}"
 wait_log "the game's screen: Some" 6 || print "the client did not log the screen"

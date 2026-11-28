@@ -20,6 +20,13 @@
 #   functions takes adb away for a moment.
 # client_has_entry
 #   Succeeds when the installed client has the entry for adb, so a start with extras can work.
+# head_pose
+#   Succeeds when the client received frames of its host in its last second of the log, which the
+#   host renders only for a head pose of the headset. A screen capture shows the app only then. A
+#   headset that lies still on a desk in a dark room gets no head pose from its runtime: its tracking
+#   cameras log "Images too dark", the client reports no eye views, the host renders no frame and the
+#   system's own picture covers the app. Every capture of that state had 15.8 % exact black, the same
+#   with the client stopped (#228). It sets `client_fps` and prints why it fails.
 
 readonly CLIENT_PACKAGE=dev.cranvr.client
 # The client takes launch extras only through this alias, which only adb's shell may start
@@ -38,6 +45,14 @@ quest_ready() {
 # Whether the installed client has the entry for adb. A query of the package manager starts nothing.
 client_has_entry() {
     ${adb_cmd} shell cmd package resolve-activity --brief -n ${CLIENT_ACTIVITY} 2> /dev/null | grep -q AdbStart
+}
+
+head_pose() {
+    client_fps=$(${adb_cmd} logcat -d -s Cranpose 2> /dev/null | sed -nE 's/.*connection: ([0-9.]+) fps received.*/\1/p' | tail -1)
+    [[ -n ${client_fps} && ${client_fps} != 0.0 ]] && return 0
+    local dark=$(${adb_cmd} logcat -d -s Tracking 2> /dev/null | grep -c "Images too dark")
+    print "void: the headset has no head pose: the client received ${client_fps:-no} frames a second, and its tracking cameras logged a dark room ${dark} times"
+    return 1
 }
 
 client_pid() {
