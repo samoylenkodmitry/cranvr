@@ -105,20 +105,12 @@ pub enum Outcome {
     Unknown { pass: Pass },
 }
 
-/// Applies a report to the launch options. `known` holds the programs that the Play tab lists:
-/// Windows paths do not differ by case, so a program takes the spelling of an existing entry or of
-/// a listed game, and its options show in the Play tab.
+/// Applies a report to the launch options. `known` holds the programs that the Play tab lists, whose
+/// spelling a program takes (see [`crate::launch::options_key`]).
 pub fn apply(launch: &mut BTreeMap<String, GameOptions>, known: &[String], program: Option<&str>, images: EyeImages) -> Outcome {
     let pass = Pass::first(images);
     let Some(program) = program.filter(|program| !program.is_empty()) else { return Outcome::Unknown { pass } };
-    // The exact spelling wins over another entry of the same program in another case
-    let key = launch
-        .keys()
-        .chain(known)
-        .find(|key| key.as_str() == program)
-        .or_else(|| launch.keys().chain(known).find(|key| key.eq_ignore_ascii_case(program)))
-        .cloned()
-        .unwrap_or_else(|| program.to_owned());
+    let key = crate::launch::options_key(launch, known, program);
     let options = launch.entry(key.clone()).or_default();
     if options.eye_one_pass {
         return Outcome::Leave { program: key, pass: Pass::Both };
