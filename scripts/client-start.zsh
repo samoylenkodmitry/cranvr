@@ -51,7 +51,7 @@ head_pose() {
     client_fps=$(${adb_cmd} logcat -d -s Cranpose 2> /dev/null | sed -nE 's/.*connection: ([0-9.]+) fps received.*/\1/p' | tail -1)
     [[ -n ${client_fps} && ${client_fps} != 0.0 ]] && return 0
     local dark=$(${adb_cmd} logcat -d -s Tracking 2> /dev/null | grep -c "Images too dark")
-    print "void: the headset has no head pose: the client received ${client_fps:-no} frames a second, and its tracking cameras logged a dark room ${dark} times"
+    print "void: the headset has no head pose: the client received ${client_fps:-no} frames a second; its tracking cameras logged a dark room ${dark} times"
     return 1
 }
 

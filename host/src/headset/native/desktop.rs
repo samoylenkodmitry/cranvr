@@ -482,7 +482,7 @@ fn cursor_in_video() -> bool {
 
 /// The size of a display's stream for a capture of `source` pixels and a wish of up to `max_width`
 /// pixels across: the capture's size, or a smaller one of the same shape. Both sides are even, as
-/// the encoder's 4:2:0 pictures need, and the picture is at least 640 pixels wide.
+/// the encoder's 4:2:0 pictures need. The picture is at least 640 pixels wide.
 fn stream_size([width, height]: [u32; 2], max_width: u32) -> [u32; 2] {
     let scaled = width.min(max_width.max(640)) & !1;
     [scaled, ((u64::from(scaled) * u64::from(height) / u64::from(width.max(1))) as u32) & !1]

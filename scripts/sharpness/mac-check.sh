@@ -1,13 +1,13 @@
 #!/bin/zsh
 # Measures the sharpness of a display's stream on this Mac, with the probe as the headset (issue #222).
 # A test host on PORT makes a virtual display of 1920 x 1080 points (3840 x 2160 pixels) that only the
-# stream shows, and show.swift puts the test pattern on it. For each width the probe asks for the display
+# stream shows. show.swift puts the test pattern on it. For each width the probe asks for the display
 # at that width, decodes the stream with VideoToolbox and saves the luma of the first key picture and of
 # the last picture. measure.swift then reads the pattern in both. The pointer of the probe moves no mouse
-# (CRANVR_POINTER_DRY_RUN=1), and the Mac's cursor stays out of the pictures.
+# (CRANVR_POINTER_DRY_RUN=1). The Mac's cursor stays out of the pictures.
 #
 # macOS adds the virtual display to the right of the Mac's displays while the host runs. No window
-# moves, and the host gives each display its old mode back.
+# moves. The host gives each display its old mode back.
 #
 # Usage: scripts/sharpness/mac-check.sh WORKDIR [SECONDS] [WIDTH...]
 #   SECONDS  the length of each probe run (3 by default: the key picture and the refresh 250 ms later)

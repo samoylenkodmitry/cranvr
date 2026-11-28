@@ -87,7 +87,7 @@ for (index, left) in lefts.enumerated() {
     elements.append(["kind": "level", "polarity": polarity, "level": "paper", "rect": [left + 20, top + 20, 120, 60]])
     fill(left + 160, top + 20, 120, 60, ink)
     elements.append(["kind": "level", "polarity": polarity, "level": "ink", "rect": [left + 170, top + 30, 100, 40]])
-    // Gratings: lines across (they vary along x) of 1 and 2 pixels, and lines along of 1 pixel
+    // Gratings: lines across (they vary along x) of 1 and 2 pixels, then lines along of 1 pixel
     let gy = top + 100
     for (n, (period, axis)) in [(2, "x"), (4, "x"), (2, "y")].enumerated() {
         let gx = left + 20 + n * 260
