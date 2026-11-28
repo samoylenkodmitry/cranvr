@@ -96,6 +96,19 @@ unsafe fn mode_of(mode: CFTypeRef) -> Mode {
     }
 }
 
+/// The pixels across of `display` in its current mode: twice its points in a HiDPI mode.
+pub fn pixel_width(display: u32) -> Option<usize> {
+    unsafe {
+        let mode = CGDisplayCopyDisplayMode(display);
+        if mode.is_null() {
+            return None;
+        }
+        let width = CGDisplayModeGetPixelWidth(mode);
+        CFRelease(mode as *mut c_void);
+        (width > 0).then_some(width)
+    }
+}
+
 fn describe(m: &Mode) -> String {
     format!("{}x{} points ({}x{} pixels, {:.0} Hz)", m.points.0, m.points.1, m.pixels.0, m.pixels.1, m.hz)
 }

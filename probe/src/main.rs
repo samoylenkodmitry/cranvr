@@ -74,6 +74,9 @@ fn usage() -> ! {
          \n  --console AT:JSON  at AT seconds send one request of the console in VR, as a press on its button does,\
          \n                     such as 5:{{\"action\": \"set\", \"id\": \"fps\", \"value\": \"90\"}}. The host hands it to the cranvr app.\
          \n  --display-fps N    with --desktop: each display's wish asks for at most N pictures a second (1 to 60)\
+         \n  --display-width N  with --desktop: each display's wish asks for at most N pixels across (640 to 8192)\
+         \n  --save-display P   with --desktop: write the luma of the first display's first key picture to P-key.pgm\
+         \n                     and of its last picture to P-last.pgm, for scripts/sharpness/measure.swift\
          \n  --microphone       offer a microphone: while the host asks for it, the probe sends a click every 500 ms\
          \n                     and prints the time of each on mach_continuous_time"
     );
@@ -113,6 +116,8 @@ fn main() {
         displays: 1,
         displays_in_game: false,
         display_fps: None,
+        display_width: None,
+        save_display: None,
         microphone: false,
         hold_script: false,
         hold_hands: false,
@@ -142,6 +147,8 @@ fn main() {
             "--displays-in-game" => options.displays_in_game = true,
             "--microphone" => options.microphone = true,
             "--display-fps" => options.display_fps = Some(value().parse().ok().filter(|fps| (1..=60).contains(fps)).unwrap_or_else(|| usage())),
+            "--display-width" => options.display_width = Some(value().parse().ok().filter(|width| (640..=8192).contains(width)).unwrap_or_else(|| usage())),
+            "--save-display" => options.save_display = Some(value().into()),
             "--hold-script" => options.hold_script = true,
             "--hold-hands" => options.hold_hands = true,
             "--tracking" => options.tracking = true,

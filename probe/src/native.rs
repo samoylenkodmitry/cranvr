@@ -66,6 +66,9 @@ pub struct Options {
     pub displays_in_game: bool,
     /// The most pictures a second of each display's wish, in place of the client's rule
     pub display_fps: Option<u8>,
+    pub display_width: Option<u32>,
+    /// Where the first display's pictures go (`--save-display`)
+    pub save_display: Option<std::path::PathBuf>,
     /// Offer a microphone: while the host asks, the probe sends a click every 500 ms
     pub microphone: bool,
     /// The right hand points at a panel in every other window of its script: its input is the
@@ -325,8 +328,8 @@ pub fn run(o: Options) -> i32 {
         drop_percent: o.drop_percent,
         rng: Mutex::new(Rng(0x9E37_79B9_7F4A_7C15)),
         stop: AtomicBool::new(false),
-        desktop: (o.desktop || o.displays > 1 || o.displays_in_game).then(|| DesktopProbe::new(DESKTOP_STREAM)),
-        displays: DisplaySet::new(DisplayPlan { wanted: o.displays.max(1), in_game: o.displays_in_game, max_fps: o.display_fps }),
+        desktop: (o.desktop || o.displays > 1 || o.displays_in_game).then(|| DesktopProbe::new(DESKTOP_STREAM, o.save_display.clone())),
+        displays: DisplaySet::new(DisplayPlan { wanted: o.displays.max(1), in_game: o.displays_in_game, max_fps: o.display_fps, max_width: o.display_width }),
         hold_script: o.hold_script,
         hold_hands: o.hold_hands,
         game_runs: AtomicBool::new(false),

@@ -501,6 +501,54 @@ unsafe fn parameter_sets(format: CMFormatDescriptionRef) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Scales pictures into a buffer of another size (VTPixelTransferSession). A smaller picture averages
+/// the pixels that each of its pixels covers. ScreenCaptureKit's own scaling blurs small text far more:
+/// in `scripts/sharpness/mac-check.sh` text of 12 points kept 23 % of the gaps between its letters at
+/// 2560 pixels across from a display of 3840 pixels, and 77 to 80 % with this scaling.
+pub struct Scaler(*mut c_void);
+
+unsafe impl Send for Scaler {}
+
+impl Scaler {
+    pub fn new() -> Result<Self, String> {
+        unsafe {
+            let mut session = ptr::null_mut();
+            let status = VTPixelTransferSessionCreate(kCFAllocatorDefault, &mut session);
+            if status != 0 || session.is_null() {
+                return Err(format!("VTPixelTransferSessionCreate failed: {status}"));
+            }
+            let scaler = Self(session);
+            for (key, value) in [
+                (kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_Normal),
+                (kVTPixelTransferPropertyKey_DownsamplingMode, kVTDownsamplingMode_Average),
+            ] {
+                let status = VTSessionSetProperty(session, key, value as CFTypeRef);
+                if status != 0 {
+                    return Err(format!("the transfer session takes no scaling mode: {status}"));
+                }
+            }
+            Ok(scaler)
+        }
+    }
+
+    /// Writes `source` into `destination` at the destination's size.
+    pub fn scale(&self, source: &PixelBuffer, destination: &PixelBuffer) -> Result<(), String> {
+        match unsafe { VTPixelTransferSessionTransferImage(self.0, source.raw(), destination.raw()) } {
+            0 => Ok(()),
+            status => Err(format!("VTPixelTransferSessionTransferImage failed: {status}")),
+        }
+    }
+}
+
+impl Drop for Scaler {
+    fn drop(&mut self) {
+        unsafe {
+            VTPixelTransferSessionInvalidate(self.0);
+            CFRelease(self.0 as CFTypeRef);
+        }
+    }
+}
+
 /// Mirrors pictures top to bottom into another buffer, on the Mac's media hardware
 /// (VTPixelRotationSession). The desktop layer needs it: the Quest's compositor reads a decoder's
 /// surface bottom row first.
