@@ -963,6 +963,13 @@ const GAME_IDLE: Duration = Duration::from_millis(500);
 /// one second more than the window of the stats line after frames. A stream with frames therefore
 /// never gets one.
 const NO_FRAME_STATS: Duration = Duration::from_secs(6);
+
+/// Whether a stream whose frames stopped only waits for the headset's poses: each turn of the loop
+/// found no new pose, and nothing else held a frame back. A headset on a desk in a dark room is
+/// linked and gives no pose. A new host would get none either.
+fn waits_for_pose(no_sample: u32, no_buffer: u32, busy: u32, missing: u32) -> bool {
+    no_sample > 0 && no_buffer == 0 && busy == 0 && missing == 0
+}
 /// A planned frame's wait ends this long before its start, and the loop spins until the start. A
 /// timer wakes the thread up to a millisecond late: the lateness counted as part of the frame's need
 /// and widened its spread.
@@ -1353,7 +1360,9 @@ fn frame_loop(
         // The stats line at the end of the loop comes only after a frame that went out. A stream
         // whose frames stopped (no new pose, no free buffer, a busy encoder) gets a line too, with
         // the frames of its window and the reasons. The cranvr app starts a new host when such
-        // lines or the silence of a stuck loop last 15 s (issue #148).
+        // lines or the silence of a stuck loop last 15 s (issue #148). A stream that only waits for
+        // the headset's poses says so: the host is alive, and a new host would get no pose either
+        // (issue #234).
         if since.elapsed() >= NO_FRAME_STATS {
             let secs = since.elapsed().as_secs_f64();
             info!(
@@ -1362,6 +1371,7 @@ fn frame_loop(
             status::emit(json!({
                 "type": "stats", "fps": count as f64 / secs, "game_frames": game_count, "render_ms": 0.0, "encode_ms": 0.0,
                 "mbps": bitrate / 1_000_000, "mbps_set": mbps, "audio_s": 0.0, "latency": null, "stopped": true,
+                "waits_for_pose": waits_for_pose(no_sample, no_buffer, busy, missing),
             }));
             (count, game_count, gpu_ms, gpu_exec_ms, since) = (0, 0, 0.0, 0.0, Instant::now());
             (no_sample, no_buffer, busy, dropped, missing) = (0, 0, 0, 0, 0);
@@ -1843,6 +1853,15 @@ mod foveation_levels;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stream_that_gets_no_pose_waits_and_other_stops_do_not() {
+        assert!(waits_for_pose(875, 0, 0, 0), "a headset on a desk in a dark room");
+        assert!(!waits_for_pose(0, 0, 0, 0), "a loop that counted nothing is stuck");
+        assert!(!waits_for_pose(875, 3, 0, 0), "no free buffer");
+        assert!(!waits_for_pose(875, 0, 2, 0), "a busy encoder");
+        assert!(!waits_for_pose(875, 0, 0, 1), "unknown images");
+    }
 
     /// A headset whose send waits while its gate is shut, as a TCP write behind a slow link does. It
     /// keeps the sample and the key flag of each frame that it sent.
