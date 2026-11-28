@@ -136,26 +136,32 @@ impl Layout {
         let get = |key: &str| preferences().get(key);
         let mut layout = Self::from_saved(get(ROOM_KEY).as_deref(), get(PINNED_KEY).as_deref());
         log::info!("the panels' saved layout: {}", layout.saved_text());
-        // A test chooses the panels and the pinned display with launch extras and saves nothing:
-        // `shown` is a list such as `display1,stats` and `pinned` a display's number
         let args = crate::launch::args();
-        if let Some(list) = args.string("shown") {
-            let set: BTreeSet<PanelId> = list.split(',').filter_map(from_name).collect();
-            layout.room.clone_from(&set);
-            layout.game.clone_from(&set);
-            layout.test = Some(set);
-        }
-        // The launch asks for every panel hidden (`panels=hidden`), as a test of the beams needs
-        if crate::settings::panels_hidden_on_launch() && layout.test.is_none() {
-            layout.room.clear();
-            layout.game.clear();
-            layout.test = Some(BTreeSet::new());
-        }
-        if let Some(stream) = args.int("pinned").and_then(|n| u8::try_from(n).ok()) {
-            layout.pinned = Some(stream);
-            layout.test.get_or_insert_with(|| layout.room.clone());
-        }
+        layout.apply_test(args.string("shown"), crate::settings::panels_hidden_on_launch(), args.int("pinned").and_then(|n| u8::try_from(n).ok()));
         layout
+    }
+
+    /// A test chooses the panels and the pinned display with launch extras and saves nothing: `shown`
+    /// is a list such as `display1,stats`, `hidden` hides every panel (`panels=hidden`, as a test of
+    /// the beams needs) and `pinned` is a display's number. A test that lists its panels pins only the
+    /// display that it names: the user's own pin would put a display of the list on the hand.
+    fn apply_test(&mut self, shown: Option<&str>, hidden: bool, pinned: Option<u8>) {
+        if let Some(list) = shown {
+            let set: BTreeSet<PanelId> = list.split(',').filter_map(from_name).collect();
+            self.room.clone_from(&set);
+            self.game.clone_from(&set);
+            self.test = Some(set);
+            self.pinned = None;
+        }
+        if hidden && self.test.is_none() {
+            self.room.clear();
+            self.game.clear();
+            self.test = Some(BTreeSet::new());
+        }
+        if let Some(stream) = pinned {
+            self.pinned = Some(stream);
+            self.test.get_or_insert_with(|| self.room.clone());
+        }
     }
 
     /// Keeps the room's choice and the pinned display for the next start.
@@ -395,6 +401,26 @@ mod tests {
         assert!(back.shown(PanelId::Connection) && !back.shown(PanelId::Stats) && back.shown(PanelId::Display(3)) && back.shown(PanelId::Display(1)));
         assert!(!back.shown(PanelId::Display(2)));
         assert_eq!(back.pinned(), Some(3));
+    }
+
+    #[test]
+    fn a_test_that_lists_its_panels_pins_only_the_display_that_it_names() {
+        // The user keeps display 1 on the hand
+        let saved = Layout::from_saved(Some("connection,display1"), Some("1"));
+        assert_eq!(saved.pinned(), Some(1));
+        // A test of display 1 in the room: the user's pin must not put it on the hand
+        let mut test = saved.clone();
+        test.apply_test(Some("display1"), false, None);
+        assert_eq!(test.pinned(), None);
+        assert!(test.shown(PanelId::Display(1)) && !test.shown(PanelId::Connection));
+        // A test that names a pin gets it
+        let mut test = saved.clone();
+        test.apply_test(Some("display1,display2"), false, Some(2));
+        assert_eq!(test.pinned(), Some(2));
+        // A test with no list keeps the user's panels and pin, and saves nothing
+        let mut test = saved.clone();
+        test.apply_test(None, false, None);
+        assert_eq!((test.room_text(), test.pinned_text()), (saved.room_text(), saved.pinned_text()));
     }
 
     #[test]
