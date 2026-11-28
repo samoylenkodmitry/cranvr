@@ -11,7 +11,7 @@
 # with no frame of the host in the client's last second the script takes no capture, prints why and
 # exits 2.
 #
-# Usage: scripts/sharpness/headset-check.sh SERIAL WORKDIR [CAPTURES] CASE...
+# Usage: scripts/sharpness/headset-check.sh SERIAL WORKDIR CAPTURES CASE...
 #   CAPTURES  a folder for the captures that pass capture-check.py, or `-` to delete every capture
 #   CASE      WIDTH,DISTANCE in meters, then `:PIXELS` for the widest picture to ask for, such as
 #             1.6,1.5 (the panel's default size and distance) or 3.0,1.5:2560
