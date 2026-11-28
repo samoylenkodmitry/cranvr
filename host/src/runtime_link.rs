@@ -35,7 +35,6 @@ use std::{
     fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
@@ -301,10 +300,11 @@ impl RuntimeLink {
     /// what the runtime accepts.
     pub fn write_control_file(&self, eye_size: (u32, u32), fps: u32) -> std::io::Result<()> {
         let (w, h) = view_size(eye_size);
-        // The refresh rate field needs cranvr's runtime patch; the stock runtime rejects it
-        fs::write(&self.control_file, format!("{} {} {w} {h} {fps}\n", self.port, self.token))?;
+        // The refresh rate field needs cranvr's runtime patch; the stock runtime rejects it. The
+        // file holds the token that lets a program drive the runtime, so only the user may read it.
+        crate::private_file::write(&self.control_file, format!("{} {} {w} {h} {fps}\n", self.port, self.token).as_bytes())?;
         *self.written.lock().unwrap() = ((w, h), fps);
-        fs::set_permissions(&self.control_file, fs::Permissions::from_mode(0o600))
+        Ok(())
     }
 
     /// The eye size and the refresh rate that the control file holds now.
@@ -808,6 +808,7 @@ mod tests {
     }
 
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     use crate::pose::{Pose, Quat, Vec3};
 

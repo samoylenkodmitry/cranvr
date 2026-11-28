@@ -9,8 +9,8 @@ use crate::console::{Interface, Room, Theme, Volume};
 use crate::hub::MediaChoice;
 use cranpose::{launch_args, preferences};
 use cranvr_common::controls::{Controls, Hand};
-use cranvr_proto::identity::{fingerprint, from_hex, random_bytes, to_hex, Identity, FINGERPRINT_LEN};
-use std::sync::OnceLock;
+use cranvr_proto::identity::{fingerprint, from_hex, to_hex, Identity, FINGERPRINT_LEN};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 const HOST_KEY: &str = "host";
 const IDENTITY_KEY: &str = "identity";
@@ -266,35 +266,29 @@ pub fn forget_host_key(name: &str) {
     }
 }
 
-/// The key of this headset, for pairing with a host. The first call reads it from Cranpose's
-/// preferences service, or makes a new one and saves it there. The host remembers the public key
-/// of a paired headset, so a headset keeps its key for good.
-pub fn identity() -> &'static Identity {
+/// The key of this headset, for pairing with a host. The first call that succeeds reads it from
+/// Cranpose's preferences service, or makes a new one from the system's random numbers and saves it
+/// there. The host remembers the public key of a paired headset, so a headset keeps its key for
+/// good. Without random numbers the call fails and makes no key.
+pub fn identity() -> std::io::Result<&'static Identity> {
     static IDENTITY: OnceLock<Identity> = OnceLock::new();
-    IDENTITY.get_or_init(|| {
-        if let Some(seed) = preferences().get(IDENTITY_KEY).and_then(|text| from_hex(&text)) {
-            return Identity::from_seed(seed);
-        }
-        let seed = random_bytes().unwrap_or_else(|e| {
-            // Without the system's random numbers the key is weak. The host's code check still
-            // holds. The headset then pairs, but its key is as strong as the clock.
-            log::warn!("no random numbers for the pairing key: {e}");
-            let mut seed = [0u8; 32];
-            for chunk in seed.chunks_mut(8) {
-                let bits = std::hash::BuildHasher::hash_one(&std::collections::hash_map::RandomState::new(), now_nanos());
-                chunk.copy_from_slice(&bits.to_le_bytes());
+    // Two first calls at once must not make two keys and save the second one
+    static MAKING: Mutex<()> = Mutex::new(());
+    let _making = MAKING.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(identity) = IDENTITY.get() {
+        return Ok(identity);
+    }
+    let identity = match preferences().get(IDENTITY_KEY).and_then(|text| from_hex(&text)) {
+        Some(seed) => Identity::from_seed(seed),
+        None => {
+            let identity = Identity::generate()?;
+            if let Err(e) = preferences().set(IDENTITY_KEY, &to_hex(&identity.seed())) {
+                log::warn!("the pairing key was not saved, so the host will see a new headset at the next start: {e}");
             }
-            seed
-        });
-        if let Err(e) = preferences().set(IDENTITY_KEY, &to_hex(&seed)) {
-            log::warn!("the pairing key was not saved, so the host will see a new headset at the next start: {e}");
+            identity
         }
-        Identity::from_seed(seed)
-    })
-}
-
-fn now_nanos() -> u128 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())
+    };
+    Ok(IDENTITY.get_or_init(|| identity))
 }
 
 #[cfg(test)]

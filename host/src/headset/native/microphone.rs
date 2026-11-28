@@ -29,7 +29,8 @@ use cranvr_proto::{
 };
 use log::{info, warn};
 use std::{
-    fs::OpenOptions,
+    fs::{OpenOptions, Permissions},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
     ptr,
     sync::{
@@ -75,7 +76,10 @@ unsafe impl Sync for Ring {}
 
 impl Ring {
     fn create(path: &Path) -> std::io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path)?;
+        // The ring holds what the headset's microphone hears, so only the user may read it. A ring
+        // that an earlier host made keeps its file, so a game that mapped it hears the new host.
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).mode(crate::private_file::MODE).open(path)?;
+        file.set_permissions(Permissions::from_mode(crate::private_file::MODE))?;
         let len = HEADER + CAPACITY * 2;
         file.set_len(len as u64)?;
         let ring = Self::map(&file, len)?;

@@ -52,19 +52,12 @@ pub fn mac_name() -> String {
 /// saves it there, readable by the user alone. When the file cannot be written the key lasts for
 /// this run only. The headsets that paired with the old key then refuse the host.
 pub fn host_identity(config_dir: &std::path::Path) -> Identity {
-    use std::os::unix::fs::OpenOptionsExt;
     let path = config_dir.join(HOST_KEY_FILE);
     if let Some(seed) = std::fs::read_to_string(&path).ok().and_then(|text| from_hex(&text)) {
         return Identity::from_seed(seed);
     }
     let identity = Identity::generate().expect("random numbers for the host's key");
-    let saved = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)
-        .and_then(|mut file| file.write_all(format!("{}\n", to_hex(&identity.seed())).as_bytes()));
+    let saved = crate::private_file::write(&path, format!("{}\n", to_hex(&identity.seed())).as_bytes());
     match saved {
         Ok(()) => info!("Native protocol: made the host's key in {}", path.display()),
         Err(e) => warn!("Native protocol: the host's key was not saved to {}: {e}. Paired headsets refuse the host at its next start.", path.display()),

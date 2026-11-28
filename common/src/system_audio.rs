@@ -50,13 +50,15 @@ struct Framework {
 fn framework() -> &'static Framework {
     static FRAMEWORK: OnceLock<Framework> = OnceLock::new();
     FRAMEWORK.get_or_init(|| unsafe {
-        let handle = dlopen(TCC.as_ptr(), RTLD_NOW);
+        let service = CFStringCreateWithCString(std::ptr::null(), SERVICE.as_ptr(), UTF8);
+        // Without the service's name neither call can ask TCC: the framework then counts as missing
+        let handle = if service.is_null() { std::ptr::null_mut() } else { dlopen(TCC.as_ptr(), RTLD_NOW) };
         let symbol = |name: &CStr| if handle.is_null() { std::ptr::null_mut() } else { dlsym(handle, name.as_ptr()) };
         let (preflight, request) = (symbol(c"TCCAccessPreflight"), symbol(c"TCCAccessRequest"));
         Framework {
             preflight: (!preflight.is_null()).then(|| std::mem::transmute::<*mut c_void, Preflight>(preflight)),
             request: (!request.is_null()).then(|| std::mem::transmute::<*mut c_void, Request>(request)),
-            service: CFStringCreateWithCString(std::ptr::null(), SERVICE.as_ptr(), UTF8) as usize,
+            service: service as usize,
         }
     })
 }
