@@ -125,11 +125,12 @@ public:
 
 namespace {
 
-// The messages of Half-Life: Alyx at the start of its first level, as OpenComposite logged them
+// The messages of Half-Life: Alyx at the start of its first level, in the form that OpenComposite logged, with lines of
+// this program in place of the game's tip and description
 const char* const kBeginLoading = "{\n\t\"type\": \"begin_loading\",\n\t\"mapName\": \"a1_intro_world\",\n\t\"chapter\": \"\",\n"
-                                  "\t\"tipText\": \"CITY 17: A former cosmopolitan city, CITY 17 is now home to THE COMBINE'S human administration.\",\n"
-                                  "\t\"description\": \"THE SEVEN HOUR WAR. THE COMBINE used the rift opened by THE BLACK MESA INCIDENT to travel to Earth "
-                                  "and occupy the entire planet in a single confrontation.\",\n\t\"loadingText\": \"LOADING\",\n\t\"facingAngle\": 0.000000\n}";
+                                  "\t\"tipText\": \"TIP: This line stands for a game's tip. It is long enough to wrap on the panel in the headset.\",\n"
+                                  "\t\"description\": \"This line stands for the description of the level. A game sends a few sentences here while it loads, so the panel shows three or four lines of it.\",\n"
+                                  "\t\"loadingText\": \"LOADING\",\n\t\"facingAngle\": 0.000000\n}";
 const char* const kShowMessage = "{\n\t\"type\": \"show_message\",\n\t\"text\": \"Press Trigger To Start\"\n}";
 const char* const kEndLoading = "{\n\t\"type\": \"end_loading\"\n}";
 const char* const kMailboxAddress = "smoke/interstitials";

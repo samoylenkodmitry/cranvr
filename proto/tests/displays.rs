@@ -60,7 +60,7 @@ fn the_display_messages_round_trip() {
     round_trip(HostMsg::GameRuns(true));
     round_trip(HostMsg::GameScreen(Some(GameScreen {
         loading: Some("LOADING".into()),
-        lines: vec!["CITY 17: a city".into()],
+        lines: vec!["A tip".into()],
         message: Some("Press Trigger To Start".into()),
         facing_deg: Some(90.0),
     })));

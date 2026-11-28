@@ -1,8 +1,8 @@
 diff --git i/runtime/pe/basalt_control_protocol.h w/runtime/pe/basalt_control_protocol.h
-index b077592..9b63cfa 100644
+index b077592..8d7050c 100644
 --- i/runtime/pe/basalt_control_protocol.h
 +++ w/runtime/pe/basalt_control_protocol.h
-@@ -135,6 +135,17 @@
+@@ -135,6 +135,18 @@
   *         f32 linear_velocity[3], f32 angular_velocity[3]
   */
  
@@ -11,7 +11,8 @@ index b077592..9b63cfa 100644
 + * SteamVR through IVRMailbox, such as what its loading screen shows. An OpenVR runtime on top of
 + * this runtime (OpenComposite) hands each message to the runtime through the extension
 + * XR_CRANVR_mailbox, and the runtime passes it on unchanged. The daemon knows what the messages of
-+ * a game mean. A message that does not fit into BASALT_CONTROL_MAX_MESSAGE_LENGTH is dropped.
++ * a game mean. A message that comes while no daemon is connected goes out at the next connection, in
++ * order. A message that does not fit into BASALT_CONTROL_MAX_MESSAGE_LENGTH is dropped.
 + *   MAILBOX_MESSAGE (runtime -> daemon)
 + *     u16 address_length, the address in UTF-8 (such as "game/interstitials"),
 + *     u16 message_length, the message in UTF-8 (a JSON object in the games known so far)
@@ -20,7 +21,7 @@ index b077592..9b63cfa 100644
  #define BASALT_CONTROL_PROTOCOL_VERSION 9u
  #define BASALT_CONTROL_TOKEN_LENGTH 32u
  #define BASALT_CONTROL_MAX_MESSAGE_LENGTH 4096u
-@@ -172,6 +183,7 @@ enum {
+@@ -172,6 +184,7 @@ enum {
      BASALT_MSG_FACE_TRACKING = 22,
      BASALT_MSG_EYE_GAZE = 23,
      BASALT_MSG_HAND_INTERACTION = 24,
@@ -29,51 +30,121 @@ index b077592..9b63cfa 100644
  
  /* Bits of TRACKING_REQUEST and of tracking-features.txt's words. FACE_VISUAL and FACE_AUDIO
 diff --git i/runtime/pe/control.cpp w/runtime/pe/control.cpp
-index 1dd5c6b..7e7c3f9 100644
+index 1dd5c6b..3b8cad3 100644
 --- i/runtime/pe/control.cpp
 +++ w/runtime/pe/control.cpp
-@@ -2262,6 +2262,31 @@ void controlRequestTracking(XrSession session, uint32_t features) {
+@@ -1602,6 +1602,40 @@ uint32_t queryTextureIOSurfaceId(ID3D11Texture2D* texture) {
+     return id;
+ }
+ 
++// cranvr: the mailbox messages that wait for a daemon. OpenComposite restarts its session at the game's first frame, and
++// the connection to the daemon ends with the old session: a message of the gap waits for the new connection. The
++// newest messages wait, the oldest go when more come.
++constexpr size_t kMailboxCapacity = BASALT_CONTROL_MAX_MESSAGE_LENGTH - sizeof(uint16_t);
++constexpr uint32_t kHeldMailboxMessages = 8;
++struct HeldMailboxMessage {
++    size_t length;
++    uint8_t payload[kMailboxCapacity];
++};
++SRWLOCK gMailboxLock = SRWLOCK_INIT;
++HeldMailboxMessage gHeldMailbox[kHeldMailboxMessages];
++uint32_t gHeldMailboxFirst = 0;
++uint32_t gHeldMailboxCount = 0;
++
++// The socket of a connected daemon, or INVALID_SOCKET
++SOCKET mailboxSocket() {
++    AcquireSRWLockShared(&gControlLock);
++    const SOCKET socket = gSocket != INVALID_SOCKET && !gReceiverFailed ? gSocket : INVALID_SOCKET;
++    ReleaseSRWLockShared(&gControlLock);
++    return socket;
++}
++
++// Sends the messages that wait, in their order. The caller holds gMailboxLock.
++void sendHeldMailboxMessagesLocked(SOCKET socket) {
++    while (gHeldMailboxCount > 0) {
++        const HeldMailboxMessage& held = gHeldMailbox[gHeldMailboxFirst];
++        if (!sendMessage(socket, BASALT_MSG_MAILBOX_MESSAGE, held.payload, held.length)) {
++            return;
++        }
++        gHeldMailboxFirst = (gHeldMailboxFirst + 1) % kHeldMailboxMessages;
++        --gHeldMailboxCount;
++    }
++}
++
+ void controlSessionCreated(XrSession session, ID3D11Device* device) {
+     if (!basaltGateEnabled() || !probeSessionIOSurface(device)) {
+         return;
+@@ -1738,6 +1772,13 @@ void controlSessionCreatedWith(XrSession session, FrameSync* sync, const char* r
+         return;
+     }
+     ReleaseSRWLockExclusive(&gControlLock);
++    // cranvr: the game's mailbox messages of the time without a daemon
++    AcquireSRWLockExclusive(&gMailboxLock);
++    const SOCKET socket = mailboxSocket();
++    if (socket != INVALID_SOCKET) {
++        sendHeldMailboxMessagesLocked(socket);
++    }
++    ReleaseSRWLockExclusive(&gMailboxLock);
+ }
+ 
+ void controlSessionDestroyed(XrSession session) {
+@@ -2262,6 +2303,45 @@ void controlRequestTracking(XrSession session, uint32_t features) {
      }
  }
  
 +bool controlSendMailboxMessage(const char* address, const char* message) {
 +    const size_t addressLength = std::strlen(address);
 +    const size_t messageLength = std::strlen(message);
-+    // The type of the message takes two bytes of the length that the daemon accepts
-+    constexpr size_t kCapacity = BASALT_CONTROL_MAX_MESSAGE_LENGTH - sizeof(uint16_t);
-+    if (2 * sizeof(uint16_t) + addressLength + messageLength > kCapacity) {
++    if (2 * sizeof(uint16_t) + addressLength + messageLength > kMailboxCapacity) {
 +        note("cranvr: a mailbox message to %s has %zu bytes, more than the daemon takes: it is dropped\n", address, messageLength);
 +        return false;
 +    }
-+    AcquireSRWLockShared(&gControlLock);
-+    const SOCKET socket = gSocket != INVALID_SOCKET && !gReceiverFailed ? gSocket : INVALID_SOCKET;
-+    ReleaseSRWLockShared(&gControlLock);
-+    if (socket == INVALID_SOCKET) {
-+        note("cranvr: no daemon is connected: a mailbox message to %s is dropped\n", address);
-+        return false;
++    AcquireSRWLockExclusive(&gMailboxLock);
++    const SOCKET socket = mailboxSocket();
++    if (socket != INVALID_SOCKET) {
++        sendHeldMailboxMessagesLocked(socket);
 +    }
-+    uint8_t payload[kCapacity];
-+    MessageWriter writer(payload, sizeof(payload));
++    HeldMailboxMessage* slot = nullptr;
++    if (socket == INVALID_SOCKET || gHeldMailboxCount > 0) {
++        if (gHeldMailboxCount == kHeldMailboxMessages) {
++            gHeldMailboxFirst = (gHeldMailboxFirst + 1) % kHeldMailboxMessages;
++            --gHeldMailboxCount;
++        }
++        slot = &gHeldMailbox[(gHeldMailboxFirst + gHeldMailboxCount) % kHeldMailboxMessages];
++        ++gHeldMailboxCount;
++        note("cranvr: no daemon is connected: a mailbox message to %s waits for the next connection\n", address);
++    }
++    static uint8_t sending[kMailboxCapacity];
++    uint8_t* payload = slot != nullptr ? slot->payload : sending;
++    MessageWriter writer(payload, kMailboxCapacity);
 +    writer.u16(static_cast<uint16_t>(addressLength));
 +    writer.bytes(address, addressLength);
 +    writer.u16(static_cast<uint16_t>(messageLength));
 +    writer.bytes(message, messageLength);
-+    return writer.ok() && sendMessage(socket, BASALT_MSG_MAILBOX_MESSAGE, payload, writer.length());
++    bool sent = false;
++    if (slot != nullptr) {
++        slot->length = writer.length();
++    } else {
++        sent = writer.ok() && sendMessage(socket, BASALT_MSG_MAILBOX_MESSAGE, payload, writer.length());
++    }
++    ReleaseSRWLockExclusive(&gMailboxLock);
++    return sent;
 +}
 +
  bool controlHandState(XrSession session, uint32_t hand, XrTime locateTime, ControlHandState* state) {
      if (state == nullptr || hand > 1) {
          return false;
 diff --git i/runtime/pe/control.hpp w/runtime/pe/control.hpp
-index d0f6927..4e632b9 100644
+index d0f6927..bef74d5 100644
 --- i/runtime/pe/control.hpp
 +++ w/runtime/pe/control.hpp
-@@ -57,6 +57,10 @@ void controlSessionCreated(XrSession session, ID3D11Device* device);
+@@ -57,6 +57,11 @@ void controlSessionCreated(XrSession session, ID3D11Device* device);
  void controlSessionCreatedWith(XrSession session, FrameSync* sync, const char* renderer);
  void controlSessionDestroyed(XrSession session);
  
-+// cranvr: sends a game's mailbox message to the daemon (BASALT_MSG_MAILBOX_MESSAGE). False when no
-+// daemon is connected or the message does not fit into one control message: it is then dropped.
++// cranvr: sends a game's mailbox message to the daemon (BASALT_MSG_MAILBOX_MESSAGE). A message that comes
++// while no daemon is connected waits for the next connection; the newest 8 wait. A message that does not
++// fit into one control message is dropped. True when the message went out at once.
 +bool controlSendMailboxMessage(const char* address, const char* message);
 +
  // True only while the daemon handshake is complete for the live session.

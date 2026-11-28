@@ -585,6 +585,18 @@ fn the_connection_choice_comes_as_a_line() {
     }
 }
 
+// A check of the headset's panel shows a game's screen with no game
+#[test]
+fn a_game_s_screen_comes_as_a_line() {
+    let line = r#"screen {"loading": "LOADING", "lines": ["A line"], "message": "Press Trigger To Start", "facing_deg": null}"#;
+    let Some(Command::Screen(Some(screen))) = parse_command(line) else { panic!("{line}") };
+    assert_eq!((screen.loading.as_deref(), screen.lines.len(), screen.message.as_deref(), screen.facing_deg), (Some("LOADING"), 1, Some("Press Trigger To Start"), None));
+    assert_eq!(parse_command("screen null"), Some(Command::Screen(None)));
+    for wrong in ["screen", "screen {", r#"screen {"loading": 3}"#] {
+        assert_eq!(parse_command(wrong), None, "{wrong}");
+    }
+}
+
 // The cranvr app's button "Open the menu in the headset" writes a line to the host's input
 #[test]
 fn the_request_to_open_the_hand_menu_comes_as_a_line() {

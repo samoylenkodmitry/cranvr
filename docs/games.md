@@ -103,7 +103,7 @@ Half-Life: Alyx registers the mailbox `hlvr/mailbox` and sends to `hlvr/intersti
 | Type | Fields | What the game's page shows | What the headset shows |
 |---|---|---|---|
 | `set_paths` | `webroot`, `models`: the folders of the page and of its 3D models | nothing | nothing |
-| `begin_loading` | `mapName`, `chapter`, `tipText`, `description`, `loadingText` ("LOADING"), `facingAngle` (degrees) | "LOADING" with a spinner, the map's model, turned by `facingAngle` about the up axis | the loading words, the tip and the description, at `facingAngle` |
+| `begin_loading` | `mapName`, `chapter`, `tipText`, `description`, `loadingText` ("LOADING"), `facingAngle` (degrees) | "LOADING" with a spinner, the map's model, turned by `facingAngle` about the up axis | the loading words, the tip and the description, turned by `facingAngle` from where the head looks |
 | `show_message` | `text` (HTML, such as "Press Trigger To Start", `#HLVR_Loading_Trigger_Start` in the game's language) | the text in place of "LOADING", only during a load | the message under the lines |
 | `end_loading` | none | the chapter's name for 6.5 s, then nothing | nothing |
 

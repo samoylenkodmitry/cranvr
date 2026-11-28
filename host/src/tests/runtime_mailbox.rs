@@ -4,7 +4,7 @@
 use super::*;
 use std::sync::mpsc::Receiver;
 
-const BEGIN: &str = r#"{"type": "begin_loading", "mapName": "a1_intro_world", "chapter": "", "tipText": "CITY 17: A former cosmopolitan city.", "loadingText": "LOADING", "facingAngle": 0.000000}"#;
+const BEGIN: &str = r#"{"type": "begin_loading", "mapName": "a1_intro_world", "chapter": "", "tipText": "A tip of the test.", "loadingText": "LOADING", "facingAngle": 0.000000}"#;
 const MESSAGE: &str = r#"{"type": "show_message", "text": "Press Trigger To Start"}"#;
 
 fn message(kind: u16, payload: &[u8]) -> Vec<u8> {
@@ -58,7 +58,7 @@ fn the_messages_reach_the_headset_in_order_and_the_screen_survives_a_session_res
     runtime.write_all(&mailbox("game/interstitials", BEGIN)).unwrap();
     let shown = next(&screens).expect("the load shows");
     assert_eq!(shown.loading.as_deref(), Some("LOADING"));
-    assert_eq!(shown.lines, ["CITY 17: A former cosmopolitan city."]);
+    assert_eq!(shown.lines, ["A tip of the test."]);
     // OpenComposite ends its first session at the game's first frame and makes a new one at once
     runtime.write_all(&message(msg::TEARDOWN, &[])).unwrap();
     drop(runtime);

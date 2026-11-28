@@ -1,7 +1,8 @@
 use super::*;
 
-/// The messages of Half-Life: Alyx at the start of its first level, as OpenComposite logged them
-const BEGIN: &str = "{\n\t\"type\": \"begin_loading\",\n\t\"mapName\": \"a1_intro_world\",\n\t\"chapter\": \"\",\n\t\"tipText\": \"CITY 17: A former cosmopolitan city, CITY 17 is now home to THE COMBINE'S human administration.\",\n\t\"description\": \"THE SEVEN HOUR WAR. THE COMBINE used the rift opened by THE BLACK MESA INCIDENT to travel to Earth and occupy the entire planet in a single confrontation.\",\n\t\"loadingText\": \"LOADING\",\n\t\"facingAngle\": 0.000000\n}";
+/// The messages of Half-Life: Alyx at the start of its first level, in the form that OpenComposite logged, with made-up
+/// lines in place of the game's tip and description
+const BEGIN: &str = "{\n\t\"type\": \"begin_loading\",\n\t\"mapName\": \"a1_intro_world\",\n\t\"chapter\": \"\",\n\t\"tipText\": \"TIP: This line stands for a game's tip. It is long enough to wrap on the panel in the headset.\",\n\t\"description\": \"This line stands for the description of the level. A game sends a few sentences here while it loads, so the panel shows three or four lines of it.\",\n\t\"loadingText\": \"LOADING\",\n\t\"facingAngle\": 0.000000\n}";
 const MESSAGE: &str = "{\n\t\"type\": \"show_message\",\n\t\"text\": \"Press Trigger To Start\"\n}";
 const END: &str = "{\n\t\"type\": \"end_loading\"\n}";
 const PATHS: &str = "{\n\t\"type\": \"set_paths\",\n\t\"webroot\": \"C:\\\\Game\\\\webui\",\n\t\"models\": \"C:\\\\Game\\\\models\\\\ui\\\\\"\n}";
@@ -19,8 +20,8 @@ fn begin_loading_shows_the_words_the_tip_the_description_and_the_angle() {
     let screen = shown(&[BEGIN]).expect("a load shows");
     assert_eq!(screen.loading.as_deref(), Some("LOADING"));
     assert_eq!(screen.lines.len(), 2);
-    assert!(screen.lines[0].starts_with("CITY 17: A former"), "{:?}", screen.lines);
-    assert!(screen.lines[1].starts_with("THE SEVEN HOUR WAR."), "{:?}", screen.lines);
+    assert!(screen.lines[0].starts_with("TIP: This line"), "{:?}", screen.lines);
+    assert!(screen.lines[1].starts_with("This line stands for the description"), "{:?}", screen.lines);
     assert_eq!(screen.message, None);
     assert_eq!(screen.facing_deg, Some(0.0));
     // The empty chapter and a load with no words of its own
