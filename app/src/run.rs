@@ -151,6 +151,8 @@ pub fn tick(settings: &mut Settings, model: &mut Model, slow: bool) {
         model.steam_running = model.steam == SteamState::Ready && steam::running();
         model.steam_signed_in = steam::signed_in();
         model.games = steam::games();
+        let app_ids: Vec<String> = model.games.iter().filter_map(|game| steam::app_id(steam::program(game).and_then(|program| settings.launch.get(&program)), Some(&game.app_id))).collect();
+        model.cloud = crate::steam_cloud::notes(&steam::steam_dir(), app_ids.iter().map(String::as_str));
         model.learned_sizes = backend::learned_game_sizes();
         model.found_programs = steam::found_programs(&model.games, crate::pages::FOUND_PROGRAMS);
     }

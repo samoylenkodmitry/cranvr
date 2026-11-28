@@ -3,7 +3,7 @@
 use crate::{
     appinfo,
     backend::{self, config_dir},
-    game_run, launch, openvr,
+    game_run, launch, openvr, steam_cloud,
 };
 use std::{
     fs,
@@ -483,8 +483,13 @@ fn spawn_game(mut command: Command, run: Option<u64>) -> Result<(), String> {
 /// The Steam app ID that a program's Steam check gets: the one in its launch options, else the one of
 /// the Steam manifest that names its install folder. None when it has neither.
 fn steam_id(program: &str, manifest_id: Option<&str>) -> Option<String> {
-    let options = backend::Settings::load().launch.get(program).cloned().unwrap_or_default();
-    let own = options.steam_app_id.trim();
+    app_id(backend::Settings::load().launch.get(program), manifest_id)
+}
+
+/// The Steam app ID of a game with these launch options: the one in the options, else `manifest_id`, the one of
+/// the game's Steam manifest. None when it has neither.
+pub fn app_id(options: Option<&launch::GameOptions>, manifest_id: Option<&str>) -> Option<String> {
+    let own = options.map_or("", |options| options.steam_app_id.trim());
     let id = if own.is_empty() { manifest_id.unwrap_or_default().trim() } else { own };
     (!id.is_empty()).then(|| id.to_owned())
 }
@@ -555,23 +560,17 @@ pub fn start() -> Result<(), String> {
 /// Starts a game by its program while Steam runs. A game started by `steam.exe -applaunch`
 /// would get Steam's environment; this one gets the host's control file and its app ID. The ID
 /// comes from the program's launch options, else from the game's Steam manifest. A game with an ID
-/// has a Steam check, so Steam starts first. A game with none (a program that the user added from a
-/// folder, with no ID in its options) starts without Steam.
+/// has a Steam check, so Steam starts first, with the game's cloud files ([`steam_for`]). A game with
+/// none (a program that the user added from a folder, with no ID in its options) starts without Steam.
 pub fn play(game: &Game) -> Result<(), String> {
     require_current_game_support()?;
     let exe = game.exe.clone().ok_or(format!("No program found for {}", game.name))?;
     let program = mac_to_windows(&exe);
     let app_id = steam_id(&program, Some(&game.app_id));
-    if app_id.is_some() && !running() {
-        start()?;
-        // Steam must answer the game's Steam check: give it time to come up
-        let since = Instant::now();
-        while !running() && since.elapsed() < Duration::from_secs(20) {
-            thread::sleep(Duration::from_millis(500));
-        }
-        thread::sleep(Duration::from_secs(5));
-    } else if !wine_ready() {
-        return Err("Set up game support first".into());
+    match &app_id {
+        Some(id) => steam_for(id)?,
+        None if !wine_ready() => return Err("Set up game support first".into()),
+        None => {}
     }
     let (mut command, run) = game_wine(&program, &game.args, game.engine);
     if let Some(id) = &app_id {
@@ -589,12 +588,78 @@ pub fn run_program(path: &Path) -> Result<(), String> {
     }
     require_current_game_support()?;
     let program = mac_to_windows(path);
+    let app_id = steam_id(&program, backend::steam_app_id(path.parent().unwrap_or(path)).as_deref());
+    if let Some(id) = &app_id {
+        steam_for(id)?;
+    }
     let (mut command, run) = game_wine(&program, &[], launch::engine(path));
-    if let Some(id) = steam_id(&program, backend::steam_app_id(path.parent().unwrap_or(path)).as_deref()) {
-        command.env("SteamAppId", &id).env("SteamGameId", &id);
+    if let Some(id) = &app_id {
+        command.env("SteamAppId", id).env("SteamGameId", id);
     }
     command.current_dir(path.parent().unwrap_or(Path::new("/")));
     spawn_game(command, run)
+}
+
+/// Makes Steam run with the cloud files of the game `app_id` on this Mac, before the game starts. Steam downloads
+/// a game's cloud files only at its own start (steam_cloud.rs). So a Steam that runs starts again when the game's
+/// cache lists files that are not in sync. After a start of Steam the game waits for Steam's look at its files.
+/// A game whose files do not come does not start: the error and the game's row say why.
+fn steam_for(app_id: &str) -> Result<(), String> {
+    let steam = steam_dir();
+    let account = steam_cloud::account(&steam);
+    let cache = account.and_then(|account| steam_cloud::Cache::of(&steam, account, app_id));
+    let refuse = |refusal: steam_cloud::Refusal| {
+        let words = refusal.words();
+        steam_cloud::set_note(app_id, Some(words.clone()));
+        words
+    };
+    steam_cloud::set_note(app_id, None);
+    let waiting = cache.map_or(0, |cache| cache.waiting);
+    if running() {
+        if waiting == 0 {
+            return Ok(());
+        }
+        if game_run::active() {
+            return Err(refuse(steam_cloud::Refusal::GameRuns { waiting }));
+        }
+        backend::log(format!("Steam has {waiting} cloud files of app {app_id} that are not on this Mac. cranvr starts Steam again, which downloads them at its start."));
+        if !stop_steam() {
+            return Err(refuse(steam_cloud::Refusal::SteamStays));
+        }
+    }
+    let look = account.map(|account| steam_cloud::Look::before_start(&steam, account, app_id));
+    if waiting > 0 {
+        steam_cloud::set_note(app_id, Some(steam_cloud::waiting_note(waiting)));
+    }
+    start()?;
+    // Steam must answer the game's Steam check: give it time to come up
+    let since = Instant::now();
+    while !running() && since.elapsed() < Duration::from_secs(20) {
+        thread::sleep(Duration::from_millis(500));
+    }
+    thread::sleep(Duration::from_secs(5));
+    if let Some(look) = look {
+        look.wait(steam_cloud::SYNC_TIME, running).map_err(refuse)?;
+    }
+    if cache.is_some() {
+        backend::log(format!("The cloud files of app {app_id} are on this Mac, {:.1} s after cranvr started Steam.", since.elapsed().as_secs_f32()));
+    }
+    steam_cloud::set_note(app_id, None);
+    Ok(())
+}
+
+/// Ends Steam as the Exit of its menu does, so Steam finishes its own work, and waits until it is gone. Returns
+/// whether it ended within 30 s.
+fn stop_steam() -> bool {
+    wine("steam.exe").arg("-shutdown").current_dir(steam_dir()).stdout(Stdio::null()).stderr(Stdio::null()).status().ok();
+    let since = Instant::now();
+    while running() {
+        if since.elapsed() > Duration::from_secs(30) {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    true
 }
 
 /// Ends a running program and starts it again with the launch options that are saved now. The

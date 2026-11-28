@@ -14,6 +14,7 @@ mod recorder;
 mod run;
 mod setup;
 mod steam;
+mod steam_cloud;
 mod system;
 mod ui;
 mod usb;
