@@ -3,7 +3,7 @@
 //! every program sit in its Wine card.
 
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path};
+use std::{collections::BTreeMap, fs, path::Path};
 
 /// The launch options of one program.
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -396,6 +396,19 @@ pub fn detect(program: &Path, copy_of: Option<(&str, &str)>) -> GameOptions {
         );
     }
     options
+}
+
+/// The entry of `launch` that holds the options of `program`. Windows paths do not differ by case, so a
+/// program takes the spelling of an entry or of a program in `known`, the programs that the Play tab lists,
+/// and its options show in the Play tab. The exact spelling wins over an entry of the same program in
+/// another case. A program with no entry keeps its own spelling.
+pub fn options_key(launch: &BTreeMap<String, GameOptions>, known: &[String], program: &str) -> String {
+    let mut keys = launch.keys().chain(known);
+    keys.clone()
+        .find(|key| key.as_str() == program)
+        .or_else(|| keys.find(|key| key.eq_ignore_ascii_case(program)))
+        .cloned()
+        .unwrap_or_else(|| program.to_owned())
 }
 
 #[cfg(test)]
