@@ -1,0 +1,31 @@
+diff --git i/OpenOVR/Reimpl/BaseInput.cpp w/OpenOVR/Reimpl/BaseInput.cpp
+index fe4c5bb..eca6548 100644
+--- i/OpenOVR/Reimpl/BaseInput.cpp
++++ w/OpenOVR/Reimpl/BaseInput.cpp
+@@ -2284,12 +2284,22 @@ EVRInputError BaseInput::TriggerHapticVibrationAction(VRActionHandle_t action, f
+ 
+ 	// TODO implement fStartSecondsFromNow - just assume most games leave it at or very close to zero
+ 
++	// cranvr: OpenXR takes a duration of 64 bits, a frequency of at least 0 and an amplitude from 0 to 1, and a runtime
++	// refuses other values with XR_ERROR_VALIDATION_FAILURE. An int turned a pulse of more than 2.1 s negative. A pulse
++	// that the runtime refuses costs the game only that pulse: the abort stopped Half-Life: Alyx with a message box.
+ 	XrHapticVibration vibration = { XR_TYPE_HAPTIC_VIBRATION };
+-	vibration.frequency = fFrequency == 0.0f ? XR_FREQUENCY_UNSPECIFIED : fFrequency;
+-	vibration.duration = (int)(fDurationSeconds * 1000000000.0f);
+-	vibration.amplitude = fAmplitude;
++	vibration.frequency = std::isfinite(fFrequency) && fFrequency > 0.0f ? fFrequency : XR_FREQUENCY_UNSPECIFIED;
++	vibration.duration = std::isfinite(fDurationSeconds) && fDurationSeconds > 0.0f ? (XrDuration)((double)fDurationSeconds * 1e9) : XR_MIN_HAPTIC_DURATION;
++	vibration.amplitude = std::isfinite(fAmplitude) ? std::clamp(fAmplitude, 0.0f, 1.0f) : 0.0f;
+ 
+-	OOVR_FAILED_XR_ABORT(xrApplyHapticFeedback(xr_session.get(), &info, (XrHapticBaseHeader*)&vibration));
++	XrResult result = xrApplyHapticFeedback(xr_session.get(), &info, (XrHapticBaseHeader*)&vibration);
++	if (XR_FAILED(result)) {
++		static int logged = 0;
++		if (logged++ < 10)
++			OOVR_LOGF("The runtime refused a haptic pulse of %.3f s at %.1f Hz with amplitude %.2f on '%s': %d",
++			    fDurationSeconds, fFrequency, fAmplitude, act->fullName.c_str(), result);
++		return VRInputError_InvalidParam;
++	}
+ 
+ 	return VRInputError_None;
+ }

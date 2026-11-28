@@ -1,0 +1,335 @@
+diff --git i/OCOVR/openvr_api.cpp w/OCOVR/openvr_api.cpp
+index 2599d54..109169f 100644
+--- i/OCOVR/openvr_api.cpp
++++ w/OCOVR/openvr_api.cpp
+@@ -130,9 +130,13 @@ VR_INTERFACE void* VR_CALLTYPE VR_GetGenericInterface(const char* interfaceVersi
+ 		return impl;
+ 	}
+ 
+-	OOVR_LOG(interfaceVersion);
+-	OOVR_MESSAGE(interfaceVersion, "Missing interface");
+-	ERR("unknown/unsupported interface " + string(interfaceVersion));
++	// cranvr: SteamVR answers an interface that it lacks with an error, and a game that asks for an optional
++	// interface goes on without it. Half-Life: Alyx (OpenVR SDK 2.16) asks for IVRIPCResourceManagerClient_004
++	// at its start. A message box here stopped the game until someone closed it on the Mac's screen.
++	OOVR_LOGF("The application asked for %s, which OpenComposite lacks: it gets VRInitError_Init_InterfaceNotFound", interfaceVersion);
++	if (error)
++		*error = VRInitError_Init_InterfaceNotFound;
++	return nullptr;
+ #undef INTERFACE
+ }
+ 
+diff --git i/OpenOVR/Reimpl/BaseApplications.cpp w/OpenOVR/Reimpl/BaseApplications.cpp
+index 614daca..f2fdc43 100644
+--- i/OpenOVR/Reimpl/BaseApplications.cpp
++++ w/OpenOVR/Reimpl/BaseApplications.cpp
+@@ -177,3 +177,8 @@ uint32_t BaseApplications::GetCurrentSceneProcessId()
+ {
+ 	STUBBED();
+ }
++
++EVRApplicationError BaseApplications::RegisterSubprocess(uint32_t nPid)
++{
++	return VRApplicationError_None;
++}
+diff --git i/OpenOVR/Reimpl/BaseApplications.h w/OpenOVR/Reimpl/BaseApplications.h
+index e69e741..9308a05 100644
+--- i/OpenOVR/Reimpl/BaseApplications.h
++++ w/OpenOVR/Reimpl/BaseApplications.h
+@@ -206,6 +206,8 @@ public:
+ 	 * If working directory is NULL or "" the directory portion of the binary path will be
+ 	 * the working directory. */
+ 	EVRApplicationError LaunchInternalProcess(const char* pchBinaryPath, const char* pchArguments, const char* pchWorkingDirectory);
++	/** IVRApplications_008: a process of the application that also uses OpenVR. Nothing here tracks processes. */
++	EVRApplicationError RegisterSubprocess(uint32_t nPid);
+ 
+ 	/** Returns the current scene process ID according to the application system. A scene process will get scene
+ 	 * focus once it starts rendering, but it will appear here once it calls VR_Init with the Scene application
+diff --git i/OpenOVR/Reimpl/BaseChaperoneSetup.cpp w/OpenOVR/Reimpl/BaseChaperoneSetup.cpp
+index 42cc309..61b08a6 100644
+--- i/OpenOVR/Reimpl/BaseChaperoneSetup.cpp
++++ w/OpenOVR/Reimpl/BaseChaperoneSetup.cpp
+@@ -119,7 +119,7 @@ bool BaseChaperoneSetup::ImportFromBufferToWorking(const char* pBuffer, uint32_t
+ {
+ 	STUBBED();
+ }
+-void BaseChaperoneSetup::SetWorkingPerimeter(VR_ARRAY_COUNT(unPointCount) HmdVector2_t* pPointBuffer, uint32_t unPointCount)
++void BaseChaperoneSetup::SetWorkingPerimeter(VR_ARRAY_COUNT(unPointCount) const HmdVector2_t* pPointBuffer, uint32_t unPointCount)
+ {
+ 	STUBBED();
+ }
+diff --git i/OpenOVR/Reimpl/BaseChaperoneSetup.h w/OpenOVR/Reimpl/BaseChaperoneSetup.h
+index a2fba31..19a5572 100644
+--- i/OpenOVR/Reimpl/BaseChaperoneSetup.h
++++ w/OpenOVR/Reimpl/BaseChaperoneSetup.h
+@@ -77,7 +77,7 @@ public:
+ 	bool ImportFromBufferToWorking(const char* pBuffer, uint32_t nImportFlags);
+ 
+ 	/** Sets the Collision Bounds in the working copy. */
+-	void SetWorkingPerimeter(VR_ARRAY_COUNT(unPointCount) vr::HmdVector2_t* pPointBuffer, uint32_t unPointCount);
++	void SetWorkingPerimeter(VR_ARRAY_COUNT(unPointCount) const vr::HmdVector2_t* pPointBuffer, uint32_t unPointCount);
+ 
+ 	/** Shows the chaperone data in the working set to preview in the compositor.*/
+ 	void ShowWorkingSetPreview();
+diff --git i/OpenOVR/Reimpl/BaseCompositor.cpp w/OpenOVR/Reimpl/BaseCompositor.cpp
+index b40cc1b..3dfac70 100644
+--- i/OpenOVR/Reimpl/BaseCompositor.cpp
++++ w/OpenOVR/Reimpl/BaseCompositor.cpp
+@@ -619,3 +619,9 @@ ovr_enum_t BaseCompositor::GetPosesForFrame(uint32_t unPosePredictionID, Tracked
+ {
+ 	STUBBED();
+ }
++
++ovr_enum_t BaseCompositor::GetSubmitTexture(Texture_t* pOutTexture, bool* pNeedsFlush, OOVR_EVRCompositorTextureUsage eUsage, const Texture_t* pTexture,
++    const VRTextureBounds_t* pBounds, EVRSubmitFlags nSubmitFlags)
++{
++	return VRCompositorError_RequestFailed;
++}
+diff --git i/OpenOVR/Reimpl/BaseCompositor.h w/OpenOVR/Reimpl/BaseCompositor.h
+index 458cc6a..5f54561 100644
+--- i/OpenOVR/Reimpl/BaseCompositor.h
++++ w/OpenOVR/Reimpl/BaseCompositor.h
+@@ -74,6 +74,13 @@ struct OOVR_Compositor_CumulativeStats {
+ 	uint32_t m_nNumReprojectedFramesTimedOut;
+ };
+ 
++/** Usage types for retrieving shared textures (IVRCompositor_029) */
++enum OOVR_EVRCompositorTextureUsage {
++	VRCompositorTextureUsage_Left = vr::Eye_Left,
++	VRCompositorTextureUsage_Right = vr::Eye_Right,
++	VRCompositorTextureUsage_Both,
++};
++
+ enum OOVR_EVRCompositorTimingMode {
+ 	VRCompositorTimingMode_Implicit = 0,
+ 	VRCompositorTimingMode_Explicit_RuntimePerformsPostPresentHandoff = 1,
+@@ -183,6 +190,10 @@ public:
+ 	 */
+ 	ovr_enum_t Submit(vr::EVREye eEye, const vr::Texture_t* pTexture, const vr::VRTextureBounds_t* pBounds, vr::EVRSubmitFlags nSubmitFlags = vr::Submit_Default);
+ 	ovr_enum_t SubmitWithArrayIndex(vr::EVREye eEye, const vr::Texture_t* pTexture, uint32_t unTextureArrayIndex, const vr::VRTextureBounds_t* pBounds, vr::EVRSubmitFlags nSubmitFlags = vr::Submit_Default);
++	/** IVRCompositor_029: a texture of the compositor that the game would draw into. The game submits its own
++	 * textures here, so the call fails and the game goes on with Submit. */
++	ovr_enum_t GetSubmitTexture(vr::Texture_t* pOutTexture, bool* pNeedsFlush, OOVR_EVRCompositorTextureUsage eUsage, const vr::Texture_t* pTexture,
++	    const vr::VRTextureBounds_t* pBounds = 0, vr::EVRSubmitFlags nSubmitFlags = vr::Submit_Default);
+ 
+ 	/** Clears the frame that was sent with the last call to Submit. This will cause the
+ 	 * compositor to show the grid until Submit is called again. */
+diff --git i/OpenOVR/Reimpl/BaseInput.cpp w/OpenOVR/Reimpl/BaseInput.cpp
+index 288e794..fe4c5bb 100644
+--- i/OpenOVR/Reimpl/BaseInput.cpp
++++ w/OpenOVR/Reimpl/BaseInput.cpp
+@@ -2815,3 +2815,15 @@ ITrackedDevice::TrackedDeviceType BaseInput::ParseAndRemoveHandPrefix(std::strin
+ 
+ 	return ITrackedDevice::HAND_NONE;
+ }
++
++EVRInputError BaseInput::GetEyeTrackingDataRelativeToNow(VRActionHandle_t action, ETrackingUniverseOrigin eOrigin, float fPredictedSecondsFromNow,
++    VREyeTrackingData_t* pEyeTrackingData, uint32_t ulEyeTrackingDataSize)
++{
++	return VRInputError_NoData;
++}
++
++EVRInputError BaseInput::GetEyeTrackingDataForNextFrame(VRActionHandle_t action, ETrackingUniverseOrigin eOrigin, VREyeTrackingData_t* pEyeTrackingData,
++    uint32_t ulEyeTrackingDataSize)
++{
++	return VRInputError_NoData;
++}
+diff --git i/OpenOVR/Reimpl/BaseInput.h w/OpenOVR/Reimpl/BaseInput.h
+index 09286c4..6adaa40 100644
+--- i/OpenOVR/Reimpl/BaseInput.h
++++ w/OpenOVR/Reimpl/BaseInput.h
+@@ -252,6 +252,11 @@ public:
+ 	/** Reads the state of a pose action given its handle. The returned values will match the values returned
+ 	 * by the last call to IVRCompositor::WaitGetPoses(). */
+ 	EVRInputError GetPoseActionDataForNextFrame(VRActionHandle_t action, ETrackingUniverseOrigin eOrigin, InputPoseActionData_t* pActionData, uint32_t unActionDataSize, VRInputValueHandle_t ulRestrictToDevice);
++	/** IVRInput_011: the runtime tracks no eyes */
++	EVRInputError GetEyeTrackingDataRelativeToNow(VRActionHandle_t action, ETrackingUniverseOrigin eOrigin, float fPredictedSecondsFromNow,
++	    vr::VREyeTrackingData_t* pEyeTrackingData, uint32_t ulEyeTrackingDataSize);
++	EVRInputError GetEyeTrackingDataForNextFrame(VRActionHandle_t action, ETrackingUniverseOrigin eOrigin, vr::VREyeTrackingData_t* pEyeTrackingData,
++	    uint32_t ulEyeTrackingDataSize);
+ 
+ 	/** Reads the state of a skeletal action given its handle. */
+ 	EVRInputError GetSkeletalActionData(VRActionHandle_t action, InputSkeletalActionData_t* pActionData, uint32_t unActionDataSize, VRInputValueHandle_t ulRestrictToDevice);
+diff --git i/OpenOVR/Reimpl/BaseOverlay.cpp w/OpenOVR/Reimpl/BaseOverlay.cpp
+index 5c3bf8b..bddf867 100644
+--- i/OpenOVR/Reimpl/BaseOverlay.cpp
++++ w/OpenOVR/Reimpl/BaseOverlay.cpp
+@@ -980,3 +980,14 @@ EVROverlayError BaseOverlay::WaitFrameSync(uint32_t nTimeoutMs)
+ {
+ 	STUBBED();
+ }
++
++EVROverlayError BaseOverlay::CreateSubviewOverlay(VROverlayHandle_t parentOverlayHandle, const char* pchSubviewOverlayKey, const char* pchSubviewOverlayName,
++    VROverlayHandle_t* pSubviewOverlayHandle)
++{
++	return VROverlayError_RequestFailed;
++}
++
++EVROverlayError BaseOverlay::SetSubviewPosition(VROverlayHandle_t ulOverlayHandle, float fX, float fY)
++{
++	return VROverlayError_RequestFailed;
++}
+diff --git i/OpenOVR/Reimpl/BaseOverlay.h w/OpenOVR/Reimpl/BaseOverlay.h
+index cb01dba..8a74e50 100644
+--- i/OpenOVR/Reimpl/BaseOverlay.h
++++ w/OpenOVR/Reimpl/BaseOverlay.h
+@@ -212,6 +212,10 @@ public:
+ 
+ 	/** Creates a new named overlay. All overlays start hidden and with default settings. */
+ 	vr::EVROverlayError CreateOverlay(const char* pchOverlayKey, const char* pchOverlayName, vr::VROverlayHandle_t* pOverlayHandle);
++	/** IVROverlay_028: an overlay inside another one. The runtime takes no quad layer, so there is none. */
++	vr::EVROverlayError CreateSubviewOverlay(vr::VROverlayHandle_t parentOverlayHandle, const char* pchSubviewOverlayKey, const char* pchSubviewOverlayName,
++	    vr::VROverlayHandle_t* pSubviewOverlayHandle);
++	vr::EVROverlayError SetSubviewPosition(vr::VROverlayHandle_t ulOverlayHandle, float fX, float fY);
+ 
+ 	/** Destroys the specified overlay. When an application calls VR_Shutdown all overlays created by that app are
+ 	 * automatically destroyed. */
+diff --git i/OpenOVR/Reimpl/BaseSystem.cpp w/OpenOVR/Reimpl/BaseSystem.cpp
+index 3c7edcb..1dd1b9f 100644
+--- i/OpenOVR/Reimpl/BaseSystem.cpp
++++ w/OpenOVR/Reimpl/BaseSystem.cpp
+@@ -884,3 +884,33 @@ void BaseSystem::ResetSeatedZeroPose()
+ 		}
+ 	}
+ }
++
++bool BaseSystem::ComputeDistortionSet(EVREye eEye, EVRDistortionChannel eChannel, bool bAsNormalizedDeviceCoordinates, uint32_t nNumCoordinates,
++    const DistortionCoordinate_t* pInput, DistortionCoordinate_t* pOutput)
++{
++	return false;
++}
++
++bool BaseSystem::PollNextEventWithPoseAndOverlays(ETrackingUniverseOrigin eOrigin, VREvent_t* pEvent, uint32_t uncbVREvent,
++    TrackedDevicePose_t* pTrackedDevicePose, VROverlayHandle_t* pulOverlayHandle)
++{
++	if (pulOverlayHandle)
++		*pulOverlayHandle = k_ulOverlayHandleInvalid;
++	return PollNextEventWithPose(eOrigin, pEvent, uncbVREvent, pTrackedDevicePose);
++}
++
++bool BaseSystem::GetEyeTrackedFoveationCenter(HmdVector2_t* pNdcLeft, HmdVector2_t* pNdcRight)
++{
++	return false;
++}
++
++bool BaseSystem::GetEyeTrackedFoveationCenterForProjection(const HmdMatrix44_t* pProjMat, HmdVector2_t* pNdc)
++{
++	return false;
++}
++
++EVRInitError BaseSystem::SetSDKVersion(uint32_t nVersionMajor, uint32_t nVersionMinor, uint32_t nVersionBuild)
++{
++	OOVR_LOGF("The application uses OpenVR SDK %u.%u.%u", nVersionMajor, nVersionMinor, nVersionBuild);
++	return VRInitError_None;
++}
+diff --git i/OpenOVR/Reimpl/BaseSystem.h w/OpenOVR/Reimpl/BaseSystem.h
+index 3f9d7c7..baad72d 100644
+--- i/OpenOVR/Reimpl/BaseSystem.h
++++ w/OpenOVR/Reimpl/BaseSystem.h
+@@ -75,6 +75,9 @@ public:
+ 	 * the upper left of that eye's viewport and 1,1 in the lower right of that eye's viewport.
+ 	 * Returns true for success. Otherwise, returns false, and distortion coordinates are not suitable. */
+ 	bool ComputeDistortion(vr::EVREye eEye, float fU, float fV, vr::DistortionCoordinates_t* pDistortionCoordinates);
++	/** IVRSystem_026: the distortion of many coordinates at once. Returns false: the runtime has no distortion data. */
++	bool ComputeDistortionSet(vr::EVREye eEye, vr::EVRDistortionChannel eChannel, bool bAsNormalizedDeviceCoordinates, uint32_t nNumCoordinates,
++	    const vr::DistortionCoordinate_t* pInput, vr::DistortionCoordinate_t* pOutput);
+ 
+ 	/** Returns the transform from eye space to the head space. Eye space is the per-eye flavor of head
+ 	 * space that provides stereo disparity. Instead of Model * View * Projection the sequence is Model * View * Eye^-1 * Projection.
+@@ -270,6 +273,14 @@ public:
+ 	* This pose will always be older than the call to this function and should not be used to render the device.
+ 	uncbVREvent should be the size in bytes of the VREvent_t struct */
+ 	bool PollNextEventWithPose(vr::ETrackingUniverseOrigin eOrigin, vr::VREvent_t* pEvent, uint32_t uncbVREvent, vr::TrackedDevicePose_t* pTrackedDevicePose);
++	/** IVRSystem_026: as PollNextEventWithPose, and the overlay of the event, which is never one here */
++	bool PollNextEventWithPoseAndOverlays(vr::ETrackingUniverseOrigin eOrigin, vr::VREvent_t* pEvent, uint32_t uncbVREvent,
++	    vr::TrackedDevicePose_t* pTrackedDevicePose, vr::VROverlayHandle_t* pulOverlayHandle);
++	/** IVRSystem_026: the runtime tracks no eyes, so there is no foveation centre */
++	bool GetEyeTrackedFoveationCenter(vr::HmdVector2_t* pNdcLeft, vr::HmdVector2_t* pNdcRight);
++	bool GetEyeTrackedFoveationCenterForProjection(const vr::HmdMatrix44_t* pProjMat, vr::HmdVector2_t* pNdc);
++	/** IVRSystem_026: the OpenVR SDK version that the game was built with. Nothing here depends on it. */
++	vr::EVRInitError SetSDKVersion(uint32_t nVersionMajor, uint32_t nVersionMinor, uint32_t nVersionBuild);
+ 
+ 	/** returns the name of an EVREvent enum value */
+ 	const char* GetEventTypeNameFromEnum(vr::EVREventType eType);
+diff --git i/OpenOVR/Reimpl/CVRApplications.cpp w/OpenOVR/Reimpl/CVRApplications.cpp
+index 5196caa..8d3574f 100644
+--- i/OpenOVR/Reimpl/CVRApplications.cpp
++++ w/OpenOVR/Reimpl/CVRApplications.cpp
+@@ -10,3 +10,4 @@ GEN_INTERFACE("Applications", "004")
+ GEN_INTERFACE("Applications", "005")
+ GEN_INTERFACE("Applications", "006")
+ GEN_INTERFACE("Applications", "007")
++GEN_INTERFACE("Applications", "008")
+diff --git i/OpenOVR/Reimpl/CVRCompositor.cpp w/OpenOVR/Reimpl/CVRCompositor.cpp
+index dc0cab9..cf67eb4 100644
+--- i/OpenOVR/Reimpl/CVRCompositor.cpp
++++ w/OpenOVR/Reimpl/CVRCompositor.cpp
+@@ -20,6 +20,7 @@ GEN_INTERFACE("Compositor", "024")
+ GEN_INTERFACE("Compositor", "026")
+ GEN_INTERFACE("Compositor", "027")
+ GEN_INTERFACE("Compositor", "028")
++GEN_INTERFACE("Compositor", "029")
+ 
+ #include "generated/GVRCompositor.gen.h"
+ 
+diff --git i/OpenOVR/Reimpl/CVRInput.cpp w/OpenOVR/Reimpl/CVRInput.cpp
+index 816dd78..9ae1e9d 100644
+--- i/OpenOVR/Reimpl/CVRInput.cpp
++++ w/OpenOVR/Reimpl/CVRInput.cpp
+@@ -8,6 +8,7 @@ GEN_INTERFACE("Input", "006")
+ GEN_INTERFACE("Input", "007")
+ // version 8 and 9 are skipped
+ GEN_INTERFACE("Input", "010")
++GEN_INTERFACE("Input", "011")
+ 
+ #include "generated/GVRInput.gen.h"
+ 
+diff --git i/OpenOVR/Reimpl/CVROverlay.cpp w/OpenOVR/Reimpl/CVROverlay.cpp
+index faeea0e..49414b4 100644
+--- i/OpenOVR/Reimpl/CVROverlay.cpp
++++ w/OpenOVR/Reimpl/CVROverlay.cpp
+@@ -21,6 +21,7 @@ GEN_INTERFACE("Overlay", "024")
+ GEN_INTERFACE("Overlay", "025")
+ GEN_INTERFACE("Overlay", "026")
+ GEN_INTERFACE("Overlay", "027")
++GEN_INTERFACE("Overlay", "028")
+ 
+ #include "generated/GVROverlay.gen.h"
+ 
+diff --git i/OpenOVR/Reimpl/CVRSystem.cpp w/OpenOVR/Reimpl/CVRSystem.cpp
+index d0e0a5d..f425085 100644
+--- i/OpenOVR/Reimpl/CVRSystem.cpp
++++ w/OpenOVR/Reimpl/CVRSystem.cpp
+@@ -15,6 +15,7 @@ GEN_INTERFACE("System", "019")
+ GEN_INTERFACE("System", "020")
+ GEN_INTERFACE("System", "021")
+ GEN_INTERFACE("System", "022")
++GEN_INTERFACE("System", "026")
+ 
+ #include "generated/GVRSystem.gen.h"
+ 
+diff --git i/scripts/libparse.py w/scripts/libparse.py
+index 03100a8..c7ca6d8 100644
+--- i/scripts/libparse.py
++++ w/scripts/libparse.py
+@@ -9,7 +9,7 @@ regex = re.compile(regex_src)
+ arg_src = r"(?P<type>[^=]+ \**)(?P<name>\w+)(?: = (?P<default>.*))?"
+ argr = re.compile(arg_src)
+ 
+-typedecl = re.compile(r"^(?:enum|struct)\s+(?P<name>\w+)$")
++typedecl = re.compile(r"^(?:enum(?:\s+class)?|struct)\s+(?P<name>\w+)(?:\s*:\s*\w+)?$")
+ 
+ typedef = re.compile(r"^typedef\s+(?P<def>[\w\s\d_\*&]+)\s+(?P<name>\w+);$")
+ typedef_struct = re.compile(r"^typedef\s+(?:struct|union)$")
+diff --git i/scripts/split_headers.py w/scripts/split_headers.py
+index b2980c7..3749344 100644
+--- i/scripts/split_headers.py
++++ w/scripts/split_headers.py
+@@ -45,6 +45,7 @@ versions = [
+     "1.16.8",
+     "1.23.7",
+     "2.5.1",
++    "2.15.6",
+ ]
+ 
+ driver_versions = [
