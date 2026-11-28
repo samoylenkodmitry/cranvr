@@ -163,7 +163,7 @@ fn record_until(link: &ClientLink, stop: &AtomicBool) {
     let origin = Arc::new(Origin(AtomicU64::new(now_ns())));
     let dropped = Arc::new(AtomicU64::new(0));
     let capture = Capture { queue: producer, origin: Arc::clone(&origin), written: 0, phase: 0.0, last: 0.0, dropped: Arc::clone(&dropped) };
-    let preset = if cranpose::launch_args().string("microphone_preset") == Some("communication") {
+    let preset = if crate::launch::args().string("microphone_preset") == Some("communication") {
         InputPreset::VoiceCommunication
     } else {
         InputPreset::VoiceRecognition

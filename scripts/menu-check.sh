@@ -57,7 +57,7 @@ case ${case} in
     ball) extras+=(--es scripted_point ball --es hand_anchor view) ;;
     *) extras+=(--es scripted_pointer menu --es scripted_hands ${case}) ;;
 esac
-${adb_cmd} shell am start -n dev.cranvr.client/dev.cranpose.android.CranposeActivity ${extras} > /dev/null
+${adb_cmd} shell am start -n dev.cranvr.client/dev.cranvr.client.AdbStart ${extras} > /dev/null
 if [[ ${case} == mac ]]; then
     sleep 8
     print "menu open" >&3

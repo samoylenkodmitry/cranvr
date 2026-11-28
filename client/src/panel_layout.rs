@@ -138,7 +138,7 @@ impl Layout {
         log::info!("the panels' saved layout: {}", layout.saved_text());
         // A test chooses the panels and the pinned display with launch extras and saves nothing:
         // `shown` is a list such as `display1,stats` and `pinned` a display's number
-        let args = cranpose::launch_args();
+        let args = crate::launch::args();
         if let Some(list) = args.string("shown") {
             let set: BTreeSet<PanelId> = list.split(',').filter_map(from_name).collect();
             layout.room.clone_from(&set);

@@ -35,6 +35,13 @@ if [[ -n ${apk} ]]; then
     done
     (( installed )) || print -u2 "give-back: ${apk:t} did not install"
 fi
+# A client from before the entry for adb takes no extras from adb. Leave it running rather than
+# stop it and fail to start it again.
+quest_ready
+if ! client_has_entry; then
+    print -u2 "give-back: the installed client has no ${CLIENT_ACTIVITY#*/}. Install a build from main: scripts/give-back.sh SERIAL APK"
+    exit 1
+fi
 for attempt in 1 2 3; do
     quest_ready
     ${adb_cmd} shell am force-stop ${CLIENT_PACKAGE}

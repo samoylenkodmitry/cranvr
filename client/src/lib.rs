@@ -39,6 +39,7 @@ mod page_model;
 mod microphone;
 mod models;
 mod hub;
+mod launch;
 mod palm;
 mod panel_layout;
 mod phone;

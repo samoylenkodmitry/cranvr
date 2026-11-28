@@ -19,7 +19,7 @@
 #
 # Afterwards a running cranvr client may have moved to Wi-Fi. Start it again on the cable:
 #   adb -s SERIAL shell am force-stop dev.cranvr.client
-#   adb -s SERIAL shell am start -n dev.cranvr.client/dev.cranpose.android.CranposeActivity --es host 127.0.0.1:9950 --ez connect true
+#   adb -s SERIAL shell am start -n dev.cranvr.client/dev.cranvr.client.AdbStart --es host 127.0.0.1:9950 --ez connect true
 set -euo pipefail
 
 serial=$1 hold=${2:-120}

@@ -14,7 +14,8 @@
 //! the link.
 
 use crate::focus;
-use cranpose::{launch_args, request_network, Network, NetworkRequest, NetworkRequestState, NetworkTransport, RequestedNetwork};
+use crate::launch;
+use cranpose::{request_network, Network, NetworkRequest, NetworkRequestState, NetworkTransport, RequestedNetwork};
 use cranvr_proto::{
     discovery::{find_with, Finder, DEFAULT_PORT},
     link::Route,
@@ -59,7 +60,7 @@ static UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 /// functions as they are, for a test of `adb reverse` that a change of the functions would cut.
 pub fn wanted() -> bool {
     static WANTED: OnceLock<bool> = OnceLock::new();
-    *WANTED.get_or_init(|| launch_args().boolean("usb_network").unwrap_or(true))
+    *WANTED.get_or_init(|| launch::args().boolean("usb_network").unwrap_or(true))
 }
 
 /// Keeps a request for the USB network while the app has the focus. The cable's thread calls it

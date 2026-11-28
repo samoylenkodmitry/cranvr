@@ -123,7 +123,7 @@
 //!   closes the menu in turn.
 
 use crate::{hand_menu, menu_model, place, ui};
-use cranpose::launch_args;
+use crate::launch;
 use cranpose_xr::{script_controller, script_hand, Hand, PinchCycle, Pose, ScriptedButtons, ScriptedController, ScriptedHand, SubspaceModifier};
 use std::{sync::Once, time::Duration};
 
@@ -142,7 +142,7 @@ const BALL_AT: [f32; 3] = [-0.30, -0.35 + 0.11, -1.0 + 0.60];
 pub fn install_once() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let args = launch_args();
+        let args = launch::args();
         if args.string("scripted_pointer") == Some("desktop") {
             let pitch = args.string("scripted_pitch").and_then(|text| text.parse::<f32>().ok()).unwrap_or(0.0);
             desktop_pointers(pitch);
@@ -394,7 +394,7 @@ pub fn note_input(input: &cranvr_proto::message::Input) {
     use std::sync::{Mutex, OnceLock};
     static LAST: Mutex<Option<String>> = Mutex::new(None);
     static PRESSING: OnceLock<bool> = OnceLock::new();
-    if !*PRESSING.get_or_init(|| launch_args().string("scripted_pointer") == Some("models")) {
+    if !*PRESSING.get_or_init(|| launch::args().string("scripted_pointer") == Some("models")) {
         return;
     }
     let hand = &input.hands[1];
@@ -423,7 +423,7 @@ pub fn note_poses(frame: &crate::tracking::HeadsetFrame) {
     };
     static LOGGING: OnceLock<bool> = OnceLock::new();
     static LAST: AtomicU64 = AtomicU64::new(0);
-    if !*LOGGING.get_or_init(|| launch_args().boolean("log_poses").unwrap_or(false)) {
+    if !*LOGGING.get_or_init(|| launch::args().boolean("log_poses").unwrap_or(false)) {
         return;
     }
     let now = frame.sample_time;
@@ -735,8 +735,8 @@ fn pages_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
     // and the page's button opens the console anew there, at its place in front of the user. The
     // first change of the page that restarts nothing is pressed.
     // `scripted_pages` names the pages to walk, as a comma list of their ids; all by default
-    let wanted: Option<Vec<String>> = launch_args().string("scripted_pages").map(|list| list.split(',').map(|id| id.trim().to_string()).collect());
-    let actions: Vec<String> = launch_args().string("scripted_actions").map(|list| list.split(',').map(|id| id.trim().to_string()).collect()).unwrap_or_default();
+    let wanted: Option<Vec<String>> = launch::args().string("scripted_pages").map(|list| list.split(',').map(|id| id.trim().to_string()).collect());
+    let actions: Vec<String> = launch::args().string("scripted_actions").map(|list| list.split(',').map(|id| id.trim().to_string()).collect()).unwrap_or_default();
     for (index, (id, short)) in pages.iter().enumerate() {
         if wanted.as_ref().is_some_and(|wanted| !wanted.contains(id)) {
             continue;
@@ -853,7 +853,7 @@ fn ui3d_script(menu: &crate::console::Menu) -> Option<ScriptedController> {
     let stream = pages.iter().position(|(id, _)| id == "stream")?;
     // A run can wait before the first press (`walk_wait_ms`), so that a system toast that covers the
     // screen captures has gone
-    let wait = launch_args().int("walk_wait_ms").and_then(|ms| u64::try_from(ms).ok()).unwrap_or(500);
+    let wait = launch::args().int("walk_wait_ms").and_then(|ms| u64::try_from(ms).ok()).unwrap_or(500);
     let mut right = ScriptedController::new(Hand::Right, at, away_from(at)).holding(Duration::from_millis(wait), rest);
     log::info!("scripted ui3d: the ball at {ball:?}");
     right = press(right, ball);
@@ -937,7 +937,7 @@ fn record_row_script(menu: &crate::console::Menu) -> Option<ScriptedController> 
     let (record, idle_height) = button(&Recording::default())?;
     let (stop, running_height) = button(&Recording { running: true, ..Default::default() })?;
     let at = PRESS_AT;
-    let length = launch_args().int("record_ms").and_then(|ms| u64::try_from(ms).ok()).unwrap_or(6000);
+    let length = launch::args().int("record_ms").and_then(|ms| u64::try_from(ms).ok()).unwrap_or(6000);
     let press = |script: ScriptedController, target: [f32; 3]| {
         script.moving_to(Duration::from_millis(1), (at, target), rest).holding(Duration::from_millis(1200), rest).holding(Duration::from_millis(300), pull).holding(Duration::from_millis(500), rest)
     };
@@ -977,8 +977,8 @@ fn hologram_walk() {
     };
     use cranvr_common::menu::{Item, Request};
     // The page and the items that the walk changes: the Stream page's every item by default
-    let page_id = launch_args().string("walk_page").unwrap_or(HOLOGRAM_PAGE).to_owned();
-    let items: Vec<String> = launch_args().string("walk_items").map(|ids| ids.split(',').map(str::to_owned).collect()).unwrap_or_default();
+    let page_id = launch::args().string("walk_page").unwrap_or(HOLOGRAM_PAGE).to_owned();
+    let items: Vec<String> = launch::args().string("walk_items").map(|ids| ids.split(',').map(str::to_owned).collect()).unwrap_or_default();
     let since = std::time::Instant::now();
     let menu = loop {
         if let Some(menu) = hub().console().menu.filter(|menu| menu.page(&page_id).is_some() && menu.headset.theme.is_some()) {
@@ -996,8 +996,8 @@ fn hologram_walk() {
     let rest = ScriptedButtons::default();
     let pull = ScriptedButtons { trigger: 1.0, ..rest };
     let at = MENU_RIGHT_AT;
-    let restart = Duration::from_millis(launch_args().int("walk_restart_ms").and_then(|ms| u64::try_from(ms).ok()).unwrap_or(9000));
-    let wait = Duration::from_millis(launch_args().int("walk_wait_ms").and_then(|ms| u64::try_from(ms).ok()).unwrap_or(1500));
+    let restart = Duration::from_millis(launch::args().int("walk_restart_ms").and_then(|ms| u64::try_from(ms).ok()).unwrap_or(9000));
+    let wait = Duration::from_millis(launch::args().int("walk_wait_ms").and_then(|ms| u64::try_from(ms).ok()).unwrap_or(1500));
     let local = Local { link: true, interface: hub().console().interface };
     let rows = console_rows(Some(&menu), &Shown::Host(page_id.clone()), local, "", None, std::time::Instant::now());
     if !rows.first().is_some_and(|row| matches!(row.line, Line::Header { .. })) {
@@ -1073,7 +1073,7 @@ fn hologram_pinch(hand: Hand, cycle: PinchCycle) {
         hub::hub,
         page_model::{console_rows, find_key, key_point, Local},
     };
-    let page_id = launch_args().string("walk_page").unwrap_or(HOLOGRAM_PAGE).to_owned();
+    let page_id = launch::args().string("walk_page").unwrap_or(HOLOGRAM_PAGE).to_owned();
     let since = std::time::Instant::now();
     let menu = loop {
         if let Some(menu) = hub().console().menu.filter(|menu| menu.page(&page_id).is_some()) {
@@ -1162,7 +1162,7 @@ fn touch_walk(hand: Hand) {
         page_model::{console_rows, find_key, key_point, Local},
     };
     use cranvr_common::menu::{Item, Request};
-    let page_id = launch_args().string("walk_page").unwrap_or(HOLOGRAM_PAGE).to_owned();
+    let page_id = launch::args().string("walk_page").unwrap_or(HOLOGRAM_PAGE).to_owned();
     let since = std::time::Instant::now();
     let menu = loop {
         if let Some(menu) = hub().console().menu.filter(|menu| menu.page(&page_id).is_some()) {
@@ -1271,7 +1271,7 @@ fn press_check() {
     let carried = [at[0] + 0.1, at[1], at[2]];
     // A run can wait longer before the first press (`press_wait_ms`), so that a system toast that
     // covers the screen capture has gone
-    let wait = launch_args().int("press_wait_ms").and_then(|ms| u64::try_from(ms).ok()).unwrap_or(3000);
+    let wait = launch::args().int("press_wait_ms").and_then(|ms| u64::try_from(ms).ok()).unwrap_or(3000);
     let right = ScriptedController::new(Hand::Right, at, away_from(at))
         .holding(Duration::from_millis(wait), rest)
         // 3 s: the ray enters the Show button and rests there for a screen capture
@@ -1313,7 +1313,7 @@ pub fn note_menu_point(kind: cranpose::PointerEventKind, at: cranpose::Point) {
     use menu_model::size::{BUTTON, GAP, PADDING, ROW, TITLE, WIDTH};
     use std::sync::Mutex;
     static INSIDE: Mutex<Option<&'static str>> = Mutex::new(None);
-    if launch_args().string("scripted_pointer") != Some("press") {
+    if launch::args().string("scripted_pointer") != Some("press") {
         return;
     }
     let row_top = |row: f32| PADDING + TITLE + GAP + row * (ROW + GAP);

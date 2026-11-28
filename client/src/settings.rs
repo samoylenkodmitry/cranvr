@@ -1,13 +1,14 @@
 //! What the app remembers and what it takes from its launch.
 //!
 //! The host address lives in Cranpose's preferences service. The launch arguments come from
-//! Cranpose's `launch_args`: the extras of the launching intent on Android
-//! (`adb shell am start ... --es host 192.168.1.20:9950 --ez connect true`) and the command line
-//! on the desktop (`--host=192.168.1.20:9950 --connect`).
+//! `crate::launch::args`: on Android the extras of a launch through the entry for adb
+//! (`adb shell am start -n dev.cranvr.client/dev.cranvr.client.AdbStart --es host 192.168.1.20:9950
+//! --ez connect true`), on the desktop the command line (`--host=192.168.1.20:9950 --connect`).
 
 use crate::console::{Interface, Room, Theme, Volume};
 use crate::hub::MediaChoice;
-use cranpose::{launch_args, preferences};
+use crate::launch;
+use cranpose::preferences;
 use cranvr_common::controls::{Controls, Hand};
 use cranvr_proto::identity::{fingerprint, from_hex, to_hex, Identity, FINGERPRINT_LEN};
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -25,7 +26,7 @@ const DEFAULT_HOST: &str = "127.0.0.1:9950";
 /// The address for the text field: the launch argument, else the last address that was used, else
 /// the default.
 pub fn initial_host() -> String {
-    let args = launch_args();
+    let args = launch::args();
     if let Some(host) = args.string("host") {
         return host.to_owned();
     }
@@ -44,7 +45,7 @@ pub fn remember_host(host: &str) {
 /// display uses it. Without it the console's Room setting counts, as it saved it. A missing or
 /// unknown value gives the passthrough.
 pub fn room() -> Room {
-    if let Some(room) = launch_args().string("room").and_then(Room::from_key) {
+    if let Some(room) = launch::args().string("room").and_then(Room::from_key) {
         return room;
     }
     if bare_room() {
@@ -56,14 +57,14 @@ pub fn room() -> Room {
 /// Whether the launch asks for nothing behind the panels (`room=none`), for a screen capture: the
 /// app's black background shows, with neither the room nor the host's picture.
 pub fn bare_room() -> bool {
-    launch_args().string("room") == Some("none")
+    launch::args().string("room") == Some("none")
 }
 
 /// Whether the choices that a Mac sends are saved for the time without a link. The launch extra
 /// `save_choices=false` keeps the saved ones as they are, for a test with a test host on the user's
 /// headset: the user's own host sends the user's own choices.
 fn saves_choices() -> bool {
-    launch_args().boolean("save_choices").unwrap_or(true)
+    launch::args().boolean("save_choices").unwrap_or(true)
 }
 
 pub fn remember_room(room: Room) {
@@ -94,7 +95,7 @@ pub fn remember_volume(volume: Volume) {
 /// launch and saves nothing, for a test. Without it the saved choice counts. A missing or unknown
 /// value gives 3D.
 pub fn interface() -> Interface {
-    if let Some(interface) = launch_args().string("interface").and_then(Interface::from_key) {
+    if let Some(interface) = launch::args().string("interface").and_then(Interface::from_key) {
         return interface;
     }
     preferences().get(INTERFACE_KEY).and_then(|text| Interface::from_key(&text)).unwrap_or_default()
@@ -102,7 +103,7 @@ pub fn interface() -> Interface {
 
 /// Whether the launch fixes the interface for a test.
 pub fn interface_fixed() -> bool {
-    launch_args().string("interface").is_some()
+    launch::args().string("interface").is_some()
 }
 
 pub fn remember_interface(interface: Interface) {
@@ -118,7 +119,7 @@ pub fn remember_interface(interface: Interface) {
 /// and saves nothing, for a test. Without it the saved choice counts. A missing or unknown value
 /// gives cyan.
 pub fn theme() -> Theme {
-    if let Some(theme) = launch_args().string("theme").and_then(Theme::from_key) {
+    if let Some(theme) = launch::args().string("theme").and_then(Theme::from_key) {
         return theme;
     }
     preferences().get(THEME_KEY).and_then(|text| Theme::from_key(&text)).unwrap_or_default()
@@ -126,7 +127,7 @@ pub fn theme() -> Theme {
 
 /// Whether the launch fixes the theme for a test.
 pub fn theme_fixed() -> bool {
-    launch_args().string("theme").is_some()
+    launch::args().string("theme").is_some()
 }
 
 pub fn remember_theme(theme: Theme) {
@@ -158,7 +159,7 @@ pub fn remember_controls(controls: &Controls) {
 /// `--panels=hidden` or the extra `panels`. A headset on a desk has no controller that could press
 /// the ball, and a test of the beams and the models needs the panels hidden. It saves nothing.
 pub fn panels_hidden_on_launch() -> bool {
-    launch_args().string("panels") == Some("hidden")
+    launch::args().string("panels") == Some("hidden")
 }
 
 /// The addresses whose host keys the launch asks to forget, with `--forget_host_key=ADDRESS,ADDRESS` or
@@ -166,7 +167,7 @@ pub fn panels_hidden_on_launch() -> bool {
 /// leaves the key of that host behind: the headset then refuses the next test host on that address.
 /// Each address is as the connect panel shows it, with its port.
 pub fn host_keys_to_forget_on_launch() -> Vec<String> {
-    launch_args().string("forget_host_key").map(split_addresses).unwrap_or_default()
+    launch::args().string("forget_host_key").map(split_addresses).unwrap_or_default()
 }
 
 fn split_addresses(text: &str) -> Vec<String> {
@@ -175,7 +176,7 @@ fn split_addresses(text: &str) -> Vec<String> {
 
 /// Whether the launch asks to connect at once, with `--connect` or the extra `connect`.
 pub fn connect_on_launch() -> bool {
-    launch_args().boolean("connect").unwrap_or(false)
+    launch::args().boolean("connect").unwrap_or(false)
 }
 
 /// Whether the launch asks for the console open and kept open, with `--console` or the extra
@@ -183,20 +184,20 @@ pub fn connect_on_launch() -> bool {
 /// desk has no controller that could hold the menu button, and a capture of the hand menu needs the
 /// console out of the way. `None` without the extra: the console opens with the first menu.
 pub fn console_on_launch() -> Option<bool> {
-    launch_args().boolean("console")
+    launch::args().boolean("console")
 }
 
 /// The host's page that the console opens on at the launch, with `--console_page=stream` or the
 /// extra `console_page`: a test or a capture of a page needs it open with no press.
 pub fn console_page_on_launch() -> Option<String> {
-    launch_args().string("console_page").map(str::to_owned)
+    launch::args().string("console_page").map(str::to_owned)
 }
 
 /// Whether the launch asks for the console to open on the Controls page, with `--controls_page=left`
 /// or `--controls_page=right` or the extra `controls_page`. A test on a desk has no controller that
 /// could press the console's Controls button, and a screen capture of the page needs it open.
 pub fn controls_page_on_launch() -> Option<Hand> {
-    match launch_args().string("controls_page") {
+    match launch::args().string("controls_page") {
         Some("left") => Some(Hand::Left),
         Some("right") => Some(Hand::Right),
         _ => None,
@@ -206,12 +207,12 @@ pub fn controls_page_on_launch() -> Option<Hand> {
 /// Whether the launch asks for the address field open at the start, with `--address_entry` or the
 /// extra `address_entry`. A test that types into the field needs it there without a press.
 pub fn address_entry_on_launch() -> bool {
-    launch_args().boolean("address_entry").unwrap_or(false)
+    launch::args().boolean("address_entry").unwrap_or(false)
 }
 
 /// How the media should travel, from the launch argument `media` (`udp` or `tcp`).
 pub fn media_choice() -> MediaChoice {
-    match launch_args().string("media") {
+    match launch::args().string("media") {
         Some("udp") => MediaChoice::Udp,
         Some("tcp") => MediaChoice::Tcp,
         _ => MediaChoice::Auto,

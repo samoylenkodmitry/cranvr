@@ -21,7 +21,8 @@ use crate::{
     panel_layout::layer_rank,
     place,
 };
-use cranpose::{launch_args, prelude::*};
+use crate::launch;
+use cranpose::prelude::*;
 use cranpose_xr::{
     Controller, Pose, ResizeLimits, ResizePolicy, SpatialExternalSurface, SpatialFrameEffect, SpatialMoveEvent, SpatialMoveEventType, SpatialPanel, SpatialResizeEventType,
     StereoMode, SubspaceModifier, XrFrame, METERS_PER_DP,
@@ -89,7 +90,7 @@ pub(crate) fn start_panel() -> (Pose, f32) {
 /// and leans its thumbstick forward for 2 s every 6 s. The packets go to the host as the surface's events
 /// do. Cranpose's ray is not part of the test.
 fn pointer_test() -> bool {
-    launch_args().string("desktop_pointer_test") == Some("circle")
+    launch::args().string("desktop_pointer_test") == Some("circle")
 }
 
 /// The pointer of the pointer test at the headset time `time`: a point that circles the middle of
@@ -197,7 +198,7 @@ pub fn RoomDisplay(stream: u8) {
         return;
     }
     RoomSurface(stream, name, pose, width, carrying, view.aspect);
-    if !displays().cursor_in_video(stream) && launch_args().string("cursor") != Some("none") {
+    if !displays().cursor_in_video(stream) && launch::args().string("cursor") != Some("none") {
         CursorRing(pose, width, cursor, view.aspect);
     }
 }
