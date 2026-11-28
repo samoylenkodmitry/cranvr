@@ -1,4 +1,4 @@
-use super::{local_stamp, mp4_writing, parse_video, Device, Journal, Out, Phase, Recorder, Sound, Video, View, CABLE_OUT, JOURNAL, OUT_LOOKS};
+use super::{local_stamp, mp4_writing, parse_video, remove_line, Device, Journal, Out, Phase, Recorder, Sound, Video, View, CABLE_OUT, JOURNAL, OUT_LOOKS};
 use serde_json::{json, Value};
 use std::{
     path::{Path, PathBuf},
@@ -440,4 +440,27 @@ fn the_header_says_whether_the_headsets_recorder_still_writes_a_file() {
     assert_eq!(parse_video(&format!("696810515 1795780000 x{WHOLE} a.mp4"), 1_795_786_003).map(|video| video.writing), Some(false));
     // A file that a dead recorder never finished stops counting as written once it is old
     assert_eq!(parse_video(&line, 1_795_786_000 + 120).map(|video| video.writing), Some(false));
+}
+
+// Any app on the headset can put a file into the recorder's folder. Its name reaches the headset's
+// shell, which must delete that one file and run nothing of the name. The Mac's sh reads the line as
+// the headset's sh does.
+#[test]
+fn the_delete_of_a_video_runs_nothing_of_its_name() {
+    let dir = std::env::temp_dir().join(format!("cranvr-remove-line-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let names = ["a b.mp4", "x; touch ran1 #.mp4", "$(touch ran2).mp4", "`touch ran3`.mp4", "q'; touch ran4; '.mp4", "-rf.mp4", "new\nline.mp4"];
+    for name in names {
+        std::fs::write(dir.join(name), "video").unwrap();
+        let line = remove_line(&dir.display().to_string(), name).unwrap();
+        let shell = std::process::Command::new("/bin/sh").arg("-c").arg(&line).current_dir(&dir).output().unwrap();
+        assert!(shell.status.success(), "{line}: {}", String::from_utf8_lossy(&shell.stderr));
+        assert!(!dir.join(name).exists(), "{name} is still there after {line}");
+    }
+    let left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+    assert!(left.is_empty(), "the shell made {left:?}");
+    std::fs::remove_dir_all(&dir).ok();
+    // A path elsewhere or another kind of file is no video of the recorder
+    assert!(remove_line("/sdcard/Oculus/VideoShots", "../x.mp4").is_err());
+    assert!(remove_line("/sdcard/Oculus/VideoShots", "notes.txt").is_err());
 }

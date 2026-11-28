@@ -607,6 +607,18 @@ fn parse_video(line: &str, now: u64) -> Option<Video> {
     Some(Video { name: name.to_string(), bytes: bytes.parse().ok()?, writing: mp4_writing(&header) && age_s < WRITE_RECENT_S, age_s })
 }
 
+/// The shell line that deletes the video `name` in the folder `dir`. Only a plain name of an mp4
+/// file counts: never a path elsewhere. Any app on the headset can name a file in the recorder's
+/// folder. adb joins the words of `adb shell` with spaces, and the headset's shell reads the line
+/// again. So the path goes as one quoted word, and no character of the name can end it.
+fn remove_line(dir: &str, name: &str) -> Result<String, String> {
+    if name.contains('/') || !name.ends_with(".mp4") {
+        return Err(format!("{name} is no video of the headset's recorder"));
+    }
+    let path = format!("{dir}/{name}").replace('\'', r"'\''");
+    Ok(format!("rm -- '{path}'"))
+}
+
 /// A reason of a failure that a later try may not have
 fn later(what: &'static str) -> impl Fn(String) -> Unsaved {
     move |e| Unsaved::Later(format!("{what}: {e}"))
@@ -910,11 +922,7 @@ impl Device for Real {
     }
 
     fn remove(&self, serial: &str, name: &str) -> Result<(), String> {
-        // Only a plain name of the recorder's folder: never a path elsewhere
-        if name.contains('/') || !name.ends_with(".mp4") {
-            return Err(format!("{name} is no video of the headset's recorder"));
-        }
-        Self::adb(serial, &["shell", "rm", &format!("{VIDEOS}/{name}")], ADB_CALL).map(drop)
+        Self::adb(serial, &["shell", &remove_line(VIDEOS, name)?], ADB_CALL).map(drop)
     }
 
     /// The free disk where the final files go. A test names a file that holds the number instead
@@ -998,5 +1006,5 @@ impl Sound for SoundProcess {
 }
 
 #[cfg(test)]
-#[path = "recorder_tests.rs"]
+#[path = "tests/recorder.rs"]
 mod tests;
